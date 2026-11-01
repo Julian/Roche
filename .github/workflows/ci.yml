@@ -13,29 +13,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: Rustfmt
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install rustfmt
-        run: rustup toolchain install stable --profile minimal --component rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install clippy
-        run: rustup toolchain install stable --profile minimal --component clippy
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -W clippy::pedantic -W clippy::nursery -D warnings
+      - name: Install Rust components and tools
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          cargo install --locked prek cargo-deny cargo-machete
+      - name: Run prek
+        run: prek run --all-files
 
   test:
     name: Test
@@ -47,4 +37,4 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked

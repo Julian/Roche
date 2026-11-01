@@ -1,0 +1,59 @@
+[package]
+name = "roche-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+# HTTP framework
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+headers = "0.4"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.7", features = ["cors", "limit", "compression-full", "trace"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Auth & Crypto
+rand = "0.10"
+sha2 = "0.10"
+
+# HTTP client
+reqwest = "0.13"
+
+# Feed parsing
+feed-rs = "3"
+quick-xml = "0.42"
+
+# Validation
+url = { version = "2", features = ["serde"] }
+ip_network = "0.4"
+
+# HTML sanitization
+ammonia = "4"
+
+# Utilities
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+toml = "1.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

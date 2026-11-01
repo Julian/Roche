@@ -1,30 +1,42 @@
-ci:
-  skip:
-    # pre-commit.ci doesn't have Rust installed
-    - fmt
-    - clippy
-    - zizmor
-
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
-      - id: check-ast
-      - id: check-docstring-first
       - id: check-toml
       - id: check-vcs-permalinks
       - id: check-yaml
-      - id: debug-statements
       - id: end-of-file-fixer
       - id: mixed-line-ending
         args: [--fix, lf]
       - id: trailing-whitespace
-  - repo: https://github.com/doublify/pre-commit-rust
-    rev: "v1.0"
+  - repo: local
     hooks:
       - id: fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: ^(Cargo\.toml|rustfmt\.toml|.*/Cargo\.toml|.*\.rs)$
       - id: clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: ^(Cargo\.(toml|lock)|.*/Cargo\.toml|.*\.rs)$
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+        files: ^(Cargo\.(toml|lock)|deny\.toml|.*/Cargo\.toml)$
+      - id: cargo-machete
+        name: cargo machete
+        entry: cargo machete
+        language: system
+        pass_filenames: false
+        files: ^(Cargo\.toml|.*/Cargo\.toml|.*\.rs)$
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.31.1
+    rev: v1.30.1
     hooks:
       - id: zizmor
+        args: [--persona=pedantic]
