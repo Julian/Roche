@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+/server/target/
+
+# Local runtime data & SQLite databases
+/data/
+/server/data/
+*.db
+*.db-shm
+*.db-wal
+
+# OS & editor files
+.DS_Store
+*.swp
+.env
