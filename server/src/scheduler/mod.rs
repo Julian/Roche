@@ -159,12 +159,18 @@ impl FeedIngester {
                     .filter_map(|item| {
                         let url = item.link?;
                         let summary = HtmlSanitizer::clean(&item.description);
+                        let content_html = item
+                            .content_html
+                            .as_deref()
+                            .map(HtmlSanitizer::clean)
+                            .or_else(|| Some(summary.clone()));
                         Some(PollItemCandidate {
                             title: item.title,
                             url,
                             author: item.author,
                             published_at: item.pub_date,
                             summary,
+                            content_html,
                             content_type: ContentType::Article,
                         })
                     })
@@ -185,13 +191,17 @@ impl FeedIngester {
                     .items
                     .into_iter()
                     .take(MAX_ITEMS_PER_POLL)
-                    .map(|video| PollItemCandidate {
-                        title: video.title,
-                        url: video.watch_url,
-                        author: author.clone(),
-                        published_at: video.published_at,
-                        summary: HtmlSanitizer::clean(&video.description),
-                        content_type: ContentType::Video,
+                    .map(|video| {
+                        let summary = HtmlSanitizer::clean(&video.description);
+                        PollItemCandidate {
+                            title: video.title,
+                            url: video.watch_url,
+                            author: author.clone(),
+                            published_at: video.published_at,
+                            content_html: Some(summary.clone()),
+                            summary,
+                            content_type: ContentType::Video,
+                        }
                     })
                     .collect();
                 Ok(PollBatch {
@@ -210,12 +220,14 @@ impl FeedIngester {
                         let url = paper.abstract_url?;
                         let authors = paper.authors.join(", ");
                         let author = (!authors.is_empty()).then_some(authors);
+                        let summary = HtmlSanitizer::clean(&paper.summary);
                         Some(PollItemCandidate {
                             title: paper.title,
                             url,
                             author,
                             published_at: paper.published_at,
-                            summary: HtmlSanitizer::clean(&paper.summary),
+                            content_html: Some(summary.clone()),
+                            summary,
                             content_type: ContentType::Paper,
                         })
                     })

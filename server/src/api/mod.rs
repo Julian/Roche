@@ -67,7 +67,7 @@ impl ApiRoutes {
                 patch(Self::tags_update::<F>).delete(Self::tags_delete::<F>),
             )
             // Media
-            .route("/api/v1/media/{id}", delete(Self::media_delete::<F>))
+            .route("/api/v1/media/{id}", get(Self::media_get::<F>).delete(Self::media_delete::<F>))
             // Import / Export
             .route("/api/v1/import/opml", post(Self::import_opml::<F>))
             .route("/api/v1/export/feeds", get(Self::export_feeds_opml::<F>))
@@ -322,6 +322,21 @@ impl ApiRoutes {
     ) -> Result<Json<serde_json::Value>, ApiError> {
         let media = service.items().list_media(&item_id).await?;
         Ok(Json(serde_json::json!({ "media": media })))
+    }
+
+    async fn media_get<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemPath(id): ProblemPath<String>,
+    ) -> Result<Response, ApiError> {
+        let (content_type, bytes) = service.media().read_bytes(&id).await?;
+        Ok((
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response())
     }
 
     async fn media_delete<F: FeedFetcher>(
@@ -623,7 +638,7 @@ mod tests {
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Verify refreshed item appears under feed items
+        // Verify refreshed item appears under feed items with feed_title and content_html
         let req = Request::builder()
             .uri(format!("/api/v1/feeds/{feed_id}/items"))
             .header(header::AUTHORIZATION, &auth)
@@ -635,6 +650,21 @@ mod tests {
             serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["title"], "Refreshed Article");
+        assert_eq!(body["items"][0]["feed_title"], "Example");
+        assert_eq!(body["items"][0]["content_html"], "Summary");
+
+        // Verify feed unread_count is 1 after refresh
+        let feed_get_request = Request::builder()
+            .uri(format!("/api/v1/feeds/{feed_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let feed_get_response = app.clone().oneshot(feed_get_request).await.unwrap();
+        let feed_get_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(feed_get_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(feed_get_body["unread_count"], 1);
 
         // Invalid poll_interval is rejected with 400 Bad Request
         let bad_patch = Request::builder()
@@ -754,6 +784,82 @@ mod tests {
         .unwrap();
         assert_eq!(exp_body["item_tags"].as_array().unwrap().len(), 2);
         assert!(exp_body["activity"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_media_serving_and_inbox_projections() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+        let auth = format!("Bearer {token}");
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-media-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let thumb_path = temp_dir.join("thumb.webp");
+        tokio::fs::write(&thumb_path, b"RIFF-fake-webp").await.unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.storage.media_dir = temp_dir.clone();
+        let service = RocheService::new(db.clone(), FakeFeedFetcher, config);
+        let app = ApiRoutes::router_with_service(service);
+
+        let url = Url::parse("https://youtube.com/watch?v=abc").unwrap();
+        let (item, _) = db
+            .items()
+            .save_manual_with_tags(&url, "Video Item", &["rust".to_string()])
+            .await
+            .unwrap();
+        let thumb = db
+            .media()
+            .create(&item.id, crate::db::MediaType::Thumbnail, "thumb.webp", Some(14), None)
+            .await
+            .unwrap();
+        let _video = db
+            .media()
+            .create(&item.id, crate::db::MediaType::Video, "video.mp4", Some(1024), Some(1694))
+            .await
+            .unwrap();
+
+        // Star the item and verify ?is_favorite=true filter + thumbnail_media_id + duration projection
+        db.items().update(&item.id, None, Some(true)).await.unwrap();
+        let list_request = Request::builder()
+            .uri("/api/v1/items?is_favorite=true")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let list_response = app.clone().oneshot(list_request).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list_response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(list_body["items"][0]["thumbnail_media_id"], thumb.id);
+        assert_eq!(list_body["items"][0]["duration"], 1694);
+
+        // Verify GET /api/v1/tags returns unread_count = 1
+        let tags_request = Request::builder()
+            .uri("/api/v1/tags")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let tags_response = app.clone().oneshot(tags_request).await.unwrap();
+        let tags_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(tags_response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(tags_body["tags"][0]["unread_count"], 1);
+
+        // Verify GET /api/v1/media/{id} serves bytes with image/webp Content-Type
+        let media_request = Request::builder()
+            .uri(format!("/api/v1/media/{}", thumb.id))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let media_response = app.oneshot(media_request).await.unwrap();
+        assert_eq!(media_response.status(), StatusCode::OK);
+        assert_eq!(media_response.headers().get(header::CONTENT_TYPE).unwrap(), "image/webp");
+        let media_bytes = to_bytes(media_response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&media_bytes[..], b"RIFF-fake-webp");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[tokio::test]

@@ -8,6 +8,11 @@ use uuid::Uuid;
 use super::{ActivityAction, ActivityEntityType, ContentType, FeedType, SyncRepo};
 use crate::feeds::OpmlOutline;
 
+const FEED_SELECT: &str = "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
+       f.poll_interval, f.last_polled, f.last_error, f.is_active,
+       (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread') AS unread_count
+FROM feeds f";
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
 pub struct Feed {
@@ -22,6 +27,7 @@ pub struct Feed {
     pub last_polled: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub is_active: bool,
+    pub unread_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +37,7 @@ pub struct PollItemCandidate {
     pub author: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub summary: String,
+    pub content_html: Option<String>,
     pub content_type: ContentType,
 }
 
@@ -112,6 +119,7 @@ impl<'a> FeedRepo<'a> {
             last_polled: None,
             last_error: None,
             is_active: true,
+            unread_count: 0,
         })
     }
 
@@ -162,6 +170,7 @@ impl<'a> FeedRepo<'a> {
                     last_polled: None,
                     last_error: None,
                     is_active: true,
+                    unread_count: 0,
                 });
             }
         }
@@ -171,16 +180,13 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Feed>> {
-        Ok(sqlx::query_as::<_, Feed>("SELECT * FROM feeds WHERE id = ?")
-            .bind(id)
-            .fetch_optional(self.pool)
-            .await?)
+        let sql = format!("{FEED_SELECT} WHERE f.id = ?");
+        Ok(sqlx::query_as::<_, Feed>(&sql).bind(id).fetch_optional(self.pool).await?)
     }
 
     pub async fn list(&self) -> Result<Vec<Feed>> {
-        Ok(sqlx::query_as::<_, Feed>("SELECT * FROM feeds ORDER BY created_at DESC")
-            .fetch_all(self.pool)
-            .await?)
+        let sql = format!("{FEED_SELECT} ORDER BY f.created_at DESC");
+        Ok(sqlx::query_as::<_, Feed>(&sql).fetch_all(self.pool).await?)
     }
 
     pub async fn update(
@@ -249,13 +255,12 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn get_active_for_polling(&self) -> Result<Vec<Feed>> {
-        Ok(sqlx::query_as::<_, Feed>(
-            "SELECT * FROM feeds
-             WHERE is_active = 1
-               AND (last_polled IS NULL OR datetime(last_polled) < datetime('now', '-' || poll_interval || ' minutes'))",
-        )
-        .fetch_all(self.pool)
-        .await?)
+        let sql = format!(
+            "{FEED_SELECT}
+             WHERE f.is_active = 1
+               AND (f.last_polled IS NULL OR datetime(f.last_polled) < datetime('now', '-' || f.poll_interval || ' minutes'))"
+        );
+        Ok(sqlx::query_as::<_, Feed>(&sql).fetch_all(self.pool).await?)
     }
 
     pub async fn record_poll_batch(
@@ -289,8 +294,8 @@ impl<'a> FeedRepo<'a> {
             let id = Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT OR IGNORE INTO items
-                 (id, feed_id, title, url, author, published_at, summary, content_type, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(feed_id)
@@ -299,6 +304,7 @@ impl<'a> FeedRepo<'a> {
             .bind(item.author.as_deref())
             .bind(item.published_at)
             .bind(&item.summary)
+            .bind(item.content_html.as_deref())
             .bind(item.content_type)
             .bind(now)
             .bind(now)

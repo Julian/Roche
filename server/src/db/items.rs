@@ -12,20 +12,33 @@ use super::{
     SortOrder, SyncRepo, Tag, TagRepo,
 };
 
+const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
+       i.published_at, i.created_at, i.summary, i.content_html, i.content_type, i.status,
+       i.is_favorite, i.read_at,
+       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
+       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration
+FROM items i
+LEFT JOIN feeds f ON i.feed_id = f.id";
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
     pub id: String,
     pub feed_id: Option<String>,
+    pub feed_title: Option<String>,
     pub title: String,
     #[sqlx(try_from = "&'a str")]
     pub url: Url,
     pub author: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
     pub summary: Option<String>,
+    pub content_html: Option<String>,
     pub content_type: ContentType,
     pub status: ItemStatus,
     pub is_favorite: bool,
     pub read_at: Option<DateTime<Utc>>,
+    pub thumbnail_media_id: Option<String>,
+    pub duration: Option<i64>,
 }
 
 #[cfg(test)]
@@ -46,6 +59,7 @@ pub struct ItemFilter {
     pub feed_id: Option<String>,
     pub tag_id: Option<String>,
     pub content_type: Option<ContentType>,
+    pub is_favorite: Option<bool>,
     pub search: Option<String>,
     pub sort: Option<ItemSortField>,
     pub order: Option<SortOrder>,
@@ -102,15 +116,20 @@ impl<'a> ItemRepo<'a> {
         Ok(Item {
             id,
             feed_id: new_item.feed_id.map(String::from),
+            feed_title: None,
             title: new_item.title.to_string(),
             url: new_item.url.clone(),
             author: new_item.author.map(String::from),
             published_at: new_item.published_at,
+            created_at: now,
             summary: new_item.summary.map(String::from),
+            content_html: new_item.summary.map(String::from),
             content_type: new_item.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
             read_at: None,
+            thumbnail_media_id: None,
+            duration: None,
         })
     }
 
@@ -126,8 +145,8 @@ impl<'a> ItemRepo<'a> {
 
         sqlx::query(
             "INSERT INTO items
-             (id, feed_id, title, url, author, published_at, summary, content_type, created_at, updated_at)
-             VALUES (?, NULL, ?, ?, NULL, NULL, NULL, ?, ?, ?)",
+             (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
+             VALUES (?, NULL, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)",
         )
         .bind(&item_id)
         .bind(title)
@@ -164,25 +183,28 @@ impl<'a> ItemRepo<'a> {
         let item = Item {
             id: item_id,
             feed_id: None,
+            feed_title: None,
             title: title.to_string(),
             url: url.clone(),
             author: None,
             published_at: None,
+            created_at: now,
             summary: None,
+            content_html: None,
             content_type: ContentType::Article,
             status: ItemStatus::Unread,
             is_favorite: false,
             read_at: None,
+            thumbnail_media_id: None,
+            duration: None,
         };
 
         Ok((item, attached_tags))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Item>> {
-        Ok(sqlx::query_as::<_, Item>("SELECT * FROM items WHERE id = ?")
-            .bind(id)
-            .fetch_optional(self.pool)
-            .await?)
+        let sql = format!("{ITEM_SELECT} WHERE i.id = ?");
+        Ok(sqlx::query_as::<_, Item>(&sql).bind(id).fetch_optional(self.pool).await?)
     }
 
     pub async fn list(
@@ -191,14 +213,15 @@ impl<'a> ItemRepo<'a> {
         feed_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<Item>> {
-        let mut qb = QueryBuilder::new("SELECT * FROM items WHERE 1=1");
+        let mut qb = QueryBuilder::new(ITEM_SELECT);
+        qb.push(" WHERE 1=1");
         if let Some(s) = status {
-            qb.push(" AND status = ").push_bind(s);
+            qb.push(" AND i.status = ").push_bind(s);
         }
         if let Some(f) = feed_id {
-            qb.push(" AND feed_id = ").push_bind(f);
+            qb.push(" AND i.feed_id = ").push_bind(f);
         }
-        qb.push(" ORDER BY created_at DESC");
+        qb.push(" ORDER BY i.created_at DESC");
         if let Some(l) = limit {
             qb.push(" LIMIT ").push_bind(i64::try_from(l).unwrap_or(i64::MAX));
         }
@@ -207,10 +230,7 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn list_filtered(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
-        let mut qb = QueryBuilder::new("SELECT DISTINCT i.* FROM items i");
-        if filter.tag_id.is_some() {
-            qb.push(" JOIN item_tags it ON i.id = it.item_id");
-        }
+        let mut qb = QueryBuilder::new(ITEM_SELECT);
         qb.push(" WHERE 1=1");
 
         if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
@@ -220,10 +240,17 @@ impl<'a> ItemRepo<'a> {
             qb.push(" AND i.feed_id = ").push_bind(f);
         }
         if let Some(t) = &filter.tag_id {
-            qb.push(" AND it.tag_id = ").push_bind(t);
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = i.id AND it.tag_id = ",
+            )
+            .push_bind(t)
+            .push(")");
         }
         if let Some(ct) = filter.content_type {
             qb.push(" AND i.content_type = ").push_bind(ct);
+        }
+        if let Some(fav) = filter.is_favorite {
+            qb.push(" AND i.is_favorite = ").push_bind(fav);
         }
         if let Some(search) = &filter.search {
             let pattern = format!("%{}%", ItemFilter::escape_like(search));
@@ -232,6 +259,8 @@ impl<'a> ItemRepo<'a> {
                 .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
                 .push_bind(pattern.clone())
                 .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
                 .push_bind(pattern)
                 .push(" ESCAPE '\\')");
         }
@@ -260,17 +289,18 @@ impl<'a> ItemRepo<'a> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
-        let existing: Option<Item> = sqlx::query_as("SELECT * FROM items WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let existing: Option<(ItemStatus, bool)> =
+            sqlx::query_as("SELECT status, is_favorite FROM items WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-        let Some(current) = existing else {
+        let Some((current_status, current_favorite)) = existing else {
             return Ok(false);
         };
 
         if let Some(new_status) = status
-            && new_status != current.status
+            && new_status != current_status
         {
             match new_status {
                 ItemStatus::Archived => {
@@ -312,7 +342,7 @@ impl<'a> ItemRepo<'a> {
         }
 
         if let Some(fav) = is_favorite
-            && fav != current.is_favorite
+            && fav != current_favorite
         {
             let action = if fav { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
             sqlx::query("UPDATE items SET is_favorite = ?, updated_at = ? WHERE id = ?")

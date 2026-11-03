@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS items (
     author TEXT,
     published_at DATETIME,
     summary TEXT,
+    content_html TEXT,
     content_type TEXT NOT NULL DEFAULT 'article' CHECK (content_type IN ('article', 'video', 'paper', 'audio', 'pdf')),
     status TEXT NOT NULL DEFAULT 'unread' CHECK (status IN ('unread', 'archived')),
     is_favorite BOOLEAN NOT NULL DEFAULT 0,

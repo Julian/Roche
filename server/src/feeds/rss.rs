@@ -17,6 +17,7 @@ pub struct RssItem {
     pub title: String,
     pub link: Option<Url>,
     pub description: String,
+    pub content_html: Option<String>,
     pub author: Option<String>,
     pub pub_date: Option<DateTime<Utc>>,
 }
@@ -41,17 +42,16 @@ impl RssParser {
                 let title = entry.title.map(|t| t.content).unwrap_or_default();
                 let link = select_entry_link(&entry.links)
                     .or_else(|| SafeHttpClient::parse_url(&entry.id).ok());
-                let description = entry
-                    .summary
-                    .map(|s| s.content)
-                    .or_else(|| entry.content.and_then(|c| c.body))
-                    .unwrap_or_default();
+                let body = entry.content.and_then(|c| c.body);
+                let summary = entry.summary.map(|s| s.content);
+                let description = summary.clone().or_else(|| body.clone()).unwrap_or_default();
+                let content_html = body.or(summary);
 
                 let authors: Vec<String> =
                     entry.authors.into_iter().filter_map(|a| a.name).collect();
                 let author = (!authors.is_empty()).then(|| authors.join(", "));
 
-                RssItem { title, link, description, author, pub_date }
+                RssItem { title, link, description, content_html, author, pub_date }
             })
             .collect();
 

@@ -489,6 +489,22 @@ pub struct MediaService<'a, F> {
 }
 
 impl<F: FeedFetcher> MediaService<'_, F> {
+    pub async fn read_bytes(&self, id: &str) -> Result<(&'static str, Vec<u8>), ApiError> {
+        let repo = self.service.db.media();
+        let media = repo.get(id).await?.ok_or_else(|| ApiError::not_found("Media not found"))?;
+        let content_type = MediaStore::content_type_for(media.media_type, &media.path);
+        let bytes = self.service.media_store.read(&media.path).await.map_err(|e| {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                ApiError::not_found("Media file not found on disk")
+            } else {
+                ApiError::Internal(e)
+            }
+        })?;
+        Ok((content_type, bytes))
+    }
+
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {
         let repo = self.service.db.media();
         let media = repo.get(id).await?.ok_or_else(|| ApiError::not_found("Media not found"))?;
