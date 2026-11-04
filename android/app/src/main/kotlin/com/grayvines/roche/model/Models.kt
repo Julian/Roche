@@ -112,13 +112,9 @@ data class InboxEntry(
             when (contentType) {
                 ContentType.VIDEO -> duration ?: "Video"
                 ContentType.PDF -> "PDF"
-                ContentType.ARTICLE -> formatArticleMinutes(contentText ?: summary.orEmpty())
+                ContentType.ARTICLE ->
+                    formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
             }
-
-    private companion object {
-        private const val WORDS_PER_MINUTE = 180
-        private val WHITESPACE_REGEX = Regex("\\s+")
-    }
 }
 
 internal fun formatArticleMinutes(text: String): String {
@@ -128,4 +124,4 @@ internal fun formatArticleMinutes(text: String): String {
 }
 
 private const val ARTICLE_WORDS_PER_MINUTE = 180
-private val WHITESPACE_REGEX_TOP = Regex("\\s+")
+private val WHITESPACE_REGEX_TOP = Regex("""\s+""")

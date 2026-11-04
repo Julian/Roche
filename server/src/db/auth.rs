@@ -1,10 +1,19 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use super::SyncRepo;
 
 const MAX_PAIRING_ATTEMPTS: i64 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DeviceToken {
+    pub id: String,
+    pub device_name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
 
 pub struct AuthRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
@@ -112,5 +121,29 @@ impl<'a> AuthRepo<'a> {
         }
 
         Ok(true)
+    }
+
+    pub async fn count_devices(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_tokens")
+            .fetch_one(self.pool)
+            .await?)
+    }
+
+    pub async fn list_devices(&self) -> Result<Vec<DeviceToken>> {
+        Ok(sqlx::query_as::<_, DeviceToken>(
+            "SELECT id, device_name, created_at, last_used_at
+             FROM device_tokens
+             ORDER BY created_at DESC",
+        )
+        .fetch_all(self.pool)
+        .await?)
+    }
+
+    pub async fn revoke_device(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM device_tokens WHERE id = ?")
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 }

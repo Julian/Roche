@@ -13,7 +13,7 @@ mod sync;
 mod tags;
 mod types;
 
-pub use auth::AuthRepo;
+pub use auth::{AuthRepo, DeviceToken};
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
 pub use items::NewItem;

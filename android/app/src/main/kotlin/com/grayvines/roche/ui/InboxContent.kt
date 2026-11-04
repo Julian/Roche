@@ -35,8 +35,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -350,17 +352,23 @@ private fun InboxEntryTextColumn(
             maxLines = maxTitleLines,
             overflow = TextOverflow.Ellipsis,
         )
-        val snippet = entry.summary
-        if (!ultraDense && !snippet.isNullOrBlank()) {
-            Spacer(modifier = Modifier.height(3.dp))
-            Text(
-                text = snippet,
-                color = colors.textSecondary,
-                fontSize = 12.5.sp,
-                lineHeight = 17.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        val rawSummary = entry.summary
+        if (!ultraDense && !rawSummary.isNullOrBlank()) {
+            val snippet =
+                androidx.compose.runtime.remember(rawSummary) {
+                    AnnotatedString.fromHtml(rawSummary).text.replace('\n', ' ').trim()
+                }
+            if (snippet.isNotBlank()) {
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = snippet,
+                    color = colors.textSecondary,
+                    fontSize = 12.5.sp,
+                    lineHeight = 17.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

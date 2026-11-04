@@ -55,7 +55,8 @@ impl<'a> SyncRepo<'a> {
         Ok(sqlx::query_as::<_, ActivityEntry>(
             "SELECT id, entity_type, entity_id, action, timestamp
              FROM activity_log
-             ORDER BY id DESC",
+             ORDER BY id DESC
+             LIMIT 5000",
         )
         .fetch_all(self.pool)
         .await?)

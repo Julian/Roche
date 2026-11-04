@@ -26,10 +26,27 @@ internal fun buildPairDevicePayload(code: String, deviceName: String): String = 
 internal fun extractTokenFromPairResponse(raw: String): String =
     rocheJson.parseToJsonElement(raw).jsonObject.stringOrEmpty("token")
 
-internal fun buildCreateFeedPayload(url: String): String = buildJsonObject {
+internal fun buildCreateFeedPayload(url: String, title: String? = null): String = buildJsonObject {
     put(KEY_URL, url)
+    put("feed_type", inferFeedTypeWireValue(url))
+    if (!title.isNullOrBlank()) {
+        put(KEY_TITLE, title)
+    }
 }
     .toString()
+
+internal fun buildAddItemTagPayload(tagName: String): String = buildJsonObject {
+    put("name", tagName)
+}
+    .toString()
+
+internal fun inferFeedTypeWireValue(url: String): String =
+    when {
+        url.contains("arxiv.org", ignoreCase = true) -> "arxiv"
+        url.contains("youtube.com", ignoreCase = true) ||
+            url.contains("youtu.be", ignoreCase = true) -> "youtube"
+        else -> "rss"
+    }
 
 internal fun buildSaveItemPayload(url: String, title: String?, tags: List<String>): String =
     buildJsonObject {
@@ -141,7 +158,25 @@ private fun parseItemJsonObject(obj: JsonObject): RemoteItemDto =
         readProgress = obj.doubleOrDefault(KEY_READ_PROGRESS, 0.0),
         thumbnailMediaId = obj.nullableString("thumbnail_media_id"),
         duration = obj.parseDurationLabel(),
+        tagNames = obj.parseItemTagNames(),
     )
+
+private fun JsonObject.parseItemTagNames(): List<String> {
+    val fromTagNames =
+        (this["tag_names"] as? JsonArray)?.mapNotNull { elem ->
+            (elem as? JsonPrimitive)?.content?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+        }
+    if (!fromTagNames.isNullOrEmpty()) return fromTagNames
+    val fromTags =
+        (this["tags"] as? JsonArray)?.mapNotNull { elem ->
+            when (elem) {
+                is JsonPrimitive -> elem.content.trim().lowercase().takeIf { it.isNotBlank() }
+                is JsonObject -> elem.nullableString("name")?.trim()?.lowercase()
+                else -> null
+            }
+        }
+    return fromTags.orEmpty()
+}
 
 private fun JsonObject.parseDurationLabel(): String? {
     val raw = nullableString("duration") ?: return null

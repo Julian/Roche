@@ -45,12 +45,7 @@ class HttpUrlConnectionTransport : HttpTransport {
                     } else {
                         connection.errorStream
                     }
-                val text =
-                    stream?.let { input ->
-                        BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use {
-                            it.readText()
-                        }
-                    } ?: ""
+                val text = stream?.let { input -> readBoundedText(input) } ?: ""
                 HttpResponse(statusCode = status, body = text)
             } finally {
                 connection.disconnect()
@@ -62,6 +57,23 @@ class HttpUrlConnectionTransport : HttpTransport {
         private const val READ_TIMEOUT_MS = 15_000
     }
 }
+
+internal fun readBoundedText(input: java.io.InputStream): String =
+    BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
+        val builder = StringBuilder()
+        val buffer = CharArray(READ_BUFFER_CHARS)
+        var total = 0
+        while (total < MAX_RESPONSE_CHARS) {
+            val read = reader.read(buffer, 0, minOf(buffer.size, MAX_RESPONSE_CHARS - total))
+            if (read == -1) break
+            builder.append(buffer, 0, read)
+            total += read
+        }
+        builder.toString()
+    }
+
+private const val READ_BUFFER_CHARS = 8_192
+private const val MAX_RESPONSE_CHARS = 4 * 1024 * 1024
 
 class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
     Exception("$title ($statusCode): $detail")
@@ -93,6 +105,7 @@ data class RemoteItemDto(
     val readProgress: Double,
     val thumbnailMediaId: String?,
     val duration: String?,
+    val tagNames: List<String> = emptyList(),
 )
 
 data class RemoteTagDto(val id: String, val name: String, val unreadCount: Int)
@@ -125,14 +138,19 @@ class RocheApiClient(private val transport: HttpTransport) {
         return parseFeedsJsonArray(response.body)
     }
 
-    suspend fun createFeed(serverUrl: String, token: String, url: String): RemoteFeedDto {
+    suspend fun createFeed(
+        serverUrl: String,
+        token: String,
+        url: String,
+        title: String? = null,
+    ): RemoteFeedDto {
         val response =
             transport.execute(
                 HttpRequest(
                     method = METHOD_POST,
                     url = "${serverUrl.trimEnd('/')}/api/v1/feeds",
                     headers = authHeaders(token),
-                    body = buildCreateFeedPayload(url),
+                    body = buildCreateFeedPayload(url = url, title = title),
                 )
             )
         ensureSuccess(response)
@@ -144,7 +162,7 @@ class RocheApiClient(private val transport: HttpTransport) {
             transport.execute(
                 HttpRequest(
                     method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items?limit=200",
+                    url = "${serverUrl.trimEnd('/')}/api/v1/items?per_page=200",
                     headers = authHeaders(token),
                 )
             )
@@ -209,6 +227,42 @@ class RocheApiClient(private val transport: HttpTransport) {
             )
         ensureSuccess(response)
         return parseTagsJsonArray(response.body)
+    }
+
+    internal suspend fun addTagToItem(
+        serverUrl: String,
+        token: String,
+        itemId: String,
+        tagName: String,
+    ): List<RemoteTagDto> {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_POST,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$itemId/tags",
+                    headers = authHeaders(token),
+                    body = buildAddItemTagPayload(tagName),
+                )
+            )
+        ensureSuccess(response)
+        return parseTagsJsonArray(response.body)
+    }
+
+    internal suspend fun removeTagFromItem(
+        serverUrl: String,
+        token: String,
+        itemId: String,
+        tagId: String,
+    ) {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = "DELETE",
+                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$itemId/tags/$tagId",
+                    headers = authHeaders(token),
+                )
+            )
+        ensureSuccess(response)
     }
 
     private companion object {

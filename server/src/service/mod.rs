@@ -7,8 +7,8 @@ use crate::{
     config::Config,
     content::fetcher::SafeHttpClient,
     db::{
-        ActivityEntry, Db, Feed, FeedSource, FeedType, HexColor, Item, ItemFilter, ItemStatus,
-        ItemTag, Media, SyncRepo, Tag,
+        ActivityEntry, Db, DeviceToken, Feed, FeedSource, FeedType, HexColor, Item, ItemFilter,
+        ItemStatus, ItemTag, Media, SyncRepo, Tag,
     },
     error::ApiError,
     feeds::OpmlDocument,
@@ -88,8 +88,9 @@ impl<F: FeedFetcher> RocheService<F> {
     }
 
     pub async fn export_data(&self) -> Result<ExportBundle, ApiError> {
+        const MAX_EXPORT_ROWS: usize = 5_000;
         let feeds = self.db.feeds().list().await?;
-        let items = self.db.items().list(None, None, None).await?;
+        let items = self.db.items().list(None, None, Some(MAX_EXPORT_ROWS)).await?;
         let tags = self.db.tags().list().await?;
         let item_tags = self.db.tags().list_all_item_tags().await?;
         let activity = self.db.sync().list_activity().await?;
@@ -160,6 +161,21 @@ impl<F: FeedFetcher> AuthService<'_, F> {
         let tokens = TokenManager::new(self.service.db.auth());
         if !tokens.validate(bearer_token).await? {
             return Err(ApiError::unauthorized("Invalid or revoked bearer token"));
+        }
+        Ok(())
+    }
+
+    pub async fn count_devices(&self) -> Result<i64, ApiError> {
+        Ok(self.service.db.auth().count_devices().await?)
+    }
+
+    pub async fn list_devices(&self) -> Result<Vec<DeviceToken>, ApiError> {
+        Ok(self.service.db.auth().list_devices().await?)
+    }
+
+    pub async fn revoke_device(&self, id: &str) -> Result<(), ApiError> {
+        if !self.service.db.auth().revoke_device(id).await? {
+            return Err(ApiError::not_found("Device not found"));
         }
         Ok(())
     }
@@ -489,11 +505,11 @@ pub struct MediaService<'a, F> {
 }
 
 impl<F: FeedFetcher> MediaService<'_, F> {
-    pub async fn read_bytes(&self, id: &str) -> Result<(&'static str, Vec<u8>), ApiError> {
+    pub async fn open_stream(&self, id: &str) -> Result<(&'static str, tokio::fs::File), ApiError> {
         let repo = self.service.db.media();
         let media = repo.get(id).await?.ok_or_else(|| ApiError::not_found("Media not found"))?;
         let content_type = MediaStore::content_type_for(media.media_type, &media.path);
-        let bytes = self.service.media_store.read(&media.path).await.map_err(|e| {
+        let file = self.service.media_store.open_file(&media.path).await.map_err(|e| {
             if e.downcast_ref::<std::io::Error>()
                 .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
             {
@@ -502,7 +518,7 @@ impl<F: FeedFetcher> MediaService<'_, F> {
                 ApiError::Internal(e)
             }
         })?;
-        Ok((content_type, bytes))
+        Ok((content_type, file))
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {

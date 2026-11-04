@@ -51,8 +51,13 @@ class MainActivity : ComponentActivity() {
     private fun handleIncomingShareIntent(intent: Intent?) {
         if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
             val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
-            if (sharedText.isNotBlank()) {
-                viewModel.dispatch(MainAction.OpenAddSheet(prefilledUrl = sharedText))
+            val candidateUrl =
+                sharedText.split(WHITESPACE_SPLIT_REGEX).firstOrNull { token ->
+                    val scheme = runCatching { token.toUri().scheme?.lowercase() }.getOrNull()
+                    scheme in ALLOWED_HTTP_SCHEMES
+                }
+            if (candidateUrl != null) {
+                viewModel.dispatch(MainAction.OpenAddSheet(prefilledUrl = candidateUrl))
             }
         }
     }
@@ -71,8 +76,15 @@ class MainActivity : ComponentActivity() {
 
     private fun openUrlInBrowser(url: String) {
         runCatching {
-            val browserIntent = Intent(Intent.ACTION_VIEW, url.toUri())
-            startActivity(browserIntent)
+            val uri = url.trim().toUri()
+            if (uri.scheme?.lowercase() in ALLOWED_HTTP_SCHEMES) {
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+            }
         }
+    }
+
+    private companion object {
+        private val ALLOWED_HTTP_SCHEMES = setOf("http", "https")
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
     }
 }

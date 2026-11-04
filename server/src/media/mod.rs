@@ -63,9 +63,9 @@ impl MediaStore {
         Ok(norm_cand)
     }
 
-    pub async fn read(&self, stored_path: &str) -> Result<Vec<u8>> {
+    pub async fn open_file(&self, stored_path: &str) -> Result<tokio::fs::File> {
         let safe_path = self.validate_path(Path::new(stored_path))?;
-        Ok(tokio::fs::read(&safe_path).await?)
+        Ok(tokio::fs::File::open(&safe_path).await?)
     }
 
     #[must_use]

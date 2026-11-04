@@ -20,9 +20,18 @@ impl RocheServer {
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone());
 
-        match roche_service.auth().issue_pairing_code().await {
-            Ok(code) => tracing::info!(pairing_code = %code, "Device pairing code generated"),
-            Err(e) => tracing::error!(error = %e, "Failed to generate startup device pairing code"),
+        if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
+            match roche_service.auth().issue_pairing_code().await {
+                Ok(code) => tracing::info!(
+                    pairing_code = %code,
+                    "No paired devices found; generated bootstrap pairing code"
+                ),
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to generate bootstrap device pairing code");
+                }
+            }
+        } else {
+            tracing::info!("Paired devices exist; run `roche pair` to generate a new pairing code");
         }
 
         let scheduler_db = db.clone();
@@ -62,5 +71,31 @@ impl RocheServer {
             tracing::error!(error = %e, "Failed to listen for shutdown signal");
         }
         tracing::info!("Shutdown signal received, stopping server");
+    }
+
+    pub async fn issue_pairing_code(
+        config_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<String> {
+        let cfg = config::Config::load(config_path)?;
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        let pairing = auth::pairing::PairingManager::new(db.auth());
+        pairing.create_code(cfg.auth.pairing_code_ttl).await
+    }
+
+    pub async fn list_devices(
+        config_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<Vec<db::DeviceToken>> {
+        let cfg = config::Config::load(config_path)?;
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        db.auth().list_devices().await
+    }
+
+    pub async fn revoke_device(
+        config_path: Option<&std::path::Path>,
+        device_id: &str,
+    ) -> anyhow::Result<bool> {
+        let cfg = config::Config::load(config_path)?;
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        db.auth().revoke_device(device_id).await
     }
 }

@@ -34,6 +34,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -379,6 +380,7 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         rememberSaveable(state.settings.serverUrl) { mutableStateOf(state.settings.serverUrl) }
     var bearerToken by
         rememberSaveable(state.settings.bearerToken) { mutableStateOf(state.settings.bearerToken) }
+    var pairingCode by rememberSaveable { mutableStateOf("") }
 
     Text(
         text = "SELF-HOSTED SERVER",
@@ -391,34 +393,24 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         onValueChange = { serverUrl = it },
         label = { Text("Roche Server URL (Tailscale / LAN)") },
         singleLine = true,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().testTag("server_url_input"),
+    )
+    PairingCodeRow(
+        pairingCode = pairingCode,
+        onPairingCodeChange = { pairingCode = it },
+        onPairClick = { onAction(MainAction.PairWithServer(serverUrl, pairingCode)) },
     )
     OutlinedTextField(
         value = bearerToken,
         onValueChange = { bearerToken = it },
         label = { Text("Bearer Token") },
         singleLine = true,
-        modifier = Modifier.fillMaxWidth(),
+        visualTransformation = PasswordVisualTransformation(),
+        modifier = Modifier.fillMaxWidth().testTag("bearer_token_input"),
     )
-    ServerSettingsActionRow(
-        onSave = {
-            onAction(
-                MainAction.UpdateServerConfig(
-                    serverUrl = serverUrl,
-                    bearerToken = bearerToken,
-                )
-            )
-        },
-        onSync = { onAction(MainAction.SyncNow) },
-    )
-}
-
-@Composable
-private fun ServerSettingsActionRow(onSave: () -> Unit, onSync: () -> Unit) {
-    val colors = LocalRocheColors.current
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Button(
-            onClick = onSave,
+            onClick = { onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken)) },
             colors =
                 ButtonDefaults.buttonColors(
                     containerColor = colors.accentBlue,
@@ -427,6 +419,28 @@ private fun ServerSettingsActionRow(onSave: () -> Unit, onSync: () -> Unit) {
         ) {
             Text("Save Settings")
         }
-        HeaderActionButton(label = "Sync Now", onClick = onSync)
+        HeaderActionButton(label = "Sync Now", onClick = { onAction(MainAction.SyncNow) })
+    }
+}
+
+@Composable
+private fun PairingCodeRow(
+    pairingCode: String,
+    onPairingCodeChange: (String) -> Unit,
+    onPairClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = pairingCode,
+            onValueChange = onPairingCodeChange,
+            label = { Text("Pairing Code (from roche pair)") },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("pairing_code_input"),
+        )
+        HeaderActionButton(label = "Pair Device", onClick = onPairClick)
     }
 }

@@ -6,9 +6,13 @@ import com.grayvines.roche.data.local.ItemTagEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
+import com.grayvines.roche.data.remote.RemoteTagDto
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.inferFeedTypeWireValue
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
@@ -17,10 +21,13 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.net.URI
+import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+
+data class SaveUrlResult(val title: String, val isFeed: Boolean)
 
 data class RepositorySnapshot(
     val entries: List<InboxEntry>,
@@ -45,8 +52,8 @@ class RocheRepository(
             buildSnapshot(items = items, feeds = feeds, tags = tags, itemTags = itemTags)
         }
 
-    suspend fun ensureSeeded() {
-        if (dao.countItems() == 0) {
+    internal suspend fun ensureSeeded() {
+        if (dao.countItems() == 0 && settings.settings.first().bearerToken.isBlank()) {
             dao.upsertFeeds(SeedData.feeds)
             dao.upsertTags(SeedData.tags)
             dao.upsertItems(SeedData.items)
@@ -97,14 +104,42 @@ class RocheRepository(
         if (normalized.isBlank()) return
         val existingTag =
             dao.getTagByName(normalized)
-                ?: TagEntity(id = "tag-${UUID.randomUUID()}", name = normalized).also {
-                    dao.upsertTag(it)
-                }
+                ?: TagEntity(id = newTagId(), name = normalized).also { dao.upsertTag(it) }
         val alreadyAssigned = dao.hasItemTag(itemId = itemId, tagId = existingTag.id) > 0
         if (alreadyAssigned) {
             dao.deleteItemTag(itemId = itemId, tagId = existingTag.id)
+            runCatching {
+                val currentSettings = settings.settings.first()
+                if (currentSettings.bearerToken.isNotBlank()) {
+                    apiClient.removeTagFromItem(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        itemId = itemId,
+                        tagId = existingTag.id,
+                    )
+                }
+            }
         } else {
             dao.insertItemTag(ItemTagEntity(itemId = itemId, tagId = existingTag.id))
+            runCatching {
+                val currentSettings = settings.settings.first()
+                if (currentSettings.bearerToken.isNotBlank()) {
+                    val remoteTags =
+                        apiClient.addTagToItem(
+                            serverUrl = currentSettings.serverUrl,
+                            token = currentSettings.bearerToken,
+                            itemId = itemId,
+                            tagName = normalized,
+                        )
+                    reconcileAddedRemoteTag(
+                        dao = dao,
+                        itemId = itemId,
+                        localTag = existingTag,
+                        normalizedName = normalized,
+                        remoteTags = remoteTags,
+                    )
+                }
+            }
         }
     }
 
@@ -112,23 +147,72 @@ class RocheRepository(
         inputUrl: String,
         titleOverride: String?,
         tagCsv: String,
-    ): InboxEntry {
+    ): SaveUrlResult {
         val trimmedUrl = inputUrl.trim()
+        if (isLikelyFeedUrl(trimmedUrl)) {
+            val feedTitle =
+                subscribeFeedBestEffort(
+                    dao = dao,
+                    apiClient = apiClient,
+                    settings = settings,
+                    url = trimmedUrl,
+                    titleOverride = titleOverride,
+                )
+            return SaveUrlResult(title = feedTitle, isFeed = true)
+        }
         val tags = parseTagCsv(tagCsv)
         val inferredType = inferContentType(trimmedUrl)
         val hostTitle = extractHostTitle(trimmedUrl)
         val resolvedTitle =
             titleOverride?.trim()?.takeIf { it.isNotBlank() } ?: "$hostTitle — Saved Entry"
-        val entity = createSavedItemEntity(trimmedUrl, resolvedTitle, hostTitle, inferredType)
+        val localEntity = createSavedItemEntity(trimmedUrl, resolvedTitle, hostTitle, inferredType)
 
-        dao.upsertItem(entity)
-        tags.forEach { tag -> toggleTagOnItem(itemId = entity.id, tagName = tag) }
-        pushSavedUrlBestEffort(trimmedUrl, titleOverride, tags)
-        return toInboxEntry(entity, tags)
+        dao.upsertItem(localEntity)
+        attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = tags)
+
+        val remoteSaved = pushSavedUrlBestEffort(trimmedUrl, titleOverride, tags)
+        val finalEntity =
+            if (
+                remoteSaved != null &&
+                    remoteSaved.id.isNotBlank() &&
+                    remoteSaved.id != localEntity.id
+            ) {
+                val reconciled =
+                    localEntity.copy(
+                        id = remoteSaved.id,
+                        createdAt = remoteSaved.createdAt.ifBlank { localEntity.createdAt },
+                    )
+                dao.deleteItemTagsForItem(localEntity.id)
+                dao.deleteItemById(localEntity.id)
+                dao.upsertItem(reconciled)
+                attachTagsLocally(dao = dao, itemId = reconciled.id, tagNames = tags)
+                reconciled
+            } else {
+                localEntity
+            }
+        return SaveUrlResult(title = finalEntity.title, isFeed = false)
+    }
+
+    suspend fun pairWithCode(
+        serverUrl: String,
+        pairingCode: String,
+        deviceName: String,
+    ): Result<String> = runCatching {
+        val normalizedUrl = normalizeServerUrl(serverUrl)
+        check(normalizedUrl.isNotBlank()) { "Enter your Roche Server URL" }
+        val token =
+            apiClient.pairDevice(
+                serverUrl = normalizedUrl,
+                code = pairingCode.trim(),
+                deviceName = deviceName.trim().ifBlank { "Roche Android" },
+            )
+        settings.update { it.copy(serverUrl = normalizedUrl, bearerToken = token) }
+        token
     }
 
     suspend fun syncWithServer(): Result<Int> = runCatching {
         val currentSettings = settings.settings.first()
+        check(currentSettings.serverUrl.isNotBlank()) { "Configure Server URL in Settings" }
         val remoteFeeds =
             apiClient.fetchFeeds(
                 serverUrl = currentSettings.serverUrl,
@@ -145,32 +229,11 @@ class RocheRepository(
                 token = currentSettings.bearerToken,
             )
 
-        val feedTitlesById = remoteFeeds.associate { it.id to it.title }
-        dao.upsertFeeds(
-            remoteFeeds.map {
-                FeedEntity(
-                    id = it.id,
-                    title = it.title,
-                    url = it.url,
-                    siteUrl = it.siteUrl,
-                    feedType = it.feedType,
-                )
-            }
-        )
-        remoteTags.forEach { remoteTag ->
-            val normalizedName = remoteTag.name.trim().lowercase()
-            if (normalizedName.isNotBlank()) {
-                val existingTag = dao.getTagByName(normalizedName)
-                if (existingTag == null) {
-                    dao.upsertTag(TagEntity(id = remoteTag.id, name = normalizedName))
-                }
-            }
-        }
-        dao.upsertItems(
-            remoteItems.map { remote ->
-                val existing = dao.getItemById(remote.id)
-                toRemoteItemEntity(remote, feedTitlesById, existing?.isCachedOffline ?: false)
-            }
+        reconcileRemoteSnapshot(
+            dao = dao,
+            remoteFeeds = remoteFeeds,
+            remoteItems = remoteItems,
+            remoteTags = remoteTags,
         )
         remoteItems.size
     }
@@ -179,20 +242,18 @@ class RocheRepository(
         url: String,
         titleOverride: String?,
         tags: List<String>,
-    ) {
-        runCatching {
-            val currentSettings = settings.settings.first()
-            if (currentSettings.bearerToken.isNotBlank()) {
-                apiClient.saveItemUrl(
-                    serverUrl = currentSettings.serverUrl,
-                    token = currentSettings.bearerToken,
-                    url = url,
-                    title = titleOverride,
-                    tags = tags,
-                )
-            }
-        }
+    ): RemoteItemDto? = runCatching {
+        val currentSettings = settings.settings.first()
+        if (currentSettings.bearerToken.isBlank()) return null
+        apiClient.saveItemUrl(
+            serverUrl = currentSettings.serverUrl,
+            token = currentSettings.bearerToken,
+            url = url,
+            title = titleOverride,
+            tags = tags,
+        )
     }
+        .getOrNull()
 
     private suspend fun pushStatusBestEffort(itemId: String, status: String) {
         runCatching {
@@ -226,6 +287,162 @@ class RocheRepository(
 }
 
 private const val DEFAULT_SAVED_HOST = "Saved Link"
+
+internal fun newTagId(): String = "tag-${UUID.randomUUID()}"
+
+internal suspend fun reconcileAddedRemoteTag(
+    dao: com.grayvines.roche.data.local.RocheDao,
+    itemId: String,
+    localTag: TagEntity,
+    normalizedName: String,
+    remoteTags: List<RemoteTagDto>,
+) {
+    val remoteMatch =
+        remoteTags.firstOrNull { it.name.trim().equals(normalizedName, ignoreCase = true) }
+            ?: return
+    if (remoteMatch.id.isNotBlank() && remoteMatch.id != localTag.id) {
+        dao.deleteItemTag(itemId = itemId, tagId = localTag.id)
+        dao.deleteTagById(id = localTag.id)
+        dao.upsertTag(TagEntity(id = remoteMatch.id, name = normalizedName))
+        dao.insertItemTag(ItemTagEntity(itemId = itemId, tagId = remoteMatch.id))
+    }
+}
+
+internal suspend fun subscribeFeedBestEffort(
+    dao: com.grayvines.roche.data.local.RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    url: String,
+    titleOverride: String?,
+): String {
+    val fallbackTitle = titleOverride?.trim()?.takeIf { it.isNotBlank() } ?: extractHostTitle(url)
+    val remoteFeed = runCatching {
+        val currentSettings = settings.settings.first()
+        if (currentSettings.bearerToken.isNotBlank()) {
+            apiClient.createFeed(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                url = url,
+                title = titleOverride?.trim()?.takeIf { it.isNotBlank() },
+            )
+        } else {
+            null
+        }
+    }
+        .getOrNull()
+    val entity =
+        if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
+            FeedEntity(
+                id = remoteFeed.id,
+                title = remoteFeed.title.ifBlank { fallbackTitle },
+                url = remoteFeed.url.ifBlank { url },
+                siteUrl = remoteFeed.siteUrl,
+                feedType = remoteFeed.feedType,
+            )
+        } else {
+            FeedEntity(
+                id = "feed-${UUID.randomUUID()}",
+                title = fallbackTitle,
+                url = url,
+                siteUrl = null,
+                feedType = inferFeedTypeWireValue(url),
+            )
+        }
+    dao.upsertFeed(entity)
+    return entity.title
+}
+
+internal suspend fun attachTagsLocally(
+    dao: com.grayvines.roche.data.local.RocheDao,
+    itemId: String,
+    tagNames: List<String>,
+) {
+    tagNames.forEach { tagName ->
+        val normalized = tagName.trim().lowercase()
+        if (normalized.isNotBlank()) {
+            val tag =
+                dao.getTagByName(normalized)
+                    ?: TagEntity(id = newTagId(), name = normalized).also { dao.upsertTag(it) }
+            dao.insertItemTag(ItemTagEntity(itemId = itemId, tagId = tag.id))
+        }
+    }
+}
+
+internal suspend fun reconcileRemoteSnapshot(
+    dao: com.grayvines.roche.data.local.RocheDao,
+    remoteFeeds: List<RemoteFeedDto>,
+    remoteItems: List<RemoteItemDto>,
+    remoteTags: List<RemoteTagDto>,
+) {
+    val existingItemsById = dao.getAllItems().associateBy { it.id }
+    val feedTitlesById = remoteFeeds.associate { it.id to it.title }
+    val tagEntitiesByName = buildRemoteTagEntityMap(remoteTags, remoteItems)
+    val itemTagEntities = remoteItems.flatMap { remote ->
+        remote.tagNames.mapNotNull { rawName ->
+            tagEntitiesByName[rawName.trim().lowercase()]?.let { tag ->
+                ItemTagEntity(itemId = remote.id, tagId = tag.id)
+            }
+        }
+    }
+
+    dao.replaceSnapshotAtomically(
+        feeds =
+            remoteFeeds.map {
+                FeedEntity(
+                    id = it.id,
+                    title = it.title,
+                    url = it.url,
+                    siteUrl = it.siteUrl,
+                    feedType = it.feedType,
+                )
+            },
+        tags = tagEntitiesByName.values.toList(),
+        items =
+            remoteItems.map { remote ->
+                toRemoteItemEntity(
+                    remote = remote,
+                    feedTitlesById = feedTitlesById,
+                    isCachedOffline = existingItemsById[remote.id]?.isCachedOffline ?: false,
+                )
+            },
+        itemTags = itemTagEntities,
+    )
+}
+
+private fun buildRemoteTagEntityMap(
+    remoteTags: List<RemoteTagDto>,
+    remoteItems: List<RemoteItemDto>,
+): Map<String, TagEntity> {
+    val map = mutableMapOf<String, TagEntity>()
+    remoteTags.forEach { remoteTag ->
+        val normalized = remoteTag.name.trim().lowercase()
+        if (normalized.isNotBlank()) {
+            map[normalized] = TagEntity(id = remoteTag.id, name = normalized)
+        }
+    }
+    remoteItems
+        .flatMap { it.tagNames }
+        .forEach { rawName ->
+            val normalized = rawName.trim().lowercase()
+            if (normalized.isNotBlank() && normalized !in map) {
+                map[normalized] = TagEntity(id = newTagId(), name = normalized)
+            }
+        }
+    return map
+}
+
+internal fun isLikelyFeedUrl(url: String): Boolean {
+    val lower = url.lowercase().substringBefore('?')
+    return lower.endsWith(".xml") ||
+        lower.endsWith(".rss") ||
+        lower.endsWith(".atom") ||
+        lower.endsWith("/rss") ||
+        lower.endsWith("/feed") ||
+        lower.endsWith("/atom") ||
+        lower.contains("rss.arxiv.org") ||
+        lower.contains("export.arxiv.org/api/query") ||
+        lower.contains("feeds/videos.xml")
+}
 
 internal fun toRemoteItemEntity(
     remote: RemoteItemDto,
@@ -287,6 +504,7 @@ internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boo
         entry.url.lowercase().contains(cleanQuery) ||
         entry.summary.orEmpty().lowercase().contains(cleanQuery) ||
         entry.contentText.orEmpty().lowercase().contains(cleanQuery) ||
+        entry.contentHtml.orEmpty().lowercase().contains(cleanQuery) ||
         entry.tags.any { it.lowercase().contains(cleanQuery) }
 }
 
@@ -419,7 +637,7 @@ internal fun createSavedItemEntity(
         isFavorite = false,
         isCachedOffline = true,
         publishedAt = "now",
-        createdAt = "2026-03-29T12:00:00Z",
+        createdAt = Instant.now().toString(),
         readProgress = 0.0,
         thumbnailMediaId = if (type == ContentType.ARTICLE) null else "media-saved-$id",
         duration =

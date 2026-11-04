@@ -12,20 +12,27 @@ data class Settings(
     val ultraDenseRows: Boolean = false,
 ) {
     companion object {
-        const val DEFAULT_SERVER_URL = "http://100.64.0.4:8080"
+        const val DEFAULT_SERVER_URL = ""
     }
 }
 
-fun Settings.clamped(): Settings {
-    val trimmedUrl = serverUrl.trim().trimEnd('/').ifBlank { Settings.DEFAULT_SERVER_URL }
-    val normalizedUrl =
-        if (trimmedUrl.startsWith("http://") || trimmedUrl.startsWith("https://")) {
-            trimmedUrl
-        } else {
-            "http://$trimmedUrl"
-        }
-    return copy(
-        serverUrl = normalizedUrl,
+fun Settings.clamped(): Settings =
+    copy(
+        serverUrl = normalizeServerUrl(serverUrl),
         bearerToken = bearerToken.trim(),
     )
+
+internal fun normalizeServerUrl(rawUrl: String): String {
+    val trimmedUrl = rawUrl.trim().trimEnd('/')
+    if (trimmedUrl.isBlank()) return ""
+    if (trimmedUrl.startsWith("http://") || trimmedUrl.startsWith("https://")) {
+        return trimmedUrl
+    }
+    val hostPart = trimmedUrl.substringBefore('/').substringBefore(':').lowercase()
+    val useCleartext =
+        hostPart == "localhost" ||
+            hostPart.startsWith("127.") ||
+            hostPart.startsWith("100.") ||
+            hostPart == "10.0.2.2"
+    return if (useCleartext) "http://$trimmedUrl" else "https://$trimmedUrl"
 }

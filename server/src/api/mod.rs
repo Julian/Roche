@@ -35,7 +35,14 @@ impl ApiRoutes {
     pub fn router_with_service<F: FeedFetcher>(service: RocheService<F>) -> Router {
         let service = Arc::new(service);
 
+        let opml_import = Router::new()
+            .route("/api/v1/import/opml", post(Self::import_opml::<F>))
+            .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+
         let protected = Router::new()
+            // Auth Devices
+            .route("/api/v1/auth/devices", get(Self::devices_list::<F>))
+            .route("/api/v1/auth/devices/{id}", delete(Self::devices_revoke::<F>))
             // Feeds
             .route("/api/v1/feeds", get(Self::feeds_list::<F>).post(Self::feeds_create::<F>))
             .route(
@@ -68,28 +75,32 @@ impl ApiRoutes {
             )
             // Media
             .route("/api/v1/media/{id}", get(Self::media_get::<F>).delete(Self::media_delete::<F>))
-            // Import / Export
-            .route("/api/v1/import/opml", post(Self::import_opml::<F>))
+            // Export
             .route("/api/v1/export/feeds", get(Self::export_feeds_opml::<F>))
             .route("/api/v1/export/data", get(Self::export_data::<F>))
             // Sync
             .route("/api/v1/sync/status", get(Self::sync_status::<F>))
+            .layer(RequestBodyLimitLayer::new(64 * 1024))
+            .merge(opml_import)
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&service),
                 Self::require_auth::<F>,
             ));
 
-        Router::new()
-            .route("/health", get(Self::health))
+        let public_pair = Router::new()
             .route("/auth/pair", post(Self::auth_pair::<F>))
             .route("/api/v1/auth/pair", post(Self::auth_pair::<F>))
+            .layer(RequestBodyLimitLayer::new(16 * 1024));
+
+        Router::new()
+            .route("/health", get(Self::health))
+            .merge(public_pair)
             .merge(protected)
             .fallback(Self::handle_not_found)
             .method_not_allowed_fallback(Self::handle_method_not_allowed)
             .layer(TraceLayer::new_for_http())
             .layer(CompressionLayer::new())
             .layer(CorsLayer::new())
-            .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
             .with_state(service)
     }
 
@@ -134,6 +145,21 @@ impl ApiRoutes {
             "token": token,
             "expires_at": null,
         })))
+    }
+
+    async fn devices_list<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+    ) -> Result<Json<serde_json::Value>, ApiError> {
+        let devices = service.auth().list_devices().await?;
+        Ok(Json(serde_json::json!({ "devices": devices })))
+    }
+
+    async fn devices_revoke<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemPath(id): ProblemPath<String>,
+    ) -> Result<StatusCode, ApiError> {
+        service.auth().revoke_device(&id).await?;
+        Ok(StatusCode::NO_CONTENT)
     }
 
     // --- Feeds ---
@@ -328,13 +354,15 @@ impl ApiRoutes {
         State(service): State<Arc<RocheService<F>>>,
         ProblemPath(id): ProblemPath<String>,
     ) -> Result<Response, ApiError> {
-        let (content_type, bytes) = service.media().read_bytes(&id).await?;
+        let (content_type, file) = service.media().open_stream(&id).await?;
+        let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
         Ok((
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, "private, max-age=86400"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             ],
-            bytes,
+            body,
         )
             .into_response())
     }
@@ -577,8 +605,41 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
-        let res = app.oneshot(req).await.unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+
+        // List paired devices and revoke device token
+        let list_devices_request = Request::builder()
+            .uri("/api/v1/auth/devices")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let list_devices_response = app.clone().oneshot(list_devices_request).await.unwrap();
+        assert_eq!(list_devices_response.status(), StatusCode::OK);
+        let dev_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_devices_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let dev_id = dev_body["devices"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(dev_body["devices"][0]["device_name"], "my-mac");
+
+        let revoke_request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/auth/devices/{dev_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let revoke_response = app.clone().oneshot(revoke_request).await.unwrap();
+        assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
+
+        // Revoked token is now rejected with 401
+        let post_revoke_request = Request::builder()
+            .uri("/api/v1/feeds")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let post_revoke_response = app.oneshot(post_revoke_request).await.unwrap();
+        assert_eq!(post_revoke_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -834,6 +895,7 @@ mod tests {
                 .unwrap();
         assert_eq!(list_body["items"][0]["thumbnail_media_id"], thumb.id);
         assert_eq!(list_body["items"][0]["duration"], 1694);
+        assert_eq!(list_body["items"][0]["tag_names"], serde_json::json!(["rust"]));
 
         // Verify GET /api/v1/tags returns unread_count = 1
         let tags_request = Request::builder()
@@ -847,7 +909,7 @@ mod tests {
                 .unwrap();
         assert_eq!(tags_body["tags"][0]["unread_count"], 1);
 
-        // Verify GET /api/v1/media/{id} serves bytes with image/webp Content-Type
+        // Verify GET /api/v1/media/{id} serves bytes with image/webp Content-Type and nosniff
         let media_request = Request::builder()
             .uri(format!("/api/v1/media/{}", thumb.id))
             .header(header::AUTHORIZATION, &auth)
@@ -856,6 +918,10 @@ mod tests {
         let media_response = app.oneshot(media_request).await.unwrap();
         assert_eq!(media_response.status(), StatusCode::OK);
         assert_eq!(media_response.headers().get(header::CONTENT_TYPE).unwrap(), "image/webp");
+        assert_eq!(
+            media_response.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
         let media_bytes = to_bytes(media_response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&media_bytes[..], b"RIFF-fake-webp");
 

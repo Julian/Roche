@@ -22,7 +22,7 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { host: "0.0.0.0".to_string(), port: 8080 }
+        Self { host: "127.0.0.1".to_string(), port: 8080 }
     }
 }
 
@@ -190,7 +190,7 @@ data_dir = "/srv/roche"
 "#;
         let cfg = Config::from_toml_str(partial).unwrap();
         assert_eq!(cfg.server.port, 9090);
-        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.storage.database_path, Path::new("/srv/roche/roche.db"));
         assert_eq!(cfg.storage.media_dir, Path::new("/srv/roche/media"));
     }

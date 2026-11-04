@@ -16,9 +16,22 @@ const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.titl
        i.published_at, i.created_at, i.summary, i.content_html, i.content_type, i.status,
        i.is_favorite, i.read_at,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
-       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration
+       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
+       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
 FROM items i
 LEFT JOIN feeds f ON i.feed_id = f.id";
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TagNames(pub Vec<String>);
+
+impl TryFrom<&str> for TagNames {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        serde_json::from_str(value).map(Self)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
@@ -39,6 +52,9 @@ pub struct Item {
     pub read_at: Option<DateTime<Utc>>,
     pub thumbnail_media_id: Option<String>,
     pub duration: Option<i64>,
+    #[serde(default)]
+    #[sqlx(try_from = "&'a str")]
+    pub tag_names: TagNames,
 }
 
 #[cfg(test)]
@@ -130,6 +146,7 @@ impl<'a> ItemRepo<'a> {
             read_at: None,
             thumbnail_media_id: None,
             duration: None,
+            tag_names: TagNames::default(),
         })
     }
 
@@ -180,6 +197,7 @@ impl<'a> ItemRepo<'a> {
 
         tx.commit().await?;
 
+        let tag_names = TagNames(attached_tags.iter().map(|t| t.name.clone()).collect());
         let item = Item {
             id: item_id,
             feed_id: None,
@@ -197,6 +215,7 @@ impl<'a> ItemRepo<'a> {
             read_at: None,
             thumbnail_media_id: None,
             duration: None,
+            tag_names,
         };
 
         Ok((item, attached_tags))

@@ -34,6 +34,10 @@ class RocheApiClientTest {
                     put("read_progress", 0.5)
                     put("thumbnail_media_id", "media-1")
                     put("duration", 1694)
+                    putJsonArray("tag_names") {
+                        add(kotlinx.serialization.json.JsonPrimitive("systems"))
+                        add(kotlinx.serialization.json.JsonPrimitive("llm-inference"))
+                    }
                 }
             }
             put("total", 1)
@@ -41,6 +45,7 @@ class RocheApiClientTest {
             .toString()
 
         val client = RocheApiClient { request ->
+            assertEquals("http://localhost:8080/api/v1/items?per_page=200", request.url)
             assertEquals("Bearer token-123", request.headers["Authorization"])
             HttpResponse(statusCode = 200, body = body)
         }
@@ -52,6 +57,7 @@ class RocheApiClientTest {
         assertEquals("arXiv cs.LG", first.feedTitle)
         assertEquals("media-1", first.thumbnailMediaId)
         assertEquals("28:14", first.duration)
+        assertEquals(listOf("systems", "llm-inference"), first.tagNames)
         assertEquals(ContentType.PDF, ContentType.fromWireValue(first.contentType))
     }
 

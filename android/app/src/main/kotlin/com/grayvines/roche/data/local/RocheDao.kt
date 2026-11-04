@@ -4,6 +4,7 @@ import androidx.room3.Dao
 import androidx.room3.Insert
 import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
+import androidx.room3.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -19,8 +20,42 @@ interface RocheDao {
 
     @Query("SELECT COUNT(*) FROM items") suspend fun countItems(): Int
 
+    @Query("SELECT * FROM items") suspend fun getAllItems(): List<ItemEntity>
+
     @Query("SELECT * FROM items WHERE id = :id LIMIT 1")
     suspend fun getItemById(id: String): ItemEntity?
+
+    @Query("DELETE FROM items WHERE id = :id") suspend fun deleteItemById(id: String)
+
+    @Query("DELETE FROM tags WHERE id = :id") suspend fun deleteTagById(id: String)
+
+    @Query("DELETE FROM item_tags WHERE itemId = :itemId")
+    suspend fun deleteItemTagsForItem(itemId: String)
+
+    @Query("DELETE FROM item_tags") suspend fun clearAllItemTags()
+
+    @Query("DELETE FROM items") suspend fun clearAllItems()
+
+    @Query("DELETE FROM feeds") suspend fun clearAllFeeds()
+
+    @Query("DELETE FROM tags") suspend fun clearAllTags()
+
+    @Transaction
+    suspend fun replaceSnapshotAtomically(
+        feeds: List<FeedEntity>,
+        tags: List<TagEntity>,
+        items: List<ItemEntity>,
+        itemTags: List<ItemTagEntity>,
+    ) {
+        clearAllItemTags()
+        clearAllItems()
+        clearAllFeeds()
+        clearAllTags()
+        upsertFeeds(feeds)
+        upsertTags(tags)
+        upsertItems(items)
+        insertItemTags(itemTags)
+    }
 
     @Query("SELECT * FROM tags WHERE LOWER(name) = LOWER(:name) LIMIT 1")
     suspend fun getTagByName(name: String): TagEntity?

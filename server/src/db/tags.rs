@@ -243,7 +243,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn list_all_item_tags(&self) -> Result<Vec<ItemTag>> {
         Ok(sqlx::query_as::<_, ItemTag>(
-            "SELECT item_id, tag_id FROM item_tags ORDER BY item_id, tag_id",
+            "SELECT item_id, tag_id FROM item_tags ORDER BY item_id, tag_id LIMIT 20000",
         )
         .fetch_all(self.pool)
         .await?)

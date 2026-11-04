@@ -117,6 +117,12 @@ sealed interface MainAction {
         val serverUrl: String,
         val bearerToken: String,
     ) : Mutation
+
+    data class PairWithServer(
+        val serverUrl: String,
+        val pairingCode: String,
+        val deviceName: String = "Roche Android",
+    ) : Mutation
 }
 
 internal data class TransientUiState(
@@ -154,10 +160,6 @@ class MainViewModel(
                 initialValue = MainUiState(),
             )
 
-    init {
-        viewModelScope.launch { repository.ensureSeeded() }
-    }
-
     fun dispatch(action: MainAction) {
         when (action) {
             is MainAction.Ui -> transientState.update { reduceUiAction(it, action) }
@@ -191,8 +193,32 @@ class MainViewModel(
             is MainAction.SetSwipeToArchive ->
                 settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
+            is MainAction.PairWithServer -> performPairWithServer(action)
             else -> Unit
         }
+    }
+
+    private suspend fun performPairWithServer(action: MainAction.PairWithServer) {
+        if (action.pairingCode.isBlank()) {
+            transientState.update { it.copy(statusBanner = "Enter a pairing code") }
+            return
+        }
+        repository
+            .pairWithCode(
+                serverUrl = action.serverUrl,
+                pairingCode = action.pairingCode,
+                deviceName = action.deviceName,
+            )
+            .onSuccess {
+                val syncCount = repository.syncWithServer().getOrNull()
+                val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
+                transientState.update { it.copy(statusBanner = "Paired with server$suffix") }
+            }
+            .onFailure { error ->
+                transientState.update {
+                    it.copy(statusBanner = "Pairing failed (${error.message ?: "error"})")
+                }
+            }
     }
 
     private suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
@@ -257,13 +283,15 @@ class MainViewModel(
                 titleOverride = titleOverride,
                 tagCsv = tagCsv,
             )
+        val verb = if (created.isFeed) "Subscribed" else "Saved"
+        val nextTab = if (created.isFeed) AppTab.FEEDS else AppTab.INBOX
         transientState.update {
             it.copy(
                 isAddSheetOpen = false,
                 prefilledShareUrl = "",
-                activeTab = AppTab.INBOX,
+                activeTab = nextTab,
                 activeFilter = InboxFilter.UNREAD,
-                statusBanner = "Saved \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
             )
         }
     }

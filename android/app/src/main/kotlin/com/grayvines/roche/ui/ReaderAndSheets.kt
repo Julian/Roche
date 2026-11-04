@@ -39,8 +39,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.fromHtml
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -206,6 +211,39 @@ private fun ReaderArticleBody(entry: InboxEntry, onSelectTag: (String) -> Unit) 
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         Spacer(modifier = Modifier.height(16.dp))
 
+        ReaderBodyContent(entry = entry)
+    }
+}
+
+@Composable
+internal fun ReaderBodyContent(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    val htmlBody =
+        entry.contentHtml?.takeIf { it.isNotBlank() }
+            ?: entry.summary?.takeIf { "<" in it || "&" in it }
+    if (htmlBody != null) {
+        val linkStyles =
+            remember(colors.accentBlue) {
+                TextLinkStyles(
+                    style =
+                        SpanStyle(
+                            color = colors.accentBlue,
+                            textDecoration = TextDecoration.Underline,
+                        )
+                )
+            }
+        val annotated =
+            remember(htmlBody, linkStyles) {
+                AnnotatedString.fromHtml(htmlString = htmlBody, linkStyles = linkStyles)
+            }
+        Text(
+            text = annotated,
+            color = colors.textPrimary,
+            fontFamily = FontFamily.Serif,
+            fontSize = 16.sp,
+            lineHeight = 26.sp,
+        )
+    } else {
         val bodyParagraphs =
             (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
                 .split("\n\n")

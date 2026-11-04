@@ -19,6 +19,11 @@ class BaselineProfileGenerator {
             startActivityAndWait()
             device.wait(Until.hasObject(By.pkg(PACKAGE)), TIMEOUT_MS)
             device.waitForIdle()
+
+            listOf("Search", "Feeds", "Offline", "Settings", "Inbox").forEach { tabLabel ->
+                device.findObject(By.text(tabLabel))?.click()
+                device.waitForIdle()
+            }
         }
 
     private companion object {
