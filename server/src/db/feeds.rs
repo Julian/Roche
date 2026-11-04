@@ -267,7 +267,7 @@ impl<'a> FeedRepo<'a> {
         &self,
         feed_id: &str,
         batch: &PollBatch,
-    ) -> std::result::Result<(), sqlx::Error> {
+    ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
@@ -290,9 +290,10 @@ impl<'a> FeedRepo<'a> {
         .execute(&mut *tx)
         .await?;
 
+        let mut inserted = Vec::new();
         for item in &batch.items {
             let id = Uuid::new_v4().to_string();
-            sqlx::query(
+            let result = sqlx::query(
                 "INSERT OR IGNORE INTO items
                  (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -310,10 +311,22 @@ impl<'a> FeedRepo<'a> {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+
+            if result.rows_affected() > 0 {
+                SyncRepo::record_activity(
+                    &mut tx,
+                    ActivityEntityType::Item,
+                    &id,
+                    ActivityAction::Create,
+                    now,
+                )
+                .await?;
+                inserted.push((id, item.clone()));
+            }
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(inserted)
     }
 
     pub async fn mark_error(&self, id: &str, error: &str) -> Result<()> {

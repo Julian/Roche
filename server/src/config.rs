@@ -9,6 +9,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub feeds: FeedsConfig,
+    pub media: MediaConfig,
     pub sync: SyncConfig,
     pub auth: AuthConfig,
 }
@@ -61,6 +62,24 @@ impl Default for FeedsConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct MediaConfig {
+    pub ytdlp_path: PathBuf,
+    pub download_dir: PathBuf,
+    pub max_concurrent_downloads: usize,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            ytdlp_path: PathBuf::from("/usr/local/bin/yt-dlp"),
+            download_dir: PathBuf::from("./data/media/downloads"),
+            max_concurrent_downloads: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SyncConfig {
     pub op_log_prune_after: i64,
 }
@@ -103,6 +122,7 @@ impl Config {
     pub fn from_toml_str(contents: &str) -> Result<Self> {
         let mut cfg: Self = toml::from_str(contents)?;
         let default_storage = StorageConfig::default();
+        let default_media = MediaConfig::default();
         if cfg.storage.data_dir != default_storage.data_dir {
             if cfg.storage.database_path == default_storage.database_path {
                 cfg.storage.database_path = cfg.storage.data_dir.join("roche.db");
@@ -110,6 +130,11 @@ impl Config {
             if cfg.storage.media_dir == default_storage.media_dir {
                 cfg.storage.media_dir = cfg.storage.data_dir.join("media");
             }
+        }
+        if cfg.storage.media_dir != default_storage.media_dir
+            && cfg.media.download_dir == default_media.download_dir
+        {
+            cfg.media.download_dir = cfg.storage.media_dir.join("downloads");
         }
         cfg.validate()?;
         Ok(cfg)
@@ -128,6 +153,14 @@ impl Config {
             anyhow::bail!(
                 "feeds.default_poll_interval must be between min_poll_interval and max_poll_interval"
             );
+        }
+        if self.media.max_concurrent_downloads == 0 {
+            anyhow::bail!("media.max_concurrent_downloads must be greater than 0");
+        }
+        let norm_media = crate::media::MediaStore::normalize_lexical(&self.storage.media_dir);
+        let norm_downloads = crate::media::MediaStore::normalize_lexical(&self.media.download_dir);
+        if !norm_downloads.starts_with(&norm_media) {
+            anyhow::bail!("media.download_dir must be inside storage.media_dir");
         }
         if self.sync.op_log_prune_after <= 0 {
             anyhow::bail!("sync.op_log_prune_after must be greater than 0");
@@ -164,6 +197,11 @@ default_poll_interval = 30
 max_poll_interval = 1440
 min_poll_interval = 5
 
+[media]
+ytdlp_path = "/usr/local/bin/yt-dlp"
+download_dir = "/var/lib/roche/media/downloads"
+max_concurrent_downloads = 2
+
 [sync]
 op_log_prune_after = 30
 
@@ -175,6 +213,9 @@ token_length = 32
         assert_eq!(cfg.server.port, 8080);
         assert_eq!(cfg.storage.database_path, Path::new("/var/lib/roche/roche.db"));
         assert_eq!(cfg.feeds.max_poll_interval, 1440);
+        assert_eq!(cfg.media.ytdlp_path, Path::new("/usr/local/bin/yt-dlp"));
+        assert_eq!(cfg.media.download_dir, Path::new("/var/lib/roche/media/downloads"));
+        assert_eq!(cfg.media.max_concurrent_downloads, 2);
         assert_eq!(cfg.sync.op_log_prune_after, 30);
         assert_eq!(cfg.auth.token_length, 32);
     }
@@ -193,5 +234,6 @@ data_dir = "/srv/roche"
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.storage.database_path, Path::new("/srv/roche/roche.db"));
         assert_eq!(cfg.storage.media_dir, Path::new("/srv/roche/media"));
+        assert_eq!(cfg.media.download_dir, Path::new("/srv/roche/media/downloads"));
     }
 }

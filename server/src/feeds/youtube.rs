@@ -30,6 +30,40 @@ impl YouTubeParser {
         matches!(host, Some("youtube.com" | "www.youtube.com" | "m.youtube.com"))
     }
 
+    #[must_use]
+    pub fn extract_video_id(url: &Url) -> Option<String> {
+        let host = url.host_str()?;
+        if Self::is_youtube_host(Some(host)) {
+            if url.path() == "/watch" {
+                for (key, value) in url.query_pairs() {
+                    if key == "v" && Self::is_valid_video_id(&value) {
+                        return Some(value.into_owned());
+                    }
+                }
+            } else if let Some(mut segments) = url.path_segments()
+                && let Some(prefix) = segments.next()
+                && matches!(prefix, "shorts" | "embed" | "v")
+                && let Some(candidate) = segments.next()
+                && Self::is_valid_video_id(candidate)
+            {
+                return Some(candidate.to_string());
+            }
+        } else if host.eq_ignore_ascii_case("youtu.be")
+            && let Some(mut segments) = url.path_segments()
+            && let Some(candidate) = segments.next()
+            && Self::is_valid_video_id(candidate)
+        {
+            return Some(candidate.to_string());
+        }
+        None
+    }
+
+    #[must_use]
+    pub fn canonical_watch_url(url: &Url) -> Option<Url> {
+        let video_id = Self::extract_video_id(url)?;
+        Url::parse(&format!("https://www.youtube.com/watch?v={video_id}")).ok()
+    }
+
     pub fn feed_url_for_channel_id(channel_id: &str) -> Result<Url> {
         SafeHttpClient::parse_url(&format!(
             "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"

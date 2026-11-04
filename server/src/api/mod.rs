@@ -517,6 +517,33 @@ mod tests {
             </rss>"#
                 .to_string()))
         }
+
+        fn fetch_html(
+            &self,
+            url: &Url,
+        ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send {
+            let res = if url.as_str() == "https://example.com/deep-dive" {
+                Some(
+                    r#"<html><head><title>Fetched Page Title</title><meta name="description" content="Extracted meta summary" /></head><body><script>evil()</script><p>Full article body.</p></body></html>"#
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            std::future::ready(Ok(res))
+        }
+
+        fn fetch_pdf(
+            &self,
+            url: &Url,
+        ) -> impl std::future::Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
+            let res = if url.as_str() == "https://arxiv.org/pdf/2301.07041.pdf" {
+                Some(b"%PDF-1.5\n%fake-arxiv-pdf-payload\n%%EOF".to_vec())
+            } else {
+                None
+            };
+            std::future::ready(Ok(res))
+        }
     }
 
     async fn setup_app() -> (Router, String) {
@@ -966,5 +993,75 @@ mod tests {
         assert!(exported.contains("https://blog.rust-lang.org/feed.xml?a=1&amp;b=2"));
         assert!(exported.contains("R &amp; D &gt; News"));
         assert!(exported.contains("https://rss.arxiv.org/rss/cs.AI"));
+    }
+
+    #[tokio::test]
+    async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+        let auth = format!("Bearer {token}");
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-save-test-{}", uuid::Uuid::new_v4()));
+        let mut config = crate::config::Config::default();
+        config.storage.media_dir = temp_dir.clone();
+        let service = RocheService::new(db, FakeFeedFetcher, config);
+        let app = ApiRoutes::router_with_service(service);
+
+        // 1. Save article without explicit title -> extracts <title>, meta summary, and sanitized HTML
+        let article_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/items/save")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"https://example.com/deep-dive"}"#))
+            .unwrap();
+        let article_response = app.clone().oneshot(article_request).await.unwrap();
+        assert_eq!(article_response.status(), StatusCode::CREATED);
+        let article_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(article_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(article_body["title"], "Fetched Page Title");
+        assert_eq!(article_body["summary"], "Extracted meta summary");
+        assert_eq!(article_body["content_type"], "article");
+        let content_html = article_body["content_html"].as_str().unwrap();
+        assert!(content_html.contains("<p>Full article body.</p>"));
+        assert!(!content_html.contains("<script>"));
+
+        // 2. Save arXiv abstract URL -> classifies as "paper", downloads PDF, and attaches media
+        let arxiv_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/items/save")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"url":"https://arxiv.org/abs/2301.07041","title":"Attention Paper"}"#,
+            ))
+            .unwrap();
+        let arxiv_response = app.clone().oneshot(arxiv_request).await.unwrap();
+        assert_eq!(arxiv_response.status(), StatusCode::CREATED);
+        let arxiv_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(arxiv_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arxiv_body["content_type"], "paper");
+        assert_eq!(arxiv_body["media"].as_array().unwrap().len(), 1);
+        assert_eq!(arxiv_body["media"][0]["media_type"], "pdf");
+        let pdf_media_id = arxiv_body["media"][0]["id"].as_str().unwrap().to_string();
+
+        // 3. Stream the downloaded PDF via GET /api/v1/media/{id}
+        let pdf_request = Request::builder()
+            .uri(format!("/api/v1/media/{pdf_media_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let pdf_response = app.oneshot(pdf_request).await.unwrap();
+        assert_eq!(pdf_response.status(), StatusCode::OK);
+        assert_eq!(pdf_response.headers().get(header::CONTENT_TYPE).unwrap(), "application/pdf");
+        let pdf_bytes = to_bytes(pdf_response.into_body(), usize::MAX).await.unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-1.5"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

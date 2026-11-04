@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -47,9 +48,17 @@ class RocheRepositoryTest {
         database.close()
     }
 
+    private suspend fun seedTestDatabase() {
+        val dao = database.dao()
+        dao.upsertFeeds(SeedData.feeds)
+        dao.upsertTags(SeedData.tags)
+        dao.upsertItems(SeedData.items)
+        dao.insertItemTags(SeedData.itemTags)
+    }
+
     @Test
-    fun `ensureSeeded populates initial items feeds and tags`() = runTest {
-        repository.ensureSeeded()
+    fun `seedTestDatabase populates initial items feeds and tags`() = runTest {
+        seedTestDatabase()
         val snapshot = repository.snapshot.first()
 
         assertEquals(6, snapshot.entries.size)
@@ -66,7 +75,7 @@ class RocheRepositoryTest {
 
     @Test
     fun `inbox filters partition articles papers videos starred and archived`() = runTest {
-        repository.ensureSeeded()
+        seedTestDatabase()
         val entries = repository.snapshot.first().entries
 
         val articles = RocheRepository.filterEntries(entries, InboxFilter.ARTICLES)
@@ -86,7 +95,7 @@ class RocheRepositoryTest {
 
     @Test
     fun `setArchiveState and restoreStatus support filing cabinet undo`() = runTest {
-        repository.ensureSeeded()
+        seedTestDatabase()
 
         val previousStatus = repository.setArchiveState(itemId = "item-1", archived = true)
         assertEquals(ItemStatus.UNREAD, previousStatus)
@@ -102,7 +111,7 @@ class RocheRepositoryTest {
 
     @Test
     fun `toggleTagOnItem adds and removes normalized tag on entry`() = runTest {
-        repository.ensureSeeded()
+        seedTestDatabase()
         repository.toggleTagOnItem(itemId = "item-2", tagName = "nvme")
 
         val entry = repository.snapshot.first().entries.first { it.id == "item-2" }
@@ -116,7 +125,7 @@ class RocheRepositoryTest {
     @Test
     fun `matchesSearchQuery searches titles authors feeds urls bodies and hashtag tokens`() =
         runTest {
-            repository.ensureSeeded()
+            seedTestDatabase()
             val entries = repository.snapshot.first().entries
 
             val byTag = entries.filter { matchesSearchQuery(it, "#llm-inference") }
@@ -158,7 +167,7 @@ class RocheRepositoryTest {
     @Test
     fun `syncWithServer replaces demo seed rows populates item tags and strips html in reader`() =
         runTest {
-            repository.ensureSeeded()
+            seedTestDatabase()
             settings.update {
                 it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
             }
@@ -205,7 +214,7 @@ class RocheRepositoryTest {
     @Test
     fun `saveUrlOrFeed subscribes feed without saving raw xml item and toggleTag reconciles server tag id`() =
         runTest {
-            repository.ensureSeeded()
+            seedTestDatabase()
             settings.update {
                 it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
             }

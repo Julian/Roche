@@ -1,3 +1,5 @@
+pub mod ytdlp;
+
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
@@ -15,8 +17,37 @@ impl MediaStore {
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let raw = base_dir.into();
-        let abs = std::path::absolute(&raw).unwrap_or(raw);
-        Self { base_dir: abs }
+        Self { base_dir: Self::normalize_lexical(&raw) }
+    }
+
+    #[must_use]
+    pub fn normalize_lexical(path: &Path) -> PathBuf {
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut normalized = PathBuf::new();
+        for comp in abs.components() {
+            match comp {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    let _ = normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    #[must_use]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Converts a path inside `base_dir` to a normalized forward-slash relative path for database storage.
+    pub fn relative_path(&self, candidate: &Path) -> Result<String> {
+        let safe_path = self.validate_path(candidate)?;
+        let rel = safe_path
+            .strip_prefix(&self.base_dir)
+            .map_err(|_| anyhow::anyhow!("Media path is outside configured media_dir"))?;
+        Ok(rel.to_string_lossy().replace('\\', "/"))
     }
 
     /// Validates that `candidate` resolves inside `self.base_dir` with no parent-directory (`..`)
@@ -29,13 +60,13 @@ impl MediaStore {
         }
 
         let norm_cand = if candidate.is_absolute() {
-            let normalized = std::path::absolute(candidate)?;
+            let normalized = Self::normalize_lexical(candidate);
             if !normalized.starts_with(&self.base_dir) {
                 anyhow::bail!("Media path is outside configured media_dir");
             }
             normalized
         } else {
-            std::path::absolute(self.base_dir.join(candidate))?
+            Self::normalize_lexical(&self.base_dir.join(candidate))
         };
 
         let rel = norm_cand
@@ -51,11 +82,11 @@ impl MediaStore {
             }
         }
 
-        if let Ok(canon_base) = std::fs::canonicalize(&self.base_dir)
-            && let Some(existing_ancestor) =
-                norm_cand.ancestors().find(|a| a.starts_with(&self.base_dir) && a.exists())
-            && let Ok(canon_ancestor) = std::fs::canonicalize(existing_ancestor)
-            && !canon_ancestor.starts_with(&canon_base)
+        if let Some(base_ancestor) = self.base_dir.ancestors().find(|a| a.exists())
+            && let Ok(canon_base_anc) = std::fs::canonicalize(base_ancestor)
+            && let Some(cand_ancestor) = norm_cand.ancestors().find(|a| a.exists())
+            && let Ok(canon_cand_anc) = std::fs::canonicalize(cand_ancestor)
+            && !canon_cand_anc.starts_with(&canon_base_anc)
         {
             anyhow::bail!("Canonical media path escapes configured media_dir");
         }
@@ -68,6 +99,17 @@ impl MediaStore {
         Ok(tokio::fs::File::open(&safe_path).await?)
     }
 
+    pub async fn write_bytes(&self, stored_path: &str, bytes: &[u8]) -> Result<i64> {
+        let safe_path = self.validate_path(Path::new(stored_path))?;
+        if let Some(parent) = safe_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // Re-validate after creating parent directories to guard against TOCTOU symlink swaps
+        let verified_path = self.validate_path(&safe_path)?;
+        tokio::fs::write(&verified_path, bytes).await?;
+        Ok(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
+    }
+
     #[must_use]
     pub fn content_type_for(media_type: MediaType, stored_path: &str) -> &'static str {
         let ext = Path::new(stored_path)
@@ -77,6 +119,7 @@ impl MediaStore {
         match ext.as_deref() {
             Some("pdf") => "application/pdf",
             Some("webm") => "video/webm",
+            Some("mkv") => "video/x-matroska",
             Some("mp4" | "m4v") => "video/mp4",
             Some("m4a") => "audio/mp4",
             Some("ogg" | "opus") => "audio/ogg",
@@ -96,10 +139,17 @@ impl MediaStore {
     pub async fn remove(&self, stored_path: &str) -> Result<()> {
         let safe_path = self.validate_path(Path::new(stored_path))?;
         match tokio::fs::remove_file(&safe_path).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
+        if let Some(parent) = safe_path.parent()
+            && parent != self.base_dir
+            && parent.starts_with(&self.base_dir)
+        {
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
+        Ok(())
     }
 }
 

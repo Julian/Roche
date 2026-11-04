@@ -69,6 +69,16 @@ pub struct NewItem<'a> {
     pub content_type: ContentType,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ManualItemInput<'a> {
+    pub url: &'a Url,
+    pub title: &'a str,
+    pub summary: Option<&'a str>,
+    pub content_html: Option<&'a str>,
+    pub content_type: ContentType,
+    pub tags: &'a [String],
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ItemFilter {
     pub status: Option<ItemStatusFilter>,
@@ -150,11 +160,27 @@ impl<'a> ItemRepo<'a> {
         })
     }
 
+    #[cfg(test)]
     pub async fn save_manual_with_tags(
         &self,
         url: &Url,
         title: &str,
         tags: &[String],
+    ) -> std::result::Result<(Item, Vec<Tag>), sqlx::Error> {
+        self.save_manual_input_with_tags(&ManualItemInput {
+            url,
+            title,
+            summary: None,
+            content_html: None,
+            content_type: ContentType::Article,
+            tags,
+        })
+        .await
+    }
+
+    pub async fn save_manual_input_with_tags(
+        &self,
+        input: &ManualItemInput<'_>,
     ) -> std::result::Result<(Item, Vec<Tag>), sqlx::Error> {
         let item_id = Uuid::new_v4().to_string();
         let now = SyncRepo::now_utc();
@@ -163,12 +189,14 @@ impl<'a> ItemRepo<'a> {
         sqlx::query(
             "INSERT INTO items
              (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
-             VALUES (?, NULL, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)",
+             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)",
         )
         .bind(&item_id)
-        .bind(title)
-        .bind(url.as_str())
-        .bind(ContentType::Article)
+        .bind(input.title)
+        .bind(input.url.as_str())
+        .bind(input.summary)
+        .bind(input.content_html)
+        .bind(input.content_type)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -185,7 +213,7 @@ impl<'a> ItemRepo<'a> {
 
         let mut seen_names = HashSet::new();
         let mut attached_tags = Vec::new();
-        for tag_name in tags {
+        for tag_name in input.tags {
             let trimmed = tag_name.trim();
             if trimmed.is_empty() || !seen_names.insert(trimmed.to_owned()) {
                 continue;
@@ -202,14 +230,14 @@ impl<'a> ItemRepo<'a> {
             id: item_id,
             feed_id: None,
             feed_title: None,
-            title: title.to_string(),
-            url: url.clone(),
+            title: input.title.to_string(),
+            url: input.url.clone(),
             author: None,
             published_at: None,
             created_at: now,
-            summary: None,
-            content_html: None,
-            content_type: ContentType::Article,
+            summary: input.summary.map(String::from),
+            content_html: input.content_html.map(String::from),
+            content_type: input.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
             read_at: None,
@@ -409,6 +437,33 @@ impl<'a> ItemRepo<'a> {
             .bind(status)
             .fetch_one(self.pool)
             .await?)
+    }
+
+    pub async fn backfill_metadata(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        author: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let now = SyncRepo::now_utc();
+        sqlx::query(
+            "UPDATE items
+             SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
+                 author = COALESCE(author, ?),
+                 summary = COALESCE(summary, ?),
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(title)
+        .bind(author)
+        .bind(summary)
+        .bind(now)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(())
     }
 }
 

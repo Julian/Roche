@@ -1,19 +1,22 @@
+use std::{sync::Arc, time::Duration};
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::{
     auth::{pairing::PairingManager, tokens::TokenManager},
     config::Config,
-    content::fetcher::SafeHttpClient,
+    content::fetcher::{HtmlSanitizer, SafeHttpClient, classify_url},
     db::{
-        ActivityEntry, Db, DeviceToken, Feed, FeedSource, FeedType, HexColor, Item, ItemFilter,
-        ItemStatus, ItemTag, Media, SyncRepo, Tag,
+        ActivityEntry, ContentType, Db, DeviceToken, Feed, FeedSource, FeedType, HexColor, Item,
+        ItemFilter, ItemStatus, ItemTag, ManualItemInput, Media, SyncRepo, Tag,
     },
     error::ApiError,
     feeds::OpmlDocument,
-    media::MediaStore,
-    scheduler::{FeedFetcher, FeedIngester, HttpFeedFetcher, PollError},
+    media::{MediaStore, ytdlp::YtDlpWorker},
+    scheduler::{FeedFetcher, FeedIngester, HttpFeedFetcher, MediaIngestContext, PollError},
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
@@ -53,13 +56,18 @@ pub struct RocheService<F = HttpFeedFetcher> {
     fetcher: F,
     config: Config,
     media_store: MediaStore,
+    ytdlp_worker: YtDlpWorker,
+    download_semaphore: Arc<Semaphore>,
 }
 
 impl<F: FeedFetcher> RocheService<F> {
     #[must_use]
     pub fn new(db: Db, fetcher: F, config: Config) -> Self {
         let media_store = MediaStore::new(&config.storage.media_dir);
-        Self { db, fetcher, config, media_store }
+        let ytdlp_worker = YtDlpWorker::new(config.media.clone(), media_store.clone());
+        let download_semaphore =
+            Arc::new(Semaphore::new(config.media.max_concurrent_downloads.max(1)));
+        Self { db, fetcher, config, media_store, ytdlp_worker, download_semaphore }
     }
 
     #[must_use]
@@ -85,6 +93,21 @@ impl<F: FeedFetcher> RocheService<F> {
     #[must_use]
     pub const fn media(&self) -> MediaService<'_, F> {
         MediaService { service: self }
+    }
+
+    #[must_use]
+    pub fn download_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.download_semaphore)
+    }
+
+    const fn media_ingest_context(&self) -> MediaIngestContext<'_, F> {
+        MediaIngestContext {
+            db: &self.db,
+            media_store: &self.media_store,
+            ytdlp_worker: Some(&self.ytdlp_worker),
+            download_semaphore: Some(&self.download_semaphore),
+            fetcher: &self.fetcher,
+        }
     }
 
     pub async fn export_data(&self) -> Result<ExportBundle, ApiError> {
@@ -273,8 +296,9 @@ impl<F: FeedFetcher> FeedService<'_, F> {
     pub async fn refresh(&self, id: &str) -> Result<Feed, ApiError> {
         let repo = self.service.db.feeds();
         let feed = self.get(id).await?;
+        let ctx = self.service.media_ingest_context();
 
-        if let Err(err) = FeedIngester::poll(&repo, &feed, &self.service.fetcher).await {
+        if let Err(err) = FeedIngester::poll_with_media(&ctx, &feed).await {
             let _ = repo.mark_error(&feed.id, &err.to_string()).await;
             return match err {
                 PollError::Upstream(upstream) => {
@@ -334,13 +358,68 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         SafeHttpClient::validate_url(url)
             .map_err(|e| ApiError::bad_request(format!("Invalid item URL: {e}")))?;
 
-        let resolved_title =
-            title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or_else(|| url.as_str());
+        let content_type = classify_url(url);
+        let explicit_title = title.map(str::trim).filter(|t| !t.is_empty());
 
-        let (item, attached_tags) =
-            self.service.db.items().save_manual_with_tags(url, resolved_title, tags).await?;
+        let should_fetch_html = content_type == ContentType::Article
+            || (explicit_title.is_none() && content_type != ContentType::Pdf);
+        let snapshot = if should_fetch_html {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                self.service.fetcher.fetch_html(url),
+            )
+            .await
+            {
+                Ok(Ok(Some(raw_html))) => {
+                    tokio::task::spawn_blocking(move || HtmlSanitizer::extract_snapshot(&raw_html))
+                        .await
+                        .ok()
+                }
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
+                    tracing::warn!(url = %url, error = %e, "Failed to fetch HTML snapshot on save");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(url = %url, "Timed out fetching HTML snapshot on save");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        Ok(ItemDetail { item, tags: attached_tags, media: Vec::new() })
+        let resolved_title = explicit_title
+            .or_else(|| snapshot.as_ref().and_then(|s| s.title.as_deref()))
+            .unwrap_or_else(|| url.as_str());
+        let summary = snapshot.as_ref().and_then(|s| s.summary.as_deref());
+        let content_html = (content_type == ContentType::Article)
+            .then(|| snapshot.as_ref().map(|s| s.content_html.as_str()))
+            .flatten()
+            .filter(|html| !html.trim().is_empty());
+
+        let (item, _) = self
+            .service
+            .db
+            .items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url,
+                title: resolved_title,
+                summary,
+                content_html,
+                content_type,
+                tags,
+            })
+            .await?;
+
+        let ctx = self.service.media_ingest_context();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            FeedIngester::ingest_item_media(&ctx, &item.id, content_type, url),
+        )
+        .await;
+
+        self.get(&item.id).await
     }
 
     pub async fn update(

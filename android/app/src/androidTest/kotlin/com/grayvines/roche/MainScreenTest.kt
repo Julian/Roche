@@ -3,7 +3,6 @@ package com.grayvines.roche
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
@@ -39,28 +38,26 @@ class MainScreenTest {
         composeRule.onNodeWithTag("save_fab").assertExists()
     }
 
-    private fun createSampleEntry(): InboxEntry {
-        val entity = SeedData.items.first()
-        return InboxEntry(
-            id = entity.id,
-            feedId = entity.feedId,
-            feedTitle = entity.feedTitle,
-            title = entity.title,
-            url = entity.url,
-            author = entity.author,
-            summary = entity.summary,
-            contentText = entity.contentText,
-            contentHtml = entity.contentHtml,
-            contentType = ContentType.fromWireValue(entity.contentType),
-            status = ItemStatus.fromWireValue(entity.status),
-            isFavorite = entity.isFavorite,
-            isCachedOffline = entity.isCachedOffline,
-            publishedAt = entity.publishedAt,
-            createdAt = entity.createdAt,
-            readProgress = entity.readProgress,
-            thumbnailMediaId = entity.thumbnailMediaId,
-            duration = entity.duration,
+    private fun createSampleEntry(): InboxEntry =
+        InboxEntry(
+            id = "item-1",
+            feedId = "feed-arxiv-cs-lg",
+            feedTitle = "arXiv cs.LG",
+            title = "Speculative Decoding with Quantized Draft Models on Edge NPU Targets",
+            url = "https://arxiv.org/abs/2603.11842",
+            author = "Chen, Alvarez, K. Sato",
+            summary = "Wait-free verification schedules reduce token latency.",
+            contentText = null,
+            contentHtml = "<p>Autoregressive decoding from large language models.</p>",
+            contentType = ContentType.PDF,
+            status = ItemStatus.UNREAD,
+            isFavorite = true,
+            isCachedOffline = true,
+            publishedAt = "18m",
+            createdAt = "2026-03-29T10:00:00Z",
+            readProgress = 0.35,
+            thumbnailMediaId = "media-paper-1",
+            duration = null,
             tags = listOf("llm-inference"),
         )
-    }
 }

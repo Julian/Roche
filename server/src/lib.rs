@@ -36,13 +36,19 @@ impl RocheServer {
 
         let scheduler_db = db.clone();
         let scheduler_fetcher = fetcher.clone();
-        let scheduler_handle = tokio::spawn(async move {
-            let poll_scheduler =
-                scheduler::PollScheduler::with_fetcher(scheduler_db, scheduler_fetcher);
-            if let Err(e) = poll_scheduler.run().await {
-                tracing::error!(error = %e, "PollScheduler terminated with error");
-            }
-        });
+        let scheduler_media_store = media::MediaStore::new(&cfg.storage.media_dir);
+        let scheduler_ytdlp =
+            media::ytdlp::YtDlpWorker::new(cfg.media.clone(), scheduler_media_store.clone());
+        let shared_download_sem = roche_service.download_semaphore();
+        let scheduler_handle =
+            tokio::spawn(async move {
+                let poll_scheduler =
+                    scheduler::PollScheduler::with_fetcher(scheduler_db, scheduler_fetcher)
+                        .with_media(scheduler_media_store, scheduler_ytdlp, shared_download_sem);
+                if let Err(e) = poll_scheduler.run().await {
+                    tracing::error!(error = %e, "PollScheduler terminated with error");
+                }
+            });
 
         let worker_db = db.clone();
         let prune_after = cfg.sync.op_log_prune_after;

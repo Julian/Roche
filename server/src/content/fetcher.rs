@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -6,8 +7,14 @@ use std::{
 
 use anyhow::Result;
 use ip_network::IpNetwork;
+use quick_xml::{Reader, XmlVersion, escape::unescape, events::Event};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::{Host, Url};
+
+use crate::{
+    db::ContentType,
+    feeds::{ArxivParser, YouTubeParser},
+};
 
 /// Custom DNS resolver for `reqwest` that validates every resolved IP address against
 /// [`SafeHttpClient::is_global_ip`] at socket connection time.
@@ -136,11 +143,49 @@ impl SafeHttpClient {
     }
 
     pub async fn fetch_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
+        self.fetch_bytes_internal(url, max_bytes, false, false).await
+    }
+
+    pub async fn fetch_pdf_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
+        self.fetch_bytes_internal(url, max_bytes, false, true).await
+    }
+
+    pub async fn fetch_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
+        let bytes = self.fetch_bytes(url, max_bytes).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub async fn fetch_html_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
+        let bytes = self.fetch_bytes_internal(url, max_bytes, true, false).await?;
+        if is_valid_pdf_bytes(&bytes) || bytes.contains(&0) {
+            anyhow::bail!("Upstream response from {url} is binary, not HTML");
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn fetch_bytes_internal(
+        &self,
+        url: &Url,
+        max_bytes: usize,
+        require_html_content_type: bool,
+        require_pdf_magic: bool,
+    ) -> Result<Vec<u8>> {
         Self::validate_url(url)?;
         let mut response = self.client.get(url.clone()).send().await?;
         let response_status = response.status();
         if !response_status.is_success() {
             anyhow::bail!("Upstream server returned HTTP {response_status}");
+        }
+        if require_html_content_type
+            && let Some(ct_header) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && let Ok(ct_str) = ct_header.to_str()
+        {
+            let mime = ct_str.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            if !mime.is_empty()
+                && !matches!(mime.as_str(), "text/html" | "application/xhtml+xml" | "text/plain")
+            {
+                anyhow::bail!("Disallowed HTML Content-Type '{mime}' from {url}");
+            }
         }
         if let Some(len) = response.content_length()
             && usize::try_from(len).unwrap_or(usize::MAX) > max_bytes
@@ -151,18 +196,25 @@ impl SafeHttpClient {
         }
 
         let mut buffer = Vec::new();
+        let mut checked_pdf_magic = false;
         while let Some(chunk) = response.chunk().await? {
             if buffer.len().saturating_add(chunk.len()) > max_bytes {
                 anyhow::bail!("Response body exceeded maximum size of {max_bytes} bytes");
             }
             buffer.extend_from_slice(&chunk);
+            if require_pdf_magic && !checked_pdf_magic && buffer.len() >= 5 {
+                if !is_valid_pdf_bytes(&buffer) {
+                    anyhow::bail!(
+                        "Upstream response from {url} does not start with %PDF- magic header"
+                    );
+                }
+                checked_pdf_magic = true;
+            }
+        }
+        if require_pdf_magic && !is_valid_pdf_bytes(&buffer) {
+            anyhow::bail!("Upstream response from {url} does not start with %PDF- magic header");
         }
         Ok(buffer)
-    }
-
-    pub async fn fetch_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
-        let bytes = self.fetch_bytes(url, max_bytes).await?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn redirect_policy() -> reqwest::redirect::Policy {
@@ -180,11 +232,204 @@ impl SafeHttpClient {
 
 pub struct HtmlSanitizer;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedSnapshot {
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub content_html: String,
+}
+
 impl HtmlSanitizer {
     #[must_use]
     pub fn clean(html: &str) -> String {
-        ammonia::clean(html)
+        let mut builder = ammonia::Builder::default();
+        builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
+        builder.clean(html).to_string()
     }
+
+    /// Extracts `<title>`, `<meta name="description">` / `<meta property="og:description">`,
+    /// and sanitized `content_html` from a raw HTML5 document using `ammonia` (`html5ever`) + `quick_xml`.
+    #[must_use]
+    pub fn extract_snapshot(raw_html: &str) -> ExtractedSnapshot {
+        // Normalize <title> and <meta> tags through html5ever (via ammonia) so inline <script>if (a < b)</script>,
+        // <svg><title>, unquoted attributes, and bare ampersands are parsed per HTML5 spec.
+        let mut meta_builder = ammonia::Builder::new();
+        meta_builder
+            .tags(HashSet::from(["title", "meta"]))
+            .clean_content_tags(HashSet::from([
+                "script", "style", "svg", "noscript", "template", "math",
+            ]))
+            .add_tag_attributes("meta", &["name", "property", "content"]);
+        let normalized_meta_html = meta_builder.clean(raw_html).to_string();
+
+        let (title, meta_desc) = Self::parse_title_and_meta(&normalized_meta_html);
+        let content_html = Self::clean(raw_html);
+        let summary = meta_desc
+            .or_else(|| Self::extract_first_paragraph(&content_html))
+            .filter(|s| !s.is_empty());
+
+        ExtractedSnapshot { title, summary, content_html }
+    }
+
+    fn parse_title_and_meta(normalized_html: &str) -> (Option<String>, Option<String>) {
+        let mut reader = Reader::from_str(normalized_html);
+        reader.config_mut().check_end_names = false;
+
+        let mut title: Option<String> = None;
+        let mut og_title: Option<String> = None;
+        let mut meta_desc: Option<String> = None;
+        let mut in_title = false;
+        let mut current_buf = String::new();
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(tag)) => {
+                    let name = tag.name();
+                    let name_bytes = name.as_ref();
+                    if name_bytes.eq_ignore_ascii_case("title") && title.is_none() {
+                        in_title = true;
+                        current_buf.clear();
+                    } else if name_bytes.eq_ignore_ascii_case("meta") {
+                        Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc);
+                    }
+                }
+                Ok(Event::Empty(tag)) if tag.name().as_ref().eq_ignore_ascii_case("meta") => {
+                    Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc);
+                }
+                Ok(Event::Text(text)) if in_title => {
+                    let decoded =
+                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
+                    current_buf.push_str(&decoded);
+                }
+                Ok(Event::GeneralRef(entity)) if in_title => {
+                    let raw = format!("&{};", entity.as_ref());
+                    if let Ok(decoded) = unescape(&raw) {
+                        current_buf.push_str(&decoded);
+                    }
+                }
+                Ok(Event::End(tag))
+                    if in_title && tag.name().as_ref().eq_ignore_ascii_case("title") =>
+                {
+                    in_title = false;
+                    let trimmed = current_buf.trim();
+                    if !trimmed.is_empty() {
+                        title = Some(trimmed.to_owned());
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        (title.or(og_title), meta_desc)
+    }
+
+    fn extract_first_paragraph(clean_body_html: &str) -> Option<String> {
+        let mut reader = Reader::from_str(clean_body_html);
+        reader.config_mut().check_end_names = false;
+
+        let mut in_p = false;
+        let mut current_buf = String::new();
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(tag)) if tag.name().as_ref().eq_ignore_ascii_case("p") => {
+                    if !in_p {
+                        in_p = true;
+                        current_buf.clear();
+                    }
+                }
+                Ok(Event::Text(text)) if in_p => {
+                    let decoded =
+                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
+                    current_buf.push_str(&decoded);
+                }
+                Ok(Event::GeneralRef(entity)) if in_p => {
+                    let raw = format!("&{};", entity.as_ref());
+                    if let Ok(decoded) = unescape(&raw) {
+                        current_buf.push_str(&decoded);
+                    }
+                }
+                Ok(Event::End(tag)) if in_p && tag.name().as_ref().eq_ignore_ascii_case("p") => {
+                    in_p = false;
+                    let trimmed = current_buf.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_owned());
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    fn inspect_meta_tag(
+        tag: &quick_xml::events::BytesStart<'_>,
+        og_title: &mut Option<String>,
+        meta_desc: &mut Option<String>,
+    ) {
+        let mut attr_name: Option<String> = None;
+        let mut attr_content: Option<String> = None;
+
+        for attr in tag.attributes().with_checks(false).flatten() {
+            let key = attr.key.as_ref();
+            let val = attr
+                .normalized_value(XmlVersion::default())
+                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+            if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("property") {
+                attr_name = Some(val);
+            } else if key.eq_ignore_ascii_case("content") {
+                attr_content = Some(val);
+            }
+        }
+
+        let Some(name) = attr_name else { return };
+        let Some(content) = attr_content.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty())
+        else {
+            return;
+        };
+
+        if meta_desc.is_none()
+            && (name.eq_ignore_ascii_case("description")
+                || name.eq_ignore_ascii_case("og:description"))
+        {
+            *meta_desc = Some(content);
+        } else if og_title.is_none() && name.eq_ignore_ascii_case("og:title") {
+            *og_title = Some(content);
+        }
+    }
+}
+
+#[must_use]
+pub fn is_direct_pdf_url(url: &Url) -> bool {
+    let raw_path = url.path();
+    std::path::Path::new(raw_path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        || raw_path.to_ascii_lowercase().ends_with("/pdf")
+}
+
+#[must_use]
+pub fn classify_url(url: &Url) -> ContentType {
+    if ArxivParser::pdf_url_for_paper(url).is_some() {
+        ContentType::Paper
+    } else if YouTubeParser::extract_video_id(url).is_some() {
+        ContentType::Video
+    } else if is_direct_pdf_url(url) {
+        ContentType::Pdf
+    } else {
+        ContentType::Article
+    }
+}
+
+#[must_use]
+pub fn resolve_pdf_url(url: &Url) -> Option<Url> {
+    ArxivParser::pdf_url_for_paper(url).or_else(|| is_direct_pdf_url(url).then(|| url.clone()))
+}
+
+#[must_use]
+pub fn is_valid_pdf_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"%PDF-")
 }
 
 #[cfg(test)]
@@ -198,6 +443,46 @@ mod tests {
             HtmlSanitizer::clean("<html><body><script>alert(1)</script><p>Hello</p></body></html>");
         assert!(!clean.contains("<script>"));
         assert!(clean.contains("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn test_extract_snapshot_and_url_classification() {
+        let html = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <script>if (1 < 2 && 3 > 1) { console.log("<title>Fake</title>"); }</script>
+            <title>Deep Systems &amp; Storage</title>
+            <meta name="description" content="A guide to crash-safe SQLite & WAL." />
+          </head>
+          <body>
+            <svg><title>Icon Title</title></svg>
+            <script>evil()</script>
+            <article><p>First paragraph body.</p></article>
+          </body>
+        </html>"#;
+
+        let snap = HtmlSanitizer::extract_snapshot(html);
+        assert_eq!(snap.title.as_deref(), Some("Deep Systems & Storage"));
+        assert_eq!(snap.summary.as_deref(), Some("A guide to crash-safe SQLite & WAL."));
+        assert!(snap.content_html.contains("<p>First paragraph body.</p>"));
+        assert!(!snap.content_html.contains("<script>"));
+        assert!(!snap.content_html.contains("Deep Systems"));
+        assert!(!snap.content_html.contains("Icon Title"));
+
+        let arxiv = Url::parse("https://arxiv.org/abs/2301.07041v2").unwrap();
+        assert_eq!(classify_url(&arxiv), ContentType::Paper);
+        assert_eq!(
+            resolve_pdf_url(&arxiv).unwrap().as_str(),
+            "https://arxiv.org/pdf/2301.07041v2.pdf"
+        );
+
+        let pdf = Url::parse("https://example.com/papers/whitepaper.pdf").unwrap();
+        assert_eq!(classify_url(&pdf), ContentType::Pdf);
+        assert_eq!(resolve_pdf_url(&pdf).unwrap().as_str(), pdf.as_str());
+
+        let yt = Url::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert_eq!(classify_url(&yt), ContentType::Video);
+        assert!(resolve_pdf_url(&yt).is_none());
     }
 
     #[test]

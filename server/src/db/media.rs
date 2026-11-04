@@ -1,7 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-#[cfg(test)]
 use uuid::Uuid;
 
 use super::{ActivityAction, ActivityEntityType, MediaType, SyncRepo};
@@ -28,7 +27,6 @@ impl<'a> MediaRepo<'a> {
         Self { pool }
     }
 
-    #[cfg(test)]
     pub async fn create(
         &self,
         item_id: &str,
@@ -39,6 +37,7 @@ impl<'a> MediaRepo<'a> {
     ) -> Result<Media> {
         let id = Uuid::new_v4().to_string();
         let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO media (id, item_id, media_type, path, file_size, duration, created_at)
@@ -51,8 +50,19 @@ impl<'a> MediaRepo<'a> {
         .bind(file_size)
         .bind(duration)
         .bind(now)
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        SyncRepo::record_activity(
+            &mut tx,
+            ActivityEntityType::Media,
+            &id,
+            ActivityAction::Create,
+            now,
+        )
+        .await?;
+
+        tx.commit().await?;
 
         Ok(Media {
             id,

@@ -76,6 +76,27 @@ impl ArxivParser {
 
         if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
     }
+
+    #[must_use]
+    pub fn pdf_url_for_paper(paper_url: &Url) -> Option<Url> {
+        if !Self::is_arxiv_host(paper_url.host_str()) {
+            return None;
+        }
+        let path = paper_url.path();
+        if !path.starts_with("/abs/") && !path.starts_with("/pdf/") {
+            return None;
+        }
+        let arxiv_id = Self::extract_arxiv_id(paper_url.as_str())?;
+        if arxiv_id.contains("..")
+            || arxiv_id.matches('/').count() > 1
+            || !arxiv_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        {
+            return None;
+        }
+        Url::parse(&format!("https://arxiv.org/pdf/{arxiv_id}.pdf")).ok()
+    }
 }
 
 #[cfg(test)]

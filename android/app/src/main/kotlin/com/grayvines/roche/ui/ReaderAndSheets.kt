@@ -452,7 +452,7 @@ fun AddUrlOrFeedBottomSheet(
     val colors = LocalRocheColors.current
     var url by rememberSaveable(initialUrl) { mutableStateOf(initialUrl) }
     var title by rememberSaveable { mutableStateOf("") }
-    var tags by rememberSaveable { mutableStateOf("systems") }
+    var tags by rememberSaveable { mutableStateOf("") }
 
     LaunchedEffect(initialUrl) {
         if (initialUrl.isNotBlank()) {

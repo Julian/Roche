@@ -4,7 +4,6 @@ import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.ItemTagEntity
 import com.grayvines.roche.data.local.RocheDatabase
-import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
@@ -51,15 +50,6 @@ class RocheRepository(
         ) { items, feeds, tags, itemTags ->
             buildSnapshot(items = items, feeds = feeds, tags = tags, itemTags = itemTags)
         }
-
-    internal suspend fun ensureSeeded() {
-        if (dao.countItems() == 0 && settings.settings.first().bearerToken.isBlank()) {
-            dao.upsertFeeds(SeedData.feeds)
-            dao.upsertTags(SeedData.tags)
-            dao.upsertItems(SeedData.items)
-            dao.insertItemTags(SeedData.itemTags)
-        }
-    }
 
     suspend fun setArchiveState(itemId: String, archived: Boolean): ItemStatus? {
         val previous = dao.getItemById(itemId)?.let { ItemStatus.fromWireValue(it.status) }
@@ -172,18 +162,24 @@ class RocheRepository(
 
         val remoteSaved = pushSavedUrlBestEffort(trimmedUrl, titleOverride, tags)
         val finalEntity =
-            if (
-                remoteSaved != null &&
-                    remoteSaved.id.isNotBlank() &&
-                    remoteSaved.id != localEntity.id
-            ) {
+            if (remoteSaved != null && remoteSaved.id.isNotBlank()) {
                 val reconciled =
                     localEntity.copy(
                         id = remoteSaved.id,
+                        title = remoteSaved.title.ifBlank { localEntity.title },
+                        summary = remoteSaved.summary ?: localEntity.summary,
+                        contentText = remoteSaved.contentText ?: localEntity.contentText,
+                        contentHtml = remoteSaved.contentHtml ?: localEntity.contentHtml,
+                        contentType = remoteSaved.contentType.ifBlank { localEntity.contentType },
                         createdAt = remoteSaved.createdAt.ifBlank { localEntity.createdAt },
+                        thumbnailMediaId =
+                            remoteSaved.thumbnailMediaId ?: localEntity.thumbnailMediaId,
+                        duration = remoteSaved.duration ?: localEntity.duration,
                     )
-                dao.deleteItemTagsForItem(localEntity.id)
-                dao.deleteItemById(localEntity.id)
+                if (remoteSaved.id != localEntity.id) {
+                    dao.deleteItemTagsForItem(localEntity.id)
+                    dao.deleteItemById(localEntity.id)
+                }
                 dao.upsertItem(reconciled)
                 attachTagsLocally(dao = dao, itemId = reconciled.id, tagNames = tags)
                 reconciled
@@ -629,22 +625,17 @@ internal fun createSavedItemEntity(
         title = title,
         url = url,
         author = null,
-        summary = "Saved from Android client ($url).",
-        contentText = "Saved entry from $url.",
+        summary = null,
+        contentText = null,
         contentHtml = null,
         contentType = type.wireValue,
         status = ItemStatus.UNREAD.wireValue,
         isFavorite = false,
-        isCachedOffline = true,
-        publishedAt = "now",
+        isCachedOffline = false,
+        publishedAt = null,
         createdAt = Instant.now().toString(),
         readProgress = 0.0,
-        thumbnailMediaId = if (type == ContentType.ARTICLE) null else "media-saved-$id",
-        duration =
-            when (type) {
-                ContentType.VIDEO -> "12:00"
-                ContentType.PDF -> "10p"
-                ContentType.ARTICLE -> null
-            },
+        thumbnailMediaId = null,
+        duration = null,
     )
 }
