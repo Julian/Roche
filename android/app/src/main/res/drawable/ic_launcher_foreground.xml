@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Filing cabinet / editorial glyph in Timberwolf & Verdigris -->
+    <path
+        android:fillColor="#48A9A6"
+        android:pathData="M34,30h40a4,4 0 0,1 4,4v40a4,4 0 0,1 -4,4H34a4,4 0 0,1 -4,-4V34a4,4 0 0,1 4,-4z" />
+    <path
+        android:fillColor="#141413"
+        android:pathData="M34,53h40v2H34z" />
+    <path
+        android:fillColor="#E4DFDA"
+        android:pathData="M48,41h12v3H48zM48,64h12v3H48z" />
+</vector>

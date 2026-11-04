@@ -13,3 +13,12 @@
 .DS_Store
 *.swp
 .env
+
+# Android / Gradle build artifacts
+.gradle/
+build/
+local.properties
+.kotlin/
+.idea/
+*.iml
+android/app/src/release/generated/baselineProfiles/

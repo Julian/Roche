@@ -1,0 +1,49 @@
+# Runs on top of detekt's defaults with allRules = true. Only deviations live here.
+
+comments:
+  # KDoc-on-everything is for library APIs; this is an app.
+  UndocumentedPublicClass:
+    active: false
+  UndocumentedPublicFunction:
+    active: false
+  UndocumentedPublicProperty:
+    active: false
+  # A short comment on a private member is fine.
+  DocumentationOverPrivateFunction:
+    active: false
+  DocumentationOverPrivateProperty:
+    active: false
+
+style:
+  # ktfmt owns formatting and line length.
+  MaxLineLength:
+    active: false
+  ReturnCount:
+    excludeGuardClauses: true
+  # Compose code and colour palettes use literal numbers; named constants would add noise.
+  MagicNumber:
+    ignoreAnnotated: ['Composable']
+    ignorePropertyDeclaration: true
+
+naming:
+  # Composable functions are PascalCase by convention.
+  FunctionNaming:
+    ignoreAnnotated: ['Composable']
+  # Backtick test names are sentences.
+  FunctionNameMaxLength:
+    excludes: ['**/test/**', '**/androidTest/**']
+  FunctionNameMinLength:
+    excludes: ['**/test/**', '**/androidTest/**']
+
+complexity:
+  # Composables and Room entities take many named parameters.
+  LongParameterList:
+    ignoreAnnotated: ['Composable', 'Entity']
+  # A DAO is a list of queries.
+  ComplexInterface:
+    ignoreAnnotated: ['Dao']
+  TooManyFunctions:
+    ignoreAnnotated: ['Dao']
+    ignoreInternal: true
+  LargeClass:
+    excludes: ['**/androidTest/**']
