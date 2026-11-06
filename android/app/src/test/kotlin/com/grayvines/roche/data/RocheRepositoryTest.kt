@@ -425,6 +425,96 @@ class RocheRepositoryTest {
             assertEquals(listOf("crdt"), savedItem.tags)
         }
 
+    @Test
+    internal fun `YouTube channel URLs and bare UC channel IDs are classified as youtube feeds`() =
+        runTest {
+            assertTrue(isLikelyFeedUrl("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"))
+            assertTrue(isLikelyFeedUrl("HTTPS://WWW.YOUTUBE.COM/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"))
+            assertTrue(isLikelyFeedUrl("UC_x5XG1OV2P6uZZ5FSM9Ttw"))
+            assertTrue(isLikelyFeedUrl("https://example.com/feed/"))
+            assertTrue(isLikelyFeedUrl("https://arxiv.org/rss/cs.LG"))
+            assertFalse(isLikelyFeedUrl("UC_x5XG1OV2P6uZZ5FSM9Ttw/videos"))
+            assertFalse(isLikelyFeedUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+            assertEquals(
+                ContentType.PDF,
+                inferContentType("https://example.com/paper.pdf?download=1#page=2"),
+            )
+
+            val savedChannel =
+                repository.saveUrlOrFeed(
+                    inputUrl = "UC_x5XG1OV2P6uZZ5FSM9Ttw",
+                    titleOverride = "Google Developers",
+                    tagCsv = "",
+                )
+            assertTrue(savedChannel.isFeed)
+            assertEquals("Google Developers", savedChannel.title)
+            val feed = repository.snapshot.first().feeds.first()
+            assertEquals("youtube", feed.feedType.wireValue)
+        }
+
+    @Test
+    internal fun `in-flight tag mutations on local item are preserved and synced when finalized`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val addedTagRequests = mutableListOf<String>()
+            val liveClient = buildInFlightTagMockClient(addedTagRequests)
+            val dao = database.dao()
+            val localEntity =
+                createSavedItemEntity(
+                    url = "https://example.com/in-flight",
+                    title = "In-Flight Entry",
+                    hostTitle = "example.com",
+                    type = ContentType.ARTICLE,
+                )
+            dao.upsertItem(localEntity)
+            attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = listOf("initial"))
+            dao.upsertPendingMutation(
+                com.grayvines.roche.data.local.PendingMutationEntity(
+                    entityId = localEntity.id,
+                    isLocalItem = true,
+                )
+            )
+            val liveRepo =
+                RocheRepository(database = database, apiClient = liveClient, settings = settings)
+            liveRepo.toggleTagOnItem(itemId = localEntity.id, tagName = "added-in-flight")
+
+            finalizeOnlineSavedItem(
+                dao = dao,
+                apiClient = liveClient,
+                settings = settings,
+                localEntity = localEntity,
+                remoteSaved =
+                    com.grayvines.roche.data.remote.parseItemJson(
+                        """{"id":"srv-item-77","title":"In-Flight Entry","url":"https://example.com/in-flight","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["initial"]}"""
+                    ),
+                tags = listOf("initial"),
+            )
+
+            val entry = liveRepo.snapshot.first().entries.first { it.id == "srv-item-77" }
+            assertEquals(listOf("added-in-flight", "initial"), entry.tags)
+            assertTrue(
+                addedTagRequests.any {
+                    it.contains("/api/v1/items/srv-item-77/tags") && it.contains("added-in-flight")
+                }
+            )
+        }
+
+    internal fun buildInFlightTagMockClient(addedTagRequests: MutableList<String>): RocheApiClient =
+        RocheApiClient { request ->
+            if (request.method == "POST" && request.url.endsWith("/tags")) {
+                addedTagRequests.add("${request.url}:${request.body}")
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"id":"srv-item-77","tags":[{"id":"srv-tag-added","name":"added-in-flight","unread_count":1}]}""",
+                )
+            } else {
+                HttpResponse(statusCode = 404, body = "{}")
+            }
+        }
+
     internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
         assertTrue(
             pushedRequests.any { (req, body) ->

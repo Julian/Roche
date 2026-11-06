@@ -28,42 +28,11 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                     throw exception
                 }
             }
-            .map { prefs ->
-                Settings(
-                        serverUrl = prefs[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
-                        bearerToken = prefs[KEY_BEARER_TOKEN].orEmpty(),
-                        swipeToArchive = prefs[KEY_SWIPE_TO_ARCHIVE] ?: true,
-                        themeMode =
-                            prefs[KEY_THEME_MODE]?.let { raw ->
-                                ThemeMode.entries.firstOrNull { it.name == raw }
-                            } ?: ThemeMode.DARK,
-                        headlineFont =
-                            prefs[KEY_HEADLINE_FONT]?.let { raw ->
-                                HeadlineFont.entries.firstOrNull { it.name == raw }
-                            } ?: HeadlineFont.SERIF,
-                        ultraDenseRows = prefs[KEY_ULTRA_DENSE_ROWS] ?: false,
-                    )
-                    .clamped()
-            }
+            .map { prefs -> prefs.toSettings() }
 
     suspend fun update(transform: (Settings) -> Settings) {
         dataStore.edit { prefs ->
-            val current =
-                Settings(
-                        serverUrl = prefs[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
-                        bearerToken = prefs[KEY_BEARER_TOKEN].orEmpty(),
-                        swipeToArchive = prefs[KEY_SWIPE_TO_ARCHIVE] ?: true,
-                        themeMode =
-                            prefs[KEY_THEME_MODE]?.let { raw ->
-                                ThemeMode.entries.firstOrNull { it.name == raw }
-                            } ?: ThemeMode.DARK,
-                        headlineFont =
-                            prefs[KEY_HEADLINE_FONT]?.let { raw ->
-                                HeadlineFont.entries.firstOrNull { it.name == raw }
-                            } ?: HeadlineFont.SERIF,
-                        ultraDenseRows = prefs[KEY_ULTRA_DENSE_ROWS] ?: false,
-                    )
-                    .clamped()
+            val current = prefs.toSettings()
             val updated = transform(current).clamped()
             prefs[KEY_SERVER_URL] = updated.serverUrl
             prefs[KEY_BEARER_TOKEN] = updated.bearerToken
@@ -73,6 +42,23 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             prefs[KEY_ULTRA_DENSE_ROWS] = updated.ultraDenseRows
         }
     }
+
+    private fun Preferences.toSettings(): Settings =
+        Settings(
+                serverUrl = this[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
+                bearerToken = this[KEY_BEARER_TOKEN].orEmpty(),
+                swipeToArchive = this[KEY_SWIPE_TO_ARCHIVE] ?: true,
+                themeMode =
+                    this[KEY_THEME_MODE]?.let { raw ->
+                        ThemeMode.entries.firstOrNull { it.name == raw }
+                    } ?: ThemeMode.DARK,
+                headlineFont =
+                    this[KEY_HEADLINE_FONT]?.let { raw ->
+                        HeadlineFont.entries.firstOrNull { it.name == raw }
+                    } ?: HeadlineFont.SERIF,
+                ultraDenseRows = this[KEY_ULTRA_DENSE_ROWS] ?: false,
+            )
+            .clamped()
 
     companion object {
         private const val STORE_NAME = "roche_settings"

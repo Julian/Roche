@@ -222,4 +222,60 @@ class RocheApiClientTest {
         assertEquals(true, updated.isFavorite)
         assertEquals(0.75, updated.readProgress)
     }
+
+    @Test
+    internal fun `fetchItems paginates across pages when page 1 returns 200 items`() = runTest {
+        val page1Body = buildJsonObject {
+            putJsonArray("items") {
+                for (index in 1..200) {
+                    addJsonObject {
+                        put("id", "item-$index")
+                        put("title", "Entry $index")
+                        put("url", "https://example.com/$index")
+                        put("content_type", "article")
+                        put("status", "unread")
+                        put("created_at", "2026-03-29T10:00:00Z")
+                    }
+                }
+            }
+        }
+            .toString()
+        val page2Body = buildJsonObject {
+            putJsonArray("items") {
+                addJsonObject {
+                    put("id", "item-201")
+                    put("title", "Entry 201")
+                    put("url", "https://example.com/201")
+                    put("content_type", "article")
+                    put("status", "unread")
+                    put("created_at", "2026-03-29T09:00:00Z")
+                }
+            }
+        }
+            .toString()
+
+        val requestedUrls = mutableListOf<String>()
+        val client = RocheApiClient { request ->
+            requestedUrls.add(request.url)
+            when (request.url) {
+                "http://localhost:8080/api/v1/items?per_page=200" ->
+                    HttpResponse(statusCode = 200, body = page1Body)
+                "http://localhost:8080/api/v1/items?per_page=200&page=2" ->
+                    HttpResponse(statusCode = 200, body = page2Body)
+                else -> HttpResponse(statusCode = 404, body = "{}")
+            }
+        }
+
+        val items = client.fetchItems(serverUrl = "http://localhost:8080", token = "tok-123")
+        assertEquals(201, items.size)
+        assertEquals("item-1", items.first().id)
+        assertEquals("item-201", items.last().id)
+        assertEquals(
+            listOf(
+                "http://localhost:8080/api/v1/items?per_page=200",
+                "http://localhost:8080/api/v1/items?per_page=200&page=2",
+            ),
+            requestedUrls,
+        )
+    }
 }

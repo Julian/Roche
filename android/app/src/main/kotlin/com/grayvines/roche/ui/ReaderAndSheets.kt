@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.normalizeTagName
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.FilingCabinetIcon
@@ -485,7 +486,7 @@ internal fun ContextSheetTagsEditor(
         HeaderActionButton(
             label = "Add Tag",
             onClick = {
-                val clean = customTag.trim().trimStart('#')
+                val clean = normalizeTagName(customTag)
                 if (clean.isNotBlank()) {
                     onAction(MainAction.ToggleTagOnEntry(entry.id, clean))
                     customTag = ""

@@ -25,7 +25,6 @@ enum class ContentType(val wireValue: String) {
 
 enum class ItemStatus(val wireValue: String) {
     UNREAD("unread"),
-    READ("read"),
     ARCHIVED("archived");
 
     companion object {
@@ -145,7 +144,8 @@ internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now())
 }
 
 internal fun formatArticleMinutes(text: String): String {
-    val wordCount = text.split(WHITESPACE_REGEX_TOP).count { it.isNotBlank() }
+    val plainText = text.replace(HTML_TAG_STRIP_REGEX, " ")
+    val wordCount = plainText.split(WHITESPACE_REGEX_TOP).count { it.isNotBlank() }
     val minutes = (wordCount / ARTICLE_WORDS_PER_MINUTE).coerceAtLeast(1)
     return "${minutes}m"
 }
@@ -155,5 +155,6 @@ private const val SECONDS_PER_HOUR = 3_600L
 private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
 private const val ARTICLE_WORDS_PER_MINUTE = 180
+private val HTML_TAG_STRIP_REGEX = Regex("""<[^>]+>""")
 private val WHITESPACE_REGEX_TOP = Regex("""\s+""")
 private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

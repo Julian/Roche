@@ -1,5 +1,6 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.inferFeedTypeWireValue
 import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -40,14 +41,6 @@ internal fun buildAddItemTagPayload(tagName: String): String = buildJsonObject {
     put("name", tagName)
 }
     .toString()
-
-internal fun inferFeedTypeWireValue(url: String): String =
-    when {
-        url.contains("arxiv.org", ignoreCase = true) -> "arxiv"
-        url.contains("youtube.com", ignoreCase = true) ||
-            url.contains("youtu.be", ignoreCase = true) -> "youtube"
-        else -> "rss"
-    }
 
 internal fun buildSaveItemPayload(url: String, title: String?, tags: List<String>): String =
     buildJsonObject {

@@ -199,16 +199,35 @@ class RocheApiClient(private val transport: HttpTransport) {
     }
 
     suspend fun fetchItems(serverUrl: String, token: String): List<RemoteItemDto> {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items?per_page=200",
-                    headers = authHeaders(token),
+        val baseUrl = serverUrl.trimEnd('/')
+        val headers = authHeaders(token)
+        val collected = LinkedHashMap<String, RemoteItemDto>()
+        for (page in 1..MAX_SYNC_PAGES) {
+            val url =
+                if (page == 1) {
+                    "$baseUrl/api/v1/items?per_page=$ITEMS_PER_PAGE"
+                } else {
+                    "$baseUrl/api/v1/items?per_page=$ITEMS_PER_PAGE&page=$page"
+                }
+            val response =
+                transport.execute(
+                    HttpRequest(
+                        method = METHOD_GET,
+                        url = url,
+                        headers = headers,
+                    )
                 )
-            )
-        ensureSuccess(response)
-        return parseItemsEnvelopeJson(response.body)
+            ensureSuccess(response)
+            val pageItems = parseItemsEnvelopeJson(response.body)
+            val beforeSize = collected.size
+            pageItems.forEach { item ->
+                if (item.id.isNotBlank() && item.id !in collected) {
+                    collected[item.id] = item
+                }
+            }
+            if (pageItems.size < ITEMS_PER_PAGE || collected.size == beforeSize) break
+        }
+        return collected.values.toList()
     }
 
     suspend fun saveItemUrl(
@@ -309,6 +328,8 @@ class RocheApiClient(private val transport: HttpTransport) {
     private companion object {
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
+        private const val ITEMS_PER_PAGE = 200
+        private const val MAX_SYNC_PAGES = 25
     }
 }
 
