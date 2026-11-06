@@ -40,37 +40,69 @@ impl FeedSource {
         Ok(Self::Url(url))
     }
 
-    pub fn into_feed_url(self, feed_type: FeedType) -> Result<Url> {
+    pub fn into_feed_url(self, requested_type: FeedType) -> Result<(FeedType, Url)> {
         match self {
-            Self::YouTubeChannelId(channel_id) => {
-                if feed_type != FeedType::Youtube {
-                    anyhow::bail!(
-                        "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
-                    );
+            Self::YouTubeChannelId(channel_id) => match requested_type {
+                FeedType::Youtube | FeedType::Rss => {
+                    Ok((FeedType::Youtube, YouTubeParser::feed_url_for_channel_id(&channel_id)?))
                 }
-                YouTubeParser::feed_url_for_channel_id(&channel_id)
-            }
-            Self::Url(url) => match feed_type {
+                FeedType::Arxiv => anyhow::bail!(
+                    "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
+                ),
+            },
+            Self::Url(url) => match requested_type {
                 FeedType::Youtube => {
                     if !url.as_str().contains("/feeds/videos.xml")
                         && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
                     {
-                        return YouTubeParser::feed_url_for_channel_id(&channel_id);
+                        return Ok((
+                            FeedType::Youtube,
+                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                        ));
                     }
                     if !YouTubeParser::is_youtube_host(url.host_str()) {
                         anyhow::bail!("YouTube feed URL must point to youtube.com");
                     }
-                    Ok(url)
+                    Ok((FeedType::Youtube, url))
                 }
                 FeedType::Arxiv => {
                     if !ArxivParser::is_arxiv_host(url.host_str()) {
                         anyhow::bail!("arXiv feed URL must point to arxiv.org");
                     }
-                    Ok(url)
+                    Self::validate_arxiv_feed_url(&url)?;
+                    Ok((FeedType::Arxiv, url))
                 }
-                FeedType::Rss => Ok(url),
+                FeedType::Rss => {
+                    if !url.as_str().contains("/feeds/videos.xml")
+                        && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
+                    {
+                        return Ok((
+                            FeedType::Youtube,
+                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                        ));
+                    }
+                    if url.as_str().contains("youtube.com/feeds/videos.xml") {
+                        return Ok((FeedType::Youtube, url));
+                    }
+                    if ArxivParser::is_arxiv_host(url.host_str()) {
+                        Self::validate_arxiv_feed_url(&url)?;
+                        return Ok((FeedType::Arxiv, url));
+                    }
+                    Ok((FeedType::Rss, url))
+                }
             },
         }
+    }
+
+    fn validate_arxiv_feed_url(url: &Url) -> Result<()> {
+        let path = url.path();
+        if path.starts_with("/abs/")
+            || path.starts_with("/pdf/")
+            || crate::content::fetcher::is_direct_pdf_url(url)
+        {
+            anyhow::bail!("URL points to a single arXiv paper, not an arXiv feed");
+        }
+        Ok(())
     }
 }
 

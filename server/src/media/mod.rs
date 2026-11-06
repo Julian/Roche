@@ -106,8 +106,55 @@ impl MediaStore {
         }
         // Re-validate after creating parent directories to guard against TOCTOU symlink swaps
         let verified_path = self.validate_path(&safe_path)?;
-        tokio::fs::write(&verified_path, bytes).await?;
+        let file_name = verified_path.file_name().and_then(|n| n.to_str()).unwrap_or("media");
+        let temp_name = format!(".tmp-{}-{file_name}", uuid::Uuid::new_v4());
+        let temp_path = verified_path.with_file_name(temp_name);
+
+        if let Err(e) = tokio::fs::write(&temp_path, bytes).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = tokio::fs::rename(&temp_path, &verified_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
         Ok(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
+    }
+
+    pub async fn delete_file(&self, stored_path: &str) -> Result<()> {
+        self.remove(stored_path).await
+    }
+
+    /// Removes any `.tmp-*` temporary files older than `max_age` inside `base_dir`, `pdfs/`, and `thumbnails/`.
+    pub async fn cleanup_stale_temp_files(&self, max_age: std::time::Duration) -> Result<usize> {
+        let mut removed = 0;
+        let dirs =
+            [self.base_dir.clone(), self.base_dir.join("pdfs"), self.base_dir.join("thumbnails")];
+        for dir in dirs {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if !entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let is_stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= max_age);
+                if is_stale && tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     #[must_use]
@@ -171,5 +218,39 @@ mod tests {
         let rel_store = MediaStore::new("./data/media");
         let expected_abs = std::env::current_dir().unwrap().join("data/media/clip.mp4");
         assert!(rel_store.validate_path(&expected_abs).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_media_store_atomic_write_bytes_and_delete_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-media-atomic-{}", uuid::Uuid::new_v4()));
+        let store = MediaStore::new(&temp_dir);
+
+        let payload = b"%PDF-1.7\natomic-write-test\n%%EOF";
+        let size = store.write_bytes("pdfs/paper-1.pdf", payload).await.unwrap();
+        assert_eq!(size, i64::try_from(payload.len()).unwrap());
+
+        let written = tokio::fs::read(temp_dir.join("pdfs/paper-1.pdf")).await.unwrap();
+        assert_eq!(written, payload);
+
+        // Verify no temporary .tmp-* sibling files remain in pdfs/
+        let mut entries = tokio::fs::read_dir(temp_dir.join("pdfs")).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            assert!(!name.to_string_lossy().starts_with(".tmp-"));
+        }
+
+        store.delete_file("pdfs/paper-1.pdf").await.unwrap();
+        assert!(!temp_dir.join("pdfs/paper-1.pdf").exists());
+
+        // Stale .tmp-* file in pdfs/ is cleaned up by cleanup_stale_temp_files
+        tokio::fs::create_dir_all(temp_dir.join("pdfs")).await.unwrap();
+        let stale_tmp = temp_dir.join("pdfs/.tmp-1234-aborted.pdf");
+        tokio::fs::write(&stale_tmp, b"partial").await.unwrap();
+        let removed = store.cleanup_stale_temp_files(std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(!stale_tmp.exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

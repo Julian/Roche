@@ -12,6 +12,7 @@ const SERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_CONCURRENT_PROBES: usize = 16;
 const MAX_HEALTH_BYTES: usize = 16 * 1024;
+const MACOS_APP_TAILSCALE_BIN: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
@@ -279,12 +280,10 @@ pub async fn advertise_service(cfg: &TailscaleConfig, port: u16) -> Result<Optio
 
     let service_arg = format!("--service={svc}");
     let target_arg = format!("127.0.0.1:{port}");
-    let output = tokio::time::timeout(
+    let output = run_tailscale_cmd(
+        &cfg.tailscale_bin,
+        &["serve", "--bg", &service_arg, "--https=443", &target_arg],
         SERVE_TIMEOUT,
-        Command::new(&cfg.tailscale_bin)
-            .args(["serve", "--bg", &service_arg, "--https=443", &target_arg])
-            .kill_on_drop(true)
-            .output(),
     )
     .await
     .context("Timed out running `tailscale serve`")?
@@ -390,19 +389,42 @@ async fn probe_single(client: &reqwest::Client, base_url: &str) -> Option<Discov
 }
 
 async fn run_tailscale_status(tailscale_bin: &Path) -> Result<String> {
-    let output = tokio::time::timeout(
-        STATUS_TIMEOUT,
-        Command::new(tailscale_bin).args(["status", "--json"]).kill_on_drop(true).output(),
-    )
-    .await
-    .context("Timed out querying `tailscale status --json`")?
-    .context("Failed to execute `tailscale status --json`")?;
+    let output = run_tailscale_cmd(tailscale_bin, &["status", "--json"], STATUS_TIMEOUT)
+        .await
+        .context("Timed out querying `tailscale status --json`")?
+        .context("Failed to execute `tailscale status --json`")?;
 
     if !output.status.success() {
         anyhow::bail!("tailscale status exited with {}", output.status);
     }
 
     String::from_utf8(output.stdout).context("Invalid UTF-8 in tailscale status output")
+}
+
+async fn run_tailscale_cmd(
+    tailscale_bin: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> std::result::Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    let first = tokio::time::timeout(
+        timeout,
+        Command::new(tailscale_bin).args(args).kill_on_drop(true).output(),
+    )
+    .await?;
+    match first {
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && tailscale_bin == Path::new("tailscale")
+                && Path::new(MACOS_APP_TAILSCALE_BIN).exists() =>
+        {
+            tokio::time::timeout(
+                timeout,
+                Command::new(MACOS_APP_TAILSCALE_BIN).args(args).kill_on_drop(true).output(),
+            )
+            .await
+        }
+        other => Ok(other),
+    }
 }
 
 fn append_node_candidates(candidates: &mut Vec<String>, node: &RawNode, port: u16) {

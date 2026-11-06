@@ -27,13 +27,15 @@ impl<'a> AuthRepo<'a> {
 
     pub async fn save_pairing_code(&self, code: &str, expires_at: DateTime<Utc>) -> Result<()> {
         let now = SyncRepo::now_utc();
+        let normalized = code.trim().to_ascii_lowercase();
+        let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM pairing_codes").execute(&mut *tx).await?;
 
         sqlx::query(
             "INSERT INTO pairing_codes (code, failed_attempts, created_at, expires_at) VALUES (?, 0, ?, ?)",
         )
-        .bind(code)
+        .bind(&code_hash)
         .bind(now)
         .bind(expires_at)
         .execute(&mut *tx)
@@ -44,6 +46,8 @@ impl<'a> AuthRepo<'a> {
 
     pub async fn consume_valid_pairing_code(&self, code: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
+        let normalized = code.trim().to_ascii_lowercase();
+        let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
         let mut tx = self.pool.begin().await?;
 
         sqlx::query("DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)")
@@ -55,7 +59,7 @@ impl<'a> AuthRepo<'a> {
             "DELETE FROM pairing_codes
              WHERE code = ? AND datetime(expires_at) > datetime(?) AND failed_attempts < ?",
         )
-        .bind(code)
+        .bind(&code_hash)
         .bind(now)
         .bind(MAX_PAIRING_ATTEMPTS)
         .execute(&mut *tx)

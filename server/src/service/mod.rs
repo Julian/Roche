@@ -53,7 +53,7 @@ pub struct SyncStatus {
 #[derive(Debug, Clone)]
 pub struct RocheService<F = HttpFeedFetcher> {
     db: Db,
-    fetcher: F,
+    fetcher: Arc<F>,
     config: Config,
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
@@ -70,7 +70,7 @@ impl<F: FeedFetcher> RocheService<F> {
             Arc::new(Semaphore::new(config.media.max_concurrent_downloads.max(1)));
         Self {
             db,
-            fetcher,
+            fetcher: Arc::new(fetcher),
             config,
             media_store,
             ytdlp_worker,
@@ -137,13 +137,13 @@ impl<F: FeedFetcher> RocheService<F> {
         Arc::clone(&self.download_semaphore)
     }
 
-    const fn media_ingest_context(&self) -> MediaIngestContext<'_, F> {
+    fn media_ingest_context(&self) -> MediaIngestContext<'_, F> {
         MediaIngestContext {
             db: &self.db,
             media_store: &self.media_store,
             ytdlp_worker: Some(&self.ytdlp_worker),
             download_semaphore: Some(&self.download_semaphore),
-            fetcher: &self.fetcher,
+            fetcher: self.fetcher.as_ref(),
         }
     }
 
@@ -261,7 +261,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         title: Option<&str>,
         description: Option<&str>,
     ) -> Result<Feed, ApiError> {
-        let validated_url = source
+        let (resolved_type, validated_url) = source
             .into_feed_url(feed_type)
             .map_err(|e| ApiError::bad_request(format!("Invalid feed URL: {e}")))?;
 
@@ -270,7 +270,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
             .db
             .feeds()
             .create_with_interval(
-                feed_type,
+                resolved_type,
                 &validated_url,
                 title.map(str::trim).filter(|t| !t.is_empty()),
                 description.map(str::trim).filter(|d| !d.is_empty()),
@@ -449,12 +449,25 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             })
             .await?;
 
-        let ctx = self.service.media_ingest_context();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(10),
-            FeedIngester::ingest_item_media(&ctx, &item.id, content_type, url),
-        )
-        .await;
+        let db = self.service.db.clone();
+        let media_store = self.service.media_store.clone();
+        let ytdlp_worker = self.service.ytdlp_worker.clone();
+        let download_semaphore = Arc::clone(&self.service.download_semaphore);
+        let fetcher = Arc::clone(&self.service.fetcher);
+        let item_id = item.id.clone();
+        let item_url = url.clone();
+
+        let ingest_handle = tokio::spawn(async move {
+            let ctx = MediaIngestContext {
+                db: &db,
+                media_store: &media_store,
+                ytdlp_worker: Some(&ytdlp_worker),
+                download_semaphore: Some(&download_semaphore),
+                fetcher: fetcher.as_ref(),
+            };
+            FeedIngester::ingest_item_media(&ctx, &item_id, content_type, &item_url).await;
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), ingest_handle).await;
 
         self.get(&item.id).await
     }
@@ -622,12 +635,19 @@ impl<F: FeedFetcher> TagService<'_, F> {
     }
 }
 
+pub struct MediaStream {
+    pub content_type: &'static str,
+    pub filename: String,
+    pub total_len: u64,
+    pub file: tokio::fs::File,
+}
+
 pub struct MediaService<'a, F> {
     service: &'a RocheService<F>,
 }
 
 impl<F: FeedFetcher> MediaService<'_, F> {
-    pub async fn open_stream(&self, id: &str) -> Result<(&'static str, tokio::fs::File), ApiError> {
+    pub async fn open_stream(&self, id: &str) -> Result<MediaStream, ApiError> {
         let repo = self.service.db.media();
         let media = repo.get(id).await?.ok_or_else(|| ApiError::not_found("Media not found"))?;
         let content_type = MediaStore::content_type_for(media.media_type, &media.path);
@@ -640,7 +660,21 @@ impl<F: FeedFetcher> MediaService<'_, F> {
                 ApiError::Internal(e)
             }
         })?;
-        Ok((content_type, file))
+        let total_len = match file.metadata().await {
+            Ok(meta) => meta.len(),
+            Err(_) => media.file_size.and_then(|s| u64::try_from(s).ok()).unwrap_or(0),
+        };
+        let filename = std::path::Path::new(&media.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| {
+                name.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                    .collect::<String>()
+            })
+            .filter(|s| !s.trim_matches('.').is_empty() && !s.starts_with('.'))
+            .unwrap_or_else(|| "media".to_string());
+        Ok(MediaStream { content_type, filename, total_len, file })
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {

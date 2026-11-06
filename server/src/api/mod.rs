@@ -12,7 +12,13 @@ use axum_extra::{TypedHeader, typed_header::TypedHeaderRejection};
 use headers::{Authorization, authorization::Bearer};
 use serde::Deserialize;
 use tower_http::{
-    compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer,
+    compression::{
+        CompressionLayer,
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+    },
+    cors::CorsLayer,
+    limit::RequestBodyLimitLayer,
+    trace::TraceLayer,
 };
 use url::Url;
 
@@ -92,6 +98,13 @@ impl ApiRoutes {
             .route("/api/v1/auth/pair", post(Self::auth_pair::<F>))
             .layer(RequestBodyLimitLayer::new(16 * 1024));
 
+        let compression = CompressionLayer::new().compress_when(
+            DefaultPredicate::new()
+                .and(NotForContentType::new("video/"))
+                .and(NotForContentType::new("audio/"))
+                .and(NotForContentType::new("application/pdf")),
+        );
+
         Router::new()
             .route("/health", get(Self::health::<F>))
             .merge(public_pair)
@@ -99,7 +112,7 @@ impl ApiRoutes {
             .fallback(Self::handle_not_found)
             .method_not_allowed_fallback(Self::handle_method_not_allowed)
             .layer(TraceLayer::new_for_http())
-            .layer(CompressionLayer::new())
+            .layer(compression)
             .layer(CorsLayer::new())
             .with_state(service)
     }
@@ -353,18 +366,125 @@ impl ApiRoutes {
     async fn media_get<F: FeedFetcher>(
         State(service): State<Arc<RocheService<F>>>,
         ProblemPath(id): ProblemPath<String>,
+        headers: axum::http::HeaderMap,
     ) -> Result<Response, ApiError> {
-        let (content_type, file) = service.media().open_stream(&id).await?;
-        let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+        use std::io::SeekFrom;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+        let stream = service.media().open_stream(&id).await?;
+        let disposition = format!("inline; filename=\"{}\"", stream.filename);
+
+        if let Some(range_val) = headers.get(header::RANGE) {
+            let parsed = range_val.to_str().ok().map_or(ByteRangeParse::Unsatisfiable, |s| {
+                Self::parse_byte_range(s, stream.total_len)
+            });
+            match parsed {
+                ByteRangeParse::IgnoreUnit => {}
+                ByteRangeParse::Unsatisfiable => {
+                    return Ok((
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                            (header::CONTENT_RANGE, format!("bytes */{}", stream.total_len)),
+                        ],
+                        axum::body::Body::empty(),
+                    )
+                        .into_response());
+                }
+                ByteRangeParse::Satisfiable { start, end } => {
+                    let len = end - start + 1;
+                    let mut file = stream.file;
+                    file.seek(SeekFrom::Start(start))
+                        .await
+                        .map_err(|e| ApiError::Internal(e.into()))?;
+                    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+                        file.take(len),
+                    ));
+
+                    return Ok((
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_TYPE, stream.content_type.to_string()),
+                            (header::CONTENT_LENGTH, len.to_string()),
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                            (
+                                header::CONTENT_RANGE,
+                                format!("bytes {start}-{end}/{}", stream.total_len),
+                            ),
+                            (header::CONTENT_DISPOSITION, disposition),
+                            (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
+                            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                        ],
+                        body,
+                    )
+                        .into_response());
+                }
+            }
+        }
+
+        let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(stream.file));
         Ok((
+            StatusCode::OK,
             [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "private, max-age=86400"),
-                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_TYPE, stream.content_type.to_string()),
+                (header::CONTENT_LENGTH, stream.total_len.to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_DISPOSITION, disposition),
+                (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
             ],
             body,
         )
             .into_response())
+    }
+
+    fn parse_byte_range(range_header: &str, total_len: u64) -> ByteRangeParse {
+        let trimmed = range_header.trim();
+        let Some(spec) = trimmed
+            .get(..6)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
+            .and_then(|_| trimmed.get(6..))
+        else {
+            return ByteRangeParse::IgnoreUnit;
+        };
+
+        if total_len == 0 || spec.contains(',') {
+            return ByteRangeParse::Unsatisfiable;
+        }
+        let Some((start_str, end_str)) = spec.trim().split_once('-') else {
+            return ByteRangeParse::Unsatisfiable;
+        };
+        if start_str.is_empty() {
+            if end_str.is_empty() {
+                return ByteRangeParse::Unsatisfiable;
+            }
+            let Ok(suffix) = end_str.parse::<u64>() else {
+                return ByteRangeParse::Unsatisfiable;
+            };
+            if suffix == 0 {
+                return ByteRangeParse::Unsatisfiable;
+            }
+            let start = total_len.saturating_sub(suffix);
+            ByteRangeParse::Satisfiable { start, end: total_len - 1 }
+        } else {
+            let Ok(start) = start_str.parse::<u64>() else {
+                return ByteRangeParse::Unsatisfiable;
+            };
+            if start >= total_len {
+                return ByteRangeParse::Unsatisfiable;
+            }
+            if end_str.is_empty() {
+                ByteRangeParse::Satisfiable { start, end: total_len - 1 }
+            } else {
+                let Ok(end) = end_str.parse::<u64>() else {
+                    return ByteRangeParse::Unsatisfiable;
+                };
+                if start > end {
+                    return ByteRangeParse::Unsatisfiable;
+                }
+                ByteRangeParse::Satisfiable { start, end: end.min(total_len - 1) }
+            }
+        }
     }
 
     async fn media_delete<F: FeedFetcher>(
@@ -418,6 +538,13 @@ impl ApiRoutes {
         let status = service.sync_status().await?;
         Ok(Json(status))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRangeParse {
+    IgnoreUnit,
+    Satisfiable { start: u64, end: u64 },
+    Unsatisfiable,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,5 +1264,172 @@ mod tests {
         assert_eq!(urls[1], "http://roche.tail9876.ts.net:8080");
         assert_eq!(urls[2], "http://roche:8080");
         assert_eq!(urls[3], "http://100.64.0.12:8080");
+    }
+
+    #[tokio::test]
+    async fn test_media_byte_range_partial_content_and_416() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+        let auth = format!("Bearer {token}");
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-range-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let payload = b"0123456789abcdef"; // 16 bytes
+        tokio::fs::write(temp_dir.join("video.mp4"), payload).await.unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.storage.media_dir = temp_dir.clone();
+        let service = RocheService::new(db.clone(), FakeFeedFetcher, config);
+        let app = ApiRoutes::router_with_service(service);
+
+        let url = Url::parse("https://youtube.com/watch?v=abc").unwrap();
+        let (item, _) = db.items().save_manual_with_tags(&url, "Video", &[]).await.unwrap();
+        let media = db
+            .media()
+            .create(&item.id, crate::db::MediaType::Video, "video.mp4", Some(16), Some(60))
+            .await
+            .unwrap();
+
+        // 1. Full GET without Range header -> 200 OK with Accept-Ranges, Content-Length, Content-Disposition
+        let full_request = Request::builder()
+            .uri(format!("/api/v1/media/{}", media.id))
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let full_response = app.clone().oneshot(full_request).await.unwrap();
+        assert_eq!(full_response.status(), StatusCode::OK);
+        assert_eq!(full_response.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(full_response.headers().get(header::CONTENT_LENGTH).unwrap(), "16");
+        assert_eq!(
+            full_response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "inline; filename=\"video.mp4\""
+        );
+        let full_bytes = to_bytes(full_response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&full_bytes[..], payload);
+
+        // 2. Closed range bytes=0-3 -> 206 Partial Content
+        let range_request = Request::builder()
+            .uri(format!("/api/v1/media/{}", media.id))
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::RANGE, "bytes=0-3")
+            .body(Body::empty())
+            .unwrap();
+        let range_response = app.clone().oneshot(range_request).await.unwrap();
+        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range_response.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(range_response.headers().get(header::CONTENT_LENGTH).unwrap(), "4");
+        assert_eq!(range_response.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 0-3/16");
+        let range_bytes = to_bytes(range_response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&range_bytes[..], b"0123");
+
+        // 3. Open-ended range bytes=10- and clamped range bytes=12-999 -> 206 Partial Content
+        for (hdr, expected_cr, expected_slice) in [
+            ("bytes=10-", "bytes 10-15/16", &b"abcdef"[..]),
+            ("bytes=12-999", "bytes 12-15/16", &b"cdef"[..]),
+            ("bytes=-4", "bytes 12-15/16", &b"cdef"[..]),
+        ] {
+            let req = Request::builder()
+                .uri(format!("/api/v1/media/{}", media.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header(header::RANGE, hdr)
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(res.headers().get(header::CONTENT_RANGE).unwrap(), expected_cr);
+            assert_eq!(
+                res.headers().get(header::CONTENT_LENGTH).unwrap(),
+                &expected_slice.len().to_string()
+            );
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&bytes[..], expected_slice);
+        }
+
+        // 4. Unsatisfiable or malformed byte ranges -> 416 Range Not Satisfiable with Content-Range: bytes */16
+        for bad_range in ["bytes=16-20", "bytes=10-5", "bytes=-0", "bytes=0-1, 3-4", "bytes=abc"] {
+            let bad_request = Request::builder()
+                .uri(format!("/api/v1/media/{}", media.id))
+                .header(header::AUTHORIZATION, &auth)
+                .header(header::RANGE, bad_range)
+                .body(Body::empty())
+                .unwrap();
+            let bad_response = app.clone().oneshot(bad_request).await.unwrap();
+            assert_eq!(bad_response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(bad_response.headers().get(header::CONTENT_RANGE).unwrap(), "bytes */16");
+        }
+
+        // 5. Unknown range unit (RFC 9110 §14.2) -> ignored, falls back to 200 OK full content
+        assert_eq!(ApiRoutes::parse_byte_range("items=0-5", 16), ByteRangeParse::IgnoreUnit);
+        let unknown_unit_request = Request::builder()
+            .uri(format!("/api/v1/media/{}", media.id))
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::RANGE, "items=0-5")
+            .body(Body::empty())
+            .unwrap();
+        let unknown_unit_response = app.oneshot(unknown_unit_request).await.unwrap();
+        assert_eq!(unknown_unit_response.status(), StatusCode::OK);
+        let unknown_unit_bytes =
+            to_bytes(unknown_unit_response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&unknown_unit_bytes[..], payload);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_feed_type_auto_inference_when_omitted() {
+        let (app, auth) = setup_app().await;
+
+        // 1. Bare YouTube channel ID with omitted feed_type -> infers youtube & normalizes feed URL
+        let yt_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/feeds")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"UCX6OQ3DkcsbYNE6H8uQQuVA"}"#))
+            .unwrap();
+        let yt_response = app.clone().oneshot(yt_request).await.unwrap();
+        assert_eq!(yt_response.status(), StatusCode::CREATED);
+        let yt_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(yt_response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(yt_body["feed_type"], "youtube");
+        assert_eq!(
+            yt_body["url"],
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA"
+        );
+
+        // 2. arXiv RSS URL with omitted feed_type -> infers arxiv
+        let arxiv_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/feeds")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"https://rss.arxiv.org/rss/cs.LG"}"#))
+            .unwrap();
+        let arxiv_response = app.clone().oneshot(arxiv_request).await.unwrap();
+        assert_eq!(arxiv_response.status(), StatusCode::CREATED);
+        let arxiv_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(arxiv_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(arxiv_body["feed_type"], "arxiv");
+        assert_eq!(arxiv_body["url"], "https://rss.arxiv.org/rss/cs.LG");
+
+        // 3. Single arXiv paper URL (/abs/ or /pdf/) is rejected as a feed URL with 400 Bad Request
+        for paper_url in
+            ["https://arxiv.org/abs/2301.07041", "https://arxiv.org/pdf/2301.07041.pdf"]
+        {
+            let bad_feed_request = Request::builder()
+                .method("POST")
+                .uri("/api/v1/feeds")
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"url":"{paper_url}"}}"#)))
+                .unwrap();
+            let bad_feed_response = app.clone().oneshot(bad_feed_request).await.unwrap();
+            assert_eq!(bad_feed_response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

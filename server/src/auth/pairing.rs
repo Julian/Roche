@@ -80,7 +80,20 @@ mod tests {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let pairing = PairingManager::new(db.auth());
         let code = pairing.create_code(300).await.unwrap();
-        assert!(pairing.consume_valid_code(&code).await.unwrap());
+
+        // Raw pairing code is never stored in plaintext in the database
+        let stored_code: String = sqlx::query_scalar("SELECT code FROM pairing_codes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_ne!(stored_code, code);
+        assert_eq!(stored_code, crate::auth::tokens::TokenManager::hash_token(&code));
+
+        // Submitting the stored SHA-256 hash directly as the pairing code is rejected
+        assert!(!pairing.consume_valid_code(&stored_code).await.unwrap());
+
+        // Auto-capitalized code from mobile keyboards still matches case-insensitively
+        assert!(pairing.consume_valid_code(&code.to_ascii_uppercase()).await.unwrap());
         assert!(!pairing.consume_valid_code(&code).await.unwrap());
 
         // Brute-force protection: 5 wrong attempts invalidate the active code

@@ -19,14 +19,32 @@ impl RocheServer {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
 
-        if let Err(e) = Self::maybe_advertise_tailscale(&cfg).await {
-            tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
+        let advertised_ok = match Self::maybe_advertise_tailscale(&cfg).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
+                false
+            }
+        };
+        let mut ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
+        if !advertised_ok && let Some(identity) = &mut ts_identity {
+            identity.service_name = None;
         }
-        let ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
         if let Some(identity) = &ts_identity {
             let urls = identity.candidate_urls(cfg.server.port);
             tracing::info!(tailscale_urls = ?urls, "Detected Tailscale node addresses");
         }
+
+        let listen_host = if cfg.server.host.trim().eq_ignore_ascii_case("tailscale") {
+            let ts_ip = ts_identity
+                .as_ref()
+                .and_then(|id| id.ipv4.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("`--host tailscale` requested, but no active Tailscale IPv4 address was found"))?;
+            ts_ip.to_string()
+        } else {
+            cfg.server.host.clone()
+        };
+        let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
 
         let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone())
             .with_node_identity(ts_identity);
@@ -72,7 +90,7 @@ impl RocheServer {
         });
 
         let app = api::ApiRoutes::router_with_service(roche_service);
-        let addr = cfg.server.listen_addr();
+        let addr = listen_cfg.listen_addr();
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         tracing::info!(addr = %addr, "Roche server listening");

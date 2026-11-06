@@ -189,7 +189,7 @@ impl Config {
                 "pairing_code_ttl" | "auth_pairing_code_ttl" => "auth.pairing_code_ttl".into(),
                 "token_length" | "auth_token_length" => "auth.token_length".into(),
                 "tailscale_enabled" => "tailscale.enabled".into(),
-                "tailscale_bin" => "tailscale.tailscale_bin".into(),
+                "tailscale_bin" | "tailscale_tailscale_bin" => "tailscale.tailscale_bin".into(),
                 "tailscale_advertise_service" => "tailscale.advertise_service".into(),
                 other => other.replace("__", ".").into(),
             }

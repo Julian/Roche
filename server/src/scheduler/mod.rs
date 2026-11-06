@@ -10,7 +10,9 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::{
-    content::fetcher::{HtmlSanitizer, SafeHttpClient, is_valid_pdf_bytes, resolve_pdf_url},
+    content::fetcher::{
+        HtmlSanitizer, SafeHttpClient, classify_url, is_valid_pdf_bytes, resolve_pdf_url,
+    },
     db::{ContentType, Db, Feed, FeedRepo, FeedType, MediaType, PollBatch, PollItemCandidate},
     feeds::{ArxivParser, RssParser, YouTubeParser},
     media::{MediaStore, ytdlp::YtDlpWorker},
@@ -175,15 +177,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
                                 download_semaphore: Some(&download_semaphore),
                                 fetcher: fetcher.as_ref(),
                             };
-                            for (item_id, candidate) in inserted {
-                                FeedIngester::ingest_item_media(
-                                    &ctx,
-                                    &item_id,
-                                    candidate.content_type,
-                                    &candidate.url,
-                                )
-                                .await;
-                            }
+                            FeedIngester::ingest_items_concurrently(&ctx, &inserted).await;
                         }
                     }
                     Err(e) => {
@@ -225,10 +219,44 @@ impl FeedIngester {
     ) -> std::result::Result<(), PollError> {
         let feed_repo = ctx.db.feeds();
         let inserted = Self::poll_returning_inserted(&feed_repo, feed, ctx.fetcher).await?;
-        for (item_id, candidate) in inserted {
-            Self::ingest_item_media(ctx, &item_id, candidate.content_type, &candidate.url).await;
-        }
+        Self::ingest_items_concurrently(ctx, &inserted).await;
         Ok(())
+    }
+
+    pub async fn ingest_items_concurrently<F: FeedFetcher>(
+        ctx: &MediaIngestContext<'_, F>,
+        inserted: &[(String, PollItemCandidate)],
+    ) {
+        let mut futures: Vec<Option<_>> = inserted
+            .iter()
+            .map(|(item_id, candidate)| {
+                Some(Box::pin(Self::ingest_item_media(
+                    ctx,
+                    item_id,
+                    candidate.content_type,
+                    &candidate.url,
+                )))
+            })
+            .collect();
+
+        if futures.is_empty() {
+            return;
+        }
+
+        std::future::poll_fn(move |cx| {
+            let mut all_done = true;
+            for slot in &mut futures {
+                if let Some(fut) = slot {
+                    if fut.as_mut().poll(cx).is_ready() {
+                        *slot = None;
+                    } else {
+                        all_done = false;
+                    }
+                }
+            }
+            if all_done { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
+        })
+        .await;
     }
 
     pub async fn ingest_item_media<F: FeedFetcher>(
@@ -263,6 +291,7 @@ impl FeedIngester {
                                     )
                                     .await
                                 {
+                                    let _ = ctx.media_store.delete_file(&rel_path).await;
                                     tracing::warn!(
                                         item_id = %item_id,
                                         error = %e,
@@ -357,6 +386,7 @@ impl FeedIngester {
                     .into_iter()
                     .filter_map(|item| {
                         let url = item.link?;
+                        let content_type = classify_url(&url);
                         let summary = HtmlSanitizer::clean(&item.description);
                         let content_html = item
                             .content_html
@@ -370,7 +400,7 @@ impl FeedIngester {
                             published_at: item.pub_date,
                             summary,
                             content_html,
-                            content_type: ContentType::Article,
+                            content_type,
                         })
                     })
                     .take(MAX_ITEMS_PER_POLL)
@@ -501,5 +531,88 @@ mod tests {
         assert_eq!(updated_feed.title.as_deref(), Some("Example Channel"));
         assert_eq!(updated_feed.description.as_deref(), Some("Desc"));
         assert_eq!(updated_feed.language.as_deref(), Some("en"));
+    }
+
+    #[tokio::test]
+    async fn test_rss_url_classification_and_orphan_file_cleanup_on_db_error() {
+        struct PdfCapableFetcher;
+        impl FeedFetcher for PdfCapableFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                std::future::ready(Ok(r#"<?xml version="1.0" encoding="UTF-8" ?>
+                <rss version="2.0">
+                <channel>
+                    <title>Mixed Feed</title>
+                    <link>https://example.com</link>
+                    <description>Mixed</description>
+                    <item>
+                        <title>Video Link</title>
+                        <link>https://www.youtube.com/watch?v=dQw4w9WgXcQ</link>
+                        <description>Vid</description>
+                    </item>
+                    <item>
+                        <title>Arxiv Link</title>
+                        <link>https://arxiv.org/abs/2301.07041</link>
+                        <description>Paper</description>
+                    </item>
+                    <item>
+                        <title>Direct PDF Link</title>
+                        <link>https://example.com/doc.pdf</link>
+                        <description>PDF</description>
+                    </item>
+                </channel>
+                </rss>"#
+                    .to_string()))
+            }
+
+            fn fetch_pdf(
+                &self,
+                _url: &Url,
+            ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> {
+                std::future::ready(Ok(Some(b"%PDF-1.5\n%test-pdf\n%%EOF".to_vec())))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/mixed.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-sched-test-{}", uuid::Uuid::new_v4()));
+        let store = MediaStore::new(&temp_dir);
+        let sem = Arc::new(Semaphore::new(4));
+        let ctx = MediaIngestContext {
+            db: &db,
+            media_store: &store,
+            ytdlp_worker: None,
+            download_semaphore: Some(&sem),
+            fetcher: &PdfCapableFetcher,
+        };
+
+        FeedIngester::poll_with_media(&ctx, &feed).await.unwrap();
+
+        let items = db.items().list(None, Some(&feed.id), None).await.unwrap();
+        assert_eq!(items.len(), 3);
+        let by_title: std::collections::HashMap<_, _> =
+            items.iter().map(|i| (i.title.as_str(), i)).collect();
+        assert_eq!(by_title["Video Link"].content_type, ContentType::Video);
+        assert_eq!(by_title["Arxiv Link"].content_type, ContentType::Paper);
+        assert_eq!(by_title["Direct PDF Link"].content_type, ContentType::Pdf);
+
+        // Both paper and direct PDF items have ingested PDF media
+        assert_eq!(db.media().list_for_item(&by_title["Arxiv Link"].id).await.unwrap().len(), 1);
+        assert_eq!(
+            db.media().list_for_item(&by_title["Direct PDF Link"].id).await.unwrap().len(),
+            1
+        );
+
+        // If `db.media().create` fails after writing the PDF file to disk, the file is immediately
+        // deleted so no orphaned file remains in `media_dir`.
+        sqlx::query("DROP TABLE media").execute(db.pool()).await.unwrap();
+        let pdf_url = Url::parse("https://example.com/orphan.pdf").unwrap();
+        FeedIngester::ingest_item_media(&ctx, "non-existent-item", ContentType::Pdf, &pdf_url)
+            .await;
+        assert!(!temp_dir.join("pdfs/non-existent-item.pdf").exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

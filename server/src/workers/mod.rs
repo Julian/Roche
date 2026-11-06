@@ -41,6 +41,7 @@ impl WorkerManager {
     }
 
     async fn run_media_cleaner(&self) -> Result<()> {
+        let _ = self.media_store.cleanup_stale_temp_files(Duration::from_secs(600)).await;
         let media_repo = self.db.media();
         let orphans = media_repo.find_orphaned().await?;
         media_repo.delete_with_files(&self.media_store, orphans).await
