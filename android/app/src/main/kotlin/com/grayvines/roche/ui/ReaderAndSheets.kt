@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,14 +66,18 @@ fun ReaderView(
     BackHandler { onAction(MainAction.CloseReader) }
     val colors = LocalRocheColors.current
     val scrollState = rememberScrollState()
-    val scrollFraction =
-        if (scrollState.maxValue > 0) {
-            (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(
-                MIN_PROGRESS,
-                1f,
-            )
-        } else {
-            entry.readProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
+    val scrollFraction by
+        remember(scrollState, entry.readProgress) {
+            derivedStateOf {
+                if (scrollState.maxValue > 0) {
+                    (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(
+                        MIN_PROGRESS,
+                        1f,
+                    )
+                } else {
+                    entry.readProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
+                }
+            }
         }
 
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {

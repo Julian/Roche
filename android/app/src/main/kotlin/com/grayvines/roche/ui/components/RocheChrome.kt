@@ -114,7 +114,7 @@ fun RocheTopHeader(
     title: String,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
-    trailing: (@Composable RowScope.() -> Unit)? = null,
+    content: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily =
@@ -154,11 +154,11 @@ fun RocheTopHeader(
                 )
             }
         }
-        if (trailing != null) {
+        if (content != null) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                content = trailing,
+                content = content,
             )
         }
     }
