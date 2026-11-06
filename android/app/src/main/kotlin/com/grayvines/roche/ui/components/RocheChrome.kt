@@ -7,9 +7,11 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,6 +25,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -34,17 +40,23 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 @Composable
 fun RocheBottomBar(activeTab: AppTab, onSelectTab: (AppTab) -> Unit) {
     val colors = LocalRocheColors.current
-    Column(modifier = Modifier.fillMaxWidth().background(colors.background)) {
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surface)
+                .navigationBarsPadding()
+                .testTag("bottom_nav_bar")
+    ) {
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         Row(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceAround,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
             AppTab.entries.forEach { tab ->
                 BottomBarTabItem(
                     tab = tab,
-                    selected = tab == activeTab,
+                    isSelected = tab == activeTab,
                     onClick = { onSelectTab(tab) },
                 )
             }
@@ -53,26 +65,44 @@ fun RocheBottomBar(activeTab: AppTab, onSelectTab: (AppTab) -> Unit) {
 }
 
 @Composable
-private fun BottomBarTabItem(tab: AppTab, selected: Boolean, onClick: () -> Unit) {
+private fun RowScope.BottomBarTabItem(tab: AppTab, isSelected: Boolean, onClick: () -> Unit) {
     val colors = LocalRocheColors.current
-    val indicatorColor = if (selected) colors.accentBlue else Color.Transparent
-    val labelColor = if (selected) colors.textPrimary else colors.textMuted
-    val labelWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+    val pillBg = if (isSelected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val iconTint = if (isSelected) colors.accentBlue else colors.textSecondary
+    val labelColor = if (isSelected) colors.textPrimary else colors.textSecondary
+    val labelWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
         modifier =
-            Modifier.clip(RoundedCornerShape(8.dp))
+            Modifier.weight(1f)
+                .clip(RoundedCornerShape(10.dp))
                 .clickable(onClick = onClick)
-                .padding(horizontal = 12.dp, vertical = 4.dp),
+                .semantics {
+                    role = Role.Tab
+                    selected = isSelected
+                }
+                .padding(vertical = 6.dp)
+                .testTag("bottom_tab_${tab.name.lowercase()}"),
     ) {
-        Box(modifier = Modifier.width(18.dp).height(2.dp).background(indicatorColor))
+        Box(
+            modifier =
+                Modifier.width(48.dp)
+                    .height(28.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(pillBg),
+            contentAlignment = Alignment.Center,
+        ) {
+            BottomTabIcon(tab = tab, tint = iconTint, size = 19.dp)
+        }
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = tab.label,
             color = labelColor,
             fontSize = 11.5.sp,
             fontWeight = labelWeight,
+            maxLines = 1,
         )
     }
 }

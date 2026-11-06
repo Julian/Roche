@@ -32,6 +32,12 @@ class MainScreenTest {
 
         composeRule.onNodeWithText("Roche").assertExists()
         composeRule.onNodeWithText("Search").assertExists()
+        composeRule.onNodeWithTag("bottom_nav_bar").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_inbox").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_search").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_feeds").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_offline").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_settings").assertExists()
         composeRule.onNodeWithText(sample.title).assertExists()
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
