@@ -145,6 +145,7 @@ private fun MainOverlaySheets(
     if (state.isAddSheetOpen) {
         AddUrlOrFeedBottomSheet(
             initialUrl = state.prefilledShareUrl,
+            initialTitle = state.prefilledShareTitle,
             onDismiss = { onAction(MainAction.CloseAddSheet) },
             onSave = { url, title, tags ->
                 onAction(MainAction.SaveUrlOrFeed(url = url, titleOverride = title, tagCsv = tags))

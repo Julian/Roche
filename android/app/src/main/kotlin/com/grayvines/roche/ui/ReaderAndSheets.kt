@@ -501,19 +501,14 @@ private fun ContextActionItem(label: String, onClick: () -> Unit) {
 @Composable
 fun AddUrlOrFeedBottomSheet(
     initialUrl: String,
+    initialTitle: String = "",
     onDismiss: () -> Unit,
     onSave: (String, String?, String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    var url by rememberSaveable(initialUrl) { mutableStateOf(initialUrl) }
-    var title by rememberSaveable { mutableStateOf("") }
-    var tags by rememberSaveable { mutableStateOf("") }
-
-    LaunchedEffect(initialUrl) {
-        if (initialUrl.isNotBlank()) {
-            url = initialUrl
-        }
-    }
+    var url by rememberSaveable(initialUrl, initialTitle) { mutableStateOf(initialUrl) }
+    var title by rememberSaveable(initialUrl, initialTitle) { mutableStateOf(initialTitle) }
+    var tags by rememberSaveable(initialUrl, initialTitle) { mutableStateOf("") }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surface) {
         Column(

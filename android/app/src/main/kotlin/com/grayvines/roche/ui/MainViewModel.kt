@@ -39,6 +39,7 @@ data class MainUiState(
     val contextSheetEntryId: String? = null,
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
+    val prefilledShareTitle: String = "",
     val visibleEntries: List<InboxEntry> = emptyList(),
     val searchResults: List<InboxEntry> = emptyList(),
     val allEntries: List<InboxEntry> = emptyList(),
@@ -84,7 +85,10 @@ sealed interface MainAction {
 
     data object CloseContextSheet : Ui
 
-    data class OpenAddSheet(val prefilledUrl: String = "") : Ui
+    data class OpenAddSheet(
+        val prefilledUrl: String = "",
+        val prefilledTitle: String = "",
+    ) : Ui
 
     data object CloseAddSheet : Ui
 
@@ -135,6 +139,7 @@ internal data class TransientUiState(
     val contextSheetEntryId: String? = null,
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
+    val prefilledShareTitle: String = "",
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
 )
@@ -289,6 +294,8 @@ class MainViewModel(
             it.copy(
                 isAddSheetOpen = false,
                 prefilledShareUrl = "",
+                prefilledShareTitle = "",
+                selectedReaderEntryId = null,
                 activeTab = nextTab,
                 activeFilter = InboxFilter.UNREAD,
                 statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
@@ -369,8 +376,18 @@ private fun reduceOverlayUiAction(
         is MainAction.OpenContextSheet -> state.copy(contextSheetEntryId = action.entryId)
         MainAction.CloseContextSheet -> state.copy(contextSheetEntryId = null)
         is MainAction.OpenAddSheet ->
-            state.copy(isAddSheetOpen = true, prefilledShareUrl = action.prefilledUrl)
-        MainAction.CloseAddSheet -> state.copy(isAddSheetOpen = false, prefilledShareUrl = "")
+            state.copy(
+                isAddSheetOpen = true,
+                prefilledShareUrl = action.prefilledUrl,
+                prefilledShareTitle = action.prefilledTitle,
+                contextSheetEntryId = null,
+            )
+        MainAction.CloseAddSheet ->
+            state.copy(
+                isAddSheetOpen = false,
+                prefilledShareUrl = "",
+                prefilledShareTitle = "",
+            )
         MainAction.DismissMessages -> state.copy(undoEvent = null, statusBanner = null)
         else -> state
     }
@@ -407,6 +424,7 @@ internal fun buildMainUiState(
         contextSheetEntryId = local.contextSheetEntryId,
         isAddSheetOpen = local.isAddSheetOpen,
         prefilledShareUrl = local.prefilledShareUrl,
+        prefilledShareTitle = local.prefilledShareTitle,
         visibleEntries = filtered,
         searchResults = searchResults,
         allEntries = snapshot.entries,

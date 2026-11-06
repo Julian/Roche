@@ -25,7 +25,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleIncomingShareIntent(intent)
+        if (savedInstanceState == null) {
+            handleIncomingShareIntent(intent)
+        }
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -45,20 +47,31 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleIncomingShareIntent(intent)
     }
 
     private fun handleIncomingShareIntent(intent: Intent?) {
-        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
-            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
-            val candidateUrl =
-                sharedText.split(WHITESPACE_SPLIT_REGEX).firstOrNull { token ->
-                    val scheme = runCatching { token.toUri().scheme?.lowercase() }.getOrNull()
-                    scheme in ALLOWED_HTTP_SCHEMES
-                }
-            if (candidateUrl != null) {
-                viewModel.dispatch(MainAction.OpenAddSheet(prefilledUrl = candidateUrl))
-            }
+        val currentIntent = intent ?: return
+        val payload =
+            extractSharedLink(
+                action = currentIntent.action,
+                mimeType = currentIntent.type,
+                extraText = currentIntent.getStringExtra(Intent.EXTRA_TEXT),
+                extraSubject = currentIntent.getStringExtra(Intent.EXTRA_SUBJECT),
+                extraTitle = currentIntent.getStringExtra(Intent.EXTRA_TITLE),
+            )
+        if (payload != null) {
+            currentIntent.removeExtra(Intent.EXTRA_TEXT)
+            currentIntent.removeExtra(Intent.EXTRA_SUBJECT)
+            currentIntent.removeExtra(Intent.EXTRA_TITLE)
+            currentIntent.action = Intent.ACTION_MAIN
+            viewModel.dispatch(
+                MainAction.OpenAddSheet(
+                    prefilledUrl = payload.url,
+                    prefilledTitle = payload.title.orEmpty(),
+                )
+            )
         }
     }
 
@@ -85,6 +98,5 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         private val ALLOWED_HTTP_SCHEMES = setOf("http", "https")
-        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
     }
 }
