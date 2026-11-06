@@ -4,14 +4,40 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Filing cabinet / editorial glyph in Timberwolf & Verdigris -->
+
+    <!-- Back index card (Steel Blue #4281A4) -->
+    <path
+        android:fillColor="#4281A4"
+        android:pathData="M39,28h37a2.5,2.5 0 0,1 2.5,2.5v39a2.5,2.5 0 0,1 -2.5,2.5H39a2.5,2.5 0 0,1 -2.5,-2.5v-39A2.5,2.5 0 0,1 39,28z" />
+
+    <!-- Middle folio sheet (Verdigris #48A9A6) -->
     <path
         android:fillColor="#48A9A6"
-        android:pathData="M34,30h40a4,4 0 0,1 4,4v40a4,4 0 0,1 -4,4H34a4,4 0 0,1 -4,-4V34a4,4 0 0,1 4,-4z" />
+        android:pathData="M35.5,31.5h37a2.5,2.5 0 0,1 2.5,2.5v39a2.5,2.5 0 0,1 -2.5,2.5h-37a2.5,2.5 0 0,1 -2.5,-2.5V34a2.5,2.5 0 0,1 2.5,-2.5z" />
+
+    <!-- Subtle drop shadow under primary Timberwolf page -->
     <path
-        android:fillColor="#141413"
-        android:pathData="M34,53h40v2H34z" />
+        android:fillColor="#38000000"
+        android:pathData="M32,36h37a2.5,2.5 0 0,1 2.5,2.5v39a2.5,2.5 0 0,1 -2.5,2.5H32a2.5,2.5 0 0,1 -2.5,-2.5v-39A2.5,2.5 0 0,1 32,36z" />
+
+    <!-- Front editorial page (Timberwolf #E4DFDA) -->
     <path
         android:fillColor="#E4DFDA"
-        android:pathData="M48,41h12v3H48zM48,64h12v3H48z" />
+        android:pathData="M32,35h37a2.5,2.5 0 0,1 2.5,2.5v39a2.5,2.5 0 0,1 -2.5,2.5H32a2.5,2.5 0 0,1 -2.5,-2.5v-39A2.5,2.5 0 0,1 32,35z" />
+
+    <!-- Bookmark ribbon at top-right of front page (Indian Red #C1666B) -->
+    <path
+        android:fillColor="#C1666B"
+        android:pathData="M61,35h5.5v13.5l-2.75,-2.2l-2.75,2.2z" />
+
+    <!-- Engraved serif monogram 'R' in warm charcoal (#18191A) -->
+    <path
+        android:fillColor="#18191A"
+        android:fillType="evenOdd"
+        android:pathData="M37.5,46.5h12.2c4.4,0 7.2,2.2 7.2,5.6c0,2.7 -1.7,4.6 -4.5,5.3l5.2,8.1h1.9v2h-4.6l-5.3,-8.6h-3.8v6.6h2.4v2h-10.7v-2h2.5v-17h-2.5v-2zM44.3,48.6v6.8h4.6c2.6,0 4.1,-1.3 4.1,-3.4c0,-2.1 -1.5,-3.4 -4.1,-3.4h-4.6z" />
+
+    <!-- Fine editorial rule under monogram (Ecru #9E7B46) -->
+    <path
+        android:fillColor="#9E7B46"
+        android:pathData="M37.5,71.5h26.5v1.4H37.5z" />
 </vector>
