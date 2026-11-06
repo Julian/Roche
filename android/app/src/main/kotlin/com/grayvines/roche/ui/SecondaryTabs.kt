@@ -17,8 +17,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -30,7 +28,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -43,6 +40,7 @@ import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
@@ -408,17 +406,15 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         visualTransformation = PasswordVisualTransformation(),
         modifier = Modifier.fillMaxWidth().testTag("bearer_token_input"),
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Button(
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeaderActionButton(
+            label = "Save Settings",
+            style = RocheButtonStyle.PRIMARY,
             onClick = { onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken)) },
-            colors =
-                ButtonDefaults.buttonColors(
-                    containerColor = colors.accentBlue,
-                    contentColor = Color.White,
-                ),
-        ) {
-            Text("Save Settings")
-        }
+        )
         HeaderActionButton(label = "Sync Now", onClick = { onAction(MainAction.SyncNow) })
     }
 }
@@ -441,6 +437,10 @@ private fun PairingCodeRow(
             singleLine = true,
             modifier = Modifier.weight(1f).testTag("pairing_code_input"),
         )
-        HeaderActionButton(label = "Pair Device", onClick = onPairClick)
+        HeaderActionButton(
+            label = "Pair Device",
+            style = RocheButtonStyle.PRIMARY,
+            onClick = onPairClick,
+        )
     }
 }

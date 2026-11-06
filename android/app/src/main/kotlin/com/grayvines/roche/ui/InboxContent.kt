@@ -2,7 +2,6 @@ package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -20,7 +19,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
@@ -33,8 +31,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -50,6 +46,7 @@ import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -289,14 +286,11 @@ private fun EntryPrimaryActionButtons(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        Box(
-            modifier =
-                Modifier.size(32.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onToggleStar)
-                    .semantics { contentDescription = starDescription }
-                    .testTag("star_btn_${entry.id}"),
-            contentAlignment = Alignment.Center,
+        RocheIconActionButton(
+            contentDescription = starDescription,
+            onClick = onToggleStar,
+            outlined = false,
+            modifier = Modifier.testTag("star_btn_${entry.id}"),
         ) {
             StarIcon(
                 tint = starTint,
@@ -304,14 +298,11 @@ private fun EntryPrimaryActionButtons(
                 size = 17.dp,
             )
         }
-        Box(
-            modifier =
-                Modifier.size(32.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onToggleArchive)
-                    .semantics { contentDescription = archiveDescription }
-                    .testTag("archive_btn_${entry.id}"),
-            contentAlignment = Alignment.Center,
+        RocheIconActionButton(
+            contentDescription = archiveDescription,
+            onClick = onToggleArchive,
+            outlined = false,
+            modifier = Modifier.testTag("archive_btn_${entry.id}"),
         ) {
             FilingCabinetIcon(
                 tint = colors.textMuted,

@@ -18,8 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
@@ -35,10 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
@@ -54,6 +49,8 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RocheButtonStyle
+import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -124,35 +121,22 @@ private fun CompactStarAndArchiveButtons(
     onToggleArchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(7.dp)
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
     val starDesc = if (entry.isFavorite) "Remove Star" else "Star Entry"
     val archiveDesc = if (entry.isArchived) "Unarchive to Inbox" else "Archive Entry"
 
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Box(
-            modifier =
-                Modifier.size(32.dp)
-                    .clip(shape)
-                    .background(colors.surfaceElevated)
-                    .border(1.dp, colors.border, shape)
-                    .clickable(onClick = onToggleStar)
-                    .semantics { contentDescription = starDesc }
-                    .testTag("${tagPrefix}_star_btn"),
-            contentAlignment = Alignment.Center,
+        RocheIconActionButton(
+            contentDescription = starDesc,
+            onClick = onToggleStar,
+            modifier = Modifier.testTag("${tagPrefix}_star_btn"),
         ) {
             StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
         }
-        Box(
-            modifier =
-                Modifier.size(32.dp)
-                    .clip(shape)
-                    .background(colors.surfaceElevated)
-                    .border(1.dp, colors.border, shape)
-                    .clickable(onClick = onToggleArchive)
-                    .semantics { contentDescription = archiveDesc }
-                    .testTag("${tagPrefix}_archive_btn"),
-            contentAlignment = Alignment.Center,
+        RocheIconActionButton(
+            contentDescription = archiveDesc,
+            onClick = onToggleArchive,
+            modifier = Modifier.testTag("${tagPrefix}_archive_btn"),
         ) {
             FilingCabinetIcon(
                 tint = colors.textSecondary,
@@ -493,17 +477,12 @@ fun AddUrlOrFeedBottomSheet(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            Button(
+            HeaderActionButton(
+                label = "Save to Roche Inbox",
+                style = RocheButtonStyle.PRIMARY,
                 onClick = { onSave(url, title.takeIf { it.isNotBlank() }, tags) },
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor = colors.accentBlue,
-                        contentColor = Color.White,
-                    ),
                 modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Save to Roche Inbox")
-            }
+            )
             Spacer(modifier = Modifier.height(16.dp))
         }
     }

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
@@ -26,6 +27,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -128,24 +130,88 @@ fun FilterChipPill(label: String, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
+enum class RocheButtonStyle {
+    PRIMARY,
+    SECONDARY,
+}
+
 @Composable
-fun HeaderActionButton(label: String, onClick: () -> Unit) {
+fun HeaderActionButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    style: RocheButtonStyle = RocheButtonStyle.SECONDARY,
+) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(7.dp)
+    val shape = RoundedCornerShape(8.dp)
+    val bg =
+        when (style) {
+            RocheButtonStyle.PRIMARY -> colors.accentBlue
+            RocheButtonStyle.SECONDARY -> colors.surfaceElevated
+        }
+    val border =
+        when (style) {
+            RocheButtonStyle.PRIMARY -> colors.accentBlue
+            RocheButtonStyle.SECONDARY -> colors.border
+        }
+    val textColor =
+        when (style) {
+            RocheButtonStyle.PRIMARY -> Color.White
+            RocheButtonStyle.SECONDARY -> colors.textPrimary
+        }
+
     Box(
+        contentAlignment = Alignment.Center,
         modifier =
-            Modifier.clip(shape)
-                .background(colors.surface)
-                .border(1.dp, colors.border, shape)
+            modifier
+                .height(36.dp)
+                .clip(shape)
+                .background(bg)
+                .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 10.dp, vertical = 5.dp)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 14.dp),
     ) {
         Text(
             text = label,
-            color = colors.textSecondary,
-            fontSize = 11.5.sp,
-            fontWeight = FontWeight.Medium,
+            color = textColor,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
         )
+    }
+}
+
+@Composable
+fun RocheIconActionButton(
+    contentDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    outlined: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    val baseModifier =
+        if (outlined) {
+            modifier
+                .size(36.dp)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
+        } else {
+            modifier.size(36.dp).clip(shape)
+        }
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            baseModifier.clickable(onClick = onClick).semantics {
+                role = Role.Button
+                this.contentDescription = contentDescription
+            },
+    ) {
+        content()
     }
 }
 
