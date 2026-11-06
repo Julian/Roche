@@ -106,6 +106,60 @@ impl ItemFilter {
         }
         out
     }
+
+    /// Converts user search input into a safe SQLite FTS5 `MATCH` expression.
+    ///
+    /// - Balanced double-quoted segments (`"distributed systems"`) become exact FTS5 phrase queries.
+    /// - Individual words (`quant`) become `("quant" OR "quant"*)` so both Porter-stemmed matches
+    ///   (`computing` -> `compute`) and prefix matches (`quant` -> `quantum`) succeed.
+    /// - Special FTS5 syntax characters (`:`, `*`, `^`, `-`, `(`, `)`, unclosed `"`, boolean keywords)
+    ///   are sanitized so arbitrary user input never triggers an FTS5 syntax error.
+    #[must_use]
+    pub fn build_fts_query(input: &str) -> Option<String> {
+        let mut clauses = Vec::new();
+        let mut chars = input.chars().peekable();
+
+        while let Some(&ch) = chars.peek() {
+            if ch == '"' {
+                chars.next();
+                let mut phrase_buf = String::new();
+                let mut closed = false;
+                for next_ch in chars.by_ref() {
+                    if next_ch == '"' {
+                        closed = true;
+                        break;
+                    }
+                    phrase_buf.push(next_ch);
+                }
+                let words = Self::extract_word_tokens(&phrase_buf);
+                if closed && words.len() > 1 {
+                    clauses.push(format!("\"{}\"", words.join(" ")));
+                } else {
+                    for word in words {
+                        clauses.push(format!("(\"{word}\" OR \"{word}\"*)"));
+                    }
+                }
+            } else {
+                let mut unquoted_buf = String::new();
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch == '"' {
+                        break;
+                    }
+                    unquoted_buf.push(next_ch);
+                    chars.next();
+                }
+                for word in Self::extract_word_tokens(&unquoted_buf) {
+                    clauses.push(format!("(\"{word}\" OR \"{word}\"*)"));
+                }
+            }
+        }
+
+        if clauses.is_empty() { None } else { Some(clauses.join(" AND ")) }
+    }
+
+    fn extract_word_tokens(segment: &str) -> Vec<&str> {
+        segment.split(|c: char| !c.is_alphanumeric()).filter(|tok| !tok.is_empty()).collect()
+    }
 }
 
 pub struct ItemRepo<'a> {
@@ -280,7 +334,17 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn list_filtered(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
+        let trimmed_search = filter.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
+
         let mut qb = QueryBuilder::new(ITEM_SELECT);
+        if let Some(fts_match) = &fts_query {
+            qb.push(
+                " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(items_fts, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM items_fts WHERE items_fts MATCH ",
+            )
+            .push_bind(fts_match.clone())
+            .push(") fts ON fts.fts_rowid = i.rowid");
+        }
         qb.push(" WHERE 1=1");
 
         if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
@@ -302,22 +366,43 @@ impl<'a> ItemRepo<'a> {
         if let Some(fav) = filter.is_favorite {
             qb.push(" AND i.is_favorite = ").push_bind(fav);
         }
-        if let Some(search) = &filter.search {
+        if let Some(search) = trimmed_search {
             let pattern = format!("%{}%", ItemFilter::escape_like(search));
-            qb.push(" AND (i.title LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
-                .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
-                .push_bind(pattern)
-                .push(" ESCAPE '\\')");
+            if fts_query.is_some() {
+                qb.push(" AND (fts.fts_rowid IS NOT NULL OR COALESCE(f.title, '') LIKE ")
+                    .push_bind(pattern)
+                    .push(" ESCAPE '\\')");
+            } else {
+                qb.push(" AND (i.title LIKE ")
+                    .push_bind(pattern.clone())
+                    .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
+                    .push_bind(pattern.clone())
+                    .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
+                    .push_bind(pattern.clone())
+                    .push(" ESCAPE '\\' OR COALESCE(i.content_html, '') LIKE ")
+                    .push_bind(pattern.clone())
+                    .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
+                    .push_bind(pattern)
+                    .push(" ESCAPE '\\')");
+            }
         }
 
-        let sort_col = filter.sort.unwrap_or_default().as_sql_expr();
-        let sort_dir = filter.order.unwrap_or_default().as_sql();
-        qb.push(format_args!(" ORDER BY {sort_col} {sort_dir}, i.id DESC"));
+        let sort_by_relevance =
+            fts_query.is_some() && matches!(filter.sort, None | Some(ItemSortField::Relevance));
+        if sort_by_relevance {
+            let rank_dir = match filter.order.unwrap_or_default() {
+                // bm25() returns negative scores where more negative = higher relevance
+                SortOrder::Desc => "ASC",
+                SortOrder::Asc => "DESC",
+            };
+            qb.push(format_args!(
+                " ORDER BY CASE WHEN fts.fts_rank IS NULL THEN 1 ELSE 0 END ASC, fts.fts_rank {rank_dir}, i.created_at DESC, i.id DESC"
+            ));
+        } else {
+            let sort_col = filter.sort.unwrap_or_default().as_sql_expr();
+            let sort_dir = filter.order.unwrap_or_default().as_sql();
+            qb.push(format_args!(" ORDER BY {sort_col} {sort_dir}, i.id DESC"));
+        }
 
         let per_page = filter.per_page.unwrap_or(50).clamp(1, 200);
         let page = filter.page.unwrap_or(1).max(1);
@@ -529,5 +614,129 @@ mod tests {
         };
         items.create(&feed_item).await.unwrap();
         assert!(items.create(&feed_item).await.is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_fts5_search_stemming_phrases_ranking_and_trigger_sync() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let items = db.items();
+
+        let feed_url = Url::parse("https://example.com/feed.xml").unwrap();
+        let feed = db
+            .feeds()
+            .create(FeedType::Rss, &feed_url, Some("Systems Engineering Digest"), None)
+            .await
+            .unwrap();
+
+        // Item 1: matches "distributed systems" only in content_html body
+        let url1 = Url::parse("https://example.com/1").unwrap();
+        let (body_item, _) = items
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &url1,
+                title: "Notes on Consensus",
+                summary: Some("A brief overview of Raft and Paxos."),
+                content_html: Some(
+                    "<p>Modern distributed systems rely on state machine replication and optimizing latency.</p>",
+                ),
+                content_type: ContentType::Article,
+                tags: &[],
+            })
+            .await
+            .unwrap();
+
+        // Item 2: matches "distributed systems" directly in the title (higher BM25 weight)
+        let url2 = Url::parse("https://example.com/2").unwrap();
+        let title_item = items
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "Distributed Systems in Practice",
+                url: &url2,
+                author: Some("Leslie Lamport"),
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        // 1. Exact phrase search + BM25 ranking (title match ranks ahead of body-only match)
+        let results = items
+            .list_filtered(&ItemFilter {
+                search: Some("\"distributed systems\"".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, title_item.id);
+        assert_eq!(results[1].id, body_item.id);
+
+        // 2. Porter stemming ("optimize" matches "optimizing" in body_item's content_html)
+        let stemmed = items
+            .list_filtered(&ItemFilter {
+                search: Some("optimize".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(stemmed.len(), 1);
+        assert_eq!(stemmed[0].id, body_item.id);
+
+        // 3. Prefix matching ("lamp" matches author "Lamport")
+        let prefix = items
+            .list_filtered(&ItemFilter { search: Some("lamp".to_string()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].id, title_item.id);
+
+        // 4. Feed title fallback ("Engineering Digest" matches feed_item via f.title)
+        let by_feed = items
+            .list_filtered(&ItemFilter {
+                search: Some("Engineering Digest".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_feed.len(), 1);
+        assert_eq!(by_feed[0].id, title_item.id);
+
+        // 5. UPDATE trigger: backfill_metadata updates summary and makes new terms searchable
+        items
+            .backfill_metadata(&title_item.id, None, None, Some("Byzantine quorum verification"))
+            .await
+            .unwrap();
+        let after_update = items
+            .list_filtered(&ItemFilter {
+                search: Some("byzantine".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_update.len(), 1);
+        assert_eq!(after_update[0].id, title_item.id);
+
+        // 6. Adversarial FTS syntax characters never cause SQL errors
+        let special = items
+            .list_filtered(&ItemFilter {
+                search: Some("c++ \"unclosed AND OR NOT (foo:bar) -baz * ^".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(special.is_empty());
+
+        // 7. DELETE trigger (including ON DELETE CASCADE when feed is deleted) removes from FTS
+        db.feeds().delete(&feed.id).await.unwrap();
+        let after_delete = items
+            .list_filtered(&ItemFilter {
+                search: Some("distributed".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].id, body_item.id);
     }
 }

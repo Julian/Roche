@@ -32,6 +32,7 @@ pub struct Db {
 }
 
 impl Db {
+    /// Connects to the SQLite database at `database_path` and runs all embedded migrations.
     pub async fn connect(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
         let base_options = match path.to_str() {

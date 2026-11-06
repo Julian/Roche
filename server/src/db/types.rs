@@ -142,13 +142,14 @@ pub enum ItemSortField {
     CreatedAt,
     PublishedAt,
     Title,
+    Relevance,
 }
 
 impl ItemSortField {
     #[must_use]
     pub const fn as_sql_expr(self) -> &'static str {
         match self {
-            Self::CreatedAt => "i.created_at",
+            Self::CreatedAt | Self::Relevance => "i.created_at",
             Self::PublishedAt => "COALESCE(i.published_at, i.created_at)",
             Self::Title => "i.title COLLATE NOCASE",
         }
