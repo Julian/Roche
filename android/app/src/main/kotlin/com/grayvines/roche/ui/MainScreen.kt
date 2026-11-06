@@ -9,6 +9,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -22,6 +23,7 @@ import com.grayvines.roche.ui.components.PlusIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
 import com.grayvines.roche.ui.components.UndoOrStatusSnackbar
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlinx.coroutines.delay
 
 @Composable
 fun MainScreen(
@@ -33,12 +35,13 @@ fun MainScreen(
 ) {
     val colors = LocalRocheColors.current
     val showChrome = state.activeReaderEntry == null
+    val hasFab = showChrome && state.activeTab != AppTab.SETTINGS
 
     Scaffold(
         modifier = modifier.fillMaxSize().background(colors.background),
         containerColor = colors.background,
         floatingActionButton = {
-            if (showChrome && state.activeTab != AppTab.SETTINGS) {
+            if (hasFab) {
                 SaveFloatingActionButton(onClick = { onAction(MainAction.OpenAddSheet()) })
             }
         },
@@ -56,19 +59,15 @@ fun MainScreen(
                 state = state,
                 onAction = onAction,
                 onShareEntry = onShareEntry,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
 
-            val undo = state.undoEvent
-            val banner = state.statusBanner
-            if (undo != null || banner != null) {
-                UndoOrStatusSnackbar(
-                    message = undo?.message ?: banner.orEmpty(),
-                    showUndo = undo != null,
-                    onUndo = { onAction(MainAction.UndoLastArchive) },
-                    onDismiss = { onAction(MainAction.DismissMessages) },
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(14.dp),
-                )
-            }
+            MainSnackbarOverlay(
+                state = state,
+                hasFab = hasFab,
+                onAction = onAction,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
     }
 
@@ -78,6 +77,34 @@ fun MainScreen(
         onShareEntry = onShareEntry,
         onOpenExternalUrl = onOpenExternalUrl,
     )
+}
+
+@Composable
+private fun MainSnackbarOverlay(
+    state: MainUiState,
+    hasFab: Boolean,
+    onAction: (MainAction) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val undo = state.undoEvent
+    val banner = state.statusBanner
+    LaunchedEffect(undo, banner) {
+        if (undo != null || banner != null) {
+            delay(SNACKBAR_AUTO_DISMISS_MS)
+            onAction(MainAction.DismissMessages)
+        }
+    }
+
+    if (undo != null || banner != null) {
+        val endPadding = if (hasFab) 80.dp else 14.dp
+        UndoOrStatusSnackbar(
+            message = undo?.message ?: banner.orEmpty(),
+            showUndo = undo != null,
+            onUndo = { onAction(MainAction.UndoLastArchive) },
+            onDismiss = { onAction(MainAction.DismissMessages) },
+            modifier = modifier.padding(start = 14.dp, end = endPadding, bottom = 14.dp),
+        )
+    }
 }
 
 @Composable
@@ -131,6 +158,7 @@ private fun MainBodyContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     val readerEntry = state.activeReaderEntry
     if (readerEntry != null) {
@@ -138,6 +166,7 @@ private fun MainBodyContent(
             entry = readerEntry,
             onAction = onAction,
             onShareEntry = onShareEntry,
+            onOpenExternalUrl = onOpenExternalUrl,
         )
         return
     }
@@ -149,3 +178,5 @@ private fun MainBodyContent(
         AppTab.SETTINGS -> SettingsTabContent(state = state, onAction = onAction)
     }
 }
+
+private const val SNACKBAR_AUTO_DISMISS_MS = 4_000L

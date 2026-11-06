@@ -60,9 +60,21 @@ fun ReaderView(
     entry: InboxEntry,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     BackHandler { onAction(MainAction.CloseReader) }
     val colors = LocalRocheColors.current
+    val scrollState = rememberScrollState()
+    val scrollFraction =
+        if (scrollState.maxValue > 0) {
+            (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(
+                MIN_PROGRESS,
+                1f,
+            )
+        } else {
+            entry.readProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
+        }
+
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
             entry = entry,
@@ -71,14 +83,18 @@ fun ReaderView(
         )
 
         Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(colors.border)) {
-            val fraction = entry.readProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
             Box(
                 modifier =
-                    Modifier.fillMaxWidth(fraction).height(2.dp).background(colors.accentBlue)
+                    Modifier.fillMaxWidth(scrollFraction).height(2.dp).background(colors.accentBlue)
             )
         }
 
-        ReaderArticleBody(entry = entry, onSelectTag = { onAction(MainAction.FilterByTag(it)) })
+        ReaderArticleBody(
+            entry = entry,
+            scrollState = scrollState,
+            onSelectTag = { onAction(MainAction.FilterByTag(it)) },
+            onOpenExternalUrl = { onOpenExternalUrl(entry.url) },
+        )
     }
 }
 
@@ -148,7 +164,12 @@ private fun CompactStarAndArchiveButtons(
 }
 
 @Composable
-private fun ReaderArticleBody(entry: InboxEntry, onSelectTag: (String) -> Unit) {
+private fun ReaderArticleBody(
+    entry: InboxEntry,
+    scrollState: androidx.compose.foundation.ScrollState,
+    onSelectTag: (String) -> Unit,
+    onOpenExternalUrl: () -> Unit,
+) {
     val colors = LocalRocheColors.current
     val headlineFamily =
         if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
@@ -160,7 +181,7 @@ private fun ReaderArticleBody(entry: InboxEntry, onSelectTag: (String) -> Unit) 
     Column(
         modifier =
             Modifier.fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp, vertical = 18.dp)
     ) {
         Text(
@@ -195,12 +216,13 @@ private fun ReaderArticleBody(entry: InboxEntry, onSelectTag: (String) -> Unit) 
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         Spacer(modifier = Modifier.height(16.dp))
 
-        ReaderBodyContent(entry = entry)
+        ReaderBodyContent(entry = entry, onOpenExternalUrl = onOpenExternalUrl)
+        Spacer(modifier = Modifier.height(24.dp))
     }
 }
 
 @Composable
-internal fun ReaderBodyContent(entry: InboxEntry) {
+internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit = {}) {
     val colors = LocalRocheColors.current
     val htmlBody =
         entry.contentHtml?.takeIf { it.isNotBlank() }
@@ -233,39 +255,42 @@ internal fun ReaderBodyContent(entry: InboxEntry) {
                 .split("\n\n")
                 .filter { it.isNotBlank() }
 
-        bodyParagraphs.forEach { paragraph ->
+        if (bodyParagraphs.isEmpty()) {
             Text(
-                text = paragraph.trim(),
-                color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
-                fontSize = 16.sp,
-                lineHeight = 26.sp,
+                text = "Full article text is not cached locally for this item.",
+                color = colors.textMuted,
+                fontSize = 14.sp,
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+        } else {
+            bodyParagraphs.forEach { paragraph ->
+                Text(
+                    text = paragraph.trim(),
+                    color = colors.textPrimary,
+                    fontFamily = FontFamily.Serif,
+                    fontSize = 16.sp,
+                    lineHeight = 26.sp,
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+            }
         }
     }
+    Spacer(modifier = Modifier.height(8.dp))
+    HeaderActionButton(label = "Open Original Link ↗", onClick = onOpenExternalUrl)
 }
 
 @Composable
 private fun ReaderTagStrip(tags: List<String>, onSelectTag: (String) -> Unit) {
-    val colors = LocalRocheColors.current
     Spacer(modifier = Modifier.height(10.dp))
     Row(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         modifier = Modifier.horizontalScroll(rememberScrollState()),
     ) {
         tags.forEach { tag ->
-            Text(
-                text = "#$tag",
-                color = colors.textSecondary,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                modifier =
-                    Modifier.clip(RoundedCornerShape(5.dp))
-                        .background(colors.surface)
-                        .border(1.dp, colors.border, RoundedCornerShape(5.dp))
-                        .clickable { onSelectTag(tag) }
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+            FilterChipPill(
+                label = "#$tag",
+                selected = false,
+                onClick = { onSelectTag(tag) },
             )
         }
     }
@@ -273,7 +298,7 @@ private fun ReaderTagStrip(tags: List<String>, onSelectTag: (String) -> Unit) {
 
 private fun formatReaderByline(entry: InboxEntry): String = buildString {
     entry.author?.let { append("$it · ") }
-    append(entry.publishedAt ?: "Saved")
+    append(entry.formattedPublishedLabel)
     if (entry.isCachedOffline) {
         append(" · Cached offline")
     }
@@ -362,24 +387,65 @@ private fun ContextSheetHeaderAndTags(
             onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
         )
     }
+    ContextSheetTagsEditor(
+        entry = entry,
+        allTags = allTags,
+        onAction = onAction,
+    )
+}
+
+@Composable
+internal fun ContextSheetTagsEditor(
+    entry: InboxEntry,
+    allTags: List<String>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var customTag by rememberSaveable { mutableStateOf("") }
+
     Text(
         text = "TAGS (TAP TO TOGGLE)",
         color = colors.textMuted,
         fontFamily = FontFamily.Monospace,
         fontSize = 10.sp,
     )
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        allTags.forEach { tag ->
-            val assigned = entry.tags.any { it.equals(tag, ignoreCase = true) }
-            FilterChipPill(
-                label = "#$tag",
-                selected = assigned,
-                onClick = { onAction(MainAction.ToggleTagOnEntry(entry.id, tag)) },
-            )
+    if (allTags.isNotEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            allTags.forEach { tag ->
+                val assigned = entry.tags.any { it.equals(tag, ignoreCase = true) }
+                FilterChipPill(
+                    label = "#$tag",
+                    selected = assigned,
+                    onClick = { onAction(MainAction.ToggleTagOnEntry(entry.id, tag)) },
+                )
+            }
         }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = customTag,
+            onValueChange = { customTag = it },
+            placeholder = { Text("Add new #tag…", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.weight(1f),
+        )
+        HeaderActionButton(
+            label = "Add Tag",
+            onClick = {
+                val clean = customTag.trim().trimStart('#')
+                if (clean.isNotBlank()) {
+                    onAction(MainAction.ToggleTagOnEntry(entry.id, clean))
+                    customTag = ""
+                }
+            },
+        )
     }
 }
 

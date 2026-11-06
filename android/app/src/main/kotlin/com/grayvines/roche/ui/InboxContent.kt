@@ -47,6 +47,7 @@ import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -58,22 +59,22 @@ fun InboxTabContent(
 ) {
     val colors = LocalRocheColors.current
     Column(modifier = Modifier.fillMaxSize()) {
-        InboxTopBar(state = state, onAction = onAction)
+        RocheTopHeader(
+            title = "Roche",
+            subtitle = "${state.visibleEntries.size} items",
+        ) {
+            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+        }
 
         InboxFilterStrip(state = state, onAction = onAction)
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
         if (state.visibleEntries.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "No entries match this view.",
-                    color = colors.textMuted,
-                    fontSize = 13.sp,
-                )
-            }
+            InboxEmptyState(
+                hasEntriesAtAll = state.allEntries.isNotEmpty(),
+                onSaveClick = { onAction(MainAction.OpenAddSheet()) },
+                onSyncClick = { onAction(MainAction.SyncNow) },
+            )
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize().testTag("inbox_list"),
@@ -97,40 +98,36 @@ fun InboxTabContent(
 }
 
 @Composable
-private fun InboxTopBar(state: MainUiState, onAction: (MainAction) -> Unit) {
+private fun InboxEmptyState(
+    hasEntriesAtAll: Boolean,
+    onSaveClick: () -> Unit,
+    onSyncClick: () -> Unit,
+) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
-
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+    Box(
+        modifier = Modifier.fillMaxSize().padding(32.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Row(
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
-                text = "Roche",
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 23.sp,
+                text =
+                    if (hasEntriesAtAll) {
+                        "No entries match this filter."
+                    } else {
+                        "Your inbox is empty."
+                    },
+                color = colors.textSecondary,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
             )
-            Text(
-                text = "${state.visibleEntries.size} items",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                modifier = Modifier.padding(bottom = 3.dp),
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                HeaderActionButton(label = "Save URL or Feed", onClick = onSaveClick)
+                HeaderActionButton(label = "Sync", onClick = onSyncClick)
+            }
         }
-        HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
     }
 }
 
@@ -386,12 +383,14 @@ private fun EntrySourceMetaRow(entry: InboxEntry) {
             fontWeight = FontWeight.Medium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
         )
         Text(
-            text = "· ${entry.publishedAt ?: "recent"} · ${entry.readEstimateLabel}",
+            text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
             color = colors.textMuted,
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
+            maxLines = 1,
         )
         if (entry.isCachedOffline) {
             Text(

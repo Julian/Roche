@@ -110,23 +110,89 @@ private fun RowScope.BottomBarTabItem(tab: AppTab, isSelected: Boolean, onClick:
 }
 
 @Composable
+fun RocheTopHeader(
+    title: String,
+    modifier: Modifier = Modifier,
+    subtitle: String? = null,
+    trailing: (@Composable RowScope.() -> Unit)? = null,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (
+            com.grayvines.roche.ui.theme.LocalHeadlineFont.current ==
+                com.grayvines.roche.model.HeadlineFont.SERIF
+        ) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+
+    Row(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1f, fill = false),
+        ) {
+            Text(
+                text = title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 23.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(bottom = 3.dp),
+                )
+            }
+        }
+        if (trailing != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                content = trailing,
+            )
+        }
+    }
+}
+
+@Composable
 fun FilterChipPill(label: String, selected: Boolean, onClick: () -> Unit) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(6.dp)
-    val bg = if (selected) colors.surfaceElevated else Color.Transparent
+    val shape = RoundedCornerShape(8.dp)
+    val bg =
+        if (selected) {
+            colors.accentBlue.copy(alpha = 0.16f)
+        } else {
+            colors.surface
+        }
     val border = if (selected) colors.accentBlue else colors.border
     val textColor = if (selected) colors.textPrimary else colors.textSecondary
     val weight = if (selected) FontWeight.SemiBold else FontWeight.Medium
 
     Box(
+        contentAlignment = Alignment.Center,
         modifier =
-            Modifier.clip(shape)
+            Modifier.height(32.dp)
+                .clip(shape)
                 .background(bg)
                 .border(width = 1.dp, color = border, shape = shape)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 11.dp, vertical = 5.dp)
+                .semantics {
+                    role = Role.Tab
+                    this.selected = selected
+                }
+                .padding(horizontal = 12.dp),
     ) {
-        Text(text = label, color = textColor, fontSize = 12.sp, fontWeight = weight)
+        Text(text = label, color = textColor, fontSize = 12.sp, fontWeight = weight, maxLines = 1)
     }
 }
 

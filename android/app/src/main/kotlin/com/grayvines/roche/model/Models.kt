@@ -1,5 +1,12 @@
 package com.grayvines.roche.model
 
+import java.time.Duration
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
 enum class ContentType(val wireValue: String) {
     ARTICLE("article"),
     PDF("pdf"),
@@ -107,14 +114,34 @@ data class InboxEntry(
     val showsThumbnailPreview: Boolean
         get() = contentType != ContentType.ARTICLE
 
+    val formattedPublishedLabel: String
+        get() = formatRelativeTimestamp(publishedAt ?: createdAt)
+
     val readEstimateLabel: String
         get() =
             when (contentType) {
                 ContentType.VIDEO -> duration ?: "Video"
-                ContentType.PDF -> "PDF"
+                ContentType.PDF -> duration ?: "PDF"
                 ContentType.ARTICLE ->
                     formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
             }
+}
+
+internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now()): String {
+    val trimmed = raw?.trim().orEmpty()
+    if (trimmed.isBlank()) return "recent"
+    val instant =
+        runCatching { Instant.parse(trimmed) }.getOrNull()
+            ?: runCatching { OffsetDateTime.parse(trimmed).toInstant() }.getOrNull()
+            ?: return trimmed
+    val seconds = Duration.between(instant, now).seconds.coerceAtLeast(0L)
+    return when {
+        seconds < SECONDS_PER_MIN -> "now"
+        seconds < SECONDS_PER_HOUR -> "${seconds / SECONDS_PER_MIN}m"
+        seconds < SECONDS_PER_DAY -> "${seconds / SECONDS_PER_HOUR}h"
+        seconds < SECONDS_PER_MONTH -> "${seconds / SECONDS_PER_DAY}d"
+        else -> SHORT_DATE_FORMATTER.format(instant.atOffset(ZoneOffset.UTC))
+    }
 }
 
 internal fun formatArticleMinutes(text: String): String {
@@ -123,5 +150,10 @@ internal fun formatArticleMinutes(text: String): String {
     return "${minutes}m"
 }
 
+private const val SECONDS_PER_MIN = 60L
+private const val SECONDS_PER_HOUR = 3_600L
+private const val SECONDS_PER_DAY = 86_400L
+private const val SECONDS_PER_MONTH = 2_592_000L
 private const val ARTICLE_WORDS_PER_MINUTE = 180
 private val WHITESPACE_REGEX_TOP = Regex("""\s+""")
+private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

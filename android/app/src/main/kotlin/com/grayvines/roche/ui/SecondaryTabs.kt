@@ -41,6 +41,7 @@ import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
+import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
@@ -86,37 +87,23 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
 
 @Composable
 private fun SearchHeaderSection(state: MainUiState, onAction: (MainAction) -> Unit) {
-    val colors = LocalRocheColors.current
-    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.Bottom,
-        ) {
-            Text(
-                text = "Search",
-                color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            Text(
-                text = "${state.searchResults.size} matches",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-            )
-        }
-        Spacer(modifier = Modifier.height(10.dp))
-        OutlinedTextField(
-            value = state.searchQuery,
-            onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
-            placeholder = { Text("Search titles, authors, feeds, #tags…", fontSize = 13.sp) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth().testTag("search_input"),
+    Column(modifier = Modifier.fillMaxWidth()) {
+        RocheTopHeader(
+            title = "Search",
+            subtitle = "${state.searchResults.size} matches",
         )
-        Spacer(modifier = Modifier.height(8.dp))
-        SearchQuickTagStrip(state = state, onAction = onAction)
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            OutlinedTextField(
+                value = state.searchQuery,
+                onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
+                placeholder = { Text("Search titles, authors, feeds, #tags…", fontSize = 13.sp) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().testTag("search_input"),
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            SearchQuickTagStrip(state = state, onAction = onAction)
+            Spacer(modifier = Modifier.height(10.dp))
+        }
     }
 }
 
@@ -151,21 +138,46 @@ private fun SearchQuickTagStrip(state: MainUiState, onAction: (MainAction) -> Un
 @Composable
 fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    Column(
-        modifier =
-            Modifier.fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-    ) {
-        FeedsTabHeader(onAction = onAction)
-        Spacer(modifier = Modifier.height(16.dp))
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(
+            title = "Feeds & Tags",
+            subtitle = "${state.feeds.size} feeds",
+        ) {
+            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+        }
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        Column(
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+        ) {
+            TagsSection(state = state, onAction = onAction)
+            Spacer(modifier = Modifier.height(20.dp))
+            SubscribedFeedsSection(state = state, onAction = onAction)
+            Spacer(modifier = Modifier.height(72.dp))
+        }
+    }
+}
+
+@Composable
+internal fun TagsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = "TAGS",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    if (state.tags.isEmpty()) {
         Text(
-            text = "TAGS",
+            text = "No tags yet. Add tags when saving a link or via an item's menu.",
             color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
+            fontSize = 12.5.sp,
         )
-        Spacer(modifier = Modifier.height(8.dp))
+    } else {
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -178,14 +190,26 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 )
             }
         }
-        Spacer(modifier = Modifier.height(20.dp))
+    }
+}
+
+@Composable
+internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = "SUBSCRIBED FEEDS",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    if (state.feeds.isEmpty()) {
         Text(
-            text = "SUBSCRIBED FEEDS",
+            text = "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube.",
             color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
+            fontSize = 12.5.sp,
         )
-        Spacer(modifier = Modifier.height(8.dp))
+    } else {
         state.feeds.forEach { feed ->
             SubscribedFeedRow(
                 feed = feed,
@@ -193,25 +217,6 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
-    }
-}
-
-@Composable
-private fun FeedsTabHeader(onAction: (MainAction) -> Unit) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = "Feeds & Tags",
-            color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
     }
 }
 
@@ -258,82 +263,95 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
     val offlineEntries = state.offlineEntries
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 12.dp)) {
-        Text(
-            text = "Offline Vault",
-            color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Medium,
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(
+            title = "Offline Vault",
+            subtitle = "${offlineEntries.size} cached",
         )
-        Text(
-            text = "${offlineEntries.size} entries cached locally on device",
-            color = colors.textSecondary,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-        )
-        Spacer(modifier = Modifier.height(12.dp))
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        LazyColumn(modifier = Modifier.fillMaxSize()) {
-            items(items = offlineEntries, key = { it.id }) { entry ->
-                Row(
-                    modifier =
-                        Modifier.fillMaxWidth()
-                            .clickable { onAction(MainAction.OpenReader(entry.id)) }
-                            .padding(vertical = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = entry.title,
-                            color = colors.textPrimary,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text =
-                                "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
-                            color = colors.textMuted,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                        )
-                    }
-                    HeaderActionButton(
-                        label = "Evict",
-                        onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-                    )
+        if (offlineEntries.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "No offline entries cached on this device.",
+                    color = colors.textMuted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+            ) {
+                items(items = offlineEntries, key = { it.id }) { entry ->
+                    OfflineVaultEntryRow(entry = entry, onAction = onAction)
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
-                HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
         }
     }
 }
 
 @Composable
+private fun OfflineVaultEntryRow(
+    entry: com.grayvines.roche.model.InboxEntry,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable { onAction(MainAction.OpenReader(entry.id)) }
+                .padding(vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                text = entry.title,
+                color = colors.textPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text =
+                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
+        HeaderActionButton(
+            label = "Evict",
+            onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+        )
+    }
+}
+
+@Composable
 fun SettingsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    Column(
-        modifier =
-            Modifier.fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "Settings",
-            color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.Medium,
-        )
-
-        AppearanceTogglesSection(state = state, onAction = onAction)
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(title = "Settings")
         HorizontalDivider(color = colors.border, thickness = 1.dp)
-        ServerConfigSection(state = state, onAction = onAction)
+
+        Column(
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            AppearanceTogglesSection(state = state, onAction = onAction)
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            ServerConfigSection(state = state, onAction = onAction)
+            Spacer(modifier = Modifier.height(24.dp))
+        }
     }
 }
 
