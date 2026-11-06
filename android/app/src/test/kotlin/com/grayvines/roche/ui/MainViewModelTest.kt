@@ -10,6 +10,7 @@ import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
 import java.io.File
+import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.collect
@@ -134,8 +135,25 @@ class MainViewModelTest {
 
         viewModel.dispatch(MainAction.UpdateReadProgress(entryId = "item-1", progress = 0.65))
 
-        val updated = repository.snapshot.first().entries.first { it.id == "item-1" }
+        val updated =
+            repository.snapshot
+                .first { snap ->
+                    snap.entries.any { it.id == "item-1" && abs(it.readProgress - 0.65) < 1e-6 }
+                }
+                .entries
+                .first { it.id == "item-1" }
         assertEquals(0.65, updated.readProgress, 1e-6)
+
+        viewModel.dispatch(MainAction.UpdateReadProgress(entryId = "item-1", progress = 1.4))
+
+        val clamped =
+            repository.snapshot
+                .first { snap ->
+                    snap.entries.any { it.id == "item-1" && abs(it.readProgress - 1.0) < 1e-6 }
+                }
+                .entries
+                .first { it.id == "item-1" }
+        assertEquals(1.0, clamped.readProgress, 1e-6)
 
         collectJob.cancel()
     }
