@@ -522,14 +522,22 @@ private fun ContextSheetActionsList(
         )
     }
     ContextActionItem(label = "Open Original URL", onClick = onOpenExternalUrl)
+    ContextActionItem(
+        label = "Delete Entry",
+        textColor = LocalRocheColors.current.accentIndianRed,
+        onClick = { onAction(MainAction.DeleteEntry(entry.id)) },
+    )
 }
 
 @Composable
-private fun ContextActionItem(label: String, onClick: () -> Unit) {
-    val colors = LocalRocheColors.current
+private fun ContextActionItem(
+    label: String,
+    onClick: () -> Unit,
+    textColor: androidx.compose.ui.graphics.Color = LocalRocheColors.current.textPrimary,
+) {
     Text(
         text = label,
-        color = colors.textPrimary,
+        color = textColor,
         fontSize = 14.sp,
         modifier =
             Modifier.fillMaxWidth()

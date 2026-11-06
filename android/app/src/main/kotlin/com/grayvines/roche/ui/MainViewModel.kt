@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -40,6 +41,7 @@ data class MainUiState(
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
+    val isSyncing: Boolean = false,
     val visibleEntries: List<InboxEntry> = emptyList(),
     val searchResults: List<InboxEntry> = emptyList(),
     val allEntries: List<InboxEntry> = emptyList(),
@@ -109,7 +111,20 @@ sealed interface MainAction {
     data class SaveUrlOrFeed(val url: String, val titleOverride: String?, val tagCsv: String) :
         Mutation
 
+    data class RefreshFeed(val feedId: String) : Mutation
+
+    data class DeleteFeed(val feedId: String) : Mutation
+
+    data class DeleteEntry(val entryId: String) : Mutation
+
     data object SyncNow : Mutation
+
+    data class SyncWithServerConfig(
+        val serverUrl: String,
+        val bearerToken: String,
+    ) : Mutation
+
+    data object StartupSyncIfConfigured : Mutation
 
     data class SetThemeMode(val mode: ThemeMode) : Mutation
 
@@ -122,6 +137,7 @@ sealed interface MainAction {
     data class UpdateServerConfig(
         val serverUrl: String,
         val bearerToken: String,
+        val silent: Boolean = false,
     ) : Mutation
 
     data class PairWithServer(
@@ -144,6 +160,7 @@ internal data class TransientUiState(
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
+    val isSyncing: Boolean = false,
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
 )
@@ -176,6 +193,10 @@ class MainViewModel(
         }
     }
 
+    fun triggerStartupSyncIfConfigured() {
+        dispatch(MainAction.StartupSyncIfConfigured)
+    }
+
     private suspend fun executeMutation(action: MainAction.Mutation) {
         when (action) {
             is MainAction.ToggleArchive -> performToggleArchive(action.entry)
@@ -188,9 +209,31 @@ class MainViewModel(
                 repository.updateReadProgress(itemId = action.entryId, progress = action.progress)
             is MainAction.SaveUrlOrFeed ->
                 performSaveUrl(action.url, action.titleOverride, action.tagCsv)
-            MainAction.SyncNow -> performSync()
+            else -> executeSyncOrSettingsMutation(action)
+        }
+    }
+
+    internal suspend fun executeSyncOrSettingsMutation(action: MainAction.Mutation) {
+        when (action) {
+            is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
+            is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
+            is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
+            MainAction.SyncNow -> performSync(silentOnError = false)
+            is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
+            MainAction.StartupSyncIfConfigured -> performStartupSync()
             else -> applySettingsMutation(action)
         }
+    }
+
+    internal suspend fun performSyncWithServerConfig(action: MainAction.SyncWithServerConfig) {
+        performUpdateServerConfig(
+            MainAction.UpdateServerConfig(
+                serverUrl = action.serverUrl,
+                bearerToken = action.bearerToken,
+                silent = true,
+            )
+        )
+        performSync(silentOnError = false)
     }
 
     private suspend fun applySettingsMutation(action: MainAction.Mutation) {
@@ -217,7 +260,11 @@ class MainViewModel(
                 bearerToken = action.bearerToken,
             )
         }
-        transientState.update { it.copy(statusBanner = "Saved server settings") }
+        if (!action.silent) {
+            transientState.update {
+                it.copy(undoEvent = null, statusBanner = "Saved server settings")
+            }
+        }
     }
 
     internal suspend fun performDiscoverServer() {
@@ -228,12 +275,14 @@ class MainViewModel(
                     onSuccess = { url -> "Discovered Roche server at $url" },
                     onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
                 )
-        transientState.update { it.copy(statusBanner = message) }
+        transientState.update { it.copy(undoEvent = null, statusBanner = message) }
     }
 
-    private suspend fun performPairWithServer(action: MainAction.PairWithServer) {
+    internal suspend fun performPairWithServer(action: MainAction.PairWithServer) {
         if (action.pairingCode.isBlank()) {
-            transientState.update { it.copy(statusBanner = "Enter a pairing code") }
+            transientState.update {
+                it.copy(undoEvent = null, statusBanner = "Enter a pairing code")
+            }
             return
         }
         repository
@@ -245,29 +294,34 @@ class MainViewModel(
             .onSuccess {
                 val syncCount = repository.syncWithServer().getOrNull()
                 val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
-                transientState.update { it.copy(statusBanner = "Paired with server$suffix") }
+                transientState.update {
+                    it.copy(undoEvent = null, statusBanner = "Paired with server$suffix")
+                }
             }
             .onFailure { error ->
                 transientState.update {
-                    it.copy(statusBanner = "Pairing failed (${error.message ?: "error"})")
+                    it.copy(
+                        undoEvent = null,
+                        statusBanner = "Pairing failed (${error.message ?: "error"})",
+                    )
                 }
             }
     }
 
-    private suspend fun performToggleStar(entryId: String) {
+    internal suspend fun performToggleStar(entryId: String) {
         val starred = repository.toggleStar(entryId)
         transientState.update {
-            it.copy(statusBanner = if (starred) "Starred" else "Removed star")
+            it.copy(undoEvent = null, statusBanner = if (starred) "Starred" else "Removed star")
         }
     }
 
-    private suspend fun performToggleOffline(entryId: String) {
+    internal suspend fun performToggleOffline(entryId: String) {
         val cached = repository.toggleOfflineCache(entryId)
         val msg = if (cached) "Cached local copy" else "Removed local offline copy"
-        transientState.update { it.copy(statusBanner = msg) }
+        transientState.update { it.copy(undoEvent = null, statusBanner = msg) }
     }
 
-    private suspend fun performToggleArchive(entry: InboxEntry) {
+    internal suspend fun performToggleArchive(entry: InboxEntry) {
         val targetArchived = !entry.isArchived
         val previousStatus =
             repository.setArchiveState(itemId = entry.id, archived = targetArchived) ?: entry.status
@@ -282,6 +336,7 @@ class MainViewModel(
             current.copy(
                 selectedReaderEntryId = nextReaderId,
                 contextSheetEntryId = null,
+                statusBanner = null,
                 undoEvent =
                     UndoArchiveEvent(
                         itemId = entry.id,
@@ -292,13 +347,13 @@ class MainViewModel(
         }
     }
 
-    private suspend fun performUndoArchive() {
+    internal suspend fun performUndoArchive() {
         val pending = transientState.value.undoEvent ?: return
         repository.restoreStatus(itemId = pending.itemId, status = pending.previousStatus)
         transientState.update { it.copy(undoEvent = null, statusBanner = "Restored entry") }
     }
 
-    private suspend fun performSaveUrl(url: String, titleOverride: String?, tagCsv: String) {
+    internal suspend fun performSaveUrl(url: String, titleOverride: String?, tagCsv: String) {
         if (url.isBlank()) return
         val created =
             repository.saveUrlOrFeed(
@@ -316,24 +371,144 @@ class MainViewModel(
                 selectedReaderEntryId = null,
                 activeTab = nextTab,
                 activeFilter = InboxFilter.UNREAD,
+                undoEvent = null,
                 statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
             )
         }
     }
 
-    private suspend fun performSync() {
+    internal suspend fun performRefreshFeed(feedId: String) {
+        if (!tryAcquireSyncLock()) return
+        try {
+            repository
+                .refreshFeed(feedId)
+                .onSuccess { title ->
+                    transientState.update {
+                        it.copy(
+                            undoEvent = null,
+                            statusBanner = "Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    transientState.update {
+                        it.copy(
+                            undoEvent = null,
+                            statusBanner = "Refresh failed (${error.message ?: "unreachable"})",
+                        )
+                    }
+                }
+        } finally {
+            transientState.update { it.copy(isSyncing = false) }
+        }
+    }
+
+    internal suspend fun performDeleteFeed(feedId: String) {
         repository
-            .syncWithServer()
-            .onSuccess { count ->
-                transientState.update {
-                    it.copy(statusBanner = "Synced $count entries from server")
+            .deleteFeed(feedId)
+            .onSuccess { title ->
+                transientState.update { current ->
+                    val nextFeedId =
+                        if (current.selectedFeedId == feedId) null else current.selectedFeedId
+                    current.copy(
+                        selectedFeedId = nextFeedId,
+                        undoEvent = null,
+                        statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                    )
                 }
             }
             .onFailure { error ->
                 transientState.update {
-                    it.copy(statusBanner = "Sync offline (${error.message ?: "unreachable"})")
+                    it.copy(
+                        undoEvent = null,
+                        statusBanner = "Unsubscribe failed (${error.message ?: "error"})",
+                    )
                 }
             }
+    }
+
+    internal suspend fun performDeleteEntry(entryId: String) {
+        repository
+            .deleteItem(entryId)
+            .onSuccess { title ->
+                transientState.update { current ->
+                    val nextReaderId =
+                        if (current.selectedReaderEntryId == entryId) {
+                            null
+                        } else {
+                            current.selectedReaderEntryId
+                        }
+                    val nextSheetId =
+                        if (current.contextSheetEntryId == entryId) {
+                            null
+                        } else {
+                            current.contextSheetEntryId
+                        }
+                    current.copy(
+                        selectedReaderEntryId = nextReaderId,
+                        contextSheetEntryId = nextSheetId,
+                        undoEvent = null,
+                        statusBanner = "Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                    )
+                }
+            }
+            .onFailure { error ->
+                transientState.update {
+                    it.copy(
+                        undoEvent = null,
+                        statusBanner = "Delete failed (${error.message ?: "error"})",
+                    )
+                }
+            }
+    }
+
+    internal suspend fun performStartupSync() {
+        val currentSettings = settingsRepository.settings.first()
+        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            performSync(silentOnError = true)
+        }
+    }
+
+    private suspend fun performSync(silentOnError: Boolean = false) {
+        if (!tryAcquireSyncLock()) return
+        try {
+            repository
+                .syncWithServer()
+                .onSuccess { count ->
+                    transientState.update {
+                        it.copy(
+                            undoEvent = null,
+                            statusBanner = "Synced $count entries from server",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    if (!silentOnError) {
+                        transientState.update {
+                            it.copy(
+                                undoEvent = null,
+                                statusBanner = "Sync offline (${error.message ?: "unreachable"})",
+                            )
+                        }
+                    }
+                }
+        } finally {
+            transientState.update { it.copy(isSyncing = false) }
+        }
+    }
+
+    internal fun tryAcquireSyncLock(): Boolean {
+        var acquired = false
+        transientState.update { current ->
+            if (current.isSyncing) {
+                acquired = false
+                current
+            } else {
+                acquired = true
+                current.copy(isSyncing = true)
+            }
+        }
+        return acquired
     }
 
     class Factory(
@@ -443,6 +618,7 @@ internal fun buildMainUiState(
         isAddSheetOpen = local.isAddSheetOpen,
         prefilledShareUrl = local.prefilledShareUrl,
         prefilledShareTitle = local.prefilledShareTitle,
+        isSyncing = local.isSyncing,
         visibleEntries = filtered,
         searchResults = searchResults,
         allEntries = snapshot.entries,

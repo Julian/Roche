@@ -19,10 +19,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -69,28 +71,34 @@ fun InboxTabContent(
         InboxFilterStrip(state = state, onAction = onAction)
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (state.visibleEntries.isEmpty()) {
-            InboxEmptyState(
-                hasEntriesAtAll = state.allEntries.isNotEmpty(),
-                onSaveClick = { onAction(MainAction.OpenAddSheet()) },
-                onSyncClick = { onAction(MainAction.SyncNow) },
-            )
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().testTag("inbox_list"),
-                contentPadding = PaddingValues(bottom = 88.dp),
-            ) {
-                items(items = state.visibleEntries, key = { it.id }) { entry ->
-                    InboxEntryRowItem(
-                        entry = entry,
-                        ultraDense = state.settings.ultraDenseRows,
-                        swipeToArchiveEnabled = state.settings.swipeToArchive,
-                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-                    )
-                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("inbox_pull_to_refresh"),
+        ) {
+            if (state.visibleEntries.isEmpty()) {
+                InboxEmptyState(
+                    hasEntriesAtAll = state.allEntries.isNotEmpty(),
+                    onSaveClick = { onAction(MainAction.OpenAddSheet()) },
+                    onSyncClick = { onAction(MainAction.SyncNow) },
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize().testTag("inbox_list"),
+                    contentPadding = PaddingValues(bottom = 88.dp),
+                ) {
+                    items(items = state.visibleEntries, key = { it.id }) { entry ->
+                        InboxEntryRowItem(
+                            entry = entry,
+                            ultraDense = state.settings.ultraDenseRows,
+                            swipeToArchiveEnabled = state.settings.swipeToArchive,
+                            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                            onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                        )
+                        HorizontalDivider(color = colors.border, thickness = 1.dp)
+                    }
                 }
             }
         }
@@ -105,7 +113,7 @@ private fun InboxEmptyState(
 ) {
     val colors = LocalRocheColors.current
     Box(
-        modifier = Modifier.fillMaxSize().padding(32.dp),
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(

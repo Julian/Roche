@@ -53,7 +53,8 @@ class RocheRepository(
         }
 
     suspend fun setArchiveState(itemId: String, archived: Boolean): ItemStatus? {
-        val previous = dao.getItemById(itemId)?.let { ItemStatus.fromWireValue(it.status) }
+        val current = dao.getItemById(itemId) ?: return null
+        val previous = ItemStatus.fromWireValue(current.status)
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
         dao.updateItemStatus(itemId, newStatus.wireValue)
         syncStatusMutation(
@@ -66,7 +67,8 @@ class RocheRepository(
         return previous
     }
 
-    suspend fun restoreStatus(itemId: String, status: ItemStatus) {
+    internal suspend fun restoreStatus(itemId: String, status: ItemStatus) {
+        if (dao.getItemById(itemId) == null) return
         dao.updateItemStatus(itemId, status.wireValue)
         syncStatusMutation(
             dao = dao,
@@ -98,8 +100,8 @@ class RocheRepository(
         return updated
     }
 
-    suspend fun updateReadProgress(itemId: String, progress: Double) {
-        if (!progress.isFinite()) return
+    internal suspend fun updateReadProgress(itemId: String, progress: Double) {
+        if (!progress.isFinite() || dao.getItemById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
         dao.updateReadProgress(itemId, clamped)
         syncReadProgressMutation(
@@ -111,9 +113,9 @@ class RocheRepository(
         )
     }
 
-    suspend fun toggleTagOnItem(itemId: String, tagName: String) {
+    internal suspend fun toggleTagOnItem(itemId: String, tagName: String) {
         val normalized = normalizeTagName(tagName)
-        if (normalized.isBlank()) return
+        if (normalized.isBlank() || dao.getItemById(itemId) == null) return
         val existingTag =
             dao.getTagByName(normalized)
                 ?: TagEntity(id = newTagId(), name = normalized).also { dao.upsertTag(it) }
@@ -139,6 +141,61 @@ class RocheRepository(
                 normalizedName = normalized,
             )
         }
+    }
+
+    suspend fun refreshFeed(feedId: String): Result<String> = runCatching {
+        val currentSettings = settings.settings.first()
+        check(currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            "Configure Server URL in Settings"
+        }
+        val existingTitle = dao.getFeedById(feedId)?.title
+        val refreshed =
+            apiClient.refreshFeed(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                feedId = feedId,
+            )
+        if (refreshed.id.isNotBlank()) {
+            dao.upsertFeed(toRemoteFeedEntity(refreshed))
+        }
+        syncWithServer()
+        refreshed.title.ifBlank { existingTitle ?: feedId }
+    }
+
+    suspend fun deleteFeed(feedId: String): Result<String> = runCatching {
+        deleteFeedFromServerOrLocal(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            offlineCacheManager = offlineCacheManager,
+            feedId = feedId,
+        )
+    }
+
+    suspend fun deleteItem(itemId: String): Result<String> = runCatching {
+        val existing = dao.getItemById(itemId)
+        val wasLocalUnpushed = dao.getPendingMutation(itemId)?.isLocalItem == true
+        offlineCacheManager.evictCachedItemFiles(itemId)
+        dao.deleteItemTagsForItem(itemId)
+        dao.deletePendingMutation(itemId)
+        dao.deleteItemById(itemId)
+        if (!wasLocalUnpushed) {
+            val deletedOnServer =
+                pushDeleteItemBestEffort(
+                    apiClient = apiClient,
+                    settings = settings,
+                    itemId = itemId,
+                )
+            if (!deletedOnServer) {
+                dao.upsertPendingMutation(
+                    PendingMutationEntity(
+                        entityId = itemId,
+                        dirtyStatus = DELETED_STATUS_TOMBSTONE,
+                    )
+                )
+            }
+        }
+        existing?.title ?: itemId
     }
 
     suspend fun saveUrlOrFeed(

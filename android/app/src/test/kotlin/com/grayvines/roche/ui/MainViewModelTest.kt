@@ -157,4 +157,76 @@ class MainViewModelTest {
 
         collectJob.cancel()
     }
+
+    @Test
+    internal fun `DeleteEntry DeleteFeed RefreshFeed and SyncNow update UI state and isSyncing`() =
+        runTest {
+            database.dao().upsertFeeds(SeedData.feeds)
+            database.dao().upsertItems(SeedData.items)
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+            // Select a feed and open reader + context sheet for item-1
+            viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
+            viewModel.dispatch(MainAction.OpenReader("item-1"))
+            viewModel.dispatch(MainAction.OpenContextSheet("item-1"))
+            val beforeDelete =
+                viewModel.uiState.first { state ->
+                    state.allEntries.isNotEmpty() && state.selectedReaderEntryId == "item-1"
+                }
+            assertEquals("item-1", beforeDelete.selectedReaderEntryId)
+
+            // Archive sets undoEvent, and DeleteEntry clears undoEvent while setting statusBanner
+            val item2 = beforeDelete.allEntries.first { it.id == "item-2" }
+            viewModel.dispatch(MainAction.ToggleArchive(item2))
+            val afterArchive = viewModel.uiState.first { it.undoEvent != null }
+            assertEquals("item-2", afterArchive.undoEvent?.itemId)
+            assertNull(afterArchive.statusBanner)
+
+            // DeleteEntry closes reader & context sheet, clears undoEvent, and removes entry
+            viewModel.dispatch(MainAction.DeleteEntry("item-1"))
+            val afterDeleteEntry =
+                viewModel.uiState.first { state ->
+                    state.allEntries.none { it.id == "item-1" } &&
+                        state.statusBanner?.startsWith("Deleted") == true
+                }
+            assertNull(afterDeleteEntry.selectedReaderEntryId)
+            assertNull(afterDeleteEntry.contextSheetEntryId)
+            assertNull(afterDeleteEntry.undoEvent)
+            assertTrue(afterDeleteEntry.statusBanner?.startsWith("Deleted") == true)
+
+            // DeleteFeed clears selectedFeedId when that feed was selected
+            viewModel.dispatch(MainAction.DeleteFeed("feed-arxiv-cs-lg"))
+            val afterDeleteFeed =
+                viewModel.uiState.first { state ->
+                    state.feeds.none { it.id == "feed-arxiv-cs-lg" } &&
+                        state.statusBanner?.startsWith("Unsubscribed") == true
+                }
+            assertNull(afterDeleteFeed.selectedFeedId)
+            assertTrue(afterDeleteFeed.statusBanner?.startsWith("Unsubscribed") == true)
+
+            // StartupSyncIfConfigured is silent when unconfigured or offline, and resets isSyncing
+            viewModel.dispatch(MainAction.DismissMessages)
+            val dismissed = viewModel.uiState.first { it.statusBanner == null }
+            assertFalse(dismissed.isSyncing)
+            viewModel.triggerStartupSyncIfConfigured()
+            assertFalse(viewModel.uiState.value.isSyncing)
+            assertNull(viewModel.uiState.value.statusBanner)
+
+            // SyncNow sets statusBanner and resets isSyncing to false in finally block
+            viewModel.dispatch(MainAction.SyncNow)
+            val afterSync =
+                viewModel.uiState.first { it.statusBanner?.startsWith("Sync offline") == true }
+            assertFalse(afterSync.isSyncing)
+            assertTrue(afterSync.statusBanner?.startsWith("Sync offline") == true)
+
+            // RefreshFeed sets statusBanner and resets isSyncing to false in finally block
+            viewModel.dispatch(MainAction.DismissMessages)
+            viewModel.uiState.first { it.statusBanner == null }
+            viewModel.dispatch(MainAction.RefreshFeed("feed-2"))
+            val afterRefresh =
+                viewModel.uiState.first { it.statusBanner?.startsWith("Refresh failed") == true }
+            assertFalse(afterRefresh.isSyncing)
+
+            collectJob.cancel()
+        }
 }

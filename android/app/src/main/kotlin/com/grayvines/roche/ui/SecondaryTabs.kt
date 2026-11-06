@@ -21,6 +21,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -28,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -35,6 +37,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -44,6 +47,7 @@ import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlinx.coroutines.delay
 
 @Composable
 fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
@@ -214,6 +218,8 @@ internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -
             SubscribedFeedRow(
                 feed = feed,
                 onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
+                onDelete = { onAction(MainAction.DeleteFeed(feed.id)) },
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
@@ -221,7 +227,12 @@ internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -
 }
 
 @Composable
-private fun SubscribedFeedRow(feed: FeedItem, onClick: () -> Unit) {
+private fun SubscribedFeedRow(
+    feed: FeedItem,
+    onClick: () -> Unit,
+    onRefresh: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val colors = LocalRocheColors.current
     Row(
         modifier =
@@ -232,7 +243,7 @@ private fun SubscribedFeedRow(feed: FeedItem, onClick: () -> Unit) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
             Text(
                 text = feed.title,
                 color = colors.textPrimary,
@@ -248,13 +259,28 @@ private fun SubscribedFeedRow(feed: FeedItem, onClick: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Text(
-            text = feed.unreadCount.toString(),
-            color = colors.accentBlue,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = feed.unreadCount.toString(),
+                color = colors.accentBlue,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            HeaderActionButton(
+                label = "Refresh",
+                onClick = onRefresh,
+                modifier = Modifier.testTag("refresh_feed_${feed.id}"),
+            )
+            HeaderActionButton(
+                label = "Unsubscribe",
+                onClick = onDelete,
+                modifier = Modifier.testTag("delete_feed_${feed.id}"),
+            )
+        }
     }
 }
 
@@ -392,11 +418,28 @@ private fun AppearanceTogglesSection(state: MainUiState, onAction: (MainAction) 
 @Composable
 private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    var serverUrl by
-        rememberSaveable(state.settings.serverUrl) { mutableStateOf(state.settings.serverUrl) }
-    var bearerToken by
-        rememberSaveable(state.settings.bearerToken) { mutableStateOf(state.settings.bearerToken) }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
+    var bearerToken by rememberSaveable { mutableStateOf(state.settings.bearerToken) }
     var pairingCode by rememberSaveable { mutableStateOf("") }
+
+    LaunchedEffect(state.settings.serverUrl) {
+        if (normalizeServerUrl(serverUrl) != state.settings.serverUrl) {
+            serverUrl = state.settings.serverUrl
+        }
+    }
+    LaunchedEffect(state.settings.bearerToken) {
+        if (bearerToken.trim() != state.settings.bearerToken) {
+            bearerToken = state.settings.bearerToken
+        }
+    }
+    ServerConfigAutoSaveEffect(
+        serverUrl = serverUrl,
+        bearerToken = bearerToken,
+        savedServerUrl = state.settings.serverUrl,
+        savedBearerToken = state.settings.bearerToken,
+        onAction = onAction,
+    )
 
     Text(
         text = "SELF-HOSTED SERVER",
@@ -414,7 +457,10 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
     PairingCodeRow(
         pairingCode = pairingCode,
         onPairingCodeChange = { pairingCode = it },
-        onPairClick = { onAction(MainAction.PairWithServer(serverUrl, pairingCode)) },
+        onPairClick = {
+            keyboardController?.hide()
+            onAction(MainAction.PairWithServer(serverUrl, pairingCode))
+        },
     )
     OutlinedTextField(
         value = bearerToken,
@@ -424,6 +470,39 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         visualTransformation = PasswordVisualTransformation(),
         modifier = Modifier.fillMaxWidth().testTag("bearer_token_input"),
     )
+    ServerConfigActionsRow(
+        serverUrl = serverUrl,
+        bearerToken = bearerToken,
+        onAction = onAction,
+        onHideKeyboard = { keyboardController?.hide() },
+    )
+}
+
+@Composable
+internal fun ServerConfigAutoSaveEffect(
+    serverUrl: String,
+    bearerToken: String,
+    savedServerUrl: String,
+    savedBearerToken: String,
+    onAction: (MainAction) -> Unit,
+) {
+    LaunchedEffect(serverUrl, bearerToken) {
+        val normalizedUrl = normalizeServerUrl(serverUrl)
+        val trimmedToken = bearerToken.trim()
+        if (normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken) {
+            delay(SERVER_CONFIG_AUTOSAVE_DELAY_MS)
+            onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken, silent = true))
+        }
+    }
+}
+
+@Composable
+internal fun ServerConfigActionsRow(
+    serverUrl: String,
+    bearerToken: String,
+    onAction: (MainAction) -> Unit,
+    onHideKeyboard: () -> Unit,
+) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -431,15 +510,29 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         HeaderActionButton(
             label = "Save Settings",
             style = RocheButtonStyle.PRIMARY,
-            onClick = { onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken)) },
+            onClick = {
+                onHideKeyboard()
+                onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken))
+            },
         )
         HeaderActionButton(
             label = "Discover on Tailnet",
-            onClick = { onAction(MainAction.DiscoverServer) },
+            onClick = {
+                onHideKeyboard()
+                onAction(MainAction.DiscoverServer)
+            },
         )
-        HeaderActionButton(label = "Sync Now", onClick = { onAction(MainAction.SyncNow) })
+        HeaderActionButton(
+            label = "Sync Now",
+            onClick = {
+                onHideKeyboard()
+                onAction(MainAction.SyncWithServerConfig(serverUrl, bearerToken))
+            },
+        )
     }
 }
+
+private const val SERVER_CONFIG_AUTOSAVE_DELAY_MS = 350L
 
 @Composable
 private fun PairingCodeRow(

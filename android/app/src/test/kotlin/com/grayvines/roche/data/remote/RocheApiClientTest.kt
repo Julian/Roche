@@ -334,4 +334,46 @@ class RocheApiClientTest {
             }
             assertEquals("..%2F..%2Fsecret", encodePathSegment("../../secret"))
         }
+
+    @Test
+    internal fun `refreshFeed deleteFeed and deleteItem send expected endpoints and methods`() =
+        runTest {
+            val recorded = mutableListOf<String>()
+            val client = RocheApiClient { request ->
+                recorded.add("${request.method} ${request.url}")
+                when {
+                    request.method == "POST" &&
+                        request.url == "http://localhost:8080/api/v1/feeds/feed-1/refresh" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"id":"feed-1","title":"Refreshed Feed","url":"https://example.com/rss","feed_type":"rss","unread_count":4}""",
+                        )
+                    request.method == "DELETE" &&
+                        request.url == "http://localhost:8080/api/v1/feeds/feed-1" ->
+                        HttpResponse(statusCode = 204, body = "")
+                    request.method == "DELETE" &&
+                        request.url == "http://localhost:8080/api/v1/items/item-99" ->
+                        HttpResponse(statusCode = 204, body = "")
+                    else -> HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+
+            val refreshed = client.refreshFeed("http://localhost:8080", "tok-123", "feed-1")
+            assertEquals("feed-1", refreshed.id)
+            assertEquals("Refreshed Feed", refreshed.title)
+            assertEquals(4, refreshed.unreadCount)
+
+            client.deleteFeed("http://localhost:8080", "tok-123", "feed-1")
+            client.deleteItem("http://localhost:8080", "tok-123", "item-99")
+
+            assertEquals(
+                listOf(
+                    "POST http://localhost:8080/api/v1/feeds/feed-1/refresh",
+                    "DELETE http://localhost:8080/api/v1/feeds/feed-1",
+                    "DELETE http://localhost:8080/api/v1/items/item-99",
+                ),
+                recorded,
+            )
+        }
 }

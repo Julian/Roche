@@ -245,6 +245,41 @@ class RocheApiClient(private val transport: HttpTransport) {
         return parseFeedJson(response.body)
     }
 
+    suspend fun refreshFeed(
+        serverUrl: String,
+        token: String,
+        feedId: String,
+    ): RemoteFeedDto {
+        val encodedId = encodePathSegment(feedId)
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_POST,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId/refresh",
+                    headers = authHeaders(token),
+                )
+            )
+        ensureSuccess(response)
+        return parseFeedJson(response.body)
+    }
+
+    suspend fun deleteFeed(
+        serverUrl: String,
+        token: String,
+        feedId: String,
+    ) {
+        val encodedId = encodePathSegment(feedId)
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_DELETE,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId",
+                    headers = authHeaders(token),
+                )
+            )
+        ensureSuccess(response)
+    }
+
     suspend fun fetchItems(serverUrl: String, token: String): List<RemoteItemDto> {
         val baseUrl = serverUrl.trimEnd('/')
         val headers = authHeaders(token)
@@ -277,17 +312,16 @@ class RocheApiClient(private val transport: HttpTransport) {
         return collected.values.toList()
     }
 
-    suspend fun fetchItemDetail(
+    internal suspend fun fetchItemDetail(
         serverUrl: String,
         token: String,
         itemId: String,
     ): RemoteItemDto {
-        val encodedId = encodePathSegment(itemId)
         val response =
             transport.execute(
                 HttpRequest(
                     method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$encodedId",
+                    url = itemEndpointUrl(serverUrl, itemId),
                     headers = authHeaders(token),
                 )
             )
@@ -295,17 +329,16 @@ class RocheApiClient(private val transport: HttpTransport) {
         return parseItemJson(response.body)
     }
 
-    suspend fun fetchItemMedia(
+    internal suspend fun fetchItemMedia(
         serverUrl: String,
         token: String,
         itemId: String,
     ): List<RemoteMediaDto> {
-        val encodedId = encodePathSegment(itemId)
         val response =
             transport.execute(
                 HttpRequest(
                     method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$encodedId/media",
+                    url = "${itemEndpointUrl(serverUrl, itemId)}/media",
                     headers = authHeaders(token),
                 )
             )
@@ -313,7 +346,7 @@ class RocheApiClient(private val transport: HttpTransport) {
         return parseMediaJsonArray(response.body)
     }
 
-    suspend fun fetchMediaBytes(
+    internal suspend fun fetchMediaBytes(
         serverUrl: String,
         token: String,
         mediaId: String,
@@ -355,6 +388,22 @@ class RocheApiClient(private val transport: HttpTransport) {
         return parseItemJson(response.body)
     }
 
+    suspend fun deleteItem(
+        serverUrl: String,
+        token: String,
+        itemId: String,
+    ) {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_DELETE,
+                    url = itemEndpointUrl(serverUrl, itemId),
+                    headers = authHeaders(token),
+                )
+            )
+        ensureSuccess(response)
+    }
+
     internal suspend fun updateItem(
         serverUrl: String,
         token: String,
@@ -363,12 +412,11 @@ class RocheApiClient(private val transport: HttpTransport) {
         isFavorite: Boolean? = null,
         readProgress: Double? = null,
     ): RemoteItemDto {
-        val encodedId = encodePathSegment(itemId)
         val response =
             transport.execute(
                 HttpRequest(
                     method = "PATCH",
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$encodedId",
+                    url = itemEndpointUrl(serverUrl, itemId),
                     headers = authHeaders(token),
                     body =
                         buildUpdateItemPayload(
@@ -401,12 +449,11 @@ class RocheApiClient(private val transport: HttpTransport) {
         itemId: String,
         tagName: String,
     ): List<RemoteTagDto> {
-        val encodedId = encodePathSegment(itemId)
         val response =
             transport.execute(
                 HttpRequest(
                     method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/$encodedId/tags",
+                    url = "${itemEndpointUrl(serverUrl, itemId)}/tags",
                     headers = authHeaders(token),
                     body = buildAddItemTagPayload(tagName),
                 )
@@ -421,14 +468,12 @@ class RocheApiClient(private val transport: HttpTransport) {
         itemId: String,
         tagId: String,
     ) {
-        val encodedItemId = encodePathSegment(itemId)
         val encodedTagId = encodePathSegment(tagId)
         val response =
             transport.execute(
                 HttpRequest(
-                    method = "DELETE",
-                    url =
-                        "${serverUrl.trimEnd('/')}/api/v1/items/$encodedItemId/tags/$encodedTagId",
+                    method = METHOD_DELETE,
+                    url = "${itemEndpointUrl(serverUrl, itemId)}/tags/$encodedTagId",
                     headers = authHeaders(token),
                 )
             )
@@ -438,6 +483,7 @@ class RocheApiClient(private val transport: HttpTransport) {
     private companion object {
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
+        private const val METHOD_DELETE = "DELETE"
         private const val ITEMS_PER_PAGE = 200
         private const val MAX_SYNC_PAGES = 25
     }
@@ -445,6 +491,9 @@ class RocheApiClient(private val transport: HttpTransport) {
 
 private const val HTTP_OK_START = 200
 private const val HTTP_OK_END = 299
+
+internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
+    "${serverUrl.trimEnd('/')}/api/v1/items/${encodePathSegment(itemId)}"
 
 internal fun encodePathSegment(raw: String): String =
     URLEncoder.encode(raw, StandardCharsets.UTF_8.name()).replace("+", "%20")

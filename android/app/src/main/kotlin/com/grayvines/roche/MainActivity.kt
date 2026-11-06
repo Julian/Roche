@@ -29,6 +29,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         if (savedInstanceState == null) {
             handleIncomingShareIntent(intent)
+            viewModel.triggerStartupSyncIfConfigured()
         }
         val thumbnailLoader = (application as RocheApp).graph.thumbnailLoader
 

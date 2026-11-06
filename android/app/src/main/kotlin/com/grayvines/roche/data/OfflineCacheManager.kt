@@ -169,7 +169,7 @@ internal class OfflineCacheManager(
             }
         }
 
-    private suspend fun evictCachedItemFiles(itemId: String) {
+    internal suspend fun evictCachedItemFiles(itemId: String) {
         val rootDir = cacheDir ?: return
         withContext(Dispatchers.IO) {
             runCatching {

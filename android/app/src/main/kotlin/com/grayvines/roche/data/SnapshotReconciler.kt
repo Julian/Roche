@@ -57,9 +57,14 @@ internal suspend fun reconcileRemoteSnapshot(
     val remainingMutations = dao.getAllPendingMutations()
     val effectiveMutations = (appliedMutations + remainingMutations).associateBy { it.entityId }
 
-    val adjustedRemoteItems = remoteItems.map { remote ->
-        applyMutationToRemoteItem(remote, effectiveMutations[remote.id])
-    }
+    val adjustedRemoteItems =
+        remoteItems
+            .filterNot { remote ->
+                effectiveMutations[remote.id]?.dirtyStatus == DELETED_STATUS_TOMBSTONE
+            }
+            .map { remote ->
+                applyMutationToRemoteItem(remote, effectiveMutations[remote.id])
+            }
     val unpushedLocalFeeds =
         collectUnpushedLocalFeeds(remainingMutations, existingFeedsById, remoteFeeds)
     val unpushedLocalItems =
@@ -93,7 +98,7 @@ internal suspend fun reconcileRemoteSnapshot(
                 },
         itemTags = (unpushedItemTags + remoteItemTagEntities).distinct(),
     )
-    pruneOrphanedPendingMutations(dao, remainingMutations, adjustedRemoteItems)
+    pruneOrphanedPendingMutations(dao, remainingMutations, remoteItems)
 }
 
 internal fun collectUnpushedLocalFeeds(

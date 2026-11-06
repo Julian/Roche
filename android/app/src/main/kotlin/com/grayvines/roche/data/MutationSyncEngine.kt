@@ -16,6 +16,7 @@ import java.util.UUID
 import kotlinx.coroutines.flow.first
 
 private const val HTTP_NOT_FOUND = 404
+internal const val DELETED_STATUS_TOMBSTONE = "__deleted__"
 
 internal data class PushMutationsOutcome(
     val createdFeeds: List<RemoteFeedDto> = emptyList(),
@@ -541,6 +542,78 @@ internal suspend fun subscribeFeedBestEffort(
     return entity.title
 }
 
+internal suspend fun deleteFeedFromServerOrLocal(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    offlineCacheManager: OfflineCacheManager,
+    feedId: String,
+): String {
+    val existing = dao.getFeedById(feedId)
+    val isLocalFeed = dao.getPendingMutation(feedId)?.isLocalFeed == true
+    if (isLocalFeed) {
+        purgeFeedItemsLocally(dao = dao, offlineCacheManager = offlineCacheManager, feedId = feedId)
+        dao.deletePendingMutation(feedId)
+        dao.deleteFeedById(feedId)
+        return existing?.title ?: feedId
+    }
+    val currentSettings = settings.settings.first()
+    if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+        runCatching {
+            apiClient.deleteFeed(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                feedId = feedId,
+            )
+        }
+            .onFailure { error ->
+                val problem = error as? ProblemDetailsException
+                if (problem?.statusCode != HTTP_NOT_FOUND) throw error
+            }
+    }
+    purgeFeedItemsLocally(dao = dao, offlineCacheManager = offlineCacheManager, feedId = feedId)
+    dao.deletePendingMutation(feedId)
+    dao.deleteFeedById(feedId)
+    return existing?.title ?: feedId
+}
+
+internal suspend fun purgeFeedItemsLocally(
+    dao: RocheDao,
+    offlineCacheManager: OfflineCacheManager,
+    feedId: String,
+) {
+    val feedItems = dao.getAllItems().filter { it.feedId == feedId }
+    for (item in feedItems) {
+        offlineCacheManager.evictCachedItemFiles(item.id)
+        dao.deleteItemTagsForItem(item.id)
+        dao.deletePendingMutation(item.id)
+        dao.deleteItemById(item.id)
+    }
+}
+
+internal suspend fun pushDeleteItemBestEffort(
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    itemId: String,
+): Boolean = runCatching {
+    val currentSettings = settings.settings.first()
+    if (currentSettings.serverUrl.isBlank() || currentSettings.bearerToken.isBlank()) {
+        false
+    } else {
+        apiClient.deleteItem(
+            serverUrl = currentSettings.serverUrl,
+            token = currentSettings.bearerToken,
+            itemId = itemId,
+        )
+        true
+    }
+}
+    .recover { error ->
+        val problem = error as? ProblemDetailsException
+        problem?.statusCode == HTTP_NOT_FOUND
+    }
+    .getOrDefault(false)
+
 internal suspend fun pushPendingMutations(
     dao: RocheDao,
     apiClient: RocheApiClient,
@@ -740,6 +813,24 @@ internal suspend fun pushPendingItemMutation(
     token: String,
     mutation: PendingMutationEntity,
 ): PendingMutationEntity {
+    if (mutation.dirtyStatus == DELETED_STATUS_TOMBSTONE) {
+        val deleted = runCatching {
+            apiClient.deleteItem(
+                serverUrl = serverUrl,
+                token = token,
+                itemId = mutation.entityId,
+            )
+            true
+        }
+            .recover { error ->
+                (error as? ProblemDetailsException)?.statusCode == HTTP_NOT_FOUND
+            }
+            .getOrDefault(false)
+        if (deleted) {
+            dao.deletePendingMutation(mutation.entityId)
+        }
+        return mutation
+    }
     val updateResult = pushDirtyItemFields(apiClient, serverUrl, token, mutation.entityId, mutation)
     val updateError = updateResult.exceptionOrNull() as? ProblemDetailsException
     if (updateError?.statusCode == HTTP_NOT_FOUND) {

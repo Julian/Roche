@@ -560,7 +560,97 @@ class RocheRepositoryTest {
                 com.grayvines.roche.ui.components.calculateInSampleSize(4000, 3000, 256, 256),
             )
         }
+
+    @Test
+    internal fun `refreshFeed deleteFeed and deleteItem sync with server and clean up local state`() =
+        runTest {
+            seedTestDatabase()
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val cacheDir = File(tempDir, "delete_item_cache")
+            val itemCacheDir = File(File(cacheDir, "items"), "item-1").apply { mkdirs() }
+            File(itemCacheDir, "media-paper-1").writeBytes(byteArrayOf(1, 2, 3))
+            val requests = mutableListOf<String>()
+            val managedRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildFeedAndItemManagementMockClient(requests),
+                    settings = settings,
+                    cacheDir = cacheDir,
+                )
+
+            val refreshedTitle = managedRepo.refreshFeed("feed-arxiv-cs-lg").getOrThrow()
+            assertEquals("arXiv cs.LG", refreshedTitle)
+            assertTrue(managedRepo.snapshot.first().entries.any { it.id == "item-fresh" })
+
+            // Offline deleteItem records tombstone so syncWithServer does not resurrect item-1
+            settings.update { it.copy(bearerToken = "") }
+            assertTrue(managedRepo.deleteItem("item-1").getOrThrow().isNotBlank())
+            assertFalse(itemCacheDir.exists())
+            assertEquals(
+                DELETED_STATUS_TOMBSTONE,
+                database.dao().getPendingMutation("item-1")?.dirtyStatus,
+            )
+            // Mutating a deleted item is a safe no-op and does not overwrite tombstone
+            assertEquals(null, managedRepo.setArchiveState("item-1", archived = true))
+            managedRepo.restoreStatus("item-1", ItemStatus.UNREAD)
+            managedRepo.updateReadProgress("item-1", 0.5)
+            managedRepo.toggleTagOnItem("item-1", "tag-1")
+            assertEquals(
+                DELETED_STATUS_TOMBSTONE,
+                database.dao().getPendingMutation("item-1")?.dirtyStatus,
+            )
+
+            // Syncing back online pushes DELETE /api/v1/items/item-1 and does not resurrect item-1
+            settings.update { it.copy(bearerToken = "tok-live") }
+            managedRepo.syncWithServer().getOrThrow()
+            assertTrue(requests.contains("DELETE http://100.64.0.12:8080/api/v1/items/item-1"))
+            assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-1" })
+            assertEquals(null, database.dao().getPendingMutation("item-1"))
+
+            // Delete remote feed purges feed AND its remaining local items (item-fresh)
+            assertEquals("arXiv cs.LG", managedRepo.deleteFeed("feed-arxiv-cs-lg").getOrThrow())
+            assertFalse(managedRepo.snapshot.first().feeds.any { it.id == "feed-arxiv-cs-lg" })
+            assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-fresh" })
+        }
 }
+
+internal fun buildFeedAndItemManagementMockClient(requests: MutableList<String>): RocheApiClient =
+    RocheApiClient { request ->
+        requests.add("${request.method} ${request.url}")
+        when {
+            request.method == "POST" &&
+                request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg/refresh") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}""",
+                )
+            request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}]}""",
+                )
+            request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
+                HttpResponse(statusCode = 200, body = """{"tags":[]}""")
+            request.method == "GET" && request.url.contains("/api/v1/items") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"created_at":"2026-03-29T10:00:00Z"},{"id":"item-fresh","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Fresh Polled Paper","url":"https://arxiv.org/abs/2604.00001","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z"}]}""",
+                )
+            request.method == "DELETE" && request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg") ->
+                HttpResponse(
+                    statusCode = 404,
+                    body = """{"title":"Not Found","detail":"missing"}""",
+                )
+            request.method == "DELETE" && request.url.endsWith("/api/v1/items/item-1") ->
+                HttpResponse(statusCode = 204, body = "")
+            else -> HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
 
 internal fun buildOfflineCacheMockClient(
     pdfBytes: ByteArray,

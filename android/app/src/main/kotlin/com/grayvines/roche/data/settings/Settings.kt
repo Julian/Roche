@@ -76,22 +76,35 @@ private fun extractExplicitPort(authority: String): String =
 
 private fun parseCleanOriginUri(candidate: String): String? = runCatching {
     val uri = URI(candidate)
-    val scheme = uri.scheme?.lowercase() ?: return null
+    val rawScheme = uri.scheme?.lowercase() ?: return null
     val host = uri.host?.lowercase() ?: return null
-    val validOrigin =
-        (scheme == "http" || scheme == "https") &&
-            hasNoUriExtras(uri) &&
-            (uri.port == -1 || uri.port in 1..MAX_TCP_PORT) &&
-            host.isNotBlank()
-    if (!validOrigin) {
+    if (!isValidOriginUri(uri, rawScheme, host)) {
         null
-    } else if (uri.port == -1) {
-        "$scheme://$host"
     } else {
-        "$scheme://$host:${uri.port}"
+        val effectiveScheme = resolveEffectiveOriginScheme(rawScheme, host, uri.port)
+        if (uri.port == -1) {
+            "$effectiveScheme://$host"
+        } else {
+            "$effectiveScheme://$host:${uri.port}"
+        }
     }
 }
     .getOrNull()
+
+internal fun isValidOriginUri(uri: URI, rawScheme: String, host: String): Boolean {
+    val validScheme = rawScheme == "http" || rawScheme == "https"
+    val validPort = uri.port == -1 || uri.port in 1..MAX_TCP_PORT
+    return validScheme && hasNoUriExtras(uri) && validPort && host.isNotBlank()
+}
+
+internal fun resolveEffectiveOriginScheme(rawScheme: String, host: String, port: Int): String {
+    val isCleartextOrTailnet = host.endsWith(TS_NET_SUFFIX) || shouldUseCleartextHttp(host, "")
+    return if (rawScheme == "https" && port == DEFAULT_ROCHE_PORT && isCleartextOrTailnet) {
+        "http"
+    } else {
+        rawScheme
+    }
+}
 
 private fun hasNoUriExtras(uri: URI): Boolean =
     uri.rawUserInfo == null &&

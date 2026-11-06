@@ -51,6 +51,10 @@ class SettingsRepositoryTest {
             normalizeServerUrl("mac-mini.tail9876.ts.net:8080"),
         )
         assertEquals(
+            "http://airm.long-boa.ts.net:8080",
+            normalizeServerUrl("https://airm.long-boa.ts.net:8080"),
+        )
+        assertEquals(
             "https://roche.tail9876.ts.net",
             normalizeServerUrl("roche.tail9876.ts.net"),
         )
