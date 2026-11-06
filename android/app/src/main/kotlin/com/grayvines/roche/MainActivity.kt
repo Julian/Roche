@@ -6,6 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -13,6 +14,7 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
+import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.theme.RocheTheme
 
 class MainActivity : ComponentActivity() {
@@ -28,19 +30,22 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) {
             handleIncomingShareIntent(intent)
         }
+        val thumbnailLoader = (application as RocheApp).graph.thumbnailLoader
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
-            RocheTheme(
-                themeMode = state.settings.themeMode,
-                headlineFont = state.settings.headlineFont,
-            ) {
-                MainScreen(
-                    state = state,
-                    onAction = viewModel::dispatch,
-                    onShareEntry = ::shareEntryViaSystemSheet,
-                    onOpenExternalUrl = ::openUrlInBrowser,
-                )
+            CompositionLocalProvider(LocalThumbnailLoader provides thumbnailLoader) {
+                RocheTheme(
+                    themeMode = state.settings.themeMode,
+                    headlineFont = state.settings.headlineFont,
+                ) {
+                    MainScreen(
+                        state = state,
+                        onAction = viewModel::dispatch,
+                        onShareEntry = ::shareEntryViaSystemSheet,
+                        onOpenExternalUrl = ::openUrlInBrowser,
+                    )
+                }
             }
         }
     }

@@ -501,102 +501,197 @@ class RocheRepositoryTest {
             )
         }
 
-    internal fun buildInFlightTagMockClient(addedTagRequests: MutableList<String>): RocheApiClient =
-        RocheApiClient { request ->
-            if (request.method == "POST" && request.url.endsWith("/tags")) {
-                addedTagRequests.add("${request.url}:${request.body}")
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"id":"srv-item-77","tags":[{"id":"srv-tag-added","name":"added-in-flight","unread_count":1}]}""",
-                )
-            } else {
-                HttpResponse(statusCode = 404, body = "{}")
+    @Test
+    internal fun `toggleOfflineCache hydrates item detail downloads media files and cleans up on evict`() =
+        runTest {
+            seedTestDatabase()
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
             }
-        }
+            val cacheDir = File(tempDir, "offline_media")
+            val pdfBytes = "%PDF-1.7-test".toByteArray(Charsets.UTF_8)
+            val thumbBytes = byteArrayOf(1, 2, 3, 4)
+            val offlineClient = buildOfflineCacheMockClient(pdfBytes, thumbBytes)
+            val cachedRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = offlineClient,
+                    settings = settings,
+                    cacheDir = cacheDir,
+                )
 
-    internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
-        assertTrue(
-            pushedRequests.any { (req, body) ->
-                req == "POST http://100.64.0.12:8080/api/v1/items/save" &&
-                    body?.contains("https://example.com/offline-note") == true
-            }
-        )
-        assertTrue(
-            pushedRequests.any { (req, body) ->
-                req == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
-                    body == """{"status":"archived","is_favorite":false,"read_progress":0.9}"""
-            }
-        )
-        assertTrue(
-            pushedRequests.any { (req, body) ->
-                req == "POST http://100.64.0.12:8080/api/v1/items/item-1/tags" &&
-                    body == """{"name":"rust"}"""
-            }
-        )
-        assertTrue(
-            pushedRequests.any { (req, _) ->
-                req == "DELETE http://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
-            }
-        )
-    }
+            val enabled = cachedRepo.toggleOfflineCache("item-5")
+            assertTrue(enabled)
 
-    internal fun buildTwoWaySyncMockClient(
-        pushedRequests: MutableList<Pair<String, String?>>
-    ): RocheApiClient = RocheApiClient { request ->
-        pushedRequests.add("${request.method} ${request.url}" to request.body)
-        if (request.method == "GET") {
-            handleTwoWaySyncReadRequest(request.url)
-        } else {
-            handleTwoWaySyncWriteRequest(request.method, request.url)
-        }
-    }
+            val hydrated = cachedRepo.snapshot.first().entries.first { it.id == "item-5" }
+            assertTrue(hydrated.isCachedOffline)
+            assertEquals("<p>Hydrated full paper HTML</p>", hydrated.contentHtml)
+            assertEquals("thumb-item-5", hydrated.thumbnailMediaId)
 
-    internal fun handleTwoWaySyncWriteRequest(method: String, url: String): HttpResponse =
-        when {
-            method == "POST" && url.endsWith("/api/v1/items/save") ->
-                HttpResponse(
-                    statusCode = 201,
-                    body =
-                        """{"id":"srv-saved-99","title":"Offline Note","url":"https://example.com/offline-note","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["crdt"]}""",
-                )
-            method == "PATCH" && url.endsWith("/api/v1/items/item-1") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"id":"item-1","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"archived","is_favorite":false,"read_progress":0.9,"created_at":"2026-03-29T10:00:00Z"}""",
-                )
-            method == "POST" && url.endsWith("/api/v1/items/item-1/tags") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"id":"item-1","tags":[{"id":"srv-tag-rust","name":"rust","unread_count":0}]}""",
-                )
-            method == "DELETE" && url.endsWith("/api/v1/items/item-1/tags/srv-tag-systems") ->
-                HttpResponse(statusCode = 204, body = "")
-            else -> HttpResponse(statusCode = 404, body = "{}")
-        }
+            val cachedPdf = File(File(File(cacheDir, "items"), "item-5"), "pdf-item-5")
+            val cachedThumb = File(File(File(cacheDir, "items"), "item-5"), "thumb-item-5")
+            val sharedThumb = File(File(cacheDir, "thumbnails"), "thumb-item-5")
+            assertTrue(cachedPdf.isFile)
+            assertTrue(cachedThumb.isFile)
+            assertTrue(sharedThumb.isFile)
+            org.junit.jupiter.api.Assertions.assertArrayEquals(pdfBytes, cachedPdf.readBytes())
+            org.junit.jupiter.api.Assertions.assertArrayEquals(thumbBytes, cachedThumb.readBytes())
 
-    internal fun handleTwoWaySyncReadRequest(url: String): HttpResponse =
-        when {
-            url.endsWith("/api/v1/feeds") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":0}]}""",
-                )
-            url.endsWith("/api/v1/tags") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"tags":[{"id":"srv-tag-llm","name":"llm-inference","unread_count":0},{"id":"srv-tag-systems","name":"systems","unread_count":0},{"id":"srv-tag-rust","name":"rust","unread_count":0},{"id":"srv-tag-crdt","name":"crdt","unread_count":1}]}""",
-                )
-            url.contains("/api/v1/items") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.35,"created_at":"2026-03-29T10:00:00Z","tag_names":["llm-inference","systems"]}]}""",
-                )
-            else -> HttpResponse(statusCode = 404, body = "{}")
+            // Verify syncWithServer preserves hydrated contentHtml and thumbnailMediaId when list
+            // response omits them
+            cachedRepo.syncWithServer().getOrThrow()
+            val afterSync = cachedRepo.snapshot.first().entries.first { it.id == "item-5" }
+            assertEquals("<p>Hydrated full paper HTML</p>", afterSync.contentHtml)
+            assertEquals("thumb-item-5", afterSync.thumbnailMediaId)
+            assertTrue(afterSync.isCachedOffline)
+
+            val disabled = cachedRepo.toggleOfflineCache("item-5")
+            assertFalse(disabled)
+            assertFalse(File(File(cacheDir, "items"), "item-5").exists())
+
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException::class.java) {
+                sanitizeCacheFileName("..")
+            }
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException::class.java) {
+                sanitizeCacheFileName(".")
+            }
+            assertEquals(
+                8,
+                com.grayvines.roche.ui.components.calculateInSampleSize(4000, 3000, 256, 256),
+            )
         }
 }
+
+internal fun buildOfflineCacheMockClient(
+    pdfBytes: ByteArray,
+    thumbBytes: ByteArray,
+): RocheApiClient = RocheApiClient { request ->
+    when (request.url) {
+        "http://100.64.0.12:8080/api/v1/items/item-5" ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"item-5","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","content_html":"<p>Hydrated full paper HTML</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-27T10:00:00Z","thumbnail_media_id":"thumb-item-5"}""",
+            )
+        "http://100.64.0.12:8080/api/v1/items/item-5/media" ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"media":[{"id":"pdf-item-5","item_id":"item-5","media_type":"pdf","file_size":13},{"id":"thumb-item-5","item_id":"item-5","media_type":"thumbnail","file_size":4}]}""",
+            )
+        "http://100.64.0.12:8080/api/v1/media/pdf-item-5" ->
+            HttpResponse(statusCode = 200, body = "", bodyBytes = pdfBytes)
+        "http://100.64.0.12:8080/api/v1/media/thumb-item-5" ->
+            HttpResponse(statusCode = 200, body = "", bodyBytes = thumbBytes)
+        "http://100.64.0.12:8080/api/v1/feeds" ->
+            HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
+        "http://100.64.0.12:8080/api/v1/tags" ->
+            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
+        "http://100.64.0.12:8080/api/v1/items?per_page=200" ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"items":[{"id":"item-5","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-27T10:00:00Z"}]}""",
+            )
+        else -> HttpResponse(statusCode = 404, body = "{}")
+    }
+}
+
+internal fun buildInFlightTagMockClient(addedTagRequests: MutableList<String>): RocheApiClient =
+    RocheApiClient { request ->
+        if (request.method == "POST" && request.url.endsWith("/tags")) {
+            addedTagRequests.add("${request.url}:${request.body}")
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"srv-item-77","tags":[{"id":"srv-tag-added","name":"added-in-flight","unread_count":1}]}""",
+            )
+        } else {
+            HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
+
+internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
+    assertTrue(
+        pushedRequests.any { (req, body) ->
+            req == "POST http://100.64.0.12:8080/api/v1/items/save" &&
+                body?.contains("https://example.com/offline-note") == true
+        }
+    )
+    assertTrue(
+        pushedRequests.any { (req, body) ->
+            req == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                body == """{"status":"archived","is_favorite":false,"read_progress":0.9}"""
+        }
+    )
+    assertTrue(
+        pushedRequests.any { (req, body) ->
+            req == "POST http://100.64.0.12:8080/api/v1/items/item-1/tags" &&
+                body == """{"name":"rust"}"""
+        }
+    )
+    assertTrue(
+        pushedRequests.any { (req, _) ->
+            req == "DELETE http://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
+        }
+    )
+}
+
+internal fun buildTwoWaySyncMockClient(
+    pushedRequests: MutableList<Pair<String, String?>>
+): RocheApiClient = RocheApiClient { request ->
+    pushedRequests.add("${request.method} ${request.url}" to request.body)
+    if (request.method == "GET") {
+        handleTwoWaySyncReadRequest(request.url)
+    } else {
+        handleTwoWaySyncWriteRequest(request.method, request.url)
+    }
+}
+
+internal fun handleTwoWaySyncWriteRequest(method: String, url: String): HttpResponse =
+    when {
+        method == "POST" && url.endsWith("/api/v1/items/save") ->
+            HttpResponse(
+                statusCode = 201,
+                body =
+                    """{"id":"srv-saved-99","title":"Offline Note","url":"https://example.com/offline-note","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["crdt"]}""",
+            )
+        method == "PATCH" && url.endsWith("/api/v1/items/item-1") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"item-1","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"archived","is_favorite":false,"read_progress":0.9,"created_at":"2026-03-29T10:00:00Z"}""",
+            )
+        method == "POST" && url.endsWith("/api/v1/items/item-1/tags") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"item-1","tags":[{"id":"srv-tag-rust","name":"rust","unread_count":0}]}""",
+            )
+        method == "DELETE" && url.endsWith("/api/v1/items/item-1/tags/srv-tag-systems") ->
+            HttpResponse(statusCode = 204, body = "")
+        else -> HttpResponse(statusCode = 404, body = "{}")
+    }
+
+internal fun handleTwoWaySyncReadRequest(url: String): HttpResponse =
+    when {
+        url.endsWith("/api/v1/feeds") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":0}]}""",
+            )
+        url.endsWith("/api/v1/tags") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"tags":[{"id":"srv-tag-llm","name":"llm-inference","unread_count":0},{"id":"srv-tag-systems","name":"systems","unread_count":0},{"id":"srv-tag-rust","name":"rust","unread_count":0},{"id":"srv-tag-crdt","name":"crdt","unread_count":1}]}""",
+            )
+        url.contains("/api/v1/items") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.35,"created_at":"2026-03-29T10:00:00Z","tag_names":["llm-inference","systems"]}]}""",
+            )
+        else -> HttpResponse(statusCode = 404, body = "{}")
+    }

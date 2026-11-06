@@ -278,4 +278,60 @@ class RocheApiClientTest {
             requestedUrls,
         )
     }
+
+    @Test
+    internal fun `fetchItemDetail fetchItemMedia and fetchMediaBytes parse item details and binary media`() =
+        runTest {
+            val expectedBytes = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+            val client = RocheApiClient { request ->
+                when (request.url) {
+                    "http://localhost:8080/api/v1/items/item-42" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"id":"item-42","title":"Full Paper","url":"https://arxiv.org/abs/2603.00001","content_html":"<p>Hydrated article body</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-29T10:00:00Z","thumbnail_media_id":"thumb-42"}""",
+                        )
+                    "http://localhost:8080/api/v1/items/item-42/media" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"media":[{"id":"thumb-42","item_id":"item-42","media_type":"thumbnail","file_size":8},{"id":"pdf-42","item_id":"item-42","media_type":"pdf","file_size":4096}]}""",
+                        )
+                    "http://localhost:8080/api/v1/media/thumb-42" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body = "",
+                            bodyBytes = expectedBytes,
+                        )
+                    else -> HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+
+            val detail = client.fetchItemDetail("http://localhost:8080", "tok-123", "item-42")
+            assertEquals("item-42", detail.id)
+            assertEquals("<p>Hydrated article body</p>", detail.contentHtml)
+            assertEquals("thumb-42", detail.thumbnailMediaId)
+
+            val mediaList = client.fetchItemMedia("http://localhost:8080", "tok-123", "item-42")
+            assertEquals(2, mediaList.size)
+            assertEquals("thumb-42", mediaList[0].id)
+            assertEquals("thumbnail", mediaList[0].mediaType)
+            assertEquals(8L, mediaList[0].fileSize)
+            assertEquals("pdf-42", mediaList[1].id)
+            assertEquals("pdf", mediaList[1].mediaType)
+
+            val bytes = client.fetchMediaBytes("http://localhost:8080", "tok-123", "thumb-42")
+            org.junit.jupiter.api.Assertions.assertArrayEquals(expectedBytes, bytes)
+
+            val missingBytes = client.fetchMediaBytes("http://localhost:8080", "tok-123", "missing")
+            assertEquals(null, missingBytes)
+
+            val exactLimit =
+                readBoundedBytes(java.io.ByteArrayInputStream(ByteArray(16)), maxBytes = 16)
+            assertEquals(16, exactLimit.size)
+            assertThrows(java.io.IOException::class.java) {
+                readBoundedBytes(java.io.ByteArrayInputStream(ByteArray(17)), maxBytes = 16)
+            }
+            assertEquals("..%2F..%2Fsecret", encodePathSegment("../../secret"))
+        }
 }

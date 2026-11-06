@@ -15,6 +15,7 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 private val rocheJson = Json { ignoreUnknownKeys = true }
@@ -111,6 +112,26 @@ internal fun parseTagsJsonArray(raw: String): List<RemoteTagDto> {
             id = obj.stringOrEmpty(KEY_ID),
             name = obj.stringOrEmpty("name"),
             unreadCount = obj.intOrDefault(KEY_UNREAD_COUNT, 0),
+        )
+    }
+}
+
+internal fun parseMediaJsonArray(raw: String): List<RemoteMediaDto> {
+    val root = rocheJson.parseToJsonElement(raw)
+    val mediaArray =
+        when (root) {
+            is JsonArray -> root
+            is JsonObject -> root["media"] as? JsonArray ?: return emptyList()
+            else -> return emptyList()
+        }
+    return mediaArray.map { element ->
+        val obj = element.jsonObject
+        RemoteMediaDto(
+            id = obj.stringOrEmpty(KEY_ID),
+            itemId = obj.stringOrEmpty("item_id"),
+            mediaType = obj.nullableString("media_type") ?: "thumbnail",
+            fileSize = obj.longOrNull("file_size"),
+            mimeType = obj.nullableString("mime_type"),
         )
     }
 }
@@ -222,6 +243,8 @@ private fun JsonObject.booleanOrDefault(key: String, default: Boolean): Boolean 
 
 private fun JsonObject.doubleOrDefault(key: String, default: Double): Double =
     (this[key] as? JsonPrimitive)?.doubleOrNull ?: default
+
+private fun JsonObject.longOrNull(key: String): Long? = (this[key] as? JsonPrimitive)?.longOrNull
 
 private const val KEY_ID = "id"
 private const val KEY_TITLE = "title"

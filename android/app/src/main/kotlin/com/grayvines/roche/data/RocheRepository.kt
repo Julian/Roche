@@ -14,6 +14,7 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
+import java.io.File
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -30,8 +31,16 @@ class RocheRepository(
     private val database: RocheDatabase,
     private val apiClient: RocheApiClient,
     private val settings: SettingsRepository,
+    private val cacheDir: File? = null,
 ) {
     private val dao = database.dao()
+    private val offlineCacheManager =
+        OfflineCacheManager(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            cacheDir = cacheDir,
+        )
 
     val snapshot: Flow<RepositorySnapshot> =
         combine(
@@ -85,7 +94,7 @@ class RocheRepository(
     suspend fun toggleOfflineCache(itemId: String): Boolean {
         val current = dao.getItemById(itemId) ?: return false
         val updated = !current.isCachedOffline
-        dao.updateItemCachedOffline(itemId, updated)
+        offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = updated)
         return updated
     }
 

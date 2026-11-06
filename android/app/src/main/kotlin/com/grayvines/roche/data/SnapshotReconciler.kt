@@ -83,10 +83,12 @@ internal suspend fun reconcileRemoteSnapshot(
         items =
             unpushedLocalItems +
                 adjustedRemoteItems.map { remote ->
+                    val existing = existingItemsById[remote.id]
                     toRemoteItemEntity(
                         remote = remote,
                         feedTitlesById = feedTitlesById,
-                        isCachedOffline = existingItemsById[remote.id]?.isCachedOffline ?: false,
+                        isCachedOffline = existing?.isCachedOffline ?: false,
+                        existing = existing,
                     )
                 },
         itemTags = (unpushedItemTags + remoteItemTagEntities).distinct(),

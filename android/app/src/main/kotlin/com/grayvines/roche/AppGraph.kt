@@ -6,6 +6,8 @@ import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpUrlConnectionTransport
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.ui.components.ThumbnailLoader
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,7 +23,22 @@ class AppGraph(context: Context) {
 
     val apiClient: RocheApiClient by lazy { RocheApiClient(HttpUrlConnectionTransport()) }
 
+    val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
+
     val repository: RocheRepository by lazy {
-        RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        RocheRepository(
+            database = database,
+            apiClient = apiClient,
+            settings = settings,
+            cacheDir = offlineCacheDir,
+        )
+    }
+
+    val thumbnailLoader: ThumbnailLoader by lazy {
+        ThumbnailLoader(
+            apiClient = apiClient,
+            settings = settings,
+            cacheDir = offlineCacheDir,
+        )
     }
 }

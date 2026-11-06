@@ -109,27 +109,32 @@ internal fun toRemoteItemEntity(
     remote: RemoteItemDto,
     feedTitlesById: Map<String, String>,
     isCachedOffline: Boolean,
+    existing: ItemEntity? = null,
 ): ItemEntity =
     ItemEntity(
         id = remote.id,
-        feedId = remote.feedId,
+        feedId = remote.feedId ?: existing?.feedId,
         feedTitle =
-            remote.feedTitle ?: remote.feedId?.let { feedTitlesById[it] } ?: DEFAULT_SAVED_HOST,
-        title = remote.title,
-        url = remote.url,
-        author = remote.author,
-        summary = remote.summary,
-        contentText = remote.contentText,
-        contentHtml = remote.contentHtml,
-        contentType = remote.contentType,
+            remote.feedTitle
+                ?: remote.feedId?.let { feedTitlesById[it] }
+                ?: existing?.feedTitle
+                ?: DEFAULT_SAVED_HOST,
+        title = remote.title.ifBlank { existing?.title.orEmpty() },
+        url = remote.url.ifBlank { existing?.url.orEmpty() },
+        author = remote.author?.takeIf { it.isNotBlank() } ?: existing?.author,
+        summary = remote.summary?.takeIf { it.isNotBlank() } ?: existing?.summary,
+        contentText = remote.contentText?.takeIf { it.isNotBlank() } ?: existing?.contentText,
+        contentHtml = remote.contentHtml?.takeIf { it.isNotBlank() } ?: existing?.contentHtml,
+        contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
         status = remote.status,
         isFavorite = remote.isFavorite,
         isCachedOffline = isCachedOffline,
-        publishedAt = remote.publishedAt,
-        createdAt = remote.createdAt,
+        publishedAt = remote.publishedAt ?: existing?.publishedAt,
+        createdAt = remote.createdAt.ifBlank { existing?.createdAt.orEmpty() },
         readProgress = remote.readProgress,
-        thumbnailMediaId = remote.thumbnailMediaId,
-        duration = remote.duration,
+        thumbnailMediaId =
+            remote.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: existing?.thumbnailMediaId,
+        duration = remote.duration?.takeIf { it.isNotBlank() } ?: existing?.duration,
     )
 
 internal fun reconcileSavedItemEntity(

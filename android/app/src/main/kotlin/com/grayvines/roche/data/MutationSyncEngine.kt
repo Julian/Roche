@@ -702,7 +702,14 @@ internal suspend fun commitPushedLocalItem(
         dao.deleteItemTagsForItem(localItem.id)
         dao.deleteItemById(localItem.id)
     }
-    dao.upsertItem(toRemoteItemEntity(effectiveSaved, emptyMap(), localItem.isCachedOffline))
+    dao.upsertItem(
+        toRemoteItemEntity(
+            remote = effectiveSaved,
+            feedTitlesById = emptyMap(),
+            isCachedOffline = localItem.isCachedOffline,
+            existing = localItem,
+        )
+    )
     attachTagsLocally(dao = dao, itemId = remoteSaved.id, tagNames = effectiveSaved.tagNames)
     dao.deletePendingMutation(mutation.entityId)
     if (!fieldsPushed) {

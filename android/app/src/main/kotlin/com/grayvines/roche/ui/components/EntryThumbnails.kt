@@ -1,14 +1,18 @@
 package com.grayvines.roche.ui.components
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -16,10 +20,12 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -50,6 +56,7 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(5.dp)
     val isAlternateChart = entry.id.hashCode() % 2 == 0
+    val bitmap = rememberEntryThumbnailBitmap(entry.thumbnailMediaId)
     Box(
         modifier =
             modifier
@@ -58,8 +65,17 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
                 .background(Color(0xFFEBE7E0))
                 .border(width = 1.dp, color = colors.border, shape = shape)
     ) {
-        Canvas(modifier = Modifier.matchParentSize()) {
-            drawPaperPage(colors = colors, isAlternateChart = isAlternateChart)
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawPaperPage(colors = colors, isAlternateChart = isAlternateChart)
+            }
         }
     }
 }
@@ -158,6 +174,7 @@ private fun DrawScope.drawPaperFigure(
 private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
+    val bitmap = rememberEntryThumbnailBitmap(entry.thumbnailMediaId)
     Box(
         modifier =
             modifier
@@ -166,7 +183,16 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
                 .background(Color(0xFF1A2226))
                 .border(width = 1.dp, color = colors.border, shape = shape)
     ) {
-        Canvas(modifier = Modifier.matchParentSize()) { drawVideoCanvas(colors) }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) { drawVideoCanvas(colors) }
+        }
 
         Text(
             text = entry.duration ?: "Video",
@@ -182,6 +208,23 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
                     .padding(horizontal = 4.dp, vertical = 1.dp),
         )
     }
+}
+
+@Composable
+internal fun rememberEntryThumbnailBitmap(mediaId: String?): ImageBitmap? {
+    val cleanId = mediaId?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    val loader = LocalThumbnailLoader.current ?: return null
+    val bitmap by
+        produceState<ImageBitmap?>(
+            initialValue = loader.getCached(cleanId),
+            key1 = cleanId,
+            key2 = loader,
+        ) {
+            if (value == null) {
+                value = loader.loadThumbnail(cleanId)
+            }
+        }
+    return bitmap
 }
 
 private fun DrawScope.drawVideoCanvas(colors: RocheColors) {
