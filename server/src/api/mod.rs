@@ -93,7 +93,7 @@ impl ApiRoutes {
             .layer(RequestBodyLimitLayer::new(16 * 1024));
 
         Router::new()
-            .route("/health", get(Self::health))
+            .route("/health", get(Self::health::<F>))
             .merge(public_pair)
             .merge(protected)
             .fallback(Self::handle_not_found)
@@ -127,11 +127,10 @@ impl ApiRoutes {
         Ok(next.run(req).await)
     }
 
-    fn health() -> std::future::Ready<Json<serde_json::Value>> {
-        std::future::ready(Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-        })))
+    fn health<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+    ) -> std::future::Ready<Json<serde_json::Value>> {
+        std::future::ready(Json(service.health_payload()))
     }
 
     // --- Auth ---
@@ -1107,5 +1106,36 @@ mod tests {
         assert!(pdf_bytes.starts_with(b"%PDF-1.5"));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_health_exposes_tailscale_discovery_urls() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let identity = crate::tailscale::NodeIdentity {
+            hostname: "roche".to_string(),
+            dns_name: Some("roche.tail9876.ts.net".to_string()),
+            magic_dns_suffix: Some("tail9876.ts.net".to_string()),
+            ipv4: Some("100.64.0.12".to_string()),
+            ipv6: None,
+            service_name: Some("svc:roche".to_string()),
+        };
+        let service = RocheService::new(db, FakeFeedFetcher, crate::config::Config::default())
+            .with_node_identity(Some(identity));
+        let app = ApiRoutes::router_with_service(service);
+
+        let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "roche");
+        assert_eq!(body["canonical_url"], "https://roche.tail9876.ts.net");
+        let urls = body["urls"].as_array().unwrap();
+        assert_eq!(urls.len(), 4);
+        assert_eq!(urls[0], "https://roche.tail9876.ts.net");
+        assert_eq!(urls[1], "http://roche.tail9876.ts.net:8080");
+        assert_eq!(urls[2], "http://roche:8080");
+        assert_eq!(urls[3], "http://100.64.0.12:8080");
     }
 }

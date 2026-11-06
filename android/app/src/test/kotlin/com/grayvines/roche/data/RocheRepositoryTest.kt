@@ -165,6 +165,77 @@ class RocheRepositoryTest {
     }
 
     @Test
+    fun `pairWithCode auto-discovers Roche server on Tailnet when serverUrl is blank`() = runTest {
+        val autoDiscoverClient = RocheApiClient { request ->
+            when (request.url) {
+                "http://roche:8080/health" ->
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
+                    )
+                "http://roche.tail9876.ts.net:8080/auth/pair" ->
+                    HttpResponse(statusCode = 200, body = """{"token":"auto-paired-tok"}""")
+                else -> HttpResponse(statusCode = 404, body = "{}")
+            }
+        }
+        val autoRepo =
+            RocheRepository(
+                database = database,
+                apiClient = autoDiscoverClient,
+                settings = settings,
+            )
+
+        val result =
+            autoRepo.pairWithCode(
+                serverUrl = "",
+                pairingCode = "9999-guitarist-whisper-orbit-falcon",
+                deviceName = "Pixel 9",
+            )
+        assertTrue(result.isSuccess)
+        assertEquals("auto-paired-tok", result.getOrNull())
+
+        val currentSettings = settings.settings.first()
+        assertEquals("http://roche.tail9876.ts.net:8080", currentSettings.serverUrl)
+        assertEquals("auto-paired-tok", currentSettings.bearerToken)
+    }
+
+    @Test
+    fun `discoverServer clears existing bearerToken when switching to a different server host`() =
+        runTest {
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "secret-existing-token",
+                )
+            }
+            val discoverClient = RocheApiClient { request ->
+                if (request.url == "http://roche:8080/health") {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+            val repo =
+                RocheRepository(
+                    database = database,
+                    apiClient = discoverClient,
+                    settings = settings,
+                )
+
+            val discoveredUrl = repo.discoverServer().getOrThrow()
+            assertEquals("http://roche.tail9876.ts.net:8080", discoveredUrl)
+
+            val updated = settings.settings.first()
+            assertEquals("http://roche.tail9876.ts.net:8080", updated.serverUrl)
+            assertEquals("", updated.bearerToken)
+        }
+
+    @Test
     fun `syncWithServer replaces demo seed rows populates item tags and strips html in reader`() =
         runTest {
             seedTestDatabase()

@@ -58,6 +58,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
+    node_identity: Option<crate::tailscale::NodeIdentity>,
 }
 
 impl<F: FeedFetcher> RocheService<F> {
@@ -67,7 +68,43 @@ impl<F: FeedFetcher> RocheService<F> {
         let ytdlp_worker = YtDlpWorker::new(config.media.clone(), media_store.clone());
         let download_semaphore =
             Arc::new(Semaphore::new(config.media.max_concurrent_downloads.max(1)));
-        Self { db, fetcher, config, media_store, ytdlp_worker, download_semaphore }
+        Self {
+            db,
+            fetcher,
+            config,
+            media_store,
+            ytdlp_worker,
+            download_semaphore,
+            node_identity: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_node_identity(
+        mut self,
+        node_identity: Option<crate::tailscale::NodeIdentity>,
+    ) -> Self {
+        self.node_identity = node_identity;
+        self
+    }
+
+    #[must_use]
+    pub fn health_payload(&self) -> serde_json::Value {
+        let port = self.config.server.port;
+        let canonical_url =
+            self.node_identity.as_ref().and_then(|identity| identity.canonical_url(port));
+        let urls = self
+            .node_identity
+            .as_ref()
+            .map_or_else(Vec::new, |identity| identity.candidate_urls(port));
+
+        serde_json::json!({
+            "status": "ok",
+            "service": "roche",
+            "version": env!("CARGO_PKG_VERSION"),
+            "canonical_url": canonical_url,
+            "urls": urls,
+        })
     }
 
     #[must_use]

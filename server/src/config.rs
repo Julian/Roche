@@ -16,6 +16,7 @@ pub struct Config {
     pub media: MediaConfig,
     pub sync: SyncConfig,
     pub auth: AuthConfig,
+    pub tailscale: TailscaleConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +120,20 @@ impl Default for AuthConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    pub enabled: bool,
+    pub tailscale_bin: PathBuf,
+    pub advertise_service: Option<String>,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        Self { enabled: true, tailscale_bin: PathBuf::from("tailscale"), advertise_service: None }
+    }
+}
+
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
         Self::load_with_provider(path, Figment::new())
@@ -173,6 +188,9 @@ impl Config {
                 }
                 "pairing_code_ttl" | "auth_pairing_code_ttl" => "auth.pairing_code_ttl".into(),
                 "token_length" | "auth_token_length" => "auth.token_length".into(),
+                "tailscale_enabled" => "tailscale.enabled".into(),
+                "tailscale_bin" => "tailscale.tailscale_bin".into(),
+                "tailscale_advertise_service" => "tailscale.advertise_service".into(),
                 other => other.replace("__", ".").into(),
             }
         })
@@ -203,6 +221,14 @@ impl Config {
         if (explicit_data_dir || explicit_media_dir) && !explicit_download_dir {
             cfg.media.download_dir = cfg.storage.media_dir.join("downloads");
         }
+
+        cfg.tailscale.advertise_service = cfg
+            .tailscale
+            .advertise_service
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::tailscale::normalize_service_name);
 
         cfg.validate()?;
         Ok(cfg)
@@ -241,6 +267,13 @@ impl Config {
         }
         if self.auth.token_length < crate::auth::MIN_TOKEN_BYTES {
             anyhow::bail!("auth.token_length must be at least {}", crate::auth::MIN_TOKEN_BYTES);
+        }
+        if let Some(svc) = &self.tailscale.advertise_service
+            && !crate::tailscale::is_valid_service_name(svc)
+        {
+            anyhow::bail!(
+                "tailscale.advertise_service must be a valid service name (e.g. 'svc:roche')"
+            );
         }
         Ok(())
     }

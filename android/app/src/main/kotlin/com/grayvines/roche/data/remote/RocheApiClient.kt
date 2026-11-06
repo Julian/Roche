@@ -1,5 +1,6 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -110,7 +111,47 @@ data class RemoteItemDto(
 
 data class RemoteTagDto(val id: String, val name: String, val unreadCount: Int)
 
+data class DiscoveredServerDto(
+    val probedUrl: String,
+    val canonicalUrl: String? = null,
+    val version: String? = null,
+) {
+    val preferredUrl: String
+        get() = canonicalUrl?.takeIf { it.isNotBlank() } ?: probedUrl
+}
+
 class RocheApiClient(private val transport: HttpTransport) {
+
+    suspend fun probeServerHealth(candidateUrl: String): DiscoveredServerDto? = runCatching {
+        val base = candidateUrl.trim().trimEnd('/')
+        if (base.isBlank()) return null
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = "$base/health",
+                )
+            )
+        if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
+        parseHealthDiscoveryJson(raw = response.body, probedBaseUrl = base)
+    }
+        .getOrNull()
+
+    suspend fun discoverServer(
+        tailnetDomains: List<String> = emptyList(),
+        extraCandidates: List<String> = emptyList(),
+    ): DiscoveredServerDto? {
+        val candidates =
+            (extraCandidates + tailscaleDiscoveryUrls(tailnetDomains = tailnetDomains))
+                .map { it.trim().trimEnd('/') }
+                .filter { it.isNotBlank() }
+                .distinct()
+        for (candidate in candidates) {
+            val discovered = probeServerHealth(candidate)
+            if (discovered != null) return discovered
+        }
+        return null
+    }
 
     suspend fun pairDevice(serverUrl: String, code: String, deviceName: String): String {
         val response =

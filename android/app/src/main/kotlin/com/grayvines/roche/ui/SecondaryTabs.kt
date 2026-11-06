@@ -433,6 +433,10 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
             style = RocheButtonStyle.PRIMARY,
             onClick = { onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken)) },
         )
+        HeaderActionButton(
+            label = "Discover on Tailnet",
+            onClick = { onAction(MainAction.DiscoverServer) },
+        )
         HeaderActionButton(label = "Sync Now", onClick = { onAction(MainAction.SyncNow) })
     }
 }

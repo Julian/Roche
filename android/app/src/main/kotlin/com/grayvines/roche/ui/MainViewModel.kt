@@ -129,6 +129,8 @@ sealed interface MainAction {
         val pairingCode: String,
         val deviceName: String = "Roche Android",
     ) : Mutation
+
+    data object DiscoverServer : Mutation
 }
 
 internal data class TransientUiState(
@@ -203,8 +205,30 @@ class MainViewModel(
                 settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
             is MainAction.PairWithServer -> performPairWithServer(action)
+            MainAction.DiscoverServer -> performDiscoverServer()
             else -> Unit
         }
+    }
+
+    internal suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
+        settingsRepository.update {
+            it.copy(
+                serverUrl = action.serverUrl,
+                bearerToken = action.bearerToken,
+            )
+        }
+        transientState.update { it.copy(statusBanner = "Saved server settings") }
+    }
+
+    internal suspend fun performDiscoverServer() {
+        val message =
+            repository
+                .discoverServer()
+                .fold(
+                    onSuccess = { url -> "Discovered Roche server at $url" },
+                    onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
+                )
+        transientState.update { it.copy(statusBanner = message) }
     }
 
     private suspend fun performPairWithServer(action: MainAction.PairWithServer) {
@@ -228,16 +252,6 @@ class MainViewModel(
                     it.copy(statusBanner = "Pairing failed (${error.message ?: "error"})")
                 }
             }
-    }
-
-    private suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
-        settingsRepository.update {
-            it.copy(
-                serverUrl = action.serverUrl,
-                bearerToken = action.bearerToken,
-            )
-        }
-        transientState.update { it.copy(statusBanner = "Saved server settings") }
     }
 
     private suspend fun performToggleStar(entryId: String) {

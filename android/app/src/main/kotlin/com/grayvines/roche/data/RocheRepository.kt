@@ -15,6 +15,7 @@ import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.inferFeedTypeWireValue
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.normalizeServerUrl
+import com.grayvines.roche.data.settings.parsePairingInput
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
@@ -194,20 +195,52 @@ class RocheRepository(
         return SaveUrlResult(title = finalEntity.title, isFeed = false)
     }
 
+    internal suspend fun discoverServer(
+        tailnetDomains: List<String> = emptyList()
+    ): Result<String> = runCatching {
+        val discovered =
+            apiClient.discoverServer(tailnetDomains = tailnetDomains)
+                ?: error("No Roche server found on Tailnet (tried roche:8080 / svc:roche)")
+        val preferredUrl = normalizeServerUrl(discovered.preferredUrl)
+        check(preferredUrl.isNotBlank()) { "Discovered server returned an invalid URL" }
+        settings.update { current ->
+            val preservedToken = if (current.serverUrl == preferredUrl) current.bearerToken else ""
+            current.copy(serverUrl = preferredUrl, bearerToken = preservedToken)
+        }
+        preferredUrl
+    }
+
     suspend fun pairWithCode(
         serverUrl: String,
         pairingCode: String,
         deviceName: String,
     ): Result<String> = runCatching {
-        val normalizedUrl = normalizeServerUrl(serverUrl)
-        check(normalizedUrl.isNotBlank()) { "Enter your Roche Server URL" }
+        val (parsedUrl, cleanCode) = parsePairingInput(serverUrl, pairingCode)
+        check(cleanCode.isNotBlank()) { "Enter a valid pairing code" }
+        val resolvedUrl =
+            if (parsedUrl.isNotBlank()) {
+                parsedUrl
+            } else {
+                val savedUrl = normalizeServerUrl(settings.settings.first().serverUrl)
+                if (savedUrl.isNotBlank()) {
+                    savedUrl
+                } else {
+                    apiClient
+                        .discoverServer()
+                        ?.let { normalizeServerUrl(it.preferredUrl) }
+                        .orEmpty()
+                }
+            }
+        check(resolvedUrl.isNotBlank()) {
+            "Could not auto-discover Roche server on Tailnet; enter Server URL"
+        }
         val token =
             apiClient.pairDevice(
-                serverUrl = normalizedUrl,
-                code = pairingCode.trim(),
+                serverUrl = resolvedUrl,
+                code = cleanCode,
                 deviceName = deviceName.trim().ifBlank { "Roche Android" },
             )
-        settings.update { it.copy(serverUrl = normalizedUrl, bearerToken = token) }
+        settings.update { it.copy(serverUrl = resolvedUrl, bearerToken = token) }
         token
     }
 

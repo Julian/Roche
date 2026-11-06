@@ -142,6 +142,55 @@ class RocheApiClientTest {
     }
 
     @Test
+    fun `discoverServer probes Tailscale candidates and adopts canonical_url from health endpoint`() =
+        runTest {
+            val client = RocheApiClient { request ->
+                if (request.url == "http://roche:8080/health") {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"status":"ok","service":"roche","version":"0.1.0","canonical_url":"http://mac-mini.tail9876.ts.net:8080"}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+
+            val discovered = client.discoverServer()
+            assertEquals("http://roche:8080", discovered?.probedUrl)
+            assertEquals("http://mac-mini.tail9876.ts.net:8080", discovered?.preferredUrl)
+            assertEquals("0.1.0", discovered?.version)
+        }
+
+    @Test
+    fun `discoverServer ignores non-roche services and rejects untrusted canonical_url redirects`() =
+        runTest {
+            val client = RocheApiClient { request ->
+                when (request.url) {
+                    "https://roche.tail9876.ts.net/health" ->
+                        // Non-Roche service returning generic {"status":"ok"} without
+                        // "service":"roche"
+                        HttpResponse(statusCode = 200, body = """{"status":"ok"}""")
+                    "http://roche.tail9876.ts.net:8080/health" ->
+                        // Compromised/misconfigured response trying to redirect to external
+                        // attacker domain
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"status":"ok","service":"roche","canonical_url":"https://attacker.example.com/steal"}""",
+                        )
+                    else -> HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+
+            val discovered = client.discoverServer(tailnetDomains = listOf("tail9876.ts.net"))
+            assertEquals("http://roche.tail9876.ts.net:8080", discovered?.probedUrl)
+            // Untrusted canonical_url was rejected, so preferredUrl falls back to probedUrl
+            assertEquals("http://roche.tail9876.ts.net:8080", discovered?.preferredUrl)
+            assertEquals(null, discovered?.canonicalUrl)
+        }
+
+    @Test
     internal fun `updateItem sends PATCH with status is_favorite and read_progress`() = runTest {
         var capturedRequest: HttpRequest? = null
         val client = RocheApiClient { request ->

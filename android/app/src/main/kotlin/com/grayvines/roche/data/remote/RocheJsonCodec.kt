@@ -1,5 +1,6 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -128,6 +129,30 @@ internal fun parseProblemDetails(raw: String, statusCode: Int): Pair<String, Str
     parsedTitle to parsedDetail
 }
     .getOrElse { DEFAULT_ERROR_TITLE to raw.ifBlank { "Status $statusCode" } }
+
+internal fun parseHealthDiscoveryJson(
+    raw: String,
+    probedBaseUrl: String,
+): DiscoveredServerDto? = runCatching {
+    val obj = rocheJson.parseToJsonElement(raw).jsonObject
+    val status = obj.stringOrEmpty(KEY_STATUS)
+    val service = obj.nullableString("service")
+    if (status != "ok" || service != "roche") {
+        null
+    } else {
+        val cleanProbed = probedBaseUrl.trim().trimEnd('/')
+        val validatedCanonical =
+            obj.nullableString("canonical_url")?.let { rawCanonical ->
+                validateCanonicalDiscoveryUrl(rawCanonical, cleanProbed)
+            }
+        DiscoveredServerDto(
+            probedUrl = cleanProbed,
+            canonicalUrl = validatedCanonical,
+            version = obj.nullableString("version"),
+        )
+    }
+}
+    .getOrNull()
 
 private fun parseFeedJsonObject(obj: JsonObject): RemoteFeedDto =
     RemoteFeedDto(

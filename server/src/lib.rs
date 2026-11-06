@@ -9,6 +9,7 @@ mod feeds;
 mod media;
 mod scheduler;
 mod service;
+pub mod tailscale;
 mod workers;
 
 pub struct RocheServer;
@@ -17,7 +18,18 @@ impl RocheServer {
     pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
-        let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone());
+
+        if let Err(e) = Self::maybe_advertise_tailscale(&cfg).await {
+            tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
+        }
+        let ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
+        if let Some(identity) = &ts_identity {
+            let urls = identity.candidate_urls(cfg.server.port);
+            tracing::info!(tailscale_urls = ?urls, "Detected Tailscale node addresses");
+        }
+
+        let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone())
+            .with_node_identity(ts_identity);
 
         if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
             match roche_service.auth().issue_pairing_code().await {
@@ -92,5 +104,27 @@ impl RocheServer {
     pub async fn revoke_device(cfg: &config::Config, device_id: &str) -> anyhow::Result<bool> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         db.auth().revoke_device(device_id).await
+    }
+
+    pub async fn discover_servers(
+        cfg: &config::Config,
+    ) -> anyhow::Result<Vec<tailscale::DiscoveredServer>> {
+        Ok(tailscale::discover_on_tailnet(&cfg.tailscale, cfg.server.port).await)
+    }
+
+    pub async fn inspect_tailscale_canonical_url(cfg: &config::Config) -> Option<String> {
+        let identity = tailscale::inspect_local_node(&cfg.tailscale).await?;
+        identity.canonical_url(cfg.server.port)
+    }
+
+    async fn maybe_advertise_tailscale(cfg: &config::Config) -> anyhow::Result<()> {
+        if let Some(svc) = tailscale::advertise_service(&cfg.tailscale, cfg.server.port).await? {
+            tracing::info!(
+                service = %svc,
+                port = cfg.server.port,
+                "Advertised Roche server on Tailnet via `tailscale serve`"
+            );
+        }
+        Ok(())
     }
 }

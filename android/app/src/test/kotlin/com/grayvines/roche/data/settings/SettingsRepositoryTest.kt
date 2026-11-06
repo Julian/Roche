@@ -41,4 +41,57 @@ class SettingsRepositoryTest {
         assertEquals(HeadlineFont.SANS, current.headlineFont)
         assertEquals(true, current.ultraDenseRows)
     }
+
+    @Test
+    fun `normalizeServerUrl parsePairingInput and Tailscale candidates handle MagicDNS and bundles`() {
+        assertEquals("http://roche:8080", normalizeServerUrl("roche"))
+        assertEquals("http://roche:8080", normalizeServerUrl("roche:8080/"))
+        assertEquals(
+            "http://mac-mini.tail9876.ts.net:8080",
+            normalizeServerUrl("mac-mini.tail9876.ts.net:8080"),
+        )
+        assertEquals(
+            "https://roche.tail9876.ts.net",
+            normalizeServerUrl("roche.tail9876.ts.net"),
+        )
+
+        val (url, code) =
+            parsePairingInput(
+                rawServerUrl = "",
+                rawPairingCode = "  http://roche.tail9876.ts.net:8080#1234-guitarist-revenue  ",
+            )
+        assertEquals("http://roche.tail9876.ts.net:8080", url)
+        assertEquals("1234-guitarist-revenue", code)
+
+        val candidates = tailscaleDiscoveryUrls(listOf("tail9876.ts.net.", "evil.com/path#@"))
+        assertEquals(
+            listOf(
+                "https://roche.tail9876.ts.net",
+                "http://roche.tail9876.ts.net:8080",
+                "http://roche:8080",
+                "https://roche",
+            ),
+            candidates,
+        )
+    }
+
+    @Test
+    fun `normalizeServerUrl and parsePairingInput reject adversarial URLs and malformed bundles`() {
+        assertEquals("http://[::1]:8080", normalizeServerUrl("[::1]:8080"))
+        assertEquals("", normalizeServerUrl("javascript:alert(1)"))
+        assertEquals("", normalizeServerUrl("file:///etc/passwd"))
+        assertEquals("", normalizeServerUrl("http://user:pass@100.64.0.1:8080"))
+        assertEquals("", normalizeServerUrl("http://roche:8080/evil/path"))
+        assertEquals("", normalizeServerUrl("http://roche:8080?query=1"))
+        assertEquals("", normalizeServerUrl("http://roche:8080#frag"))
+
+        assertEquals(
+            "" to "",
+            parsePairingInput("", "https://roche.tail9876.ts.net#evil#code"),
+        )
+        assertEquals(
+            "" to "",
+            parsePairingInput("", "javascript:alert(1)#1234-code"),
+        )
+    }
 }

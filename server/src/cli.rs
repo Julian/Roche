@@ -43,6 +43,10 @@ pub struct CliOverrides {
     /// Base directory for data, database, and media storage [env: `ROCHE_DATA_DIR`]
     #[arg(long, global = true, value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Tailscale Service name to auto-advertise via `tailscale serve` (e.g. `svc:roche`) [env: `ROCHE_TAILSCALE_ADVERTISE_SERVICE`]
+    #[arg(long, global = true, value_name = "SERVICE")]
+    pub advertise_service: Option<String>,
 }
 
 impl Provider for CliOverrides {
@@ -61,6 +65,9 @@ impl Provider for CliOverrides {
         if let Some(data_dir) = &self.data_dir {
             figment = figment.merge(("storage.data_dir", data_dir.as_path()));
         }
+        if let Some(svc) = &self.advertise_service {
+            figment = figment.merge(("tailscale.advertise_service", svc.as_str()));
+        }
         figment.data()
     }
 }
@@ -77,6 +84,24 @@ impl Cli {
             Some(Command::Pair) => {
                 let code = crate::RocheServer::issue_pairing_code(&cfg).await?;
                 println!("{code}");
+                if let Some(url) = crate::RocheServer::inspect_tailscale_canonical_url(&cfg).await {
+                    eprintln!("Tailscale one-step pairing bundle: {url}#{code}");
+                }
+                Ok(())
+            }
+            Some(Command::Discover) => {
+                let servers = crate::RocheServer::discover_servers(&cfg).await?;
+                if servers.is_empty() {
+                    println!("No Roche servers discovered on Tailnet.");
+                } else {
+                    for s in servers {
+                        let canonical =
+                            sanitize_terminal_text(s.canonical_url.as_deref().unwrap_or(&s.url));
+                        let probed = sanitize_terminal_text(&s.url);
+                        let ver = sanitize_terminal_text(s.version.as_deref().unwrap_or("unknown"));
+                        println!("{canonical}\t(probed={probed}, version={ver})");
+                    }
+                }
                 Ok(())
             }
             Some(Command::Devices { action }) => match action {
@@ -118,6 +143,8 @@ pub enum Command {
     Serve,
     /// Generate a short-lived pairing code on demand
     Pair,
+    /// Auto-discover running Roche servers on the local Tailnet
+    Discover,
     /// Manage paired devices and tokens
     Devices {
         #[command(subcommand)]
@@ -134,6 +161,10 @@ pub enum DeviceCommand {
         /// Device token ID to revoke
         id: String,
     },
+}
+
+fn sanitize_terminal_text(input: &str) -> String {
+    input.chars().filter(|c| !c.is_control()).collect()
 }
 
 #[cfg(test)]
