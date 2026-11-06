@@ -427,8 +427,14 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
+        read_progress: Option<f64>,
     ) -> Result<ItemDetail, ApiError> {
-        if !self.service.db.items().update(id, status, is_favorite).await? {
+        if let Some(p) = read_progress
+            && (!p.is_finite() || !(0.0..=1.0).contains(&p))
+        {
+            return Err(ApiError::bad_request("read_progress must be between 0.0 and 1.0"));
+        }
+        if !self.service.db.items().update(id, status, is_favorite, read_progress).await? {
             return Err(ApiError::not_found("Item not found"));
         }
         self.get(id).await

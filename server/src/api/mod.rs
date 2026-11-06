@@ -260,7 +260,8 @@ impl ApiRoutes {
         ProblemPath(id): ProblemPath<String>,
         ProblemJson(req): ProblemJson<UpdateItemRequest>,
     ) -> Result<Json<ItemDetail>, ApiError> {
-        let detail = service.items().update(&id, req.status, req.is_favorite).await?;
+        let detail =
+            service.items().update(&id, req.status, req.is_favorite, req.read_progress).await?;
         Ok(Json(detail))
     }
 
@@ -454,6 +455,7 @@ struct SaveItemRequest {
 struct UpdateItemRequest {
     status: Option<ItemStatus>,
     is_favorite: Option<bool>,
+    read_progress: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -792,6 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_items_save_archive_tags_and_export() {
         let (app, auth) = setup_app().await;
 
@@ -822,6 +825,46 @@ mod tests {
             .unwrap();
         let bad_res = app.clone().oneshot(bad_status).await.unwrap();
         assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+
+        // Reject out-of-range read_progress on PATCH /api/v1/items/{id}
+        for invalid_progress in [1.5, -0.1] {
+            let bad_progress = Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/items/{item_id}"))
+                .header(header::AUTHORIZATION, &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"read_progress":{invalid_progress}}}"#)))
+                .unwrap();
+            let bad_progress_res = app.clone().oneshot(bad_progress).await.unwrap();
+            assert_eq!(bad_progress_res.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Update read_progress via PATCH /api/v1/items/{id} and verify persistence
+        let patch_progress = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/items/{item_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"read_progress":0.75}"#))
+            .unwrap();
+        let patch_res = app.clone().oneshot(patch_progress).await.unwrap();
+        assert_eq!(patch_res.status(), StatusCode::OK);
+        let patch_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(patch_res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(patch_body["read_progress"], 0.75);
+
+        let get_item = Request::builder()
+            .uri(format!("/api/v1/items/{item_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let get_res = app.clone().oneshot(get_item).await.unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let get_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(get_res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(get_body["read_progress"], 0.75);
 
         // Reject invalid query filter status on GET /api/v1/items?status=bogus
         let bad_query = Request::builder()
@@ -857,6 +900,7 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["read_progress"], 0.75);
 
         // Export data includes item_tags and non-empty activity log
         let export_request = Request::builder()
@@ -909,7 +953,7 @@ mod tests {
             .unwrap();
 
         // Star the item and verify ?is_favorite=true filter + thumbnail_media_id + duration projection
-        db.items().update(&item.id, None, Some(true)).await.unwrap();
+        db.items().update(&item.id, None, Some(true), None).await.unwrap();
         let list_request = Request::builder()
             .uri("/api/v1/items?is_favorite=true")
             .header(header::AUTHORIZATION, &auth)

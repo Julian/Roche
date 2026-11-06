@@ -1,0 +1,142 @@
+package com.grayvines.roche.ui
+
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.room3.Room
+import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.SeedData
+import com.grayvines.roche.data.remote.HttpResponse
+import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.settings.SettingsRepository
+import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class MainViewModelTest {
+    @TempDir lateinit var tempDir: File
+
+    private lateinit var database: RocheDatabase
+    private lateinit var settings: SettingsRepository
+    private lateinit var repository: RocheRepository
+    private lateinit var viewModel: MainViewModel
+
+    @BeforeEach
+    fun setUp() {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        database =
+            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
+        val dataStore =
+            PreferenceDataStoreFactory.create(
+                produceFile = { File(tempDir, "vm_test_settings.preferences_pb") }
+            )
+        settings = SettingsRepository(dataStore)
+        val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
+        repository =
+            RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        viewModel = MainViewModel(repository = repository, settingsRepository = settings)
+    }
+
+    @AfterEach
+    fun tearDown() {
+        database.close()
+        Dispatchers.resetMain()
+    }
+
+    @Test
+    fun `OpenAddSheet populates prefilled url and title and CloseAddSheet resets both`() = runTest {
+        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+        viewModel.dispatch(MainAction.OpenContextSheet("item-1"))
+        viewModel.dispatch(
+            MainAction.OpenAddSheet(
+                prefilledUrl = "https://example.com/shared",
+                prefilledTitle = "Shared Headline",
+            )
+        )
+
+        val opened = viewModel.uiState.first { it.isAddSheetOpen }
+        assertTrue(opened.isAddSheetOpen)
+        assertEquals("https://example.com/shared", opened.prefilledShareUrl)
+        assertEquals("Shared Headline", opened.prefilledShareTitle)
+        assertNull(opened.contextSheetEntryId)
+
+        viewModel.dispatch(MainAction.CloseAddSheet)
+        val closed = viewModel.uiState.first { !it.isAddSheetOpen }
+        assertFalse(closed.isAddSheetOpen)
+        assertEquals("", closed.prefilledShareUrl)
+        assertEquals("", closed.prefilledShareTitle)
+
+        collectJob.cancel()
+    }
+
+    @Test
+    fun `SaveUrlOrFeed saves entry with prefilled title and clears reader and add sheet state`() =
+        runTest {
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+            viewModel.dispatch(MainAction.OpenReader("item-1"))
+            viewModel.dispatch(
+                MainAction.OpenAddSheet(
+                    prefilledUrl = "https://example.com/shared-article",
+                    prefilledTitle = "Shared Article Title",
+                )
+            )
+            viewModel.dispatch(
+                MainAction.SaveUrlOrFeed(
+                    url = "https://example.com/shared-article",
+                    titleOverride = "Shared Article Title",
+                    tagCsv = "systems, reading",
+                )
+            )
+
+            val state = viewModel.uiState.first { it.statusBanner != null }
+            assertFalse(state.isAddSheetOpen)
+            assertEquals("", state.prefilledShareUrl)
+            assertEquals("", state.prefilledShareTitle)
+            assertNull(state.selectedReaderEntryId)
+
+            val savedEntry =
+                repository.snapshot
+                    .first { snap ->
+                        snap.entries.any {
+                            it.url == "https://example.com/shared-article" && it.tags.isNotEmpty()
+                        }
+                    }
+                    .entries
+                    .first { it.url == "https://example.com/shared-article" }
+            assertEquals("Shared Article Title", savedEntry.title)
+            assertEquals(listOf("reading", "systems"), savedEntry.tags)
+
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `UpdateReadProgress persists clamped progress to repository`() = runTest {
+        database.dao().upsertItems(SeedData.items)
+        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+        viewModel.dispatch(MainAction.UpdateReadProgress(entryId = "item-1", progress = 0.65))
+
+        val updated = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertEquals(0.65, updated.readProgress, 1e-6)
+
+        collectJob.cancel()
+    }
+}

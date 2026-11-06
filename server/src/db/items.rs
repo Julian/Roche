@@ -14,7 +14,7 @@ use super::{
 
 const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
        i.published_at, i.created_at, i.summary, i.content_html, i.content_type, i.status,
-       i.is_favorite, i.read_at,
+       i.is_favorite, i.read_at, i.read_progress,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
        (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
        COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
@@ -50,6 +50,7 @@ pub struct Item {
     pub status: ItemStatus,
     pub is_favorite: bool,
     pub read_at: Option<DateTime<Utc>>,
+    pub read_progress: f64,
     pub thumbnail_media_id: Option<String>,
     pub duration: Option<i64>,
     #[serde(default)]
@@ -154,6 +155,7 @@ impl<'a> ItemRepo<'a> {
             status: ItemStatus::Unread,
             is_favorite: false,
             read_at: None,
+            read_progress: 0.0,
             thumbnail_media_id: None,
             duration: None,
             tag_names: TagNames::default(),
@@ -241,6 +243,7 @@ impl<'a> ItemRepo<'a> {
             status: ItemStatus::Unread,
             is_favorite: false,
             read_at: None,
+            read_progress: 0.0,
             thumbnail_media_id: None,
             duration: None,
             tag_names,
@@ -332,17 +335,18 @@ impl<'a> ItemRepo<'a> {
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
+        read_progress: Option<f64>,
     ) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
-        let existing: Option<(ItemStatus, bool)> =
-            sqlx::query_as("SELECT status, is_favorite FROM items WHERE id = ?")
+        let existing: Option<(ItemStatus, bool, f64)> =
+            sqlx::query_as("SELECT status, is_favorite, read_progress FROM items WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
 
-        let Some((current_status, current_favorite)) = existing else {
+        let Some((current_status, current_favorite, current_progress)) = existing else {
             return Ok(false);
         };
 
@@ -401,16 +405,35 @@ impl<'a> ItemRepo<'a> {
             SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
+        if let Some(progress) = read_progress
+            && (progress - current_progress).abs() > f64::EPSILON
+        {
+            sqlx::query("UPDATE items SET read_progress = ?, updated_at = ? WHERE id = ?")
+                .bind(progress)
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Item,
+                id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(true)
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Archived), None).await
+        self.update(id, Some(ItemStatus::Archived), None, None).await
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Unread), None).await
+        self.update(id, Some(ItemStatus::Unread), None, None).await
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {

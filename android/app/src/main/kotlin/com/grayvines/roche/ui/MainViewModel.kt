@@ -104,6 +104,8 @@ sealed interface MainAction {
 
     data class ToggleTagOnEntry(val entryId: String, val tagName: String) : Mutation
 
+    data class UpdateReadProgress(val entryId: String, val progress: Double) : Mutation
+
     data class SaveUrlOrFeed(val url: String, val titleOverride: String?, val tagCsv: String) :
         Mutation
 
@@ -180,6 +182,8 @@ class MainViewModel(
             is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
             is MainAction.ToggleTagOnEntry ->
                 repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
+            is MainAction.UpdateReadProgress ->
+                repository.updateReadProgress(itemId = action.entryId, progress = action.progress)
             is MainAction.SaveUrlOrFeed ->
                 performSaveUrl(action.url, action.titleOverride, action.tagCsv)
             MainAction.SyncNow -> performSync()

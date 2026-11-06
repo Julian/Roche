@@ -7,8 +7,15 @@ import androidx.room3.RoomDatabase
 import androidx.sqlite.driver.AndroidSQLiteDriver
 
 @Database(
-    entities = [FeedEntity::class, ItemEntity::class, TagEntity::class, ItemTagEntity::class],
-    version = 1,
+    entities =
+        [
+            FeedEntity::class,
+            ItemEntity::class,
+            TagEntity::class,
+            ItemTagEntity::class,
+            PendingMutationEntity::class,
+        ],
+    version = 2,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -20,6 +27,7 @@ abstract class RocheDatabase : RoomDatabase() {
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }
 }

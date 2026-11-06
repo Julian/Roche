@@ -53,3 +53,16 @@ data class TagEntity(@PrimaryKey val id: String, val name: String)
     indices = [Index(value = ["itemId"]), Index(value = ["tagId"])],
 )
 data class ItemTagEntity(val itemId: String, val tagId: String)
+
+@Entity(tableName = "pending_mutations")
+data class PendingMutationEntity(
+    @PrimaryKey val entityId: String,
+    val isLocalFeed: Boolean = false,
+    val isLocalItem: Boolean = false,
+    val titleOverride: String? = null,
+    val dirtyStatus: String? = null,
+    val dirtyFavorite: Boolean? = null,
+    val dirtyReadProgress: Double? = null,
+    val addedTagsCsv: String = "",
+    val removedTagsCsv: String = "",
+)

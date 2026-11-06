@@ -48,7 +48,7 @@ class RocheRepositoryTest {
         database.close()
     }
 
-    private suspend fun seedTestDatabase() {
+    internal suspend fun seedTestDatabase() {
         val dao = database.dao()
         dao.upsertFeeds(SeedData.feeds)
         dao.upsertTags(SeedData.tags)
@@ -260,5 +260,182 @@ class RocheRepositoryTest {
                     "DELETE http://100.64.0.12:8080/api/v1/items/item-2/tags/tag-srv-77"
                 )
             )
+        }
+
+    @Test
+    internal fun `updateReadProgress and local tag removal push mutations to server`() = runTest {
+        seedTestDatabase()
+        settings.update {
+            it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+        }
+        val requests = mutableListOf<Pair<String, String?>>()
+        val liveClient = RocheApiClient { request ->
+            requests.add("${request.method} ${request.url}" to request.body)
+            when {
+                request.method == "PATCH" && request.url.endsWith("/api/v1/items/item-1") ->
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"id":"item-1","title":"Paper","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.85,"created_at":"2026-03-29T10:00:00Z"}""",
+                    )
+                request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"tags":[{"id":"srv-sqlite-uuid","name":"sqlite","unread_count":2}]}""",
+                    )
+                request.method == "DELETE" &&
+                    request.url.endsWith("/api/v1/items/item-2/tags/srv-sqlite-uuid") ->
+                    HttpResponse(statusCode = 204, body = "")
+                else -> HttpResponse(statusCode = 404, body = "{}")
+            }
+        }
+        val liveRepo =
+            RocheRepository(database = database, apiClient = liveClient, settings = settings)
+
+        liveRepo.updateReadProgress(itemId = "item-1", progress = 0.85)
+        val updatedItem = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertEquals(0.85, updatedItem.readProgress)
+        assertTrue(
+            requests.any { (endpoint, body) ->
+                endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                    body == """{"read_progress":0.85}"""
+            }
+        )
+
+        // Removing a tag whose local ID starts with "tag-" resolves the server UUID first
+        liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "sqlite")
+        assertTrue(
+            requests.any { (endpoint, _) ->
+                endpoint ==
+                    "DELETE http://100.64.0.12:8080/api/v1/items/item-2/tags/srv-sqlite-uuid"
+            }
+        )
+    }
+
+    @Test
+    internal fun `offline mutations and saved urls are pushed on next syncWithServer without data loss`() =
+        runTest {
+            seedTestDatabase()
+            // Perform mutations while offline (bearerToken is blank)
+            repository.setArchiveState(itemId = "item-1", archived = true)
+            repository.toggleStar(itemId = "item-1")
+            repository.updateReadProgress(itemId = "item-1", progress = 0.9)
+            repository.toggleTagOnItem(itemId = "item-1", tagName = "rust")
+            repository.toggleTagOnItem(itemId = "item-1", tagName = "systems")
+            repository.saveUrlOrFeed(
+                inputUrl = "https://example.com/offline-note",
+                titleOverride = "Offline Note",
+                tagCsv = "crdt",
+            )
+
+            // Come online and sync with server
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val pushedRequests = mutableListOf<Pair<String, String?>>()
+            val syncClient = buildTwoWaySyncMockClient(pushedRequests)
+            val syncedRepo =
+                RocheRepository(database = database, apiClient = syncClient, settings = settings)
+
+            val count = syncedRepo.syncWithServer().getOrThrow()
+            assertEquals(2, count)
+            assertTwoWaySyncPushedRequests(pushedRequests)
+
+            val entries = syncedRepo.snapshot.first().entries.associateBy { it.id }
+            val item1 = entries.getValue("item-1")
+            assertTrue(item1.isArchived)
+            assertFalse(item1.isFavorite)
+            assertEquals(0.9, item1.readProgress)
+            assertEquals(listOf("llm-inference", "rust"), item1.tags)
+
+            val savedItem = entries.getValue("srv-saved-99")
+            assertEquals("Offline Note", savedItem.title)
+            assertEquals(listOf("crdt"), savedItem.tags)
+        }
+
+    internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
+        assertTrue(
+            pushedRequests.any { (req, body) ->
+                req == "POST http://100.64.0.12:8080/api/v1/items/save" &&
+                    body?.contains("https://example.com/offline-note") == true
+            }
+        )
+        assertTrue(
+            pushedRequests.any { (req, body) ->
+                req == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                    body == """{"status":"archived","is_favorite":false,"read_progress":0.9}"""
+            }
+        )
+        assertTrue(
+            pushedRequests.any { (req, body) ->
+                req == "POST http://100.64.0.12:8080/api/v1/items/item-1/tags" &&
+                    body == """{"name":"rust"}"""
+            }
+        )
+        assertTrue(
+            pushedRequests.any { (req, _) ->
+                req == "DELETE http://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
+            }
+        )
+    }
+
+    internal fun buildTwoWaySyncMockClient(
+        pushedRequests: MutableList<Pair<String, String?>>
+    ): RocheApiClient = RocheApiClient { request ->
+        pushedRequests.add("${request.method} ${request.url}" to request.body)
+        if (request.method == "GET") {
+            handleTwoWaySyncReadRequest(request.url)
+        } else {
+            handleTwoWaySyncWriteRequest(request.method, request.url)
+        }
+    }
+
+    internal fun handleTwoWaySyncWriteRequest(method: String, url: String): HttpResponse =
+        when {
+            method == "POST" && url.endsWith("/api/v1/items/save") ->
+                HttpResponse(
+                    statusCode = 201,
+                    body =
+                        """{"id":"srv-saved-99","title":"Offline Note","url":"https://example.com/offline-note","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["crdt"]}""",
+                )
+            method == "PATCH" && url.endsWith("/api/v1/items/item-1") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"id":"item-1","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"archived","is_favorite":false,"read_progress":0.9,"created_at":"2026-03-29T10:00:00Z"}""",
+                )
+            method == "POST" && url.endsWith("/api/v1/items/item-1/tags") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"id":"item-1","tags":[{"id":"srv-tag-rust","name":"rust","unread_count":0}]}""",
+                )
+            method == "DELETE" && url.endsWith("/api/v1/items/item-1/tags/srv-tag-systems") ->
+                HttpResponse(statusCode = 204, body = "")
+            else -> HttpResponse(statusCode = 404, body = "{}")
+        }
+
+    internal fun handleTwoWaySyncReadRequest(url: String): HttpResponse =
+        when {
+            url.endsWith("/api/v1/feeds") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":0}]}""",
+                )
+            url.endsWith("/api/v1/tags") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"tags":[{"id":"srv-tag-llm","name":"llm-inference","unread_count":0},{"id":"srv-tag-systems","name":"systems","unread_count":0},{"id":"srv-tag-rust","name":"rust","unread_count":0},{"id":"srv-tag-crdt","name":"crdt","unread_count":1}]}""",
+                )
+            url.contains("/api/v1/items") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.35,"created_at":"2026-03-29T10:00:00Z","tag_names":["llm-inference","systems"]}]}""",
+                )
+            else -> HttpResponse(statusCode = 404, body = "{}")
         }
 }

@@ -140,4 +140,37 @@ class RocheApiClientTest {
         assertEquals("Unauthorized", error.title)
         assertEquals("Invalid or expired bearer token", error.detail)
     }
+
+    @Test
+    internal fun `updateItem sends PATCH with status is_favorite and read_progress`() = runTest {
+        var capturedRequest: HttpRequest? = null
+        val client = RocheApiClient { request ->
+            capturedRequest = request
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"item-42","title":"Test","url":"https://example.com","content_type":"article","status":"archived","is_favorite":true,"read_progress":0.75,"created_at":"2026-03-29T10:00:00Z"}""",
+            )
+        }
+
+        val updated =
+            client.updateItem(
+                serverUrl = "http://localhost:8080",
+                token = "tok-123",
+                itemId = "item-42",
+                status = "archived",
+                isFavorite = true,
+                readProgress = 0.75,
+            )
+
+        assertEquals("PATCH", capturedRequest?.method)
+        assertEquals("http://localhost:8080/api/v1/items/item-42", capturedRequest?.url)
+        assertEquals(
+            """{"status":"archived","is_favorite":true,"read_progress":0.75}""",
+            capturedRequest?.body,
+        )
+        assertEquals("archived", updated.status)
+        assertEquals(true, updated.isFavorite)
+        assertEquals(0.75, updated.readProgress)
+    }
 }

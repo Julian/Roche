@@ -80,6 +80,12 @@ fun ReaderView(
             }
         }
 
+    ReaderScrollProgressEffect(
+        entry = entry,
+        scrollState = scrollState,
+        onAction = onAction,
+    )
+
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
             entry = entry,
@@ -100,6 +106,41 @@ fun ReaderView(
             onSelectTag = { onAction(MainAction.FilterByTag(it)) },
             onOpenExternalUrl = { onOpenExternalUrl(entry.url) },
         )
+    }
+}
+
+@Composable
+internal fun ReaderScrollProgressEffect(
+    entry: InboxEntry,
+    scrollState: androidx.compose.foundation.ScrollState,
+    onAction: (MainAction) -> Unit,
+) {
+    var restoredEntryId by remember { mutableStateOf<String?>(null) }
+    var hasUserScrolled by remember(entry.id) { mutableStateOf(false) }
+
+    LaunchedEffect(entry.id, scrollState.maxValue) {
+        if (scrollState.maxValue > 0 && restoredEntryId != entry.id) {
+            restoredEntryId = entry.id
+            val targetScroll =
+                (entry.readProgress.coerceIn(0.0, 1.0) * scrollState.maxValue).toInt()
+            scrollState.scrollTo(targetScroll)
+        }
+    }
+
+    LaunchedEffect(
+        entry.id,
+        scrollState.isScrollInProgress,
+        scrollState.maxValue,
+    ) {
+        if (scrollState.isScrollInProgress) {
+            hasUserScrolled = true
+        } else if (hasUserScrolled && scrollState.maxValue > 0) {
+            val rawProgress =
+                (scrollState.value.toDouble() / scrollState.maxValue.toDouble()).coerceIn(0.0, 1.0)
+            if (kotlin.math.abs(rawProgress - entry.readProgress) >= READ_PROGRESS_MIN_DELTA) {
+                onAction(MainAction.UpdateReadProgress(entry.id, rawProgress))
+            }
+        }
     }
 }
 
@@ -555,3 +596,4 @@ fun AddUrlOrFeedBottomSheet(
 }
 
 private const val MIN_PROGRESS = 0.08f
+private const val READ_PROGRESS_MIN_DELTA = 0.05

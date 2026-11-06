@@ -20,6 +20,38 @@ interface RocheDao {
 
     @Query("SELECT COUNT(*) FROM items") suspend fun countItems(): Int
 
+    @Query("SELECT * FROM feeds") suspend fun getAllFeeds(): List<FeedEntity>
+
+    @Query("SELECT * FROM feeds WHERE id = :id LIMIT 1")
+    suspend fun getFeedById(id: String): FeedEntity?
+
+    @Query("DELETE FROM feeds WHERE id = :id") suspend fun deleteFeedById(id: String)
+
+    @Query("SELECT * FROM tags") suspend fun getAllTags(): List<TagEntity>
+
+    @Query("SELECT * FROM item_tags") suspend fun getAllItemTags(): List<ItemTagEntity>
+
+    @Query(
+        "SELECT t.name FROM tags t INNER JOIN item_tags it ON t.id = it.tagId " +
+            "WHERE it.itemId = :itemId ORDER BY t.name ASC"
+    )
+    suspend fun getTagNamesForItem(itemId: String): List<String>
+
+    @Query("UPDATE OR IGNORE item_tags SET tagId = :newTagId WHERE tagId = :oldTagId")
+    suspend fun migrateItemTagIds(oldTagId: String, newTagId: String)
+
+    @Query("SELECT * FROM pending_mutations")
+    suspend fun getAllPendingMutations(): List<PendingMutationEntity>
+
+    @Query("SELECT * FROM pending_mutations WHERE entityId = :entityId LIMIT 1")
+    suspend fun getPendingMutation(entityId: String): PendingMutationEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertPendingMutation(mutation: PendingMutationEntity)
+
+    @Query("DELETE FROM pending_mutations WHERE entityId = :entityId")
+    suspend fun deletePendingMutation(entityId: String)
+
     @Query("SELECT * FROM items") suspend fun getAllItems(): List<ItemEntity>
 
     @Query("SELECT * FROM items WHERE id = :id LIMIT 1")
