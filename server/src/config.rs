@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use figment::{
+    Figment, Provider,
+    providers::{Env, Format, Serialized, Toml},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +23,18 @@ pub struct Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+}
+
+impl ServerConfig {
+    #[must_use]
+    pub fn listen_addr(&self) -> String {
+        let host = self.host.trim();
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", self.port)
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -105,42 +121,97 @@ impl Default for AuthConfig {
 
 impl Config {
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        if let Some(explicit) = path {
-            let contents = std::fs::read_to_string(explicit)?;
-            Self::from_toml_str(&contents)
+        Self::load_with_provider(path, Figment::new())
+    }
+
+    pub fn load_with_provider<P: Provider>(path: Option<&Path>, cli_provider: P) -> Result<Self> {
+        let env_config_path = std::env::var("ROCHE_CONFIG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let effective_path = path.or(env_config_path.as_deref());
+
+        let mut figment = Figment::new();
+        if let Some(explicit) = effective_path {
+            if !explicit.exists() {
+                anyhow::bail!("configuration file not found: {}", explicit.display());
+            }
+            figment = figment.merge(Toml::file(explicit));
         } else {
             let default_path = Path::new("config.toml");
             if default_path.exists() {
-                let contents = std::fs::read_to_string(default_path)?;
-                Self::from_toml_str(&contents)
-            } else {
-                Ok(Self::default())
+                figment = figment.merge(Toml::file(default_path));
             }
         }
+
+        figment = figment.merge(Self::env_provider()).merge(cli_provider);
+        Self::from_figment(&figment)
+    }
+
+    #[must_use]
+    pub fn env_provider() -> Env {
+        Env::prefixed("ROCHE_").ignore(&["CONFIG"]).map(|key| {
+            match key.as_str().to_ascii_lowercase().as_str() {
+                "host" | "interface" | "server_host" => "server.host".into(),
+                "port" | "server_port" => "server.port".into(),
+                "data_dir" | "storage_data_dir" => "storage.data_dir".into(),
+                "database_path" | "storage_database_path" => "storage.database_path".into(),
+                "media_dir" | "storage_media_dir" => "storage.media_dir".into(),
+                "default_poll_interval" | "feeds_default_poll_interval" => {
+                    "feeds.default_poll_interval".into()
+                }
+                "max_poll_interval" | "feeds_max_poll_interval" => "feeds.max_poll_interval".into(),
+                "min_poll_interval" | "feeds_min_poll_interval" => "feeds.min_poll_interval".into(),
+                "ytdlp_path" | "media_ytdlp_path" => "media.ytdlp_path".into(),
+                "download_dir" | "media_download_dir" => "media.download_dir".into(),
+                "max_concurrent_downloads" | "media_max_concurrent_downloads" => {
+                    "media.max_concurrent_downloads".into()
+                }
+                "op_log_prune_after" | "sync_op_log_prune_after" => {
+                    "sync.op_log_prune_after".into()
+                }
+                "pairing_code_ttl" | "auth_pairing_code_ttl" => "auth.pairing_code_ttl".into(),
+                "token_length" | "auth_token_length" => "auth.token_length".into(),
+                other => other.replace("__", ".").into(),
+            }
+        })
     }
 
     pub fn from_toml_str(contents: &str) -> Result<Self> {
-        let mut cfg: Self = toml::from_str(contents)?;
-        let default_storage = StorageConfig::default();
-        let default_media = MediaConfig::default();
-        if cfg.storage.data_dir != default_storage.data_dir {
-            if cfg.storage.database_path == default_storage.database_path {
+        let figment = Figment::new().merge(Toml::string(contents));
+        Self::from_figment(&figment)
+    }
+
+    pub fn from_figment(overrides: &Figment) -> Result<Self> {
+        let explicit_data_dir = overrides.contains("storage.data_dir");
+        let explicit_db_path = overrides.contains("storage.database_path");
+        let explicit_media_dir = overrides.contains("storage.media_dir");
+        let explicit_download_dir = overrides.contains("media.download_dir");
+
+        let mut cfg: Self =
+            Figment::from(Serialized::defaults(Self::default())).merge(overrides).extract()?;
+
+        if explicit_data_dir {
+            if !explicit_db_path {
                 cfg.storage.database_path = cfg.storage.data_dir.join("roche.db");
             }
-            if cfg.storage.media_dir == default_storage.media_dir {
+            if !explicit_media_dir {
                 cfg.storage.media_dir = cfg.storage.data_dir.join("media");
             }
         }
-        if cfg.storage.media_dir != default_storage.media_dir
-            && cfg.media.download_dir == default_media.download_dir
-        {
+        if (explicit_data_dir || explicit_media_dir) && !explicit_download_dir {
             cfg.media.download_dir = cfg.storage.media_dir.join("downloads");
         }
+
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.server.host.trim().is_empty() {
+            anyhow::bail!("server.host must not be empty");
+        }
         if self.feeds.min_poll_interval <= 0 {
             anyhow::bail!("feeds.min_poll_interval must be greater than 0");
         }
@@ -178,6 +249,8 @@ impl Config {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     #[test]
@@ -235,5 +308,88 @@ data_dir = "/srv/roche"
         assert_eq!(cfg.storage.database_path, Path::new("/srv/roche/roche.db"));
         assert_eq!(cfg.storage.media_dir, Path::new("/srv/roche/media"));
         assert_eq!(cfg.media.download_dir, Path::new("/srv/roche/media/downloads"));
+    }
+
+    #[test]
+    fn test_override_precedence_cli_over_env_over_toml_over_defaults() {
+        let toml_layer = Toml::string(
+            r#"
+[server]
+host = "192.168.1.10"
+port = 7000
+
+[storage]
+data_dir = "/toml/roche"
+
+[feeds]
+default_poll_interval = 45
+"#,
+        );
+
+        let env_layer = Figment::new()
+            .merge(("server.host", "100.64.0.5"))
+            .merge(("server.port", 8000))
+            .merge(("media.max_concurrent_downloads", 4));
+
+        let cli = crate::cli::Cli::try_parse_from(["roche", "--host", "0.0.0.0", "serve"]).unwrap();
+
+        let figment = Figment::new().merge(toml_layer).merge(env_layer).merge(&cli.overrides);
+        let cfg = Config::from_figment(&figment).unwrap();
+
+        // CLI overrides env and TOML
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        // Env overrides TOML when CLI is unset
+        assert_eq!(cfg.server.port, 8000);
+        assert_eq!(cfg.media.max_concurrent_downloads, 4);
+        // TOML overrides default when neither CLI nor env is set
+        assert_eq!(cfg.feeds.default_poll_interval, 45);
+        assert_eq!(cfg.storage.data_dir, Path::new("/toml/roche"));
+        assert_eq!(cfg.storage.database_path, Path::new("/toml/roche/roche.db"));
+        // Default preserved when unset in all layers
+        assert_eq!(cfg.sync.op_log_prune_after, 30);
+    }
+
+    #[test]
+    fn test_derived_paths_update_when_data_dir_overridden_by_env_or_cli() {
+        let base_figment = Figment::new()
+            .merge(Toml::string(
+                r#"
+[server]
+host = "127.0.0.1"
+"#,
+            ))
+            .merge(("storage.data_dir", "/env/roche"));
+
+        let cfg_from_env = Config::from_figment(&base_figment).unwrap();
+        assert_eq!(cfg_from_env.storage.data_dir, Path::new("/env/roche"));
+        assert_eq!(cfg_from_env.storage.database_path, Path::new("/env/roche/roche.db"));
+        assert_eq!(cfg_from_env.storage.media_dir, Path::new("/env/roche/media"));
+        assert_eq!(cfg_from_env.media.download_dir, Path::new("/env/roche/media/downloads"));
+
+        let cli = crate::cli::Cli::try_parse_from(["roche", "--data-dir", "/cli/roche"]).unwrap();
+
+        let cfg_from_cli = Config::from_figment(&base_figment.merge(&cli.overrides)).unwrap();
+        assert_eq!(cfg_from_cli.storage.data_dir, Path::new("/cli/roche"));
+        assert_eq!(cfg_from_cli.storage.database_path, Path::new("/cli/roche/roche.db"));
+        assert_eq!(cfg_from_cli.storage.media_dir, Path::new("/cli/roche/media"));
+        assert_eq!(cfg_from_cli.media.download_dir, Path::new("/cli/roche/media/downloads"));
+    }
+
+    #[test]
+    fn test_empty_host_validation() {
+        let empty_host = Figment::new().merge(("server.host", "   "));
+        assert!(Config::from_figment(&empty_host).is_err());
+    }
+
+    #[test]
+    fn test_server_config_listen_addr_brackets_ipv6() {
+        let v4 = ServerConfig { host: "0.0.0.0".to_string(), port: 8080 };
+        assert_eq!(v4.listen_addr(), "0.0.0.0:8080");
+
+        let v6 = ServerConfig { host: "::".to_string(), port: 8080 };
+        assert_eq!(v6.listen_addr(), "[::]:8080");
+
+        let bracketed_v6 = ServerConfig { host: "[::1]".to_string(), port: 9090 };
+        assert_eq!(bracketed_v6.listen_addr(), "[::1]:9090");
     }
 }

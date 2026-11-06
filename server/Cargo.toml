@@ -51,7 +51,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
-toml = "1.1"
+figment = { version = "0.10", features = ["toml", "env"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

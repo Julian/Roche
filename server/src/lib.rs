@@ -1,7 +1,7 @@
 mod api;
 mod auth;
 pub mod cli;
-mod config;
+pub mod config;
 mod content;
 mod db;
 mod error;
@@ -14,8 +14,7 @@ mod workers;
 pub struct RocheServer;
 
 impl RocheServer {
-    pub async fn run(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
-        let cfg = config::Config::load(config_path)?;
+    pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone());
@@ -61,7 +60,7 @@ impl RocheServer {
         });
 
         let app = api::ApiRoutes::router_with_service(roche_service);
-        let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+        let addr = cfg.server.listen_addr();
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         tracing::info!(addr = %addr, "Roche server listening");
@@ -79,28 +78,18 @@ impl RocheServer {
         tracing::info!("Shutdown signal received, stopping server");
     }
 
-    pub async fn issue_pairing_code(
-        config_path: Option<&std::path::Path>,
-    ) -> anyhow::Result<String> {
-        let cfg = config::Config::load(config_path)?;
+    pub async fn issue_pairing_code(cfg: &config::Config) -> anyhow::Result<String> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let pairing = auth::pairing::PairingManager::new(db.auth());
         pairing.create_code(cfg.auth.pairing_code_ttl).await
     }
 
-    pub async fn list_devices(
-        config_path: Option<&std::path::Path>,
-    ) -> anyhow::Result<Vec<db::DeviceToken>> {
-        let cfg = config::Config::load(config_path)?;
+    pub async fn list_devices(cfg: &config::Config) -> anyhow::Result<Vec<db::DeviceToken>> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         db.auth().list_devices().await
     }
 
-    pub async fn revoke_device(
-        config_path: Option<&std::path::Path>,
-        device_id: &str,
-    ) -> anyhow::Result<bool> {
-        let cfg = config::Config::load(config_path)?;
+    pub async fn revoke_device(cfg: &config::Config, device_id: &str) -> anyhow::Result<bool> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         db.auth().revoke_device(device_id).await
     }
