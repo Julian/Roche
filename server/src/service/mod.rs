@@ -581,6 +581,25 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         self.get(id).await
     }
 
+    pub async fn archive_batch(
+        &self,
+        item_ids: &[String],
+        feed_id: Option<&str>,
+        all_unread: bool,
+    ) -> Result<u64, ApiError> {
+        let clean_feed_id = feed_id.map(str::trim).filter(|s| !s.is_empty());
+        let has_valid_ids = item_ids.iter().any(|id| !id.trim().is_empty());
+        if !has_valid_ids && clean_feed_id.is_none() && !all_unread {
+            return Err(ApiError::bad_request(
+                "Specify non-empty item_ids, feed_id, or all_unread: true",
+            ));
+        }
+        if let Some(fid) = clean_feed_id {
+            let _ = self.service.feeds().get(fid).await?;
+        }
+        Ok(self.service.db.items().archive_batch(item_ids, clean_feed_id, all_unread).await?)
+    }
+
     pub async fn unarchive(&self, id: &str) -> Result<ItemDetail, ApiError> {
         if !self.service.db.items().unarchive(id).await? {
             return Err(ApiError::not_found("Item not found"));

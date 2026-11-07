@@ -124,6 +124,64 @@ impl RocheServer {
         db.auth().revoke_device(device_id).await
     }
 
+    pub async fn import_opml_file(
+        cfg: &config::Config,
+        path: &std::path::Path,
+        poll: bool,
+    ) -> anyhow::Result<usize> {
+        let bytes = tokio::fs::read(path).await?;
+        let opml_str = content::fetcher::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
+        let outlines = tokio::task::spawn_blocking(move || feeds::OpmlDocument::parse(&opml_str))
+            .await
+            .map_err(|e| anyhow::anyhow!("OPML parse task failed: {e}"))?;
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        let imported =
+            db.feeds().import_outlines(outlines, cfg.feeds.default_poll_interval).await?;
+        let count = imported.len();
+        if poll && !imported.is_empty() {
+            let fetcher = std::sync::Arc::new(scheduler::HttpFeedFetcher::new()?);
+            let media_store = media::MediaStore::new(&cfg.storage.media_dir);
+            let ytdlp = media::ytdlp::YtDlpWorker::new(cfg.media.clone(), media_store.clone());
+            let download_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cfg.media.max_concurrent_downloads.max(1),
+            ));
+            let poll_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for feed in imported {
+                let db_clone = db.clone();
+                let fetcher_clone = std::sync::Arc::clone(&fetcher);
+                let store_clone = media_store.clone();
+                let ytdlp_clone = ytdlp.clone();
+                let dl_sem = std::sync::Arc::clone(&download_sem);
+                let p_sem = std::sync::Arc::clone(&poll_sem);
+                join_set.spawn(async move {
+                    let Ok(_permit) = p_sem.acquire_owned().await else {
+                        return;
+                    };
+                    let ctx = scheduler::MediaIngestContext {
+                        db: &db_clone,
+                        media_store: &store_clone,
+                        ytdlp_worker: Some(&ytdlp_clone),
+                        download_semaphore: Some(&dl_sem),
+                        fetcher: fetcher_clone.as_ref(),
+                    };
+                    if let Err(err) = scheduler::FeedIngester::poll_with_media(&ctx, &feed).await {
+                        let _ = db_clone.feeds().mark_error(&feed.id, &err.to_string()).await;
+                    }
+                });
+            }
+            while join_set.join_next().await.is_some() {}
+        }
+        Ok(count)
+    }
+
+    pub async fn export_opml(cfg: &config::Config) -> anyhow::Result<String> {
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        let feeds = db.feeds().list().await?;
+        Ok(feeds::OpmlDocument::to_xml(&feeds))
+    }
+
     pub async fn discover_servers(
         cfg: &config::Config,
     ) -> anyhow::Result<Vec<tailscale::DiscoveredServer>> {

@@ -152,7 +152,52 @@ impl SafeHttpClient {
 
     pub async fn fetch_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
         let bytes = self.fetch_bytes(url, max_bytes).await?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(Self::decode_xml_or_text_bytes(&bytes))
+    }
+
+    #[must_use]
+    pub fn decode_xml_or_text_bytes(bytes: &[u8]) -> String {
+        let decoded = match bytes {
+            [0xFF, 0xFE, rest @ ..] => Self::decode_utf16_slice(rest, true),
+            [0xFE, 0xFF, rest @ ..] => Self::decode_utf16_slice(rest, false),
+            [b0, 0, b2, 0, ..] if *b0 != 0 && *b2 != 0 => Self::decode_utf16_slice(bytes, true),
+            [0, b1, 0, b3, ..] if *b1 != 0 && *b3 != 0 => Self::decode_utf16_slice(bytes, false),
+            _ => String::from_utf8_lossy(bytes).into_owned(),
+        };
+
+        let trimmed = decoded.trim_start_matches('\u{FEFF}').trim_start();
+        if let Some(prolog_end) = trimmed.find("?>")
+            && trimmed.starts_with("<?xml")
+        {
+            let prolog = &trimmed[..prolog_end + 2];
+            if prolog.to_ascii_lowercase().contains("utf-16") {
+                let normalized_prolog = Self::normalize_xml_prolog_encoding(prolog);
+                return format!("{normalized_prolog}{}", &trimmed[prolog_end + 2..]);
+            }
+        }
+        trimmed.to_owned()
+    }
+
+    fn decode_utf16_slice(bytes: &[u8], little_endian: bool) -> String {
+        let units = bytes.as_chunks::<2>().0.iter().map(|pair| {
+            if little_endian { u16::from_le_bytes(*pair) } else { u16::from_be_bytes(*pair) }
+        });
+        char::decode_utf16(units).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    }
+
+    fn normalize_xml_prolog_encoding(prolog: &str) -> String {
+        let lower = prolog.to_ascii_lowercase();
+        if let Some(enc_idx) = lower.find("encoding")
+            && let Some(quote_offset) = prolog[enc_idx..].find(['"', '\''])
+        {
+            let quote_pos = enc_idx + quote_offset;
+            let quote_char = prolog.as_bytes()[quote_pos] as char;
+            if let Some(end_offset) = prolog[quote_pos + 1..].find(quote_char) {
+                let end_pos = quote_pos + 1 + end_offset;
+                return format!("{}UTF-8{}", &prolog[..=quote_pos], &prolog[end_pos..]);
+            }
+        }
+        prolog.to_owned()
     }
 
     pub async fn fetch_html_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
@@ -230,6 +275,8 @@ impl SafeHttpClient {
     }
 }
 
+pub const MAX_SUMMARY_CHARS: usize = 320;
+
 pub struct HtmlSanitizer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +292,160 @@ impl HtmlSanitizer {
         let mut builder = ammonia::Builder::default();
         builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
         builder.clean(html).to_string()
+    }
+
+    /// Converts raw HTML into a single-line plain-text excerpt of at most `max_chars` characters.
+    #[must_use]
+    pub fn plain_text_excerpt(html_or_text: &str, max_chars: usize) -> String {
+        if html_or_text.trim().is_empty() || max_chars == 0 {
+            return String::new();
+        }
+        let cleaned = Self::clean(html_or_text);
+        Self::plain_text_excerpt_from_clean(&cleaned, max_chars)
+    }
+
+    /// Collapses whitespace and truncates an already-plain-text string without running HTML tag stripping.
+    #[must_use]
+    pub fn plain_text_truncate(plain_text: &str, max_chars: usize) -> String {
+        if plain_text.trim().is_empty() || max_chars == 0 {
+            return String::new();
+        }
+        let collapsed = plain_text.split_whitespace().collect::<Vec<_>>().join(" ");
+        Self::truncate_excerpt(&collapsed, max_chars)
+    }
+
+    /// Extracts a plain-text excerpt from already-sanitized HTML, stripping all markup tags,
+    /// decoding character/entity references, collapsing whitespace, and truncating at `max_chars`.
+    #[must_use]
+    pub fn plain_text_excerpt_from_clean(clean_html: &str, max_chars: usize) -> String {
+        if clean_html.trim().is_empty() || max_chars == 0 {
+            return String::new();
+        }
+
+        let mut reader = Reader::from_str(clean_html);
+        reader.config_mut().check_end_names = false;
+
+        let mut collapsed = String::new();
+        let target_scan_chars = max_chars.saturating_add(96);
+        let mut collected_chars = 0usize;
+        let mut pending_space = false;
+
+        loop {
+            if collected_chars >= target_scan_chars {
+                break;
+            }
+            match reader.read_event() {
+                Ok(Event::Start(tag) | Event::Empty(tag)) => {
+                    if Self::is_block_or_break_tag(tag.name().as_ref()) && !collapsed.is_empty() {
+                        pending_space = true;
+                    }
+                }
+                Ok(Event::End(tag)) => {
+                    if Self::is_block_or_break_tag(tag.name().as_ref()) && !collapsed.is_empty() {
+                        pending_space = true;
+                    }
+                }
+                Ok(Event::Text(text)) => {
+                    let decoded =
+                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
+                    collected_chars = collected_chars.saturating_add(Self::push_collapsed_segment(
+                        &mut collapsed,
+                        &mut pending_space,
+                        &decoded,
+                    ));
+                }
+                Ok(Event::GeneralRef(entity)) => {
+                    let raw = format!("&{};", entity.as_ref());
+                    if let Ok(decoded) = unescape(&raw) {
+                        collected_chars =
+                            collected_chars.saturating_add(Self::push_collapsed_segment(
+                                &mut collapsed,
+                                &mut pending_space,
+                                &decoded,
+                            ));
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        Self::truncate_excerpt(&collapsed, max_chars)
+    }
+
+    fn push_collapsed_segment(
+        collapsed: &mut String,
+        pending_space: &mut bool,
+        segment: &str,
+    ) -> usize {
+        if segment.is_empty() {
+            return 0;
+        }
+        let starts_ws = segment.chars().next().is_some_and(char::is_whitespace);
+        let ends_ws = segment.chars().last().is_some_and(char::is_whitespace);
+        let mut added = 0usize;
+
+        for (idx, word) in segment.split_whitespace().enumerate() {
+            if !collapsed.is_empty() && (idx > 0 || *pending_space || starts_ws) {
+                collapsed.push(' ');
+                added = added.saturating_add(1);
+            }
+            collapsed.push_str(word);
+            added = added.saturating_add(word.chars().count());
+            *pending_space = false;
+        }
+        if ends_ws && !collapsed.is_empty() {
+            *pending_space = true;
+        }
+        added
+    }
+
+    fn is_block_or_break_tag(name: &str) -> bool {
+        matches!(
+            name.as_bytes().to_ascii_lowercase().as_slice(),
+            b"p" | b"br"
+                | b"div"
+                | b"li"
+                | b"ul"
+                | b"ol"
+                | b"h1"
+                | b"h2"
+                | b"h3"
+                | b"h4"
+                | b"h5"
+                | b"h6"
+                | b"blockquote"
+                | b"pre"
+                | b"tr"
+                | b"td"
+                | b"th"
+                | b"hr"
+                | b"figure"
+                | b"figcaption"
+                | b"section"
+                | b"article"
+                | b"header"
+                | b"footer"
+        )
+    }
+
+    fn truncate_excerpt(collapsed: &str, max_chars: usize) -> String {
+        let total_chars = collapsed.chars().count();
+        if total_chars <= max_chars {
+            return collapsed.to_owned();
+        }
+        if max_chars <= 1 {
+            return "…".to_owned();
+        }
+        let budget = max_chars - 1;
+        let prefix: String = collapsed.chars().take(budget).collect();
+        if let Some(last_space) = prefix.rfind(' ')
+            && prefix[..last_space].chars().count() >= budget * 2 / 3
+        {
+            format!("{}…", prefix[..last_space].trim_end())
+        } else {
+            format!("{}…", prefix.trim_end())
+        }
     }
 
     /// Extracts `<title>`, `<meta name="description">` / `<meta property="og:description">`,
@@ -265,8 +466,18 @@ impl HtmlSanitizer {
         let (title, meta_desc) = Self::parse_title_and_meta(&normalized_meta_html);
         let content_html = Self::clean(raw_html);
         let summary = meta_desc
-            .or_else(|| Self::extract_first_paragraph(&content_html))
-            .filter(|s| !s.is_empty());
+            .map(|desc| Self::plain_text_truncate(&desc, MAX_SUMMARY_CHARS))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                Self::extract_first_paragraph(&content_html)
+                    .map(|p| Self::plain_text_truncate(&p, MAX_SUMMARY_CHARS))
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                let fallback =
+                    Self::plain_text_excerpt_from_clean(&content_html, MAX_SUMMARY_CHARS);
+                (!fallback.is_empty()).then_some(fallback)
+            });
 
         ExtractedSnapshot { title, summary, content_html }
     }
@@ -338,6 +549,11 @@ impl HtmlSanitizer {
                         in_p = true;
                         current_buf.clear();
                     }
+                }
+                Ok(Event::Start(tag) | Event::Empty(tag))
+                    if in_p && Self::is_block_or_break_tag(tag.name().as_ref()) =>
+                {
+                    current_buf.push(' ');
                 }
                 Ok(Event::Text(text)) if in_p => {
                     let decoded =
@@ -510,5 +726,49 @@ mod tests {
         assert!(SafeHttpClient::parse_url("http://[fc00::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[fe80::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[2001:db8::1]/").is_err());
+    }
+
+    #[test]
+    fn test_plain_text_excerpt_strips_html_decodes_entities_and_truncates() {
+        let html = r#"<figure><img src="https://example.com/chart.png" alt="chart"></figure><p>We had some <strong>big drawdowns</strong> &amp; volatility &mdash; in the market.</p><p>Second paragraph here.</p>"#;
+        let excerpt = HtmlSanitizer::plain_text_excerpt(html, 320);
+        assert_eq!(
+            excerpt,
+            "We had some big drawdowns & volatility \u{2014} in the market. Second paragraph here."
+        );
+        assert!(!excerpt.contains('<'));
+        assert!(!excerpt.contains("&amp;"));
+
+        let truncated = HtmlSanitizer::plain_text_excerpt(html, 40);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 40);
+
+        // Heavily indented HTML with > 600 whitespace characters before text should not truncate early
+        let indented_html = format!(
+            "<div>\n{}\n<p>{}\n<br/>Second line after break</p></div>",
+            " ".repeat(600),
+            "word ".repeat(50)
+        );
+        let indented_excerpt = HtmlSanitizer::plain_text_excerpt(&indented_html, 320);
+        assert!(indented_excerpt.contains("Second line after break"));
+        assert!(indented_excerpt.chars().count() > 250);
+
+        let snap = HtmlSanitizer::extract_snapshot(
+            "<html><body><p>First line<br>Second line</p></body></html>",
+        );
+        assert_eq!(snap.summary.as_deref(), Some("First line Second line"));
+    }
+
+    #[test]
+    fn test_decode_xml_or_text_bytes_handles_utf16_bom_and_encoding_prolog() {
+        let raw_xml = r#"<?xml version="1.0" encoding="utf-16"?><rss version="2.0"><channel><title>Petzold</title></channel></rss>"#;
+        let mut utf16le = vec![0xFF, 0xFE];
+        for unit in raw_xml.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = SafeHttpClient::decode_xml_or_text_bytes(&utf16le);
+        assert!(decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        let (feed, _) = crate::feeds::RssParser::parse(&decoded).unwrap();
+        assert_eq!(feed.title, "Petzold");
     }
 }

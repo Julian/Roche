@@ -23,6 +23,20 @@ const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.titl
 FROM items i
 LEFT JOIN feeds f ON i.feed_id = f.id";
 
+/// List query projection that caps inline `content_html` at 64 KB so multi-hundred-KB full-book
+/// essays do not blow up bulk sync page responses or Android's 2 MB SQLite `CursorWindow`;
+/// oversized articles are lazy-hydrated via `GET /api/v1/items/{id}` (`ItemRepo::get`).
+const ITEM_SELECT_LIST: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
+       i.published_at, i.created_at, i.summary,
+       CASE WHEN length(i.content_html) <= 65536 THEN i.content_html ELSE NULL END AS content_html,
+       i.content_type, i.status,
+       i.is_favorite, i.read_at, i.read_progress,
+       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
+       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
+       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
+FROM items i
+LEFT JOIN feeds f ON i.feed_id = f.id";
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TagNames(pub Vec<String>);
@@ -389,7 +403,7 @@ impl<'a> ItemRepo<'a> {
         feed_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<Item>> {
-        let mut qb = QueryBuilder::new(ITEM_SELECT);
+        let mut qb = QueryBuilder::new(ITEM_SELECT_LIST);
         qb.push(" WHERE 1=1");
         if let Some(s) = status {
             qb.push(" AND i.status = ").push_bind(s);
@@ -397,7 +411,7 @@ impl<'a> ItemRepo<'a> {
         if let Some(f) = feed_id {
             qb.push(" AND i.feed_id = ").push_bind(f);
         }
-        qb.push(" ORDER BY i.created_at DESC");
+        qb.push(" ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC");
         if let Some(l) = limit {
             qb.push(" LIMIT ").push_bind(i64::try_from(l).unwrap_or(i64::MAX));
         }
@@ -416,7 +430,7 @@ impl<'a> ItemRepo<'a> {
             trimmed_search.map(ItemFilter::tokenize_search_terms).unwrap_or_default();
         let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
 
-        let mut qb = QueryBuilder::new(ITEM_SELECT);
+        let mut qb = QueryBuilder::new(ITEM_SELECT_LIST);
         if let Some(fts_match) = &fts_query {
             qb.push(
                 " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(items_fts, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM items_fts WHERE items_fts MATCH ",
@@ -461,7 +475,7 @@ impl<'a> ItemRepo<'a> {
                 SortOrder::Asc => "DESC",
             };
             qb.push(format_args!(
-                " ORDER BY CASE WHEN fts.fts_rank IS NULL THEN 1 ELSE 0 END ASC, fts.fts_rank {rank_dir}, i.created_at DESC, i.id DESC"
+                " ORDER BY CASE WHEN fts.fts_rank IS NULL THEN 1 ELSE 0 END ASC, fts.fts_rank {rank_dir}, COALESCE(i.published_at, i.created_at) DESC, i.id DESC"
             ));
         } else {
             let sort_col = filter.sort.unwrap_or_default().as_sql_expr();
@@ -622,6 +636,159 @@ impl<'a> ItemRepo<'a> {
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
         self.update(id, Some(ItemStatus::Archived), None, None).await
+    }
+
+    pub async fn archive_batch(
+        &self,
+        item_ids: &[String],
+        feed_id: Option<&str>,
+        all_unread: bool,
+    ) -> Result<u64> {
+        const MAX_BATCH_IDS: usize = 5_000;
+        const CHUNK_SIZE: usize = 400;
+
+        let mut unique_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for raw_id in item_ids {
+            let trimmed = raw_id.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed) {
+                unique_ids.push(trimmed);
+                if unique_ids.len() >= MAX_BATCH_IDS {
+                    break;
+                }
+            }
+        }
+
+        let candidate_ids: Vec<String> = if !unique_ids.is_empty() {
+            let mut matched = Vec::new();
+            for chunk in unique_ids.chunks(CHUNK_SIZE) {
+                let mut qb = QueryBuilder::new(
+                    "SELECT id FROM items WHERE status != 'archived' AND id IN (",
+                );
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(*id);
+                }
+                sep.push_unseparated(")");
+                if let Some(fid) = feed_id {
+                    qb.push(" AND feed_id = ").push_bind(fid);
+                }
+                let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
+                matched.extend(rows);
+            }
+            matched
+        } else if let Some(fid) = feed_id {
+            sqlx::query_scalar(
+                "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?",
+            )
+            .bind(fid)
+            .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+            .fetch_all(self.pool)
+            .await?
+        } else if all_unread {
+            sqlx::query_scalar("SELECT id FROM items WHERE status != 'archived' LIMIT ?")
+                .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+                .fetch_all(self.pool)
+                .await?
+        } else {
+            return Ok(0);
+        };
+
+        if candidate_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+        let mut archived_ids = Vec::with_capacity(candidate_ids.len());
+
+        for chunk in candidate_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new(
+                "UPDATE items SET status = 'archived', read_at = COALESCE(read_at, ",
+            );
+            qb.push_bind(now)
+                .push("), updated_at = ")
+                .push_bind(now)
+                .push(" WHERE status != 'archived' AND id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.as_str());
+            }
+            sep.push_unseparated(") RETURNING id");
+            let updated: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+            archived_ids.extend(updated);
+        }
+
+        for chunk in archived_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new(
+                "INSERT INTO activity_log (entity_type, entity_id, action, timestamp) ",
+            );
+            qb.push_values(chunk, |mut b, id| {
+                b.push_bind(ActivityEntityType::Item)
+                    .push_bind(id.as_str())
+                    .push_bind(ActivityAction::Archive)
+                    .push_bind(now);
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(u64::try_from(archived_ids.len()).unwrap_or(u64::MAX))
+    }
+
+    pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
+        use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
+
+        let candidates: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, summary FROM items
+             WHERE summary IS NOT NULL
+               AND (
+                 length(summary) > 320
+                 OR (
+                   (content_html IS NULL OR content_html = '' OR summary = content_html)
+                   AND (summary LIKE '%<%' OR summary LIKE '%&%;%')
+                 )
+               )",
+        )
+        .fetch_all(self.pool)
+        .await?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let normalized: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter_map(|(id, raw_summary)| {
+                    let excerpt =
+                        HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
+                    (excerpt != raw_summary).then_some((id, excerpt))
+                })
+                .collect()
+        })
+        .await?;
+
+        if normalized.is_empty() {
+            return Ok(0);
+        }
+
+        let count = u64::try_from(normalized.len()).unwrap_or(0);
+        let mut tx = self.pool.begin().await?;
+        for (id, excerpt) in normalized {
+            sqlx::query(
+                "UPDATE items
+                 SET content_html = COALESCE(NULLIF(content_html, ''), summary),
+                     summary = ?
+                 WHERE id = ?",
+            )
+            .bind(&excerpt)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(count)
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
@@ -962,5 +1129,116 @@ mod tests {
             .unwrap();
         let noop_changes = db.sync().list_changes_since(after_first_backfill_id, 10).await.unwrap();
         assert_eq!(noop_changes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_default_published_sort_summary_normalization_and_archive_batch() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let items = db.items();
+
+        let feed_url = Url::parse("https://example.com/archive.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Archive"), None).await.unwrap();
+
+        let older_pub =
+            DateTime::parse_from_rfc3339("2013-04-21T08:00:00Z").unwrap().with_timezone(&Utc);
+        let newer_pub =
+            DateTime::parse_from_rfc3339("2026-11-06T22:00:00Z").unwrap().with_timezone(&Utc);
+
+        let url_new = Url::parse("https://example.com/2026-post").unwrap();
+        let item_new = items
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "Yesterday Post",
+                url: &url_new,
+                author: None,
+                published_at: Some(newer_pub),
+                summary: Some("<figure><img src=\"https://example.com/a.png\"></figure><p>Clean &amp; fast summary</p>"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        let url_old = Url::parse("https://example.com/2013-post").unwrap();
+        let item_old = items
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "2013 Post",
+                url: &url_old,
+                author: None,
+                published_at: Some(older_pub),
+                summary: Some("Old summary"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        let default_sorted = items.list_filtered(&ItemFilter::default()).await.unwrap();
+        assert_eq!(default_sorted.len(), 2);
+        assert_eq!(default_sorted[0].id, item_new.id);
+        assert_eq!(default_sorted[1].id, item_old.id);
+
+        let list_sorted = items.list(None, None, None).await.unwrap();
+        assert_eq!(list_sorted[0].id, item_new.id);
+        assert_eq!(list_sorted[1].id, item_old.id);
+
+        let normalized_count = items.normalize_legacy_html_summaries().await.unwrap();
+        assert_eq!(normalized_count, 1);
+        let refreshed_new = items.get(&item_new.id).await.unwrap().unwrap();
+        assert_eq!(refreshed_new.summary.as_deref(), Some("Clean & fast summary"));
+        assert!(refreshed_new.content_html.as_deref().unwrap().contains("<figure>"));
+
+        // Second normalization call is idempotent even when plain-text summary has literal `<`
+        let url_angle = Url::parse("https://example.com/angle-post").unwrap();
+        let item_angle = items
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "Angle Post",
+                url: &url_angle,
+                author: None,
+                published_at: None,
+                summary: Some("<p>Use &lt;div&gt; or x &lt; y &gt; z</p>"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        assert_eq!(items.normalize_legacy_html_summaries().await.unwrap(), 1);
+        let after_first = items.get(&item_angle.id).await.unwrap().unwrap();
+        assert_eq!(after_first.summary.as_deref(), Some("Use <div> or x < y > z"));
+        assert_eq!(items.normalize_legacy_html_summaries().await.unwrap(), 0);
+        let after_second = items.get(&item_angle.id).await.unwrap().unwrap();
+        assert_eq!(after_second.summary.as_deref(), Some("Use <div> or x < y > z"));
+
+        // Oversized (> 64 KB) content_html is omitted in list_filtered_page but returned by get()
+        let url_huge = Url::parse("https://example.com/huge-essay").unwrap();
+        let huge_html = format!("<p>{}</p>", "a".repeat(70_000));
+        let (huge_item, _) = items
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &url_huge,
+                title: "Book-Length Essay",
+                summary: Some("Short summary"),
+                content_html: Some(&huge_html),
+                content_type: ContentType::Article,
+                tags: &[],
+            })
+            .await
+            .unwrap();
+        let listed = items.list_filtered(&ItemFilter::default()).await.unwrap();
+        let listed_huge = listed.iter().find(|i| i.id == huge_item.id).unwrap();
+        assert!(listed_huge.content_html.is_none());
+        let fetched_huge = items.get(&huge_item.id).await.unwrap().unwrap();
+        assert_eq!(fetched_huge.content_html.as_deref(), Some(huge_html.as_str()));
+
+        // Whitespace-only item_ids do not shadow feed_id in archive_batch
+        let before_archive_id = db.sync().latest_activity_id().await.unwrap();
+        let archived =
+            items.archive_batch(&["   ".to_string()], Some(&feed.id), false).await.unwrap();
+        assert_eq!(archived, 3);
+        assert_eq!(items.count_by_status(ItemStatus::Unread).await.unwrap(), 1);
+        assert_eq!(items.count_by_status(ItemStatus::Archived).await.unwrap(), 3);
+
+        let archive_changes = db.sync().list_changes_since(before_archive_id, 10).await.unwrap();
+        assert_eq!(archive_changes.len(), 3);
+        assert!(archive_changes.iter().all(|c| c.action == ActivityAction::Archive));
     }
 }

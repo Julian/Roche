@@ -62,6 +62,7 @@ impl ApiRoutes {
             // Items
             .route("/api/v1/items", get(Self::items_list::<F>))
             .route("/api/v1/items/save", post(Self::items_save::<F>))
+            .route("/api/v1/items/archive-batch", post(Self::items_archive_batch::<F>))
             .route(
                 "/api/v1/items/{id}",
                 get(Self::items_get::<F>)
@@ -292,6 +293,17 @@ impl ApiRoutes {
     ) -> Result<Json<ItemDetail>, ApiError> {
         let detail = service.items().archive(&id).await?;
         Ok(Json(detail))
+    }
+
+    async fn items_archive_batch<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemJson(req): ProblemJson<ArchiveBatchRequest>,
+    ) -> Result<Json<serde_json::Value>, ApiError> {
+        let archived_count = service
+            .items()
+            .archive_batch(&req.item_ids, req.feed_id.as_deref(), req.all_unread)
+            .await?;
+        Ok(Json(serde_json::json!({ "archived_count": archived_count })))
     }
 
     async fn items_unarchive<F: FeedFetcher>(
@@ -590,6 +602,15 @@ struct SaveItemRequest {
     title: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ArchiveBatchRequest {
+    #[serde(default)]
+    item_ids: Vec<String>,
+    feed_id: Option<String>,
+    #[serde(default)]
+    all_unread: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1573,8 +1594,34 @@ mod tests {
             .header(header::AUTHORIZATION, &auth)
             .body(Body::empty())
             .unwrap();
-        let invalid_ts_response = app.oneshot(invalid_ts_request).await.unwrap();
+        let invalid_ts_response = app.clone().oneshot(invalid_ts_request).await.unwrap();
         assert_eq!(invalid_ts_response.status(), StatusCode::BAD_REQUEST);
+
+        // 5. Verify POST /api/v1/items/archive-batch rejects empty request and archives unread items
+        let empty_batch_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/items/archive-batch")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let empty_batch_response = app.clone().oneshot(empty_batch_request).await.unwrap();
+        assert_eq!(empty_batch_response.status(), StatusCode::BAD_REQUEST);
+
+        let batch_archive_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/items/archive-batch")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"all_unread":true}"#))
+            .unwrap();
+        let batch_archive_response = app.oneshot(batch_archive_request).await.unwrap();
+        assert_eq!(batch_archive_response.status(), StatusCode::OK);
+        let batch_archive_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(batch_archive_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(batch_archive_body["archived_count"], 2);
     }
 
     #[tokio::test]

@@ -170,8 +170,8 @@ pub enum MediaType {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemSortField {
-    #[default]
     CreatedAt,
+    #[default]
     PublishedAt,
     Title,
     Relevance,
@@ -181,8 +181,8 @@ impl ItemSortField {
     #[must_use]
     pub const fn as_sql_expr(self) -> &'static str {
         match self {
-            Self::CreatedAt | Self::Relevance => "i.created_at",
-            Self::PublishedAt => "COALESCE(i.published_at, i.created_at)",
+            Self::CreatedAt => "i.created_at",
+            Self::PublishedAt | Self::Relevance => "COALESCE(i.published_at, i.created_at)",
             Self::Title => "i.title COLLATE NOCASE",
         }
     }

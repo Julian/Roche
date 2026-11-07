@@ -133,6 +133,21 @@ impl Cli {
                     Ok(())
                 }
             },
+            Some(Command::Import { file, poll }) => {
+                let imported = crate::RocheServer::import_opml_file(&cfg, &file, poll).await?;
+                println!("Imported {imported} feeds from {}", file.display());
+                Ok(())
+            }
+            Some(Command::Export { output }) => {
+                let xml = crate::RocheServer::export_opml(&cfg).await?;
+                if let Some(path) = output {
+                    tokio::fs::write(&path, xml).await?;
+                    println!("Exported feeds to {}", path.display());
+                } else {
+                    print!("{xml}");
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -149,6 +164,20 @@ pub enum Command {
     Devices {
         #[command(subcommand)]
         action: DeviceCommand,
+    },
+    /// Import feeds from an OPML file into the local database
+    Import {
+        /// Path to the OPML file to import
+        file: PathBuf,
+        /// Immediately poll newly imported feeds
+        #[arg(long)]
+        poll: bool,
+    },
+    /// Export subscribed feeds as OPML XML
+    Export {
+        /// Optional output file path (defaults to stdout)
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -194,5 +223,17 @@ mod tests {
 
         let bind_alias = Cli::try_parse_from(["roche", "--bind", "::"]).unwrap();
         assert_eq!(bind_alias.overrides.host.as_deref(), Some("::"));
+
+        let import_cmd = Cli::try_parse_from(["roche", "import", "feeds.opml", "--poll"]).unwrap();
+        assert_eq!(
+            import_cmd.command,
+            Some(Command::Import { file: PathBuf::from("feeds.opml"), poll: true })
+        );
+
+        let export_cmd = Cli::try_parse_from(["roche", "export", "-o", "backup.opml"]).unwrap();
+        assert_eq!(
+            export_cmd.command,
+            Some(Command::Export { output: Some(PathBuf::from("backup.opml")) })
+        );
     }
 }

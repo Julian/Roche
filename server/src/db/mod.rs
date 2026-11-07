@@ -59,7 +59,12 @@ impl Db {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        Ok(Self { pool })
+        let db = Self { pool };
+        if let Err(e) = db.items().normalize_legacy_html_summaries().await {
+            tracing::warn!(error = %e, "Failed to normalize legacy HTML summaries");
+        }
+
+        Ok(db)
     }
 
     #[cfg(test)]

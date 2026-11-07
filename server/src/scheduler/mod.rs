@@ -11,7 +11,8 @@ use url::Url;
 
 use crate::{
     content::fetcher::{
-        HtmlSanitizer, SafeHttpClient, classify_url, is_valid_pdf_bytes, resolve_pdf_url,
+        HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url, is_valid_pdf_bytes,
+        resolve_pdf_url,
     },
     db::{ContentType, Db, Feed, FeedRepo, FeedType, MediaType, PollBatch, PollItemCandidate},
     feeds::{ArxivParser, RssParser, YouTubeParser},
@@ -335,7 +336,10 @@ impl FeedIngester {
                     let media_repo = db.media();
                     match worker.download_for_item(&media_repo, &item_id_owned, &url_owned).await {
                         Ok((_, meta)) => {
-                            let clean_desc = meta.description.as_deref().map(HtmlSanitizer::clean);
+                            let clean_desc = meta
+                                .description
+                                .as_deref()
+                                .map(|d| HtmlSanitizer::plain_text_truncate(d, MAX_SUMMARY_CHARS));
                             let _ = db
                                 .items()
                                 .backfill_metadata(
@@ -378,6 +382,7 @@ impl FeedIngester {
         Ok(inserted)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_feed_content(feed_type: FeedType, content: &str) -> Result<PollBatch> {
         match feed_type {
             FeedType::Rss => {
@@ -387,12 +392,17 @@ impl FeedIngester {
                     .filter_map(|item| {
                         let url = item.link?;
                         let content_type = classify_url(&url);
-                        let summary = HtmlSanitizer::clean(&item.description);
+                        let clean_desc = HtmlSanitizer::clean(&item.description);
                         let content_html = item
                             .content_html
                             .as_deref()
                             .map(HtmlSanitizer::clean)
-                            .or_else(|| Some(summary.clone()));
+                            .filter(|h| !h.trim().is_empty())
+                            .or_else(|| Some(clean_desc.clone()));
+                        let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
+                            &clean_desc,
+                            MAX_SUMMARY_CHARS,
+                        );
                         Some(PollItemCandidate {
                             title: item.title,
                             url,
@@ -421,13 +431,17 @@ impl FeedIngester {
                     .into_iter()
                     .take(MAX_ITEMS_PER_POLL)
                     .map(|video| {
-                        let summary = HtmlSanitizer::clean(&video.description);
+                        let clean_desc = HtmlSanitizer::clean(&video.description);
+                        let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
+                            &clean_desc,
+                            MAX_SUMMARY_CHARS,
+                        );
                         PollItemCandidate {
                             title: video.title,
                             url: video.watch_url,
                             author: author.clone(),
                             published_at: video.published_at,
-                            content_html: Some(summary.clone()),
+                            content_html: Some(clean_desc),
                             summary,
                             content_type: ContentType::Video,
                         }
@@ -449,13 +463,17 @@ impl FeedIngester {
                         let url = paper.abstract_url?;
                         let authors = paper.authors.join(", ");
                         let author = (!authors.is_empty()).then_some(authors);
-                        let summary = HtmlSanitizer::clean(&paper.summary);
+                        let clean_summary = HtmlSanitizer::clean(&paper.summary);
+                        let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
+                            &clean_summary,
+                            MAX_SUMMARY_CHARS,
+                        );
                         Some(PollItemCandidate {
                             title: paper.title,
                             url,
                             author,
                             published_at: paper.published_at,
-                            content_html: Some(summary.clone()),
+                            content_html: Some(clean_summary),
                             summary,
                             content_type: ContentType::Paper,
                         })
@@ -524,7 +542,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Trait Tested Post");
         assert_eq!(items[0].url.as_str(), "https://example.com/post-1");
-        assert_eq!(items[0].summary.as_deref(), Some("<p>Safe Body</p>"));
+        assert_eq!(items[0].summary.as_deref(), Some("Safe Body"));
+        assert_eq!(items[0].content_html.as_deref(), Some("<p>Safe Body</p>"));
 
         let updated_feed = db.feeds().get(&feed.id).await.unwrap().unwrap();
         assert!(updated_feed.last_polled.is_some());
