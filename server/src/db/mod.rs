@@ -17,7 +17,7 @@ pub use auth::{AuthRepo, DeviceToken};
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
 pub use items::NewItem;
-pub use items::{Item, ItemFilter, ItemRepo, ManualItemInput};
+pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo};
 pub use sync::{ActivityEntry, SyncRepo};
 pub use tags::{ItemTag, Tag, TagRepo};

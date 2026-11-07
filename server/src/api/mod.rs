@@ -23,10 +23,10 @@ use tower_http::{
 use url::Url;
 
 use crate::{
-    db::{Feed, FeedSource, FeedType, HexColor, ItemFilter, ItemStatus, Tag},
+    db::{Feed, FeedSource, FeedType, HexColor, ItemFilter, ItemPage, ItemStatus, Tag},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
     scheduler::FeedFetcher,
-    service::{ExportBundle, ItemDetail, RocheService, SyncStatus},
+    service::{ExportBundle, ItemDetail, RocheService, SyncChanges, SyncStatus},
 };
 
 pub struct ApiRoutes;
@@ -86,6 +86,7 @@ impl ApiRoutes {
             .route("/api/v1/export/data", get(Self::export_data::<F>))
             // Sync
             .route("/api/v1/sync/status", get(Self::sync_status::<F>))
+            .route("/api/v1/sync/changes", get(Self::sync_changes::<F>))
             .layer(RequestBodyLimitLayer::new(64 * 1024))
             .merge(opml_import)
             .route_layer(middleware::from_fn_with_state(
@@ -234,11 +235,11 @@ impl ApiRoutes {
         State(service): State<Arc<RocheService<F>>>,
         ProblemPath(id): ProblemPath<String>,
         ProblemQuery(filter): ProblemQuery<ItemFilter>,
-    ) -> Result<Json<serde_json::Value>, ApiError> {
+    ) -> Result<Json<ItemPage>, ApiError> {
         // Verify feed exists first
         let _ = service.feeds().get(&id).await?;
-        let items = service.items().query().with_filter(filter).feed_id(id).list().await?;
-        Ok(Json(serde_json::json!({ "items": items })))
+        let page = service.items().query().with_filter(filter).feed_id(id).list_page().await?;
+        Ok(Json(page))
     }
 
     // --- Items ---
@@ -246,9 +247,9 @@ impl ApiRoutes {
     async fn items_list<F: FeedFetcher>(
         State(service): State<Arc<RocheService<F>>>,
         ProblemQuery(filter): ProblemQuery<ItemFilter>,
-    ) -> Result<Json<serde_json::Value>, ApiError> {
-        let items = service.items().query().with_filter(filter).list().await?;
-        Ok(Json(serde_json::json!({ "items": items })))
+    ) -> Result<Json<ItemPage>, ApiError> {
+        let page = service.items().query().with_filter(filter).list_page().await?;
+        Ok(Json(page))
     }
 
     async fn items_get<F: FeedFetcher>(
@@ -530,7 +531,7 @@ impl ApiRoutes {
         Ok(Json(bundle))
     }
 
-    // --- Sync Status ---
+    // --- Sync Status & Incremental Changes ---
 
     async fn sync_status<F: FeedFetcher>(
         State(service): State<Arc<RocheService<F>>>,
@@ -538,6 +539,20 @@ impl ApiRoutes {
         let status = service.sync_status().await?;
         Ok(Json(status))
     }
+
+    async fn sync_changes<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemQuery(query): ProblemQuery<SyncChangesQuery>,
+    ) -> Result<Json<SyncChanges>, ApiError> {
+        let changes = service.sync_changes(query.since_id, query.limit).await?;
+        Ok(Json(changes))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SyncChangesQuery {
+    since_id: Option<i64>,
+    limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1431,5 +1446,202 @@ mod tests {
             let bad_feed_response = app.clone().oneshot(bad_feed_request).await.unwrap();
             assert_eq!(bad_feed_response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_incremental_sync_changes_pagination_and_updated_after() {
+        let (app, auth) = setup_app().await;
+
+        // 1. Initial sync status has latest_activity_id = 0
+        let status_request = Request::builder()
+            .uri("/api/v1/sync/status")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let status_response = app.clone().oneshot(status_request).await.unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(status_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status_body["latest_activity_id"], 0);
+
+        // 2. Create a feed without title -> refresh populates title/description and logs feed update + item create
+        let create_feed = Request::builder()
+            .method("POST")
+            .uri("/api/v1/feeds")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"https://example.com/feed.xml","feed_type":"rss"}"#))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_feed).await.unwrap();
+        let feed_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let feed_id = feed_body["id"].as_str().unwrap().to_string();
+
+        let refresh_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/feeds/{feed_id}/refresh"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let refresh_response = app.clone().oneshot(refresh_request).await.unwrap();
+        assert_eq!(refresh_response.status(), StatusCode::OK);
+
+        // Save manual item so we have 2 items total
+        let save_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/items/save")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"https://example.com/manual","title":"Manual Item"}"#))
+            .unwrap();
+        let save_response = app.clone().oneshot(save_request).await.unwrap();
+        assert_eq!(save_response.status(), StatusCode::CREATED);
+
+        // 3. Paginate /api/v1/sync/changes with limit=2
+        let first_changes_request = Request::builder()
+            .uri("/api/v1/sync/changes?since_id=0&limit=2")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let first_changes_response = app.clone().oneshot(first_changes_request).await.unwrap();
+        assert_eq!(first_changes_response.status(), StatusCode::OK);
+        let changes_page1: serde_json::Value = serde_json::from_slice(
+            &to_bytes(first_changes_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let page1_arr = changes_page1["changes"].as_array().unwrap();
+        assert_eq!(page1_arr.len(), 2);
+        assert_eq!(changes_page1["has_more"], true);
+        assert_eq!(page1_arr[0]["entity_type"], "feed");
+        assert_eq!(page1_arr[0]["action"], "create");
+        assert_eq!(page1_arr[1]["entity_type"], "feed");
+        assert_eq!(page1_arr[1]["action"], "update");
+        let cursor = changes_page1["next_since_id"].as_i64().unwrap();
+        assert_eq!(cursor, page1_arr[1]["id"].as_i64().unwrap());
+
+        let next_changes_request = Request::builder()
+            .uri(format!("/api/v1/sync/changes?since_id={cursor}&limit=10"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let next_changes_response = app.clone().oneshot(next_changes_request).await.unwrap();
+        let changes_page2: serde_json::Value = serde_json::from_slice(
+            &to_bytes(next_changes_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(changes_page2["has_more"], false);
+        assert_eq!(changes_page2["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(changes_page2["next_since_id"], changes_page2["latest_activity_id"]);
+
+        // 4. Verify pagination metadata & updated_after on GET /api/v1/items
+        let paged_items_request = Request::builder()
+            .uri("/api/v1/items?page=1&per_page=1")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let paged_items_response = app.clone().oneshot(paged_items_request).await.unwrap();
+        let items_p1: serde_json::Value = serde_json::from_slice(
+            &to_bytes(paged_items_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(items_p1["page"], 1);
+        assert_eq!(items_p1["per_page"], 1);
+        assert_eq!(items_p1["has_more"], true);
+        assert_eq!(items_p1["items"].as_array().unwrap().len(), 1);
+
+        let future_request = Request::builder()
+            .uri("/api/v1/items?updated_after=2099-01-01T00:00:00Z")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let future_response = app.clone().oneshot(future_request).await.unwrap();
+        assert_eq!(future_response.status(), StatusCode::OK);
+        let future_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(future_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(future_body["items"].as_array().unwrap().len(), 0);
+        assert_eq!(future_body["has_more"], false);
+
+        let invalid_ts_request = Request::builder()
+            .uri("/api/v1/items?updated_after=not-a-timestamp")
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let invalid_ts_response = app.oneshot(invalid_ts_request).await.unwrap();
+        assert_eq!(invalid_ts_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let service =
+            RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+        let app = ApiRoutes::router_with_service(service.clone());
+
+        // Bogus attempts before any pairing code exists return 401 without pre-filling the rate limiter
+        for i in 0..6 {
+            let unissued_request = Request::builder()
+                .method("POST")
+                .uri("/auth/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_name":"pre-{i}","pairing_code":"0000-wrong"}}"#
+                )))
+                .unwrap();
+            let unissued_response = app.clone().oneshot(unissued_request).await.unwrap();
+            assert_eq!(unissued_response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let valid_code = service.auth().issue_pairing_code().await.unwrap();
+
+        // 4 rapid wrong attempts return 401 Unauthorized
+        for i in 0..4 {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/auth/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_name":"attacker-{i}","pairing_code":"0000-wrong"}}"#
+                )))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // 5th rapid attempt is throttled with 429 Too Many Requests before touching the DB
+        let throttled_request = Request::builder()
+            .method("POST")
+            .uri("/auth/pair")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"device_name":"attacker-5","pairing_code":"0000-wrong"}"#))
+            .unwrap();
+        let throttled_response = app.clone().oneshot(throttled_request).await.unwrap();
+        assert_eq!(throttled_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let problem: serde_json::Value = serde_json::from_slice(
+            &to_bytes(throttled_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(problem["type"], "urn:roche:problem:too-many-requests");
+
+        // Simulating `roche pair` in a separate CLI process (writing directly to SQLite)
+        // automatically resets the server's rate-limiter state because the active code hash changed!
+        let fresh_code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+        assert_ne!(fresh_code, valid_code);
+        let pair_request = Request::builder()
+            .method("POST")
+            .uri("/auth/pair")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"device_name":"legit-phone","pairing_code":"{fresh_code}"}}"#
+            )))
+            .unwrap();
+        let pair_response = app.oneshot(pair_request).await.unwrap();
+        assert_eq!(pair_response.status(), StatusCode::OK);
     }
 }

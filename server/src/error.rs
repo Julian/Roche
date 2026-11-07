@@ -67,6 +67,9 @@ pub enum ApiError {
     #[error("Unsupported media type: {0}")]
     UnsupportedMediaType(String),
 
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("Upstream fetch failed: {0}")]
     BadGateway(String),
 
@@ -92,6 +95,10 @@ impl ApiError {
 
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self::MethodNotAllowed(message.into())
+    }
+
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::TooManyRequests(message.into())
     }
 
     pub fn bad_gateway(message: impl Into<String>) -> Self {
@@ -152,6 +159,15 @@ impl ApiError {
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     "urn:roche:problem:unsupported-media-type",
                     "Unsupported Media Type",
+                    detail.clone(),
+                ),
+            ),
+            Self::TooManyRequests(detail) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ProblemDetails::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "urn:roche:problem:too-many-requests",
+                    "Too Many Requests",
                     detail.clone(),
                 ),
             ),

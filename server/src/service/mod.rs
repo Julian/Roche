@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -11,7 +15,7 @@ use crate::{
     content::fetcher::{HtmlSanitizer, SafeHttpClient, classify_url},
     db::{
         ActivityEntry, ContentType, Db, DeviceToken, Feed, FeedSource, FeedType, HexColor, Item,
-        ItemFilter, ItemStatus, ItemTag, ManualItemInput, Media, SyncRepo, Tag,
+        ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, SyncRepo, Tag,
     },
     error::ApiError,
     feeds::OpmlDocument,
@@ -20,6 +24,8 @@ use crate::{
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
+const PAIR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ItemDetail {
@@ -46,7 +52,16 @@ pub struct SyncStatus {
     pub feeds_count: usize,
     pub unread_items_count: i64,
     pub archived_items_count: i64,
+    pub latest_activity_id: i64,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncChanges {
+    pub changes: Vec<ActivityEntry>,
+    pub next_since_id: i64,
+    pub latest_activity_id: i64,
+    pub has_more: bool,
 }
 
 /// Application service layer coordinating repositories, domain validation, and external fetchers.
@@ -58,6 +73,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
+    failed_pair_attempts: Arc<Mutex<(Option<String>, VecDeque<Instant>)>>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
 }
 
@@ -75,6 +91,7 @@ impl<F: FeedFetcher> RocheService<F> {
             media_store,
             ytdlp_worker,
             download_semaphore,
+            failed_pair_attempts: Arc::new(Mutex::new((None, VecDeque::new()))),
             node_identity: None,
         }
     }
@@ -170,14 +187,32 @@ impl<F: FeedFetcher> RocheService<F> {
         let feeds = self.db.feeds().list().await?;
         let unread_items_count = self.db.items().count_by_status(ItemStatus::Unread).await?;
         let archived_items_count = self.db.items().count_by_status(ItemStatus::Archived).await?;
+        let latest_activity_id = self.db.sync().latest_activity_id().await?;
 
         Ok(SyncStatus {
             status: "ok",
             feeds_count: feeds.len(),
             unread_items_count,
             archived_items_count,
+            latest_activity_id,
             timestamp: SyncRepo::now_utc(),
         })
+    }
+
+    pub async fn sync_changes(
+        &self,
+        since_id: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<SyncChanges, ApiError> {
+        let since = since_id.unwrap_or(0).max(0);
+        let lim = limit.unwrap_or(500).clamp(1, 1000);
+        let mut changes = self.db.sync().list_changes_since(since, lim.saturating_add(1)).await?;
+        let limit_usize = usize::try_from(lim).unwrap_or(500);
+        let has_more = changes.len() > limit_usize;
+        changes.truncate(limit_usize);
+        let next_since_id = changes.last().map_or(since, |c| c.id);
+        let latest_activity_id = self.db.sync().latest_activity_id().await?;
+        Ok(SyncChanges { changes, next_since_id, latest_activity_id, has_more })
     }
 }
 
@@ -188,7 +223,12 @@ pub struct AuthService<'a, F> {
 impl<F: FeedFetcher> AuthService<'_, F> {
     pub async fn issue_pairing_code(&self) -> Result<String, ApiError> {
         let pairing = PairingManager::new(self.service.db.auth());
-        Ok(pairing.create_code(self.service.config.auth.pairing_code_ttl).await?)
+        let code = pairing.create_code(self.service.config.auth.pairing_code_ttl).await?;
+        if let Ok(mut guard) = self.service.failed_pair_attempts.lock() {
+            guard.0 = None;
+            guard.1.clear();
+        }
+        Ok(code)
     }
 
     pub async fn pair_device(
@@ -206,10 +246,54 @@ impl<F: FeedFetcher> AuthService<'_, F> {
             )));
         }
 
+        let Some(active_hash) = self.service.db.auth().active_pairing_code_hash().await? else {
+            return Err(ApiError::unauthorized("Invalid or expired pairing code"));
+        };
+
+        {
+            let now = Instant::now();
+            let mut guard = self
+                .service
+                .failed_pair_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.0.as_deref() != Some(active_hash.as_str()) {
+                guard.0 = Some(active_hash.clone());
+                guard.1.clear();
+            }
+            while let Some(&front) = guard.1.front() {
+                if now.duration_since(front) >= PAIR_RATE_LIMIT_WINDOW {
+                    guard.1.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if guard.1.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
+                return Err(ApiError::too_many_requests(
+                    "Too many failed pairing attempts; please wait before retrying",
+                ));
+            }
+        }
+
         let pairing = PairingManager::new(self.service.db.auth());
         let consumed = pairing.consume_valid_code(pairing_code.trim()).await?;
         if !consumed {
+            {
+                let mut guard = self
+                    .service
+                    .failed_pair_attempts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.0.as_deref() == Some(active_hash.as_str()) {
+                    guard.1.push_back(Instant::now());
+                }
+            }
             return Err(ApiError::unauthorized("Invalid or expired pairing code"));
+        }
+
+        if let Ok(mut guard) = self.service.failed_pair_attempts.lock() {
+            guard.0 = None;
+            guard.1.clear();
         }
 
         let tokens = TokenManager::new(self.service.db.auth());
@@ -577,8 +661,8 @@ impl ItemQuery<'_> {
         self
     }
 
-    pub async fn list(self) -> Result<Vec<Item>, ApiError> {
-        Ok(self.db.items().list_filtered(&self.filter).await?)
+    pub async fn list_page(self) -> Result<ItemPage, ApiError> {
+        Ok(self.db.items().list_filtered_page(&self.filter).await?)
     }
 }
 

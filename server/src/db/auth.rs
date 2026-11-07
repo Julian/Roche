@@ -44,6 +44,19 @@ impl<'a> AuthRepo<'a> {
         Ok(())
     }
 
+    pub async fn active_pairing_code_hash(&self) -> Result<Option<String>> {
+        let now = SyncRepo::now_utc();
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT code FROM pairing_codes
+             WHERE datetime(expires_at) > datetime(?) AND failed_attempts < ?
+             LIMIT 1",
+        )
+        .bind(now)
+        .bind(MAX_PAIRING_ATTEMPTS)
+        .fetch_optional(self.pool)
+        .await?)
+    }
+
     pub async fn consume_valid_pairing_code(&self, code: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let normalized = code.trim().to_ascii_lowercase();

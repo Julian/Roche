@@ -271,6 +271,22 @@ impl<'a> FeedRepo<'a> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
+        let new_title = batch.title.as_deref().filter(|s| !s.is_empty());
+        let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
+        let new_lang = batch.language.as_deref().filter(|s| !s.is_empty());
+
+        let existing_meta: Option<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT title, description, language FROM feeds WHERE id = ?")
+                .bind(feed_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let metadata_updated = existing_meta.is_some_and(|(cur_title, cur_desc, cur_lang)| {
+            (cur_title.is_none() && new_title.is_some())
+                || (cur_desc.is_none() && new_desc.is_some())
+                || (cur_lang.is_none() && new_lang.is_some())
+        });
+
         sqlx::query(
             "UPDATE feeds
              SET title = COALESCE(title, ?),
@@ -281,14 +297,25 @@ impl<'a> FeedRepo<'a> {
                  updated_at = ?
              WHERE id = ?",
         )
-        .bind(batch.title.as_deref().filter(|s| !s.is_empty()))
-        .bind(batch.description.as_deref().filter(|s| !s.is_empty()))
-        .bind(batch.language.as_deref().filter(|s| !s.is_empty()))
+        .bind(new_title)
+        .bind(new_desc)
+        .bind(new_lang)
         .bind(now)
         .bind(now)
         .bind(feed_id)
         .execute(&mut *tx)
         .await?;
+
+        if metadata_updated {
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Feed,
+                feed_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
 
         let mut inserted = Vec::new();
         for item in &batch.items {

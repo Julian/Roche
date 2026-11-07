@@ -12,6 +12,8 @@ use super::{
     SortOrder, SyncRepo, Tag, TagRepo,
 };
 
+const MAX_SEARCH_TERMS: usize = 16;
+
 const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
        i.published_at, i.created_at, i.summary, i.content_html, i.content_type, i.status,
        i.is_favorite, i.read_at, i.read_progress,
@@ -80,6 +82,47 @@ pub struct ManualItemInput<'a> {
     pub tags: &'a [String],
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ItemPage {
+    pub items: Vec<Item>,
+    pub page: usize,
+    pub per_page: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTerm {
+    pub fts_clause: String,
+    pub like_pattern: String,
+}
+
+fn deserialize_optional_rfc3339<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = opt else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(serde::de::Error::custom("updated_after cannot be empty"));
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+    if trimmed.contains(' ')
+        && let Ok(dt) = DateTime::parse_from_rfc3339(&trimmed.replace(' ', "+"))
+    {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+    Err(serde::de::Error::custom(format!(
+        "Invalid RFC 3339 timestamp for updated_after: '{trimmed}'"
+    )))
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct ItemFilter {
     pub status: Option<ItemStatusFilter>,
@@ -88,6 +131,8 @@ pub struct ItemFilter {
     pub content_type: Option<ContentType>,
     pub is_favorite: Option<bool>,
     pub search: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_rfc3339")]
+    pub updated_after: Option<DateTime<Utc>>,
     pub sort: Option<ItemSortField>,
     pub order: Option<SortOrder>,
     pub page: Option<usize>,
@@ -107,16 +152,11 @@ impl ItemFilter {
         out
     }
 
-    /// Converts user search input into a safe SQLite FTS5 `MATCH` expression.
-    ///
-    /// - Balanced double-quoted segments (`"distributed systems"`) become exact FTS5 phrase queries.
-    /// - Individual words (`quant`) become `("quant" OR "quant"*)` so both Porter-stemmed matches
-    ///   (`computing` -> `compute`) and prefix matches (`quant` -> `quantum`) succeed.
-    /// - Special FTS5 syntax characters (`:`, `*`, `^`, `-`, `(`, `)`, unclosed `"`, boolean keywords)
-    ///   are sanitized so arbitrary user input never triggers an FTS5 syntax error.
+    /// Parses user search input into structured [`SearchTerm`]s for multi-field matching across
+    /// `items_fts`, `feeds.title`, and `tags.name`.
     #[must_use]
-    pub fn build_fts_query(input: &str) -> Option<String> {
-        let mut clauses = Vec::new();
+    pub fn tokenize_search_terms(input: &str) -> Vec<SearchTerm> {
+        let mut terms = Vec::new();
         let mut chars = input.chars().peekable();
 
         while let Some(&ch) = chars.peek() {
@@ -133,10 +173,17 @@ impl ItemFilter {
                 }
                 let words = Self::extract_word_tokens(&phrase_buf);
                 if closed && words.len() > 1 {
-                    clauses.push(format!("\"{}\"", words.join(" ")));
+                    let joined = words.join(" ");
+                    terms.push(SearchTerm {
+                        fts_clause: format!("\"{joined}\""),
+                        like_pattern: format!("%{}%", Self::escape_like(&joined)),
+                    });
                 } else {
                     for word in words {
-                        clauses.push(format!("(\"{word}\" OR \"{word}\"*)"));
+                        terms.push(SearchTerm {
+                            fts_clause: format!("(\"{word}\" OR \"{word}\"*)"),
+                            like_pattern: format!("%{}%", Self::escape_like(word)),
+                        });
                     }
                 }
             } else {
@@ -149,16 +196,41 @@ impl ItemFilter {
                     chars.next();
                 }
                 for word in Self::extract_word_tokens(&unquoted_buf) {
-                    clauses.push(format!("(\"{word}\" OR \"{word}\"*)"));
+                    terms.push(SearchTerm {
+                        fts_clause: format!("(\"{word}\" OR \"{word}\"*)"),
+                        like_pattern: format!("%{}%", Self::escape_like(word)),
+                    });
                 }
             }
         }
 
-        if clauses.is_empty() { None } else { Some(clauses.join(" AND ")) }
+        terms.truncate(MAX_SEARCH_TERMS);
+        terms
+    }
+
+    /// Converts user search input into a safe SQLite FTS5 `MATCH` expression.
+    ///
+    /// - Balanced double-quoted segments (`"distributed systems"`) become exact FTS5 phrase queries.
+    /// - Individual words (`quant`) become `("quant" OR "quant"*)` so both Porter-stemmed matches
+    ///   (`computing` -> `compute`) and prefix matches (`quant` -> `quantum`) succeed.
+    /// - Special FTS5 syntax characters (`:`, `*`, `^`, `-`, `(`, `)`, unclosed `"`, boolean keywords)
+    ///   are sanitized so arbitrary user input never triggers an FTS5 syntax error.
+    #[must_use]
+    pub fn build_fts_query(input: &str) -> Option<String> {
+        let terms = Self::tokenize_search_terms(input);
+        if terms.is_empty() {
+            None
+        } else {
+            Some(terms.into_iter().map(|t| t.fts_clause).collect::<Vec<_>>().join(" AND "))
+        }
     }
 
     fn extract_word_tokens(segment: &str) -> Vec<&str> {
-        segment.split(|c: char| !c.is_alphanumeric()).filter(|tok| !tok.is_empty()).collect()
+        segment
+            .trim_start_matches('#')
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|tok| !tok.is_empty())
+            .collect()
     }
 }
 
@@ -333,8 +405,15 @@ impl<'a> ItemRepo<'a> {
         Ok(qb.build_query_as::<Item>().fetch_all(self.pool).await?)
     }
 
+    #[cfg(test)]
     pub async fn list_filtered(&self, filter: &ItemFilter) -> Result<Vec<Item>> {
+        Ok(self.list_filtered_page(filter).await?.items)
+    }
+
+    pub async fn list_filtered_page(&self, filter: &ItemFilter) -> Result<ItemPage> {
         let trimmed_search = filter.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let search_terms =
+            trimmed_search.map(ItemFilter::tokenize_search_terms).unwrap_or_default();
         let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
 
         let mut qb = QueryBuilder::new(ITEM_SELECT);
@@ -366,25 +445,11 @@ impl<'a> ItemRepo<'a> {
         if let Some(fav) = filter.is_favorite {
             qb.push(" AND i.is_favorite = ").push_bind(fav);
         }
+        if let Some(ts) = filter.updated_after {
+            qb.push(" AND datetime(i.updated_at) > datetime(").push_bind(ts).push(")");
+        }
         if let Some(search) = trimmed_search {
-            let pattern = format!("%{}%", ItemFilter::escape_like(search));
-            if fts_query.is_some() {
-                qb.push(" AND (fts.fts_rowid IS NOT NULL OR COALESCE(f.title, '') LIKE ")
-                    .push_bind(pattern)
-                    .push(" ESCAPE '\\')");
-            } else {
-                qb.push(" AND (i.title LIKE ")
-                    .push_bind(pattern.clone())
-                    .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
-                    .push_bind(pattern.clone())
-                    .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
-                    .push_bind(pattern.clone())
-                    .push(" ESCAPE '\\' OR COALESCE(i.content_html, '') LIKE ")
-                    .push_bind(pattern.clone())
-                    .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
-                    .push_bind(pattern)
-                    .push(" ESCAPE '\\')");
-            }
+            Self::append_search_where_clause(&mut qb, search, &search_terms);
         }
 
         let sort_by_relevance =
@@ -407,12 +472,54 @@ impl<'a> ItemRepo<'a> {
         let per_page = filter.per_page.unwrap_or(50).clamp(1, 200);
         let page = filter.page.unwrap_or(1).max(1);
         let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let fetch_limit = per_page.saturating_add(1);
         qb.push(" LIMIT ")
-            .push_bind(i64::try_from(per_page).unwrap_or(50))
+            .push_bind(i64::try_from(fetch_limit).unwrap_or(51))
             .push(" OFFSET ")
             .push_bind(i64::try_from(offset).unwrap_or(0));
 
-        Ok(qb.build_query_as::<Item>().fetch_all(self.pool).await?)
+        let mut items = qb.build_query_as::<Item>().fetch_all(self.pool).await?;
+        let has_more = items.len() > per_page;
+        items.truncate(per_page);
+        Ok(ItemPage { items, page, per_page, has_more })
+    }
+
+    fn append_search_where_clause(
+        qb: &mut QueryBuilder<'_, sqlx::Sqlite>,
+        raw_search: &str,
+        search_terms: &[SearchTerm],
+    ) {
+        if search_terms.is_empty() {
+            let pattern = format!("%{}%", ItemFilter::escape_like(raw_search));
+            qb.push(" AND (i.title LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR COALESCE(i.content_html, '') LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
+                .push_bind(pattern.clone())
+                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                .push_bind(pattern)
+                .push(" ESCAPE '\\'))");
+        } else {
+            qb.push(" AND (fts.fts_rowid IS NOT NULL OR (");
+            for (idx, term) in search_terms.iter().enumerate() {
+                if idx > 0 {
+                    qb.push(" AND ");
+                }
+                qb.push("(i.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ")
+                    .push_bind(term.fts_clause.clone())
+                    .push(") OR COALESCE(f.title, '') LIKE ")
+                    .push_bind(term.like_pattern.clone())
+                    .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                    .push_bind(term.like_pattern.clone())
+                    .push(" ESCAPE '\\'))");
+            }
+            qb.push("))");
+        }
     }
 
     pub async fn update(
@@ -554,23 +661,49 @@ impl<'a> ItemRepo<'a> {
         author: Option<&str>,
         summary: Option<&str>,
     ) -> Result<()> {
+        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
+        let clean_author = author.map(str::trim).filter(|s| !s.is_empty());
+        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
+        if clean_title.is_none() && clean_author.is_none() && clean_summary.is_none() {
+            return Ok(());
+        }
+
         let now = SyncRepo::now_utc();
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
             "UPDATE items
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
                  author = COALESCE(author, ?),
                  summary = COALESCE(summary, ?),
                  updated_at = ?
-             WHERE id = ?",
+             WHERE id = ?
+               AND ((title = url AND ? IS NOT NULL)
+                    OR (author IS NULL AND ? IS NOT NULL)
+                    OR (summary IS NULL AND ? IS NOT NULL))",
         )
-        .bind(title)
-        .bind(title)
-        .bind(author)
-        .bind(summary)
+        .bind(clean_title)
+        .bind(clean_title)
+        .bind(clean_author)
+        .bind(clean_summary)
         .bind(now)
         .bind(id)
-        .execute(self.pool)
+        .bind(clean_title)
+        .bind(clean_author)
+        .bind(clean_summary)
+        .execute(&mut *tx)
         .await?;
+
+        if result.rows_affected() > 0 {
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Item,
+                id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -738,5 +871,96 @@ mod tests {
             .unwrap();
         assert_eq!(after_delete.len(), 1);
         assert_eq!(after_delete[0].id, body_item.id);
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_search_across_tags_feed_title_and_backfill_activity() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let items = db.items();
+
+        let feed_url = Url::parse("https://example.com/rust-weekly.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Rust Weekly"), None).await.unwrap();
+
+        let url1 = Url::parse("https://example.com/async-closures").unwrap();
+        let feed_item = items
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "Stabilizing Async Closures",
+                url: &url1,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        db.tags().add_named_to_item(&feed_item.id, "llm-inference").await.unwrap();
+
+        // 1. Tag search (both plain and hashtag-prefixed)
+        for query in ["llm-inference", "#llm-inference"] {
+            let by_tag = items
+                .list_filtered(&ItemFilter {
+                    search: Some(query.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(by_tag.len(), 1);
+            assert_eq!(by_tag[0].id, feed_item.id);
+        }
+
+        // 2. Multi-token search spanning feed title ("Rust") + item title ("Async")
+        let cross_feed_item = items
+            .list_filtered(&ItemFilter {
+                search: Some("rust async".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cross_feed_item.len(), 1);
+        assert_eq!(cross_feed_item[0].id, feed_item.id);
+
+        // 3. Multi-token search spanning tag ("inference") + item title ("Closures")
+        let cross_tag_item = items
+            .list_filtered(&ItemFilter {
+                search: Some("#inference closures".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cross_tag_item.len(), 1);
+        assert_eq!(cross_tag_item[0].id, feed_item.id);
+
+        // 4. backfill_metadata records ActivityAction::Update only when a field is actually backfilled
+        let before_id = db.sync().latest_activity_id().await.unwrap();
+        items
+            .backfill_metadata(
+                &feed_item.id,
+                Some("Updated Title"),
+                Some("Niko"),
+                Some("Deep dive"),
+            )
+            .await
+            .unwrap();
+        let changes = db.sync().list_changes_since(before_id, 10).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity_type, ActivityEntityType::Item);
+        assert_eq!(changes[0].entity_id, feed_item.id);
+        assert_eq!(changes[0].action, ActivityAction::Update);
+
+        // Calling backfill_metadata again when author and summary are already populated is a no-op
+        let after_first_backfill_id = db.sync().latest_activity_id().await.unwrap();
+        items
+            .backfill_metadata(
+                &feed_item.id,
+                Some("Updated Title"),
+                Some("Niko"),
+                Some("Deep dive"),
+            )
+            .await
+            .unwrap();
+        let noop_changes = db.sync().list_changes_since(after_first_backfill_id, 10).await.unwrap();
+        assert_eq!(noop_changes.len(), 0);
     }
 }

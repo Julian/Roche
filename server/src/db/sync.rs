@@ -62,6 +62,32 @@ impl<'a> SyncRepo<'a> {
         .await?)
     }
 
+    pub async fn latest_activity_id(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(id), 0) FROM activity_log")
+            .fetch_one(self.pool)
+            .await?)
+    }
+
+    pub async fn list_changes_since(
+        &self,
+        since_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ActivityEntry>> {
+        let clamped_since = since_id.max(0);
+        let clamped_limit = limit.clamp(1, 1001);
+        Ok(sqlx::query_as::<_, ActivityEntry>(
+            "SELECT id, entity_type, entity_id, action, timestamp
+             FROM activity_log
+             WHERE id > ?
+             ORDER BY id ASC
+             LIMIT ?",
+        )
+        .bind(clamped_since)
+        .bind(clamped_limit)
+        .fetch_all(self.pool)
+        .await?)
+    }
+
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
         let result =
