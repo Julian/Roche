@@ -124,7 +124,10 @@ internal fun toRemoteItemEntity(
         author = remote.author?.takeIf { it.isNotBlank() } ?: existing?.author,
         summary = remote.summary?.takeIf { it.isNotBlank() } ?: existing?.summary,
         contentText = remote.contentText?.takeIf { it.isNotBlank() } ?: existing?.contentText,
-        contentHtml = remote.contentHtml?.takeIf { it.isNotBlank() } ?: existing?.contentHtml,
+        contentHtml =
+            (remote.contentHtml?.takeIf { it.isNotBlank() } ?: existing?.contentHtml)?.take(
+                MAX_SQLITE_HTML_CHARS
+            ),
         contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
         status = remote.status,
         isFavorite = remote.isFavorite,
@@ -146,7 +149,10 @@ internal fun reconcileSavedItemEntity(
         title = remoteSaved.title.ifBlank { localEntity.title },
         summary = remoteSaved.summary ?: localEntity.summary,
         contentText = remoteSaved.contentText ?: localEntity.contentText,
-        contentHtml = remoteSaved.contentHtml ?: localEntity.contentHtml,
+        contentHtml =
+            (remoteSaved.contentHtml?.takeIf { it.isNotBlank() } ?: localEntity.contentHtml)?.take(
+                MAX_SQLITE_HTML_CHARS
+            ),
         contentType = remoteSaved.contentType.ifBlank { localEntity.contentType },
         createdAt = remoteSaved.createdAt.ifBlank { localEntity.createdAt },
         thumbnailMediaId = remoteSaved.thumbnailMediaId ?: localEntity.thumbnailMediaId,
@@ -186,3 +192,5 @@ internal fun createSavedItemEntity(
         duration = null,
     )
 }
+
+internal const val MAX_SQLITE_HTML_CHARS = 512_000

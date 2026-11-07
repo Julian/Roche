@@ -111,7 +111,7 @@ internal fun readBoundedText(input: java.io.InputStream): String =
     }
 
 private const val READ_BUFFER_CHARS = 8_192
-private const val MAX_RESPONSE_CHARS = 4 * 1024 * 1024
+private const val MAX_RESPONSE_CHARS = 16 * 1024 * 1024
 private const val MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
@@ -478,6 +478,65 @@ class RocheApiClient(private val transport: HttpTransport) {
                 )
             )
         ensureSuccess(response)
+    }
+
+    internal suspend fun archiveBatch(
+        serverUrl: String,
+        token: String,
+        itemIds: List<String> = emptyList(),
+        feedId: String? = null,
+        allUnread: Boolean = false,
+    ): Int {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_POST,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/items/archive-batch",
+                    headers = authHeaders(token),
+                    body =
+                        buildArchiveBatchPayload(
+                            itemIds = itemIds,
+                            feedId = feedId,
+                            allUnread = allUnread,
+                        ),
+                )
+            )
+        ensureSuccess(response)
+        return parseArchivedCountJson(response.body)
+    }
+
+    internal suspend fun importOpml(
+        serverUrl: String,
+        token: String,
+        opmlXml: String,
+    ): Int {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_POST,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/import/opml",
+                    headers = authHeaders(token),
+                    body = buildImportOpmlPayload(opmlXml),
+                )
+            )
+        ensureSuccess(response)
+        return parseImportedCountJson(response.body)
+    }
+
+    internal suspend fun exportOpml(
+        serverUrl: String,
+        token: String,
+    ): String {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/export/feeds",
+                    headers = authHeaders(token),
+                )
+            )
+        ensureSuccess(response)
+        return response.body
     }
 
     private companion object {

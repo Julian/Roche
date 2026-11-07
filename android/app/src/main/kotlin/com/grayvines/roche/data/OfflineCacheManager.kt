@@ -27,6 +27,21 @@ internal class OfflineCacheManager(
         }
     }
 
+    suspend fun hydrateItemForReader(itemId: String) {
+        val existing = dao.getItemById(itemId) ?: return
+        if (!existing.contentHtml.isNullOrBlank()) return
+        val currentSettings = settings.settings.first()
+        val serverUrl = currentSettings.serverUrl
+        val token = currentSettings.bearerToken
+        if (serverUrl.isBlank() || token.isBlank()) return
+        runCatching {
+            val detail = apiClient.fetchItemDetail(serverUrl, token, itemId)
+            val latest = dao.getItemById(itemId) ?: return
+            dao.upsertItem(mergeHydratedItemDetail(latest, detail))
+        }
+            .onFailure { if (it is CancellationException) throw it }
+    }
+
     private suspend fun populateOfflineCache(itemId: String) {
         val currentSettings = settings.settings.first()
         val serverUrl = currentSettings.serverUrl
@@ -188,7 +203,10 @@ internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): 
         author = detail.author?.takeIf { it.isNotBlank() } ?: local.author,
         summary = detail.summary?.takeIf { it.isNotBlank() } ?: local.summary,
         contentText = detail.contentText?.takeIf { it.isNotBlank() } ?: local.contentText,
-        contentHtml = detail.contentHtml?.takeIf { it.isNotBlank() } ?: local.contentHtml,
+        contentHtml =
+            (detail.contentHtml?.takeIf { it.isNotBlank() } ?: local.contentHtml)?.take(
+                MAX_SQLITE_HTML_CHARS
+            ),
         thumbnailMediaId =
             detail.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: local.thumbnailMediaId,
         duration = detail.duration?.takeIf { it.isNotBlank() } ?: local.duration,

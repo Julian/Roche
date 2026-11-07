@@ -33,10 +33,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -65,6 +63,13 @@ fun InboxTabContent(
             title = "Roche",
             subtitle = "${state.visibleEntries.size} items",
         ) {
+            if (state.visibleEntries.any { !it.isArchived }) {
+                HeaderActionButton(
+                    label = "Archive All",
+                    onClick = { onAction(MainAction.ArchiveVisibleEntries) },
+                    modifier = Modifier.testTag("archive_all_btn"),
+                )
+            }
             HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
         }
 
@@ -351,9 +356,7 @@ private fun InboxEntryTextColumn(
         val rawSummary = entry.summary
         if (!ultraDense && !rawSummary.isNullOrBlank()) {
             val snippet =
-                androidx.compose.runtime.remember(rawSummary) {
-                    AnnotatedString.fromHtml(rawSummary).text.replace('\n', ' ').trim()
-                }
+                androidx.compose.runtime.remember(rawSummary) { extractInboxSnippet(rawSummary) }
             if (snippet.isNotBlank()) {
                 Spacer(modifier = Modifier.height(3.dp))
                 Text(

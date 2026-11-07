@@ -100,6 +100,10 @@ sealed interface MainAction {
 
     data object UndoLastArchive : Mutation
 
+    data object ArchiveVisibleEntries : Mutation
+
+    data class ImportOpml(val opmlXml: String) : Mutation
+
     data class ToggleStar(val entryId: String) : Mutation
 
     data class ToggleOfflineCache(val entryId: String) : Mutation
@@ -188,9 +192,22 @@ class MainViewModel(
 
     fun dispatch(action: MainAction) {
         when (action) {
-            is MainAction.Ui -> transientState.update { reduceUiAction(it, action) }
-            is MainAction.Mutation -> viewModelScope.launch { executeMutation(action) }
+            is MainAction.Ui -> {
+                transientState.update { reduceUiAction(it, action) }
+                if (action is MainAction.OpenReader) {
+                    viewModelScope.launch { repository.hydrateItemContentIfNeeded(action.entryId) }
+                }
+            }
+            is MainAction.Mutation -> {
+                viewModelScope.launch { executeMutation(action) }
+            }
         }
+    }
+
+    internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
+
+    internal fun showStatusMessage(message: String) {
+        transientState.update { it.copy(undoEvent = null, statusBanner = message) }
     }
 
     fun triggerStartupSyncIfConfigured() {
@@ -201,6 +218,8 @@ class MainViewModel(
         when (action) {
             is MainAction.ToggleArchive -> performToggleArchive(action.entry)
             MainAction.UndoLastArchive -> performUndoArchive()
+            MainAction.ArchiveVisibleEntries -> performArchiveVisibleEntries()
+            is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
             is MainAction.ToggleStar -> performToggleStar(action.entryId)
             is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
             is MainAction.ToggleTagOnEntry ->
@@ -351,6 +370,57 @@ class MainViewModel(
         val pending = transientState.value.undoEvent ?: return
         repository.restoreStatus(itemId = pending.itemId, status = pending.previousStatus)
         transientState.update { it.copy(undoEvent = null, statusBanner = "Restored entry") }
+    }
+
+    internal suspend fun performArchiveVisibleEntries() {
+        val currentUi = uiState.value
+        val unarchivedIds = currentUi.visibleEntries.filter { !it.isArchived }.map { it.id }
+        if (unarchivedIds.isEmpty()) return
+        val archivedCount =
+            repository.archiveEntriesBatch(
+                entryIds = unarchivedIds,
+                feedId = currentUi.selectedFeedId,
+                allUnread =
+                    currentUi.selectedFeedId == null &&
+                        currentUi.selectedTag == null &&
+                        currentUi.activeFilter == InboxFilter.UNREAD,
+            )
+        if (archivedCount > 0) {
+            val noun = if (archivedCount == 1) "entry" else "entries"
+            transientState.update {
+                it.copy(
+                    undoEvent = null,
+                    statusBanner = "Archived $archivedCount $noun",
+                )
+            }
+        }
+    }
+
+    internal suspend fun performImportOpml(opmlXml: String) {
+        if (!tryAcquireSyncLock()) return
+        try {
+            repository
+                .importOpml(opmlXml)
+                .onSuccess { importedCount ->
+                    val noun = if (importedCount == 1) "feed" else "feeds"
+                    transientState.update {
+                        it.copy(
+                            undoEvent = null,
+                            statusBanner = "Imported $importedCount $noun from OPML",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    transientState.update {
+                        it.copy(
+                            undoEvent = null,
+                            statusBanner = "OPML import failed (${error.message ?: "error"})",
+                        )
+                    }
+                }
+        } finally {
+            transientState.update { it.copy(isSyncing = false) }
+        }
     }
 
     internal suspend fun performSaveUrl(url: String, titleOverride: String?, tagCsv: String) {

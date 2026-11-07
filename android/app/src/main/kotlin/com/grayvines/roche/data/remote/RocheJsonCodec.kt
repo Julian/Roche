@@ -75,6 +75,41 @@ internal fun buildUpdateItemPayload(
 }
     .toString()
 
+internal fun buildArchiveBatchPayload(
+    itemIds: List<String>,
+    feedId: String?,
+    allUnread: Boolean,
+): String = buildJsonObject {
+    if (itemIds.isNotEmpty()) {
+        put(
+            "item_ids",
+            buildJsonArray { itemIds.forEach { id -> add(JsonPrimitive(id)) } },
+        )
+    }
+    if (!feedId.isNullOrBlank()) {
+        put("feed_id", feedId)
+    }
+    if (allUnread) {
+        put("all_unread", true)
+    }
+}
+    .toString()
+
+internal fun parseArchivedCountJson(raw: String): Int {
+    val obj = rocheJson.parseToJsonElement(raw).jsonObject
+    return obj["archived_count"]?.jsonPrimitive?.intOrNull ?: obj.intOrDefault("archived", 0)
+}
+
+internal fun buildImportOpmlPayload(opmlXml: String): String = buildJsonObject {
+    put("opml", opmlXml)
+}
+    .toString()
+
+internal fun parseImportedCountJson(raw: String): Int {
+    val obj = rocheJson.parseToJsonElement(raw).jsonObject
+    return obj["imported_count"]?.jsonPrimitive?.intOrNull ?: obj.intOrDefault("imported", 0)
+}
+
 internal fun parseFeedsJsonArray(raw: String): List<RemoteFeedDto> {
     val root = rocheJson.parseToJsonElement(raw)
     val feedsArray =

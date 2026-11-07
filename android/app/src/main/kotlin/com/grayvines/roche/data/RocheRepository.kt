@@ -100,6 +100,56 @@ class RocheRepository(
         return updated
     }
 
+    internal suspend fun hydrateItemContentIfNeeded(itemId: String) {
+        offlineCacheManager.hydrateItemForReader(itemId)
+    }
+
+    internal suspend fun archiveEntriesBatch(
+        entryIds: List<String>,
+        feedId: String? = null,
+        allUnread: Boolean = false,
+    ): Int =
+        syncArchiveBatchMutation(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            itemIds = entryIds,
+            feedId = feedId,
+            allUnread = allUnread,
+        )
+
+    internal suspend fun importOpml(opmlXml: String): Result<Int> = runCatching {
+        val trimmed = opmlXml.trim()
+        check(trimmed.isNotBlank()) { "OPML file is empty" }
+        val currentSettings = settings.settings.first()
+        check(currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            "Configure Server URL in Settings before importing OPML"
+        }
+        val imported =
+            apiClient.importOpml(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                opmlXml = trimmed,
+            )
+        syncWithServer()
+        imported
+    }
+
+    internal suspend fun exportOpml(): Result<String> = runCatching {
+        val currentSettings = settings.settings.first()
+        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            runCatching {
+                apiClient.exportOpml(
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                )
+            }
+                .getOrElse { buildLocalOpmlXml(dao.getAllFeeds()) }
+        } else {
+            buildLocalOpmlXml(dao.getAllFeeds())
+        }
+    }
+
     internal suspend fun updateReadProgress(itemId: String, progress: Double) {
         if (!progress.isFinite() || dao.getItemById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)

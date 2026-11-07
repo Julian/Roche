@@ -360,7 +360,12 @@ private fun OfflineVaultEntryRow(
 }
 
 @Composable
-fun SettingsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun SettingsTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onImportOpml: () -> Unit = {},
+    onExportOpml: () -> Unit = {},
+) {
     val colors = LocalRocheColors.current
     Column(modifier = Modifier.fillMaxSize()) {
         RocheTopHeader(title = "Settings")
@@ -376,6 +381,8 @@ fun SettingsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             AppearanceTogglesSection(state = state, onAction = onAction)
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             ServerConfigSection(state = state, onAction = onAction)
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            OpmlSubscriptionsSection(onImportOpml = onImportOpml, onExportOpml = onExportOpml)
             Spacer(modifier = Modifier.height(24.dp))
         }
     }
@@ -416,7 +423,10 @@ private fun AppearanceTogglesSection(state: MainUiState, onAction: (MainAction) 
 }
 
 @Composable
-private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+private fun ServerConfigSection(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
     val colors = LocalRocheColors.current
     val keyboardController = LocalSoftwareKeyboardController.current
     var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
@@ -476,6 +486,35 @@ private fun ServerConfigSection(state: MainUiState, onAction: (MainAction) -> Un
         onAction = onAction,
         onHideKeyboard = { keyboardController?.hide() },
     )
+}
+
+@Composable
+internal fun OpmlSubscriptionsSection(
+    onImportOpml: () -> Unit,
+    onExportOpml: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = "OPML SUBSCRIPTIONS",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+    )
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeaderActionButton(
+            label = "Import OPML…",
+            onClick = onImportOpml,
+            modifier = Modifier.testTag("import_opml_btn"),
+        )
+        HeaderActionButton(
+            label = "Export OPML…",
+            onClick = onExportOpml,
+            modifier = Modifier.testTag("export_opml_btn"),
+        )
+    }
 }
 
 @Composable

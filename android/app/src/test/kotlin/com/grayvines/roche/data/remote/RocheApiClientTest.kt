@@ -376,4 +376,53 @@ class RocheApiClientTest {
                 recorded,
             )
         }
+
+    @Test
+    internal fun `archiveBatch importOpml and exportOpml send expected requests and parse responses`() =
+        runTest {
+            val recorded = mutableListOf<Pair<String, String?>>()
+            val client = RocheApiClient { request ->
+                recorded.add("${request.method} ${request.url}" to request.body)
+                when {
+                    request.method == "POST" &&
+                        request.url == "http://localhost:8080/api/v1/items/archive-batch" ->
+                        HttpResponse(statusCode = 200, body = """{"archived_count":3}""")
+                    request.method == "POST" &&
+                        request.url == "http://localhost:8080/api/v1/import/opml" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body = """{"imported_count":70,"feeds":[]}""",
+                        )
+                    request.method == "GET" &&
+                        request.url == "http://localhost:8080/api/v1/export/feeds" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body = """<?xml version="1.0"?><opml version="2.0"><body/></opml>""",
+                        )
+                    else -> HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+
+            val archived =
+                client.archiveBatch(
+                    serverUrl = "http://localhost:8080",
+                    token = "tok-123",
+                    itemIds = listOf("i-1", "i-2", "i-3"),
+                    feedId = "feed-1",
+                    allUnread = false,
+                )
+            assertEquals(3, archived)
+
+            val imported =
+                client.importOpml(
+                    serverUrl = "http://localhost:8080",
+                    token = "tok-123",
+                    opmlXml = "<opml/>",
+                )
+            assertEquals(70, imported)
+
+            val exported = client.exportOpml(serverUrl = "http://localhost:8080", token = "tok-123")
+            assertEquals("""<?xml version="1.0"?><opml version="2.0"><body/></opml>""", exported)
+            assertEquals(3, recorded.size)
+        }
 }

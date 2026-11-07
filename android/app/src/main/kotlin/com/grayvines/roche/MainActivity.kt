@@ -1,21 +1,28 @@
 package com.grayvines.roche
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import com.grayvines.roche.data.remote.readBoundedText
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.theme.RocheTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -23,6 +30,21 @@ class MainActivity : ComponentActivity() {
         val graph = (application as RocheApp).graph
         MainViewModel.Factory(repository = graph.repository, settings = graph.settings)
     }
+
+    private val importOpmlLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            if (uri != null) {
+                importOpmlFromUri(uri)
+            }
+        }
+
+    private val exportOpmlLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/x-opml")) { uri: Uri?
+            ->
+            if (uri != null) {
+                exportOpmlToUri(uri)
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,6 +67,8 @@ class MainActivity : ComponentActivity() {
                         onAction = viewModel::dispatch,
                         onShareEntry = ::shareEntryViaSystemSheet,
                         onOpenExternalUrl = ::openUrlInBrowser,
+                        onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
+                        onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
                     )
                 }
             }
@@ -102,7 +126,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun importOpmlFromUri(uri: Uri) {
+        lifecycleScope.launch {
+            val xml =
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        contentResolver.openInputStream(uri)?.let { stream ->
+                            readBoundedText(stream)
+                        }
+                    }
+                        .getOrNull()
+                }
+            if (xml.isNullOrBlank()) {
+                viewModel.showStatusMessage("Could not read OPML file")
+            } else {
+                viewModel.dispatch(MainAction.ImportOpml(xml))
+            }
+        }
+    }
+
+    private fun exportOpmlToUri(uri: Uri) {
+        lifecycleScope.launch {
+            viewModel
+                .exportOpmlXml()
+                .onSuccess { xml ->
+                    val written =
+                        withContext(Dispatchers.IO) {
+                            runCatching {
+                                    contentResolver.openOutputStream(uri)?.use { stream ->
+                                        stream.write(xml.toByteArray(Charsets.UTF_8))
+                                    } != null
+                                }
+                                .getOrDefault(false)
+                        }
+                    val msg =
+                        if (written) "Exported OPML subscriptions" else "Failed to write OPML file"
+                    viewModel.showStatusMessage(msg)
+                }
+                .onFailure { err ->
+                    viewModel.showStatusMessage("Export failed (${err.message ?: "error"})")
+                }
+        }
+    }
+
     private companion object {
         private val ALLOWED_HTTP_SCHEMES = setOf("http", "https")
+        private val OPML_MIME_TYPES = arrayOf("text/xml", "application/xml", "text/x-opml", "*/*")
     }
 }

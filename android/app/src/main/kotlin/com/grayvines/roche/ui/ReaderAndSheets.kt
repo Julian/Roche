@@ -35,13 +35,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.fromHtml
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -274,28 +269,9 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit 
     val htmlBody =
         entry.contentHtml?.takeIf { it.isNotBlank() }
             ?: entry.summary?.takeIf { "<" in it || "&" in it }
-    if (htmlBody != null) {
-        val linkStyles =
-            remember(colors.accentBlue) {
-                TextLinkStyles(
-                    style =
-                        SpanStyle(
-                            color = colors.accentBlue,
-                            textDecoration = TextDecoration.Underline,
-                        )
-                )
-            }
-        val annotated =
-            remember(htmlBody, linkStyles) {
-                AnnotatedString.fromHtml(htmlString = htmlBody, linkStyles = linkStyles)
-            }
-        Text(
-            text = annotated,
-            color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
-            fontSize = 16.sp,
-            lineHeight = 26.sp,
-        )
+    val htmlBlocks = remember(htmlBody) { htmlBody?.let(::parseHtmlArticleBlocks).orEmpty() }
+    if (htmlBlocks.isNotEmpty()) {
+        StructuredHtmlArticleContent(blocks = htmlBlocks)
     } else {
         val bodyParagraphs =
             (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())

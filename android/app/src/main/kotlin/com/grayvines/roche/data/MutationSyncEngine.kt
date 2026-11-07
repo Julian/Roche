@@ -16,6 +16,7 @@ import java.util.UUID
 import kotlinx.coroutines.flow.first
 
 private const val HTTP_NOT_FOUND = 404
+private const val ARCHIVED_STATUS_WIRE = "archived"
 internal const val DELETED_STATUS_TOMBSTONE = "__deleted__"
 
 internal data class PushMutationsOutcome(
@@ -941,3 +942,90 @@ internal suspend fun pushPendingTagRemovals(
             .isSuccess
     }
 }
+
+internal suspend fun syncArchiveBatchMutation(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    itemIds: List<String>,
+    feedId: String? = null,
+    allUnread: Boolean = false,
+): Int {
+    val unarchivedIds =
+        dao.getAllItems()
+            .filter { it.id in itemIds.toSet() && it.status != ARCHIVED_STATUS_WIRE }
+            .map { it.id }
+    if (unarchivedIds.isEmpty()) return 0
+
+    for (itemId in unarchivedIds) {
+        dao.updateItemStatus(itemId, ARCHIVED_STATUS_WIRE)
+    }
+
+    val mutationsById = unarchivedIds.associateWith { dao.getPendingMutation(it) }
+    val remoteIds = unarchivedIds.filter { mutationsById[it]?.isLocalItem != true }
+    val remoteFeedId = feedId?.takeIf { dao.getPendingMutation(it)?.isLocalFeed != true }
+    val currentSettings = settings.settings.first()
+    val pushedToServer =
+        if (
+            remoteIds.isNotEmpty() &&
+                currentSettings.serverUrl.isNotBlank() &&
+                currentSettings.bearerToken.isNotBlank()
+        ) {
+            runCatching {
+                    apiClient.archiveBatch(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        itemIds = remoteIds,
+                        feedId = remoteFeedId,
+                        allUnread = allUnread && remoteIds.size == unarchivedIds.size,
+                    )
+                    true
+                }
+                .getOrDefault(false)
+        } else {
+            false
+        }
+
+    for (itemId in unarchivedIds) {
+        val existing = mutationsById[itemId]
+        if (existing?.isLocalItem == true) {
+            dao.upsertPendingMutation(existing.copy(dirtyStatus = ARCHIVED_STATUS_WIRE))
+        } else {
+            val base = existing ?: PendingMutationEntity(entityId = itemId)
+            upsertOrCleanPendingMutation(
+                dao = dao,
+                mutation =
+                    base.copy(dirtyStatus = if (pushedToServer) null else ARCHIVED_STATUS_WIRE),
+            )
+        }
+    }
+    return unarchivedIds.size
+}
+
+internal fun buildLocalOpmlXml(feeds: List<FeedEntity>): String = buildString {
+    appendLine("""<?xml version="1.0" encoding="UTF-8"?>""")
+    appendLine("""<opml version="2.0">""")
+    appendLine("  <head>")
+    appendLine("    <title>Roche Feeds Export</title>")
+    appendLine("  </head>")
+    appendLine("  <body>")
+    for (feed in feeds) {
+        val titleAttr = escapeXmlAttr(feed.title)
+        val xmlUrlAttr = escapeXmlAttr(feed.url)
+        val htmlUrlPart =
+            feed.siteUrl?.takeIf { it.isNotBlank() }?.let { """ htmlUrl="${escapeXmlAttr(it)}"""" }
+                ?: ""
+        appendLine(
+            """    <outline type="rss" text="$titleAttr" title="$titleAttr" xmlUrl="$xmlUrlAttr"$htmlUrlPart/>"""
+        )
+    }
+    appendLine("  </body>")
+    appendLine("</opml>")
+}
+
+private fun escapeXmlAttr(raw: String): String =
+    raw.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")

@@ -34,6 +34,8 @@ fun MainScreen(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onImportOpml: () -> Unit = {},
+    onExportOpml: () -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     val showChrome = state.activeReaderEntry == null
@@ -68,6 +70,8 @@ fun MainScreen(
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
+                onImportOpml = onImportOpml,
+                onExportOpml = onExportOpml,
             )
 
             MainSnackbarOverlay(
@@ -168,6 +172,8 @@ private fun MainBodyContent(
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    onImportOpml: () -> Unit,
+    onExportOpml: () -> Unit,
 ) {
     val readerEntry = state.activeReaderEntry
     if (readerEntry != null) {
@@ -184,7 +190,13 @@ private fun MainBodyContent(
         AppTab.SEARCH -> SearchTabContent(state = state, onAction = onAction)
         AppTab.FEEDS -> FeedsAndTagsTabContent(state = state, onAction = onAction)
         AppTab.OFFLINE -> OfflineTabContent(state = state, onAction = onAction)
-        AppTab.SETTINGS -> SettingsTabContent(state = state, onAction = onAction)
+        AppTab.SETTINGS ->
+            SettingsTabContent(
+                state = state,
+                onAction = onAction,
+                onImportOpml = onImportOpml,
+                onExportOpml = onExportOpml,
+            )
     }
 }
 
