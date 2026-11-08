@@ -81,7 +81,7 @@ private fun ArticleImageThumbnail(entry: InboxEntry, modifier: Modifier = Modifi
     }
 }
 
-private fun DrawScope.drawArticleImagePlaceholder(colors: RocheColors) {
+internal fun DrawScope.drawArticleImagePlaceholder(colors: RocheColors) {
     val w = size.width
     val h = size.height
     drawCircle(

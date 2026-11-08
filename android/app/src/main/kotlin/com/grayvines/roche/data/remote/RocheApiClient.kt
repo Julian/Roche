@@ -74,8 +74,9 @@ class HttpUrlConnectionTransport : HttpTransport {
     }
 
     private fun executeSingleRequest(request: HttpRequest): Pair<HttpResponse, String?> {
+        val sanitizedUrl = request.url.trim().replace(" ", "%20")
         val connection =
-            (URI.create(request.url).toURL().openConnection() as HttpURLConnection).apply {
+            (URI.create(sanitizedUrl).toURL().openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = false
                 requestMethod = request.method
                 connectTimeout = CONNECT_TIMEOUT_MS
@@ -125,7 +126,10 @@ class HttpUrlConnectionTransport : HttpTransport {
 }
 
 internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = runCatching {
-    val resolved = URI.create(baseUrl).resolve(location.trim()).toString()
+    val resolved =
+        URI.create(baseUrl.trim().replace(" ", "%20"))
+            .resolve(location.trim().replace(" ", "%20"))
+            .toString()
     resolved.takeIf {
         it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
     }

@@ -215,7 +215,9 @@ class MainViewModelTest {
             // SyncNow sets statusBanner and resets isSyncing to false in finally block
             viewModel.dispatch(MainAction.SyncNow)
             val afterSync =
-                viewModel.uiState.first { it.statusBanner?.startsWith("Sync offline") == true }
+                viewModel.uiState.first {
+                    !it.isSyncing && it.statusBanner?.startsWith("Sync offline") == true
+                }
             assertFalse(afterSync.isSyncing)
             assertTrue(afterSync.statusBanner?.startsWith("Sync offline") == true)
 
@@ -224,7 +226,9 @@ class MainViewModelTest {
             viewModel.uiState.first { it.statusBanner == null }
             viewModel.dispatch(MainAction.RefreshFeed("feed-2"))
             val afterRefresh =
-                viewModel.uiState.first { it.statusBanner?.startsWith("Refresh failed") == true }
+                viewModel.uiState.first {
+                    !it.isSyncing && it.statusBanner?.startsWith("Refresh failed") == true
+                }
             assertFalse(afterRefresh.isSyncing)
 
             collectJob.cancel()
@@ -273,7 +277,8 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.ToggleReadState("item-1"))
             val afterUnread =
                 viewModel.uiState.first { state ->
-                    state.allEntries.any { it.id == "item-1" && !it.isRead && it.isUnread }
+                    state.statusBanner == "Marked as unread" &&
+                        state.allEntries.any { it.id == "item-1" && !it.isRead && it.isUnread }
                 }
             assertEquals("Marked as unread", afterUnread.statusBanner)
             assertNull(afterUnread.allEntries.first { it.id == "item-1" }.readAt)

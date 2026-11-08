@@ -1,5 +1,6 @@
 package com.grayvines.roche.model
 
+import java.net.URI
 import java.time.Duration
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -138,7 +139,7 @@ data class InboxEntry(
 
     val effectiveThumbnailUrl: String? =
         thumbnailUrl?.trim()?.takeIf { it.isNotBlank() && !isNonThumbnailUrl(it) }
-            ?: extractFirstImageUrlFromHtml(contentHtml)
+            ?: extractFirstImageUrlFromHtml(contentHtml, baseUrl = url)
 
     val showsThumbnailPreview: Boolean =
         when (contentType) {
@@ -176,18 +177,45 @@ internal fun isNonThumbnailUrl(url: String): Boolean {
         lower.contains("/pixel.gif")
 }
 
-internal fun extractFirstImageUrlFromHtml(html: String?): String? {
+internal fun resolveArticleImageUrl(rawUrl: String, baseUrl: String? = null): String? {
+    val candidate = rawUrl.trim().replace("&amp;", "&")
+    if (candidate.isBlank() || hasDisallowedImageScheme(candidate)) return null
+    val resolved =
+        if (isHttpImageScheme(candidate)) {
+            candidate
+        } else if (!baseUrl.isNullOrBlank()) {
+            runCatching { URI.create(baseUrl.trim()).resolve(candidate).toString() }.getOrNull()
+        } else {
+            null
+        }
+    return resolved?.takeIf { isHttpImageScheme(it) && !isNonThumbnailUrl(it) }
+}
+
+private fun isHttpImageScheme(url: String): Boolean =
+    url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true)
+
+private fun hasDisallowedImageScheme(url: String): Boolean =
+    url.startsWith("data:", ignoreCase = true) ||
+        url.startsWith("javascript:", ignoreCase = true) ||
+        url.startsWith("mailto:", ignoreCase = true) ||
+        url.startsWith("blob:", ignoreCase = true)
+
+internal fun extractFirstImageUrlFromHtml(html: String?, baseUrl: String? = null): String? {
     if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return null
     for (match in IMG_SRC_REGEX.findAll(html)) {
-        val rawUrl = match.groupValues[1].trim().replace("&amp;", "&")
-        val isHttp =
-            rawUrl.startsWith("https://", ignoreCase = true) ||
-                rawUrl.startsWith("http://", ignoreCase = true)
-        if (isHttp && !isNonThumbnailUrl(rawUrl)) {
-            return rawUrl
+        resolveArticleImageUrl(match.groupValues[1], baseUrl)?.let {
+            return it
         }
     }
     return null
+}
+
+internal fun extractAllImageUrlsFromHtml(html: String?, baseUrl: String? = null): List<String> {
+    if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return emptyList()
+    return IMG_SRC_REGEX.findAll(html)
+        .mapNotNull { match -> resolveArticleImageUrl(match.groupValues[1], baseUrl) }
+        .distinct()
+        .toList()
 }
 
 internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now()): String {

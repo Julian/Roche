@@ -124,6 +124,44 @@ class RocheRssWorkflowTest {
         }
 
     @Test
+    fun `parseHtmlArticleBlocks extracts inline figures and paragraph images and skips tracking pixels`() {
+        val html =
+            """<figure><img src="/static/images/circus.jpg" alt="Circus show" width="1024" height="579">""" +
+                """<figcaption>The Halloween <a href="https://dark.ronacher.eu">circus</a> show.</figcaption></figure>""" +
+                """<p><a href="https://minimaxir.com/full.png"><img src="costpertask.png" alt="Chart"></a> """ +
+                """Model quality vs cost-per-task.</p>""" +
+                """<p><img src="https://example.com/pixel.gif" width="1" height="1">""" +
+                """<img src="https://example.com/icon.svg">Visible paragraph</p>"""
+
+        val blocks =
+            parseHtmlArticleBlocks(
+                rawHtml = html,
+                baseUrl = "https://dark.ronacher.eu/2026/10/31/golden-age/",
+            )
+
+        assertEquals(4, blocks.size)
+        val figImg = blocks[0] as ArticleBlock.ImageBlock
+        assertEquals("https://dark.ronacher.eu/static/images/circus.jpg", figImg.url)
+        assertEquals("Circus show", figImg.alt)
+        assertEquals(1024, figImg.width)
+        assertEquals(579, figImg.height)
+        assertTrue(figImg.captionHtml?.contains("Halloween") == true)
+
+        val inlineImg = blocks[1] as ArticleBlock.ImageBlock
+        assertEquals(
+            "https://dark.ronacher.eu/2026/10/31/golden-age/costpertask.png",
+            inlineImg.url,
+        )
+        assertEquals("Chart", inlineImg.alt)
+
+        assertEquals(
+            "Model quality vs cost-per-task.",
+            (blocks[2] as ArticleBlock.Paragraph).html,
+        )
+        assertEquals("Visible paragraph", (blocks[3] as ArticleBlock.Paragraph).html)
+    }
+
+    @Test
     fun `MainViewModel performImportOpml and local batch archive work`() = runTest {
         seedDatabase()
         settings.update { it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live") }

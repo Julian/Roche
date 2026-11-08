@@ -50,6 +50,14 @@ internal sealed interface ArticleBlock {
     data object HorizontalRule : ArticleBlock
 
     data class Paragraph(val html: String) : ArticleBlock
+
+    data class ImageBlock(
+        val url: String,
+        val alt: String? = null,
+        val captionHtml: String? = null,
+        val width: Int? = null,
+        val height: Int? = null,
+    ) : ArticleBlock
 }
 
 internal fun extractInboxSnippet(rawSummary: String): String =
@@ -59,7 +67,10 @@ internal fun extractInboxSnippet(rawSummary: String): String =
         AnnotatedString.fromHtml(rawSummary).text.replace('\n', ' ').trim()
     }
 
-internal fun parseHtmlArticleBlocks(rawHtml: String): List<ArticleBlock> {
+internal fun parseHtmlArticleBlocks(
+    rawHtml: String,
+    baseUrl: String? = null,
+): List<ArticleBlock> {
     val trimmed = rawHtml.trim()
     if (trimmed.isEmpty()) return emptyList()
 
@@ -67,30 +78,48 @@ internal fun parseHtmlArticleBlocks(rawHtml: String): List<ArticleBlock> {
     var cursor = 0
     for (match in TOP_BLOCK_REGEX.findAll(trimmed)) {
         if (match.range.first > cursor) {
-            appendGapParagraphs(trimmed.substring(cursor, match.range.first), blocks)
+            appendGapParagraphs(trimmed.substring(cursor, match.range.first), baseUrl, blocks)
         }
-        parseMatchedBlock(match)?.let { blocks.add(it) }
+        appendMatchedBlocks(match, baseUrl, blocks)
         cursor = match.range.last + 1
     }
     if (cursor < trimmed.length) {
-        appendGapParagraphs(trimmed.substring(cursor), blocks)
+        appendGapParagraphs(trimmed.substring(cursor), baseUrl, blocks)
     }
-    if (blocks.isEmpty() && hasVisibleHtmlText(trimmed)) {
-        blocks.add(ArticleBlock.Paragraph(trimmed))
+    if (blocks.isEmpty()) {
+        parseParagraphWithImages(trimmed, baseUrl, blocks)
     }
     return blocks
 }
 
-internal fun parseMatchedBlock(match: MatchResult): ArticleBlock? {
+internal fun appendMatchedBlocks(
+    match: MatchResult,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
     val preInner = match.groups[GROUP_PRE_INNER]?.value
     if (preInner != null) {
         val code = decodeHtmlCodeBlock(preInner)
-        return code.takeIf { it.isNotBlank() }?.let { ArticleBlock.CodeBlock(it) }
+        if (code.isNotBlank()) {
+            out.add(ArticleBlock.CodeBlock(code))
+        }
+        return
     }
     if (match.groups[GROUP_HR]?.value != null) {
-        return ArticleBlock.HorizontalRule
+        out.add(ArticleBlock.HorizontalRule)
+        return
     }
-    return parseHeadingOrQuoteBlock(match) ?: parseListOrParagraphBlock(match)
+    val figureInner = match.groups[GROUP_FIGURE_INNER]?.value
+    if (figureInner != null) {
+        parseFigureBlocks(figureInner, baseUrl, out)
+        return
+    }
+    val paraInner = match.groups[GROUP_PARA_INNER]?.value
+    if (paraInner != null) {
+        parseParagraphWithImages(paraInner, baseUrl, out)
+        return
+    }
+    (parseHeadingOrQuoteBlock(match) ?: parseListBlock(match))?.let { out.add(it) }
 }
 
 internal fun parseHeadingOrQuoteBlock(match: MatchResult): ArticleBlock? {
@@ -112,7 +141,7 @@ internal fun parseHeadingOrQuoteBlock(match: MatchResult): ArticleBlock? {
     return clean.takeIf { hasVisibleHtmlText(it) }?.let { ArticleBlock.Blockquote(it) }
 }
 
-internal fun parseListOrParagraphBlock(match: MatchResult): ArticleBlock? {
+internal fun parseListBlock(match: MatchResult): ArticleBlock? {
     val listTag = match.groups[GROUP_LIST_TAG]?.value
     val listInner = match.groups[GROUP_LIST_INNER]?.value
     if (listTag != null && listInner != null) {
@@ -130,9 +159,7 @@ internal fun parseListOrParagraphBlock(match: MatchResult): ArticleBlock? {
                 )
             }
     }
-    val paraInner = match.groups[GROUP_PARA_INNER]?.value ?: return null
-    val clean = stripMediaTags(paraInner).trim()
-    return clean.takeIf { hasVisibleHtmlText(it) }?.let { ArticleBlock.Paragraph(it) }
+    return null
 }
 
 internal fun normalizeInlineBlockHtml(htmlFragment: String): String =
@@ -141,12 +168,16 @@ internal fun normalizeInlineBlockHtml(htmlFragment: String): String =
         .replace(SINGLE_P_TAG_REGEX, "")
         .trim()
 
-internal fun appendGapParagraphs(gapHtml: String, out: MutableList<ArticleBlock>) {
-    val cleanedGap = stripMediaTags(gapHtml).replace(CONTAINER_TAG_REGEX, "\n\n")
+internal fun appendGapParagraphs(
+    gapHtml: String,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
+    val cleanedGap = stripNonImageMediaTags(gapHtml).replace(CONTAINER_TAG_REGEX, "\n\n")
     for (segment in cleanedGap.split(PARAGRAPH_BREAK_REGEX)) {
         val trimmed = segment.trim()
-        if (hasVisibleHtmlText(trimmed)) {
-            out.add(ArticleBlock.Paragraph(trimmed))
+        if (trimmed.isNotEmpty()) {
+            parseParagraphWithImages(trimmed, baseUrl, out)
         }
     }
 }
@@ -239,6 +270,7 @@ private fun RenderArticleBlock(block: ArticleBlock, linkStyles: TextLinkStyles) 
             )
         is ArticleBlock.Paragraph ->
             RenderParagraphBlock(html = block.html, linkStyles = linkStyles)
+        is ArticleBlock.ImageBlock -> RenderImageBlock(block = block, linkStyles = linkStyles)
     }
 }
 
@@ -384,7 +416,8 @@ private const val GROUP_QUOTE_INNER = 4
 private const val GROUP_LIST_TAG = 5
 private const val GROUP_LIST_INNER = 6
 private const val GROUP_HR = 7
-private const val GROUP_PARA_INNER = 8
+private const val GROUP_FIGURE_INNER = 8
+private const val GROUP_PARA_INNER = 9
 
 private const val MIN_HEADING = 1
 private const val MAX_HEADING = 6
@@ -395,7 +428,7 @@ private const val MAX_CODEPOINT = 0x10FFFF
 
 private val TOP_BLOCK_REGEX =
     Regex(
-        """<pre\b[^>]*>(.*?)</pre>|<h([1-6])\b[^>]*>(.*?)</h\2>|<blockquote\b[^>]*>(.*?)</blockquote>|<(ul|ol)\b[^>]*>(.*?)</\5>|(<hr\b[^>]*/?>)|<p\b[^>]*>(.*?)</p>""",
+        """<pre\b[^>]*>(.*?)</pre>|<h([1-6])\b[^>]*>(.*?)</h\2>|<blockquote\b[^>]*>(.*?)</blockquote>|<(ul|ol)\b[^>]*>(.*?)</\5>|(<hr\b[^>]*/?>)|<figure\b[^>]*>(.*?)</figure>|<p\b[^>]*>(.*?)</p>""",
         setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
     )
 
@@ -412,7 +445,7 @@ private val MEDIA_TAG_REGEX =
 
 private val CONTAINER_TAG_REGEX =
     Regex(
-        """</?(?:div|section|article|header|footer|main|aside)\b[^>]*>""",
+        """</?(?:div|section|article|header|footer|main|aside|details|summary|center|span)\b[^>]*>""",
         RegexOption.IGNORE_CASE,
     )
 

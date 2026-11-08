@@ -24,12 +24,21 @@ class ThumbnailLoader(
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
     private val decoder: (ByteArray) -> ImageBitmap? = ::decodeBitmapBytes,
+    private val inlineDecoder: (ByteArray) -> ImageBitmap? =
+        if (decoder === ::decodeBitmapBytes) ::decodeInlineBitmapBytes else decoder,
 ) {
     private val memoryCache =
         object : LinkedHashMap<String, ImageBitmap>(INITIAL_CACHE_CAPACITY, LOAD_FACTOR, true) {
             override fun removeEldestEntry(
                 eldest: MutableMap.MutableEntry<String, ImageBitmap>?
             ): Boolean = size > MAX_MEMORY_THUMBNAILS
+        }
+
+    private val inlineMemoryCache =
+        object : LinkedHashMap<String, ImageBitmap>(INITIAL_CACHE_CAPACITY, LOAD_FACTOR, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, ImageBitmap>?
+            ): Boolean = size > MAX_MEMORY_INLINE_IMAGES
         }
 
     private val failedKeys = LinkedHashSet<String>()
@@ -40,6 +49,12 @@ class ThumbnailLoader(
         return synchronized(memoryCache) { memoryCache[cleanId] }
     }
 
+    fun getCachedInlineImage(imageUrl: String): ImageBitmap? {
+        val cleanId = imageUrl.trim()
+        if (cleanId.isBlank()) return null
+        return synchronized(inlineMemoryCache) { inlineMemoryCache[cleanId] }
+    }
+
     suspend fun loadThumbnail(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
         if (cleanId.isBlank()) return null
@@ -47,10 +62,32 @@ class ThumbnailLoader(
             return it
         }
 
-        return withContext(Dispatchers.IO) { loadOrFetchThumbnail(cleanId) }
+        return withContext(Dispatchers.IO) {
+            loadOrFetchImage(cleanId = cleanId, targetCache = memoryCache, decode = decoder)
+        }
     }
 
-    private suspend fun loadOrFetchThumbnail(cleanId: String): ImageBitmap? {
+    suspend fun loadInlineImage(imageUrl: String): ImageBitmap? {
+        val cleanId = imageUrl.trim()
+        if (cleanId.isBlank()) return null
+        getCachedInlineImage(cleanId)?.let {
+            return it
+        }
+
+        return withContext(Dispatchers.IO) {
+            loadOrFetchImage(
+                cleanId = cleanId,
+                targetCache = inlineMemoryCache,
+                decode = inlineDecoder,
+            )
+        }
+    }
+
+    private suspend fun loadOrFetchImage(
+        cleanId: String,
+        targetCache: LinkedHashMap<String, ImageBitmap>,
+        decode: (ByteArray) -> ImageBitmap?,
+    ): ImageBitmap? {
         val diskBytes = readDiskCachedBytes(cleanId)
         val alreadyFailed = synchronized(failedKeys) { cleanId in failedKeys }
         if (diskBytes == null && alreadyFailed) return null
@@ -60,9 +97,9 @@ class ThumbnailLoader(
             } else {
                 fetchAndCacheRemoteBytes(cleanId)
             }
-        val bitmap = bytes?.let { runCatching { decoder(it) }.getOrNull() }
+        val bitmap = bytes?.let { runCatching { decode(it) }.getOrNull() }
         if (bitmap != null) {
-            synchronized(memoryCache) { memoryCache[cleanId] = bitmap }
+            synchronized(targetCache) { targetCache[cleanId] = bitmap }
             synchronized(failedKeys) { failedKeys.remove(cleanId) }
         } else if (attemptedNetwork || diskBytes != null) {
             recordFailedKey(cleanId)
@@ -134,12 +171,19 @@ class ThumbnailLoader(
         private const val INITIAL_CACHE_CAPACITY = 16
         private const val LOAD_FACTOR = 0.75f
         private const val MAX_MEMORY_THUMBNAILS = 64
+        private const val MAX_MEMORY_INLINE_IMAGES = 24
         private const val MAX_FAILED_THUMBNAILS = 256
         private const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
     }
 }
 
-private fun decodeBitmapBytes(bytes: ByteArray): ImageBitmap? {
+private fun decodeBitmapBytes(bytes: ByteArray): ImageBitmap? =
+    decodeBitmapBytesAtSize(bytes, TARGET_THUMBNAIL_PX)
+
+private fun decodeInlineBitmapBytes(bytes: ByteArray): ImageBitmap? =
+    decodeBitmapBytesAtSize(bytes, TARGET_INLINE_IMAGE_PX)
+
+private fun decodeBitmapBytesAtSize(bytes: ByteArray, targetPx: Int): ImageBitmap? {
     val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
     if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return null
@@ -150,8 +194,8 @@ private fun decodeBitmapBytes(bytes: ByteArray): ImageBitmap? {
                 calculateInSampleSize(
                     rawWidth = boundsOptions.outWidth,
                     rawHeight = boundsOptions.outHeight,
-                    reqWidth = TARGET_THUMBNAIL_PX,
-                    reqHeight = TARGET_THUMBNAIL_PX,
+                    reqWidth = targetPx,
+                    reqHeight = targetPx,
                 )
         }
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)?.asImageBitmap()
@@ -175,4 +219,5 @@ internal fun calculateInSampleSize(
 }
 
 private const val TARGET_THUMBNAIL_PX = 256
+private const val TARGET_INLINE_IMAGE_PX = 1440
 private const val SAMPLE_DIVISOR = 2

@@ -292,7 +292,10 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit 
     val htmlBody =
         entry.contentHtml?.takeIf { it.isNotBlank() }
             ?: entry.summary?.takeIf { "<" in it || "&" in it }
-    val htmlBlocks = remember(htmlBody) { htmlBody?.let(::parseHtmlArticleBlocks).orEmpty() }
+    val htmlBlocks =
+        remember(htmlBody, entry.url) {
+            htmlBody?.let { parseHtmlArticleBlocks(rawHtml = it, baseUrl = entry.url) }.orEmpty()
+        }
     if (htmlBlocks.isNotEmpty()) {
         StructuredHtmlArticleContent(blocks = htmlBlocks)
     } else {

@@ -6,6 +6,7 @@ import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.model.extractAllImageUrlsFromHtml
 import com.grayvines.roche.model.extractFirstImageUrlFromHtml
 import com.grayvines.roche.model.isNonThumbnailUrl
 import java.io.File
@@ -58,16 +59,24 @@ internal class OfflineCacheManager(
             return
         }
         val thumbId = hydrated?.thumbnailMediaId ?: latest.thumbnailMediaId
+        val htmlContent = hydrated?.contentHtml ?: latest.contentHtml
+        val itemUrl = (hydrated?.url ?: latest.url).takeIf { it.isNotBlank() }
         val thumbUrl =
             (hydrated?.thumbnailUrl ?: latest.thumbnailUrl)?.trim()?.takeIf {
                 it.isNotBlank() && !isNonThumbnailUrl(it)
-            } ?: extractFirstImageUrlFromHtml(hydrated?.contentHtml ?: latest.contentHtml)
+            } ?: extractFirstImageUrlFromHtml(htmlContent, baseUrl = itemUrl)
+        val externalImageUrls = buildList {
+            if (!thumbUrl.isNullOrBlank()) add(thumbUrl)
+            addAll(extractAllImageUrlsFromHtml(htmlContent, baseUrl = itemUrl))
+        }
+            .distinct()
+            .take(MAX_OFFLINE_EXTERNAL_IMAGES)
         cacheItemMediaBestEffort(
             serverUrl = serverUrl,
             token = token,
             itemId = itemId,
             thumbnailMediaId = thumbId,
-            thumbnailUrl = thumbUrl,
+            externalImageUrls = externalImageUrls,
         )
     }
 
@@ -105,7 +114,7 @@ internal class OfflineCacheManager(
         token: String,
         itemId: String,
         thumbnailMediaId: String?,
-        thumbnailUrl: String? = null,
+        externalImageUrls: List<String> = emptyList(),
     ) {
         val rootDir = cacheDir ?: return
         val remoteMedia = runCatching {
@@ -135,11 +144,11 @@ internal class OfflineCacheManager(
                 return
             }
         }
-        if (!thumbnailUrl.isNullOrBlank()) {
+        for (imageUrl in externalImageUrls) {
             cacheExternalThumbBestEffort(
                 rootDir = rootDir,
                 itemId = itemId,
-                thumbnailUrl = thumbnailUrl,
+                thumbnailUrl = imageUrl,
             )
         }
     }
@@ -317,4 +326,5 @@ internal const val ITEMS_SUBDIR = "items"
 internal const val THUMBNAILS_SUBDIR = "thumbnails"
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
+private const val MAX_OFFLINE_EXTERNAL_IMAGES = 16
 private val UNSAFE_FILENAME_REGEX = Regex("""[^a-zA-Z0-9_-]""")
