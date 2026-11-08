@@ -133,7 +133,13 @@ internal fun toRemoteItemEntity(
         readProgress = remote.readProgress,
         thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(existing?.thumbnailMediaId),
         duration = remote.duration.nonBlankOr(existing?.duration),
-        readAt = remote.readAt,
+        readAt =
+            if (remote.status.equals("archived", ignoreCase = true)) {
+                remote.readAt.nonBlankOr(existing?.readAt)
+                    ?: remote.createdAt.ifBlank { Instant.now().toString() }
+            } else {
+                remote.readAt
+            },
         thumbnailUrl = remote.thumbnailUrl.nonBlankOr(existing?.thumbnailUrl),
     )
 

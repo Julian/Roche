@@ -136,40 +136,58 @@ data class InboxEntry(
     val isUnread: Boolean
         get() = status == ItemStatus.UNREAD && !isRead
 
-    val effectiveThumbnailUrl: String?
-        get() =
-            thumbnailUrl?.trim()?.takeIf { it.isNotBlank() }
-                ?: extractFirstImageUrlFromHtml(contentHtml)
+    val effectiveThumbnailUrl: String? =
+        thumbnailUrl?.trim()?.takeIf { it.isNotBlank() && !isNonThumbnailUrl(it) }
+            ?: extractFirstImageUrlFromHtml(contentHtml)
 
-    val showsThumbnailPreview: Boolean
-        get() =
-            when (contentType) {
-                ContentType.ARTICLE ->
-                    !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
-                ContentType.PDF,
-                ContentType.VIDEO -> true
-            }
+    val showsThumbnailPreview: Boolean =
+        when (contentType) {
+            ContentType.ARTICLE ->
+                !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
+            ContentType.PDF,
+            ContentType.VIDEO -> true
+        }
 
-    val formattedPublishedLabel: String
-        get() = formatRelativeTimestamp(publishedAt ?: createdAt)
+    val formattedPublishedLabel: String = formatRelativeTimestamp(publishedAt ?: createdAt)
 
-    val readEstimateLabel: String
-        get() =
-            when (contentType) {
-                ContentType.VIDEO -> duration ?: "Video"
-                ContentType.PDF -> duration ?: "PDF"
-                ContentType.ARTICLE ->
-                    formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
-            }
+    val readEstimateLabel: String =
+        when (contentType) {
+            ContentType.VIDEO -> duration ?: "Video"
+            ContentType.PDF -> duration ?: "PDF"
+            ContentType.ARTICLE ->
+                formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
+        }
+}
+
+internal fun isNonThumbnailUrl(url: String): Boolean {
+    val pathPart = url.substringBefore('#').substringBefore('?').lowercase(Locale.US)
+    if (pathPart.endsWith(".svg") || pathPart.endsWith(".svgz") || pathPart.endsWith(".ico")) {
+        return true
+    }
+    val lower = url.lowercase(Locale.US)
+    return lower.contains("/images/core/emoji/") ||
+        lower.contains("/wp-includes/images/smilies/") ||
+        lower.contains("/wpcom-smileys/") ||
+        lower.contains("twemoji.maxcdn.com/") ||
+        lower.contains("/twemoji/") ||
+        lower.contains("feeds.feedburner.com/~") ||
+        lower.contains("/spacer.gif") ||
+        lower.contains("/1x1.gif") ||
+        lower.contains("/pixel.gif")
 }
 
 internal fun extractFirstImageUrlFromHtml(html: String?): String? {
     if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return null
-    val match = IMG_SRC_REGEX.find(html) ?: return null
-    val rawUrl = match.groupValues[1].trim().replace("&amp;", "&")
-    return rawUrl.takeIf {
-        it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
+    for (match in IMG_SRC_REGEX.findAll(html)) {
+        val rawUrl = match.groupValues[1].trim().replace("&amp;", "&")
+        val isHttp =
+            rawUrl.startsWith("https://", ignoreCase = true) ||
+                rawUrl.startsWith("http://", ignoreCase = true)
+        if (isHttp && !isNonThumbnailUrl(rawUrl)) {
+            return rawUrl
+        }
     }
+    return null
 }
 
 internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now()): String {

@@ -35,46 +35,109 @@ fun interface HttpTransport {
 
 class HttpUrlConnectionTransport : HttpTransport {
     override suspend fun execute(request: HttpRequest): HttpResponse =
-        withContext(Dispatchers.IO) {
-            val connection =
-                (URI.create(request.url).toURL().openConnection() as HttpURLConnection).apply {
-                    requestMethod = request.method
-                    connectTimeout = CONNECT_TIMEOUT_MS
-                    readTimeout = READ_TIMEOUT_MS
-                    request.headers.forEach { (key, value) -> setRequestProperty(key, value) }
-                    if (request.body != null) {
-                        doOutput = true
-                        setRequestProperty("Content-Type", "application/json")
-                        outputStream.use { out ->
-                            out.write(request.body.toByteArray(Charsets.UTF_8))
-                        }
+        withContext(Dispatchers.IO) { executeFollowingRedirects(request) }
+
+    private fun executeFollowingRedirects(initialRequest: HttpRequest): HttpResponse {
+        var currentRequest = initialRequest
+        repeat(MAX_REDIRECTS + 1) {
+            val (response, redirectLocation) = executeSingleRequest(currentRequest)
+            val nextUrl = redirectLocation?.let { resolveRedirectUrl(currentRequest.url, it) }
+            if (nextUrl == null) {
+                return response
+            }
+            currentRequest = buildRedirectedRequest(currentRequest, response.statusCode, nextUrl)
+        }
+        return executeSingleRequest(currentRequest).first
+    }
+
+    private fun buildRedirectedRequest(
+        currentRequest: HttpRequest,
+        statusCode: Int,
+        nextUrl: String,
+    ): HttpRequest {
+        val switchToGet =
+            statusCode in REDIRECT_SWITCH_TO_GET_CODES &&
+                currentRequest.method != "GET" &&
+                currentRequest.method != "HEAD"
+        val nextHeaders =
+            if (isSameOriginHost(currentRequest.url, nextUrl)) {
+                currentRequest.headers
+            } else {
+                currentRequest.headers.filterKeys { !it.equals("Authorization", ignoreCase = true) }
+            }
+        return currentRequest.copy(
+            method = if (switchToGet) "GET" else currentRequest.method,
+            url = nextUrl,
+            headers = nextHeaders,
+            body = if (switchToGet) null else currentRequest.body,
+        )
+    }
+
+    private fun executeSingleRequest(request: HttpRequest): Pair<HttpResponse, String?> {
+        val connection =
+            (URI.create(request.url).toURL().openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                requestMethod = request.method
+                connectTimeout = CONNECT_TIMEOUT_MS
+                readTimeout = READ_TIMEOUT_MS
+                request.headers.forEach { (key, value) -> setRequestProperty(key, value) }
+                if (request.body != null) {
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    outputStream.use { out ->
+                        out.write(request.body.toByteArray(Charsets.UTF_8))
                     }
                 }
-            try {
-                val status = connection.responseCode
-                val isSuccess = status in HTTP_OK_START..HTTP_OK_END
-                val stream = if (isSuccess) connection.inputStream else connection.errorStream
-                val maxBytes =
-                    if (request.expectBinary && isSuccess) MAX_MEDIA_BYTES else MAX_RESPONSE_CHARS
-                val bytes =
-                    stream?.let { input -> readBoundedBytes(input, maxBytes) } ?: ByteArray(0)
-                val text =
-                    if (request.expectBinary && isSuccess) {
-                        ""
-                    } else {
-                        bytes.toString(Charsets.UTF_8)
-                    }
-                HttpResponse(statusCode = status, body = text, bodyBytes = bytes)
-            } finally {
-                connection.disconnect()
             }
+        try {
+            val status = connection.responseCode
+            if (status in REDIRECT_STATUS_CODES) {
+                val location =
+                    connection.getHeaderField("Location")?.trim()?.takeIf { it.isNotBlank() }
+                if (location != null) {
+                    return HttpResponse(statusCode = status, body = "") to location
+                }
+            }
+            val isSuccess = status in HTTP_OK_START..HTTP_OK_END
+            val stream = if (isSuccess) connection.inputStream else connection.errorStream
+            val maxBytes =
+                if (request.expectBinary && isSuccess) MAX_MEDIA_BYTES else MAX_RESPONSE_CHARS
+            val bytes = stream?.let { input -> readBoundedBytes(input, maxBytes) } ?: ByteArray(0)
+            val text =
+                if (request.expectBinary && isSuccess) {
+                    ""
+                } else {
+                    bytes.toString(Charsets.UTF_8)
+                }
+            return HttpResponse(statusCode = status, body = text, bodyBytes = bytes) to null
+        } finally {
+            connection.disconnect()
         }
+    }
 
     private companion object {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 15_000
+        private const val MAX_REDIRECTS = 5
+        private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
+        private val REDIRECT_SWITCH_TO_GET_CODES = setOf(301, 302, 303)
     }
 }
+
+internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = runCatching {
+    val resolved = URI.create(baseUrl).resolve(location.trim()).toString()
+    resolved.takeIf {
+        it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
+    }
+}
+    .getOrNull()
+
+private fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
+    val u1 = URI.create(firstUrl)
+    val u2 = URI.create(secondUrl)
+    u1.host.equals(u2.host, ignoreCase = true) && u1.port == u2.port
+}
+    .getOrDefault(false)
 
 internal fun readBoundedBytes(
     input: java.io.InputStream,
@@ -383,6 +446,11 @@ class RocheApiClient(private val transport: HttpTransport) {
                 HttpRequest(
                     method = METHOD_GET,
                     url = trimmed,
+                    headers =
+                        mapOf(
+                            "User-Agent" to EXTERNAL_IMAGE_USER_AGENT,
+                            "Accept" to EXTERNAL_IMAGE_ACCEPT,
+                        ),
                     expectBinary = true,
                 )
             )
@@ -572,6 +640,11 @@ class RocheApiClient(private val transport: HttpTransport) {
         private const val METHOD_DELETE = "DELETE"
         private const val ITEMS_PER_PAGE = 200
         private const val MAX_SYNC_PAGES = 25
+        private const val EXTERNAL_IMAGE_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+        private const val EXTERNAL_IMAGE_ACCEPT =
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
     }
 }
 

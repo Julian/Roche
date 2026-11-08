@@ -51,6 +51,7 @@ internal suspend fun reconcileRemoteSnapshot(
     remoteItems: List<RemoteItemDto>,
     remoteTags: List<RemoteTagDto>,
     appliedMutations: List<PendingMutationEntity> = emptyList(),
+    preFetchItemsById: Map<String, ItemEntity> = emptyMap(),
 ) {
     val existingItemsById = dao.getAllItems().associateBy { it.id }
     val existingFeedsById = dao.getAllFeeds().associateBy { it.id }
@@ -64,14 +65,27 @@ internal suspend fun reconcileRemoteSnapshot(
                 effectiveMutations[remote.id]?.dirtyStatus == DELETED_STATUS_TOMBSTONE
             }
             .map { remote ->
-                applyMutationToRemoteItem(remote, effectiveMutations[remote.id])
+                val mutated = applyMutationToRemoteItem(remote, effectiveMutations[remote.id])
+                overlayInFlightLocalChanges(
+                    remote = mutated,
+                    preFetch = preFetchItemsById[remote.id],
+                    currentLocal = existingItemsById[remote.id],
+                )
             }
     val unpushedLocalFeeds =
         collectUnpushedLocalFeeds(remainingMutations, existingFeedsById, remoteFeeds)
     val unpushedLocalItems =
         collectUnpushedLocalItems(remainingMutations, existingItemsById, adjustedRemoteItems)
-    val unpushedLocalItemIds = unpushedLocalItems.map { it.id }.toSet()
-    val unpushedItemTags = dao.getAllItemTags().filter { it.itemId in unpushedLocalItemIds }
+    val preservedOfflineItems =
+        collectPreservedOfflineItems(
+            existingItemsById = existingItemsById,
+            adjustedRemoteItems = adjustedRemoteItems,
+            unpushedLocalItems = unpushedLocalItems,
+            effectiveMutations = effectiveMutations,
+        )
+    val preservedLocalItems = unpushedLocalItems + preservedOfflineItems
+    val preservedLocalItemIds = preservedLocalItems.map { it.id }.toSet()
+    val preservedItemTags = dao.getAllItemTags().filter { it.itemId in preservedLocalItemIds }
 
     val feedTitlesById = remoteFeeds.associate { it.id to it.title }
     val tagEntitiesByName =
@@ -79,7 +93,7 @@ internal suspend fun reconcileRemoteSnapshot(
             remoteTags = remoteTags,
             remoteItems = adjustedRemoteItems,
             existingTagsByName = existingTagsByName,
-            preservedTagIds = unpushedItemTags.map { it.tagId }.toSet(),
+            preservedTagIds = preservedItemTags.map { it.tagId }.toSet(),
         )
     val remoteItemTagEntities = buildRemoteItemTagEntities(adjustedRemoteItems, tagEntitiesByName)
 
@@ -87,7 +101,7 @@ internal suspend fun reconcileRemoteSnapshot(
         feeds = unpushedLocalFeeds + remoteFeeds.map { toRemoteFeedEntity(it) },
         tags = tagEntitiesByName.values.toList(),
         items =
-            unpushedLocalItems +
+            preservedLocalItems +
                 adjustedRemoteItems.map { remote ->
                     val existing = existingItemsById[remote.id]
                     toRemoteItemEntity(
@@ -97,9 +111,49 @@ internal suspend fun reconcileRemoteSnapshot(
                         existing = existing,
                     )
                 },
-        itemTags = (unpushedItemTags + remoteItemTagEntities).distinct(),
+        itemTags = (preservedItemTags + remoteItemTagEntities).distinct(),
     )
     pruneOrphanedPendingMutations(dao, remainingMutations, remoteItems)
+}
+
+internal fun collectPreservedOfflineItems(
+    existingItemsById: Map<String, ItemEntity>,
+    adjustedRemoteItems: List<RemoteItemDto>,
+    unpushedLocalItems: List<ItemEntity>,
+    effectiveMutations: Map<String, PendingMutationEntity>,
+): List<ItemEntity> {
+    if (adjustedRemoteItems.size < MAX_REMOTE_SYNC_WINDOW_ITEMS) return emptyList()
+    val adjustedRemoteItemIds = adjustedRemoteItems.map { it.id }.toSet()
+    val unpushedIds = unpushedLocalItems.map { it.id }.toSet()
+    return existingItemsById.values.filter { local ->
+        val isDeleted = effectiveMutations[local.id]?.dirtyStatus == DELETED_STATUS_TOMBSTONE
+        local.isCachedOffline &&
+            local.id !in adjustedRemoteItemIds &&
+            local.id !in unpushedIds &&
+            !isDeleted
+    }
+}
+
+private const val MAX_REMOTE_SYNC_WINDOW_ITEMS = 5_000
+
+internal fun overlayInFlightLocalChanges(
+    remote: RemoteItemDto,
+    preFetch: ItemEntity?,
+    currentLocal: ItemEntity?,
+): RemoteItemDto {
+    if (preFetch == null || currentLocal == null) return remote
+    val statusChanged = currentLocal.status != preFetch.status
+    val favoriteChanged = currentLocal.isFavorite != preFetch.isFavorite
+    val progressChanged = currentLocal.readProgress != preFetch.readProgress
+    val readAtChanged = currentLocal.readAt != preFetch.readAt
+    val coreChanged = statusChanged || favoriteChanged || progressChanged
+    if (!coreChanged && !readAtChanged) return remote
+    return remote.copy(
+        status = if (statusChanged) currentLocal.status else remote.status,
+        isFavorite = if (favoriteChanged) currentLocal.isFavorite else remote.isFavorite,
+        readProgress = if (progressChanged) currentLocal.readProgress else remote.readProgress,
+        readAt = if (readAtChanged) currentLocal.readAt else remote.readAt,
+    )
 }
 
 internal fun collectUnpushedLocalFeeds(
@@ -155,7 +209,16 @@ internal fun applyMutationToRemoteItem(
     mergedTags.removeAll(parseTagCsv(mutation.removedTagsCsv).toSet())
     val effectiveReadAt =
         when (mutation.dirtyReadAt) {
-            null -> remote.readAt
+            null ->
+                if (mutation.dirtyStatus != null) {
+                    if (mutation.dirtyStatus.equals("archived", ignoreCase = true)) {
+                        remote.readAt
+                    } else {
+                        null
+                    }
+                } else {
+                    remote.readAt
+                }
             UNREAD_READ_AT_TOMBSTONE -> null
             else -> mutation.dirtyReadAt
         }

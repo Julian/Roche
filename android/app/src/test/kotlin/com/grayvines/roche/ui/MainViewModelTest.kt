@@ -237,11 +237,24 @@ class MainViewModelTest {
             database.dao().upsertItems(SeedData.items)
             val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
 
-            // Scope Inbox to a feed, then tap Inbox tab to clear the feed filter
+            // Scope Inbox to a feed from FEEDS tab, then NavigateBackFromScope returns to FEEDS
+            viewModel.dispatch(MainAction.SelectTab(com.grayvines.roche.model.AppTab.FEEDS))
             viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
             val scoped = viewModel.uiState.first { it.selectedFeedId == "feed-arxiv-cs-lg" }
             assertEquals("feed-arxiv-cs-lg", scoped.selectedFeedId)
+            assertEquals(com.grayvines.roche.model.AppTab.FEEDS, scoped.scopeOriginTab)
 
+            viewModel.dispatch(MainAction.NavigateBackFromScope)
+            val returnedToFeeds =
+                viewModel.uiState.first {
+                    it.selectedFeedId == null &&
+                        it.activeTab == com.grayvines.roche.model.AppTab.FEEDS
+                }
+            assertNull(returnedToFeeds.selectedFeedId)
+            assertNull(returnedToFeeds.scopeOriginTab)
+
+            viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
+            viewModel.uiState.first { it.selectedFeedId == "feed-arxiv-cs-lg" }
             viewModel.dispatch(MainAction.SelectTab(com.grayvines.roche.model.AppTab.INBOX))
             val unscoped = viewModel.uiState.first { it.selectedFeedId == null }
             assertNull(unscoped.selectedFeedId)

@@ -19,8 +19,16 @@ import java.time.Instant
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class SaveUrlResult(val title: String, val isFeed: Boolean)
+
+data class ArchiveStateSnapshot(
+    val itemId: String,
+    val previousStatus: ItemStatus,
+    val previousReadAt: String?,
+)
 
 data class RepositorySnapshot(
     val entries: List<InboxEntry>,
@@ -35,6 +43,7 @@ class RocheRepository(
     private val cacheDir: File? = null,
 ) {
     private val dao = database.dao()
+    private val syncMutex = Mutex()
     private val offlineCacheManager =
         OfflineCacheManager(
             dao = dao,
@@ -53,11 +62,29 @@ class RocheRepository(
             buildSnapshot(items = items, feeds = feeds, tags = tags, itemTags = itemTags)
         }
 
-    suspend fun setArchiveState(itemId: String, archived: Boolean): ItemStatus? {
+    suspend fun setArchiveState(itemId: String, archived: Boolean): ItemStatus? =
+        setArchiveStateWithSnapshot(itemId = itemId, archived = archived)?.previousStatus
+
+    internal suspend fun setArchiveStateWithSnapshot(
+        itemId: String,
+        archived: Boolean,
+    ): ArchiveStateSnapshot? {
         val current = dao.getItemById(itemId) ?: return null
         val previous = ItemStatus.fromWireValue(current.status)
+        val snapshot =
+            ArchiveStateSnapshot(
+                itemId = itemId,
+                previousStatus = previous,
+                previousReadAt = current.readAt,
+            )
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
-        dao.updateItemStatus(itemId, newStatus.wireValue)
+        val newReadAt =
+            if (archived) {
+                current.readAt?.takeIf { it.isNotBlank() } ?: Instant.now().toString()
+            } else {
+                null
+            }
+        dao.updateItemStatusAndReadAt(itemId, newStatus.wireValue, newReadAt)
         syncStatusMutation(
             dao = dao,
             apiClient = apiClient,
@@ -65,19 +92,42 @@ class RocheRepository(
             itemId = itemId,
             status = newStatus.wireValue,
         )
-        return previous
+        return snapshot
     }
 
-    internal suspend fun restoreStatus(itemId: String, status: ItemStatus) {
-        if (dao.getItemById(itemId) == null) return
-        dao.updateItemStatus(itemId, status.wireValue)
+    internal suspend fun restoreStatus(
+        itemId: String,
+        status: ItemStatus,
+        readAt: String? = null,
+    ) {
+        val current = dao.getItemById(itemId) ?: return
+        val targetReadAt =
+            if (status == ItemStatus.ARCHIVED) {
+                readAt?.takeIf { it.isNotBlank() }
+                    ?: current.readAt?.takeIf { it.isNotBlank() }
+                    ?: Instant.now().toString()
+            } else {
+                readAt?.takeIf { it.isNotBlank() }
+            }
+        dao.updateItemStatusAndReadAt(itemId, status.wireValue, targetReadAt)
         syncStatusMutation(
             dao = dao,
             apiClient = apiClient,
             settings = settings,
             itemId = itemId,
             status = status.wireValue,
+            explicitReadAt = targetReadAt?.takeIf { status == ItemStatus.UNREAD },
         )
+    }
+
+    internal suspend fun restoreArchiveSnapshots(snapshots: List<ArchiveStateSnapshot>) {
+        for (snapshot in snapshots) {
+            restoreStatus(
+                itemId = snapshot.itemId,
+                status = snapshot.previousStatus,
+                readAt = snapshot.previousReadAt,
+            )
+        }
     }
 
     suspend fun setReadState(itemId: String, isRead: Boolean) {
@@ -140,6 +190,18 @@ class RocheRepository(
         feedId: String? = null,
         allUnread: Boolean = false,
     ): Int =
+        archiveBatchWithSnapshots(
+                entryIds = entryIds,
+                feedId = feedId,
+                allUnread = allUnread,
+            )
+            .size
+
+    internal suspend fun archiveBatchWithSnapshots(
+        entryIds: List<String>,
+        feedId: String? = null,
+        allUnread: Boolean = false,
+    ): List<ArchiveStateSnapshot> =
         syncArchiveBatchMutation(
             dao = dao,
             apiClient = apiClient,
@@ -379,46 +441,50 @@ class RocheRepository(
         token
     }
 
-    suspend fun syncWithServer(): Result<Int> = runCatching {
-        val currentSettings = settings.settings.first()
-        check(currentSettings.serverUrl.isNotBlank()) { "Configure Server URL in Settings" }
-        val pushOutcome =
-            if (currentSettings.bearerToken.isNotBlank()) {
-                pushPendingMutations(
-                    dao = dao,
-                    apiClient = apiClient,
+    suspend fun syncWithServer(): Result<Int> = syncMutex.withLock {
+        runCatching {
+            val currentSettings = settings.settings.first()
+            check(currentSettings.serverUrl.isNotBlank()) { "Configure Server URL in Settings" }
+            val pushOutcome =
+                if (currentSettings.bearerToken.isNotBlank()) {
+                    pushPendingMutations(
+                        dao = dao,
+                        apiClient = apiClient,
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                    )
+                } else {
+                    PushMutationsOutcome()
+                }
+            val preFetchItemsById = dao.getAllItems().associateBy { it.id }
+            val remoteFeeds =
+                apiClient.fetchFeeds(
                     serverUrl = currentSettings.serverUrl,
                     token = currentSettings.bearerToken,
                 )
-            } else {
-                PushMutationsOutcome()
-            }
-        val remoteFeeds =
-            apiClient.fetchFeeds(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-            )
-        val remoteItems =
-            apiClient.fetchItems(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-            )
-        val remoteTags =
-            apiClient.fetchTags(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-            )
-        val mergedFeeds = mergePushedFeeds(remoteFeeds, pushOutcome.createdFeeds)
-        val mergedItems = mergePushedItems(remoteItems, pushOutcome.savedItems)
+            val remoteItems =
+                apiClient.fetchItems(
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                )
+            val remoteTags =
+                apiClient.fetchTags(
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                )
+            val mergedFeeds = mergePushedFeeds(remoteFeeds, pushOutcome.createdFeeds)
+            val mergedItems = mergePushedItems(remoteItems, pushOutcome.savedItems)
 
-        reconcileRemoteSnapshot(
-            dao = dao,
-            remoteFeeds = mergedFeeds,
-            remoteItems = mergedItems,
-            remoteTags = remoteTags,
-            appliedMutations = pushOutcome.appliedMutations,
-        )
-        mergedItems.size
+            reconcileRemoteSnapshot(
+                dao = dao,
+                remoteFeeds = mergedFeeds,
+                remoteItems = mergedItems,
+                remoteTags = remoteTags,
+                appliedMutations = pushOutcome.appliedMutations,
+                preFetchItemsById = preFetchItemsById,
+            )
+            mergedItems.size
+        }
     }
 
     internal suspend fun pushSavedUrlBestEffort(

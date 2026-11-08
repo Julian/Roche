@@ -6,7 +6,10 @@ import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.model.extractFirstImageUrlFromHtml
+import com.grayvines.roche.model.isNonThumbnailUrl
 import java.io.File
+import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -55,11 +58,16 @@ internal class OfflineCacheManager(
             return
         }
         val thumbId = hydrated?.thumbnailMediaId ?: latest.thumbnailMediaId
+        val thumbUrl =
+            (hydrated?.thumbnailUrl ?: latest.thumbnailUrl)?.trim()?.takeIf {
+                it.isNotBlank() && !isNonThumbnailUrl(it)
+            } ?: extractFirstImageUrlFromHtml(hydrated?.contentHtml ?: latest.contentHtml)
         cacheItemMediaBestEffort(
             serverUrl = serverUrl,
             token = token,
             itemId = itemId,
             thumbnailMediaId = thumbId,
+            thumbnailUrl = thumbUrl,
         )
     }
 
@@ -97,6 +105,7 @@ internal class OfflineCacheManager(
         token: String,
         itemId: String,
         thumbnailMediaId: String?,
+        thumbnailUrl: String? = null,
     ) {
         val rootDir = cacheDir ?: return
         val remoteMedia = runCatching {
@@ -105,8 +114,6 @@ internal class OfflineCacheManager(
             .onFailure { if (it is CancellationException) throw it }
             .getOrDefault(emptyList())
         val eligibleIds = collectEligibleMediaIds(remoteMedia, thumbnailMediaId)
-        if (eligibleIds.isEmpty()) return
-
         val thumbnailIds =
             remoteMedia
                 .filter { it.mediaType.equals("thumbnail", ignoreCase = true) }
@@ -126,6 +133,30 @@ internal class OfflineCacheManager(
                 )
             ) {
                 return
+            }
+        }
+        if (!thumbnailUrl.isNullOrBlank()) {
+            cacheExternalThumbBestEffort(
+                rootDir = rootDir,
+                itemId = itemId,
+                thumbnailUrl = thumbnailUrl,
+            )
+        }
+    }
+
+    private suspend fun cacheExternalThumbBestEffort(
+        rootDir: File,
+        itemId: String,
+        thumbnailUrl: String,
+    ) {
+        if (dao.getItemById(itemId)?.isCachedOffline != true) return
+        val bytes = apiClient.fetchExternalImageBytes(thumbnailUrl) ?: return
+        if (bytes.isEmpty() || bytes.size > MAX_OFFLINE_THUMBNAIL_BYTES) return
+        if (dao.getItemById(itemId)?.isCachedOffline != true) return
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
+                writeBytesAtomically(thumbsDir, diskCacheKey(thumbnailUrl), bytes)
             }
         }
     }
@@ -269,7 +300,21 @@ internal fun writeBytesAtomically(parentDir: File, fileName: String, bytes: Byte
     }
 }
 
+internal fun isHttpThumbnailUrl(value: String): Boolean =
+    value.startsWith("https://", ignoreCase = true) ||
+        value.startsWith("http://", ignoreCase = true)
+
+internal fun diskCacheKey(mediaOrUrl: String): String =
+    if (isHttpThumbnailUrl(mediaOrUrl)) {
+        val digest =
+            MessageDigest.getInstance("SHA-256").digest(mediaOrUrl.toByteArray(Charsets.UTF_8))
+        "url_" + digest.joinToString("") { "%02x".format(it) }
+    } else {
+        mediaOrUrl
+    }
+
 internal const val ITEMS_SUBDIR = "items"
 internal const val THUMBNAILS_SUBDIR = "thumbnails"
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
+private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
 private val UNSAFE_FILENAME_REGEX = Regex("""[^a-zA-Z0-9_-]""")

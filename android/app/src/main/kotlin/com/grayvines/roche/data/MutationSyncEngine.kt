@@ -13,6 +13,8 @@ import com.grayvines.roche.data.remote.RemoteTagDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.UNREAD_READ_AT_TOMBSTONE
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.model.ItemStatus
+import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.flow.first
 
@@ -226,10 +228,11 @@ internal suspend fun syncStatusMutation(
     settings: SettingsRepository,
     itemId: String,
     status: String,
+    explicitReadAt: String? = null,
 ) {
     val existing = dao.getPendingMutation(itemId)
     if (existing?.isLocalItem == true) {
-        dao.upsertPendingMutation(existing.copy(dirtyStatus = status))
+        dao.upsertPendingMutation(existing.copy(dirtyStatus = status, dirtyReadAt = explicitReadAt))
         return
     }
     val pushed =
@@ -238,11 +241,16 @@ internal suspend fun syncStatusMutation(
             settings = settings,
             itemId = itemId,
             status = status,
+            readAt = explicitReadAt,
         )
     val base = existing ?: PendingMutationEntity(entityId = itemId)
     upsertOrCleanPendingMutation(
         dao = dao,
-        mutation = base.copy(dirtyStatus = if (pushed) null else status),
+        mutation =
+            base.copy(
+                dirtyStatus = if (pushed) null else status,
+                dirtyReadAt = if (pushed) null else explicitReadAt,
+            ),
     )
 }
 
@@ -1009,17 +1017,26 @@ internal suspend fun syncArchiveBatchMutation(
     itemIds: List<String>,
     feedId: String? = null,
     allUnread: Boolean = false,
-): Int {
-    val unarchivedIds =
-        dao.getAllItems()
-            .filter { it.id in itemIds.toSet() && it.status != ARCHIVED_STATUS_WIRE }
-            .map { it.id }
-    if (unarchivedIds.isEmpty()) return 0
+): List<ArchiveStateSnapshot> {
+    val targetIds = itemIds.toSet()
+    val unarchivedItems =
+        dao.getAllItems().filter { it.id in targetIds && it.status != ARCHIVED_STATUS_WIRE }
+    if (unarchivedItems.isEmpty()) return emptyList()
 
-    for (itemId in unarchivedIds) {
-        dao.updateItemStatus(itemId, ARCHIVED_STATUS_WIRE)
+    val nowIso = Instant.now().toString()
+    val snapshots = unarchivedItems.map { item ->
+        ArchiveStateSnapshot(
+            itemId = item.id,
+            previousStatus = ItemStatus.fromWireValue(item.status),
+            previousReadAt = item.readAt,
+        )
+    }
+    for (item in unarchivedItems) {
+        val nextReadAt = item.readAt?.takeIf { it.isNotBlank() } ?: nowIso
+        dao.updateItemStatusAndReadAt(item.id, ARCHIVED_STATUS_WIRE, nextReadAt)
     }
 
+    val unarchivedIds = unarchivedItems.map { it.id }
     val mutationsById = unarchivedIds.associateWith { dao.getPendingMutation(it) }
     val remoteIds = unarchivedIds.filter { mutationsById[it]?.isLocalItem != true }
     val remoteFeedId = feedId?.takeIf { dao.getPendingMutation(it)?.isLocalFeed != true }
@@ -1046,19 +1063,37 @@ internal suspend fun syncArchiveBatchMutation(
         }
 
     for (itemId in unarchivedIds) {
-        val existing = mutationsById[itemId]
-        if (existing?.isLocalItem == true) {
-            dao.upsertPendingMutation(existing.copy(dirtyStatus = ARCHIVED_STATUS_WIRE))
-        } else {
-            val base = existing ?: PendingMutationEntity(entityId = itemId)
-            upsertOrCleanPendingMutation(
-                dao = dao,
-                mutation =
-                    base.copy(dirtyStatus = if (pushedToServer) null else ARCHIVED_STATUS_WIRE),
-            )
-        }
+        recordBatchArchiveMutation(
+            dao = dao,
+            itemId = itemId,
+            existing = mutationsById[itemId],
+            pushedToServer = pushedToServer,
+        )
     }
-    return unarchivedIds.size
+    return snapshots
+}
+
+private suspend fun recordBatchArchiveMutation(
+    dao: RocheDao,
+    itemId: String,
+    existing: PendingMutationEntity?,
+    pushedToServer: Boolean,
+) {
+    if (existing?.isLocalItem == true) {
+        dao.upsertPendingMutation(
+            existing.copy(dirtyStatus = ARCHIVED_STATUS_WIRE, dirtyReadAt = null)
+        )
+    } else {
+        val base = existing ?: PendingMutationEntity(entityId = itemId)
+        upsertOrCleanPendingMutation(
+            dao = dao,
+            mutation =
+                base.copy(
+                    dirtyStatus = if (pushedToServer) null else ARCHIVED_STATUS_WIRE,
+                    dirtyReadAt = null,
+                ),
+        )
+    }
 }
 
 internal fun buildLocalOpmlXml(feeds: List<FeedEntity>): String = buildString {

@@ -132,4 +132,7 @@ interface RocheDao {
 
     @Query("UPDATE items SET readAt = :readAt WHERE id = :itemId")
     suspend fun updateItemReadAt(itemId: String, readAt: String?)
+
+    @Query("UPDATE items SET status = :status, readAt = :readAt WHERE id = :itemId")
+    suspend fun updateItemStatusAndReadAt(itemId: String, status: String, readAt: String?)
 }

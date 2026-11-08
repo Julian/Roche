@@ -3,6 +3,7 @@ package com.grayvines.roche.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.grayvines.roche.data.ArchiveStateSnapshot
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.settings.Settings
@@ -28,6 +29,8 @@ data class UndoArchiveEvent(
     val itemId: String,
     val previousStatus: ItemStatus,
     val message: String,
+    val previousReadAt: String? = null,
+    val batchSnapshots: List<ArchiveStateSnapshot> = emptyList(),
 )
 
 data class MainUiState(
@@ -36,6 +39,7 @@ data class MainUiState(
     val searchQuery: String = "",
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
+    val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
@@ -51,6 +55,7 @@ data class MainUiState(
     val settings: Settings = Settings(),
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
+    val messageSequence: Long = 0L,
 ) {
     val activeReaderEntry: InboxEntry?
         get() = allEntries.firstOrNull { it.id == selectedReaderEntryId }
@@ -83,6 +88,8 @@ sealed interface MainAction {
     data class FilterByTag(val tagName: String?) : Ui
 
     data class FilterByFeed(val feedId: String?) : Ui
+
+    data object NavigateBackFromScope : Ui
 
     data class UpdateSearchQuery(val query: String) : Ui
 
@@ -174,6 +181,7 @@ internal data class TransientUiState(
     val searchQuery: String = "",
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
+    val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
@@ -183,6 +191,7 @@ internal data class TransientUiState(
     val isSyncing: Boolean = false,
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
+    val messageSequence: Long = 0L,
 )
 
 class MainViewModel(
@@ -226,7 +235,13 @@ class MainViewModel(
     internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
 
     internal fun showStatusMessage(message: String) {
-        transientState.update { it.copy(undoEvent = null, statusBanner = message) }
+        transientState.update {
+            it.copy(
+                undoEvent = null,
+                statusBanner = message,
+                messageSequence = it.messageSequence + 1,
+            )
+        }
     }
 
     fun triggerStartupSyncIfConfigured() {
@@ -306,9 +321,7 @@ class MainViewModel(
             )
         }
         if (!action.silent) {
-            transientState.update {
-                it.copy(undoEvent = null, statusBanner = "Saved server settings")
-            }
+            showStatusMessage("Saved server settings")
         }
     }
 
@@ -320,14 +333,12 @@ class MainViewModel(
                     onSuccess = { url -> "Discovered Roche server at $url" },
                     onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
                 )
-        transientState.update { it.copy(undoEvent = null, statusBanner = message) }
+        showStatusMessage(message)
     }
 
     internal suspend fun performPairWithServer(action: MainAction.PairWithServer) {
         if (action.pairingCode.isBlank()) {
-            transientState.update {
-                it.copy(undoEvent = null, statusBanner = "Enter a pairing code")
-            }
+            showStatusMessage("Enter a pairing code")
             return
         }
         repository
@@ -339,25 +350,16 @@ class MainViewModel(
             .onSuccess {
                 val syncCount = repository.syncWithServer().getOrNull()
                 val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
-                transientState.update {
-                    it.copy(undoEvent = null, statusBanner = "Paired with server$suffix")
-                }
+                showStatusMessage("Paired with server$suffix")
             }
             .onFailure { error ->
-                transientState.update {
-                    it.copy(
-                        undoEvent = null,
-                        statusBanner = "Pairing failed (${error.message ?: "error"})",
-                    )
-                }
+                showStatusMessage("Pairing failed (${error.message ?: "error"})")
             }
     }
 
     internal suspend fun performToggleStar(entryId: String) {
         val starred = repository.toggleStar(entryId)
-        transientState.update {
-            it.copy(undoEvent = null, statusBanner = if (starred) "Starred" else "Removed star")
-        }
+        showStatusMessage(if (starred) "Starred" else "Removed star")
     }
 
     internal suspend fun performToggleReadState(entryId: String) {
@@ -367,6 +369,7 @@ class MainViewModel(
                 contextSheetEntryId = null,
                 undoEvent = null,
                 statusBanner = if (isRead) "Marked as read" else "Marked as unread",
+                messageSequence = it.messageSequence + 1,
             )
         }
     }
@@ -374,13 +377,15 @@ class MainViewModel(
     internal suspend fun performToggleOffline(entryId: String) {
         val cached = repository.toggleOfflineCache(entryId)
         val msg = if (cached) "Cached local copy" else "Removed local offline copy"
-        transientState.update { it.copy(undoEvent = null, statusBanner = msg) }
+        showStatusMessage(msg)
     }
 
     internal suspend fun performToggleArchive(entry: InboxEntry) {
         val targetArchived = !entry.isArchived
-        val previousStatus =
-            repository.setArchiveState(itemId = entry.id, archived = targetArchived) ?: entry.status
+        val snapshot =
+            repository.setArchiveStateWithSnapshot(itemId = entry.id, archived = targetArchived)
+        val previousStatus = snapshot?.previousStatus ?: entry.status
+        val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
         val label = if (targetArchived) "Archived" else "Restored to Unread"
         transientState.update { current ->
             val nextReaderId =
@@ -393,10 +398,13 @@ class MainViewModel(
                 selectedReaderEntryId = nextReaderId,
                 contextSheetEntryId = null,
                 statusBanner = null,
+                messageSequence = current.messageSequence + 1,
                 undoEvent =
                     UndoArchiveEvent(
                         itemId = entry.id,
                         previousStatus = previousStatus,
+                        previousReadAt = previousReadAt,
+                        batchSnapshots = listOfNotNull(snapshot),
                         message = "$label · ${entry.title.take(SNACKBAR_TITLE_LIMIT)}",
                     ),
             )
@@ -405,16 +413,25 @@ class MainViewModel(
 
     internal suspend fun performUndoArchive() {
         val pending = transientState.value.undoEvent ?: return
-        repository.restoreStatus(itemId = pending.itemId, status = pending.previousStatus)
-        transientState.update { it.copy(undoEvent = null, statusBanner = "Restored entry") }
+        if (pending.batchSnapshots.size > 1) {
+            repository.restoreArchiveSnapshots(pending.batchSnapshots)
+            showStatusMessage("Restored ${pending.batchSnapshots.size} entries")
+        } else {
+            repository.restoreStatus(
+                itemId = pending.itemId,
+                status = pending.previousStatus,
+                readAt = pending.previousReadAt,
+            )
+            showStatusMessage("Restored entry")
+        }
     }
 
     internal suspend fun performArchiveVisibleEntries() {
         val currentUi = uiState.value
         val unarchivedIds = currentUi.visibleEntries.filter { !it.isArchived }.map { it.id }
         if (unarchivedIds.isEmpty()) return
-        val archivedCount =
-            repository.archiveEntriesBatch(
+        val snapshots =
+            repository.archiveBatchWithSnapshots(
                 entryIds = unarchivedIds,
                 feedId = currentUi.selectedFeedId,
                 allUnread =
@@ -422,12 +439,22 @@ class MainViewModel(
                         currentUi.selectedTag == null &&
                         currentUi.activeFilter == InboxFilter.UNREAD,
             )
-        if (archivedCount > 0) {
+        if (snapshots.isNotEmpty()) {
+            val archivedCount = snapshots.size
             val noun = if (archivedCount == 1) "entry" else "entries"
+            val first = snapshots.first()
             transientState.update {
                 it.copy(
-                    undoEvent = null,
-                    statusBanner = "Archived $archivedCount $noun",
+                    statusBanner = null,
+                    messageSequence = it.messageSequence + 1,
+                    undoEvent =
+                        UndoArchiveEvent(
+                            itemId = first.itemId,
+                            previousStatus = first.previousStatus,
+                            previousReadAt = first.previousReadAt,
+                            batchSnapshots = snapshots,
+                            message = "Archived $archivedCount $noun",
+                        ),
                 )
             }
         }
@@ -440,20 +467,10 @@ class MainViewModel(
                 .importOpml(opmlXml)
                 .onSuccess { importedCount ->
                     val noun = if (importedCount == 1) "feed" else "feeds"
-                    transientState.update {
-                        it.copy(
-                            undoEvent = null,
-                            statusBanner = "Imported $importedCount $noun from OPML",
-                        )
-                    }
+                    showStatusMessage("Imported $importedCount $noun from OPML")
                 }
                 .onFailure { error ->
-                    transientState.update {
-                        it.copy(
-                            undoEvent = null,
-                            statusBanner = "OPML import failed (${error.message ?: "error"})",
-                        )
-                    }
+                    showStatusMessage("OPML import failed (${error.message ?: "error"})")
                 }
         } finally {
             transientState.update { it.copy(isSyncing = false) }
@@ -480,6 +497,7 @@ class MainViewModel(
                 activeFilter = InboxFilter.ALL,
                 undoEvent = null,
                 statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                messageSequence = it.messageSequence + 1,
             )
         }
     }
@@ -490,20 +508,10 @@ class MainViewModel(
             repository
                 .refreshFeed(feedId)
                 .onSuccess { title ->
-                    transientState.update {
-                        it.copy(
-                            undoEvent = null,
-                            statusBanner = "Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                        )
-                    }
+                    showStatusMessage("Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
                 }
                 .onFailure { error ->
-                    transientState.update {
-                        it.copy(
-                            undoEvent = null,
-                            statusBanner = "Refresh failed (${error.message ?: "unreachable"})",
-                        )
-                    }
+                    showStatusMessage("Refresh failed (${error.message ?: "unreachable"})")
                 }
         } finally {
             transientState.update { it.copy(isSyncing = false) }
@@ -528,16 +536,12 @@ class MainViewModel(
                         feedContextSheetId = nextFeedSheetId,
                         undoEvent = null,
                         statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                        messageSequence = current.messageSequence + 1,
                     )
                 }
             }
             .onFailure { error ->
-                transientState.update {
-                    it.copy(
-                        undoEvent = null,
-                        statusBanner = "Unsubscribe failed (${error.message ?: "error"})",
-                    )
-                }
+                showStatusMessage("Unsubscribe failed (${error.message ?: "error"})")
             }
     }
 
@@ -563,16 +567,12 @@ class MainViewModel(
                         contextSheetEntryId = nextSheetId,
                         undoEvent = null,
                         statusBanner = "Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                        messageSequence = current.messageSequence + 1,
                     )
                 }
             }
             .onFailure { error ->
-                transientState.update {
-                    it.copy(
-                        undoEvent = null,
-                        statusBanner = "Delete failed (${error.message ?: "error"})",
-                    )
-                }
+                showStatusMessage("Delete failed (${error.message ?: "error"})")
             }
     }
 
@@ -589,21 +589,11 @@ class MainViewModel(
             repository
                 .syncWithServer()
                 .onSuccess { count ->
-                    transientState.update {
-                        it.copy(
-                            undoEvent = null,
-                            statusBanner = "Synced $count entries from server",
-                        )
-                    }
+                    showStatusMessage("Synced $count entries from server")
                 }
                 .onFailure { error ->
                     if (!silentOnError) {
-                        transientState.update {
-                            it.copy(
-                                undoEvent = null,
-                                statusBanner = "Sync offline (${error.message ?: "unreachable"})",
-                            )
-                        }
+                        showStatusMessage("Sync offline (${error.message ?: "unreachable"})")
                     }
                 }
         } finally {
@@ -652,21 +642,28 @@ internal fun reduceUiAction(
                     selectedReaderEntryId = null,
                     selectedFeedId = null,
                     selectedTag = null,
+                    scopeOriginTab = null,
                 )
             } else {
-                state.copy(activeTab = action.tab, selectedReaderEntryId = null)
+                state.copy(
+                    activeTab = action.tab,
+                    selectedReaderEntryId = null,
+                    scopeOriginTab = null,
+                )
             }
         is MainAction.SelectFilter ->
             state.copy(
                 activeFilter = action.filter,
                 selectedTag = null,
                 selectedFeedId = null,
+                scopeOriginTab = null,
             )
         is MainAction.FilterByTag ->
             state.copy(
                 activeTab = AppTab.INBOX,
                 selectedTag = action.tagName,
                 selectedFeedId = null,
+                scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
                 selectedReaderEntryId = null,
                 contextSheetEntryId = null,
             )
@@ -675,12 +672,30 @@ internal fun reduceUiAction(
                 activeTab = AppTab.INBOX,
                 selectedFeedId = action.feedId,
                 selectedTag = null,
+                scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
+                selectedReaderEntryId = null,
+                contextSheetEntryId = null,
+                feedContextSheetId = null,
+            )
+        MainAction.NavigateBackFromScope ->
+            state.copy(
+                activeTab = state.scopeOriginTab ?: AppTab.INBOX,
+                selectedFeedId = null,
+                selectedTag = null,
+                scopeOriginTab = null,
                 selectedReaderEntryId = null,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
             )
         is MainAction.UpdateSearchQuery -> state.copy(searchQuery = action.query)
         else -> reduceOverlayUiAction(state, action)
+    }
+
+private fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
+    when {
+        !hasNewScope -> null
+        state.activeTab != AppTab.INBOX -> state.activeTab
+        else -> state.scopeOriginTab
     }
 
 private fun reduceOverlayUiAction(
@@ -760,6 +775,7 @@ internal fun buildMainUiState(
         searchQuery = local.searchQuery,
         selectedTag = local.selectedTag,
         selectedFeedId = local.selectedFeedId,
+        scopeOriginTab = local.scopeOriginTab,
         selectedReaderEntryId = local.selectedReaderEntryId,
         contextSheetEntryId = local.contextSheetEntryId,
         feedContextSheetId = local.feedContextSheetId,
@@ -775,5 +791,6 @@ internal fun buildMainUiState(
         settings = settings,
         undoEvent = local.undoEvent,
         statusBanner = local.statusBanner,
+        messageSequence = local.messageSequence,
     )
 }

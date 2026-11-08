@@ -1,5 +1,6 @@
 package com.grayvines.roche.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.consumeWindowInsets
@@ -40,6 +41,15 @@ fun MainScreen(
     val colors = LocalRocheColors.current
     val showChrome = state.activeReaderEntry == null
     val hasFab = showChrome && state.activeTab != AppTab.SETTINGS
+    val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
+
+    BackHandler(enabled = showChrome && (hasScopeFilter || state.activeTab != AppTab.INBOX)) {
+        if (hasScopeFilter) {
+            onAction(MainAction.NavigateBackFromScope)
+        } else {
+            onAction(MainAction.SelectTab(AppTab.INBOX))
+        }
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize().background(colors.background),
@@ -101,7 +111,7 @@ private fun MainSnackbarOverlay(
 ) {
     val undo = state.undoEvent
     val banner = state.statusBanner
-    LaunchedEffect(undo, banner) {
+    LaunchedEffect(undo, banner, state.messageSequence) {
         if (undo != null || banner != null) {
             delay(SNACKBAR_AUTO_DISMISS_MS)
             onAction(MainAction.DismissMessages)
@@ -192,6 +202,7 @@ private fun MainBodyContent(
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
+            backLabel = readerBackLabel(state),
         )
         return
     }
@@ -210,5 +221,18 @@ private fun MainBodyContent(
             )
     }
 }
+
+private fun readerBackLabel(state: MainUiState): String =
+    when (state.activeTab) {
+        AppTab.STARRED -> "← Starred"
+        AppTab.SEARCH -> "← Search"
+        AppTab.OFFLINE -> "← Offline"
+        else ->
+            when {
+                state.selectedFeedId != null -> "← ${state.selectedFeedTitle ?: "Feed"}"
+                state.selectedTag != null -> "← #${state.selectedTag}"
+                else -> "← Inbox"
+            }
+    }
 
 private const val SNACKBAR_AUTO_DISMISS_MS = 4_000L

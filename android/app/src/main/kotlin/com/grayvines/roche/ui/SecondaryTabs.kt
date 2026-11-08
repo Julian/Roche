@@ -7,6 +7,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -104,10 +107,16 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
 @Composable
 fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
+    val subtitleText =
+        if (state.searchQuery.isBlank()) {
+            "Type to search ${state.allEntries.size} entries"
+        } else {
+            "${state.searchResults.size} matches"
+        }
     Column(modifier = Modifier.fillMaxSize()) {
         RocheTopHeader(
             title = "Search",
-            subtitle = "${state.searchResults.size} matches",
+            subtitle = subtitleText,
         )
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
             OutlinedTextField(
@@ -196,20 +205,27 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
         }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        Column(
-            modifier =
-                Modifier.fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 14.dp)
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("feeds_pull_to_refresh"),
         ) {
-            TagsSection(state = state, onAction = onAction)
-            Spacer(modifier = Modifier.height(20.dp))
-            SubscribedFeedsSection(state = state, onAction = onAction)
-            Spacer(modifier = Modifier.height(72.dp))
+            Column(
+                modifier =
+                    Modifier.fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp, vertical = 14.dp)
+            ) {
+                TagsSection(state = state, onAction = onAction)
+                Spacer(modifier = Modifier.height(20.dp))
+                SubscribedFeedsSection(state = state, onAction = onAction)
+                Spacer(modifier = Modifier.height(72.dp))
+            }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun TagsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
@@ -227,9 +243,10 @@ internal fun TagsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
             fontSize = 12.5.sp,
         )
     } else {
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             state.tags.forEach { tag ->
                 FilterChipPill(
@@ -353,8 +370,8 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             }
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
             ) {
                 items(items = offlineEntries, key = { it.id }) { entry ->
                     Row(
@@ -374,10 +391,9 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
-                            val meta =
-                                "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}"
                             Text(
-                                text = meta,
+                                text =
+                                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
                                 color = colors.textMuted,
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.sp,

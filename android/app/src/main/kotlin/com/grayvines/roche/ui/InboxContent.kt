@@ -20,14 +20,20 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -100,6 +106,8 @@ fun InboxTabContent(
 @Composable
 private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Unit) {
     val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
+    val unarchivedCount = state.visibleEntries.count { !it.isArchived }
+    var showArchiveAllConfirm by remember { mutableStateOf(false) }
     val title =
         when {
             state.selectedFeedId != null -> state.selectedFeedTitle ?: "Feed"
@@ -114,10 +122,7 @@ private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Uni
                 {
                     HeaderActionButton(
                         label = "←",
-                        onClick = {
-                            onAction(MainAction.FilterByFeed(null))
-                            onAction(MainAction.FilterByTag(null))
-                        },
+                        onClick = { onAction(MainAction.NavigateBackFromScope) },
                         modifier = Modifier.testTag("clear_scope_btn"),
                     )
                 }
@@ -125,15 +130,68 @@ private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Uni
                 null
             },
     ) {
-        if (state.visibleEntries.any { !it.isArchived }) {
+        if (unarchivedCount > 0) {
             HeaderActionButton(
                 label = "Archive All",
-                onClick = { onAction(MainAction.ArchiveVisibleEntries) },
+                onClick = { showArchiveAllConfirm = true },
                 modifier = Modifier.testTag("archive_all_btn"),
             )
         }
         HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
     }
+    if (showArchiveAllConfirm) {
+        ArchiveAllConfirmDialog(
+            unarchivedCount = unarchivedCount,
+            scopeTitle = title,
+            onDismiss = { showArchiveAllConfirm = false },
+            onConfirm = {
+                showArchiveAllConfirm = false
+                onAction(MainAction.ArchiveVisibleEntries)
+            },
+        )
+    }
+}
+
+@Composable
+private fun ArchiveAllConfirmDialog(
+    unarchivedCount: Int,
+    scopeTitle: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val noun = if (unarchivedCount == 1) "entry" else "entries"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surface,
+        title = {
+            Text(
+                text = "Archive $unarchivedCount $noun?",
+                color = colors.textPrimary,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        },
+        text = {
+            Text(
+                text =
+                    "This will archive all $unarchivedCount visible $noun in \"$scopeTitle\" and mark them as read.",
+                color = colors.textSecondary,
+                fontSize = 14.sp,
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                modifier = Modifier.testTag("confirm_archive_all_btn"),
+            ) {
+                Text("Archive All", color = colors.accentVerdigris)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = colors.textSecondary) }
+        },
+    )
 }
 
 @Composable
@@ -185,10 +243,7 @@ private fun InboxFilterStrip(state: MainUiState, onAction: (MainAction) -> Unit)
             FilterChipPill(
                 label = scopeLabel,
                 selected = true,
-                onClick = {
-                    onAction(MainAction.FilterByTag(null))
-                    onAction(MainAction.FilterByFeed(null))
-                },
+                onClick = { onAction(MainAction.NavigateBackFromScope) },
             )
         }
         val hasScopeFilter = state.selectedTag != null || state.selectedFeedId != null

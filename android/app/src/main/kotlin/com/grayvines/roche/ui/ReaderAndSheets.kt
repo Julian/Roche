@@ -59,6 +59,7 @@ fun ReaderView(
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    backLabel: String = "← Inbox",
 ) {
     BackHandler { onAction(MainAction.CloseReader) }
     val colors = LocalRocheColors.current
@@ -86,6 +87,7 @@ fun ReaderView(
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
             entry = entry,
+            backLabel = backLabel,
             onAction = onAction,
             onShare = { onShareEntry(entry) },
         )
@@ -112,12 +114,15 @@ internal fun ReaderScrollProgressEffect(
     scrollState: androidx.compose.foundation.ScrollState,
     onAction: (MainAction) -> Unit,
 ) {
-    var restoredEntryId by remember { mutableStateOf<String?>(null) }
+    val hasHydratedBody = !entry.contentHtml.isNullOrBlank() || !entry.contentText.isNullOrBlank()
+    var restoredHydratedState by remember(entry.id) { mutableStateOf<Boolean?>(null) }
     var hasUserScrolled by remember(entry.id) { mutableStateOf(false) }
 
-    LaunchedEffect(entry.id, scrollState.maxValue) {
-        if (scrollState.maxValue > 0 && restoredEntryId != entry.id) {
-            restoredEntryId = entry.id
+    LaunchedEffect(entry.id, hasHydratedBody, scrollState.maxValue) {
+        if (
+            scrollState.maxValue > 0 && !hasUserScrolled && restoredHydratedState != hasHydratedBody
+        ) {
+            restoredHydratedState = hasHydratedBody
             val targetScroll =
                 (entry.readProgress.coerceIn(0.0, 1.0) * scrollState.maxValue).toInt()
             scrollState.scrollTo(targetScroll)
@@ -144,6 +149,7 @@ internal fun ReaderScrollProgressEffect(
 @Composable
 private fun ReaderTopToolbar(
     entry: InboxEntry,
+    backLabel: String,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
 ) {
@@ -152,7 +158,11 @@ private fun ReaderTopToolbar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        HeaderActionButton(label = "← Inbox", onClick = { onAction(MainAction.CloseReader) })
+        HeaderActionButton(
+            label = backLabel,
+            onClick = { onAction(MainAction.CloseReader) },
+            modifier = Modifier.testTag("reader_back_btn"),
+        )
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),

@@ -102,11 +102,29 @@ class RocheRepositoryTest {
 
         val afterArchive = repository.snapshot.first().entries.first { it.id == "item-1" }
         assertTrue(afterArchive.isArchived)
+        assertTrue(afterArchive.isRead)
 
         repository.restoreStatus(itemId = "item-1", status = previousStatus!!)
         val afterUndo = repository.snapshot.first().entries.first { it.id == "item-1" }
         assertFalse(afterUndo.isArchived)
+        assertFalse(afterUndo.isRead)
         assertEquals(ItemStatus.UNREAD, afterUndo.status)
+
+        // Mark item-1 read first, then archive, then undo archive — readAt is preserved
+        repository.setReadState(itemId = "item-1", isRead = true)
+        val readBeforeArchive = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertTrue(readBeforeArchive.isRead)
+        val snap = repository.setArchiveStateWithSnapshot(itemId = "item-1", archived = true)!!
+        assertEquals(readBeforeArchive.readAt, snap.previousReadAt)
+        repository.restoreStatus(
+            itemId = "item-1",
+            status = snap.previousStatus,
+            readAt = snap.previousReadAt,
+        )
+        val afterReadUndo = repository.snapshot.first().entries.first { it.id == "item-1" }
+        assertFalse(afterReadUndo.isArchived)
+        assertTrue(afterReadUndo.isRead)
+        assertEquals(readBeforeArchive.readAt, afterReadUndo.readAt)
     }
 
     @Test

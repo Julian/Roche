@@ -5,12 +5,13 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.grayvines.roche.data.THUMBNAILS_SUBDIR
+import com.grayvines.roche.data.diskCacheKey
+import com.grayvines.roche.data.isHttpThumbnailUrl
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.resolveSafeChildFile
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.writeBytesAtomically
 import java.io.File
-import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -31,6 +32,8 @@ class ThumbnailLoader(
             ): Boolean = size > MAX_MEMORY_THUMBNAILS
         }
 
+    private val failedKeys = LinkedHashSet<String>()
+
     fun getCached(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
         if (cleanId.isBlank()) return null
@@ -44,13 +47,36 @@ class ThumbnailLoader(
             return it
         }
 
-        return withContext(Dispatchers.IO) {
-            val bytes = readDiskCachedBytes(cleanId) ?: fetchAndCacheRemoteBytes(cleanId)
-            val bitmap = bytes?.let { runCatching { decoder(it) }.getOrNull() }
-            if (bitmap != null) {
-                synchronized(memoryCache) { memoryCache[cleanId] = bitmap }
+        return withContext(Dispatchers.IO) { loadOrFetchThumbnail(cleanId) }
+    }
+
+    private suspend fun loadOrFetchThumbnail(cleanId: String): ImageBitmap? {
+        val diskBytes = readDiskCachedBytes(cleanId)
+        val alreadyFailed = synchronized(failedKeys) { cleanId in failedKeys }
+        if (diskBytes == null && alreadyFailed) return null
+        val (bytes, attemptedNetwork) =
+            if (diskBytes != null) {
+                diskBytes to false
+            } else {
+                fetchAndCacheRemoteBytes(cleanId)
             }
-            bitmap
+        val bitmap = bytes?.let { runCatching { decoder(it) }.getOrNull() }
+        if (bitmap != null) {
+            synchronized(memoryCache) { memoryCache[cleanId] = bitmap }
+            synchronized(failedKeys) { failedKeys.remove(cleanId) }
+        } else if (attemptedNetwork || diskBytes != null) {
+            recordFailedKey(cleanId)
+        }
+        return bitmap
+    }
+
+    private fun recordFailedKey(key: String) {
+        synchronized(failedKeys) {
+            if (failedKeys.size >= MAX_FAILED_THUMBNAILS && failedKeys.isNotEmpty()) {
+                val eldest = failedKeys.first()
+                failedKeys.remove(eldest)
+            }
+            failedKeys.add(key)
         }
     }
 
@@ -67,28 +93,34 @@ class ThumbnailLoader(
     }
         .getOrNull()
 
-    private suspend fun fetchAndCacheRemoteBytes(mediaId: String): ByteArray? = runCatching {
-        val rawBytes =
-            if (isHttpThumbnailUrl(mediaId)) {
-                apiClient.fetchExternalImageBytes(mediaId)
-            } else {
-                val currentSettings = settings.settings.first()
-                val serverUrl = currentSettings.serverUrl
-                val token = currentSettings.bearerToken
-                if (serverUrl.isNotBlank() && token.isNotBlank()) {
-                    apiClient.fetchMediaBytes(serverUrl, token, mediaId)
+    private suspend fun fetchAndCacheRemoteBytes(mediaId: String): Pair<ByteArray?, Boolean> {
+        var attempted = false
+        val bytes = runCatching {
+            val rawBytes =
+                if (isHttpThumbnailUrl(mediaId)) {
+                    attempted = true
+                    apiClient.fetchExternalImageBytes(mediaId)
                 } else {
-                    null
+                    val currentSettings = settings.settings.first()
+                    val serverUrl = currentSettings.serverUrl
+                    val token = currentSettings.bearerToken
+                    if (serverUrl.isNotBlank() && token.isNotBlank()) {
+                        attempted = true
+                        apiClient.fetchMediaBytes(serverUrl, token, mediaId)
+                    } else {
+                        null
+                    }
                 }
+            val validBytes = rawBytes?.takeIf { it.size in 1..MAX_THUMBNAIL_BYTES }
+            if (validBytes != null) {
+                writeDiskCachedBytes(mediaId, validBytes)
             }
-        val validBytes = rawBytes?.takeIf { it.size in 1..MAX_THUMBNAIL_BYTES }
-        if (validBytes != null) {
-            writeDiskCachedBytes(mediaId, validBytes)
+            validBytes
         }
-        validBytes
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull()
+        return bytes to attempted
     }
-        .onFailure { if (it is CancellationException) throw it }
-        .getOrNull()
 
     private fun writeDiskCachedBytes(mediaId: String, bytes: ByteArray) {
         val rootDir = cacheDir ?: return
@@ -102,6 +134,7 @@ class ThumbnailLoader(
         private const val INITIAL_CACHE_CAPACITY = 16
         private const val LOAD_FACTOR = 0.75f
         private const val MAX_MEMORY_THUMBNAILS = 64
+        private const val MAX_FAILED_THUMBNAILS = 256
         private const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
     }
 }
@@ -143,16 +176,3 @@ internal fun calculateInSampleSize(
 
 private const val TARGET_THUMBNAIL_PX = 256
 private const val SAMPLE_DIVISOR = 2
-
-internal fun isHttpThumbnailUrl(value: String): Boolean =
-    value.startsWith("https://", ignoreCase = true) ||
-        value.startsWith("http://", ignoreCase = true)
-
-internal fun diskCacheKey(mediaOrUrl: String): String =
-    if (isHttpThumbnailUrl(mediaOrUrl)) {
-        val digest =
-            MessageDigest.getInstance("SHA-256").digest(mediaOrUrl.toByteArray(Charsets.UTF_8))
-        "url_" + digest.joinToString("") { "%02x".format(it) }
-    } else {
-        mediaOrUrl
-    }

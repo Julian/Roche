@@ -55,8 +55,11 @@ fun EntryThumbnailPreview(entry: InboxEntry, modifier: Modifier = Modifier) {
 private fun ArticleImageThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
-    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
-    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl,
+        )
     Box(
         modifier =
             modifier
@@ -106,8 +109,11 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(5.dp)
     val isAlternateChart = entry.id.hashCode() % 2 == 0
-    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
-    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl,
+        )
     Box(
         modifier =
             modifier
@@ -225,8 +231,11 @@ private fun DrawScope.drawPaperFigure(
 private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
-    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
-    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl,
+        )
     Box(
         modifier =
             modifier
@@ -263,17 +272,32 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
 }
 
 @Composable
-internal fun rememberEntryThumbnailBitmap(mediaId: String?): ImageBitmap? {
-    val cleanId = mediaId?.trim()?.takeIf { it.isNotBlank() } ?: return null
+internal fun rememberEntryThumbnailBitmap(
+    primaryKey: String?,
+    fallbackKey: String? = null,
+): ImageBitmap? {
+    val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
+    val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
+    val effectivePrimary = cleanPrimary ?: cleanFallback ?: return null
     val loader = LocalThumbnailLoader.current ?: return null
+    val initialCached =
+        loader.getCached(effectivePrimary) ?: cleanFallback?.let { loader.getCached(it) }
     val bitmap by
         produceState<ImageBitmap?>(
-            initialValue = loader.getCached(cleanId),
-            key1 = cleanId,
-            key2 = loader,
+            initialValue = initialCached,
+            key1 = effectivePrimary,
+            key2 = cleanFallback,
+            key3 = loader,
         ) {
             if (value == null) {
-                value = loader.loadThumbnail(cleanId)
+                val loadedPrimary = loader.loadThumbnail(effectivePrimary)
+                value =
+                    loadedPrimary
+                        ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
+                            loader.loadThumbnail(cleanFallback)
+                        } else {
+                            null
+                        }
             }
         }
     return bitmap
