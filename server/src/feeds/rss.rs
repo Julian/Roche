@@ -18,6 +18,7 @@ pub struct RssItem {
     pub link: Option<Url>,
     pub description: String,
     pub content_html: Option<String>,
+    pub thumbnail_url: Option<String>,
     pub author: Option<String>,
     pub pub_date: Option<DateTime<Utc>>,
 }
@@ -39,6 +40,7 @@ impl RssParser {
             .into_iter()
             .map(|entry| {
                 let pub_date = extract_entry_timestamp(&entry);
+                let thumbnail_url = Self::extract_entry_thumbnail_url(&entry);
                 let title = entry.title.map(|t| t.content).unwrap_or_default();
                 let link = select_entry_link(&entry.links)
                     .or_else(|| SafeHttpClient::parse_url(&entry.id).ok());
@@ -51,11 +53,57 @@ impl RssParser {
                     entry.authors.into_iter().filter_map(|a| a.name).collect();
                 let author = (!authors.is_empty()).then(|| authors.join(", "));
 
-                RssItem { title, link, description, content_html, author, pub_date }
+                RssItem { title, link, description, content_html, thumbnail_url, author, pub_date }
             })
             .collect();
 
         Ok((parsed_feed, items))
+    }
+
+    fn extract_entry_thumbnail_url(entry: &feed_rs::model::Entry) -> Option<String> {
+        for media in &entry.media {
+            for thumb in &media.thumbnails {
+                if let Ok(url) = SafeHttpClient::parse_url(&thumb.image.uri) {
+                    return Some(url.into());
+                }
+            }
+            for content in &media.content {
+                let is_image_mime = content
+                    .content_type
+                    .as_ref()
+                    .is_some_and(|mime| mime.ty().as_str().eq_ignore_ascii_case("image"));
+                if let Some(ref url) = content.url {
+                    let has_img_ext = Self::has_image_extension(url.path());
+                    if (is_image_mime || has_img_ext) && SafeHttpClient::validate_url(url).is_ok() {
+                        return Some(url.as_str().to_owned());
+                    }
+                }
+            }
+        }
+        for link in &entry.links {
+            let is_enclosure =
+                link.rel.as_deref().is_some_and(|r| r.eq_ignore_ascii_case("enclosure"));
+            let is_image_mime = link
+                .media_type
+                .as_deref()
+                .is_some_and(|mt| mt.trim().to_ascii_lowercase().starts_with("image/"));
+            if is_enclosure
+                && is_image_mime
+                && let Ok(url) = SafeHttpClient::parse_url(&link.href)
+            {
+                return Some(url.into());
+            }
+        }
+        None
+    }
+
+    fn has_image_extension(path: &str) -> bool {
+        std::path::Path::new(path).extension().is_some_and(|ext| {
+            matches!(
+                ext.to_str().unwrap_or("").to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "gif" | "avif"
+            )
+        })
     }
 }
 

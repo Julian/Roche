@@ -58,11 +58,24 @@ pub struct SafeHttpClient {
 
 impl SafeHttpClient {
     pub fn new(timeout: Duration) -> Result<Self> {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static(
+                "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html, application/xhtml+xml, */*;q=0.8",
+            ),
+        );
+        default_headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
+
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .dns_resolver(Arc::new(SafeDnsResolver))
             .redirect(Self::redirect_policy())
-            .user_agent("Roche/0.1")
+            .default_headers(default_headers)
+            .user_agent("Mozilla/5.0 (compatible; Roche/0.1; +https://github.com/julian/roche)")
             .build()?;
         Ok(Self { client })
     }
@@ -284,6 +297,7 @@ pub struct ExtractedSnapshot {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub content_html: String,
+    pub thumbnail_url: Option<String>,
 }
 
 impl HtmlSanitizer {
@@ -463,8 +477,9 @@ impl HtmlSanitizer {
             .add_tag_attributes("meta", &["name", "property", "content"]);
         let normalized_meta_html = meta_builder.clean(raw_html).to_string();
 
-        let (title, meta_desc) = Self::parse_title_and_meta(&normalized_meta_html);
+        let (title, meta_desc, meta_image) = Self::parse_title_and_meta(&normalized_meta_html);
         let content_html = Self::clean(raw_html);
+        let thumbnail_url = meta_image.or_else(|| Self::extract_first_image_url(&content_html));
         let summary = meta_desc
             .map(|desc| Self::plain_text_truncate(&desc, MAX_SUMMARY_CHARS))
             .filter(|s| !s.is_empty())
@@ -479,16 +494,76 @@ impl HtmlSanitizer {
                 (!fallback.is_empty()).then_some(fallback)
             });
 
-        ExtractedSnapshot { title, summary, content_html }
+        ExtractedSnapshot { title, summary, content_html, thumbnail_url }
     }
 
-    fn parse_title_and_meta(normalized_html: &str) -> (Option<String>, Option<String>) {
+    /// Scans HTML for the first valid external `http(s)` `<img src="...">` URL, skipping 1x1 tracking pixels.
+    #[must_use]
+    pub fn extract_first_image_url(html: &str) -> Option<String> {
+        if !html.contains("<img") && !html.contains("<IMG") {
+            return None;
+        }
+        let mut reader = Reader::from_str(html);
+        reader.config_mut().check_end_names = false;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(tag) | Event::Empty(tag))
+                    if tag.name().as_ref().eq_ignore_ascii_case("img") =>
+                {
+                    if let Some(url) = Self::inspect_img_tag(&tag) {
+                        return Some(url);
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn inspect_img_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+        let mut src: Option<String> = None;
+        let mut width: Option<String> = None;
+        let mut height: Option<String> = None;
+
+        for attr in tag.attributes().with_checks(false).flatten() {
+            let key = attr.key.as_ref();
+            let val = attr
+                .normalized_value(XmlVersion::default())
+                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+            if key.eq_ignore_ascii_case("src") {
+                src = Some(val);
+            } else if key.eq_ignore_ascii_case("width") {
+                width = Some(val);
+            } else if key.eq_ignore_ascii_case("height") {
+                height = Some(val);
+            }
+        }
+
+        if width.as_deref().is_some_and(|w| matches!(w.trim(), "0" | "1" | "1px"))
+            || height.as_deref().is_some_and(|h| matches!(h.trim(), "0" | "1" | "1px"))
+        {
+            return None;
+        }
+
+        let candidate = src?.trim().to_owned();
+        if candidate.is_empty() || candidate.starts_with("data:") {
+            return None;
+        }
+        SafeHttpClient::parse_url(&candidate).ok().map(String::from)
+    }
+
+    fn parse_title_and_meta(
+        normalized_html: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let mut reader = Reader::from_str(normalized_html);
         reader.config_mut().check_end_names = false;
 
         let mut title: Option<String> = None;
         let mut og_title: Option<String> = None;
         let mut meta_desc: Option<String> = None;
+        let mut meta_image: Option<String> = None;
         let mut in_title = false;
         let mut current_buf = String::new();
 
@@ -501,11 +576,16 @@ impl HtmlSanitizer {
                         in_title = true;
                         current_buf.clear();
                     } else if name_bytes.eq_ignore_ascii_case("meta") {
-                        Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc);
+                        Self::inspect_meta_tag(
+                            &tag,
+                            &mut og_title,
+                            &mut meta_desc,
+                            &mut meta_image,
+                        );
                     }
                 }
                 Ok(Event::Empty(tag)) if tag.name().as_ref().eq_ignore_ascii_case("meta") => {
-                    Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc);
+                    Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc, &mut meta_image);
                 }
                 Ok(Event::Text(text)) if in_title => {
                     let decoded =
@@ -532,7 +612,7 @@ impl HtmlSanitizer {
             }
         }
 
-        (title.or(og_title), meta_desc)
+        (title.or(og_title), meta_desc, meta_image)
     }
 
     fn extract_first_paragraph(clean_body_html: &str) -> Option<String> {
@@ -585,6 +665,7 @@ impl HtmlSanitizer {
         tag: &quick_xml::events::BytesStart<'_>,
         og_title: &mut Option<String>,
         meta_desc: &mut Option<String>,
+        meta_image: &mut Option<String>,
     ) {
         let mut attr_name: Option<String> = None;
         let mut attr_content: Option<String> = None;
@@ -614,6 +695,11 @@ impl HtmlSanitizer {
             *meta_desc = Some(content);
         } else if og_title.is_none() && name.eq_ignore_ascii_case("og:title") {
             *og_title = Some(content);
+        } else if meta_image.is_none()
+            && (name.eq_ignore_ascii_case("og:image") || name.eq_ignore_ascii_case("twitter:image"))
+            && let Ok(valid_url) = SafeHttpClient::parse_url(&content)
+        {
+            *meta_image = Some(valid_url.into());
         }
     }
 }

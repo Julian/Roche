@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{ActivityAction, ActivityEntityType, HexColor, SyncRepo};
 
 const TAG_SELECT: &str = "SELECT t.id, t.name, t.color,
-       (SELECT COUNT(*) FROM item_tags it JOIN items i ON i.id = it.item_id WHERE it.tag_id = t.id AND i.status = 'unread') AS unread_count
+       (SELECT COUNT(*) FROM item_tags it JOIN items i ON i.id = it.item_id WHERE it.tag_id = t.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
 FROM tags t";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]

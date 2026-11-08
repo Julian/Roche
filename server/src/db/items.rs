@@ -15,7 +15,7 @@ use super::{
 const MAX_SEARCH_TERMS: usize = 16;
 
 const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
-       i.published_at, i.created_at, i.summary, i.content_html, i.content_type, i.status,
+       i.published_at, i.created_at, i.summary, i.content_html, i.thumbnail_url, i.content_type, i.status,
        i.is_favorite, i.read_at, i.read_progress,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
        (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
@@ -29,7 +29,19 @@ LEFT JOIN feeds f ON i.feed_id = f.id";
 const ITEM_SELECT_LIST: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
        i.published_at, i.created_at, i.summary,
        CASE WHEN length(i.content_html) <= 65536 THEN i.content_html ELSE NULL END AS content_html,
-       i.content_type, i.status,
+       i.thumbnail_url, i.content_type, i.status,
+       i.is_favorite, i.read_at, i.read_progress,
+       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
+       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
+       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
+FROM items i
+LEFT JOIN feeds f ON i.feed_id = f.id";
+
+/// Lightweight list projection used when `include_content=false` is requested during bulk sync.
+const ITEM_SELECT_METADATA_ONLY: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
+       i.published_at, i.created_at, i.summary,
+       NULL AS content_html,
+       i.thumbnail_url, i.content_type, i.status,
        i.is_favorite, i.read_at, i.read_progress,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
        (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
@@ -62,6 +74,7 @@ pub struct Item {
     pub created_at: DateTime<Utc>,
     pub summary: Option<String>,
     pub content_html: Option<String>,
+    pub thumbnail_url: Option<String>,
     pub content_type: ContentType,
     pub status: ItemStatus,
     pub is_favorite: bool,
@@ -92,6 +105,7 @@ pub struct ManualItemInput<'a> {
     pub title: &'a str,
     pub summary: Option<&'a str>,
     pub content_html: Option<&'a str>,
+    pub thumbnail_url: Option<&'a str>,
     pub content_type: ContentType,
     pub tags: &'a [String],
 }
@@ -144,6 +158,8 @@ pub struct ItemFilter {
     pub tag_id: Option<String>,
     pub content_type: Option<ContentType>,
     pub is_favorite: Option<bool>,
+    pub is_read: Option<bool>,
+    pub include_content: Option<bool>,
     pub search: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_rfc3339")]
     pub updated_after: Option<DateTime<Utc>>,
@@ -291,6 +307,7 @@ impl<'a> ItemRepo<'a> {
             created_at: now,
             summary: new_item.summary.map(String::from),
             content_html: new_item.summary.map(String::from),
+            thumbnail_url: None,
             content_type: new_item.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
@@ -314,6 +331,7 @@ impl<'a> ItemRepo<'a> {
             title,
             summary: None,
             content_html: None,
+            thumbnail_url: None,
             content_type: ContentType::Article,
             tags,
         })
@@ -330,14 +348,15 @@ impl<'a> ItemRepo<'a> {
 
         sqlx::query(
             "INSERT INTO items
-             (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
-             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)",
+             (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, created_at, updated_at)
+             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&item_id)
         .bind(input.title)
         .bind(input.url.as_str())
         .bind(input.summary)
         .bind(input.content_html)
+        .bind(input.thumbnail_url)
         .bind(input.content_type)
         .bind(now)
         .bind(now)
@@ -379,6 +398,7 @@ impl<'a> ItemRepo<'a> {
             created_at: now,
             summary: input.summary.map(String::from),
             content_html: input.content_html.map(String::from),
+            thumbnail_url: input.thumbnail_url.map(String::from),
             content_type: input.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
@@ -430,7 +450,12 @@ impl<'a> ItemRepo<'a> {
             trimmed_search.map(ItemFilter::tokenize_search_terms).unwrap_or_default();
         let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
 
-        let mut qb = QueryBuilder::new(ITEM_SELECT_LIST);
+        let base_select = if filter.include_content == Some(false) {
+            ITEM_SELECT_METADATA_ONLY
+        } else {
+            ITEM_SELECT_LIST
+        };
+        let mut qb = QueryBuilder::new(base_select);
         if let Some(fts_match) = &fts_query {
             qb.push(
                 " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(items_fts, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM items_fts WHERE items_fts MATCH ",
@@ -442,6 +467,13 @@ impl<'a> ItemRepo<'a> {
 
         if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
             qb.push(" AND i.status = ").push_bind(s);
+        }
+        if let Some(is_read) = filter.is_read {
+            if is_read {
+                qb.push(" AND i.read_at IS NOT NULL");
+            } else {
+                qb.push(" AND i.read_at IS NULL");
+            }
         }
         if let Some(f) = &filter.feed_id {
             qb.push(" AND i.feed_id = ").push_bind(f);
@@ -536,25 +568,30 @@ impl<'a> ItemRepo<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines, clippy::option_option)]
     pub async fn update(
         &self,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
+        read_at: Option<Option<DateTime<Utc>>>,
     ) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
-        let existing: Option<(ItemStatus, bool, f64)> =
-            sqlx::query_as("SELECT status, is_favorite, read_progress FROM items WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let existing: Option<(ItemStatus, bool, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT status, is_favorite, read_progress, read_at FROM items WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-        let Some((current_status, current_favorite, current_progress)) = existing else {
+        let Some((current_status, current_favorite, current_progress, current_read_at)) = existing
+        else {
             return Ok(false);
         };
+        let mut effective_read_at = current_read_at;
 
         if let Some(new_status) = status
             && new_status != current_status
@@ -569,6 +606,7 @@ impl<'a> ItemRepo<'a> {
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
+                    effective_read_at = effective_read_at.or(Some(now));
                     SyncRepo::record_activity(
                         &mut tx,
                         ActivityEntityType::Item,
@@ -586,6 +624,7 @@ impl<'a> ItemRepo<'a> {
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
+                    effective_read_at = None;
                     SyncRepo::record_activity(
                         &mut tx,
                         ActivityEntityType::Item,
@@ -596,6 +635,35 @@ impl<'a> ItemRepo<'a> {
                     .await?;
                 }
             }
+        }
+
+        if let Some(target_read_at) = read_at
+            && target_read_at.is_some() != effective_read_at.is_some()
+        {
+            if let Some(ts) = target_read_at {
+                sqlx::query(
+                    "UPDATE items SET read_at = COALESCE(read_at, ?), updated_at = ? WHERE id = ?",
+                )
+                .bind(ts)
+                .bind(now)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query("UPDATE items SET read_at = NULL, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Item,
+                id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
         }
 
         if let Some(fav) = is_favorite
@@ -635,7 +703,7 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Archived), None, None).await
+        self.update(id, Some(ItemStatus::Archived), None, None, None).await
     }
 
     pub async fn archive_batch(
@@ -757,17 +825,23 @@ impl<'a> ItemRepo<'a> {
             return Ok(0);
         }
 
-        let normalized: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
-            candidates
-                .into_iter()
-                .filter_map(|(id, raw_summary)| {
-                    let excerpt =
-                        HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
-                    (excerpt != raw_summary).then_some((id, excerpt))
-                })
-                .collect()
-        })
-        .await?;
+        let normalized: Vec<(String, String, Option<String>)> =
+            tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .filter_map(|(id, raw_summary)| {
+                        let excerpt =
+                            HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
+                        if excerpt == raw_summary {
+                            None
+                        } else {
+                            let thumb = HtmlSanitizer::extract_first_image_url(&raw_summary);
+                            Some((id, excerpt, thumb))
+                        }
+                    })
+                    .collect()
+            })
+            .await?;
 
         if normalized.is_empty() {
             return Ok(0);
@@ -775,13 +849,15 @@ impl<'a> ItemRepo<'a> {
 
         let count = u64::try_from(normalized.len()).unwrap_or(0);
         let mut tx = self.pool.begin().await?;
-        for (id, excerpt) in normalized {
+        for (id, excerpt, thumb) in normalized {
             sqlx::query(
                 "UPDATE items
                  SET content_html = COALESCE(NULLIF(content_html, ''), summary),
+                     thumbnail_url = COALESCE(thumbnail_url, ?),
                      summary = ?
                  WHERE id = ?",
             )
+            .bind(thumb)
             .bind(&excerpt)
             .bind(&id)
             .execute(&mut *tx)
@@ -791,8 +867,55 @@ impl<'a> ItemRepo<'a> {
         Ok(count)
     }
 
+    pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
+        use crate::content::fetcher::HtmlSanitizer;
+
+        let candidates: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, content_html FROM items
+             WHERE thumbnail_url IS NULL
+               AND content_html IS NOT NULL
+               AND (content_html LIKE '%<img%' OR content_html LIKE '%<IMG%')",
+        )
+        .fetch_all(self.pool)
+        .await?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let extracted: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter_map(|(id, html)| {
+                    HtmlSanitizer::extract_first_image_url(&html).map(|thumb| (id, thumb))
+                })
+                .collect()
+        })
+        .await?;
+
+        if extracted.is_empty() {
+            return Ok(0);
+        }
+
+        let count = u64::try_from(extracted.len()).unwrap_or(0);
+        let mut tx = self.pool.begin().await?;
+        for (id, thumb) in extracted {
+            sqlx::query(
+                "UPDATE items
+                 SET thumbnail_url = COALESCE(thumbnail_url, ?)
+                 WHERE id = ?",
+            )
+            .bind(&thumb)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(count)
+    }
+
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Unread), None, None).await
+        self.update(id, Some(ItemStatus::Unread), None, None, None).await
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
@@ -939,6 +1062,7 @@ mod tests {
                 content_html: Some(
                     "<p>Modern distributed systems rely on state machine replication and optimizing latency.</p>",
                 ),
+                thumbnail_url: None,
                 content_type: ContentType::Article,
                 tags: &[],
             })
@@ -1132,6 +1256,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_default_published_sort_summary_normalization_and_archive_batch() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let items = db.items();
@@ -1187,6 +1312,7 @@ mod tests {
         let refreshed_new = items.get(&item_new.id).await.unwrap().unwrap();
         assert_eq!(refreshed_new.summary.as_deref(), Some("Clean & fast summary"));
         assert!(refreshed_new.content_html.as_deref().unwrap().contains("<figure>"));
+        assert_eq!(refreshed_new.thumbnail_url.as_deref(), Some("https://example.com/a.png"));
 
         // Second normalization call is idempotent even when plain-text summary has literal `<`
         let url_angle = Url::parse("https://example.com/angle-post").unwrap();
@@ -1218,6 +1344,7 @@ mod tests {
                 title: "Book-Length Essay",
                 summary: Some("Short summary"),
                 content_html: Some(&huge_html),
+                thumbnail_url: Some("https://example.com/cover.jpg"),
                 content_type: ContentType::Article,
                 tags: &[],
             })
@@ -1226,8 +1353,43 @@ mod tests {
         let listed = items.list_filtered(&ItemFilter::default()).await.unwrap();
         let listed_huge = listed.iter().find(|i| i.id == huge_item.id).unwrap();
         assert!(listed_huge.content_html.is_none());
+        assert_eq!(listed_huge.thumbnail_url.as_deref(), Some("https://example.com/cover.jpg"));
         let fetched_huge = items.get(&huge_item.id).await.unwrap().unwrap();
         assert_eq!(fetched_huge.content_html.as_deref(), Some(huge_html.as_str()));
+
+        // include_content=false omits content_html for all items while keeping summary and thumbnail_url
+        let metadata_only = items
+            .list_filtered(&ItemFilter { include_content: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        let meta_new = metadata_only.iter().find(|i| i.id == item_new.id).unwrap();
+        assert!(meta_new.content_html.is_none());
+        assert_eq!(meta_new.summary.as_deref(), Some("Clean & fast summary"));
+        assert_eq!(meta_new.thumbnail_url.as_deref(), Some("https://example.com/a.png"));
+
+        // Independent read state (read_at) vs archive state (status)
+        let custom_read_ts =
+            DateTime::parse_from_rfc3339("2026-03-31T09:30:00Z").unwrap().with_timezone(&Utc);
+        assert!(
+            items.update(&item_new.id, None, None, None, Some(Some(custom_read_ts))).await.unwrap()
+        );
+        let read_new = items.get(&item_new.id).await.unwrap().unwrap();
+        assert_eq!(read_new.status, ItemStatus::Unread);
+        assert_eq!(read_new.read_at, Some(custom_read_ts));
+        let unread_only = items
+            .list_filtered(&ItemFilter { is_read: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(!unread_only.iter().any(|i| i.id == item_new.id));
+        let read_only = items
+            .list_filtered(&ItemFilter { is_read: Some(true), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(read_only.iter().any(|i| i.id == item_new.id));
+
+        assert!(items.update(&item_new.id, None, None, None, Some(None)).await.unwrap());
+        let unread_again = items.get(&item_new.id).await.unwrap().unwrap();
+        assert!(unread_again.read_at.is_none());
 
         // Whitespace-only item_ids do not shadow feed_id in archive_batch
         let before_archive_id = db.sync().latest_activity_id().await.unwrap();

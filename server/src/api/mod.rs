@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use axum_extra::{TypedHeader, typed_header::TypedHeaderRejection};
+use chrono::{DateTime, Utc};
 use headers::{Authorization, authorization::Bearer};
 use serde::Deserialize;
 use tower_http::{
@@ -274,8 +275,12 @@ impl ApiRoutes {
         ProblemPath(id): ProblemPath<String>,
         ProblemJson(req): ProblemJson<UpdateItemRequest>,
     ) -> Result<Json<ItemDetail>, ApiError> {
-        let detail =
-            service.items().update(&id, req.status, req.is_favorite, req.read_progress).await?;
+        let resolved_read_at =
+            req.read_at.or_else(|| req.is_read.map(|want_read| want_read.then(Utc::now)));
+        let detail = service
+            .items()
+            .update(&id, req.status, req.is_favorite, req.read_progress, resolved_read_at)
+            .await?;
         Ok(Json(detail))
     }
 
@@ -618,6 +623,20 @@ struct UpdateItemRequest {
     status: Option<ItemStatus>,
     is_favorite: Option<bool>,
     read_progress: Option<f64>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_datetime")]
+    read_at: Option<Option<DateTime<Utc>>>,
+    is_read: Option<bool>,
+}
+
+#[allow(clippy::option_option)]
+fn deserialize_optional_nullable_datetime<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<DateTime<Utc>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<DateTime<Utc>>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1001,13 +1020,13 @@ mod tests {
             assert_eq!(bad_progress_res.status(), StatusCode::BAD_REQUEST);
         }
 
-        // Update read_progress via PATCH /api/v1/items/{id} and verify persistence
+        // Update read_progress and read_at via PATCH /api/v1/items/{id} and verify persistence
         let patch_progress = Request::builder()
             .method("PATCH")
             .uri(format!("/api/v1/items/{item_id}"))
             .header(header::AUTHORIZATION, &auth)
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"read_progress":0.75}"#))
+            .body(Body::from(r#"{"read_progress":0.75,"read_at":"2026-03-31T09:30:00Z"}"#))
             .unwrap();
         let patch_res = app.clone().oneshot(patch_progress).await.unwrap();
         assert_eq!(patch_res.status(), StatusCode::OK);
@@ -1015,6 +1034,22 @@ mod tests {
             serde_json::from_slice(&to_bytes(patch_res.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(patch_body["read_progress"], 0.75);
+        assert_eq!(patch_body["read_at"], "2026-03-31T09:30:00Z");
+
+        // Clear read_at back to null via PATCH /api/v1/items/{id}
+        let clear_read_at = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/items/{item_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"read_at":null}"#))
+            .unwrap();
+        let clear_res = app.clone().oneshot(clear_read_at).await.unwrap();
+        assert_eq!(clear_res.status(), StatusCode::OK);
+        let clear_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(clear_res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(clear_body["read_at"].is_null());
 
         let get_item = Request::builder()
             .uri(format!("/api/v1/items/{item_id}"))
@@ -1115,7 +1150,7 @@ mod tests {
             .unwrap();
 
         // Star the item and verify ?is_favorite=true filter + thumbnail_media_id + duration projection
-        db.items().update(&item.id, None, Some(true), None).await.unwrap();
+        db.items().update(&item.id, None, Some(true), None, None).await.unwrap();
         let list_request = Request::builder()
             .uri("/api/v1/items?is_favorite=true")
             .header(header::AUTHORIZATION, &auth)

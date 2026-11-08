@@ -168,8 +168,20 @@ impl<F: FeedFetcher> PollScheduler<F> {
                     FeedIngester::poll_returning_inserted(&feed_repo, &feed, fetcher.as_ref()).await
                 };
                 match poll_res {
-                    Ok(inserted) => {
-                        tracing::info!(feed_id = %feed.id, "Feed polled successfully");
+                    Ok(outcome) => {
+                        let feed_title = outcome
+                            .feed_title
+                            .as_deref()
+                            .or(feed.title.as_deref())
+                            .unwrap_or("<untitled>");
+                        tracing::info!(
+                            feed_title = %feed_title,
+                            feed_url = %feed.url,
+                            feed_id = %feed.id,
+                            new_items = outcome.inserted.len(),
+                            feed_entries = outcome.parsed_entries,
+                            "Feed polled successfully"
+                        );
                         if let Some(ref store) = media_store {
                             let ctx = MediaIngestContext {
                                 db: &db,
@@ -178,11 +190,18 @@ impl<F: FeedFetcher> PollScheduler<F> {
                                 download_semaphore: Some(&download_semaphore),
                                 fetcher: fetcher.as_ref(),
                             };
-                            FeedIngester::ingest_items_concurrently(&ctx, &inserted).await;
+                            FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
                         }
                     }
                     Err(e) => {
-                        tracing::error!(feed_id = %feed.id, error = %e, "Feed poll failed");
+                        let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
+                        tracing::error!(
+                            feed_title = %feed_title,
+                            feed_url = %feed.url,
+                            feed_id = %feed.id,
+                            error = %e,
+                            "Feed poll failed"
+                        );
                         let _ = db.feeds().mark_error(&feed.id, &e.to_string()).await;
                     }
                 }
@@ -199,6 +218,12 @@ pub struct MediaIngestContext<'a, F> {
     pub ytdlp_worker: Option<&'a YtDlpWorker>,
     pub download_semaphore: Option<&'a Arc<Semaphore>>,
     pub fetcher: &'a F,
+}
+
+pub struct PollOutcome {
+    pub inserted: Vec<(String, PollItemCandidate)>,
+    pub feed_title: Option<String>,
+    pub parsed_entries: usize,
 }
 
 pub struct FeedIngester;
@@ -219,8 +244,18 @@ impl FeedIngester {
         feed: &Feed,
     ) -> std::result::Result<(), PollError> {
         let feed_repo = ctx.db.feeds();
-        let inserted = Self::poll_returning_inserted(&feed_repo, feed, ctx.fetcher).await?;
-        Self::ingest_items_concurrently(ctx, &inserted).await;
+        let outcome = Self::poll_returning_inserted(&feed_repo, feed, ctx.fetcher).await?;
+        let feed_title =
+            outcome.feed_title.as_deref().or(feed.title.as_deref()).unwrap_or("<untitled>");
+        tracing::info!(
+            feed_title = %feed_title,
+            feed_url = %feed.url,
+            feed_id = %feed.id,
+            new_items = outcome.inserted.len(),
+            feed_entries = outcome.parsed_entries,
+            "Feed polled successfully"
+        );
+        Self::ingest_items_concurrently(ctx, &outcome.inserted).await;
         Ok(())
     }
 
@@ -369,7 +404,7 @@ impl FeedIngester {
         repo: &FeedRepo<'_>,
         feed: &Feed,
         fetcher: &F,
-    ) -> std::result::Result<Vec<(String, PollItemCandidate)>, PollError> {
+    ) -> std::result::Result<PollOutcome, PollError> {
         let content = fetcher.fetch_feed(&feed.url).await.map_err(PollError::Upstream)?;
         let feed_type = feed.feed_type;
         let batch =
@@ -378,8 +413,10 @@ impl FeedIngester {
                 .map_err(|e| PollError::Upstream(anyhow::anyhow!("Feed parse task failed: {e}")))?
                 .map_err(PollError::Upstream)?;
 
+        let parsed_entries = batch.items.len();
+        let feed_title = batch.title.clone().filter(|t| !t.trim().is_empty());
         let inserted = repo.record_poll_batch(&feed.id, &batch).await?;
-        Ok(inserted)
+        Ok(PollOutcome { inserted, feed_title, parsed_entries })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -399,6 +436,9 @@ impl FeedIngester {
                             .map(HtmlSanitizer::clean)
                             .filter(|h| !h.trim().is_empty())
                             .or_else(|| Some(clean_desc.clone()));
+                        let thumbnail_url = item.thumbnail_url.or_else(|| {
+                            content_html.as_deref().and_then(HtmlSanitizer::extract_first_image_url)
+                        });
                         let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
                             &clean_desc,
                             MAX_SUMMARY_CHARS,
@@ -410,6 +450,7 @@ impl FeedIngester {
                             published_at: item.pub_date,
                             summary,
                             content_html,
+                            thumbnail_url,
                             content_type,
                         })
                     })
@@ -436,12 +477,19 @@ impl FeedIngester {
                             &clean_desc,
                             MAX_SUMMARY_CHARS,
                         );
+                        let thumbnail_url = video
+                            .watch_url
+                            .query_pairs()
+                            .find(|(k, _)| k == "v")
+                            .filter(|(_, v)| !v.is_empty())
+                            .map(|(_, v)| format!("https://i.ytimg.com/vi/{v}/hqdefault.jpg"));
                         PollItemCandidate {
                             title: video.title,
                             url: video.watch_url,
                             author: author.clone(),
                             published_at: video.published_at,
                             content_html: Some(clean_desc),
+                            thumbnail_url,
                             summary,
                             content_type: ContentType::Video,
                         }
@@ -474,6 +522,7 @@ impl FeedIngester {
                             author,
                             published_at: paper.published_at,
                             content_html: Some(clean_summary),
+                            thumbnail_url: None,
                             summary,
                             content_type: ContentType::Paper,
                         })

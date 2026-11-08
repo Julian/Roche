@@ -63,6 +63,9 @@ impl Db {
         if let Err(e) = db.items().normalize_legacy_html_summaries().await {
             tracing::warn!(error = %e, "Failed to normalize legacy HTML summaries");
         }
+        if let Err(e) = db.items().backfill_missing_thumbnails().await {
+            tracing::warn!(error = %e, "Failed to backfill missing item thumbnails");
+        }
 
         Ok(db)
     }

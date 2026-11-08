@@ -420,6 +420,14 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         let ctx = self.service.media_ingest_context();
 
         if let Err(err) = FeedIngester::poll_with_media(&ctx, &feed).await {
+            let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
+            tracing::error!(
+                feed_title = %feed_title,
+                feed_url = %feed.url,
+                feed_id = %feed.id,
+                error = %err,
+                "Manual feed refresh failed"
+            );
             let _ = repo.mark_error(&feed.id, &err.to_string()).await;
             return match err {
                 PollError::Upstream(upstream) => {
@@ -514,6 +522,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             .or_else(|| snapshot.as_ref().and_then(|s| s.title.as_deref()))
             .unwrap_or_else(|| url.as_str());
         let summary = snapshot.as_ref().and_then(|s| s.summary.as_deref());
+        let thumbnail_url = snapshot.as_ref().and_then(|s| s.thumbnail_url.as_deref());
         let content_html = (content_type == ContentType::Article)
             .then(|| snapshot.as_ref().map(|s| s.content_html.as_str()))
             .flatten()
@@ -528,6 +537,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
                 title: resolved_title,
                 summary,
                 content_html,
+                thumbnail_url,
                 content_type,
                 tags,
             })
@@ -556,19 +566,21 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         self.get(&item.id).await
     }
 
+    #[allow(clippy::option_option)]
     pub async fn update(
         &self,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
+        read_at: Option<Option<DateTime<Utc>>>,
     ) -> Result<ItemDetail, ApiError> {
         if let Some(p) = read_progress
             && (!p.is_finite() || !(0.0..=1.0).contains(&p))
         {
             return Err(ApiError::bad_request("read_progress must be between 0.0 and 1.0"));
         }
-        if !self.service.db.items().update(id, status, is_favorite, read_progress).await? {
+        if !self.service.db.items().update(id, status, is_favorite, read_progress, read_at).await? {
             return Err(ApiError::not_found("Item not found"));
         }
         self.get(id).await

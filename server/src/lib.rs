@@ -167,6 +167,14 @@ impl RocheServer {
                         fetcher: fetcher_clone.as_ref(),
                     };
                     if let Err(err) = scheduler::FeedIngester::poll_with_media(&ctx, &feed).await {
+                        let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
+                        tracing::error!(
+                            feed_title = %feed_title,
+                            feed_url = %feed.url,
+                            feed_id = %feed.id,
+                            error = %err,
+                            "OPML initial feed poll failed"
+                        );
                         let _ = db_clone.feeds().mark_error(&feed.id, &err.to_string()).await;
                     }
                 });

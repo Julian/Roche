@@ -10,7 +10,7 @@ use crate::feeds::OpmlOutline;
 
 const FEED_SELECT: &str = "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
        f.poll_interval, f.last_polled, f.last_error, f.is_active,
-       (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread') AS unread_count
+       (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
 FROM feeds f";
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -38,6 +38,7 @@ pub struct PollItemCandidate {
     pub published_at: Option<DateTime<Utc>>,
     pub summary: String,
     pub content_html: Option<String>,
+    pub thumbnail_url: Option<String>,
     pub content_type: ContentType,
 }
 
@@ -322,8 +323,8 @@ impl<'a> FeedRepo<'a> {
             let id = Uuid::new_v4().to_string();
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO items
-                 (id, feed_id, title, url, author, published_at, summary, content_html, content_type, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(feed_id)
@@ -333,6 +334,7 @@ impl<'a> FeedRepo<'a> {
             .bind(item.published_at)
             .bind(&item.summary)
             .bind(item.content_html.as_deref())
+            .bind(item.thumbnail_url.as_deref())
             .bind(item.content_type)
             .bind(now)
             .bind(now)
