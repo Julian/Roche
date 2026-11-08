@@ -36,7 +36,7 @@ class MainScreenTest {
         composeRule.onNodeWithTag("bottom_tab_inbox").assertExists()
         composeRule.onNodeWithTag("bottom_tab_search").assertExists()
         composeRule.onNodeWithTag("bottom_tab_feeds").assertExists()
-        composeRule.onNodeWithTag("bottom_tab_offline").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_starred").assertExists()
         composeRule.onNodeWithTag("bottom_tab_settings").assertExists()
         composeRule.onNodeWithText(sample.title).assertExists()
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()

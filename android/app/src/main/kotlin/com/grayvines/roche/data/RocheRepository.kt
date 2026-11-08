@@ -15,6 +15,7 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.io.File
+import java.time.Instant
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -77,6 +78,36 @@ class RocheRepository(
             itemId = itemId,
             status = status.wireValue,
         )
+    }
+
+    suspend fun setReadState(itemId: String, isRead: Boolean) {
+        val current = dao.getItemById(itemId) ?: return
+        val currentlyRead = !current.readAt.isNullOrBlank()
+        if (currentlyRead == isRead) return
+        val nextReadAt = if (isRead) Instant.now().toString() else null
+        dao.updateItemReadAt(itemId, nextReadAt)
+        syncReadAtMutation(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            itemId = itemId,
+            readAt = nextReadAt,
+        )
+    }
+
+    suspend fun toggleReadState(itemId: String): Boolean {
+        val current = dao.getItemById(itemId) ?: return false
+        val nextIsRead = current.readAt.isNullOrBlank()
+        val nextReadAt = if (nextIsRead) Instant.now().toString() else null
+        dao.updateItemReadAt(itemId, nextReadAt)
+        syncReadAtMutation(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            itemId = itemId,
+            readAt = nextReadAt,
+        )
+        return nextIsRead
     }
 
     suspend fun toggleStar(itemId: String): Boolean {

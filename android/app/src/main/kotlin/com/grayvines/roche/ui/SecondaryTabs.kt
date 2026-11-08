@@ -1,6 +1,8 @@
 package com.grayvines.roche.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,22 +40,87 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.settings.normalizeServerUrl
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
+import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlinx.coroutines.delay
 
 @Composable
+fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    val starredEntries = state.starredEntries
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(
+            title = "Starred",
+            subtitle = "${starredEntries.size} saved",
+        ) {
+            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+        }
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (starredEntries.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "No starred entries yet. Tap ★ on any post to save it to Starred.",
+                    color = colors.textMuted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().testTag("starred_list"),
+                contentPadding = PaddingValues(bottom = 88.dp),
+            ) {
+                items(items = starredEntries, key = { it.id }) { entry ->
+                    InboxEntryRowItem(
+                        entry = entry,
+                        ultraDense = state.settings.ultraDenseRows,
+                        swipeToArchiveEnabled = state.settings.swipeToArchive,
+                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                    )
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
     Column(modifier = Modifier.fillMaxSize()) {
-        SearchHeaderSection(state = state, onAction = onAction)
+        RocheTopHeader(
+            title = "Search",
+            subtitle = "${state.searchResults.size} matches",
+        )
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            OutlinedTextField(
+                value = state.searchQuery,
+                onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
+                placeholder = { Text("Search titles, authors, feeds, #tags…", fontSize = 13.sp) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().testTag("search_input"),
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            SearchQuickTagStrip(state = state, onAction = onAction)
+            Spacer(modifier = Modifier.height(10.dp))
+        }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
         if (state.searchResults.isEmpty()) {
@@ -85,28 +152,6 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun SearchHeaderSection(state: MainUiState, onAction: (MainAction) -> Unit) {
-    Column(modifier = Modifier.fillMaxWidth()) {
-        RocheTopHeader(
-            title = "Search",
-            subtitle = "${state.searchResults.size} matches",
-        )
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
-            OutlinedTextField(
-                value = state.searchQuery,
-                onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
-                placeholder = { Text("Search titles, authors, feeds, #tags…", fontSize = 13.sp) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().testTag("search_input"),
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            SearchQuickTagStrip(state = state, onAction = onAction)
-            Spacer(modifier = Modifier.height(10.dp))
         }
     }
 }
@@ -218,32 +263,34 @@ internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -
             SubscribedFeedRow(
                 feed = feed,
                 onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
                 onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
-                onDelete = { onAction(MainAction.DeleteFeed(feed.id)) },
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SubscribedFeedRow(
     feed: FeedItem,
     onClick: () -> Unit,
+    onLongPress: () -> Unit,
     onRefresh: () -> Unit,
-    onDelete: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
-                .clickable(onClick = onClick)
-                .padding(vertical = 12.dp, horizontal = 8.dp),
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .padding(vertical = 12.dp, horizontal = 8.dp)
+                .testTag("feed_row_${feed.id}"),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
             Text(
                 text = feed.title,
                 color = colors.textPrimary,
@@ -260,26 +307,26 @@ private fun SubscribedFeedRow(
             )
         }
         Row(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = feed.unreadCount.toString(),
-                color = colors.accentBlue,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-            HeaderActionButton(
-                label = "Refresh",
+            if (feed.unreadCount > 0) {
+                Text(
+                    text = feed.unreadCount.toString(),
+                    color = colors.accentBlue,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            RocheIconActionButton(
+                contentDescription = "Refresh ${feed.title}",
                 onClick = onRefresh,
+                outlined = false,
                 modifier = Modifier.testTag("refresh_feed_${feed.id}"),
-            )
-            HeaderActionButton(
-                label = "Unsubscribe",
-                onClick = onDelete,
-                modifier = Modifier.testTag("delete_feed_${feed.id}"),
-            )
+            ) {
+                RefreshIcon(tint = colors.textSecondary, size = 18.dp)
+            }
         }
     }
 }
@@ -290,10 +337,7 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val offlineEntries = state.offlineEntries
 
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Offline Vault",
-            subtitle = "${offlineEntries.size} cached",
-        )
+        RocheTopHeader(title = "Offline Vault", subtitle = "${offlineEntries.size} cached")
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
         if (offlineEntries.isEmpty()) {
@@ -302,7 +346,7 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "No offline entries cached on this device.",
+                    "No offline entries cached on this device.",
                     color = colors.textMuted,
                     fontSize = 13.sp,
                 )
@@ -313,49 +357,41 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
             ) {
                 items(items = offlineEntries, key = { it.id }) { entry ->
-                    OfflineVaultEntryRow(entry = entry, onAction = onAction)
+                    Row(
+                        modifier =
+                            Modifier.fillMaxWidth()
+                                .clickable { onAction(MainAction.OpenReader(entry.id)) }
+                                .padding(vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                text = entry.title,
+                                color = colors.textPrimary,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            val meta =
+                                "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}"
+                            Text(
+                                text = meta,
+                                color = colors.textMuted,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                            )
+                        }
+                        HeaderActionButton(
+                            label = "Evict",
+                            onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+                        )
+                    }
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun OfflineVaultEntryRow(
-    entry: com.grayvines.roche.model.InboxEntry,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .clickable { onAction(MainAction.OpenReader(entry.id)) }
-                .padding(vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(
-                text = entry.title,
-                color = colors.textPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                text =
-                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-            )
-        }
-        HeaderActionButton(
-            label = "Evict",
-            onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-        )
     }
 }
 
@@ -380,11 +416,63 @@ fun SettingsTabContent(
         ) {
             AppearanceTogglesSection(state = state, onAction = onAction)
             HorizontalDivider(color = colors.border, thickness = 1.dp)
+            BottomNavigationConfigSection(state = state, onAction = onAction)
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
             ServerConfigSection(state = state, onAction = onAction)
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             OpmlSubscriptionsSection(onImportOpml = onImportOpml, onExportOpml = onExportOpml)
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+}
+
+@Composable
+private fun BottomNavigationConfigSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    val currentTabs = AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
+    val slotLabels = listOf("Far Left", "Inner Left", "Inner Right", "Far Right")
+
+    Text(
+        text = "BOTTOM NAVIGATION BAR (INBOX CENTERED)",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+    )
+    slotLabels.forEachIndexed { index, slotLabel ->
+        val selectedTab = currentTabs.getOrElse(index) { AppTab.defaultSideTabs[index] }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = slotLabel,
+                color = colors.textSecondary,
+                fontSize = 12.5.sp,
+                modifier = Modifier.padding(end = 8.dp),
+            )
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                AppTab.sideTabCandidates.forEach { candidate ->
+                    FilterChipPill(
+                        label = candidate.label,
+                        selected = selectedTab == candidate,
+                        onClick = { onAction(MainAction.SetBottomNavSlot(index, candidate)) },
+                    )
+                }
+            }
+        }
+    }
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeaderActionButton(
+            label = "Open Offline Vault (${state.offlineEntries.size})",
+            onClick = { onAction(MainAction.SelectTab(AppTab.OFFLINE)) },
+        )
     }
 }
 

@@ -10,6 +10,7 @@ import com.grayvines.roche.data.resolveSafeChildFile
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.writeBytesAtomically
 import java.io.File
+import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -57,7 +58,7 @@ class ThumbnailLoader(
         val rootDir = cacheDir ?: return null
         val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
         if (!thumbsDir.exists()) return null
-        val thumbFile = resolveSafeChildFile(thumbsDir, mediaId)
+        val thumbFile = resolveSafeChildFile(thumbsDir, diskCacheKey(mediaId))
         if (thumbFile.isFile && thumbFile.length() in 1..MAX_THUMBNAIL_BYTES) {
             thumbFile.readBytes()
         } else {
@@ -67,14 +68,18 @@ class ThumbnailLoader(
         .getOrNull()
 
     private suspend fun fetchAndCacheRemoteBytes(mediaId: String): ByteArray? = runCatching {
-        val currentSettings = settings.settings.first()
-        val serverUrl = currentSettings.serverUrl
-        val token = currentSettings.bearerToken
         val rawBytes =
-            if (serverUrl.isNotBlank() && token.isNotBlank()) {
-                apiClient.fetchMediaBytes(serverUrl, token, mediaId)
+            if (isHttpThumbnailUrl(mediaId)) {
+                apiClient.fetchExternalImageBytes(mediaId)
             } else {
-                null
+                val currentSettings = settings.settings.first()
+                val serverUrl = currentSettings.serverUrl
+                val token = currentSettings.bearerToken
+                if (serverUrl.isNotBlank() && token.isNotBlank()) {
+                    apiClient.fetchMediaBytes(serverUrl, token, mediaId)
+                } else {
+                    null
+                }
             }
         val validBytes = rawBytes?.takeIf { it.size in 1..MAX_THUMBNAIL_BYTES }
         if (validBytes != null) {
@@ -89,7 +94,7 @@ class ThumbnailLoader(
         val rootDir = cacheDir ?: return
         runCatching {
             val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-            writeBytesAtomically(thumbsDir, mediaId, bytes)
+            writeBytesAtomically(thumbsDir, diskCacheKey(mediaId), bytes)
         }
     }
 
@@ -138,3 +143,16 @@ internal fun calculateInSampleSize(
 
 private const val TARGET_THUMBNAIL_PX = 256
 private const val SAMPLE_DIVISOR = 2
+
+internal fun isHttpThumbnailUrl(value: String): Boolean =
+    value.startsWith("https://", ignoreCase = true) ||
+        value.startsWith("http://", ignoreCase = true)
+
+internal fun diskCacheKey(mediaOrUrl: String): String =
+    if (isHttpThumbnailUrl(mediaOrUrl)) {
+        val digest =
+            MessageDigest.getInstance("SHA-256").digest(mediaOrUrl.toByteArray(Charsets.UTF_8))
+        "url_" + digest.joinToString("") { "%02x".format(it) }
+    } else {
+        mediaOrUrl
+    }

@@ -53,6 +53,7 @@ fun MainScreen(
             if (showChrome) {
                 RocheBottomBar(
                     activeTab = state.activeTab,
+                    sideTabs = state.settings.bottomNavTabs,
                     onSelectTab = { onAction(MainAction.SelectTab(it)) },
                 )
             }
@@ -154,6 +155,15 @@ private fun MainOverlaySheets(
         )
     }
 
+    val contextFeed = state.contextSheetFeed
+    if (contextFeed != null) {
+        FeedContextBottomSheet(
+            feed = contextFeed,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+
     if (state.isAddSheetOpen) {
         AddUrlOrFeedBottomSheet(
             initialUrl = state.prefilledShareUrl,
@@ -187,6 +197,7 @@ private fun MainBodyContent(
     }
     when (state.activeTab) {
         AppTab.INBOX -> InboxTabContent(state = state, onAction = onAction)
+        AppTab.STARRED -> StarredTabContent(state = state, onAction = onAction)
         AppTab.SEARCH -> SearchTabContent(state = state, onAction = onAction)
         AppTab.FEEDS -> FeedsAndTagsTabContent(state = state, onAction = onAction)
         AppTab.OFFLINE -> OfflineTabContent(state = state, onAction = onAction)

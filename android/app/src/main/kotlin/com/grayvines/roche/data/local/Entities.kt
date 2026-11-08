@@ -42,6 +42,8 @@ data class ItemEntity(
     val readProgress: Double,
     val thumbnailMediaId: String?,
     val duration: String?,
+    val readAt: String? = null,
+    val thumbnailUrl: String? = null,
 )
 
 @Entity(tableName = "tags", indices = [Index(value = ["name"], unique = true)])
@@ -63,6 +65,7 @@ data class PendingMutationEntity(
     val dirtyStatus: String? = null,
     val dirtyFavorite: Boolean? = null,
     val dirtyReadProgress: Double? = null,
+    val dirtyReadAt: String? = null,
     val addedTagsCsv: String = "",
     val removedTagsCsv: String = "",
 )

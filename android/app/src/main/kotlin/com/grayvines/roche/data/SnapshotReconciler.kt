@@ -9,6 +9,7 @@ import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteTagDto
+import com.grayvines.roche.data.remote.UNREAD_READ_AT_TOMBSTONE
 
 internal fun mergePushedFeeds(
     remoteFeeds: List<RemoteFeedDto>,
@@ -152,10 +153,17 @@ internal fun applyMutationToRemoteItem(
         remote.tagNames.map { it.trim().lowercase() }.filter { it.isNotBlank() }.toMutableSet()
     mergedTags.addAll(parseTagCsv(mutation.addedTagsCsv))
     mergedTags.removeAll(parseTagCsv(mutation.removedTagsCsv).toSet())
+    val effectiveReadAt =
+        when (mutation.dirtyReadAt) {
+            null -> remote.readAt
+            UNREAD_READ_AT_TOMBSTONE -> null
+            else -> mutation.dirtyReadAt
+        }
     return remote.copy(
         status = mutation.dirtyStatus ?: remote.status,
         isFavorite = mutation.dirtyFavorite ?: remote.isFavorite,
         readProgress = mutation.dirtyReadProgress ?: remote.readProgress,
+        readAt = effectiveReadAt,
         tagNames = mergedTags.sorted(),
     )
 }

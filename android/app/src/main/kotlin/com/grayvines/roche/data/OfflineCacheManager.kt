@@ -209,6 +209,7 @@ internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): 
             ),
         thumbnailMediaId =
             detail.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: local.thumbnailMediaId,
+        thumbnailUrl = detail.thumbnailUrl?.takeIf { it.isNotBlank() } ?: local.thumbnailUrl,
         duration = detail.duration?.takeIf { it.isNotBlank() } ?: local.duration,
         status = local.status,
         isFavorite = local.isFavorite,

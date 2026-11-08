@@ -36,19 +36,69 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
 
 /**
- * Renders row image previews for everything EXCEPT articles:
+ * Renders row image previews for entries:
+ * - `ContentType.ARTICLE`: Rounded image link preview (`60×60 dp`) when an article has a thumbnail.
  * - `ContentType.PDF` (arXiv papers): Portrait first-page & figure preview (`54×66 dp`).
  * - `ContentType.VIDEO` (YouTube): 16:9 frame preview (`78×50 dp`) with play badge (`#C1666B`) and
  *   duration overlay.
- * - `ContentType.ARTICLE`: Renders nothing so articles remain pure editorial typography.
  */
 @Composable
 fun EntryThumbnailPreview(entry: InboxEntry, modifier: Modifier = Modifier) {
     when (entry.contentType) {
-        ContentType.ARTICLE -> Unit
+        ContentType.ARTICLE -> ArticleImageThumbnail(entry = entry, modifier = modifier)
         ContentType.PDF -> PaperFirstPageThumbnail(entry = entry, modifier = modifier)
         ContentType.VIDEO -> VideoFrameThumbnail(entry = entry, modifier = modifier)
     }
+}
+
+@Composable
+private fun ArticleImageThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
+    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
+    Box(
+        modifier =
+            modifier
+                .size(60.dp)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(width = 1.dp, color = colors.border, shape = shape)
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) { drawArticleImagePlaceholder(colors) }
+        }
+    }
+}
+
+private fun DrawScope.drawArticleImagePlaceholder(colors: RocheColors) {
+    val w = size.width
+    val h = size.height
+    drawCircle(
+        color = colors.accentVerdigris.copy(alpha = ARTICLE_SUN_ALPHA),
+        radius = w * ARTICLE_SUN_RADIUS,
+        center = Offset(w * ARTICLE_SUN_CX, h * ARTICLE_SUN_CY),
+    )
+    val landscape =
+        Path().apply {
+            moveTo(w * ARTICLE_MNT_X0, h * ARTICLE_MNT_BASE_Y)
+            lineTo(w * ARTICLE_MNT_X1, h * ARTICLE_MNT_PEAK1_Y)
+            lineTo(w * ARTICLE_MNT_X2, h * ARTICLE_MNT_VALLEY_Y)
+            lineTo(w * ARTICLE_MNT_X3, h * ARTICLE_MNT_PEAK2_Y)
+            lineTo(w * ARTICLE_MNT_X4, h * ARTICLE_MNT_BASE_Y)
+            close()
+        }
+    drawPath(
+        path = landscape,
+        color = colors.textMuted.copy(alpha = ARTICLE_MNT_ALPHA),
+    )
 }
 
 @Composable
@@ -56,7 +106,8 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(5.dp)
     val isAlternateChart = entry.id.hashCode() % 2 == 0
-    val bitmap = rememberEntryThumbnailBitmap(entry.thumbnailMediaId)
+    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
+    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
     Box(
         modifier =
             modifier
@@ -174,7 +225,8 @@ private fun DrawScope.drawPaperFigure(
 private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
-    val bitmap = rememberEntryThumbnailBitmap(entry.thumbnailMediaId)
+    val thumbKey = entry.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: entry.effectiveThumbnailUrl
+    val bitmap = rememberEntryThumbnailBitmap(thumbKey)
     Box(
         modifier =
             modifier
@@ -326,3 +378,18 @@ private const val PLAY_RING_W = 2.4f
 private const val PLAY_LEFT_OFFSET = 0.28f
 private const val PLAY_RIGHT_OFFSET = 0.46f
 private const val PLAY_HALF_H = 0.42f
+
+private const val ARTICLE_SUN_ALPHA = 0.35f
+private const val ARTICLE_SUN_RADIUS = 0.11f
+private const val ARTICLE_SUN_CX = 0.32f
+private const val ARTICLE_SUN_CY = 0.34f
+private const val ARTICLE_MNT_X0 = 0.14f
+private const val ARTICLE_MNT_X1 = 0.42f
+private const val ARTICLE_MNT_X2 = 0.58f
+private const val ARTICLE_MNT_X3 = 0.72f
+private const val ARTICLE_MNT_X4 = 0.88f
+private const val ARTICLE_MNT_BASE_Y = 0.76f
+private const val ARTICLE_MNT_PEAK1_Y = 0.48f
+private const val ARTICLE_MNT_VALLEY_Y = 0.64f
+private const val ARTICLE_MNT_PEAK2_Y = 0.50f
+private const val ARTICLE_MNT_ALPHA = 0.25f

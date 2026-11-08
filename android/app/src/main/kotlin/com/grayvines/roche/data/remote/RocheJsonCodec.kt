@@ -58,10 +58,13 @@ internal fun buildSaveItemPayload(url: String, title: String?, tags: List<String
     }
     .toString()
 
+internal const val UNREAD_READ_AT_TOMBSTONE = "__unread__"
+
 internal fun buildUpdateItemPayload(
     status: String?,
     isFavorite: Boolean?,
     readProgress: Double?,
+    readAt: String? = null,
 ): String = buildJsonObject {
     if (status != null) {
         put(KEY_STATUS, status)
@@ -71,6 +74,13 @@ internal fun buildUpdateItemPayload(
     }
     if (readProgress != null) {
         put(KEY_READ_PROGRESS, readProgress)
+    }
+    if (readAt != null) {
+        if (readAt == UNREAD_READ_AT_TOMBSTONE) {
+            put(KEY_READ_AT, JsonNull)
+        } else {
+            put(KEY_READ_AT, readAt)
+        }
     }
 }
     .toString()
@@ -227,13 +237,26 @@ private fun parseItemJsonObject(obj: JsonObject): RemoteItemDto =
         contentType = obj.nullableString("content_type") ?: "article",
         status = obj.nullableString(KEY_STATUS) ?: "unread",
         isFavorite = obj.booleanOrDefault(KEY_IS_FAVORITE, false),
-        publishedAt = obj.nullableString("published_at"),
-        createdAt = obj.nullableString("created_at") ?: obj.stringOrEmpty("published_at"),
+        publishedAt = obj.nullableString(KEY_PUBLISHED_AT),
+        createdAt = obj.nullableString(KEY_CREATED_AT) ?: obj.stringOrEmpty(KEY_PUBLISHED_AT),
         readProgress = obj.doubleOrDefault(KEY_READ_PROGRESS, 0.0),
         thumbnailMediaId = obj.nullableString("thumbnail_media_id"),
         duration = obj.parseDurationLabel(),
         tagNames = obj.parseItemTagNames(),
+        readAt = obj.parseItemReadAt(),
+        thumbnailUrl = obj.nullableString("thumbnail_url"),
     )
+
+private fun JsonObject.parseItemReadAt(): String? =
+    nullableString(KEY_READ_AT)
+        ?: if (booleanOrDefault("is_read", false) || nullableString(KEY_STATUS) == "archived") {
+            nullableString("updated_at")
+                ?: nullableString(KEY_CREATED_AT)
+                ?: nullableString(KEY_PUBLISHED_AT)
+                ?: "1970-01-01T00:00:00Z"
+        } else {
+            null
+        }
 
 private fun JsonObject.parseItemTagNames(): List<String> {
     val fromTagNames =
@@ -287,5 +310,8 @@ private const val KEY_URL = "url"
 private const val KEY_STATUS = "status"
 private const val KEY_IS_FAVORITE = "is_favorite"
 private const val KEY_READ_PROGRESS = "read_progress"
+private const val KEY_READ_AT = "read_at"
+private const val KEY_CREATED_AT = "created_at"
+private const val KEY_PUBLISHED_AT = "published_at"
 private const val KEY_UNREAD_COUNT = "unread_count"
 private const val DEFAULT_ERROR_TITLE = "HTTP Error"

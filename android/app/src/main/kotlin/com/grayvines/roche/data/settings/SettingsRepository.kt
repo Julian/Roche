@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.io.IOException
@@ -40,6 +41,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             prefs[KEY_THEME_MODE] = updated.themeMode.name
             prefs[KEY_HEADLINE_FONT] = updated.headlineFont.name
             prefs[KEY_ULTRA_DENSE_ROWS] = updated.ultraDenseRows
+            prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
         }
     }
 
@@ -57,6 +59,14 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                         HeadlineFont.entries.firstOrNull { it.name == raw }
                     } ?: HeadlineFont.SERIF,
                 ultraDenseRows = this[KEY_ULTRA_DENSE_ROWS] ?: false,
+                bottomNavTabs =
+                    this[KEY_BOTTOM_NAV_TABS]?.let { raw ->
+                        raw.split(',')
+                            .mapNotNull { token ->
+                                AppTab.entries.firstOrNull { it.name == token.trim() }
+                            }
+                            .let { AppTab.normalizeSideTabs(it) }
+                    } ?: AppTab.defaultSideTabs,
             )
             .clamped()
 
@@ -68,6 +78,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
         private val KEY_HEADLINE_FONT = stringPreferencesKey("headline_font")
         private val KEY_ULTRA_DENSE_ROWS = booleanPreferencesKey("ultra_dense_rows")
+        private val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

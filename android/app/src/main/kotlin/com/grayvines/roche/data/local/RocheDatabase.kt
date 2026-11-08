@@ -15,7 +15,7 @@ import androidx.sqlite.driver.AndroidSQLiteDriver
             ItemTagEntity::class,
             PendingMutationEntity::class,
         ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {

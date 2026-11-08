@@ -1,5 +1,6 @@
 package com.grayvines.roche.ui.components
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
@@ -24,7 +26,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -34,14 +42,66 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
+/** Crisp circular refresh arrow icon for feed rows and sync actions. */
 @Composable
-fun RocheBottomBar(activeTab: AppTab, onSelectTab: (AppTab) -> Unit) {
+fun RefreshIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * REFRESH_STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        val arcPadding = w * REFRESH_ARC_PADDING
+        val arcDiameter = w - arcPadding * 2f
+        drawArc(
+            color = tint,
+            startAngle = REFRESH_START_ANGLE_DEG,
+            sweepAngle = REFRESH_SWEEP_ANGLE_DEG,
+            useCenter = false,
+            topLeft = Offset(arcPadding, arcPadding),
+            size = Size(arcDiameter, arcDiameter),
+            style = stroke,
+        )
+        val arrowHead =
+            Path().apply {
+                moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
+                lineTo(w * REFRESH_ARROW_LEFT_X, h * REFRESH_ARROW_TIP_Y)
+                moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
+                lineTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TOP_Y)
+            }
+        drawPath(path = arrowHead, color = tint, style = stroke)
+    }
+}
+
+private const val REFRESH_STROKE_FRACTION = 0.085f
+private const val REFRESH_ARC_PADDING = 0.18f
+private const val REFRESH_START_ANGLE_DEG = 35f
+private const val REFRESH_SWEEP_ANGLE_DEG = 290f
+private const val REFRESH_ARROW_TIP_X = 0.80f
+private const val REFRESH_ARROW_TIP_Y = 0.36f
+private const val REFRESH_ARROW_LEFT_X = 0.56f
+private const val REFRESH_ARROW_TOP_Y = 0.14f
+
+@Composable
+fun RocheBottomBar(
+    activeTab: AppTab,
+    onSelectTab: (AppTab) -> Unit,
+    sideTabs: List<AppTab> = AppTab.defaultSideTabs,
+) {
     val colors = LocalRocheColors.current
+    val normalizedSideTabs = AppTab.normalizeSideTabs(sideTabs)
+    val leftTabs = normalizedSideTabs.take(2)
+    val rightTabs = normalizedSideTabs.drop(2).take(2)
+
     Column(
         modifier =
             Modifier.fillMaxWidth()
@@ -55,7 +115,18 @@ fun RocheBottomBar(activeTab: AppTab, onSelectTab: (AppTab) -> Unit) {
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            AppTab.entries.forEach { tab ->
+            leftTabs.forEach { tab ->
+                BottomBarTabItem(
+                    tab = tab,
+                    isSelected = tab == activeTab,
+                    onClick = { onSelectTab(tab) },
+                )
+            }
+            CenterInboxBarItem(
+                isSelected = activeTab == AppTab.INBOX,
+                onClick = { onSelectTab(AppTab.INBOX) },
+            )
+            rightTabs.forEach { tab ->
                 BottomBarTabItem(
                     tab = tab,
                     isSelected = tab == activeTab,
@@ -63,6 +134,50 @@ fun RocheBottomBar(activeTab: AppTab, onSelectTab: (AppTab) -> Unit) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun RowScope.CenterInboxBarItem(isSelected: Boolean, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    val circleBg = if (isSelected) colors.accentBlue else colors.surfaceElevated
+    val circleBorder = if (isSelected) colors.accentBlue else colors.accentBlue.copy(alpha = 0.55f)
+    val iconTint = if (isSelected) Color.White else colors.accentBlue
+    val labelColor = if (isSelected) colors.textPrimary else colors.textSecondary
+    val labelWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+        modifier =
+            Modifier.weight(1.1f)
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Tab
+                    selected = isSelected
+                }
+                .padding(vertical = 2.dp)
+                .testTag("bottom_tab_inbox"),
+    ) {
+        Box(
+            modifier =
+                Modifier.size(44.dp)
+                    .clip(CircleShape)
+                    .background(circleBg)
+                    .border(width = 1.5.dp, color = circleBorder, shape = CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            BottomTabIcon(tab = AppTab.INBOX, tint = iconTint, size = 21.dp)
+        }
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = AppTab.INBOX.label,
+            color = labelColor,
+            fontSize = 11.5.sp,
+            fontWeight = labelWeight,
+            maxLines = 1,
+        )
     }
 }
 
@@ -114,6 +229,7 @@ fun RocheTopHeader(
     title: String,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
+    navigationAction: (@Composable () -> Unit)? = null,
     content: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
@@ -133,25 +249,35 @@ fun RocheTopHeader(
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Row(
-            verticalAlignment = Alignment.Bottom,
+            verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.weight(1f, fill = false),
         ) {
-            Text(
-                text = title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 23.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            if (!subtitle.isNullOrBlank()) {
+            if (navigationAction != null) {
+                navigationAction()
+            }
+            Row(
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 Text(
-                    text = subtitle,
-                    color = colors.textMuted,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    modifier = Modifier.padding(bottom = 3.dp),
+                    text = title,
+                    color = colors.textPrimary,
+                    fontFamily = headlineFamily,
+                    fontSize = 23.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        color = colors.textMuted,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(bottom = 3.dp),
+                    )
+                }
             }
         }
         if (content != null) {

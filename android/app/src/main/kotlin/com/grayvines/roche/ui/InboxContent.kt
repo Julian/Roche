@@ -38,7 +38,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
@@ -58,21 +57,9 @@ fun InboxTabContent(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Roche",
-            subtitle = "${state.visibleEntries.size} items",
-        ) {
-            if (state.visibleEntries.any { !it.isArchived }) {
-                HeaderActionButton(
-                    label = "Archive All",
-                    onClick = { onAction(MainAction.ArchiveVisibleEntries) },
-                    modifier = Modifier.testTag("archive_all_btn"),
-                )
-            }
-            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
-        }
 
+    Column(modifier = Modifier.fillMaxSize()) {
+        InboxHeaderSection(state = state, onAction = onAction)
         InboxFilterStrip(state = state, onAction = onAction)
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
@@ -107,6 +94,45 @@ fun InboxTabContent(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
+    val title =
+        when {
+            state.selectedFeedId != null -> state.selectedFeedTitle ?: "Feed"
+            state.selectedTag != null -> "#${state.selectedTag}"
+            else -> "Roche"
+        }
+    RocheTopHeader(
+        title = title,
+        subtitle = "${state.visibleEntries.size} items",
+        navigationAction =
+            if (hasScopeFilter) {
+                {
+                    HeaderActionButton(
+                        label = "←",
+                        onClick = {
+                            onAction(MainAction.FilterByFeed(null))
+                            onAction(MainAction.FilterByTag(null))
+                        },
+                        modifier = Modifier.testTag("clear_scope_btn"),
+                    )
+                }
+            } else {
+                null
+            },
+    ) {
+        if (state.visibleEntries.any { !it.isArchived }) {
+            HeaderActionButton(
+                label = "Archive All",
+                onClick = { onAction(MainAction.ArchiveVisibleEntries) },
+                modifier = Modifier.testTag("archive_all_btn"),
+            )
+        }
+        HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
     }
 }
 
@@ -336,38 +362,46 @@ private fun InboxEntryTextColumn(
         } else {
             FontFamily.SansSerif
         }
-    val titleSize = if (ultraDense) 14.sp else 15.5.sp
-    val titleLineHeight = if (ultraDense) 19.sp else 21.sp
-    val maxTitleLines = if (ultraDense) 1 else 2
+    val (titleColor, titleWeight) =
+        if (entry.isUnread) {
+            colors.textPrimary to FontWeight.SemiBold
+        } else {
+            colors.textSecondary to FontWeight.Normal
+        }
+    val (titleSize, titleLineHeight, maxTitleLines) =
+        if (ultraDense) {
+            Triple(14.sp, 19.sp, 1)
+        } else {
+            Triple(15.5.sp, 21.sp, 2)
+        }
+    val snippet =
+        androidx.compose.runtime.remember(entry.summary, ultraDense) {
+            if (ultraDense) "" else extractInboxSnippet(entry.summary.orEmpty())
+        }
 
     Column(modifier = modifier) {
         EntrySourceMetaRow(entry = entry)
         Spacer(modifier = Modifier.height(3.dp))
         Text(
             text = entry.title,
-            color = colors.textPrimary,
+            color = titleColor,
             fontFamily = headlineFamily,
             fontSize = titleSize,
             lineHeight = titleLineHeight,
-            fontWeight = FontWeight.Medium,
+            fontWeight = titleWeight,
             maxLines = maxTitleLines,
             overflow = TextOverflow.Ellipsis,
         )
-        val rawSummary = entry.summary
-        if (!ultraDense && !rawSummary.isNullOrBlank()) {
-            val snippet =
-                androidx.compose.runtime.remember(rawSummary) { extractInboxSnippet(rawSummary) }
-            if (snippet.isNotBlank()) {
-                Spacer(modifier = Modifier.height(3.dp))
-                Text(
-                    text = snippet,
-                    color = colors.textSecondary,
-                    fontSize = 12.5.sp,
-                    lineHeight = 17.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+        if (snippet.isNotBlank()) {
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = snippet,
+                color = colors.textSecondary,
+                fontSize = 12.5.sp,
+                lineHeight = 17.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -375,23 +409,27 @@ private fun InboxEntryTextColumn(
 @Composable
 private fun EntrySourceMetaRow(entry: InboxEntry) {
     val colors = LocalRocheColors.current
-    val sourceDotColor =
-        when (entry.contentType) {
-            ContentType.PDF -> colors.accentBlue
-            ContentType.ARTICLE -> colors.accentVerdigris
-            ContentType.VIDEO -> colors.accentIndianRed
-        }
+    val feedLabelColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
+    val feedLabelWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Medium
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Box(modifier = Modifier.size(5.dp).clip(CircleShape).background(sourceDotColor))
+        if (entry.isUnread) {
+            Box(
+                modifier =
+                    Modifier.size(6.dp)
+                        .clip(CircleShape)
+                        .background(colors.accentBlue)
+                        .testTag("unread_dot_${entry.id}")
+            )
+        }
         Text(
             text = entry.feedTitle,
-            color = colors.textSecondary,
+            color = feedLabelColor,
             fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
+            fontWeight = feedLabelWeight,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f, fill = false),

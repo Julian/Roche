@@ -3,7 +3,6 @@ package com.grayvines.roche.data
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
-import com.grayvines.roche.model.ItemStatus
 
 internal fun filterInboxEntries(
     entries: List<InboxEntry>,
@@ -34,7 +33,8 @@ internal fun matchesScope(
 
 internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean =
     when (filter) {
-        InboxFilter.UNREAD -> entry.status == ItemStatus.UNREAD
+        InboxFilter.ALL -> !entry.isArchived
+        InboxFilter.UNREAD -> entry.isUnread
         InboxFilter.ARTICLES -> !entry.isArchived && entry.contentType == ContentType.ARTICLE
         InboxFilter.PAPERS -> !entry.isArchived && entry.contentType == ContentType.PDF
         InboxFilter.VIDEOS -> !entry.isArchived && entry.contentType == ContentType.VIDEO

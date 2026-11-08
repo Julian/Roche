@@ -56,6 +56,7 @@ enum class HeadlineFont {
 }
 
 enum class InboxFilter(val label: String) {
+    ALL("All"),
     UNREAD("Unread"),
     ARTICLES("Articles"),
     PAPERS("Papers"),
@@ -65,11 +66,31 @@ enum class InboxFilter(val label: String) {
 }
 
 enum class AppTab(val label: String) {
+    FEEDS("Feeds"),
+    STARRED("Starred"),
     INBOX("Inbox"),
     SEARCH("Search"),
-    FEEDS("Feeds"),
     OFFLINE("Offline"),
-    SETTINGS("Settings"),
+    SETTINGS("Settings");
+
+    companion object {
+        const val SIDE_TAB_COUNT = 4
+        val sideTabCandidates: List<AppTab> = listOf(FEEDS, STARRED, SEARCH, OFFLINE, SETTINGS)
+        val defaultSideTabs: List<AppTab> = listOf(FEEDS, STARRED, SEARCH, SETTINGS)
+
+        fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {
+            val distinctValid = tabs.filter { it != INBOX && it in sideTabCandidates }.distinct()
+            if (distinctValid.size == SIDE_TAB_COUNT) return distinctValid
+            val result = distinctValid.toMutableList()
+            for (fallback in defaultSideTabs + sideTabCandidates) {
+                if (result.size >= SIDE_TAB_COUNT) break
+                if (fallback !in result) {
+                    result.add(fallback)
+                }
+            }
+            return result.take(SIDE_TAB_COUNT)
+        }
+    }
 }
 
 data class FeedItem(
@@ -103,15 +124,31 @@ data class InboxEntry(
     val thumbnailMediaId: String?,
     val duration: String?,
     val tags: List<String>,
+    val readAt: String? = null,
+    val thumbnailUrl: String? = null,
 ) {
+    val isRead: Boolean
+        get() = !readAt.isNullOrBlank()
+
     val isArchived: Boolean
         get() = status == ItemStatus.ARCHIVED
 
     val isUnread: Boolean
-        get() = status == ItemStatus.UNREAD
+        get() = status == ItemStatus.UNREAD && !isRead
+
+    val effectiveThumbnailUrl: String?
+        get() =
+            thumbnailUrl?.trim()?.takeIf { it.isNotBlank() }
+                ?: extractFirstImageUrlFromHtml(contentHtml)
 
     val showsThumbnailPreview: Boolean
-        get() = contentType != ContentType.ARTICLE
+        get() =
+            when (contentType) {
+                ContentType.ARTICLE ->
+                    !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
+                ContentType.PDF,
+                ContentType.VIDEO -> true
+            }
 
     val formattedPublishedLabel: String
         get() = formatRelativeTimestamp(publishedAt ?: createdAt)
@@ -124,6 +161,15 @@ data class InboxEntry(
                 ContentType.ARTICLE ->
                     formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
             }
+}
+
+internal fun extractFirstImageUrlFromHtml(html: String?): String? {
+    if (html.isNullOrBlank() || !html.contains("<img", ignoreCase = true)) return null
+    val match = IMG_SRC_REGEX.find(html) ?: return null
+    val rawUrl = match.groupValues[1].trim().replace("&amp;", "&")
+    return rawUrl.takeIf {
+        it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
+    }
 }
 
 internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now()): String {
@@ -156,5 +202,7 @@ private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
 private const val ARTICLE_WORDS_PER_MINUTE = 180
 private val HTML_TAG_STRIP_REGEX = Regex("""<[^>]+>""")
+private val IMG_SRC_REGEX =
+    Regex("""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 private val WHITESPACE_REGEX_TOP = Regex("""\s+""")
 private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

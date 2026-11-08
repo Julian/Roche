@@ -34,6 +34,12 @@ fun BottomTabIcon(
         when (tab) {
             AppTab.INBOX ->
                 drawInboxTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+            AppTab.STARRED ->
+                drawPath(
+                    path = buildStarPath(width = this.size.width, height = this.size.height),
+                    color = tint,
+                    style = stroke,
+                )
             AppTab.SEARCH ->
                 drawSearchTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
             AppTab.FEEDS -> drawFeedsTabIcon(tint = tint, stroke = stroke)

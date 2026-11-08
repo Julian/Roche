@@ -229,4 +229,63 @@ class MainViewModelTest {
 
             collectJob.cancel()
         }
+
+    @Test
+    internal fun `OpenReader marks entry read SelectTab Inbox clears feed scope and SetBottomNavSlot swaps slots`() =
+        runTest {
+            database.dao().upsertFeeds(SeedData.feeds)
+            database.dao().upsertItems(SeedData.items)
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+            // Scope Inbox to a feed, then tap Inbox tab to clear the feed filter
+            viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
+            val scoped = viewModel.uiState.first { it.selectedFeedId == "feed-arxiv-cs-lg" }
+            assertEquals("feed-arxiv-cs-lg", scoped.selectedFeedId)
+
+            viewModel.dispatch(MainAction.SelectTab(com.grayvines.roche.model.AppTab.INBOX))
+            val unscoped = viewModel.uiState.first { it.selectedFeedId == null }
+            assertNull(unscoped.selectedFeedId)
+            assertNull(unscoped.selectedTag)
+
+            // OpenReader marks item-1 as read while keeping it in InboxFilter.ALL
+            viewModel.dispatch(MainAction.OpenReader("item-1"))
+            val afterRead =
+                viewModel.uiState.first { state ->
+                    state.allEntries.any { it.id == "item-1" && it.isRead && !it.isUnread }
+                }
+            assertTrue(afterRead.visibleEntries.any { it.id == "item-1" })
+            assertTrue(!afterRead.allEntries.first { it.id == "item-1" }.readAt.isNullOrBlank())
+
+            // ToggleReadState marks item-1 back as unread
+            viewModel.dispatch(MainAction.ToggleReadState("item-1"))
+            val afterUnread =
+                viewModel.uiState.first { state ->
+                    state.allEntries.any { it.id == "item-1" && !it.isRead && it.isUnread }
+                }
+            assertEquals("Marked as unread", afterUnread.statusBanner)
+            assertNull(afterUnread.allEntries.first { it.id == "item-1" }.readAt)
+
+            // Customize bottom navigation slot 1 to OFFLINE
+            viewModel.dispatch(
+                MainAction.SetBottomNavSlot(
+                    slotIndex = 1,
+                    tab = com.grayvines.roche.model.AppTab.OFFLINE,
+                )
+            )
+            val afterNavUpdate =
+                viewModel.uiState.first { state ->
+                    state.settings.bottomNavTabs[1] == com.grayvines.roche.model.AppTab.OFFLINE
+                }
+            assertEquals(
+                listOf(
+                    com.grayvines.roche.model.AppTab.FEEDS,
+                    com.grayvines.roche.model.AppTab.OFFLINE,
+                    com.grayvines.roche.model.AppTab.SEARCH,
+                    com.grayvines.roche.model.AppTab.SETTINGS,
+                ),
+                afterNavUpdate.settings.bottomNavTabs,
+            )
+
+            collectJob.cancel()
+        }
 }

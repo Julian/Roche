@@ -11,6 +11,7 @@ import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteTagDto
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.UNREAD_READ_AT_TOMBSTONE
 import com.grayvines.roche.data.settings.SettingsRepository
 import java.util.UUID
 import kotlinx.coroutines.flow.first
@@ -31,6 +32,7 @@ internal fun isCleanMutation(mutation: PendingMutationEntity): Boolean =
         mutation.dirtyStatus == null &&
         mutation.dirtyFavorite == null &&
         mutation.dirtyReadProgress == null &&
+        mutation.dirtyReadAt == null &&
         mutation.addedTagsCsv.isBlank() &&
         mutation.removedTagsCsv.isBlank()
 
@@ -48,7 +50,8 @@ internal suspend fun upsertOrCleanPendingMutation(
 internal fun hasDirtyItemFields(mutation: PendingMutationEntity): Boolean =
     mutation.dirtyStatus != null ||
         mutation.dirtyFavorite != null ||
-        mutation.dirtyReadProgress != null
+        mutation.dirtyReadProgress != null ||
+        mutation.dirtyReadAt != null
 
 internal suspend fun finalizeOnlineSavedItem(
     dao: RocheDao,
@@ -123,6 +126,7 @@ internal suspend fun syncInFlightSavedItemMutations(
                 status = inFlight.dirtyStatus,
                 isFavorite = inFlight.dirtyFavorite,
                 readProgress = inFlight.dirtyReadProgress,
+                readAt = inFlight.dirtyReadAt,
             )
         } else {
             true
@@ -161,17 +165,33 @@ internal suspend fun syncInFlightSavedItemMutations(
     upsertOrCleanPendingMutation(
         dao = dao,
         mutation =
-            PendingMutationEntity(
-                entityId = reconciledItemId,
-                isLocalItem = false,
-                dirtyStatus = if (fieldsPushed) null else inFlight.dirtyStatus,
-                dirtyFavorite = if (fieldsPushed) null else inFlight.dirtyFavorite,
-                dirtyReadProgress = if (fieldsPushed) null else inFlight.dirtyReadProgress,
-                addedTagsCsv = remainingAdded.joinToString(","),
-                removedTagsCsv = remainingRemoved.joinToString(","),
+            buildRemainingInFlightMutation(
+                reconciledItemId = reconciledItemId,
+                inFlight = inFlight,
+                fieldsPushed = fieldsPushed,
+                remainingAdded = remainingAdded,
+                remainingRemoved = remainingRemoved,
             ),
     )
 }
+
+private fun buildRemainingInFlightMutation(
+    reconciledItemId: String,
+    inFlight: PendingMutationEntity,
+    fieldsPushed: Boolean,
+    remainingAdded: List<String>,
+    remainingRemoved: List<String>,
+): PendingMutationEntity =
+    PendingMutationEntity(
+        entityId = reconciledItemId,
+        isLocalItem = false,
+        dirtyStatus = if (fieldsPushed) null else inFlight.dirtyStatus,
+        dirtyFavorite = if (fieldsPushed) null else inFlight.dirtyFavorite,
+        dirtyReadProgress = if (fieldsPushed) null else inFlight.dirtyReadProgress,
+        dirtyReadAt = if (fieldsPushed) null else inFlight.dirtyReadAt,
+        addedTagsCsv = remainingAdded.joinToString(","),
+        removedTagsCsv = remainingRemoved.joinToString(","),
+    )
 
 internal suspend fun pushItemUpdateBestEffort(
     apiClient: RocheApiClient,
@@ -180,6 +200,7 @@ internal suspend fun pushItemUpdateBestEffort(
     status: String? = null,
     isFavorite: Boolean? = null,
     readProgress: Double? = null,
+    readAt: String? = null,
 ): Boolean = runCatching {
     val currentSettings = settings.settings.first()
     if (currentSettings.serverUrl.isBlank() || currentSettings.bearerToken.isBlank()) {
@@ -192,6 +213,7 @@ internal suspend fun pushItemUpdateBestEffort(
             status = status,
             isFavorite = isFavorite,
             readProgress = readProgress,
+            readAt = readAt,
         )
         true
     }
@@ -273,6 +295,33 @@ internal suspend fun syncReadProgressMutation(
     upsertOrCleanPendingMutation(
         dao = dao,
         mutation = base.copy(dirtyReadProgress = if (pushed) null else progress),
+    )
+}
+
+internal suspend fun syncReadAtMutation(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    itemId: String,
+    readAt: String?,
+) {
+    val wireReadAt = readAt ?: UNREAD_READ_AT_TOMBSTONE
+    val existing = dao.getPendingMutation(itemId)
+    if (existing?.isLocalItem == true) {
+        dao.upsertPendingMutation(existing.copy(dirtyReadAt = wireReadAt))
+        return
+    }
+    val pushed =
+        pushItemUpdateBestEffort(
+            apiClient = apiClient,
+            settings = settings,
+            itemId = itemId,
+            readAt = wireReadAt,
+        )
+    val base = existing ?: PendingMutationEntity(entityId = itemId)
+    upsertOrCleanPendingMutation(
+        dao = dao,
+        mutation = base.copy(dirtyReadAt = if (pushed) null else wireReadAt),
     )
 }
 
@@ -750,6 +799,7 @@ internal suspend fun pushDirtyItemFields(
                 status = mutation.dirtyStatus,
                 isFavorite = mutation.dirtyFavorite,
                 readProgress = mutation.dirtyReadProgress,
+                readAt = mutation.dirtyReadAt,
             )
         }
     } else {
@@ -764,12 +814,19 @@ internal suspend fun commitPushedLocalItem(
     mutation: PendingMutationEntity,
     fieldsPushed: Boolean,
 ): Pair<RemoteItemDto, PendingMutationEntity> {
+    val effectiveReadAt =
+        when (mutation.dirtyReadAt) {
+            null -> remoteSaved.readAt
+            UNREAD_READ_AT_TOMBSTONE -> null
+            else -> mutation.dirtyReadAt
+        }
     val effectiveSaved =
         remoteSaved.copy(
             title = remoteSaved.title.ifBlank { localItem.title },
             status = mutation.dirtyStatus ?: remoteSaved.status,
             isFavorite = mutation.dirtyFavorite ?: remoteSaved.isFavorite,
             readProgress = mutation.dirtyReadProgress ?: remoteSaved.readProgress,
+            readAt = effectiveReadAt,
             tagNames = (remoteSaved.tagNames + localTags).distinct(),
         )
     if (remoteSaved.id != localItem.id) {
@@ -794,6 +851,7 @@ internal suspend fun commitPushedLocalItem(
                 dirtyStatus = mutation.dirtyStatus,
                 dirtyFavorite = mutation.dirtyFavorite,
                 dirtyReadProgress = mutation.dirtyReadProgress,
+                dirtyReadAt = mutation.dirtyReadAt,
             )
         )
     }
@@ -864,6 +922,7 @@ internal suspend fun pushPendingItemMutation(
             dirtyStatus = if (fieldsCleaned) null else mutation.dirtyStatus,
             dirtyFavorite = if (fieldsCleaned) null else mutation.dirtyFavorite,
             dirtyReadProgress = if (fieldsCleaned) null else mutation.dirtyReadProgress,
+            dirtyReadAt = if (fieldsCleaned) null else mutation.dirtyReadAt,
             addedTagsCsv = remainingAdded.joinToString(","),
             removedTagsCsv = remainingRemoved.joinToString(","),
         )

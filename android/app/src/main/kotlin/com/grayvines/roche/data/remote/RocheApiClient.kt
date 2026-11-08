@@ -145,6 +145,8 @@ data class RemoteItemDto(
     val thumbnailMediaId: String?,
     val duration: String?,
     val tagNames: List<String> = emptyList(),
+    val readAt: String? = null,
+    val thumbnailUrl: String? = null,
 )
 
 data class RemoteTagDto(val id: String, val name: String, val unreadCount: Int)
@@ -368,6 +370,29 @@ class RocheApiClient(private val transport: HttpTransport) {
         .onFailure { if (it is CancellationException) throw it }
         .getOrNull()
 
+    internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? = runCatching {
+        val trimmed = imageUrl.trim()
+        if (
+            !trimmed.startsWith("https://", ignoreCase = true) &&
+                !trimmed.startsWith("http://", ignoreCase = true)
+        ) {
+            return null
+        }
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = trimmed,
+                    expectBinary = true,
+                )
+            )
+        if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
+        val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
+        bytes.takeIf { it.size in 1..MAX_MEDIA_BYTES }
+    }
+        .onFailure { if (it is CancellationException) throw it }
+        .getOrNull()
+
     suspend fun saveItemUrl(
         serverUrl: String,
         token: String,
@@ -411,6 +436,7 @@ class RocheApiClient(private val transport: HttpTransport) {
         status: String? = null,
         isFavorite: Boolean? = null,
         readProgress: Double? = null,
+        readAt: String? = null,
     ): RemoteItemDto {
         val response =
             transport.execute(
@@ -423,6 +449,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                             status = status,
                             isFavorite = isFavorite,
                             readProgress = readProgress,
+                            readAt = readAt,
                         ),
                 )
             )

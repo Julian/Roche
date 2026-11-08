@@ -36,7 +36,7 @@ internal fun buildSnapshot(
 
     val unreadByFeedId =
         domainEntries
-            .filter { it.status == ItemStatus.UNREAD && it.feedId != null }
+            .filter { it.isUnread && it.feedId != null }
             .groupingBy { it.feedId!! }
             .eachCount()
 
@@ -53,7 +53,7 @@ internal fun buildSnapshot(
 
     val unreadByTagName =
         domainEntries
-            .filter { it.status == ItemStatus.UNREAD }
+            .filter { it.isUnread }
             .flatMap { entry -> entry.tags }
             .groupingBy { it }
             .eachCount()
@@ -94,6 +94,8 @@ internal fun toInboxEntry(entity: ItemEntity, tags: List<String>): InboxEntry =
         thumbnailMediaId = entity.thumbnailMediaId,
         duration = entity.duration,
         tags = tags,
+        readAt = entity.readAt,
+        thumbnailUrl = entity.thumbnailUrl,
     )
 
 internal fun toRemoteFeedEntity(remote: RemoteFeedDto): FeedEntity =
@@ -114,20 +116,14 @@ internal fun toRemoteItemEntity(
     ItemEntity(
         id = remote.id,
         feedId = remote.feedId ?: existing?.feedId,
-        feedTitle =
-            remote.feedTitle
-                ?: remote.feedId?.let { feedTitlesById[it] }
-                ?: existing?.feedTitle
-                ?: DEFAULT_SAVED_HOST,
+        feedTitle = resolveRemoteFeedTitle(remote, feedTitlesById, existing),
         title = remote.title.ifBlank { existing?.title.orEmpty() },
         url = remote.url.ifBlank { existing?.url.orEmpty() },
-        author = remote.author?.takeIf { it.isNotBlank() } ?: existing?.author,
-        summary = remote.summary?.takeIf { it.isNotBlank() } ?: existing?.summary,
-        contentText = remote.contentText?.takeIf { it.isNotBlank() } ?: existing?.contentText,
+        author = remote.author.nonBlankOr(existing?.author),
+        summary = remote.summary.nonBlankOr(existing?.summary),
+        contentText = remote.contentText.nonBlankOr(existing?.contentText),
         contentHtml =
-            (remote.contentHtml?.takeIf { it.isNotBlank() } ?: existing?.contentHtml)?.take(
-                MAX_SQLITE_HTML_CHARS
-            ),
+            remote.contentHtml.nonBlankOr(existing?.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
         contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
         status = remote.status,
         isFavorite = remote.isFavorite,
@@ -135,10 +131,24 @@ internal fun toRemoteItemEntity(
         publishedAt = remote.publishedAt ?: existing?.publishedAt,
         createdAt = remote.createdAt.ifBlank { existing?.createdAt.orEmpty() },
         readProgress = remote.readProgress,
-        thumbnailMediaId =
-            remote.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: existing?.thumbnailMediaId,
-        duration = remote.duration?.takeIf { it.isNotBlank() } ?: existing?.duration,
+        thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(existing?.thumbnailMediaId),
+        duration = remote.duration.nonBlankOr(existing?.duration),
+        readAt = remote.readAt,
+        thumbnailUrl = remote.thumbnailUrl.nonBlankOr(existing?.thumbnailUrl),
     )
+
+private fun resolveRemoteFeedTitle(
+    remote: RemoteItemDto,
+    feedTitlesById: Map<String, String>,
+    existing: ItemEntity?,
+): String =
+    remote.feedTitle
+        ?: remote.feedId?.let { feedTitlesById[it] }
+        ?: existing?.feedTitle
+        ?: DEFAULT_SAVED_HOST
+
+private fun String?.nonBlankOr(fallback: String?): String? =
+    this?.takeIf { it.isNotBlank() } ?: fallback
 
 internal fun reconcileSavedItemEntity(
     localEntity: ItemEntity,
@@ -157,6 +167,7 @@ internal fun reconcileSavedItemEntity(
         createdAt = remoteSaved.createdAt.ifBlank { localEntity.createdAt },
         thumbnailMediaId = remoteSaved.thumbnailMediaId ?: localEntity.thumbnailMediaId,
         duration = remoteSaved.duration ?: localEntity.duration,
+        thumbnailUrl = remoteSaved.thumbnailUrl ?: localEntity.thumbnailUrl,
     )
 
 internal fun createSavedItemEntity(

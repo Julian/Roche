@@ -1,5 +1,6 @@
 package com.grayvines.roche.data.settings
 
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.net.URI
@@ -11,6 +12,7 @@ data class Settings(
     val themeMode: ThemeMode = ThemeMode.DARK,
     val headlineFont: HeadlineFont = HeadlineFont.SERIF,
     val ultraDenseRows: Boolean = false,
+    val bottomNavTabs: List<AppTab> = AppTab.defaultSideTabs,
 ) {
     companion object {
         const val DEFAULT_SERVER_URL = ""
@@ -21,6 +23,7 @@ fun Settings.clamped(): Settings =
     copy(
         serverUrl = normalizeServerUrl(serverUrl),
         bearerToken = bearerToken.trim(),
+        bottomNavTabs = AppTab.normalizeSideTabs(bottomNavTabs),
     )
 
 internal fun normalizeServerUrl(rawUrl: String): String {

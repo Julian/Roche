@@ -41,6 +41,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.FilingCabinetIcon
@@ -251,7 +252,19 @@ private fun ReaderArticleBody(
         )
 
         if (entry.tags.isNotEmpty()) {
-            ReaderTagStrip(tags = entry.tags, onSelectTag = onSelectTag)
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+            ) {
+                entry.tags.forEach { tag ->
+                    FilterChipPill(
+                        label = "#$tag",
+                        selected = false,
+                        onClick = { onSelectTag(tag) },
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -300,23 +313,6 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit 
     }
     Spacer(modifier = Modifier.height(8.dp))
     HeaderActionButton(label = "Open Original Link ↗", onClick = onOpenExternalUrl)
-}
-
-@Composable
-private fun ReaderTagStrip(tags: List<String>, onSelectTag: (String) -> Unit) {
-    Spacer(modifier = Modifier.height(10.dp))
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        modifier = Modifier.horizontalScroll(rememberScrollState()),
-    ) {
-        tags.forEach { tag ->
-            FilterChipPill(
-                label = "#$tag",
-                selected = false,
-                onClick = { onSelectTag(tag) },
-            )
-        }
-    }
 }
 
 private fun formatReaderByline(entry: InboxEntry): String = buildString {
@@ -479,6 +475,7 @@ private fun ContextSheetActionsList(
     onShare: () -> Unit,
     onOpenExternalUrl: () -> Unit,
 ) {
+    val readToggleLabel = if (entry.isRead) "Mark as Unread" else "Mark as Read"
     val offlineLabel =
         if (entry.isCachedOffline) {
             "Remove Local Offline Copy"
@@ -486,6 +483,10 @@ private fun ContextSheetActionsList(
             "Download Local Offline Copy"
         }
 
+    ContextActionItem(
+        label = readToggleLabel,
+        onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
+    )
     ContextActionItem(label = "Share…", onClick = onShare)
     ContextActionItem(
         label = offlineLabel,
@@ -505,10 +506,75 @@ private fun ContextSheetActionsList(
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FeedContextBottomSheet(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    ModalBottomSheet(
+        onDismissRequest = { onAction(MainAction.CloseFeedContextSheet) },
+        containerColor = colors.surface,
+    ) {
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+                    .testTag("feed_context_bottom_sheet"),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = feed.title,
+                color = colors.textPrimary,
+                fontFamily = FontFamily.Serif,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "${feed.feedType.wireValue.uppercase()} · ${feed.url}",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            ContextActionItem(
+                label = "View Feed Items (${feed.unreadCount} unread)",
+                onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+            )
+            ContextActionItem(
+                label = "Refresh Feed Now",
+                onClick = {
+                    onAction(MainAction.CloseFeedContextSheet)
+                    onAction(MainAction.RefreshFeed(feed.id))
+                },
+            )
+            ContextActionItem(
+                label = "Open Feed / Site URL",
+                onClick = {
+                    onAction(MainAction.CloseFeedContextSheet)
+                    onOpenExternalUrl(feed.siteUrl ?: feed.url)
+                },
+            )
+            ContextActionItem(
+                label = "Unsubscribe from Feed",
+                textColor = colors.accentIndianRed,
+                onClick = { onAction(MainAction.DeleteFeed(feed.id)) },
+                modifier = Modifier.testTag("delete_feed_${feed.id}"),
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+        }
+    }
+}
+
 @Composable
 private fun ContextActionItem(
     label: String,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
     textColor: androidx.compose.ui.graphics.Color = LocalRocheColors.current.textPrimary,
 ) {
     Text(
@@ -516,7 +582,8 @@ private fun ContextActionItem(
         color = textColor,
         fontSize = 14.sp,
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
+                .fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
                 .clickable(onClick = onClick)
                 .padding(vertical = 10.dp, horizontal = 8.dp),

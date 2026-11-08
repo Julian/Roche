@@ -32,12 +32,13 @@ data class UndoArchiveEvent(
 
 data class MainUiState(
     val activeTab: AppTab = AppTab.INBOX,
-    val activeFilter: InboxFilter = InboxFilter.UNREAD,
+    val activeFilter: InboxFilter = InboxFilter.ALL,
     val searchQuery: String = "",
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
     val selectedReaderEntryId: String? = null,
     val contextSheetEntryId: String? = null,
+    val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
@@ -56,6 +57,12 @@ data class MainUiState(
 
     val contextSheetEntry: InboxEntry?
         get() = allEntries.firstOrNull { it.id == contextSheetEntryId }
+
+    val contextSheetFeed: FeedItem?
+        get() = feeds.firstOrNull { it.id == feedContextSheetId }
+
+    val starredEntries: List<InboxEntry>
+        get() = allEntries.filter { it.isFavorite }
 
     val offlineEntries: List<InboxEntry>
         get() = allEntries.filter { it.isCachedOffline }
@@ -87,6 +94,10 @@ sealed interface MainAction {
 
     data object CloseContextSheet : Ui
 
+    data class OpenFeedContextSheet(val feedId: String) : Ui
+
+    data object CloseFeedContextSheet : Ui
+
     data class OpenAddSheet(
         val prefilledUrl: String = "",
         val prefilledTitle: String = "",
@@ -105,6 +116,8 @@ sealed interface MainAction {
     data class ImportOpml(val opmlXml: String) : Mutation
 
     data class ToggleStar(val entryId: String) : Mutation
+
+    data class ToggleReadState(val entryId: String) : Mutation
 
     data class ToggleOfflineCache(val entryId: String) : Mutation
 
@@ -138,6 +151,8 @@ sealed interface MainAction {
 
     data class SetSwipeToArchive(val enabled: Boolean) : Mutation
 
+    data class SetBottomNavSlot(val slotIndex: Int, val tab: AppTab) : Mutation
+
     data class UpdateServerConfig(
         val serverUrl: String,
         val bearerToken: String,
@@ -155,12 +170,13 @@ sealed interface MainAction {
 
 internal data class TransientUiState(
     val activeTab: AppTab = AppTab.INBOX,
-    val activeFilter: InboxFilter = InboxFilter.UNREAD,
+    val activeFilter: InboxFilter = InboxFilter.ALL,
     val searchQuery: String = "",
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
     val selectedReaderEntryId: String? = null,
     val contextSheetEntryId: String? = null,
+    val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
@@ -195,7 +211,10 @@ class MainViewModel(
             is MainAction.Ui -> {
                 transientState.update { reduceUiAction(it, action) }
                 if (action is MainAction.OpenReader) {
-                    viewModelScope.launch { repository.hydrateItemContentIfNeeded(action.entryId) }
+                    viewModelScope.launch {
+                        repository.setReadState(action.entryId, true)
+                        repository.hydrateItemContentIfNeeded(action.entryId)
+                    }
                 }
             }
             is MainAction.Mutation -> {
@@ -221,6 +240,7 @@ class MainViewModel(
             MainAction.ArchiveVisibleEntries -> performArchiveVisibleEntries()
             is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
             is MainAction.ToggleStar -> performToggleStar(action.entryId)
+            is MainAction.ToggleReadState -> performToggleReadState(action.entryId)
             is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
             is MainAction.ToggleTagOnEntry ->
                 repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
@@ -265,6 +285,12 @@ class MainViewModel(
                 settingsRepository.update { it.copy(ultraDenseRows = action.enabled) }
             is MainAction.SetSwipeToArchive ->
                 settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
+            is MainAction.SetBottomNavSlot ->
+                settingsRepository.update { current ->
+                    val updatedTabs =
+                        updateBottomNavSlot(current.bottomNavTabs, action.slotIndex, action.tab)
+                    current.copy(bottomNavTabs = updatedTabs)
+                }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
             is MainAction.PairWithServer -> performPairWithServer(action)
             MainAction.DiscoverServer -> performDiscoverServer()
@@ -331,6 +357,17 @@ class MainViewModel(
         val starred = repository.toggleStar(entryId)
         transientState.update {
             it.copy(undoEvent = null, statusBanner = if (starred) "Starred" else "Removed star")
+        }
+    }
+
+    internal suspend fun performToggleReadState(entryId: String) {
+        val isRead = repository.toggleReadState(entryId)
+        transientState.update {
+            it.copy(
+                contextSheetEntryId = null,
+                undoEvent = null,
+                statusBanner = if (isRead) "Marked as read" else "Marked as unread",
+            )
         }
     }
 
@@ -440,7 +477,7 @@ class MainViewModel(
                 prefilledShareTitle = "",
                 selectedReaderEntryId = null,
                 activeTab = nextTab,
-                activeFilter = InboxFilter.UNREAD,
+                activeFilter = InboxFilter.ALL,
                 undoEvent = null,
                 statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
             )
@@ -480,8 +517,15 @@ class MainViewModel(
                 transientState.update { current ->
                     val nextFeedId =
                         if (current.selectedFeedId == feedId) null else current.selectedFeedId
+                    val nextFeedSheetId =
+                        if (current.feedContextSheetId == feedId) {
+                            null
+                        } else {
+                            current.feedContextSheetId
+                        }
                     current.copy(
                         selectedFeedId = nextFeedId,
+                        feedContextSheetId = nextFeedSheetId,
                         undoEvent = null,
                         statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
                     )
@@ -601,7 +645,17 @@ internal fun reduceUiAction(
     action: MainAction.Ui,
 ): TransientUiState =
     when (action) {
-        is MainAction.SelectTab -> state.copy(activeTab = action.tab, selectedReaderEntryId = null)
+        is MainAction.SelectTab ->
+            if (action.tab == AppTab.INBOX) {
+                state.copy(
+                    activeTab = AppTab.INBOX,
+                    selectedReaderEntryId = null,
+                    selectedFeedId = null,
+                    selectedTag = null,
+                )
+            } else {
+                state.copy(activeTab = action.tab, selectedReaderEntryId = null)
+            }
         is MainAction.SelectFilter ->
             state.copy(
                 activeFilter = action.filter,
@@ -623,6 +677,7 @@ internal fun reduceUiAction(
                 selectedTag = null,
                 selectedReaderEntryId = null,
                 contextSheetEntryId = null,
+                feedContextSheetId = null,
             )
         is MainAction.UpdateSearchQuery -> state.copy(searchQuery = action.query)
         else -> reduceOverlayUiAction(state, action)
@@ -638,12 +693,15 @@ private fun reduceOverlayUiAction(
         MainAction.CloseReader -> state.copy(selectedReaderEntryId = null)
         is MainAction.OpenContextSheet -> state.copy(contextSheetEntryId = action.entryId)
         MainAction.CloseContextSheet -> state.copy(contextSheetEntryId = null)
+        is MainAction.OpenFeedContextSheet -> state.copy(feedContextSheetId = action.feedId)
+        MainAction.CloseFeedContextSheet -> state.copy(feedContextSheetId = null)
         is MainAction.OpenAddSheet ->
             state.copy(
                 isAddSheetOpen = true,
                 prefilledShareUrl = action.prefilledUrl,
                 prefilledShareTitle = action.prefilledTitle,
                 contextSheetEntryId = null,
+                feedContextSheetId = null,
             )
         MainAction.CloseAddSheet ->
             state.copy(
@@ -654,6 +712,25 @@ private fun reduceOverlayUiAction(
         MainAction.DismissMessages -> state.copy(undoEvent = null, statusBanner = null)
         else -> state
     }
+
+internal fun updateBottomNavSlot(
+    current: List<AppTab>,
+    slotIndex: Int,
+    newTab: AppTab,
+): List<AppTab> {
+    if (newTab == AppTab.INBOX || newTab !in AppTab.sideTabCandidates) {
+        return AppTab.normalizeSideTabs(current)
+    }
+    val normalized = AppTab.normalizeSideTabs(current).toMutableList()
+    if (slotIndex !in normalized.indices) return normalized
+    val existingIndex = normalized.indexOf(newTab)
+    val oldTab = normalized[slotIndex]
+    normalized[slotIndex] = newTab
+    if (existingIndex != -1 && existingIndex != slotIndex) {
+        normalized[existingIndex] = oldTab
+    }
+    return AppTab.normalizeSideTabs(normalized)
+}
 
 internal fun buildMainUiState(
     snapshot: RepositorySnapshot,
@@ -685,6 +762,7 @@ internal fun buildMainUiState(
         selectedFeedId = local.selectedFeedId,
         selectedReaderEntryId = local.selectedReaderEntryId,
         contextSheetEntryId = local.contextSheetEntryId,
+        feedContextSheetId = local.feedContextSheetId,
         isAddSheetOpen = local.isAddSheetOpen,
         prefilledShareUrl = local.prefilledShareUrl,
         prefilledShareTitle = local.prefilledShareTitle,

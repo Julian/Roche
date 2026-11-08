@@ -374,6 +374,9 @@ class RocheRepositoryTest {
             }
         )
 
+        // Marking read records an ISO readAt timestamp and toggling clears it back to null
+        assertReadTimestampSync(liveRepo, requests)
+
         // Removing a tag whose local ID starts with "tag-" resolves the server UUID first
         liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "sqlite")
         assertTrue(
@@ -785,3 +788,30 @@ internal fun handleTwoWaySyncReadRequest(url: String): HttpResponse =
             )
         else -> HttpResponse(statusCode = 404, body = "{}")
     }
+
+internal suspend fun assertReadTimestampSync(
+    liveRepo: RocheRepository,
+    requests: List<Pair<String, String?>>,
+) {
+    liveRepo.setReadState(itemId = "item-1", isRead = true)
+    val readItem = liveRepo.snapshot.first().entries.first { it.id == "item-1" }
+    assertTrue(readItem.isRead)
+    assertTrue(!readItem.readAt.isNullOrBlank())
+    assertTrue(
+        requests.any { (endpoint, body) ->
+            endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                body == """{"read_at":"${readItem.readAt}"}"""
+        }
+    )
+
+    assertFalse(liveRepo.toggleReadState(itemId = "item-1"))
+    val unreadItem = liveRepo.snapshot.first().entries.first { it.id == "item-1" }
+    assertFalse(unreadItem.isRead)
+    assertEquals(null, unreadItem.readAt)
+    assertTrue(
+        requests.any { (endpoint, body) ->
+            endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                body == """{"read_at":null}"""
+        }
+    )
+}
