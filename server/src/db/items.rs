@@ -578,116 +578,79 @@ impl<'a> ItemRepo<'a> {
         read_at: Option<Option<DateTime<Utc>>>,
     ) -> Result<bool> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
 
+        // Read existing row state before starting the transaction so `tx` begins directly
+        // with an `UPDATE` statement (acquiring a write lock immediately without upgrading
+        // a deferred read snapshot, which prevents SQLITE_BUSY_SNAPSHOT under concurrency).
         let existing: Option<(ItemStatus, bool, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT status, is_favorite, read_progress, read_at FROM items WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(self.pool)
         .await?;
 
         let Some((current_status, current_favorite, current_progress, current_read_at)) = existing
         else {
             return Ok(false);
         };
-        let mut effective_read_at = current_read_at;
 
-        if let Some(new_status) = status
-            && new_status != current_status
-        {
-            match new_status {
-                ItemStatus::Archived => {
-                    sqlx::query(
-                        "UPDATE items SET status = 'archived', read_at = COALESCE(read_at, ?), updated_at = ? WHERE id = ?",
-                    )
-                    .bind(now)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                    effective_read_at = effective_read_at.or(Some(now));
-                    SyncRepo::record_activity(
-                        &mut tx,
-                        ActivityEntityType::Item,
-                        id,
-                        ActivityAction::Archive,
-                        now,
-                    )
-                    .await?;
-                }
-                ItemStatus::Unread => {
-                    sqlx::query(
-                        "UPDATE items SET status = 'unread', read_at = NULL, updated_at = ? WHERE id = ?",
-                    )
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                    effective_read_at = None;
-                    SyncRepo::record_activity(
-                        &mut tx,
-                        ActivityEntityType::Item,
-                        id,
-                        ActivityAction::Unarchive,
-                        now,
-                    )
-                    .await?;
-                }
-            }
+        let target_status = status.unwrap_or(current_status);
+        let target_read_at = match target_status {
+            ItemStatus::Archived => match read_at {
+                Some(Some(explicit_ts)) => Some(explicit_ts),
+                Some(None) | None => current_read_at.or(Some(now)),
+            },
+            ItemStatus::Unread => read_at.unwrap_or_else(|| {
+                if current_status == ItemStatus::Archived { None } else { current_read_at }
+            }),
+        };
+        let target_favorite = is_favorite.unwrap_or(current_favorite);
+        let target_progress = read_progress.unwrap_or(current_progress);
+
+        let status_changed = target_status != current_status;
+        let read_at_changed = target_read_at != current_read_at;
+        let fav_changed = target_favorite != current_favorite;
+        let progress_changed = (target_progress - current_progress).abs() > f64::EPSILON;
+
+        if !status_changed && !read_at_changed && !fav_changed && !progress_changed {
+            return Ok(true);
         }
 
-        if let Some(target_read_at) = read_at
-            && target_read_at.is_some() != effective_read_at.is_some()
-        {
-            if let Some(ts) = target_read_at {
-                sqlx::query(
-                    "UPDATE items SET read_at = COALESCE(read_at, ?), updated_at = ? WHERE id = ?",
-                )
-                .bind(ts)
-                .bind(now)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query("UPDATE items SET read_at = NULL, updated_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Item,
-                id,
-                ActivityAction::Update,
-                now,
-            )
-            .await?;
-        }
+        let mut tx = self.pool.begin().await?;
 
-        if let Some(fav) = is_favorite
-            && fav != current_favorite
-        {
-            let action = if fav { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
-            sqlx::query("UPDATE items SET is_favorite = ?, updated_at = ? WHERE id = ?")
-                .bind(fav)
-                .bind(now)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+        sqlx::query(
+            "UPDATE items
+             SET status = ?,
+                 read_at = ?,
+                 is_favorite = ?,
+                 read_progress = ?,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(target_status)
+        .bind(target_read_at)
+        .bind(target_favorite)
+        .bind(target_progress)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+        if status_changed {
+            let action = match target_status {
+                ItemStatus::Archived => ActivityAction::Archive,
+                ItemStatus::Unread => ActivityAction::Unarchive,
+            };
             SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
-        if let Some(progress) = read_progress
-            && (progress - current_progress).abs() > f64::EPSILON
-        {
-            sqlx::query("UPDATE items SET read_progress = ?, updated_at = ? WHERE id = ?")
-                .bind(progress)
-                .bind(now)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+        if fav_changed {
+            let action =
+                if target_favorite { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
+            SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
+        }
+
+        if (read_at_changed && !status_changed) || progress_changed {
             SyncRepo::record_activity(
                 &mut tx,
                 ActivityEntityType::Item,
@@ -746,18 +709,23 @@ impl<'a> ItemRepo<'a> {
             }
             matched
         } else if let Some(fid) = feed_id {
-            sqlx::query_scalar(
-                "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?",
-            )
-            .bind(fid)
-            .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
-            .fetch_all(self.pool)
-            .await?
-        } else if all_unread {
-            sqlx::query_scalar("SELECT id FROM items WHERE status != 'archived' LIMIT ?")
+            let sql = if all_unread {
+                "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL AND feed_id = ? LIMIT ?"
+            } else {
+                "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?"
+            };
+            sqlx::query_scalar(sql)
+                .bind(fid)
                 .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
                 .fetch_all(self.pool)
                 .await?
+        } else if all_unread {
+            sqlx::query_scalar(
+                "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL LIMIT ?",
+            )
+            .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+            .fetch_all(self.pool)
+            .await?
         } else {
             return Ok(0);
         };
@@ -807,8 +775,8 @@ impl<'a> ItemRepo<'a> {
     pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
         use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 
-        let candidates: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, summary FROM items
+        let candidates: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, url, summary FROM items
              WHERE summary IS NOT NULL
                AND (
                  length(summary) > 320
@@ -829,13 +797,17 @@ impl<'a> ItemRepo<'a> {
             tokio::task::spawn_blocking(move || {
                 candidates
                     .into_iter()
-                    .filter_map(|(id, raw_summary)| {
+                    .filter_map(|(id, url_str, raw_summary)| {
                         let excerpt =
                             HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
                         if excerpt == raw_summary {
                             None
                         } else {
-                            let thumb = HtmlSanitizer::extract_first_image_url(&raw_summary);
+                            let base_url = Url::parse(&url_str).ok();
+                            let thumb = HtmlSanitizer::extract_first_image_url_with_base(
+                                &raw_summary,
+                                base_url.as_ref(),
+                            );
                             Some((id, excerpt, thumb))
                         }
                     })
@@ -868,13 +840,23 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
-        use crate::content::fetcher::HtmlSanitizer;
+        use crate::{content::fetcher::HtmlSanitizer, feeds::youtube::YouTubeParser};
 
-        let candidates: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, content_html FROM items
-             WHERE thumbnail_url IS NULL
-               AND content_html IS NOT NULL
-               AND (content_html LIKE '%<img%' OR content_html LIKE '%<IMG%')",
+        let candidates: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, url, content_html, thumbnail_url FROM items
+             WHERE (
+                 thumbnail_url IS NULL
+                 AND (
+                   (content_html IS NOT NULL AND (content_html LIKE '%<img%' OR content_html LIKE '%<IMG%'))
+                   OR url LIKE '%youtube.com/%'
+                   OR url LIKE '%youtu.be/%'
+                 )
+               )
+               OR thumbnail_url LIKE '%.svg'
+               OR thumbnail_url LIKE '%.svg?%'
+               OR thumbnail_url LIKE '%/images/core/emoji/%'
+               OR thumbnail_url LIKE '%/wpcom-smileys/%'
+               OR thumbnail_url LIKE '%/twemoji/%'",
         )
         .fetch_all(self.pool)
         .await?;
@@ -883,29 +865,44 @@ impl<'a> ItemRepo<'a> {
             return Ok(0);
         }
 
-        let extracted: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
+        let updates: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
             candidates
                 .into_iter()
-                .filter_map(|(id, html)| {
-                    HtmlSanitizer::extract_first_image_url(&html).map(|thumb| (id, thumb))
+                .filter_map(|(id, url_str, html_opt, old_thumb)| {
+                    let base_url = Url::parse(&url_str).ok();
+                    let new_thumb = html_opt
+                        .as_deref()
+                        .and_then(|html| {
+                            HtmlSanitizer::extract_first_image_url_with_base(
+                                html,
+                                base_url.as_ref(),
+                            )
+                        })
+                        .or_else(|| {
+                            base_url
+                                .as_ref()
+                                .and_then(YouTubeParser::extract_video_id)
+                                .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"))
+                        });
+                    (new_thumb != old_thumb).then_some((id, new_thumb))
                 })
                 .collect()
         })
         .await?;
 
-        if extracted.is_empty() {
+        if updates.is_empty() {
             return Ok(0);
         }
 
-        let count = u64::try_from(extracted.len()).unwrap_or(0);
+        let count = u64::try_from(updates.len()).unwrap_or(0);
         let mut tx = self.pool.begin().await?;
-        for (id, thumb) in extracted {
+        for (id, thumb) in updates {
             sqlx::query(
                 "UPDATE items
-                 SET thumbnail_url = COALESCE(thumbnail_url, ?)
+                 SET thumbnail_url = ?
                  WHERE id = ?",
             )
-            .bind(&thumb)
+            .bind(thumb)
             .bind(&id)
             .execute(&mut *tx)
             .await?;
@@ -942,6 +939,14 @@ impl<'a> ItemRepo<'a> {
             .bind(status)
             .fetch_one(self.pool)
             .await?)
+    }
+
+    pub async fn count_unread(&self) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM items WHERE status = 'unread' AND read_at IS NULL",
+        )
+        .fetch_one(self.pool)
+        .await?)
     }
 
     pub async fn backfill_metadata(
@@ -1390,6 +1395,42 @@ mod tests {
         assert!(items.update(&item_new.id, None, None, None, Some(None)).await.unwrap());
         let unread_again = items.get(&item_new.id).await.unwrap().unwrap();
         assert!(unread_again.read_at.is_none());
+
+        // Archiving with an explicit client read_at preserves the client timestamp,
+        // and Undo Archive (status=Unread + read_at=Some(custom_read_ts)) restores both
+        assert!(
+            items
+                .update(
+                    &item_new.id,
+                    Some(ItemStatus::Archived),
+                    None,
+                    None,
+                    Some(Some(custom_read_ts)),
+                )
+                .await
+                .unwrap()
+        );
+        let archived_with_ts = items.get(&item_new.id).await.unwrap().unwrap();
+        assert_eq!(archived_with_ts.status, ItemStatus::Archived);
+        assert_eq!(archived_with_ts.read_at, Some(custom_read_ts));
+
+        assert!(
+            items
+                .update(
+                    &item_new.id,
+                    Some(ItemStatus::Unread),
+                    None,
+                    None,
+                    Some(Some(custom_read_ts)),
+                )
+                .await
+                .unwrap()
+        );
+        let restored_read = items.get(&item_new.id).await.unwrap().unwrap();
+        assert_eq!(restored_read.status, ItemStatus::Unread);
+        assert_eq!(restored_read.read_at, Some(custom_read_ts));
+
+        assert!(items.update(&item_new.id, None, None, None, Some(None)).await.unwrap());
 
         // Whitespace-only item_ids do not shadow feed_id in archive_batch
         let before_archive_id = db.sync().latest_activity_id().await.unwrap();

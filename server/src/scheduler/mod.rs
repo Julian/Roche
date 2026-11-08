@@ -202,7 +202,9 @@ impl<F: FeedFetcher> PollScheduler<F> {
                             error = %e,
                             "Feed poll failed"
                         );
-                        let _ = db.feeds().mark_error(&feed.id, &e.to_string()).await;
+                        if matches!(e, PollError::Upstream(_)) {
+                            let _ = db.feeds().mark_error(&feed.id, &e.to_string()).await;
+                        }
                     }
                 }
             });
@@ -429,16 +431,37 @@ impl FeedIngester {
                     .filter_map(|item| {
                         let url = item.link?;
                         let content_type = classify_url(&url);
-                        let clean_desc = HtmlSanitizer::clean(&item.description);
+                        let raw_img = item
+                            .content_html
+                            .as_deref()
+                            .or(Some(item.description.as_str()))
+                            .and_then(|raw| {
+                                HtmlSanitizer::extract_first_image_url_with_base(raw, Some(&url))
+                            });
+                        let clean_desc =
+                            HtmlSanitizer::clean_with_base(&item.description, Some(&url));
                         let content_html = item
                             .content_html
                             .as_deref()
-                            .map(HtmlSanitizer::clean)
+                            .map(|raw| HtmlSanitizer::clean_with_base(raw, Some(&url)))
                             .filter(|h| !h.trim().is_empty())
                             .or_else(|| Some(clean_desc.clone()));
-                        let thumbnail_url = item.thumbnail_url.or_else(|| {
-                            content_html.as_deref().and_then(HtmlSanitizer::extract_first_image_url)
-                        });
+                        let thumbnail_url = item
+                            .thumbnail_url
+                            .or(raw_img)
+                            .or_else(|| {
+                                content_html.as_deref().and_then(|html| {
+                                    HtmlSanitizer::extract_first_image_url_with_base(
+                                        html,
+                                        Some(&url),
+                                    )
+                                })
+                            })
+                            .or_else(|| {
+                                YouTubeParser::extract_video_id(&url).map(|vid| {
+                                    format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+                                })
+                            });
                         let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
                             &clean_desc,
                             MAX_SUMMARY_CHARS,

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::fetcher::SafeHttpClient;
+use crate::content::fetcher::{HtmlSanitizer, SafeHttpClient};
 
 #[derive(Debug, Clone)]
 pub struct RssFeed {
@@ -40,10 +40,10 @@ impl RssParser {
             .into_iter()
             .map(|entry| {
                 let pub_date = extract_entry_timestamp(&entry);
-                let thumbnail_url = Self::extract_entry_thumbnail_url(&entry);
-                let title = entry.title.map(|t| t.content).unwrap_or_default();
                 let link = select_entry_link(&entry.links)
                     .or_else(|| SafeHttpClient::parse_url(&entry.id).ok());
+                let thumbnail_url = Self::extract_entry_thumbnail_url(&entry, link.as_ref());
+                let title = entry.title.map(|t| t.content).unwrap_or_default();
                 let body = entry.content.and_then(|c| c.body);
                 let summary = entry.summary.map(|s| s.content);
                 let description = summary.clone().or_else(|| body.clone()).unwrap_or_default();
@@ -60,11 +60,16 @@ impl RssParser {
         Ok((parsed_feed, items))
     }
 
-    fn extract_entry_thumbnail_url(entry: &feed_rs::model::Entry) -> Option<String> {
+    fn extract_entry_thumbnail_url(
+        entry: &feed_rs::model::Entry,
+        base_url: Option<&Url>,
+    ) -> Option<String> {
         for media in &entry.media {
             for thumb in &media.thumbnails {
-                if let Ok(url) = SafeHttpClient::parse_url(&thumb.image.uri) {
-                    return Some(url.into());
+                if let Some(url) =
+                    HtmlSanitizer::resolve_and_validate_thumbnail_url(&thumb.image.uri, base_url)
+                {
+                    return Some(url);
                 }
             }
             for content in &media.content {
@@ -74,7 +79,10 @@ impl RssParser {
                     .is_some_and(|mime| mime.ty().as_str().eq_ignore_ascii_case("image"));
                 if let Some(ref url) = content.url {
                     let has_img_ext = Self::has_image_extension(url.path());
-                    if (is_image_mime || has_img_ext) && SafeHttpClient::validate_url(url).is_ok() {
+                    if (is_image_mime || has_img_ext)
+                        && !HtmlSanitizer::is_non_thumbnail_url(url)
+                        && SafeHttpClient::validate_url(url).is_ok()
+                    {
                         return Some(url.as_str().to_owned());
                     }
                 }
@@ -89,9 +97,10 @@ impl RssParser {
                 .is_some_and(|mt| mt.trim().to_ascii_lowercase().starts_with("image/"));
             if is_enclosure
                 && is_image_mime
-                && let Ok(url) = SafeHttpClient::parse_url(&link.href)
+                && let Some(url) =
+                    HtmlSanitizer::resolve_and_validate_thumbnail_url(&link.href, base_url)
             {
-                return Some(url.into());
+                return Some(url);
             }
         }
         None

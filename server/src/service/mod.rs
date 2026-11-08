@@ -185,7 +185,7 @@ impl<F: FeedFetcher> RocheService<F> {
 
     pub async fn sync_status(&self) -> Result<SyncStatus, ApiError> {
         let feeds = self.db.feeds().list().await?;
-        let unread_items_count = self.db.items().count_by_status(ItemStatus::Unread).await?;
+        let unread_items_count = self.db.items().count_unread().await?;
         let archived_items_count = self.db.items().count_by_status(ItemStatus::Archived).await?;
         let latest_activity_id = self.db.sync().latest_activity_id().await?;
 
@@ -500,9 +500,12 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             .await
             {
                 Ok(Ok(Some(raw_html))) => {
-                    tokio::task::spawn_blocking(move || HtmlSanitizer::extract_snapshot(&raw_html))
-                        .await
-                        .ok()
+                    let base_url = url.clone();
+                    tokio::task::spawn_blocking(move || {
+                        HtmlSanitizer::extract_snapshot_with_base(&raw_html, Some(&base_url))
+                    })
+                    .await
+                    .ok()
                 }
                 Ok(Ok(None)) => None,
                 Ok(Err(e)) => {
@@ -522,7 +525,12 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             .or_else(|| snapshot.as_ref().and_then(|s| s.title.as_deref()))
             .unwrap_or_else(|| url.as_str());
         let summary = snapshot.as_ref().and_then(|s| s.summary.as_deref());
-        let thumbnail_url = snapshot.as_ref().and_then(|s| s.thumbnail_url.as_deref());
+        let yt_thumb_fallback = crate::feeds::youtube::YouTubeParser::extract_video_id(url)
+            .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+        let thumbnail_url = snapshot
+            .as_ref()
+            .and_then(|s| s.thumbnail_url.as_deref())
+            .or(yt_thumb_fallback.as_deref());
         let content_html = (content_type == ContentType::Article)
             .then(|| snapshot.as_ref().map(|s| s.content_html.as_str()))
             .flatten()

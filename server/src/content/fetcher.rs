@@ -303,8 +303,16 @@ pub struct ExtractedSnapshot {
 impl HtmlSanitizer {
     #[must_use]
     pub fn clean(html: &str) -> String {
+        Self::clean_with_base(html, None)
+    }
+
+    #[must_use]
+    pub fn clean_with_base(html: &str, base_url: Option<&Url>) -> String {
         let mut builder = ammonia::Builder::default();
         builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
+        if let Some(base) = base_url {
+            builder.url_relative(ammonia::UrlRelative::RewriteWithBase(base.clone()));
+        }
         builder.clean(html).to_string()
     }
 
@@ -464,8 +472,14 @@ impl HtmlSanitizer {
 
     /// Extracts `<title>`, `<meta name="description">` / `<meta property="og:description">`,
     /// and sanitized `content_html` from a raw HTML5 document using `ammonia` (`html5ever`) + `quick_xml`.
+    #[cfg(test)]
     #[must_use]
     pub fn extract_snapshot(raw_html: &str) -> ExtractedSnapshot {
+        Self::extract_snapshot_with_base(raw_html, None)
+    }
+
+    #[must_use]
+    pub fn extract_snapshot_with_base(raw_html: &str, base_url: Option<&Url>) -> ExtractedSnapshot {
         // Normalize <title> and <meta> tags through html5ever (via ammonia) so inline <script>if (a < b)</script>,
         // <svg><title>, unquoted attributes, and bare ampersands are parsed per HTML5 spec.
         let mut meta_builder = ammonia::Builder::new();
@@ -477,9 +491,13 @@ impl HtmlSanitizer {
             .add_tag_attributes("meta", &["name", "property", "content"]);
         let normalized_meta_html = meta_builder.clean(raw_html).to_string();
 
-        let (title, meta_desc, meta_image) = Self::parse_title_and_meta(&normalized_meta_html);
-        let content_html = Self::clean(raw_html);
-        let thumbnail_url = meta_image.or_else(|| Self::extract_first_image_url(&content_html));
+        let (title, meta_desc, meta_image) =
+            Self::parse_title_and_meta(&normalized_meta_html, base_url);
+        let raw_image = Self::extract_first_image_url_with_base(raw_html, base_url);
+        let content_html = Self::clean_with_base(raw_html, base_url);
+        let thumbnail_url = meta_image
+            .or(raw_image)
+            .or_else(|| Self::extract_first_image_url_with_base(&content_html, base_url));
         let summary = meta_desc
             .map(|desc| Self::plain_text_truncate(&desc, MAX_SUMMARY_CHARS))
             .filter(|s| !s.is_empty())
@@ -497,9 +515,10 @@ impl HtmlSanitizer {
         ExtractedSnapshot { title, summary, content_html, thumbnail_url }
     }
 
-    /// Scans HTML for the first valid external `http(s)` `<img src="...">` URL, skipping 1x1 tracking pixels.
+    /// Scans HTML for the first valid raster `<img src="...">` URL (resolving relative URLs against `base_url`),
+    /// skipping tracking pixels, inline emojis, footnote icons, and `.svg` images.
     #[must_use]
-    pub fn extract_first_image_url(html: &str) -> Option<String> {
+    pub fn extract_first_image_url_with_base(html: &str, base_url: Option<&Url>) -> Option<String> {
         if !html.contains("<img") && !html.contains("<IMG") {
             return None;
         }
@@ -511,7 +530,7 @@ impl HtmlSanitizer {
                 Ok(Event::Start(tag) | Event::Empty(tag))
                     if tag.name().as_ref().eq_ignore_ascii_case("img") =>
                 {
-                    if let Some(url) = Self::inspect_img_tag(&tag) {
+                    if let Some(url) = Self::inspect_img_tag(&tag, base_url) {
                         return Some(url);
                     }
                 }
@@ -522,10 +541,62 @@ impl HtmlSanitizer {
         None
     }
 
-    fn inspect_img_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+    #[must_use]
+    pub fn resolve_and_validate_thumbnail_url(raw: &str, base_url: Option<&Url>) -> Option<String> {
+        let candidate = raw.trim();
+        if candidate.is_empty()
+            || candidate.starts_with("data:")
+            || candidate.starts_with("javascript:")
+            || candidate.starts_with("mailto:")
+        {
+            return None;
+        }
+        let parsed = match Url::parse(candidate) {
+            Ok(url) => url,
+            Err(url::ParseError::RelativeUrlWithoutBase) => base_url?.join(candidate).ok()?,
+            Err(_) => return None,
+        };
+        SafeHttpClient::validate_url(&parsed).ok()?;
+        if Self::is_non_thumbnail_url(&parsed) {
+            return None;
+        }
+        Some(parsed.into())
+    }
+
+    #[must_use]
+    pub fn is_non_thumbnail_url(url: &Url) -> bool {
+        let path_lower = url.path().to_ascii_lowercase();
+        if std::path::Path::new(&path_lower)
+            .extension()
+            .is_some_and(|ext| matches!(ext.to_str().unwrap_or(""), "svg" | "svgz" | "ico"))
+        {
+            return true;
+        }
+        let full_lower = url.as_str().to_ascii_lowercase();
+        full_lower.contains("/images/core/emoji/")
+            || full_lower.contains("/wpcom-smileys/")
+            || full_lower.contains("/twemoji/")
+            || full_lower.contains("feeds.feedburner.com/~")
+            || path_lower.ends_with("/spacer.gif")
+            || path_lower.ends_with("/blank.gif")
+            || path_lower.ends_with("/1x1.gif")
+            || path_lower.ends_with("/pixel.gif")
+    }
+
+    fn parse_small_dimension(raw: &str) -> bool {
+        let trimmed = raw.trim().trim_end_matches("px").trim();
+        trimmed.parse::<u32>().is_ok_and(|dim| dim <= 32)
+    }
+
+    fn inspect_img_tag(
+        tag: &quick_xml::events::BytesStart<'_>,
+        base_url: Option<&Url>,
+    ) -> Option<String> {
         let mut src: Option<String> = None;
         let mut width: Option<String> = None;
         let mut height: Option<String> = None;
+        let mut class_attr: Option<String> = None;
+        let mut alt_attr: Option<String> = None;
 
         for attr in tag.attributes().with_checks(false).flatten() {
             let key = attr.key.as_ref();
@@ -538,24 +609,36 @@ impl HtmlSanitizer {
                 width = Some(val);
             } else if key.eq_ignore_ascii_case("height") {
                 height = Some(val);
+            } else if key.eq_ignore_ascii_case("class") {
+                class_attr = Some(val);
+            } else if key.eq_ignore_ascii_case("alt") {
+                alt_attr = Some(val);
             }
         }
 
-        if width.as_deref().is_some_and(|w| matches!(w.trim(), "0" | "1" | "1px"))
-            || height.as_deref().is_some_and(|h| matches!(h.trim(), "0" | "1" | "1px"))
+        if width.as_deref().is_some_and(Self::parse_small_dimension)
+            || height.as_deref().is_some_and(Self::parse_small_dimension)
         {
             return None;
         }
 
-        let candidate = src?.trim().to_owned();
-        if candidate.is_empty() || candidate.starts_with("data:") {
+        if let Some(cls) = class_attr {
+            let lower = cls.to_ascii_lowercase();
+            if lower.contains("wp-smiley") || lower.contains("emoji") || lower.contains("smiley") {
+                return None;
+            }
+        }
+
+        if alt_attr.as_deref().is_some_and(|a| matches!(a.trim(), "↩" | "↩︎")) {
             return None;
         }
-        SafeHttpClient::parse_url(&candidate).ok().map(String::from)
+
+        Self::resolve_and_validate_thumbnail_url(src.as_deref()?, base_url)
     }
 
     fn parse_title_and_meta(
         normalized_html: &str,
+        base_url: Option<&Url>,
     ) -> (Option<String>, Option<String>, Option<String>) {
         let mut reader = Reader::from_str(normalized_html);
         reader.config_mut().check_end_names = false;
@@ -578,6 +661,7 @@ impl HtmlSanitizer {
                     } else if name_bytes.eq_ignore_ascii_case("meta") {
                         Self::inspect_meta_tag(
                             &tag,
+                            base_url,
                             &mut og_title,
                             &mut meta_desc,
                             &mut meta_image,
@@ -585,7 +669,13 @@ impl HtmlSanitizer {
                     }
                 }
                 Ok(Event::Empty(tag)) if tag.name().as_ref().eq_ignore_ascii_case("meta") => {
-                    Self::inspect_meta_tag(&tag, &mut og_title, &mut meta_desc, &mut meta_image);
+                    Self::inspect_meta_tag(
+                        &tag,
+                        base_url,
+                        &mut og_title,
+                        &mut meta_desc,
+                        &mut meta_image,
+                    );
                 }
                 Ok(Event::Text(text)) if in_title => {
                     let decoded =
@@ -663,6 +753,7 @@ impl HtmlSanitizer {
 
     fn inspect_meta_tag(
         tag: &quick_xml::events::BytesStart<'_>,
+        base_url: Option<&Url>,
         og_title: &mut Option<String>,
         meta_desc: &mut Option<String>,
         meta_image: &mut Option<String>,
@@ -697,9 +788,9 @@ impl HtmlSanitizer {
             *og_title = Some(content);
         } else if meta_image.is_none()
             && (name.eq_ignore_ascii_case("og:image") || name.eq_ignore_ascii_case("twitter:image"))
-            && let Ok(valid_url) = SafeHttpClient::parse_url(&content)
+            && let Some(valid_url) = Self::resolve_and_validate_thumbnail_url(&content, base_url)
         {
-            *meta_image = Some(valid_url.into());
+            *meta_image = Some(valid_url);
         }
     }
 }
@@ -856,5 +947,31 @@ mod tests {
         assert!(decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
         let (feed, _) = crate::feeds::RssParser::parse(&decoded).unwrap();
         assert_eq!(feed.title, "Petzold");
+    }
+
+    #[test]
+    fn test_extract_first_image_url_with_base_resolves_relative_and_skips_emojis_svg_and_small_icons()
+     {
+        let base = Url::parse("https://blog.example.com/posts/2026/predicate-logic/").unwrap();
+        let html = r#"
+            <p>Emoji <img src="https://s.w.org/images/core/emoji/17.0.2/72x72/21a9.png" alt="↩"> and
+            smiley <img class="wp-smiley" src="https://blog.example.com/smile.png"> and
+            tiny <img src="/icon.png" width="24" height="24"> and
+            vector <img src="/diagram.svg"> and
+            real <img src="img/quantifier-breakdown.png"></p>
+        "#;
+        let extracted = HtmlSanitizer::extract_first_image_url_with_base(html, Some(&base));
+        assert_eq!(
+            extracted.as_deref(),
+            Some(
+                "https://blog.example.com/posts/2026/predicate-logic/img/quantifier-breakdown.png"
+            )
+        );
+
+        let root_rel = HtmlSanitizer::extract_first_image_url_with_base(
+            r#"<img src="/static/hero.webp">"#,
+            Some(&base),
+        );
+        assert_eq!(root_rel.as_deref(), Some("https://blog.example.com/static/hero.webp"));
     }
 }

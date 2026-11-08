@@ -270,16 +270,18 @@ impl<'a> FeedRepo<'a> {
         batch: &PollBatch,
     ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
 
         let new_title = batch.title.as_deref().filter(|s| !s.is_empty());
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
         let new_lang = batch.language.as_deref().filter(|s| !s.is_empty());
 
+        // Read existing metadata before starting the transaction so that `tx` begins
+        // directly with an `UPDATE` statement (acquiring a write lock immediately
+        // instead of upgrading a deferred read snapshot, which avoids SQLITE_BUSY_SNAPSHOT).
         let existing_meta: Option<(Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as("SELECT title, description, language FROM feeds WHERE id = ?")
                 .bind(feed_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(self.pool)
                 .await?;
 
         let metadata_updated = existing_meta.is_some_and(|(cur_title, cur_desc, cur_lang)| {
@@ -287,6 +289,8 @@ impl<'a> FeedRepo<'a> {
                 || (cur_desc.is_none() && new_desc.is_some())
                 || (cur_lang.is_none() && new_lang.is_some())
         });
+
+        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "UPDATE feeds

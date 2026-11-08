@@ -275,8 +275,9 @@ impl ApiRoutes {
         ProblemPath(id): ProblemPath<String>,
         ProblemJson(req): ProblemJson<UpdateItemRequest>,
     ) -> Result<Json<ItemDetail>, ApiError> {
-        let resolved_read_at =
-            req.read_at.or_else(|| req.is_read.map(|want_read| want_read.then(Utc::now)));
+        let resolved_read_at = req
+            .read_at
+            .or_else(|| req.is_read.map(|want_read| want_read.then(crate::db::SyncRepo::now_utc)));
         let detail = service
             .items()
             .update(&id, req.status, req.is_favorite, req.read_progress, resolved_read_at)

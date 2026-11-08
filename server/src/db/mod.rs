@@ -52,7 +52,7 @@ impl Db {
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(30));
 
         let pool =
             SqlitePoolOptions::new().max_connections(5).connect_with(connect_options).await?;
