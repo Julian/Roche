@@ -132,7 +132,7 @@ internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = ru
 }
     .getOrNull()
 
-private fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
+internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
     val u1 = URI.create(firstUrl)
     val u2 = URI.create(secondUrl)
     u1.host.equals(u2.host, ignoreCase = true) && u1.port == u2.port
