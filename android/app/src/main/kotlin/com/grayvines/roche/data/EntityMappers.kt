@@ -13,8 +13,8 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.time.Instant
-import java.util.UUID
 
+@Suppress("LongMethod")
 internal fun buildSnapshot(
     items: List<ItemEntity>,
     feeds: List<FeedEntity>,
@@ -28,7 +28,14 @@ internal fun buildSnapshot(
                 keySelector = { it.itemId },
                 valueTransform = { tagsById[it.tagId]?.name },
             )
-            .mapValues { (_, names) -> names.filterNotNull().sorted() }
+            .mapValues { (_, names) ->
+                names
+                    .filterNotNull()
+                    .sortedWith(
+                        compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) { it }
+                            .thenBy { it }
+                    )
+            }
 
     val domainEntries = items.map { entity ->
         toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
@@ -40,16 +47,22 @@ internal fun buildSnapshot(
             .groupingBy { it.feedId!! }
             .eachCount()
 
-    val domainFeeds = feeds.map { feed ->
-        FeedItem(
-            id = feed.id,
-            title = feed.title,
-            url = feed.url,
-            siteUrl = feed.siteUrl,
-            feedType = FeedType.fromWireValue(feed.feedType),
-            unreadCount = unreadByFeedId[feed.id] ?: 0,
-        )
-    }
+    val domainFeeds =
+        feeds
+            .map { feed ->
+                FeedItem(
+                    id = feed.id,
+                    title = feed.title,
+                    url = feed.url,
+                    siteUrl = feed.siteUrl,
+                    feedType = FeedType.fromWireValue(feed.feedType),
+                    unreadCount = unreadByFeedId[feed.id] ?: 0,
+                )
+            }
+            .sortedWith(
+                compareBy<FeedItem, String>(String.CASE_INSENSITIVE_ORDER) { it.title }
+                    .thenBy { it.title }
+            )
 
     val unreadByTagName =
         domainEntries
@@ -58,13 +71,19 @@ internal fun buildSnapshot(
             .groupingBy { it }
             .eachCount()
 
-    val domainTags = tags.map { tag ->
-        TagItem(
-            id = tag.id,
-            name = tag.name,
-            unreadCount = unreadByTagName[tag.name] ?: 0,
-        )
-    }
+    val domainTags =
+        tags
+            .map { tag ->
+                TagItem(
+                    id = tag.id,
+                    name = tag.name,
+                    unreadCount = unreadByTagName[tag.name] ?: 0,
+                )
+            }
+            .sortedWith(
+                compareBy<TagItem, String>(String.CASE_INSENSITIVE_ORDER) { it.name }
+                    .thenBy { it.name }
+            )
 
     return RepositorySnapshot(
         entries = domainEntries,
@@ -98,32 +117,55 @@ internal fun toInboxEntry(entity: ItemEntity, tags: List<String>): InboxEntry =
         thumbnailUrl = entity.thumbnailUrl,
     )
 
-internal fun toRemoteFeedEntity(remote: RemoteFeedDto): FeedEntity =
-    FeedEntity(
+internal fun toRemoteFeedEntity(
+    remote: RemoteFeedDto,
+    existing: FeedEntity? = null,
+): FeedEntity {
+    val useExistingPoll =
+        existing != null &&
+            existing.lastPolled != null &&
+            (remote.lastPolled == null || existing.lastPolled > remote.lastPolled)
+    val pollSource = if (useExistingPoll) existing else null
+    return FeedEntity(
         id = remote.id,
-        title = remote.title,
-        url = remote.url,
-        siteUrl = remote.siteUrl,
+        title = remote.title.ifBlank { existing?.title.orEmpty() },
+        url = remote.url.ifBlank { existing?.url.orEmpty() },
+        siteUrl = remote.siteUrl ?: existing?.siteUrl,
         feedType = remote.feedType,
+        description = remote.description ?: existing?.description,
+        language = remote.language ?: existing?.language,
+        pollInterval = remote.pollInterval,
+        lastPolled = pollSource?.lastPolled ?: remote.lastPolled,
+        lastPolledBy = pollSource?.lastPolledBy ?: remote.lastPolledBy,
+        lastError = pollSource?.lastError ?: remote.lastError,
+        lastErrorBy = pollSource?.lastErrorBy ?: remote.lastErrorBy,
+        isActive = remote.isActive,
     )
+}
 
 internal fun toRemoteItemEntity(
     remote: RemoteItemDto,
     feedTitlesById: Map<String, String>,
     isCachedOffline: Boolean,
     existing: ItemEntity? = null,
-): ItemEntity =
-    ItemEntity(
+    feedUrlsById: Map<String, String> = emptyMap(),
+): ItemEntity {
+    val resolvedFeedId = remote.feedId ?: existing?.feedId
+    val resolvedFeedUrl =
+        remote.feedUrl ?: resolvedFeedId?.let { feedUrlsById[it] } ?: existing?.feedUrl
+    val richerSummary = pickRicherString(existing?.summary, remote.summary)
+    val richerHtml =
+        pickRicherString(existing?.contentHtml, remote.contentHtml)?.take(MAX_SQLITE_HTML_CHARS)
+    return ItemEntity(
         id = remote.id,
-        feedId = remote.feedId ?: existing?.feedId,
+        feedId = resolvedFeedId,
         feedTitle = resolveRemoteFeedTitle(remote, feedTitlesById, existing),
         title = remote.title.ifBlank { existing?.title.orEmpty() },
         url = remote.url.ifBlank { existing?.url.orEmpty() },
         author = remote.author.nonBlankOr(existing?.author),
-        summary = remote.summary.nonBlankOr(existing?.summary),
-        contentText = remote.contentText.nonBlankOr(existing?.contentText),
-        contentHtml =
-            remote.contentHtml.nonBlankOr(existing?.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
+        summary = richerSummary,
+        contentText = remote.contentText.nonBlankOr(existing?.contentText) ?: richerSummary,
+        contentHtml = richerHtml,
         contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
         status = remote.status,
         isFavorite = remote.isFavorite,
@@ -141,7 +183,25 @@ internal fun toRemoteItemEntity(
                 remote.readAt
             },
         thumbnailUrl = remote.thumbnailUrl.nonBlankOr(existing?.thumbnailUrl),
+        feedUrl = resolvedFeedUrl,
+        interactionUpdatedAt =
+            newerIsoTimestamp(remote.interactionUpdatedAt, existing?.interactionUpdatedAt),
     )
+}
+
+internal fun newerIsoTimestamp(first: String?, second: String?): String? {
+    val a = first?.trim()?.takeIf { it.isNotEmpty() }
+    val b = second?.trim()?.takeIf { it.isNotEmpty() }
+    if (a == null) return b
+    if (b == null) return a
+    val instA = runCatching { Instant.parse(a) }.getOrNull()
+    val instB = runCatching { Instant.parse(b) }.getOrNull()
+    return if (instA != null && instB != null) {
+        if (instB.isAfter(instA)) b else a
+    } else {
+        if (b > a) b else a
+    }
+}
 
 private fun resolveRemoteFeedTitle(
     remote: RemoteItemDto,
@@ -182,7 +242,7 @@ internal fun createSavedItemEntity(
     hostTitle: String,
     type: ContentType,
 ): ItemEntity {
-    val id = "item-${UUID.randomUUID()}"
+    val id = deterministicItemId(null, url)
     return ItemEntity(
         id = id,
         feedId = null,

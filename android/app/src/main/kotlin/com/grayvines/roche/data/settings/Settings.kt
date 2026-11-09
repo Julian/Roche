@@ -8,6 +8,8 @@ import java.net.URI
 data class Settings(
     val serverUrl: String = DEFAULT_SERVER_URL,
     val bearerToken: String = "",
+    val peerId: String = DEFAULT_PEER_ID,
+    val deviceName: String = DEFAULT_DEVICE_NAME,
     val swipeToArchive: Boolean = true,
     val themeMode: ThemeMode = ThemeMode.DARK,
     val headlineFont: HeadlineFont = HeadlineFont.SERIF,
@@ -16,6 +18,8 @@ data class Settings(
 ) {
     companion object {
         const val DEFAULT_SERVER_URL = ""
+        const val DEFAULT_PEER_ID = "android-peer"
+        const val DEFAULT_DEVICE_NAME = "Roche Android"
     }
 }
 
@@ -23,6 +27,8 @@ fun Settings.clamped(): Settings =
     copy(
         serverUrl = normalizeServerUrl(serverUrl),
         bearerToken = bearerToken.trim(),
+        peerId = peerId.trim().ifBlank { Settings.DEFAULT_PEER_ID },
+        deviceName = deviceName.trim().ifBlank { Settings.DEFAULT_DEVICE_NAME },
         bottomNavTabs = AppTab.normalizeSideTabs(bottomNavTabs),
     )
 

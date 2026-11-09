@@ -3,13 +3,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
 use url::Url;
-use uuid::Uuid;
 
-use super::{ActivityAction, ActivityEntityType, ContentType, FeedType, SyncRepo};
+use super::{
+    ActivityAction, ActivityEntityType, ContentType, FeedType, SyncRepo,
+    sync::{
+        SERVER_PEER_ID, deterministic_feed_id, deterministic_item_id, feed_natural_key,
+        item_natural_key,
+    },
+};
 use crate::feeds::OpmlOutline;
 
 const FEED_SELECT: &str = "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
-       f.poll_interval, f.last_polled, f.last_error, f.is_active,
+       f.poll_interval, f.last_polled, f.last_polled_by, f.last_error, f.last_error_by, f.is_active,
        (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
 FROM feeds f";
 
@@ -25,7 +30,11 @@ pub struct Feed {
     pub language: Option<String>,
     pub poll_interval: i64,
     pub last_polled: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_polled_by: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_by: Option<String>,
     pub is_active: bool,
     pub unread_count: i64,
 }
@@ -79,9 +88,16 @@ impl<'a> FeedRepo<'a> {
         description: Option<&str>,
         poll_interval: i64,
     ) -> Result<Feed> {
-        let id = Uuid::new_v4().to_string();
+        let id = deterministic_feed_id(url.as_str());
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+
+        SyncRepo::clear_tombstone(
+            &mut tx,
+            ActivityEntityType::Feed,
+            &feed_natural_key(url.as_str()),
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO feeds (id, feed_type, url, title, description, poll_interval, created_at, updated_at)
@@ -118,7 +134,9 @@ impl<'a> FeedRepo<'a> {
             language: None,
             poll_interval,
             last_polled: None,
+            last_polled_by: None,
             last_error: None,
+            last_error_by: None,
             is_active: true,
             unread_count: 0,
         })
@@ -134,7 +152,14 @@ impl<'a> FeedRepo<'a> {
         let mut imported = Vec::new();
 
         for outline in outlines {
-            let id = Uuid::new_v4().to_string();
+            let id = deterministic_feed_id(outline.xml_url.as_str());
+            SyncRepo::clear_tombstone(
+                &mut tx,
+                ActivityEntityType::Feed,
+                &feed_natural_key(outline.xml_url.as_str()),
+            )
+            .await?;
+
             let res = sqlx::query(
                 "INSERT OR IGNORE INTO feeds
                  (id, feed_type, url, title, description, poll_interval, created_at, updated_at)
@@ -169,7 +194,9 @@ impl<'a> FeedRepo<'a> {
                     language: None,
                     poll_interval: default_interval,
                     last_polled: None,
+                    last_polled_by: None,
                     last_error: None,
+                    last_error_by: None,
                     is_active: true,
                     unread_count: 0,
                 });
@@ -238,11 +265,21 @@ impl<'a> FeedRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let result =
-            sqlx::query("DELETE FROM feeds WHERE id = ?").bind(id).execute(&mut *tx).await?;
-        if result.rows_affected() == 0 {
+        let deleted_url: Option<String> =
+            sqlx::query_scalar("DELETE FROM feeds WHERE id = ? RETURNING url")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(feed_url) = deleted_url else {
             return Ok(false);
-        }
+        };
+        SyncRepo::record_tombstone(
+            &mut tx,
+            ActivityEntityType::Feed,
+            &feed_natural_key(&feed_url),
+            now,
+        )
+        .await?;
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Feed,
@@ -255,13 +292,20 @@ impl<'a> FeedRepo<'a> {
         Ok(true)
     }
 
-    pub async fn get_active_for_polling(&self) -> Result<Vec<Feed>> {
+    pub async fn get_active_for_cooperative_polling(
+        &self,
+        local_peer_id: &str,
+    ) -> Result<Vec<Feed>> {
         let sql = format!(
             "{FEED_SELECT}
              WHERE f.is_active = 1
-               AND (f.last_polled IS NULL OR datetime(f.last_polled) < datetime('now', '-' || f.poll_interval || ' minutes'))"
+               AND (
+                   f.last_polled IS NULL
+                   OR datetime(f.last_polled) < datetime('now', '-' || f.poll_interval || ' minutes')
+                   OR (f.last_error IS NOT NULL AND f.last_error_by IS NOT NULL AND f.last_error_by != ?)
+               )"
         );
-        Ok(sqlx::query_as::<_, Feed>(&sql).fetch_all(self.pool).await?)
+        Ok(sqlx::query_as::<_, Feed>(&sql).bind(local_peer_id).fetch_all(self.pool).await?)
     }
 
     pub async fn record_poll_batch(
@@ -269,6 +313,16 @@ impl<'a> FeedRepo<'a> {
         feed_id: &str,
         batch: &PollBatch,
     ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
+        self.record_poll_batch_by_peer(feed_id, batch, SERVER_PEER_ID).await
+    }
+
+    pub async fn record_poll_batch_by_peer(
+        &self,
+        feed_id: &str,
+        batch: &PollBatch,
+        peer_id: &str,
+    ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
+        type FeedMetaRow = (String, Option<String>, Option<String>, Option<String>);
         let now = SyncRepo::now_utc();
 
         let new_title = batch.title.as_deref().filter(|s| !s.is_empty());
@@ -278,17 +332,19 @@ impl<'a> FeedRepo<'a> {
         // Read existing metadata before starting the transaction so that `tx` begins
         // directly with an `UPDATE` statement (acquiring a write lock immediately
         // instead of upgrading a deferred read snapshot, which avoids SQLITE_BUSY_SNAPSHOT).
-        let existing_meta: Option<(Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT title, description, language FROM feeds WHERE id = ?")
+        let existing_meta: Option<FeedMetaRow> =
+            sqlx::query_as("SELECT url, title, description, language FROM feeds WHERE id = ?")
                 .bind(feed_id)
                 .fetch_optional(self.pool)
                 .await?;
 
-        let metadata_updated = existing_meta.is_some_and(|(cur_title, cur_desc, cur_lang)| {
-            (cur_title.is_none() && new_title.is_some())
-                || (cur_desc.is_none() && new_desc.is_some())
-                || (cur_lang.is_none() && new_lang.is_some())
-        });
+        let feed_url = existing_meta.as_ref().map(|(u, _, _, _)| u.clone());
+        let metadata_updated =
+            existing_meta.as_ref().is_some_and(|(_, cur_title, cur_desc, cur_lang)| {
+                (cur_title.is_none() && new_title.is_some())
+                    || (cur_desc.is_none() && new_desc.is_some())
+                    || (cur_lang.is_none() && new_lang.is_some())
+            });
 
         let mut tx = self.pool.begin().await?;
 
@@ -298,7 +354,9 @@ impl<'a> FeedRepo<'a> {
                  description = COALESCE(description, ?),
                  language = COALESCE(language, ?),
                  last_polled = ?,
+                 last_polled_by = ?,
                  last_error = NULL,
+                 last_error_by = NULL,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -306,6 +364,7 @@ impl<'a> FeedRepo<'a> {
         .bind(new_desc)
         .bind(new_lang)
         .bind(now)
+        .bind(peer_id)
         .bind(now)
         .bind(feed_id)
         .execute(&mut *tx)
@@ -324,11 +383,15 @@ impl<'a> FeedRepo<'a> {
 
         let mut inserted = Vec::new();
         for item in &batch.items {
-            let id = Uuid::new_v4().to_string();
+            let natural_key = item_natural_key(feed_url.as_deref(), item.url.as_str());
+            let id = deterministic_item_id(feed_url.as_deref(), item.url.as_str());
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO items
                  (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ?
+                 )",
             )
             .bind(&id)
             .bind(feed_id)
@@ -342,6 +405,7 @@ impl<'a> FeedRepo<'a> {
             .bind(item.content_type)
             .bind(now)
             .bind(now)
+            .bind(&natural_key)
             .execute(&mut *tx)
             .await?;
 
@@ -363,11 +427,16 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn mark_error(&self, id: &str, error: &str) -> Result<()> {
+        self.mark_error_by_peer(id, error, SERVER_PEER_ID).await
+    }
+
+    pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
         sqlx::query(
-            "UPDATE feeds SET last_error = ?, last_polled = ?, updated_at = ? WHERE id = ?",
+            "UPDATE feeds SET last_error = ?, last_error_by = ?, last_polled = ?, updated_at = ? WHERE id = ?",
         )
         .bind(error)
+        .bind(peer_id)
         .bind(now)
         .bind(now)
         .bind(id)
@@ -393,13 +462,19 @@ mod tests {
         let feed = feed_repo.create(FeedType::Rss, &feed_url, Some("Example"), None).await.unwrap();
 
         // Newly created feed has last_polled = NULL so it is eligible for polling
-        let active = feed_repo.get_active_for_polling().await.unwrap();
+        let active = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
         assert_eq!(active.len(), 1);
 
         // Marking an error sets last_polled so it backs off until poll_interval elapses
         feed_repo.mark_error(&feed.id, "timeout").await.unwrap();
-        let active_after_err = feed_repo.get_active_for_polling().await.unwrap();
+        let active_after_err =
+            feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
         assert!(active_after_err.is_empty());
+
+        // Another peer IS immediately eligible to rescue a feed that failed on "server"
+        let active_for_rescue_peer =
+            feed_repo.get_active_for_cooperative_polling("android-peer-1").await.unwrap();
+        assert_eq!(active_for_rescue_peer.len(), 1);
 
         // Create an item under this feed and verify ON DELETE CASCADE removes it
         let item_url = Url::parse("https://example.com/1").unwrap();

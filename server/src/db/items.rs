@@ -5,11 +5,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
 use url::Url;
-use uuid::Uuid;
 
 use super::{
     ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, ItemSortField, ItemStatus,
     ItemStatusFilter, ReadAtPatch, SortOrder, SyncRepo, Tag, TagRepo,
+    sync::{deterministic_item_id, item_natural_key},
 };
 
 const MAX_SEARCH_TERMS: usize = 16;
@@ -17,11 +17,11 @@ const MAX_SEARCH_TERMS: usize = 16;
 macro_rules! item_select_sql {
     ($content_html_expr:literal) => {
         concat!(
-            "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
+            "SELECT i.id, i.feed_id, f.url AS feed_url, f.title AS feed_title, i.title, i.url, i.author,
        i.published_at, i.created_at, i.summary, ",
             $content_html_expr,
             " AS content_html, i.thumbnail_url, i.content_type, i.status,
-       i.is_favorite, i.read_at, i.read_progress,
+       i.is_favorite, i.read_at, i.read_progress, i.interaction_updated_at,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
        (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
        COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
@@ -58,6 +58,8 @@ impl TryFrom<&str> for TagNames {
 pub struct Item {
     pub id: String,
     pub feed_id: Option<String>,
+    #[serde(default)]
+    pub feed_url: Option<String>,
     pub feed_title: Option<String>,
     pub title: String,
     #[sqlx(try_from = "&'a str")]
@@ -73,6 +75,8 @@ pub struct Item {
     pub is_favorite: bool,
     pub read_at: Option<DateTime<Utc>>,
     pub read_progress: f64,
+    #[serde(default)]
+    pub interaction_updated_at: Option<DateTime<Utc>>,
     pub thumbnail_media_id: Option<String>,
     pub duration: Option<i64>,
     #[serde(default)]
@@ -269,7 +273,16 @@ impl<'a> ItemRepo<'a> {
 
     #[cfg(test)]
     pub async fn create(&self, new_item: &NewItem<'_>) -> Result<Item> {
-        let id = Uuid::new_v4().to_string();
+        let feed_url: Option<String> = match new_item.feed_id {
+            Some(fid) => {
+                sqlx::query_scalar("SELECT url FROM feeds WHERE id = ?")
+                    .bind(fid)
+                    .fetch_optional(self.pool)
+                    .await?
+            }
+            None => None,
+        };
+        let id = deterministic_item_id(feed_url.as_deref(), new_item.url.as_str());
         let now = SyncRepo::now_utc();
 
         sqlx::query(
@@ -292,6 +305,7 @@ impl<'a> ItemRepo<'a> {
         Ok(Item {
             id,
             feed_id: new_item.feed_id.map(String::from),
+            feed_url,
             feed_title: None,
             title: new_item.title.to_string(),
             url: new_item.url.clone(),
@@ -306,6 +320,7 @@ impl<'a> ItemRepo<'a> {
             is_favorite: false,
             read_at: None,
             read_progress: 0.0,
+            interaction_updated_at: None,
             thumbnail_media_id: None,
             duration: None,
             tag_names: TagNames::default(),
@@ -335,9 +350,16 @@ impl<'a> ItemRepo<'a> {
         &self,
         input: &ManualItemInput<'_>,
     ) -> std::result::Result<(Item, Vec<Tag>), sqlx::Error> {
-        let item_id = Uuid::new_v4().to_string();
+        let item_id = deterministic_item_id(None, input.url.as_str());
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+
+        SyncRepo::clear_tombstone(
+            &mut tx,
+            ActivityEntityType::Item,
+            &item_natural_key(None, input.url.as_str()),
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO items
@@ -383,6 +405,7 @@ impl<'a> ItemRepo<'a> {
         let item = Item {
             id: item_id,
             feed_id: None,
+            feed_url: None,
             feed_title: None,
             title: input.title.to_string(),
             url: input.url.clone(),
@@ -397,6 +420,7 @@ impl<'a> ItemRepo<'a> {
             is_favorite: false,
             read_at: None,
             read_progress: 0.0,
+            interaction_updated_at: None,
             thumbnail_media_id: None,
             duration: None,
             tag_names,
@@ -625,6 +649,7 @@ impl<'a> ItemRepo<'a> {
                  read_at = ?,
                  is_favorite = ?,
                  read_progress = ?,
+                 interaction_updated_at = ?,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -632,6 +657,7 @@ impl<'a> ItemRepo<'a> {
         .bind(target_read_at)
         .bind(target_favorite)
         .bind(target_progress)
+        .bind(now)
         .bind(now)
         .bind(id)
         .execute(&mut *tx)
@@ -743,7 +769,9 @@ impl<'a> ItemRepo<'a> {
                 "UPDATE items SET status = 'archived', read_at = COALESCE(read_at, ",
             );
             qb.push_bind(now)
-                .push("), updated_at = ")
+                .push("), interaction_updated_at = ")
+                .push_bind(now)
+                .push(", updated_at = ")
                 .push_bind(now)
                 .push(" WHERE status != 'archived' AND id IN (");
             let mut sep = qb.separated(", ");
@@ -916,12 +944,29 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
+        let existing_keys: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT i.url, f.url FROM items i LEFT JOIN feeds f ON i.feed_id = f.id WHERE i.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?;
+        let Some((item_url, feed_url)) = existing_keys else {
+            return Ok(false);
+        };
+
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query("DELETE FROM items WHERE id = ?").bind(id).execute(&mut *tx).await?;
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        SyncRepo::record_tombstone(
+            &mut tx,
+            ActivityEntityType::Item,
+            &item_natural_key(feed_url.as_deref(), &item_url),
+            now,
+        )
+        .await?;
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Item,

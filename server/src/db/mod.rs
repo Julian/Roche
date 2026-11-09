@@ -19,7 +19,10 @@ pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo};
-pub use sync::{ActivityEntry, SyncRepo};
+pub use sync::{
+    ActivityEntry, NetworkTier, PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, SyncRepo,
+    should_peer_poll_feed,
+};
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
     ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, FeedType, HexColor,

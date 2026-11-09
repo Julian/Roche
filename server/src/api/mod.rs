@@ -24,7 +24,10 @@ use tower_http::{
 use url::Url;
 
 use crate::{
-    db::{Feed, FeedType, HexColor, ItemFilter, ItemPage, ItemStatus, ReadAtPatch, Tag},
+    db::{
+        Feed, FeedType, HexColor, ItemFilter, ItemPage, ItemStatus, PeerSyncRequest,
+        PeerSyncResponse, ReadAtPatch, Tag,
+    },
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
     feeds::FeedSource,
     scheduler::FeedFetcher,
@@ -43,8 +46,9 @@ impl ApiRoutes {
     pub fn router_with_service<F: FeedFetcher>(service: RocheService<F>) -> Router {
         let service = Arc::new(service);
 
-        let opml_import = Router::new()
+        let large_body_routes = Router::new()
             .route("/api/v1/import/opml", post(Self::import_opml::<F>))
+            .route("/api/v1/sync/peer", post(Self::sync_peer::<F>))
             .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
         let protected = Router::new()
@@ -91,7 +95,7 @@ impl ApiRoutes {
             .route("/api/v1/sync/status", get(Self::sync_status::<F>))
             .route("/api/v1/sync/changes", get(Self::sync_changes::<F>))
             .layer(RequestBodyLimitLayer::new(64 * 1024))
-            .merge(opml_import)
+            .merge(large_body_routes)
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&service),
                 Self::require_auth::<F>,
@@ -571,6 +575,14 @@ impl ApiRoutes {
     ) -> Result<Json<SyncChanges>, ApiError> {
         let changes = service.sync_changes(query.since_id, query.limit).await?;
         Ok(Json(changes))
+    }
+
+    async fn sync_peer<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemJson(req): ProblemJson<PeerSyncRequest>,
+    ) -> Result<Json<PeerSyncResponse>, ApiError> {
+        let res = service.peer_sync(req).await?;
+        Ok(Json(res))
     }
 }
 
@@ -1733,5 +1745,104 @@ mod tests {
             .unwrap();
         let pair_response = app.oneshot(pair_request).await.unwrap();
         assert_eq!(pair_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+        let auth = format!("Bearer {token}");
+        let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
+
+        let sync_payload = serde_json::json!({
+            "peer_id": "android-peer-1",
+            "device_name": "Pixel 9",
+            "network_tier": "wifi",
+            "feeds": [{
+                "url": "https://blog.example.com/rss.xml",
+                "title": "Example Blog",
+                "feed_type": "rss",
+                "poll_interval": 30,
+                "last_polled": "2026-06-01T12:00:00Z",
+                "last_polled_by": "android-peer-1",
+                "is_active": true
+            }],
+            "items": [{
+                "feed_url": "https://blog.example.com/rss.xml",
+                "url": "https://blog.example.com/post-1",
+                "title": "Post 1 fetched on Android",
+                "content_html": "<p>Full body from phone</p>",
+                "summary": "Full body from phone",
+                "content_type": "article",
+                "status": "unread",
+                "is_favorite": true,
+                "read_progress": 0.9,
+                "read_at": "2026-06-01T12:05:00Z",
+                "interaction_updated_at": "2026-06-01T12:05:00Z",
+                "tag_names": ["distributed"]
+            }],
+            "tags": [{
+                "name": "distributed",
+                "color": "#10b981"
+            }],
+            "tombstones": []
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(sync_payload.to_string()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["server_peer_id"], "server");
+        assert_eq!(body["feeds"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["status"], "unread");
+        assert_eq!(body["items"][0]["read_at"], "2026-06-01T12:05:00Z");
+        assert_eq!(body["items"][0]["is_favorite"], true);
+        assert_eq!(body["tags"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tags"][0]["color"], "#10b981");
+        assert_eq!(body["active_peers"].as_array().unwrap().len(), 2);
+
+        // Sending the exact same payload again must produce zero duplicates
+        let repeat_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(sync_payload.to_string()))
+            .unwrap();
+        let repeat_response = app.clone().oneshot(repeat_request).await.unwrap();
+        assert_eq!(repeat_response.status(), StatusCode::OK);
+        let all_feeds = db.feeds().list().await.unwrap();
+        assert_eq!(all_feeds.len(), 1);
+        let all_items = db.items().list(None, None, Some(50)).await.unwrap();
+        assert_eq!(all_items.len(), 1);
+
+        // Reject SSRF feed URLs in peer sync with 400 Bad Request
+        let bad_payload = serde_json::json!({
+            "peer_id": "android-peer-1",
+            "device_name": "Pixel 9",
+            "network_tier": "wifi",
+            "feeds": [{
+                "url": "http://127.0.0.1:8080/private.xml",
+                "title": "Internal",
+                "feed_type": "rss"
+            }]
+        });
+        let ssrf_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(bad_payload.to_string()))
+            .unwrap();
+        let ssrf_response = app.oneshot(ssrf_request).await.unwrap();
+        assert_eq!(ssrf_response.status(), StatusCode::BAD_REQUEST);
     }
 }

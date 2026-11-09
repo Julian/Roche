@@ -7,6 +7,7 @@ import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
@@ -16,7 +17,7 @@ import com.grayvines.roche.data.remote.UNREAD_READ_AT_TOMBSTONE
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.ItemStatus
 import java.time.Instant
-import java.util.UUID
+import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.flow.first
 
 private const val HTTP_NOT_FOUND = 404
@@ -572,6 +573,59 @@ internal suspend fun reconcileAddedRemoteTag(
     }
 }
 
+internal suspend fun refreshFeedOnlineOrOnDevice(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    feedId: String,
+    onSyncWithServer: suspend () -> Result<Int>,
+): String {
+    val currentSettings = settings.settings.first()
+    val existingFeed = dao.getFeedById(feedId)
+    val existingTitle = existingFeed?.title
+    val hasServer =
+        currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()
+    val remoteRefreshed =
+        if (hasServer) {
+            runCatching {
+                apiClient.refreshFeed(
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                    feedId = feedId,
+                )
+            }
+                .getOrNull()
+        } else {
+            null
+        }
+    return if (remoteRefreshed != null) {
+        if (remoteRefreshed.id.isNotBlank()) {
+            dao.upsertFeed(toRemoteFeedEntity(remoteRefreshed, existingFeed))
+        }
+        onSyncWithServer()
+        remoteRefreshed.title.ifBlank { existingTitle ?: feedId }
+    } else {
+        val localFeed =
+            existingFeed
+                ?: error(
+                    if (hasServer) "Feed not found: $feedId" else "Configure Server URL in Settings"
+                )
+        LocalFeedPoller.pollFeed(
+                dao = dao,
+                apiClient = apiClient,
+                feed = localFeed,
+                localPeerId = currentSettings.peerId,
+            )
+            .getOrThrow()
+        if (hasServer) {
+            onSyncWithServer()
+        }
+        dao.getFeedById(localFeed.id)?.title?.ifBlank { existingTitle ?: feedId }
+            ?: existingTitle
+            ?: feedId
+    }
+}
+
 internal suspend fun subscribeFeedBestEffort(
     dao: RocheDao,
     apiClient: RocheApiClient,
@@ -580,9 +634,11 @@ internal suspend fun subscribeFeedBestEffort(
     titleOverride: String?,
 ): String {
     val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
+    val canonicalUrl = canonicalizeFeedUrl(url)
     val fallbackTitle = cleanTitleOverride ?: extractHostTitle(url)
+    val currentSettings = settings.settings.first()
+    dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
     val remoteFeed = runCatching {
-        val currentSettings = settings.settings.first()
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             apiClient.createFeed(
                 serverUrl = currentSettings.serverUrl,
@@ -597,21 +653,22 @@ internal suspend fun subscribeFeedBestEffort(
         .getOrNull()
     val entity =
         if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
-            FeedEntity(
-                id = remoteFeed.id,
-                title = remoteFeed.title.ifBlank { fallbackTitle },
-                url = remoteFeed.url.ifBlank { url },
-                siteUrl = remoteFeed.siteUrl,
-                feedType = remoteFeed.feedType,
+            toRemoteFeedEntity(
+                remoteFeed.copy(
+                    title = remoteFeed.title.ifBlank { fallbackTitle },
+                    url = remoteFeed.url.ifBlank { canonicalUrl },
+                )
             )
         } else {
+            val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
             val localFeed =
                 FeedEntity(
-                    id = "feed-${UUID.randomUUID()}",
+                    id = deterministicFeedId(canonicalUrl),
                     title = fallbackTitle,
-                    url = url,
+                    url = canonicalUrl,
                     siteUrl = null,
                     feedType = inferFeedTypeWireValue(url),
+                    lastPolled = nowIso,
                 )
             dao.upsertPendingMutation(
                 PendingMutationEntity.localFeed(
@@ -622,7 +679,15 @@ internal suspend fun subscribeFeedBestEffort(
             localFeed
         }
     dao.upsertFeed(entity)
-    return entity.title
+    if (remoteFeed == null) {
+        LocalFeedPoller.pollFeed(
+            dao = dao,
+            apiClient = apiClient,
+            feed = entity,
+            localPeerId = currentSettings.peerId,
+        )
+    }
+    return dao.getFeedById(entity.id)?.title ?: entity.title
 }
 
 internal suspend fun deleteFeedFromServerOrLocal(
@@ -633,8 +698,18 @@ internal suspend fun deleteFeedFromServerOrLocal(
     feedId: String,
 ): String {
     val existing = dao.getFeedById(feedId)
+    val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
     val isLocalFeed = dao.getPendingMutation(feedId)?.kind == PendingEntityKind.LOCAL_FEED
     if (isLocalFeed) {
+        if (existing != null) {
+            dao.upsertTombstone(
+                TombstoneEntity(
+                    entityType = "feed",
+                    naturalKey = feedNaturalKey(existing.url),
+                    deletedAt = nowIso,
+                )
+            )
+        }
         purgeFeedItemsLocally(dao = dao, offlineCacheManager = offlineCacheManager, feedId = feedId)
         dao.deletePendingMutation(feedId)
         dao.deleteFeedById(feedId)
@@ -650,9 +725,19 @@ internal suspend fun deleteFeedFromServerOrLocal(
             )
         }
             .onFailure { error ->
+                if (error is kotlinx.coroutines.CancellationException) throw error
                 val problem = error as? ProblemDetailsException
-                if (problem?.statusCode != HTTP_NOT_FOUND) throw error
+                if (problem != null && problem.statusCode != HTTP_NOT_FOUND) throw error
             }
+    }
+    if (existing != null) {
+        dao.upsertTombstone(
+            TombstoneEntity(
+                entityType = "feed",
+                naturalKey = feedNaturalKey(existing.url),
+                deletedAt = nowIso,
+            )
+        )
     }
     purgeFeedItemsLocally(dao = dao, offlineCacheManager = offlineCacheManager, feedId = feedId)
     dao.deletePendingMutation(feedId)

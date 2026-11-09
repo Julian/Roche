@@ -1,5 +1,10 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.NetworkTier
+import com.grayvines.roche.data.PeerNodeDto
+import com.grayvines.roche.data.SyncTombstoneDto
+import com.grayvines.roche.data.local.FeedEntity
+import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
@@ -131,10 +136,14 @@ internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = ru
             .resolve(location.trim().replace(" ", "%20"))
             .toString()
     resolved.takeIf {
-        it.startsWith("https://", ignoreCase = true) || it.startsWith("http://", ignoreCase = true)
+        it.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
+            it.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
     }
 }
     .getOrNull()
+
+private const val HTTP_SCHEME_HTTPS = "https://"
+private const val HTTP_SCHEME_HTTP = "http://"
 
 internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
     val u1 = URI.create(firstUrl)
@@ -191,6 +200,14 @@ data class RemoteFeedDto(
     val siteUrl: String?,
     val feedType: String,
     val unreadCount: Int,
+    val description: String? = null,
+    val language: String? = null,
+    val pollInterval: Int = 30,
+    val lastPolled: String? = null,
+    val lastPolledBy: String? = null,
+    val lastError: String? = null,
+    val lastErrorBy: String? = null,
+    val isActive: Boolean = true,
 )
 
 data class RemoteItemDto(
@@ -214,9 +231,59 @@ data class RemoteItemDto(
     val tagNames: List<String> = emptyList(),
     val readAt: String? = null,
     val thumbnailUrl: String? = null,
+    val feedUrl: String? = null,
+    val interactionUpdatedAt: String? = null,
 )
 
-data class RemoteTagDto(val id: String, val name: String, val unreadCount: Int)
+data class RemoteTagDto(
+    val id: String,
+    val name: String,
+    val unreadCount: Int,
+    val color: String? = null,
+)
+
+data class PeerSyncItemPayload(
+    val id: String,
+    val feedId: String?,
+    val feedUrl: String?,
+    val title: String,
+    val url: String,
+    val author: String?,
+    val publishedAt: String?,
+    val createdAt: String?,
+    val summary: String?,
+    val contentHtml: String?,
+    val thumbnailUrl: String?,
+    val contentType: String,
+    val status: String,
+    val isFavorite: Boolean,
+    val readAt: String?,
+    val readProgress: Double,
+    val interactionUpdatedAt: String?,
+    val tagNames: List<String>,
+)
+
+data class PeerSyncRequestDto(
+    val peerId: String,
+    val deviceName: String? = null,
+    val networkTier: String = NetworkTier.WIFI.wireValue,
+    val weight: Double? = null,
+    val updatedAfter: String? = null,
+    val feeds: List<FeedEntity> = emptyList(),
+    val items: List<PeerSyncItemPayload> = emptyList(),
+    val tags: List<TagEntity> = emptyList(),
+    val tombstones: List<SyncTombstoneDto> = emptyList(),
+)
+
+data class PeerSyncResponseDto(
+    val serverPeerId: String,
+    val syncTimestamp: String,
+    val activePeers: List<PeerNodeDto>,
+    val feeds: List<RemoteFeedDto>,
+    val items: List<RemoteItemDto>,
+    val tags: List<RemoteTagDto>,
+    val tombstones: List<SyncTombstoneDto>,
+)
 
 data class RemoteMediaDto(
     val id: String,
@@ -440,8 +507,8 @@ class RocheApiClient(private val transport: HttpTransport) {
     internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? = runCatching {
         val trimmed = imageUrl.trim()
         if (
-            !trimmed.startsWith("https://", ignoreCase = true) &&
-                !trimmed.startsWith("http://", ignoreCase = true)
+            !trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) &&
+                !trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
         ) {
             return null
         }
@@ -464,6 +531,55 @@ class RocheApiClient(private val transport: HttpTransport) {
     }
         .onFailure { if (it is CancellationException) throw it }
         .getOrNull()
+
+    internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> = runCatching {
+        val trimmed = feedUrl.trim()
+        require(
+            trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
+                trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
+        ) {
+            "Feed URL must use http:// or https://"
+        }
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = trimmed,
+                    headers =
+                        mapOf(
+                            "User-Agent" to EXTERNAL_IMAGE_USER_AGENT,
+                            "Accept" to EXTERNAL_FEED_ACCEPT,
+                        ),
+                )
+            )
+        ensureSuccess(response)
+        response.body
+    }
+        .onFailure { if (it is CancellationException) throw it }
+
+    internal suspend fun syncPeer(
+        serverUrl: String,
+        token: String,
+        request: PeerSyncRequestDto,
+    ): PeerSyncResponseDto? {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_POST,
+                    url = "${serverUrl.trimEnd('/')}/api/v1/sync/peer",
+                    headers = authHeaders(token),
+                    body = buildPeerSyncRequestPayload(request),
+                )
+            )
+        if (
+            response.statusCode == HTTP_NOT_FOUND_CODE ||
+                response.statusCode == HTTP_METHOD_NOT_ALLOWED_CODE
+        ) {
+            return null
+        }
+        ensureSuccess(response)
+        return parsePeerSyncResponseJson(response.body)
+    }
 
     suspend fun saveItemUrl(
         serverUrl: String,
@@ -649,6 +765,10 @@ class RocheApiClient(private val transport: HttpTransport) {
                 "Chrome/124.0.0.0 Mobile Safari/537.36"
         private const val EXTERNAL_IMAGE_ACCEPT =
             "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        private const val EXTERNAL_FEED_ACCEPT =
+            "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8"
+        private const val HTTP_NOT_FOUND_CODE = 404
+        private const val HTTP_METHOD_NOT_ALLOWED_CODE = 405
     }
 }
 

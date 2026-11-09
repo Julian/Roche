@@ -5,8 +5,10 @@ import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
@@ -17,6 +19,7 @@ import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.io.File
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -48,6 +51,7 @@ data class RepositorySnapshot(
     val tags: List<TagItem>,
 )
 
+@Suppress("TooManyFunctions")
 class RocheRepository(
     private val database: RocheDatabase,
     private val apiClient: RocheApiClient,
@@ -271,6 +275,7 @@ class RocheRepository(
     internal suspend fun toggleTagOnItem(itemId: String, tagName: String) {
         val normalized = normalizeTagName(tagName)
         if (normalized.isBlank() || dao.getItemById(itemId) == null) return
+        dao.updateItemInteractionTimestamp(itemId)
         val existingTag =
             dao.getTagByName(normalized)
                 ?: TagEntity(id = newTagId(), name = normalized).also { dao.upsertTag(it) }
@@ -299,22 +304,13 @@ class RocheRepository(
     }
 
     suspend fun refreshFeed(feedId: String): Result<String> = runCatching {
-        val currentSettings = settings.settings.first()
-        check(currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-            "Configure Server URL in Settings"
-        }
-        val existingTitle = dao.getFeedById(feedId)?.title
-        val refreshed =
-            apiClient.refreshFeed(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                feedId = feedId,
-            )
-        if (refreshed.id.isNotBlank()) {
-            dao.upsertFeed(toRemoteFeedEntity(refreshed))
-        }
-        syncWithServer()
-        refreshed.title.ifBlank { existingTitle ?: feedId }
+        refreshFeedOnlineOrOnDevice(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            feedId = feedId,
+            onSyncWithServer = { syncWithServer() },
+        )
     }
 
     suspend fun deleteFeed(feedId: String): Result<String> = runCatching {
@@ -329,6 +325,18 @@ class RocheRepository(
 
     suspend fun deleteItem(itemId: String): Result<String> = runCatching {
         val existing = dao.getItemById(itemId)
+        if (existing != null) {
+            val feedUrl =
+                existing.feedUrl ?: existing.feedId?.let { fid -> dao.getFeedById(fid)?.url }
+            val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+            dao.upsertTombstone(
+                TombstoneEntity(
+                    entityType = "item",
+                    naturalKey = itemNaturalKey(feedUrl, existing.url),
+                    deletedAt = nowIso,
+                )
+            )
+        }
         val wasLocalUnpushed = dao.getPendingMutation(itemId)?.kind == PendingEntityKind.LOCAL_ITEM
         offlineCacheManager.evictCachedItemFiles(itemId)
         dao.deleteItemTagsForItem(itemId)
@@ -377,6 +385,7 @@ class RocheRepository(
         val resolvedTitle = cleanTitleOverride ?: "$hostTitle — Saved Entry"
         val localEntity = createSavedItemEntity(trimmedUrl, resolvedTitle, hostTitle, inferredType)
 
+        dao.deleteTombstone("item", itemNaturalKey(null, trimmedUrl))
         dao.upsertItem(localEntity)
         attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = tags)
         dao.upsertPendingMutation(
@@ -455,47 +464,69 @@ class RocheRepository(
     suspend fun syncWithServer(): Result<Int> = syncMutex.withLock {
         runCatching {
             val currentSettings = settings.settings.first()
-            check(currentSettings.serverUrl.isNotBlank()) { "Configure Server URL in Settings" }
-            val pushOutcome =
+            if (currentSettings.serverUrl.isBlank()) {
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = apiClient,
+                    localPeerId = currentSettings.peerId,
+                    activePeers = emptyList(),
+                )
+                error("Configure Server URL in Settings")
+            }
+            val peerSyncedCount =
                 if (currentSettings.bearerToken.isNotBlank()) {
-                    pushPendingMutations(
+                    tryPeerSyncAndCooperativePoll(
                         dao = dao,
                         apiClient = apiClient,
-                        serverUrl = currentSettings.serverUrl,
-                        token = currentSettings.bearerToken,
+                        currentSettings = currentSettings,
                     )
                 } else {
-                    PushMutationsOutcome()
+                    null
                 }
-            val preFetchItemsById = dao.getAllItems().associateBy { it.id }
-            val remoteFeeds =
-                apiClient.fetchFeeds(
-                    serverUrl = currentSettings.serverUrl,
-                    token = currentSettings.bearerToken,
-                )
-            val remoteItems =
-                apiClient.fetchItems(
-                    serverUrl = currentSettings.serverUrl,
-                    token = currentSettings.bearerToken,
-                )
-            val remoteTags =
-                apiClient.fetchTags(
-                    serverUrl = currentSettings.serverUrl,
-                    token = currentSettings.bearerToken,
-                )
-            val mergedFeeds = mergePushedFeeds(remoteFeeds, pushOutcome.createdFeeds)
-            val mergedItems = mergePushedItems(remoteItems, pushOutcome.savedItems)
-
-            reconcileRemoteSnapshot(
-                dao = dao,
-                remoteFeeds = mergedFeeds,
-                remoteItems = mergedItems,
-                remoteTags = remoteTags,
-                appliedMutations = pushOutcome.appliedMutations,
-                preFetchItemsById = preFetchItemsById,
-            )
-            mergedItems.size
+            peerSyncedCount ?: syncLegacySnapshot(currentSettings)
         }
+    }
+
+    private suspend fun syncLegacySnapshot(currentSettings: Settings): Int {
+        val pushOutcome =
+            if (currentSettings.bearerToken.isNotBlank()) {
+                pushPendingMutations(
+                    dao = dao,
+                    apiClient = apiClient,
+                    serverUrl = currentSettings.serverUrl,
+                    token = currentSettings.bearerToken,
+                )
+            } else {
+                PushMutationsOutcome()
+            }
+        val preFetchItemsById = dao.getAllItems().associateBy { it.id }
+        val remoteFeeds =
+            apiClient.fetchFeeds(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+            )
+        val remoteItems =
+            apiClient.fetchItems(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+            )
+        val remoteTags =
+            apiClient.fetchTags(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+            )
+        val mergedFeeds = mergePushedFeeds(remoteFeeds, pushOutcome.createdFeeds)
+        val mergedItems = mergePushedItems(remoteItems, pushOutcome.savedItems)
+
+        reconcileRemoteSnapshot(
+            dao = dao,
+            remoteFeeds = mergedFeeds,
+            remoteItems = mergedItems,
+            remoteTags = remoteTags,
+            appliedMutations = pushOutcome.appliedMutations,
+            preFetchItemsById = preFetchItemsById,
+        )
+        return mergedItems.size
     }
 
     internal suspend fun pushSavedUrlBestEffort(

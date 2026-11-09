@@ -11,6 +11,14 @@ data class FeedEntity(
     val url: String,
     val siteUrl: String?,
     val feedType: String,
+    val description: String? = null,
+    val language: String? = null,
+    val pollInterval: Int = 30,
+    val lastPolled: String? = null,
+    val lastPolledBy: String? = null,
+    val lastError: String? = null,
+    val lastErrorBy: String? = null,
+    val isActive: Boolean = true,
 )
 
 @Entity(
@@ -44,10 +52,22 @@ data class ItemEntity(
     val duration: String?,
     val readAt: String? = null,
     val thumbnailUrl: String? = null,
+    val feedUrl: String? = null,
+    val interactionUpdatedAt: String? = null,
 )
 
 @Entity(tableName = "tags", indices = [Index(value = ["name"], unique = true)])
-data class TagEntity(@PrimaryKey val id: String, val name: String)
+data class TagEntity(@PrimaryKey val id: String, val name: String, val color: String? = null)
+
+@Entity(
+    tableName = "sync_tombstones",
+    primaryKeys = ["entityType", "naturalKey"],
+)
+data class TombstoneEntity(
+    val entityType: String,
+    val naturalKey: String,
+    val deletedAt: String,
+)
 
 @Entity(
     tableName = "item_tags",

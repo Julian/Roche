@@ -15,8 +15,8 @@ use crate::{
     content::fetcher::{HtmlSanitizer, SafeHttpClient, classify_url},
     db::{
         ActivityEntry, ArchiveBatchScope, ContentType, Db, DeviceToken, Feed, FeedType, HexColor,
-        Item, ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, ReadAtPatch,
-        SyncRepo, Tag,
+        Item, ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, PeerSyncRequest,
+        PeerSyncResponse, ReadAtPatch, SyncRepo, Tag,
     },
     error::ApiError,
     feeds::{FeedSource, OpmlDocument},
@@ -237,6 +237,48 @@ impl<F: FeedFetcher> RocheService<F> {
         let next_since_id = changes.last().map_or(since, |c| c.id);
         let latest_activity_id = self.db.sync().latest_activity_id().await?;
         Ok(SyncChanges { changes, next_since_id, latest_activity_id, has_more })
+    }
+
+    pub async fn peer_sync(&self, mut req: PeerSyncRequest) -> Result<PeerSyncResponse, ApiError> {
+        let trimmed_peer = req.peer_id.trim();
+        if trimmed_peer.is_empty() || trimmed_peer.len() > MAX_DEVICE_NAME_LEN {
+            return Err(ApiError::bad_request(
+                "peer_id must be non-empty and at most 128 characters",
+            ));
+        }
+
+        let mut valid_feeds = Vec::with_capacity(req.feeds.len().min(500));
+        for mut f in req.feeds.into_iter().take(500) {
+            SafeHttpClient::validate_url(&f.url)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let (resolved_type, validated_url) = FeedSource::Url(f.url.clone())
+                .into_feed_url(f.feed_type)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            f.feed_type = resolved_type;
+            f.url = validated_url;
+            valid_feeds.push(f);
+        }
+        req.feeds = valid_feeds;
+
+        for item in req.items.iter().take(2_000) {
+            SafeHttpClient::validate_url(&item.url)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
+        req.items.truncate(2_000);
+        req.tags.truncate(500);
+        req.tombstones.truncate(2_000);
+
+        let (response, inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
+
+        if !inserted_candidates.is_empty() {
+            let service_clone = self.clone();
+            tokio::spawn(async move {
+                let ctx = service_clone.media_ingest_context();
+                FeedIngester::ingest_items_concurrently(&ctx, &inserted_candidates).await;
+            });
+        }
+
+        Ok(response)
     }
 }
 

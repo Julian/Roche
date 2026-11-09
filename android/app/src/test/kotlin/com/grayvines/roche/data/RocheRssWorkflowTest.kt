@@ -206,6 +206,145 @@ class RocheRssWorkflowTest {
         )
         vm.viewModelScope.cancel()
     }
+
+    @Test
+    fun `PeerConsensus HRW work splitting and cross-peer error rescue match server protocol`() {
+        val feedId1 = deterministicFeedId("https://example.com/feed.xml")
+        val feedId2 = deterministicFeedId("https://example.com/feed.xml")
+        assertEquals(feedId1, feedId2)
+        assertEquals(36, feedId1.length)
+
+        val itemId1 = deterministicItemId("https://example.com/feed.xml", "https://example.com/1")
+        val itemId2 = deterministicItemId("https://example.com/feed.xml", "https://example.com/1")
+        assertEquals(itemId1, itemId2)
+
+        val peers =
+            listOf(
+                PeerNodeDto(
+                    peerId = "server",
+                    deviceName = "Headless",
+                    networkTier = "wired",
+                    weight = 1.0,
+                ),
+                PeerNodeDto(
+                    peerId = "android-1",
+                    deviceName = "Pixel",
+                    networkTier = "wifi",
+                    weight = 0.6,
+                ),
+            )
+        var serverWins = 0
+        var androidWins = 0
+        for (i in 0 until 100) {
+            val winner =
+                selectFeedPoller(
+                    activePeers = peers,
+                    feedUrl = "https://example.com/feed-$i.xml",
+                    pollIntervalMinutes = 30,
+                    nowEpochSeconds = 1_780_000_000L,
+                    lastPolledBy = null,
+                    lastError = null,
+                    lastErrorBy = null,
+                )
+            if (winner == "server") serverWins++ else if (winner == "android-1") androidWins++
+        }
+        assertEquals(100, serverWins + androidWins)
+        assertTrue(serverWins > 35)
+        assertTrue(androidWins > 15)
+
+        // When a feed fails on "server" (e.g. HTTP 403 Forbidden), "android-1" immediately rescues
+        // it
+        val now = java.time.Instant.parse("2026-06-01T12:00:00Z")
+        val blockedFeed =
+            com.grayvines.roche.data.local.FeedEntity(
+                id = feedId1,
+                title = "Blocked on Server",
+                url = "https://protected.example.com/rss.xml",
+                siteUrl = null,
+                feedType = "rss",
+                pollInterval = 30,
+                lastPolled = "2026-06-01T11:59:00Z",
+                lastPolledBy = "server",
+                lastError = "HTTP 403 Forbidden",
+                lastErrorBy = "server",
+                isActive = true,
+            )
+        assertFalse(shouldPeerPollFeed("server", peers, blockedFeed, now))
+        assertTrue(shouldPeerPollFeed("android-1", peers, blockedFeed, now))
+    }
+
+    @Test
+    fun `Android polls feeds on device shares state via peer sync and rescues server-blocked feeds without duplication`() =
+        runTest {
+            settings.update {
+                it.copy(
+                    serverUrl = "",
+                    bearerToken = "",
+                    peerId = "android-peer-1",
+                    deviceName = "Pixel 10 Pro",
+                )
+            }
+            val peerSyncBodies = mutableListOf<String>()
+            val peerRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildPeerSyncAndExternalFeedMockClient(peerSyncBodies),
+                    settings = settings,
+                )
+
+            // 1. Offline from server: subscribe to an RSS feed on Android -> Android polls XML
+            // directly!
+            val subResult =
+                peerRepo.saveUrlOrFeed(
+                    inputUrl = "https://blog.example.com/rss.xml",
+                    titleOverride = null,
+                    tagCsv = "",
+                )
+            assertTrue(subResult.isFeed)
+            assertEquals("Systems Engineering Blog", subResult.title)
+
+            val offlineEntries = peerRepo.snapshot.first().entries
+            assertEquals(2, offlineEntries.size)
+            val post1 = offlineEntries.first { it.url == "https://blog.example.com/post-1" }
+            val post2 = offlineEntries.first { it.url == "https://blog.example.com/post-2" }
+            assertEquals("https://blog.example.com/images/diagram.png", post1.thumbnailUrl)
+
+            // 2. Interact with Post 1 and delete Post 2 while offline
+            peerRepo.setReadState(post1.id, isRead = true)
+            peerRepo.toggleStar(post1.id)
+            peerRepo.toggleTagOnItem(post1.id, "distributed")
+            peerRepo.deleteItem(post2.id).getOrThrow()
+
+            // Re-polling while offline must NOT resurrect deleted Post 2 (tombstone suppression)
+            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
+            peerRepo.refreshFeed(feedId).getOrThrow()
+            assertEquals(1, peerRepo.snapshot.first().entries.size)
+
+            // 3. Connect to peer server: syncWithServer() exchanges state via /api/v1/sync/peer,
+            // receives a server-blocked feed (last_error_by = "server"), rescues it on-device,
+            // and pushes the rescued items back to the server in the follow-up peer sync!
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-peer")
+            }
+            val totalCount = peerRepo.syncWithServer().getOrThrow()
+            assertEquals(2, totalCount)
+            assertEquals(2, peerSyncBodies.size)
+            assertTrue(peerSyncBodies[0].contains("https://blog.example.com/post-1"))
+            assertTrue(peerSyncBodies[0].contains("distributed"))
+            assertTrue(
+                peerSyncBodies[1].contains("https://protected.example.com/rescued-article"),
+                "Follow-up peer sync must share the item rescued on-device with the server",
+            )
+
+            val finalEntries = peerRepo.snapshot.first().entries
+            assertEquals(2, finalEntries.size)
+            assertTrue(
+                finalEntries.any { it.url == "https://blog.example.com/post-1" && it.isFavorite }
+            )
+            assertTrue(
+                finalEntries.any { it.url == "https://protected.example.com/rescued-article" }
+            )
+        }
 }
 
 internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheApiClient =
@@ -231,3 +370,88 @@ internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheAp
             else -> HttpResponse(statusCode = 404, body = "{}")
         }
     }
+
+internal fun buildPeerSyncAndExternalFeedMockClient(
+    peerSyncBodies: MutableList<String>
+): RocheApiClient = RocheApiClient { request ->
+    when {
+        request.method == "GET" && request.url == "https://blog.example.com/rss.xml" ->
+            mockBlogRssResponse()
+        request.method == "GET" && request.url == "https://protected.example.com/feed.xml" ->
+            mockProtectedAtomResponse()
+        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") ->
+            mockPeerSyncResponse(request.body.orEmpty(), peerSyncBodies)
+        else -> HttpResponse(statusCode = 404, body = "{}")
+    }
+}
+
+private fun mockBlogRssResponse(): HttpResponse =
+    HttpResponse(
+        statusCode = 200,
+        body =
+            """<?xml version="1.0" encoding="UTF-8"?>""" +
+                """<rss version="2.0"><channel>""" +
+                """<title>Systems Engineering Blog</title>""" +
+                """<link>https://blog.example.com</link>""" +
+                """<description>Deep dives</description>""" +
+                """<item><title>Post 1: Consensus</title>""" +
+                """<link>https://blog.example.com/post-1</link>""" +
+                """<description>&lt;p&gt;Full article with &lt;img src="/images/diagram.png"&gt;&lt;/p&gt;</description></item>""" +
+                """<item><title>Post 2: Ephemeral</title>""" +
+                """<link>https://blog.example.com/post-2</link>""" +
+                """<description>&lt;p&gt;Will be deleted&lt;/p&gt;</description></item>""" +
+                """</channel></rss>""",
+    )
+
+private fun mockProtectedAtomResponse(): HttpResponse =
+    HttpResponse(
+        statusCode = 200,
+        body =
+            """<?xml version="1.0" encoding="UTF-8"?>""" +
+                """<feed xmlns="http://www.w3.org/2005/Atom">""" +
+                """<title>Protected Feed</title>""" +
+                """<link href="https://protected.example.com" rel="alternate"/>""" +
+                """<entry><title>Rescued by Android</title>""" +
+                """<link href="https://protected.example.com/rescued-article" rel="alternate"/>""" +
+                """<id>https://protected.example.com/rescued-article</id>""" +
+                """<published>2026-06-01T12:00:00Z</published>""" +
+                """<content type="html">&lt;p&gt;Fetched via phone Wi-Fi&lt;/p&gt;</content></entry>""" +
+                """</feed>""",
+    )
+
+private fun mockPeerSyncResponse(
+    body: String,
+    peerSyncBodies: MutableList<String>,
+): HttpResponse {
+    peerSyncBodies.add(body)
+    val post1Id =
+        deterministicItemId("https://blog.example.com/rss.xml", "https://blog.example.com/post-1")
+    val rescuedId =
+        deterministicItemId(
+            "https://protected.example.com/feed.xml",
+            "https://protected.example.com/rescued-article",
+        )
+    val blogFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
+    val protectedFeedId = deterministicFeedId("https://protected.example.com/feed.xml")
+    val hasRescued = body.contains("https://protected.example.com/rescued-article")
+    val post1Json =
+        """{"id":"$post1Id","feed_id":"$blogFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Systems Engineering Blog","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","summary":"Full article with","content_html":"<p>Full article with <img src=\"https://blog.example.com/images/diagram.png\"></p>","thumbnail_url":"https://blog.example.com/images/diagram.png","content_type":"article","status":"unread","is_favorite":true,"read_at":"2026-06-01T12:00:00Z","created_at":"2026-06-01T12:00:00Z","tag_names":["distributed"]}"""
+    val rescuedJson =
+        """{"id":"$rescuedId","feed_id":"$protectedFeedId","feed_url":"https://protected.example.com/feed.xml","feed_title":"Protected Feed","title":"Rescued by Android","url":"https://protected.example.com/rescued-article","summary":"Fetched via phone Wi-Fi","content_html":"<p>Fetched via phone Wi-Fi</p>","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-06-01T12:01:00Z","tag_names":[]}"""
+    val itemsJson = if (hasRescued) "[$post1Json,$rescuedJson]" else "[$post1Json]"
+    val protectedFeedState =
+        if (hasRescued) {
+            """{"id":"$protectedFeedId","title":"Protected Feed","url":"https://protected.example.com/feed.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T12:01:00Z","last_polled_by":"android-peer-1","last_error":null,"last_error_by":null,"is_active":true,"unread_count":1}"""
+        } else {
+            """{"id":"$protectedFeedId","title":"Protected Feed","url":"https://protected.example.com/feed.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T11:59:00Z","last_polled_by":"server","last_error":"HTTP 403 Forbidden","last_error_by":"server","is_active":true,"unread_count":0}"""
+        }
+    return HttpResponse(
+        statusCode = 200,
+        body =
+            """{"server_peer_id":"server","sync_timestamp":"2026-06-01T12:01:00Z",""" +
+                """"active_peers":[{"peer_id":"server","device_name":"Headless","network_tier":"wired","weight":1.0,"last_seen_at":"2026-06-01T12:01:00Z"},""" +
+                """{"peer_id":"android-peer-1","device_name":"Pixel 10 Pro","network_tier":"wifi","weight":0.6,"last_seen_at":"2026-06-01T12:01:00Z"}],""" +
+                """"feeds":[{"id":"$blogFeedId","title":"Systems Engineering Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T12:00:00Z","last_polled_by":"android-peer-1","is_active":true,"unread_count":0},$protectedFeedState],""" +
+                """"items":$itemsJson,"tags":[{"id":"${deterministicTagId("distributed")}","name":"distributed","unread_count":0}],"tombstones":[]}""",
+    )
+}

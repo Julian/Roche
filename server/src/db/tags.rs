@@ -2,9 +2,11 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqliteConnection, SqlitePool};
-use uuid::Uuid;
 
-use super::{ActivityAction, ActivityEntityType, HexColor, SyncRepo};
+use super::{
+    ActivityAction, ActivityEntityType, HexColor, SyncRepo,
+    sync::{deterministic_tag_id, tag_natural_key},
+};
 
 const TAG_SELECT: &str = "SELECT t.id, t.name, t.color,
        (SELECT COUNT(*) FROM item_tags it JOIN items i ON i.id = it.item_id WHERE it.tag_id = t.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
@@ -35,9 +37,11 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn create(&self, name: &str, color: Option<&HexColor>) -> Result<Tag> {
-        let id = Uuid::new_v4().to_string();
+        let id = deterministic_tag_id(name);
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+
+        SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Tag, &tag_natural_key(name)).await?;
 
         sqlx::query("INSERT INTO tags (id, name, color, created_at) VALUES (?, ?, ?, ?)")
             .bind(&id)
@@ -113,10 +117,21 @@ impl<'a> TagRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("DELETE FROM tags WHERE id = ?").bind(id).execute(&mut *tx).await?;
-        if res.rows_affected() == 0 {
+        let deleted_name: Option<String> =
+            sqlx::query_scalar("DELETE FROM tags WHERE id = ? RETURNING name")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(tag_name) = deleted_name else {
             return Ok(false);
-        }
+        };
+        SyncRepo::record_tombstone(
+            &mut tx,
+            ActivityEntityType::Tag,
+            &tag_natural_key(&tag_name),
+            now,
+        )
+        .await?;
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Tag,
@@ -135,31 +150,46 @@ impl<'a> TagRepo<'a> {
         name: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<Tag, sqlx::Error> {
-        let new_tag_id = Uuid::new_v4().to_string();
-        let tag_insert = sqlx::query(
-            "INSERT OR IGNORE INTO tags (id, name, color, created_at) VALUES (?, ?, NULL, ?)",
+        let new_tag_id = deterministic_tag_id(name);
+        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::Tag, &tag_natural_key(name))
+            .await?;
+
+        let existing_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM tags WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1",
         )
         .bind(&new_tag_id)
         .bind(name)
-        .bind(now)
-        .execute(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
 
-        if tag_insert.rows_affected() > 0 {
-            SyncRepo::record_activity(
-                &mut *conn,
-                ActivityEntityType::Tag,
-                &new_tag_id,
-                ActivityAction::Create,
-                now,
+        let tag_id = if let Some(id) = existing_id {
+            id
+        } else {
+            let tag_insert = sqlx::query(
+                "INSERT OR IGNORE INTO tags (id, name, color, created_at) VALUES (?, ?, NULL, ?)",
             )
-            .await?;
-        }
-
-        let tag_id: String = sqlx::query_scalar("SELECT id FROM tags WHERE name = ?")
+            .bind(&new_tag_id)
             .bind(name)
-            .fetch_one(&mut *conn)
+            .bind(now)
+            .execute(&mut *conn)
             .await?;
+
+            if tag_insert.rows_affected() > 0 {
+                SyncRepo::record_activity(
+                    &mut *conn,
+                    ActivityEntityType::Tag,
+                    &new_tag_id,
+                    ActivityAction::Create,
+                    now,
+                )
+                .await?;
+            }
+            sqlx::query_scalar("SELECT id FROM tags WHERE id = ? OR LOWER(name) = LOWER(?) LIMIT 1")
+                .bind(&new_tag_id)
+                .bind(name)
+                .fetch_one(&mut *conn)
+                .await?
+        };
 
         Self::attach_in_tx(&mut *conn, item_id, &tag_id, now).await?;
 
@@ -180,6 +210,12 @@ impl<'a> TagRepo<'a> {
             .execute(&mut *conn)
             .await?;
         if res.rows_affected() > 0 {
+            sqlx::query("UPDATE items SET interaction_updated_at = ?, updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(now)
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
             SyncRepo::record_activity(
                 &mut *conn,
                 ActivityEntityType::Item,
@@ -219,6 +255,12 @@ impl<'a> TagRepo<'a> {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        sqlx::query("UPDATE items SET interaction_updated_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?;
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Item,

@@ -9,12 +9,14 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface RocheDao {
-    @Query("SELECT * FROM feeds ORDER BY title ASC") fun observeFeeds(): Flow<List<FeedEntity>>
+    @Query("SELECT * FROM feeds ORDER BY title COLLATE NOCASE ASC, title ASC")
+    fun observeFeeds(): Flow<List<FeedEntity>>
 
     @Query("SELECT * FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC")
     fun observeItems(): Flow<List<ItemEntity>>
 
-    @Query("SELECT * FROM tags ORDER BY name ASC") fun observeTags(): Flow<List<TagEntity>>
+    @Query("SELECT * FROM tags ORDER BY name COLLATE NOCASE ASC, name ASC")
+    fun observeTags(): Flow<List<TagEntity>>
 
     @Query("SELECT * FROM item_tags") fun observeItemTags(): Flow<List<ItemTagEntity>>
 
@@ -25,7 +27,30 @@ interface RocheDao {
     @Query("SELECT * FROM feeds WHERE id = :id LIMIT 1")
     suspend fun getFeedById(id: String): FeedEntity?
 
+    @Query("SELECT * FROM feeds WHERE url = :url LIMIT 1")
+    suspend fun getFeedByUrl(url: String): FeedEntity?
+
     @Query("DELETE FROM feeds WHERE id = :id") suspend fun deleteFeedById(id: String)
+
+    @Query("SELECT * FROM sync_tombstones") suspend fun getAllTombstones(): List<TombstoneEntity>
+
+    @Query(
+        "SELECT * FROM sync_tombstones WHERE entityType = :entityType AND naturalKey = :naturalKey LIMIT 1"
+    )
+    suspend fun getTombstone(entityType: String, naturalKey: String): TombstoneEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTombstone(tombstone: TombstoneEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTombstones(tombstones: List<TombstoneEntity>)
+
+    @Query(
+        "DELETE FROM sync_tombstones WHERE entityType = :entityType AND naturalKey = :naturalKey"
+    )
+    suspend fun deleteTombstone(entityType: String, naturalKey: String)
+
+    @Query("DELETE FROM sync_tombstones") suspend fun clearAllTombstones()
 
     @Query("SELECT * FROM tags") suspend fun getAllTags(): List<TagEntity>
 
@@ -33,7 +58,7 @@ interface RocheDao {
 
     @Query(
         "SELECT t.name FROM tags t INNER JOIN item_tags it ON t.id = it.tagId " +
-            "WHERE it.itemId = :itemId ORDER BY t.name ASC"
+            "WHERE it.itemId = :itemId ORDER BY t.name COLLATE NOCASE ASC, t.name ASC"
     )
     suspend fun getTagNamesForItem(itemId: String): List<String>
 
@@ -118,21 +143,64 @@ interface RocheDao {
     @Query("SELECT COUNT(*) FROM item_tags WHERE itemId = :itemId AND tagId = :tagId")
     suspend fun hasItemTag(itemId: String, tagId: String): Int
 
-    @Query("UPDATE items SET status = :status WHERE id = :itemId")
-    suspend fun updateItemStatus(itemId: String, status: String)
+    @Query(
+        "UPDATE items SET status = :status, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
+    )
+    suspend fun updateItemStatus(
+        itemId: String,
+        status: String,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
 
-    @Query("UPDATE items SET isFavorite = :isFavorite WHERE id = :itemId")
-    suspend fun updateItemFavorite(itemId: String, isFavorite: Boolean)
+    @Query(
+        "UPDATE items SET isFavorite = :isFavorite, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
+    )
+    suspend fun updateItemFavorite(
+        itemId: String,
+        isFavorite: Boolean,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
 
     @Query("UPDATE items SET isCachedOffline = :isCachedOffline WHERE id = :itemId")
     suspend fun updateItemCachedOffline(itemId: String, isCachedOffline: Boolean)
 
-    @Query("UPDATE items SET readProgress = :progress WHERE id = :itemId")
-    suspend fun updateReadProgress(itemId: String, progress: Double)
+    @Query(
+        "UPDATE items SET readProgress = :progress, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
+    )
+    suspend fun updateReadProgress(
+        itemId: String,
+        progress: Double,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
 
-    @Query("UPDATE items SET readAt = :readAt WHERE id = :itemId")
-    suspend fun updateItemReadAt(itemId: String, readAt: String?)
+    @Query(
+        "UPDATE items SET readAt = :readAt, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
+    )
+    suspend fun updateItemReadAt(
+        itemId: String,
+        readAt: String?,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
 
-    @Query("UPDATE items SET status = :status, readAt = :readAt WHERE id = :itemId")
-    suspend fun updateItemStatusAndReadAt(itemId: String, status: String, readAt: String?)
+    @Query(
+        "UPDATE items SET status = :status, readAt = :readAt, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
+    )
+    suspend fun updateItemStatusAndReadAt(
+        itemId: String,
+        status: String,
+        readAt: String?,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
+
+    @Query("UPDATE items SET interactionUpdatedAt = :updatedAt WHERE id = :itemId")
+    suspend fun updateItemInteractionTimestamp(
+        itemId: String,
+        updatedAt: String =
+            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
+    )
 }

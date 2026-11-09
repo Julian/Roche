@@ -14,7 +14,10 @@ use crate::{
         HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url, is_valid_pdf_bytes,
         resolve_pdf_url,
     },
-    db::{ContentType, Db, Feed, FeedRepo, FeedType, MediaType, PollBatch, PollItemCandidate},
+    db::{
+        ContentType, Db, Feed, FeedRepo, FeedType, MediaType, NetworkTier, PollBatch,
+        PollItemCandidate, SERVER_PEER_ID, SyncRepo, should_peer_poll_feed,
+    },
     feeds::{ArxivParser, RssParser, YouTubeParser},
     media::{MediaStore, ytdlp::YtDlpWorker},
 };
@@ -138,9 +141,25 @@ impl<F: FeedFetcher> PollScheduler<F> {
     }
 
     pub async fn check_and_poll(&self) -> Result<()> {
-        let feeds = self.db.feeds().get_active_for_polling().await?;
+        let now = SyncRepo::now_utc();
+        let _ = self
+            .db
+            .sync()
+            .upsert_peer_node(
+                SERVER_PEER_ID,
+                "Roche Headless Peer",
+                NetworkTier::Wired,
+                NetworkTier::Wired.default_weight(),
+                now,
+            )
+            .await;
+        let active_peers = self.db.sync().list_active_peers(now).await.unwrap_or_default();
+        let feeds = self.db.feeds().get_active_for_cooperative_polling(SERVER_PEER_ID).await?;
 
         for feed in feeds {
+            if !should_peer_poll_feed(SERVER_PEER_ID, &active_peers, &feed, now) {
+                continue;
+            }
             {
                 let Ok(mut set) = self.in_flight.lock() else {
                     continue;
