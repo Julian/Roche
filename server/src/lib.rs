@@ -46,7 +46,7 @@ impl RocheServer {
         };
         let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
 
-        let roche_service = service::RocheService::new(db.clone(), fetcher.clone(), cfg.clone())
+        let roche_service = service::RocheService::new(db.clone(), fetcher, cfg.clone())
             .with_node_identity(ts_identity);
 
         if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
@@ -63,21 +63,12 @@ impl RocheServer {
             tracing::info!("Paired devices exist; run `roche pair` to generate a new pairing code");
         }
 
-        let scheduler_db = db.clone();
-        let scheduler_fetcher = fetcher.clone();
-        let scheduler_media_store = media::MediaStore::new(&cfg.storage.media_dir);
-        let scheduler_ytdlp =
-            media::ytdlp::YtDlpWorker::new(cfg.media.clone(), scheduler_media_store.clone());
-        let shared_download_sem = roche_service.download_semaphore();
-        let scheduler_handle =
-            tokio::spawn(async move {
-                let poll_scheduler =
-                    scheduler::PollScheduler::with_fetcher(scheduler_db, scheduler_fetcher)
-                        .with_media(scheduler_media_store, scheduler_ytdlp, shared_download_sem);
-                if let Err(e) = poll_scheduler.run().await {
-                    tracing::error!(error = %e, "PollScheduler terminated with error");
-                }
-            });
+        let poll_scheduler = roche_service.poll_scheduler();
+        let scheduler_handle = tokio::spawn(async move {
+            if let Err(e) = poll_scheduler.run().await {
+                tracing::error!(error = %e, "PollScheduler terminated with error");
+            }
+        });
 
         let worker_db = db.clone();
         let prune_after = cfg.sync.op_log_prune_after;
@@ -108,20 +99,29 @@ impl RocheServer {
         tracing::info!("Shutdown signal received, stopping server");
     }
 
-    pub async fn issue_pairing_code(cfg: &config::Config) -> anyhow::Result<String> {
+    async fn connect_service(cfg: &config::Config) -> anyhow::Result<service::RocheService> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
-        let pairing = auth::pairing::PairingManager::new(db.auth());
-        pairing.create_code(cfg.auth.pairing_code_ttl).await
+        let fetcher = scheduler::HttpFeedFetcher::new()?;
+        Ok(service::RocheService::new(db, fetcher, cfg.clone()))
+    }
+
+    pub async fn issue_pairing_code(cfg: &config::Config) -> anyhow::Result<String> {
+        let service = Self::connect_service(cfg).await?;
+        Ok(service.auth().issue_pairing_code().await?)
     }
 
     pub async fn list_devices(cfg: &config::Config) -> anyhow::Result<Vec<db::DeviceToken>> {
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
-        db.auth().list_devices().await
+        let service = Self::connect_service(cfg).await?;
+        Ok(service.auth().list_devices().await?)
     }
 
     pub async fn revoke_device(cfg: &config::Config, device_id: &str) -> anyhow::Result<bool> {
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
-        db.auth().revoke_device(device_id).await
+        let service = Self::connect_service(cfg).await?;
+        match service.auth().revoke_device(device_id).await {
+            Ok(()) => Ok(true),
+            Err(error::ApiError::NotFound(_)) => Ok(false),
+            Err(other) => Err(other.into()),
+        }
     }
 
     pub async fn import_opml_file(
@@ -131,63 +131,18 @@ impl RocheServer {
     ) -> anyhow::Result<usize> {
         let bytes = tokio::fs::read(path).await?;
         let opml_str = content::fetcher::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
-        let outlines = tokio::task::spawn_blocking(move || feeds::OpmlDocument::parse(&opml_str))
-            .await
-            .map_err(|e| anyhow::anyhow!("OPML parse task failed: {e}"))?;
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
-        let imported =
-            db.feeds().import_outlines(outlines, cfg.feeds.default_poll_interval).await?;
+        let service = Self::connect_service(cfg).await?;
+        let imported = service.feeds().import_opml(opml_str).await?;
         let count = imported.len();
         if poll && !imported.is_empty() {
-            let fetcher = std::sync::Arc::new(scheduler::HttpFeedFetcher::new()?);
-            let media_store = media::MediaStore::new(&cfg.storage.media_dir);
-            let ytdlp = media::ytdlp::YtDlpWorker::new(cfg.media.clone(), media_store.clone());
-            let download_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
-                cfg.media.max_concurrent_downloads.max(1),
-            ));
-            let poll_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-            let mut join_set = tokio::task::JoinSet::new();
-
-            for feed in imported {
-                let db_clone = db.clone();
-                let fetcher_clone = std::sync::Arc::clone(&fetcher);
-                let store_clone = media_store.clone();
-                let ytdlp_clone = ytdlp.clone();
-                let dl_sem = std::sync::Arc::clone(&download_sem);
-                let p_sem = std::sync::Arc::clone(&poll_sem);
-                join_set.spawn(async move {
-                    let Ok(_permit) = p_sem.acquire_owned().await else {
-                        return;
-                    };
-                    let ctx = scheduler::MediaIngestContext {
-                        db: &db_clone,
-                        media_store: &store_clone,
-                        ytdlp_worker: Some(&ytdlp_clone),
-                        download_semaphore: Some(&dl_sem),
-                        fetcher: fetcher_clone.as_ref(),
-                    };
-                    if let Err(err) = scheduler::FeedIngester::poll_with_media(&ctx, &feed).await {
-                        let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
-                        tracing::error!(
-                            feed_title = %feed_title,
-                            feed_url = %feed.url,
-                            feed_id = %feed.id,
-                            error = %err,
-                            "OPML initial feed poll failed"
-                        );
-                        let _ = db_clone.feeds().mark_error(&feed.id, &err.to_string()).await;
-                    }
-                });
-            }
-            while join_set.join_next().await.is_some() {}
+            service.feeds().poll_feeds_concurrently(imported).await;
         }
         Ok(count)
     }
 
     pub async fn export_opml(cfg: &config::Config) -> anyhow::Result<String> {
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
-        let feeds = db.feeds().list().await?;
-        Ok(feeds::OpmlDocument::to_xml(&feeds))
+        let service = Self::connect_service(cfg).await?;
+        Ok(service.feeds().export_opml().await?)
     }
 
     pub async fn discover_servers(

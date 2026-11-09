@@ -8,46 +8,39 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
-    ActivityAction, ActivityEntityType, ContentType, ItemSortField, ItemStatus, ItemStatusFilter,
-    SortOrder, SyncRepo, Tag, TagRepo,
+    ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, ItemSortField, ItemStatus,
+    ItemStatusFilter, ReadAtPatch, SortOrder, SyncRepo, Tag, TagRepo,
 };
 
 const MAX_SEARCH_TERMS: usize = 16;
 
-const ITEM_SELECT: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
-       i.published_at, i.created_at, i.summary, i.content_html, i.thumbnail_url, i.content_type, i.status,
+macro_rules! item_select_sql {
+    ($content_html_expr:literal) => {
+        concat!(
+            "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
+       i.published_at, i.created_at, i.summary, ",
+            $content_html_expr,
+            " AS content_html, i.thumbnail_url, i.content_type, i.status,
        i.is_favorite, i.read_at, i.read_progress,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
        (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
        COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
 FROM items i
-LEFT JOIN feeds f ON i.feed_id = f.id";
+LEFT JOIN feeds f ON i.feed_id = f.id"
+        )
+    };
+}
+
+const ITEM_SELECT: &str = item_select_sql!("i.content_html");
 
 /// List query projection that caps inline `content_html` at 64 KB so multi-hundred-KB full-book
 /// essays do not blow up bulk sync page responses or Android's 2 MB SQLite `CursorWindow`;
 /// oversized articles are lazy-hydrated via `GET /api/v1/items/{id}` (`ItemRepo::get`).
-const ITEM_SELECT_LIST: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
-       i.published_at, i.created_at, i.summary,
-       CASE WHEN length(i.content_html) <= 65536 THEN i.content_html ELSE NULL END AS content_html,
-       i.thumbnail_url, i.content_type, i.status,
-       i.is_favorite, i.read_at, i.read_progress,
-       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
-       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
-       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
-FROM items i
-LEFT JOIN feeds f ON i.feed_id = f.id";
+const ITEM_SELECT_LIST: &str =
+    item_select_sql!("CASE WHEN length(i.content_html) <= 65536 THEN i.content_html ELSE NULL END");
 
 /// Lightweight list projection used when `include_content=false` is requested during bulk sync.
-const ITEM_SELECT_METADATA_ONLY: &str = "SELECT i.id, i.feed_id, f.title AS feed_title, i.title, i.url, i.author,
-       i.published_at, i.created_at, i.summary,
-       NULL AS content_html,
-       i.thumbnail_url, i.content_type, i.status,
-       i.is_favorite, i.read_at, i.read_progress,
-       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
-       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
-       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
-FROM items i
-LEFT JOIN feeds f ON i.feed_id = f.id";
+const ITEM_SELECT_METADATA_ONLY: &str = item_select_sql!("NULL");
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -568,14 +561,14 @@ impl<'a> ItemRepo<'a> {
         }
     }
 
-    #[allow(clippy::too_many_lines, clippy::option_option)]
+    #[allow(clippy::too_many_lines)]
     pub async fn update(
         &self,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
-        read_at: Option<Option<DateTime<Utc>>>,
+        read_at: ReadAtPatch,
     ) -> Result<bool> {
         let now = SyncRepo::now_utc();
 
@@ -597,12 +590,20 @@ impl<'a> ItemRepo<'a> {
         let target_status = status.unwrap_or(current_status);
         let target_read_at = match target_status {
             ItemStatus::Archived => match read_at {
-                Some(Some(explicit_ts)) => Some(explicit_ts),
-                Some(None) | None => current_read_at.or(Some(now)),
+                ReadAtPatch::MarkRead(explicit_ts) => Some(explicit_ts),
+                ReadAtPatch::MarkUnread | ReadAtPatch::Unchanged => current_read_at.or(Some(now)),
             },
-            ItemStatus::Unread => read_at.unwrap_or_else(|| {
-                if current_status == ItemStatus::Archived { None } else { current_read_at }
-            }),
+            ItemStatus::Unread => match read_at {
+                ReadAtPatch::MarkRead(explicit_ts) => Some(explicit_ts),
+                ReadAtPatch::MarkUnread => None,
+                ReadAtPatch::Unchanged => {
+                    if current_status == ItemStatus::Archived {
+                        None
+                    } else {
+                        current_read_at
+                    }
+                }
+            },
         };
         let target_favorite = is_favorite.unwrap_or(current_favorite);
         let target_progress = read_progress.unwrap_or(current_progress);
@@ -666,68 +667,67 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn archive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Archived), None, None, None).await
+        self.update(id, Some(ItemStatus::Archived), None, None, ReadAtPatch::Unchanged).await
     }
 
-    pub async fn archive_batch(
-        &self,
-        item_ids: &[String],
-        feed_id: Option<&str>,
-        all_unread: bool,
-    ) -> Result<u64> {
+    pub async fn archive_batch(&self, scope: &ArchiveBatchScope) -> Result<u64> {
         const MAX_BATCH_IDS: usize = 5_000;
         const CHUNK_SIZE: usize = 400;
 
-        let mut unique_ids = Vec::new();
-        let mut seen = HashSet::new();
-        for raw_id in item_ids {
-            let trimmed = raw_id.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed) {
-                unique_ids.push(trimmed);
-                if unique_ids.len() >= MAX_BATCH_IDS {
-                    break;
+        let candidate_ids: Vec<String> = match scope {
+            ArchiveBatchScope::Items { item_ids, feed_id } => {
+                let mut unique_ids = Vec::new();
+                let mut seen = HashSet::new();
+                for raw_id in item_ids {
+                    let trimmed = raw_id.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed) {
+                        unique_ids.push(trimmed);
+                        if unique_ids.len() >= MAX_BATCH_IDS {
+                            break;
+                        }
+                    }
                 }
+                if unique_ids.is_empty() {
+                    return Ok(0);
+                }
+                let mut matched = Vec::new();
+                for chunk in unique_ids.chunks(CHUNK_SIZE) {
+                    let mut qb = QueryBuilder::new(
+                        "SELECT id FROM items WHERE status != 'archived' AND id IN (",
+                    );
+                    let mut sep = qb.separated(", ");
+                    for id in chunk {
+                        sep.push_bind(*id);
+                    }
+                    sep.push_unseparated(")");
+                    if let Some(fid) = feed_id.as_deref() {
+                        qb.push(" AND feed_id = ").push_bind(fid);
+                    }
+                    let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
+                    matched.extend(rows);
+                }
+                matched
             }
-        }
-
-        let candidate_ids: Vec<String> = if !unique_ids.is_empty() {
-            let mut matched = Vec::new();
-            for chunk in unique_ids.chunks(CHUNK_SIZE) {
-                let mut qb = QueryBuilder::new(
-                    "SELECT id FROM items WHERE status != 'archived' AND id IN (",
-                );
-                let mut sep = qb.separated(", ");
-                for id in chunk {
-                    sep.push_bind(*id);
-                }
-                sep.push_unseparated(")");
-                if let Some(fid) = feed_id {
-                    qb.push(" AND feed_id = ").push_bind(fid);
-                }
-                let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
-                matched.extend(rows);
+            ArchiveBatchScope::Feed { feed_id, unread_only } => {
+                let sql = if *unread_only {
+                    "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL AND feed_id = ? LIMIT ?"
+                } else {
+                    "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?"
+                };
+                sqlx::query_scalar(sql)
+                    .bind(feed_id.as_str())
+                    .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+                    .fetch_all(self.pool)
+                    .await?
             }
-            matched
-        } else if let Some(fid) = feed_id {
-            let sql = if all_unread {
-                "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL AND feed_id = ? LIMIT ?"
-            } else {
-                "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?"
-            };
-            sqlx::query_scalar(sql)
-                .bind(fid)
+            ArchiveBatchScope::AllUnread => {
+                sqlx::query_scalar(
+                    "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL LIMIT ?",
+                )
                 .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
                 .fetch_all(self.pool)
                 .await?
-        } else if all_unread {
-            sqlx::query_scalar(
-                "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL LIMIT ?",
-            )
-            .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
-            .fetch_all(self.pool)
-            .await?
-        } else {
-            return Ok(0);
+            }
         };
 
         if candidate_ids.is_empty() {
@@ -912,7 +912,7 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<bool> {
-        self.update(id, Some(ItemStatus::Unread), None, None, None).await
+        self.update(id, Some(ItemStatus::Unread), None, None, ReadAtPatch::Unchanged).await
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
@@ -1376,7 +1376,10 @@ mod tests {
         let custom_read_ts =
             DateTime::parse_from_rfc3339("2026-03-31T09:30:00Z").unwrap().with_timezone(&Utc);
         assert!(
-            items.update(&item_new.id, None, None, None, Some(Some(custom_read_ts))).await.unwrap()
+            items
+                .update(&item_new.id, None, None, None, ReadAtPatch::MarkRead(custom_read_ts))
+                .await
+                .unwrap()
         );
         let read_new = items.get(&item_new.id).await.unwrap().unwrap();
         assert_eq!(read_new.status, ItemStatus::Unread);
@@ -1392,7 +1395,9 @@ mod tests {
             .unwrap();
         assert!(read_only.iter().any(|i| i.id == item_new.id));
 
-        assert!(items.update(&item_new.id, None, None, None, Some(None)).await.unwrap());
+        assert!(
+            items.update(&item_new.id, None, None, None, ReadAtPatch::MarkUnread).await.unwrap()
+        );
         let unread_again = items.get(&item_new.id).await.unwrap().unwrap();
         assert!(unread_again.read_at.is_none());
 
@@ -1405,7 +1410,7 @@ mod tests {
                     Some(ItemStatus::Archived),
                     None,
                     None,
-                    Some(Some(custom_read_ts)),
+                    ReadAtPatch::MarkRead(custom_read_ts),
                 )
                 .await
                 .unwrap()
@@ -1421,7 +1426,7 @@ mod tests {
                     Some(ItemStatus::Unread),
                     None,
                     None,
-                    Some(Some(custom_read_ts)),
+                    ReadAtPatch::MarkRead(custom_read_ts),
                 )
                 .await
                 .unwrap()
@@ -1430,12 +1435,15 @@ mod tests {
         assert_eq!(restored_read.status, ItemStatus::Unread);
         assert_eq!(restored_read.read_at, Some(custom_read_ts));
 
-        assert!(items.update(&item_new.id, None, None, None, Some(None)).await.unwrap());
+        assert!(
+            items.update(&item_new.id, None, None, None, ReadAtPatch::MarkUnread).await.unwrap()
+        );
 
         // Whitespace-only item_ids do not shadow feed_id in archive_batch
         let before_archive_id = db.sync().latest_activity_id().await.unwrap();
-        let archived =
-            items.archive_batch(&["   ".to_string()], Some(&feed.id), false).await.unwrap();
+        let scope =
+            ArchiveBatchScope::from_request(&["   ".to_string()], Some(&feed.id), false).unwrap();
+        let archived = items.archive_batch(&scope).await.unwrap();
         assert_eq!(archived, 3);
         assert_eq!(items.count_by_status(ItemStatus::Unread).await.unwrap(), 1);
         assert_eq!(items.count_by_status(ItemStatus::Archived).await.unwrap(), 3);

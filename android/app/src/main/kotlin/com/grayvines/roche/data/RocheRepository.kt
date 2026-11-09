@@ -1,6 +1,7 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.ItemTagEntity
+import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
@@ -22,7 +23,18 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-data class SaveUrlResult(val title: String, val isFeed: Boolean)
+enum class SavedResourceKind {
+    ITEM,
+    FEED,
+}
+
+data class SaveUrlResult(
+    val title: String,
+    val kind: SavedResourceKind,
+) {
+    val isFeed: Boolean
+        get() = kind == SavedResourceKind.FEED
+}
 
 data class ArchiveStateSnapshot(
     val itemId: String,
@@ -317,7 +329,7 @@ class RocheRepository(
 
     suspend fun deleteItem(itemId: String): Result<String> = runCatching {
         val existing = dao.getItemById(itemId)
-        val wasLocalUnpushed = dao.getPendingMutation(itemId)?.isLocalItem == true
+        val wasLocalUnpushed = dao.getPendingMutation(itemId)?.kind == PendingEntityKind.LOCAL_ITEM
         offlineCacheManager.evictCachedItemFiles(itemId)
         dao.deleteItemTagsForItem(itemId)
         dao.deletePendingMutation(itemId)
@@ -356,7 +368,7 @@ class RocheRepository(
                     url = trimmedUrl,
                     titleOverride = titleOverride,
                 )
-            return SaveUrlResult(title = feedTitle, isFeed = true)
+            return SaveUrlResult(title = feedTitle, kind = SavedResourceKind.FEED)
         }
         val tags = parseTagCsv(tagCsv)
         val inferredType = inferContentType(trimmedUrl)
@@ -368,9 +380,8 @@ class RocheRepository(
         dao.upsertItem(localEntity)
         attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = tags)
         dao.upsertPendingMutation(
-            PendingMutationEntity(
+            PendingMutationEntity.localItem(
                 entityId = localEntity.id,
-                isLocalItem = true,
                 titleOverride = cleanTitleOverride,
             )
         )
@@ -389,7 +400,7 @@ class RocheRepository(
             } else {
                 localEntity
             }
-        return SaveUrlResult(title = finalEntity.title, isFeed = false)
+        return SaveUrlResult(title = finalEntity.title, kind = SavedResourceKind.ITEM)
     }
 
     internal suspend fun discoverServer(

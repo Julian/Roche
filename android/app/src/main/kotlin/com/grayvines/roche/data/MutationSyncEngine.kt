@@ -3,6 +3,7 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.ItemTagEntity
+import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagEntity
@@ -22,6 +23,28 @@ private const val HTTP_NOT_FOUND = 404
 private const val ARCHIVED_STATUS_WIRE = "archived"
 internal const val DELETED_STATUS_TOMBSTONE = "__deleted__"
 
+internal val PendingMutationEntity.isDeletedItem: Boolean
+    get() = dirtyStatus == DELETED_STATUS_TOMBSTONE
+
+internal fun PendingMutationEntity.resolveEffectiveReadAt(
+    defaultReadAt: String?,
+    statusAffectsDefault: Boolean = false,
+): String? =
+    when (dirtyReadAt) {
+        null ->
+            if (statusAffectsDefault && dirtyStatus != null) {
+                if (dirtyStatus.equals(ARCHIVED_STATUS_WIRE, ignoreCase = true)) {
+                    defaultReadAt
+                } else {
+                    null
+                }
+            } else {
+                defaultReadAt
+            }
+        UNREAD_READ_AT_TOMBSTONE -> null
+        else -> dirtyReadAt
+    }
+
 internal data class PushMutationsOutcome(
     val createdFeeds: List<RemoteFeedDto> = emptyList(),
     val savedItems: List<RemoteItemDto> = emptyList(),
@@ -29,8 +52,7 @@ internal data class PushMutationsOutcome(
 )
 
 internal fun isCleanMutation(mutation: PendingMutationEntity): Boolean =
-    !mutation.isLocalFeed &&
-        !mutation.isLocalItem &&
+    mutation.kind == PendingEntityKind.REMOTE_ITEM &&
         mutation.dirtyStatus == null &&
         mutation.dirtyFavorite == null &&
         mutation.dirtyReadProgress == null &&
@@ -222,6 +244,26 @@ internal suspend fun pushItemUpdateBestEffort(
 }
     .getOrDefault(false)
 
+private suspend fun syncItemFieldMutation(
+    dao: RocheDao,
+    itemId: String,
+    applyDirty: (PendingMutationEntity) -> PendingMutationEntity,
+    clearDirty: (PendingMutationEntity) -> PendingMutationEntity,
+    pushRemote: suspend () -> Boolean,
+) {
+    val existing = dao.getPendingMutation(itemId)
+    if (existing?.kind == PendingEntityKind.LOCAL_ITEM) {
+        dao.upsertPendingMutation(applyDirty(existing))
+        return
+    }
+    val pushed = pushRemote()
+    val base = existing ?: PendingMutationEntity(entityId = itemId)
+    upsertOrCleanPendingMutation(
+        dao = dao,
+        mutation = if (pushed) clearDirty(base) else applyDirty(base),
+    )
+}
+
 internal suspend fun syncStatusMutation(
     dao: RocheDao,
     apiClient: RocheApiClient,
@@ -230,27 +272,20 @@ internal suspend fun syncStatusMutation(
     status: String,
     explicitReadAt: String? = null,
 ) {
-    val existing = dao.getPendingMutation(itemId)
-    if (existing?.isLocalItem == true) {
-        dao.upsertPendingMutation(existing.copy(dirtyStatus = status, dirtyReadAt = explicitReadAt))
-        return
-    }
-    val pushed =
-        pushItemUpdateBestEffort(
-            apiClient = apiClient,
-            settings = settings,
-            itemId = itemId,
-            status = status,
-            readAt = explicitReadAt,
-        )
-    val base = existing ?: PendingMutationEntity(entityId = itemId)
-    upsertOrCleanPendingMutation(
+    syncItemFieldMutation(
         dao = dao,
-        mutation =
-            base.copy(
-                dirtyStatus = if (pushed) null else status,
-                dirtyReadAt = if (pushed) null else explicitReadAt,
-            ),
+        itemId = itemId,
+        applyDirty = { it.copy(dirtyStatus = status, dirtyReadAt = explicitReadAt) },
+        clearDirty = { it.copy(dirtyStatus = null, dirtyReadAt = null) },
+        pushRemote = {
+            pushItemUpdateBestEffort(
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                status = status,
+                readAt = explicitReadAt,
+            )
+        },
     )
 }
 
@@ -261,22 +296,19 @@ internal suspend fun syncFavoriteMutation(
     itemId: String,
     isFavorite: Boolean,
 ) {
-    val existing = dao.getPendingMutation(itemId)
-    if (existing?.isLocalItem == true) {
-        dao.upsertPendingMutation(existing.copy(dirtyFavorite = isFavorite))
-        return
-    }
-    val pushed =
-        pushItemUpdateBestEffort(
-            apiClient = apiClient,
-            settings = settings,
-            itemId = itemId,
-            isFavorite = isFavorite,
-        )
-    val base = existing ?: PendingMutationEntity(entityId = itemId)
-    upsertOrCleanPendingMutation(
+    syncItemFieldMutation(
         dao = dao,
-        mutation = base.copy(dirtyFavorite = if (pushed) null else isFavorite),
+        itemId = itemId,
+        applyDirty = { it.copy(dirtyFavorite = isFavorite) },
+        clearDirty = { it.copy(dirtyFavorite = null) },
+        pushRemote = {
+            pushItemUpdateBestEffort(
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                isFavorite = isFavorite,
+            )
+        },
     )
 }
 
@@ -287,22 +319,19 @@ internal suspend fun syncReadProgressMutation(
     itemId: String,
     progress: Double,
 ) {
-    val existing = dao.getPendingMutation(itemId)
-    if (existing?.isLocalItem == true) {
-        dao.upsertPendingMutation(existing.copy(dirtyReadProgress = progress))
-        return
-    }
-    val pushed =
-        pushItemUpdateBestEffort(
-            apiClient = apiClient,
-            settings = settings,
-            itemId = itemId,
-            readProgress = progress,
-        )
-    val base = existing ?: PendingMutationEntity(entityId = itemId)
-    upsertOrCleanPendingMutation(
+    syncItemFieldMutation(
         dao = dao,
-        mutation = base.copy(dirtyReadProgress = if (pushed) null else progress),
+        itemId = itemId,
+        applyDirty = { it.copy(dirtyReadProgress = progress) },
+        clearDirty = { it.copy(dirtyReadProgress = null) },
+        pushRemote = {
+            pushItemUpdateBestEffort(
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                readProgress = progress,
+            )
+        },
     )
 }
 
@@ -314,22 +343,19 @@ internal suspend fun syncReadAtMutation(
     readAt: String?,
 ) {
     val wireReadAt = readAt ?: UNREAD_READ_AT_TOMBSTONE
-    val existing = dao.getPendingMutation(itemId)
-    if (existing?.isLocalItem == true) {
-        dao.upsertPendingMutation(existing.copy(dirtyReadAt = wireReadAt))
-        return
-    }
-    val pushed =
-        pushItemUpdateBestEffort(
-            apiClient = apiClient,
-            settings = settings,
-            itemId = itemId,
-            readAt = wireReadAt,
-        )
-    val base = existing ?: PendingMutationEntity(entityId = itemId)
-    upsertOrCleanPendingMutation(
+    syncItemFieldMutation(
         dao = dao,
-        mutation = base.copy(dirtyReadAt = if (pushed) null else wireReadAt),
+        itemId = itemId,
+        applyDirty = { it.copy(dirtyReadAt = wireReadAt) },
+        clearDirty = { it.copy(dirtyReadAt = null) },
+        pushRemote = {
+            pushItemUpdateBestEffort(
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                readAt = wireReadAt,
+            )
+        },
     )
 }
 
@@ -436,7 +462,7 @@ internal suspend fun syncAddTagMutation(
     val base = existing ?: PendingMutationEntity(entityId = itemId)
     val added = parseTagCsv(base.addedTagsCsv).toMutableSet()
     val removed = parseTagCsv(base.removedTagsCsv).toMutableSet()
-    if (existing?.isLocalItem == true) {
+    if (existing?.kind == PendingEntityKind.LOCAL_ITEM) {
         added.add(normalizedName)
         removed.remove(normalizedName)
         dao.upsertPendingMutation(
@@ -485,7 +511,7 @@ internal suspend fun syncRemoveTagMutation(
     val base = existing ?: PendingMutationEntity(entityId = itemId)
     val added = parseTagCsv(base.addedTagsCsv).toMutableSet()
     val removed = parseTagCsv(base.removedTagsCsv).toMutableSet()
-    if (existing?.isLocalItem == true) {
+    if (existing?.kind == PendingEntityKind.LOCAL_ITEM) {
         added.remove(normalizedName)
         removed.add(normalizedName)
         dao.upsertPendingMutation(
@@ -588,9 +614,8 @@ internal suspend fun subscribeFeedBestEffort(
                     feedType = inferFeedTypeWireValue(url),
                 )
             dao.upsertPendingMutation(
-                PendingMutationEntity(
+                PendingMutationEntity.localFeed(
                     entityId = localFeed.id,
-                    isLocalFeed = true,
                     titleOverride = cleanTitleOverride,
                 )
             )
@@ -608,7 +633,7 @@ internal suspend fun deleteFeedFromServerOrLocal(
     feedId: String,
 ): String {
     val existing = dao.getFeedById(feedId)
-    val isLocalFeed = dao.getPendingMutation(feedId)?.isLocalFeed == true
+    val isLocalFeed = dao.getPendingMutation(feedId)?.kind == PendingEntityKind.LOCAL_FEED
     if (isLocalFeed) {
         purgeFeedItemsLocally(dao = dao, offlineCacheManager = offlineCacheManager, feedId = feedId)
         dao.deletePendingMutation(feedId)
@@ -686,20 +711,20 @@ internal suspend fun pushPendingMutations(
     val appliedMutations = mutableListOf<PendingMutationEntity>()
 
     for (mutation in mutations) {
-        when {
-            mutation.isLocalFeed -> {
+        when (mutation.kind) {
+            PendingEntityKind.LOCAL_FEED -> {
                 pushPendingLocalFeed(dao, apiClient, serverUrl, token, mutation)?.let {
                     createdFeeds.add(it)
                 }
             }
-            mutation.isLocalItem -> {
+            PendingEntityKind.LOCAL_ITEM -> {
                 pushPendingLocalItem(dao, apiClient, serverUrl, token, mutation)?.let {
                     (savedItem, applied) ->
                     savedItems.add(savedItem)
                     appliedMutations.add(applied)
                 }
             }
-            else -> {
+            PendingEntityKind.REMOTE_ITEM -> {
                 appliedMutations.add(
                     pushPendingItemMutation(dao, apiClient, serverUrl, token, mutation)
                 )
@@ -822,12 +847,7 @@ internal suspend fun commitPushedLocalItem(
     mutation: PendingMutationEntity,
     fieldsPushed: Boolean,
 ): Pair<RemoteItemDto, PendingMutationEntity> {
-    val effectiveReadAt =
-        when (mutation.dirtyReadAt) {
-            null -> remoteSaved.readAt
-            UNREAD_READ_AT_TOMBSTONE -> null
-            else -> mutation.dirtyReadAt
-        }
+    val effectiveReadAt = mutation.resolveEffectiveReadAt(defaultReadAt = remoteSaved.readAt)
     val effectiveSaved =
         remoteSaved.copy(
             title = remoteSaved.title.ifBlank { localItem.title },
@@ -880,7 +900,7 @@ internal suspend fun pushPendingItemMutation(
     token: String,
     mutation: PendingMutationEntity,
 ): PendingMutationEntity {
-    if (mutation.dirtyStatus == DELETED_STATUS_TOMBSTONE) {
+    if (mutation.isDeletedItem) {
         val deleted = runCatching {
             apiClient.deleteItem(
                 serverUrl = serverUrl,
@@ -1038,8 +1058,10 @@ internal suspend fun syncArchiveBatchMutation(
 
     val unarchivedIds = unarchivedItems.map { it.id }
     val mutationsById = unarchivedIds.associateWith { dao.getPendingMutation(it) }
-    val remoteIds = unarchivedIds.filter { mutationsById[it]?.isLocalItem != true }
-    val remoteFeedId = feedId?.takeIf { dao.getPendingMutation(it)?.isLocalFeed != true }
+    val remoteIds = unarchivedIds.filter { mutationsById[it]?.kind != PendingEntityKind.LOCAL_ITEM }
+    val remoteFeedId = feedId?.takeIf {
+        dao.getPendingMutation(it)?.kind != PendingEntityKind.LOCAL_FEED
+    }
     val currentSettings = settings.settings.first()
     val pushedToServer =
         if (
@@ -1079,7 +1101,7 @@ private suspend fun recordBatchArchiveMutation(
     existing: PendingMutationEntity?,
     pushedToServer: Boolean,
 ) {
-    if (existing?.isLocalItem == true) {
+    if (existing?.kind == PendingEntityKind.LOCAL_ITEM) {
         dao.upsertPendingMutation(
             existing.copy(dirtyStatus = ARCHIVED_STATUS_WIRE, dirtyReadAt = null)
         )

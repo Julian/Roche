@@ -14,11 +14,12 @@ use crate::{
     config::Config,
     content::fetcher::{HtmlSanitizer, SafeHttpClient, classify_url},
     db::{
-        ActivityEntry, ContentType, Db, DeviceToken, Feed, FeedSource, FeedType, HexColor, Item,
-        ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, SyncRepo, Tag,
+        ActivityEntry, ArchiveBatchScope, ContentType, Db, DeviceToken, Feed, FeedType, HexColor,
+        Item, ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, ReadAtPatch,
+        SyncRepo, Tag,
     },
     error::ApiError,
-    feeds::OpmlDocument,
+    feeds::{FeedSource, OpmlDocument},
     media::{MediaStore, ytdlp::YtDlpWorker},
     scheduler::{FeedFetcher, FeedIngester, HttpFeedFetcher, MediaIngestContext, PollError},
 };
@@ -65,7 +66,7 @@ pub struct SyncChanges {
 }
 
 /// Application service layer coordinating repositories, domain validation, and external fetchers.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RocheService<F = HttpFeedFetcher> {
     db: Db,
     fetcher: Arc<F>,
@@ -75,6 +76,21 @@ pub struct RocheService<F = HttpFeedFetcher> {
     download_semaphore: Arc<Semaphore>,
     failed_pair_attempts: Arc<Mutex<(Option<String>, VecDeque<Instant>)>>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
+}
+
+impl<F> Clone for RocheService<F> {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            fetcher: Arc::clone(&self.fetcher),
+            config: self.config.clone(),
+            media_store: self.media_store.clone(),
+            ytdlp_worker: self.ytdlp_worker.clone(),
+            download_semaphore: Arc::clone(&self.download_semaphore),
+            failed_pair_attempts: Arc::clone(&self.failed_pair_attempts),
+            node_identity: self.node_identity.clone(),
+        }
+    }
 }
 
 impl<F: FeedFetcher> RocheService<F> {
@@ -150,8 +166,16 @@ impl<F: FeedFetcher> RocheService<F> {
     }
 
     #[must_use]
-    pub fn download_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.download_semaphore)
+    pub fn poll_scheduler(&self) -> crate::scheduler::PollScheduler<F> {
+        crate::scheduler::PollScheduler::with_arc_fetcher(
+            self.db.clone(),
+            Arc::clone(&self.fetcher),
+        )
+        .with_media(
+            self.media_store.clone(),
+            self.ytdlp_worker.clone(),
+            Arc::clone(&self.download_semaphore),
+        )
     }
 
     fn media_ingest_context(&self) -> MediaIngestContext<'_, F> {
@@ -448,6 +472,37 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         Ok(self.service.db.feeds().import_outlines(outlines, default_interval).await?)
     }
 
+    pub async fn poll_feeds_concurrently(&self, feeds: Vec<Feed>) {
+        if feeds.is_empty() {
+            return;
+        }
+        let poll_sem = Arc::new(Semaphore::new(8));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for feed in feeds {
+            let service_clone = self.service.clone();
+            let p_sem = Arc::clone(&poll_sem);
+            join_set.spawn(async move {
+                let Ok(_permit) = p_sem.acquire_owned().await else {
+                    return;
+                };
+                let ctx = service_clone.media_ingest_context();
+                if let Err(err) = FeedIngester::poll_with_media(&ctx, &feed).await {
+                    let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
+                    tracing::error!(
+                        feed_title = %feed_title,
+                        feed_url = %feed.url,
+                        feed_id = %feed.id,
+                        error = %err,
+                        "OPML initial feed poll failed"
+                    );
+                    let _ = service_clone.db.feeds().mark_error(&feed.id, &err.to_string()).await;
+                }
+            });
+        }
+        while join_set.join_next().await.is_some() {}
+    }
+
     pub async fn export_opml(&self) -> Result<String, ApiError> {
         let feeds = self.list().await?;
         Ok(OpmlDocument::to_xml(&feeds))
@@ -551,22 +606,12 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             })
             .await?;
 
-        let db = self.service.db.clone();
-        let media_store = self.service.media_store.clone();
-        let ytdlp_worker = self.service.ytdlp_worker.clone();
-        let download_semaphore = Arc::clone(&self.service.download_semaphore);
-        let fetcher = Arc::clone(&self.service.fetcher);
+        let service_clone = self.service.clone();
         let item_id = item.id.clone();
         let item_url = url.clone();
 
         let ingest_handle = tokio::spawn(async move {
-            let ctx = MediaIngestContext {
-                db: &db,
-                media_store: &media_store,
-                ytdlp_worker: Some(&ytdlp_worker),
-                download_semaphore: Some(&download_semaphore),
-                fetcher: fetcher.as_ref(),
-            };
+            let ctx = service_clone.media_ingest_context();
             FeedIngester::ingest_item_media(&ctx, &item_id, content_type, &item_url).await;
         });
         let _ = tokio::time::timeout(Duration::from_secs(2), ingest_handle).await;
@@ -574,14 +619,13 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         self.get(&item.id).await
     }
 
-    #[allow(clippy::option_option)]
     pub async fn update(
         &self,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
         read_progress: Option<f64>,
-        read_at: Option<Option<DateTime<Utc>>>,
+        read_at: ReadAtPatch,
     ) -> Result<ItemDetail, ApiError> {
         if let Some(p) = read_progress
             && (!p.is_finite() || !(0.0..=1.0).contains(&p))
@@ -607,17 +651,15 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         feed_id: Option<&str>,
         all_unread: bool,
     ) -> Result<u64, ApiError> {
-        let clean_feed_id = feed_id.map(str::trim).filter(|s| !s.is_empty());
-        let has_valid_ids = item_ids.iter().any(|id| !id.trim().is_empty());
-        if !has_valid_ids && clean_feed_id.is_none() && !all_unread {
+        let Some(scope) = ArchiveBatchScope::from_request(item_ids, feed_id, all_unread) else {
             return Err(ApiError::bad_request(
                 "Specify non-empty item_ids, feed_id, or all_unread: true",
             ));
-        }
-        if let Some(fid) = clean_feed_id {
+        };
+        if let Some(fid) = scope.feed_id() {
             let _ = self.service.feeds().get(fid).await?;
         }
-        Ok(self.service.db.items().archive_batch(item_ids, clean_feed_id, all_unread).await?)
+        Ok(self.service.db.items().archive_batch(&scope).await?)
     }
 
     pub async fn unarchive(&self, id: &str) -> Result<ItemDetail, ApiError> {

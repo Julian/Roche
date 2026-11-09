@@ -634,7 +634,13 @@ internal fun ServerConfigAutoSaveEffect(
         val trimmedToken = bearerToken.trim()
         if (normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken) {
             delay(SERVER_CONFIG_AUTOSAVE_DELAY_MS)
-            onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken, silent = true))
+            onAction(
+                MainAction.UpdateServerConfig(
+                    serverUrl = serverUrl,
+                    bearerToken = bearerToken,
+                    feedback = ConfigSaveFeedback.SILENT,
+                )
+            )
         }
     }
 }

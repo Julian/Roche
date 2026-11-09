@@ -56,6 +56,12 @@ data class TagEntity(@PrimaryKey val id: String, val name: String)
 )
 data class ItemTagEntity(val itemId: String, val tagId: String)
 
+enum class PendingEntityKind {
+    LOCAL_FEED,
+    LOCAL_ITEM,
+    REMOTE_ITEM,
+}
+
 @Entity(tableName = "pending_mutations")
 data class PendingMutationEntity(
     @PrimaryKey val entityId: String,
@@ -68,4 +74,28 @@ data class PendingMutationEntity(
     val dirtyReadAt: String? = null,
     val addedTagsCsv: String = "",
     val removedTagsCsv: String = "",
-)
+) {
+    val kind: PendingEntityKind
+        get() =
+            when {
+                isLocalFeed -> PendingEntityKind.LOCAL_FEED
+                isLocalItem -> PendingEntityKind.LOCAL_ITEM
+                else -> PendingEntityKind.REMOTE_ITEM
+            }
+
+    companion object {
+        fun localFeed(entityId: String, titleOverride: String? = null): PendingMutationEntity =
+            PendingMutationEntity(
+                entityId = entityId,
+                isLocalFeed = true,
+                titleOverride = titleOverride,
+            )
+
+        fun localItem(entityId: String, titleOverride: String? = null): PendingMutationEntity =
+            PendingMutationEntity(
+                entityId = entityId,
+                isLocalItem = true,
+                titleOverride = titleOverride,
+            )
+    }
+}

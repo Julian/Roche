@@ -3,13 +3,13 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.ItemTagEntity
+import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteTagDto
-import com.grayvines.roche.data.remote.UNREAD_READ_AT_TOMBSTONE
 
 internal fun mergePushedFeeds(
     remoteFeeds: List<RemoteFeedDto>,
@@ -61,9 +61,7 @@ internal suspend fun reconcileRemoteSnapshot(
 
     val adjustedRemoteItems =
         remoteItems
-            .filterNot { remote ->
-                effectiveMutations[remote.id]?.dirtyStatus == DELETED_STATUS_TOMBSTONE
-            }
+            .filterNot { remote -> effectiveMutations[remote.id]?.isDeletedItem == true }
             .map { remote ->
                 val mutated = applyMutationToRemoteItem(remote, effectiveMutations[remote.id])
                 overlayInFlightLocalChanges(
@@ -126,7 +124,7 @@ internal fun collectPreservedOfflineItems(
     val adjustedRemoteItemIds = adjustedRemoteItems.map { it.id }.toSet()
     val unpushedIds = unpushedLocalItems.map { it.id }.toSet()
     return existingItemsById.values.filter { local ->
-        val isDeleted = effectiveMutations[local.id]?.dirtyStatus == DELETED_STATUS_TOMBSTONE
+        val isDeleted = effectiveMutations[local.id]?.isDeletedItem == true
         local.isCachedOffline &&
             local.id !in adjustedRemoteItemIds &&
             local.id !in unpushedIds &&
@@ -162,7 +160,7 @@ internal fun collectUnpushedLocalFeeds(
     remoteFeeds: List<RemoteFeedDto>,
 ): List<FeedEntity> =
     remainingMutations
-        .filter { it.isLocalFeed }
+        .filter { it.kind == PendingEntityKind.LOCAL_FEED }
         .mapNotNull { existingFeedsById[it.entityId] }
         .filter { local -> remoteFeeds.none { it.url.equals(local.url, ignoreCase = true) } }
 
@@ -172,7 +170,7 @@ internal fun collectUnpushedLocalItems(
     adjustedRemoteItems: List<RemoteItemDto>,
 ): List<ItemEntity> =
     remainingMutations
-        .filter { it.isLocalItem }
+        .filter { it.kind == PendingEntityKind.LOCAL_ITEM }
         .mapNotNull { existingItemsById[it.entityId] }
         .filter { local -> adjustedRemoteItems.none { it.id == local.id } }
 
@@ -194,7 +192,7 @@ internal suspend fun pruneOrphanedPendingMutations(
 ) {
     val remoteItemIds = adjustedRemoteItems.map { it.id }.toSet()
     remainingMutations
-        .filter { !it.isLocalFeed && !it.isLocalItem && it.entityId !in remoteItemIds }
+        .filter { it.kind == PendingEntityKind.REMOTE_ITEM && it.entityId !in remoteItemIds }
         .forEach { dao.deletePendingMutation(it.entityId) }
 }
 
@@ -208,20 +206,10 @@ internal fun applyMutationToRemoteItem(
     mergedTags.addAll(parseTagCsv(mutation.addedTagsCsv))
     mergedTags.removeAll(parseTagCsv(mutation.removedTagsCsv).toSet())
     val effectiveReadAt =
-        when (mutation.dirtyReadAt) {
-            null ->
-                if (mutation.dirtyStatus != null) {
-                    if (mutation.dirtyStatus.equals("archived", ignoreCase = true)) {
-                        remote.readAt
-                    } else {
-                        null
-                    }
-                } else {
-                    remote.readAt
-                }
-            UNREAD_READ_AT_TOMBSTONE -> null
-            else -> mutation.dirtyReadAt
-        }
+        mutation.resolveEffectiveReadAt(
+            defaultReadAt = remote.readAt,
+            statusAffectsDefault = true,
+        )
     return remote.copy(
         status = mutation.dirtyStatus ?: remote.status,
         isFavorite = mutation.dirtyFavorite ?: remote.isFavorite,

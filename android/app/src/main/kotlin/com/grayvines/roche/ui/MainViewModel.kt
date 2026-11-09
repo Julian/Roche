@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.data.ArchiveStateSnapshot
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.SavedResourceKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.AppTab
@@ -74,6 +75,16 @@ data class MainUiState(
 
     val selectedFeedTitle: String?
         get() = feeds.firstOrNull { it.id == selectedFeedId }?.title
+}
+
+enum class ConfigSaveFeedback {
+    SHOW_BANNER,
+    SILENT,
+}
+
+internal enum class SyncErrorPolicy {
+    SHOW_BANNER,
+    SILENT,
 }
 
 sealed interface MainAction {
@@ -163,7 +174,7 @@ sealed interface MainAction {
     data class UpdateServerConfig(
         val serverUrl: String,
         val bearerToken: String,
-        val silent: Boolean = false,
+        val feedback: ConfigSaveFeedback = ConfigSaveFeedback.SHOW_BANNER,
     ) : Mutation
 
     data class PairWithServer(
@@ -272,7 +283,7 @@ class MainViewModel(
             is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
             is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
-            MainAction.SyncNow -> performSync(silentOnError = false)
+            MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
             is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
             MainAction.StartupSyncIfConfigured -> performStartupSync()
             else -> applySettingsMutation(action)
@@ -284,10 +295,10 @@ class MainViewModel(
             MainAction.UpdateServerConfig(
                 serverUrl = action.serverUrl,
                 bearerToken = action.bearerToken,
-                silent = true,
+                feedback = ConfigSaveFeedback.SILENT,
             )
         )
-        performSync(silentOnError = false)
+        performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
     }
 
     private suspend fun applySettingsMutation(action: MainAction.Mutation) {
@@ -320,7 +331,7 @@ class MainViewModel(
                 bearerToken = action.bearerToken,
             )
         }
-        if (!action.silent) {
+        if (action.feedback == ConfigSaveFeedback.SHOW_BANNER) {
             showStatusMessage("Saved server settings")
         }
     }
@@ -485,8 +496,11 @@ class MainViewModel(
                 titleOverride = titleOverride,
                 tagCsv = tagCsv,
             )
-        val verb = if (created.isFeed) "Subscribed" else "Saved"
-        val nextTab = if (created.isFeed) AppTab.FEEDS else AppTab.INBOX
+        val (verb, nextTab) =
+            when (created.kind) {
+                SavedResourceKind.FEED -> "Subscribed" to AppTab.FEEDS
+                SavedResourceKind.ITEM -> "Saved" to AppTab.INBOX
+            }
         transientState.update {
             it.copy(
                 isAddSheetOpen = false,
@@ -579,11 +593,11 @@ class MainViewModel(
     internal suspend fun performStartupSync() {
         val currentSettings = settingsRepository.settings.first()
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-            performSync(silentOnError = true)
+            performSync(errorPolicy = SyncErrorPolicy.SILENT)
         }
     }
 
-    private suspend fun performSync(silentOnError: Boolean = false) {
+    private suspend fun performSync(errorPolicy: SyncErrorPolicy = SyncErrorPolicy.SHOW_BANNER) {
         if (!tryAcquireSyncLock()) return
         try {
             repository
@@ -592,7 +606,7 @@ class MainViewModel(
                     showStatusMessage("Synced $count entries from server")
                 }
                 .onFailure { error ->
-                    if (!silentOnError) {
+                    if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
                         showStatusMessage("Sync offline (${error.message ?: "unreachable"})")
                     }
                 }

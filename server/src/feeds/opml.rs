@@ -109,17 +109,9 @@ impl OpmlDocument {
     }
 
     fn normalize_outline_url(url: Url) -> (FeedType, Url) {
-        if url.as_str().contains("youtube.com/feeds/videos.xml") {
-            (FeedType::Youtube, url)
-        } else if let Some(channel_id) = super::YouTubeParser::extract_channel_id(url.as_str())
-            && let Ok(feed_url) = super::YouTubeParser::feed_url_for_channel_id(&channel_id)
-        {
-            (FeedType::Youtube, feed_url)
-        } else if super::ArxivParser::is_arxiv_host(url.host_str()) {
-            (FeedType::Arxiv, url)
-        } else {
-            (FeedType::Rss, url)
-        }
+        super::FeedSource::Url(url.clone())
+            .into_feed_url(FeedType::Rss)
+            .unwrap_or((FeedType::Rss, url))
     }
 }
 

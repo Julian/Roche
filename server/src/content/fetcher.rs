@@ -56,6 +56,19 @@ pub struct SafeHttpClient {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchValidation {
+    Raw,
+    HtmlText,
+    PdfMagic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Utf16Endian {
+    Little,
+    Big,
+}
+
 impl SafeHttpClient {
     pub fn new(timeout: Duration) -> Result<Self> {
         let mut default_headers = reqwest::header::HeaderMap::new();
@@ -156,11 +169,11 @@ impl SafeHttpClient {
     }
 
     pub async fn fetch_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
-        self.fetch_bytes_internal(url, max_bytes, false, false).await
+        self.fetch_bytes_with_validation(url, max_bytes, FetchValidation::Raw).await
     }
 
     pub async fn fetch_pdf_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
-        self.fetch_bytes_internal(url, max_bytes, false, true).await
+        self.fetch_bytes_with_validation(url, max_bytes, FetchValidation::PdfMagic).await
     }
 
     pub async fn fetch_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
@@ -171,10 +184,14 @@ impl SafeHttpClient {
     #[must_use]
     pub fn decode_xml_or_text_bytes(bytes: &[u8]) -> String {
         let decoded = match bytes {
-            [0xFF, 0xFE, rest @ ..] => Self::decode_utf16_slice(rest, true),
-            [0xFE, 0xFF, rest @ ..] => Self::decode_utf16_slice(rest, false),
-            [b0, 0, b2, 0, ..] if *b0 != 0 && *b2 != 0 => Self::decode_utf16_slice(bytes, true),
-            [0, b1, 0, b3, ..] if *b1 != 0 && *b3 != 0 => Self::decode_utf16_slice(bytes, false),
+            [0xFF, 0xFE, rest @ ..] => Self::decode_utf16_slice(rest, Utf16Endian::Little),
+            [0xFE, 0xFF, rest @ ..] => Self::decode_utf16_slice(rest, Utf16Endian::Big),
+            [b0, 0, b2, 0, ..] if *b0 != 0 && *b2 != 0 => {
+                Self::decode_utf16_slice(bytes, Utf16Endian::Little)
+            }
+            [0, b1, 0, b3, ..] if *b1 != 0 && *b3 != 0 => {
+                Self::decode_utf16_slice(bytes, Utf16Endian::Big)
+            }
             _ => String::from_utf8_lossy(bytes).into_owned(),
         };
 
@@ -191,9 +208,10 @@ impl SafeHttpClient {
         trimmed.to_owned()
     }
 
-    fn decode_utf16_slice(bytes: &[u8], little_endian: bool) -> String {
-        let units = bytes.as_chunks::<2>().0.iter().map(|pair| {
-            if little_endian { u16::from_le_bytes(*pair) } else { u16::from_be_bytes(*pair) }
+    fn decode_utf16_slice(bytes: &[u8], endian: Utf16Endian) -> String {
+        let units = bytes.as_chunks::<2>().0.iter().map(|pair| match endian {
+            Utf16Endian::Little => u16::from_le_bytes(*pair),
+            Utf16Endian::Big => u16::from_be_bytes(*pair),
         });
         char::decode_utf16(units).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
     }
@@ -214,19 +232,19 @@ impl SafeHttpClient {
     }
 
     pub async fn fetch_html_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
-        let bytes = self.fetch_bytes_internal(url, max_bytes, true, false).await?;
+        let bytes =
+            self.fetch_bytes_with_validation(url, max_bytes, FetchValidation::HtmlText).await?;
         if is_valid_pdf_bytes(&bytes) || bytes.contains(&0) {
             anyhow::bail!("Upstream response from {url} is binary, not HTML");
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    async fn fetch_bytes_internal(
+    async fn fetch_bytes_with_validation(
         &self,
         url: &Url,
         max_bytes: usize,
-        require_html_content_type: bool,
-        require_pdf_magic: bool,
+        validation: FetchValidation,
     ) -> Result<Vec<u8>> {
         Self::validate_url(url)?;
         let mut response = self.client.get(url.clone()).send().await?;
@@ -234,7 +252,7 @@ impl SafeHttpClient {
         if !response_status.is_success() {
             anyhow::bail!("Upstream server returned HTTP {response_status}");
         }
-        if require_html_content_type
+        if validation == FetchValidation::HtmlText
             && let Some(ct_header) = response.headers().get(reqwest::header::CONTENT_TYPE)
             && let Ok(ct_str) = ct_header.to_str()
         {
@@ -253,6 +271,7 @@ impl SafeHttpClient {
             );
         }
 
+        let require_pdf_magic = validation == FetchValidation::PdfMagic;
         let mut buffer = Vec::new();
         let mut checked_pdf_magic = false;
         while let Some(chunk) = response.chunk().await? {

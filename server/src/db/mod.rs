@@ -22,8 +22,8 @@ pub use media::{Media, MediaRepo};
 pub use sync::{ActivityEntry, SyncRepo};
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
-    ActivityAction, ActivityEntityType, ContentType, FeedSource, FeedType, HexColor, ItemSortField,
-    ItemStatus, ItemStatusFilter, MediaType, SortOrder,
+    ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, FeedType, HexColor,
+    ItemSortField, ItemStatus, ItemStatusFilter, MediaType, ReadAtPatch, SortOrder,
 };
 
 #[derive(Debug, Clone)]

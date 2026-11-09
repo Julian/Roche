@@ -1,11 +1,6 @@
 use anyhow::Result;
-use serde::{Deserialize, Deserializer, Serialize};
-use url::Url;
-
-use crate::{
-    content::fetcher::SafeHttpClient,
-    feeds::{ArxivParser, YouTubeParser},
-};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
@@ -17,105 +12,6 @@ pub enum FeedType {
     Arxiv,
 }
 
-/// Validated feed creation source: either a full [`Url`] or a 24-character `YouTube` channel ID (`UC...`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub enum FeedSource {
-    Url(Url),
-    YouTubeChannelId(String),
-}
-
-impl FeedSource {
-    pub fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("Feed URL cannot be empty");
-        }
-        if let Some(channel_id) = YouTubeParser::extract_channel_id(trimmed)
-            && !trimmed.contains("://")
-        {
-            return Ok(Self::YouTubeChannelId(channel_id));
-        }
-        let url = SafeHttpClient::parse_url(trimmed)?;
-        Ok(Self::Url(url))
-    }
-
-    pub fn into_feed_url(self, requested_type: FeedType) -> Result<(FeedType, Url)> {
-        match self {
-            Self::YouTubeChannelId(channel_id) => match requested_type {
-                FeedType::Youtube | FeedType::Rss => {
-                    Ok((FeedType::Youtube, YouTubeParser::feed_url_for_channel_id(&channel_id)?))
-                }
-                FeedType::Arxiv => anyhow::bail!(
-                    "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
-                ),
-            },
-            Self::Url(url) => match requested_type {
-                FeedType::Youtube => {
-                    if !url.as_str().contains("/feeds/videos.xml")
-                        && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
-                    {
-                        return Ok((
-                            FeedType::Youtube,
-                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
-                        ));
-                    }
-                    if !YouTubeParser::is_youtube_host(url.host_str()) {
-                        anyhow::bail!("YouTube feed URL must point to youtube.com");
-                    }
-                    Ok((FeedType::Youtube, url))
-                }
-                FeedType::Arxiv => {
-                    if !ArxivParser::is_arxiv_host(url.host_str()) {
-                        anyhow::bail!("arXiv feed URL must point to arxiv.org");
-                    }
-                    Self::validate_arxiv_feed_url(&url)?;
-                    Ok((FeedType::Arxiv, url))
-                }
-                FeedType::Rss => {
-                    if !url.as_str().contains("/feeds/videos.xml")
-                        && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
-                    {
-                        return Ok((
-                            FeedType::Youtube,
-                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
-                        ));
-                    }
-                    if url.as_str().contains("youtube.com/feeds/videos.xml") {
-                        return Ok((FeedType::Youtube, url));
-                    }
-                    if ArxivParser::is_arxiv_host(url.host_str()) {
-                        Self::validate_arxiv_feed_url(&url)?;
-                        return Ok((FeedType::Arxiv, url));
-                    }
-                    Ok((FeedType::Rss, url))
-                }
-            },
-        }
-    }
-
-    fn validate_arxiv_feed_url(url: &Url) -> Result<()> {
-        let path = url.path();
-        if path.starts_with("/abs/")
-            || path.starts_with("/pdf/")
-            || crate::content::fetcher::is_direct_pdf_url(url)
-        {
-            anyhow::bail!("URL points to a single arXiv paper, not an arXiv feed");
-        }
-        Ok(())
-    }
-}
-
-impl<'de> Deserialize<'de> for FeedSource {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        Self::parse(&raw).map_err(serde::de::Error::custom)
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
@@ -123,6 +19,74 @@ pub enum ItemStatus {
     #[default]
     Unread,
     Archived,
+}
+
+/// Domain enum replacing `Option<Option<DateTime<Utc>>>` for updating an item's read timestamp.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAtPatch {
+    /// Leave the existing `read_at` timestamp untouched (unless archiving/unarchiving requires a default transition).
+    #[default]
+    Unchanged,
+    /// Explicitly mark the item as read at the given timestamp.
+    MarkRead(DateTime<Utc>),
+    /// Explicitly clear `read_at` (`NULL`) to mark the item as unread.
+    MarkUnread,
+}
+
+impl From<Option<Option<DateTime<Utc>>>> for ReadAtPatch {
+    fn from(opt: Option<Option<DateTime<Utc>>>) -> Self {
+        match opt {
+            None => Self::Unchanged,
+            Some(Some(ts)) => Self::MarkRead(ts),
+            Some(None) => Self::MarkUnread,
+        }
+    }
+}
+
+/// Domain sum type replacing `(item_ids, feed_id, all_unread: bool)` for batch-archiving items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveBatchScope {
+    /// Archive specific non-archived item IDs, optionally restricted to a specific feed.
+    Items { item_ids: Vec<String>, feed_id: Option<String> },
+    /// Archive all non-archived items (or only unread items with `read_at IS NULL`) in a specific feed.
+    Feed { feed_id: String, unread_only: bool },
+    /// Archive all unread items (`status = 'unread' AND read_at IS NULL`) across all feeds.
+    AllUnread,
+}
+
+impl ArchiveBatchScope {
+    pub fn from_request(
+        item_ids: &[String],
+        feed_id: Option<&str>,
+        all_unread: bool,
+    ) -> Option<Self> {
+        let clean_feed_id = feed_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let valid_ids: Vec<String> = item_ids
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+
+        if !valid_ids.is_empty() {
+            Some(Self::Items { item_ids: valid_ids, feed_id: clean_feed_id })
+        } else if let Some(fid) = clean_feed_id {
+            Some(Self::Feed { feed_id: fid, unread_only: all_unread })
+        } else if all_unread {
+            Some(Self::AllUnread)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn feed_id(&self) -> Option<&str> {
+        match self {
+            Self::Items { feed_id, .. } => feed_id.as_deref(),
+            Self::Feed { feed_id, .. } => Some(feed_id.as_str()),
+            Self::AllUnread => None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -261,5 +225,49 @@ impl TryFrom<String> for HexColor {
 impl From<HexColor> for String {
     fn from(color: HexColor) -> Self {
         color.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_at_patch_from_option_option() {
+        let now = Utc::now();
+        assert_eq!(ReadAtPatch::from(None), ReadAtPatch::Unchanged);
+        assert_eq!(ReadAtPatch::from(Some(Some(now))), ReadAtPatch::MarkRead(now));
+        assert_eq!(ReadAtPatch::from(Some(None)), ReadAtPatch::MarkUnread);
+    }
+
+    #[test]
+    fn test_archive_batch_scope_from_request() {
+        assert_eq!(ArchiveBatchScope::from_request(&[], None, false), None);
+        assert_eq!(ArchiveBatchScope::from_request(&["  ".to_string()], Some(" "), false), None);
+
+        let all_unread = ArchiveBatchScope::from_request(&[], None, true);
+        assert_eq!(all_unread, Some(ArchiveBatchScope::AllUnread));
+        assert_eq!(all_unread.as_ref().and_then(ArchiveBatchScope::feed_id), None);
+
+        let feed_unread = ArchiveBatchScope::from_request(&[], Some(" feed-1 "), true);
+        assert_eq!(
+            feed_unread,
+            Some(ArchiveBatchScope::Feed { feed_id: "feed-1".to_string(), unread_only: true })
+        );
+        assert_eq!(feed_unread.as_ref().and_then(ArchiveBatchScope::feed_id), Some("feed-1"));
+
+        let items = ArchiveBatchScope::from_request(
+            &[" id-1 ".to_string(), String::new(), "id-2".to_string()],
+            Some("feed-2"),
+            true,
+        );
+        assert_eq!(
+            items,
+            Some(ArchiveBatchScope::Items {
+                item_ids: vec!["id-1".to_string(), "id-2".to_string()],
+                feed_id: Some("feed-2".to_string()),
+            })
+        );
+        assert_eq!(items.as_ref().and_then(ArchiveBatchScope::feed_id), Some("feed-2"));
     }
 }

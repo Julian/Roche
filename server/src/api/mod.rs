@@ -24,8 +24,9 @@ use tower_http::{
 use url::Url;
 
 use crate::{
-    db::{Feed, FeedSource, FeedType, HexColor, ItemFilter, ItemPage, ItemStatus, Tag},
+    db::{Feed, FeedType, HexColor, ItemFilter, ItemPage, ItemStatus, ReadAtPatch, Tag},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
+    feeds::FeedSource,
     scheduler::FeedFetcher,
     service::{ExportBundle, ItemDetail, RocheService, SyncChanges, SyncStatus},
 };
@@ -275,9 +276,15 @@ impl ApiRoutes {
         ProblemPath(id): ProblemPath<String>,
         ProblemJson(req): ProblemJson<UpdateItemRequest>,
     ) -> Result<Json<ItemDetail>, ApiError> {
-        let resolved_read_at = req
-            .read_at
-            .or_else(|| req.is_read.map(|want_read| want_read.then(crate::db::SyncRepo::now_utc)));
+        let resolved_read_at = match req.read_at {
+            Some(Some(ts)) => ReadAtPatch::MarkRead(ts),
+            Some(None) => ReadAtPatch::MarkUnread,
+            None => match req.is_read {
+                Some(true) => ReadAtPatch::MarkRead(crate::db::SyncRepo::now_utc()),
+                Some(false) => ReadAtPatch::MarkUnread,
+                None => ReadAtPatch::Unchanged,
+            },
+        };
         let detail = service
             .items()
             .update(&id, req.status, req.is_favorite, req.read_progress, resolved_read_at)
@@ -1151,7 +1158,7 @@ mod tests {
             .unwrap();
 
         // Star the item and verify ?is_favorite=true filter + thumbnail_media_id + duration projection
-        db.items().update(&item.id, None, Some(true), None, None).await.unwrap();
+        db.items().update(&item.id, None, Some(true), None, ReadAtPatch::Unchanged).await.unwrap();
         let list_request = Request::builder()
             .uri("/api/v1/items?is_favorite=true")
             .header(header::AUTHORIZATION, &auth)

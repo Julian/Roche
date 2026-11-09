@@ -102,10 +102,10 @@ pub struct PollScheduler<F = HttpFeedFetcher> {
 
 impl<F: FeedFetcher> PollScheduler<F> {
     #[must_use]
-    pub fn with_fetcher(db: Db, fetcher: F) -> Self {
+    pub fn with_arc_fetcher(db: Db, fetcher: Arc<F>) -> Self {
         Self {
             db,
-            fetcher: Arc::new(fetcher),
+            fetcher,
             media_store: None,
             ytdlp_worker: None,
             download_semaphore: Arc::new(Semaphore::new(2)),
