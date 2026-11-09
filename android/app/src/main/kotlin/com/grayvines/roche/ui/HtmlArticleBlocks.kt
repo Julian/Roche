@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
+import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
 internal sealed interface ArticleBlock {
@@ -277,6 +278,7 @@ private fun RenderArticleBlock(block: ArticleBlock, linkStyles: TextLinkStyles) 
 @Composable
 internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val headlineFamily =
         if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
             FontFamily.Serif
@@ -287,26 +289,26 @@ internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLin
         remember(block.html, linkStyles) {
             AnnotatedString.fromHtml(htmlString = block.html, linkStyles = linkStyles)
         }
-    val fontSize =
+    val baseFontSize =
         when (block.level) {
-            1 -> 20.5.sp
-            2 -> 18.5.sp
-            3 -> 17.sp
-            else -> 16.sp
+            1 -> 20.5f
+            2 -> 18.5f
+            3 -> 17f
+            else -> 16f
         }
-    val lineHeight =
+    val baseLineHeight =
         when (block.level) {
-            1 -> 27.sp
-            2 -> 25.sp
-            else -> 23.sp
+            1 -> 27f
+            2 -> 25f
+            else -> 23f
         }
     Spacer(modifier = Modifier.height(4.dp))
     Text(
         text = annotated,
         color = colors.textPrimary,
         fontFamily = headlineFamily,
-        fontSize = fontSize,
-        lineHeight = lineHeight,
+        fontSize = (baseFontSize * scale).sp,
+        lineHeight = (baseLineHeight * scale).sp,
         fontWeight = FontWeight.SemiBold,
     )
 }
@@ -314,6 +316,7 @@ internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLin
 @Composable
 internal fun RenderCodeBlock(code: String) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     Box(
         modifier =
             Modifier.fillMaxWidth()
@@ -327,8 +330,8 @@ internal fun RenderCodeBlock(code: String) {
             text = code,
             color = colors.textPrimary,
             fontFamily = FontFamily.Monospace,
-            fontSize = 12.5.sp,
-            lineHeight = 18.5.sp,
+            fontSize = (12.5f * scale).sp,
+            lineHeight = (18.5f * scale).sp,
         )
     }
 }
@@ -336,6 +339,7 @@ internal fun RenderCodeBlock(code: String) {
 @Composable
 internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val annotated =
         remember(block.html, linkStyles) {
             AnnotatedString.fromHtml(htmlString = block.html, linkStyles = linkStyles)
@@ -354,8 +358,8 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
             color = colors.textSecondary,
             fontFamily = FontFamily.Serif,
             fontStyle = FontStyle.Italic,
-            fontSize = 15.5.sp,
-            lineHeight = 24.5.sp,
+            fontSize = (15.5f * scale).sp,
+            lineHeight = (24.5f * scale).sp,
             modifier = Modifier.weight(1f),
         )
     }
@@ -364,6 +368,7 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
 @Composable
 internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         block.itemsHtml.forEachIndexed { index, itemHtml ->
             val marker = if (block.ordered) "${index + 1}." else "•"
@@ -376,16 +381,16 @@ internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLink
                     text = marker,
                     color = colors.accentVerdigris,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 13.5.sp,
-                    lineHeight = 25.sp,
+                    fontSize = (13.5f * scale).sp,
+                    lineHeight = (25f * scale).sp,
                     modifier = Modifier.width(24.dp),
                 )
                 Text(
                     text = annotated,
                     color = colors.textPrimary,
                     fontFamily = FontFamily.Serif,
-                    fontSize = 16.sp,
-                    lineHeight = 25.sp,
+                    fontSize = (16f * scale).sp,
+                    lineHeight = (25f * scale).sp,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -396,6 +401,7 @@ internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLink
 @Composable
 internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val annotated =
         remember(html, linkStyles) {
             AnnotatedString.fromHtml(htmlString = html, linkStyles = linkStyles)
@@ -404,10 +410,21 @@ internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
         text = annotated,
         color = colors.textPrimary,
         fontFamily = FontFamily.Serif,
-        fontSize = 16.sp,
-        lineHeight = 26.sp,
+        fontSize = (16f * scale).sp,
+        lineHeight = (26f * scale).sp,
     )
 }
+
+internal fun extractPlainTextHeadings(blocks: List<ArticleBlock>): List<String> =
+    blocks
+        .filterIsInstance<ArticleBlock.Heading>()
+        .map { heading ->
+            decodeBasicHtmlEntities(heading.html.replace(ANY_HTML_TAG_REGEX, " "))
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+        }
+        .filter { it.isNotEmpty() }
+        .distinct()
 
 private const val GROUP_PRE_INNER = 1
 private const val GROUP_HEADING_LEVEL = 2

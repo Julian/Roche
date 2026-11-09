@@ -146,6 +146,64 @@ class MainScreenTest {
         composeRule.onNodeWithTag("bearer_token_input").assertExists()
     }
 
+    @Test
+    internal fun readerTypographyDrawerAndSearchScopeFiltersRenderAndDispatch() {
+        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val entry =
+            createSampleEntry()
+                .copy(contentHtml = "<h2>Architecture</h2><p>Autoregressive decoding details.</p>")
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.SEARCH,
+                            searchQuery = "Wait-free",
+                            searchResults = listOf(entry),
+                            allEntries = listOf(entry),
+                            selectedReaderEntryId = entry.id,
+                        ),
+                    onAction = { dispatched.add(it) },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("reader_typography_btn").performClick()
+        composeRule.onNodeWithTag("reader_typography_drawer").assertExists()
+        composeRule.onNodeWithText("§ Architecture").assertExists()
+        composeRule.onNodeWithTag("reader_font_larger_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.any { it is com.grayvines.roche.ui.MainAction.SetReaderFontScale }
+        )
+    }
+
+    @Test
+    internal fun searchScopeStripAndMatchSnippetRenderOnSearchTab() {
+        val entry = createSampleEntry()
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.SEARCH,
+                            searchQuery = "Wait-free",
+                            searchResults = listOf(entry),
+                        ),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("search_scope_papers").assertExists()
+        composeRule.onNodeWithTag("search_match_snippet_${entry.id}").assertExists()
+        composeRule.onNodeWithTag("search_scope_videos").performClick()
+        composeRule.onNodeWithText("No results in Videos for \"Wait-free\".").assertExists()
+    }
+
     private fun createSampleEntry(): InboxEntry =
         InboxEntry(
             id = "item-1",

@@ -3,6 +3,7 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.ItemTagEntity
 import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
+import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.local.TombstoneEntity
@@ -316,6 +317,18 @@ class RocheRepository(
             )
         }
     }
+
+    internal suspend fun renameFeed(feedId: String, newTitle: String): String? =
+        renameFeedInLocalDb(dao = dao, feedId = feedId, newTitle = newTitle)
+
+    internal suspend fun applyTagToFeedItems(feedId: String, tagName: String): Int =
+        applyTagToUnarchivedFeedItems(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            feedId = feedId,
+            tagName = tagName,
+        )
 
     suspend fun refreshFeed(feedId: String): Result<String> = runCatching {
         refreshFeedOnlineOrOnDevice(
@@ -684,3 +697,50 @@ class RocheRepository(
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
 private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L
+
+internal suspend fun renameFeedInLocalDb(
+    dao: RocheDao,
+    feedId: String,
+    newTitle: String,
+): String? {
+    val cleanTitle = newTitle.trim()
+    if (cleanTitle.isBlank()) return null
+    val existing = dao.getFeedById(feedId) ?: return null
+    if (existing.title == cleanTitle) return cleanTitle
+    dao.updateFeedTitle(feedId = feedId, title = cleanTitle)
+    dao.updateItemsFeedTitle(feedId = feedId, title = cleanTitle)
+    return cleanTitle
+}
+
+internal suspend fun applyTagToUnarchivedFeedItems(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    feedId: String,
+    tagName: String,
+): Int {
+    val normalized = normalizeTagName(tagName)
+    if (normalized.isBlank()) return 0
+    val itemIds = dao.getUnarchivedItemIdsForFeed(feedId)
+    if (itemIds.isEmpty()) return 0
+    val existingTag =
+        dao.getTagByName(normalized)
+            ?: TagEntity(id = newTagId(), name = normalized).also { dao.upsertTag(it) }
+    var taggedCount = 0
+    for (itemId in itemIds) {
+        if (dao.hasItemTag(itemId = itemId, tagId = existingTag.id) == 0) {
+            dao.updateItemInteractionTimestamp(itemId)
+            dao.insertItemTag(ItemTagEntity(itemId = itemId, tagId = existingTag.id))
+            syncAddTagMutation(
+                dao = dao,
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                existingTag = existingTag,
+                normalizedName = normalized,
+            )
+            taggedCount++
+        }
+    }
+    return taggedCount
+}

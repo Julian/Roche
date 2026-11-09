@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import com.grayvines.roche.model.AppTab
@@ -57,6 +58,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             prefs[KEY_THEME_MODE] = updated.themeMode.name
             prefs[KEY_HEADLINE_FONT] = updated.headlineFont.name
             prefs[KEY_ULTRA_DENSE_ROWS] = updated.ultraDenseRows
+            prefs[KEY_READER_FONT_SCALE] = updated.readerFontScale
             prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
             prefs[KEY_LAST_PEER_SYNC_CURSOR] = updated.lastPeerSyncCursor
         }
@@ -80,6 +82,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                         HeadlineFont.entries.firstOrNull { it.name == raw }
                     } ?: HeadlineFont.SERIF,
                 ultraDenseRows = this[KEY_ULTRA_DENSE_ROWS] ?: false,
+                readerFontScale = this[KEY_READER_FONT_SCALE] ?: Settings.DEFAULT_READER_FONT_SCALE,
                 bottomNavTabs =
                     this[KEY_BOTTOM_NAV_TABS]?.let { raw ->
                         raw.split(',')
@@ -102,6 +105,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
         private val KEY_HEADLINE_FONT = stringPreferencesKey("headline_font")
         private val KEY_ULTRA_DENSE_ROWS = booleanPreferencesKey("ultra_dense_rows")
+        private val KEY_READER_FONT_SCALE = floatPreferencesKey("reader_font_scale")
         private val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
         private val KEY_LAST_PEER_SYNC_CURSOR = stringPreferencesKey("last_peer_sync_cursor")
 

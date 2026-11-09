@@ -152,6 +152,12 @@ sealed interface MainAction {
 
     data class RefreshFeed(val feedId: String) : Mutation
 
+    data class RenameFeed(val feedId: String, val newTitle: String) : Mutation
+
+    data class ApplyTagToFeed(val feedId: String, val tagName: String) : Mutation
+
+    data class ArchiveFeedUnread(val feedId: String) : Mutation
+
     data class DeleteFeed(val feedId: String) : Mutation
 
     data class DeleteEntry(val entryId: String) : Mutation
@@ -172,6 +178,8 @@ sealed interface MainAction {
     data class SetHeadlineFont(val font: HeadlineFont) : Mutation
 
     data class SetUltraDenseRows(val enabled: Boolean) : Mutation
+
+    data class SetReaderFontScale(val scale: Float) : Mutation
 
     data class SetSwipeToArchive(val enabled: Boolean) : Mutation
 
@@ -294,6 +302,9 @@ class MainViewModel(
     internal suspend fun executeSyncOrSettingsMutation(action: MainAction.Mutation) {
         when (action) {
             is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
+            is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
+            is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
+            is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
             is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
             MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
@@ -323,6 +334,8 @@ class MainViewModel(
                 settingsRepository.update { it.copy(headlineFont = action.font) }
             is MainAction.SetUltraDenseRows ->
                 settingsRepository.update { it.copy(ultraDenseRows = action.enabled) }
+            is MainAction.SetReaderFontScale ->
+                settingsRepository.update { it.copy(readerFontScale = action.scale) }
             is MainAction.SetSwipeToArchive ->
                 settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
             is MainAction.SetBottomNavSlot ->
@@ -468,7 +481,7 @@ class MainViewModel(
             )
         if (snapshots.isNotEmpty()) {
             val archivedCount = snapshots.size
-            val noun = if (archivedCount == 1) "entry" else "entries"
+            val noun = entryCountNoun(archivedCount)
             val first = snapshots.first()
             transientState.update {
                 it.copy(
@@ -545,6 +558,59 @@ class MainViewModel(
                 }
         } finally {
             transientState.update { it.copy(isSyncing = false) }
+        }
+    }
+
+    internal suspend fun performRenameFeed(feedId: String, newTitle: String) {
+        val updatedTitle = repository.renameFeed(feedId = feedId, newTitle = newTitle)
+        if (updatedTitle != null) {
+            showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
+        }
+    }
+
+    internal suspend fun performApplyTagToFeed(feedId: String, tagName: String) {
+        val count = repository.applyTagToFeedItems(feedId = feedId, tagName = tagName)
+        val cleanTag = com.grayvines.roche.data.normalizeTagName(tagName)
+        if (cleanTag.isNotBlank()) {
+            val msg =
+                if (count > 0) {
+                    "Tagged $count ${entryCountNoun(count)} with #$cleanTag"
+                } else {
+                    "All active feed entries already have #$cleanTag"
+                }
+            showStatusMessage(msg)
+        }
+    }
+
+    internal suspend fun performArchiveFeedUnread(feedId: String) {
+        val unreadIds =
+            uiState.value.allEntries.filter { it.feedId == feedId && !it.isArchived }.map { it.id }
+        if (unreadIds.isEmpty()) return
+        val snapshots =
+            repository.archiveBatchWithSnapshots(
+                entryIds = unreadIds,
+                feedId = feedId,
+                allUnread = false,
+            )
+        if (snapshots.isNotEmpty()) {
+            val count = snapshots.size
+            val noun = entryCountNoun(count)
+            val first = snapshots.first()
+            transientState.update {
+                it.copy(
+                    feedContextSheetId = null,
+                    statusBanner = null,
+                    messageSequence = it.messageSequence + 1,
+                    undoEvent =
+                        UndoArchiveEvent(
+                            itemId = first.itemId,
+                            previousStatus = first.previousStatus,
+                            previousReadAt = first.previousReadAt,
+                            batchSnapshots = snapshots,
+                            message = "Archived $count $noun in feed",
+                        ),
+                )
+            }
         }
     }
 
@@ -842,3 +908,5 @@ internal fun buildMainUiState(
         messageSequence = local.messageSequence,
     )
 }
+
+internal fun entryCountNoun(count: Int): String = if (count == 1) "entry" else "entries"

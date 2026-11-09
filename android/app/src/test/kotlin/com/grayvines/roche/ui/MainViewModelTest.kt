@@ -411,6 +411,128 @@ class MainViewModelTest {
             collectJob.cancel()
         }
 
+    @Test
+    internal fun `rename feed bulk tag archive unread and reader font scale update state`() =
+        runTest {
+            database.dao().upsertFeeds(listOf(testFeed("f-polish", "Old Title")))
+            database
+                .dao()
+                .upsertItem(
+                    testItem(
+                        id = "i-polish",
+                        title = "Speculative Paper",
+                        feedId = "f-polish",
+                        status = "unread",
+                    )
+                )
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+            viewModel.dispatch(MainAction.SetReaderFontScale(1.15f))
+            val scaled = viewModel.uiState.first { it.settings.readerFontScale == 1.15f }
+            assertEquals(1.15f, scaled.settings.readerFontScale, 0.001f)
+
+            viewModel.dispatch(MainAction.RenameFeed("f-polish", "Renamed Feed"))
+            val renamed =
+                viewModel.uiState.first { state ->
+                    state.feeds.any { it.id == "f-polish" && it.title == "Renamed Feed" } &&
+                        state.visibleEntries.firstOrNull { it.id == "i-polish" }?.feedTitle ==
+                            "Renamed Feed"
+                }
+            assertEquals(
+                "Renamed Feed",
+                renamed.visibleEntries.first { it.id == "i-polish" }.feedTitle,
+            )
+
+            viewModel.dispatch(MainAction.ApplyTagToFeed("f-polish", "Systems"))
+            val tagged =
+                viewModel.uiState.first { state ->
+                    state.visibleEntries.first { it.id == "i-polish" }.tags.contains("systems")
+                }
+            assertTrue(tagged.tags.any { it.name == "systems" })
+
+            viewModel.dispatch(MainAction.ArchiveFeedUnread("f-polish"))
+            val archived =
+                viewModel.uiState.first { state ->
+                    state.visibleEntries.none { it.id == "i-polish" } && state.undoEvent != null
+                }
+            assertTrue(archived.undoEvent?.message?.isNotBlank() == true)
+            collectJob.cancel()
+        }
+
+    @Test
+    internal fun `search scope filters match snippets and html headings extract cleanly`() {
+        val entry =
+            testItem(id = "i-1", title = "Title").let {
+                com.grayvines.roche.model.InboxEntry(
+                    id = it.id,
+                    feedId = it.feedId,
+                    feedTitle = it.feedTitle,
+                    title = "Distributed Speculative Decoding",
+                    url = it.url,
+                    author = "A. Author",
+                    summary = "Wait-free verification schedules reduce token latency on edge.",
+                    contentText = null,
+                    contentHtml = "<h2>Introduction</h2><p>Body</p><h3>Benchmarks</h3>",
+                    contentType = com.grayvines.roche.model.ContentType.PDF,
+                    status = com.grayvines.roche.model.ItemStatus.UNREAD,
+                    isFavorite = true,
+                    isCachedOffline = false,
+                    publishedAt = "1m",
+                    createdAt = it.createdAt,
+                    readProgress = 0.0,
+                    thumbnailMediaId = null,
+                    duration = null,
+                    tags = emptyList(),
+                )
+            }
+        assertTrue(
+            com.grayvines.roche.data.matchesSearchScopeFilter(
+                entry,
+                com.grayvines.roche.data.SearchScopeFilter.PAPERS,
+            )
+        )
+        assertFalse(
+            com.grayvines.roche.data.matchesSearchScopeFilter(
+                entry,
+                com.grayvines.roche.data.SearchScopeFilter.VIDEOS,
+            )
+        )
+        val snippet = com.grayvines.roche.data.extractSearchMatchSnippet(entry, "latency")
+        assertTrue(snippet?.contains("latency", ignoreCase = true) == true)
+        assertNull(com.grayvines.roche.data.extractSearchMatchSnippet(entry, "Speculative"))
+        assertEquals(
+            listOf("Introduction", "Benchmarks"),
+            extractPlainTextHeadings(parseHtmlArticleBlocks(entry.contentHtml.orEmpty())),
+        )
+    }
+
     private fun testFeed(id: String, title: String) =
         FeedEntity(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
+
+    private fun testItem(
+        id: String,
+        title: String,
+        feedId: String = "f-1",
+        status: String = "unread",
+    ) =
+        com.grayvines.roche.data.local.ItemEntity(
+            id = id,
+            feedId = feedId,
+            feedTitle = "Test Feed",
+            title = title,
+            url = "https://example.com/$id",
+            author = "Author",
+            summary = "Summary",
+            contentText = null,
+            contentHtml = "<p>Body</p>",
+            contentType = "article",
+            status = status,
+            isFavorite = false,
+            isCachedOffline = false,
+            publishedAt = "2026-06-01T12:00:00Z",
+            createdAt = "2026-06-01T12:00:00Z",
+            readProgress = 0.0,
+            thumbnailMediaId = null,
+            duration = null,
+        )
 }

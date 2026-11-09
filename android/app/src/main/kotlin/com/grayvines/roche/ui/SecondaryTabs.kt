@@ -37,13 +37,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.SearchScopeFilter
+import com.grayvines.roche.data.extractSearchMatchSnippet
+import com.grayvines.roche.data.matchesSearchScopeFilter
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
+import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.pollerAttributionLabel
 import com.grayvines.roche.ui.components.FilterChipPill
@@ -111,12 +118,18 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
 @Composable
 fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
+    var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
+    val visibleResults =
+        remember(state.searchResults, scopeFilter) {
+            state.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
+        }
     val subtitleText =
-        if (state.searchQuery.isBlank()) {
+        if (state.searchQuery.isBlank() && scopeFilter == SearchScopeFilter.ALL) {
             "Type to search ${state.allEntries.size} entries"
         } else {
-            "${state.searchResults.size} matches"
+            "${visibleResults.size} matches"
         }
+
     Column(modifier = Modifier.fillMaxSize()) {
         RocheTopHeader(
             title = "Search",
@@ -126,46 +139,160 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             OutlinedTextField(
                 value = state.searchQuery,
                 onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
-                placeholder = { Text("Search titles, authors, feeds, #tags…", fontSize = 13.sp) },
+                placeholder = {
+                    Text("Search titles, full text, authors, feeds, #tags…", fontSize = 13.sp)
+                },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth().testTag("search_input"),
             )
             Spacer(modifier = Modifier.height(8.dp))
-            SearchQuickTagStrip(state = state, onAction = onAction)
+            SearchScopeFilterStrip(
+                selectedScope = scopeFilter,
+                onSelectScope = { scopeFilter = it },
+            )
+            if (state.tags.isNotEmpty() || state.searchQuery.isNotBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                SearchQuickTagStrip(state = state, onAction = onAction)
+            }
             Spacer(modifier = Modifier.height(10.dp))
         }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (state.searchResults.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "No entries match \"${state.searchQuery}\".",
-                    color = colors.textMuted,
-                    fontSize = 13.sp,
+        SearchResultsBody(
+            results = visibleResults,
+            searchQuery = state.searchQuery,
+            ultraDense = state.settings.ultraDenseRows,
+            swipeToArchive = state.settings.swipeToArchive,
+            onAction = onAction,
+        )
+    }
+}
+
+@Composable
+internal fun SearchScopeFilterStrip(
+    selectedScope: SearchScopeFilter,
+    onSelectScope: (SearchScopeFilter) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        SearchScopeFilter.entries.forEach { scope ->
+            FilterChipPill(
+                label = scope.label,
+                selected = selectedScope == scope,
+                onClick = { onSelectScope(scope) },
+                modifier = Modifier.testTag("search_scope_${scope.name.lowercase()}"),
+            )
+        }
+    }
+}
+
+@Composable
+internal fun SearchResultsBody(
+    results: List<InboxEntry>,
+    searchQuery: String,
+    ultraDense: Boolean,
+    swipeToArchive: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (results.isEmpty()) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(32.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "No entries match \"${searchQuery.ifBlank { "current filter" }}\".",
+                color = colors.textMuted,
+                fontSize = 13.sp,
+            )
+        }
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().testTag("search_results_list"),
+            contentPadding = PaddingValues(bottom = 88.dp),
+        ) {
+            items(items = results, key = { it.id }) { entry ->
+                InboxEntryRowItem(
+                    entry = entry,
+                    ultraDense = ultraDense,
+                    swipeToArchiveEnabled = swipeToArchive,
+                    onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                    onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                    onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                    onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
                 )
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().testTag("search_results_list"),
-                contentPadding = PaddingValues(bottom = 88.dp),
-            ) {
-                items(items = state.searchResults, key = { it.id }) { entry ->
-                    InboxEntryRowItem(
-                        entry = entry,
-                        ultraDense = state.settings.ultraDenseRows,
-                        swipeToArchiveEnabled = state.settings.swipeToArchive,
-                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                val matchSnippet =
+                    remember(entry.id, searchQuery) {
+                        extractSearchMatchSnippet(entry = entry, rawQuery = searchQuery)
+                    }
+                if (matchSnippet != null) {
+                    SearchMatchContextBanner(
+                        entryId = entry.id,
+                        snippet = matchSnippet,
+                        query = searchQuery,
+                        onClick = { onAction(MainAction.OpenReader(entry.id)) },
                     )
-                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SearchMatchContextBanner(
+    entryId: String,
+    snippet: String,
+    query: String,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val cleanQuery = query.trim().trimStart('#')
+    val highlighted =
+        remember(snippet, cleanQuery, colors.accentEcru) {
+            buildAnnotatedString {
+                if (cleanQuery.isBlank()) {
+                    append(snippet)
+                } else {
+                    val idx = snippet.indexOf(cleanQuery, ignoreCase = true)
+                    if (idx == -1) {
+                        append(snippet)
+                    } else {
+                        append(snippet.substring(0, idx))
+                        withStyle(
+                            SpanStyle(
+                                color = colors.accentEcru,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        ) {
+                            append(snippet.substring(idx, idx + cleanQuery.length))
+                        }
+                        append(snippet.substring(idx + cleanQuery.length))
+                    }
                 }
             }
         }
+
+    Box(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(colors.surface)
+                .padding(horizontal = 10.dp, vertical = 6.dp)
+                .testTag("search_match_snippet_$entryId")
+    ) {
+        Text(
+            text = highlighted,
+            color = colors.textSecondary,
+            fontSize = 11.5.sp,
+            lineHeight = 16.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

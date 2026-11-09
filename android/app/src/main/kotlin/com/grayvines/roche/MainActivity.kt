@@ -63,6 +63,7 @@ class MainActivity : ComponentActivity() {
                 RocheTheme(
                     themeMode = state.settings.themeMode,
                     headlineFont = state.settings.headlineFont,
+                    readerFontScale = state.settings.readerFontScale,
                 ) {
                     MainScreen(
                         state = state,

@@ -8,6 +8,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +30,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -41,17 +43,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
+import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlin.math.abs
+import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
 @Composable
 fun ReaderView(
@@ -60,10 +69,13 @@ fun ReaderView(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     backLabel: String = "← Inbox",
+    settings: Settings = Settings(),
 ) {
     BackHandler { onAction(MainAction.CloseReader) }
     val colors = LocalRocheColors.current
     val scrollState = rememberScrollState()
+    val coroutineScope = rememberCoroutineScope()
+    var showTypographyDrawer by rememberSaveable { mutableStateOf(false) }
     val scrollFraction by
         remember(scrollState, entry.readProgress) {
             derivedStateOf {
@@ -88,6 +100,8 @@ fun ReaderView(
         ReaderTopToolbar(
             entry = entry,
             backLabel = backLabel,
+            showTypographyDrawer = showTypographyDrawer,
+            onToggleTypography = { showTypographyDrawer = !showTypographyDrawer },
             onAction = onAction,
             onShare = { onShareEntry(entry) },
         )
@@ -96,6 +110,20 @@ fun ReaderView(
             Box(
                 modifier =
                     Modifier.fillMaxWidth(scrollFraction).height(2.dp).background(colors.accentBlue)
+            )
+        }
+
+        if (showTypographyDrawer) {
+            ReaderTypographyDrawer(
+                entry = entry,
+                settings = settings,
+                onAction = onAction,
+                onJumpToFraction = { fraction ->
+                    coroutineScope.launch {
+                        val target = (fraction * scrollState.maxValue).roundToInt()
+                        scrollState.animateScrollTo(target)
+                    }
+                },
             )
         }
 
@@ -150,6 +178,8 @@ internal fun ReaderScrollProgressEffect(
 private fun ReaderTopToolbar(
     entry: InboxEntry,
     backLabel: String,
+    showTypographyDrawer: Boolean,
+    onToggleTypography: () -> Unit,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
 ) {
@@ -167,6 +197,17 @@ private fun ReaderTopToolbar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            HeaderActionButton(
+                label = "Aa",
+                style =
+                    if (showTypographyDrawer) {
+                        RocheButtonStyle.PRIMARY
+                    } else {
+                        RocheButtonStyle.SECONDARY
+                    },
+                onClick = onToggleTypography,
+                modifier = Modifier.testTag("reader_typography_btn"),
+            )
             CompactStarAndArchiveButtons(
                 entry = entry,
                 tagPrefix = "reader",
@@ -177,6 +218,159 @@ private fun ReaderTopToolbar(
             HeaderActionButton(
                 label = "•••",
                 onClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun ReaderTypographyDrawer(
+    entry: InboxEntry,
+    settings: Settings,
+    onAction: (MainAction) -> Unit,
+    onJumpToFraction: (Float) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val scale = settings.readerFontScale
+    val headings =
+        remember(entry.contentHtml, entry.summary, entry.url) {
+            val html = entry.contentHtml ?: entry.summary.orEmpty()
+            extractPlainTextHeadings(parseHtmlArticleBlocks(rawHtml = html, baseUrl = entry.url))
+        }
+
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surface)
+                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .testTag("reader_typography_drawer"),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "TEXT SIZE (${(scale * PERCENT_MULTIPLIER).roundToInt()}%)",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+        )
+        ReaderFontScaleControlsRow(currentScale = scale, onAction = onAction)
+        ReaderAppearanceQuickToggleRow(settings = settings, onAction = onAction)
+
+        if (headings.isNotEmpty()) {
+            ReaderSectionsOutlineStrip(headings = headings, onJumpToFraction = onJumpToFraction)
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+@Composable
+internal fun ReaderAppearanceQuickToggleRow(
+    settings: Settings,
+    onAction: (MainAction) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        FilterChipPill(
+            label = if (settings.themeMode == ThemeMode.LIGHT) "☀ Paper" else "☾ Dark Ink",
+            selected = false,
+            onClick = {
+                val next =
+                    if (settings.themeMode == ThemeMode.DARK) ThemeMode.LIGHT else ThemeMode.DARK
+                onAction(MainAction.SetThemeMode(next))
+            },
+        )
+        FilterChipPill(
+            label = if (settings.headlineFont == HeadlineFont.SERIF) "Aa Serif" else "Aa Sans",
+            selected = false,
+            onClick = {
+                val next =
+                    if (settings.headlineFont == HeadlineFont.SERIF) {
+                        HeadlineFont.SANS
+                    } else {
+                        HeadlineFont.SERIF
+                    }
+                onAction(MainAction.SetHeadlineFont(next))
+            },
+        )
+    }
+}
+
+@Composable
+internal fun ReaderFontScaleControlsRow(
+    currentScale: Float,
+    onAction: (MainAction) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeaderActionButton(
+            label = "A−",
+            onClick = {
+                onAction(
+                    MainAction.SetReaderFontScale(
+                        (currentScale - READER_SCALE_STEP).coerceAtLeast(
+                            Settings.MIN_READER_FONT_SCALE
+                        )
+                    )
+                )
+            },
+            modifier = Modifier.testTag("reader_font_smaller_btn"),
+        )
+        READER_FONT_PRESETS.forEach { preset ->
+            val pct = (preset * PERCENT_MULTIPLIER).roundToInt()
+            FilterChipPill(
+                label = "$pct%",
+                selected = abs(currentScale - preset) < READER_SCALE_EPSILON,
+                onClick = { onAction(MainAction.SetReaderFontScale(preset)) },
+            )
+        }
+        HeaderActionButton(
+            label = "A+",
+            onClick = {
+                onAction(
+                    MainAction.SetReaderFontScale(
+                        (currentScale + READER_SCALE_STEP).coerceAtMost(
+                            Settings.MAX_READER_FONT_SCALE
+                        )
+                    )
+                )
+            },
+            modifier = Modifier.testTag("reader_font_larger_btn"),
+        )
+    }
+}
+
+@Composable
+internal fun ReaderSectionsOutlineStrip(
+    headings: List<String>,
+    onJumpToFraction: (Float) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = "ARTICLE SECTIONS (${headings.size})",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 10.5.sp,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        headings.forEachIndexed { index, heading ->
+            val fraction =
+                if (headings.size <= 1) {
+                    0f
+                } else {
+                    index.toFloat() / headings.size.toFloat()
+                }
+            FilterChipPill(
+                label = "§ ${heading.take(MAX_SECTION_LABEL_CHARS)}",
+                selected = false,
+                onClick = { onJumpToFraction(fraction) },
             )
         }
     }
@@ -289,6 +483,7 @@ private fun ReaderArticleBody(
 @Composable
 internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit = {}) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val htmlBody =
         entry.contentHtml?.takeIf { it.isNotBlank() }
             ?: entry.summary?.takeIf { "<" in it || "&" in it }
@@ -317,8 +512,8 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit 
                     text = paragraph.trim(),
                     color = colors.textPrimary,
                     fontFamily = FontFamily.Serif,
-                    fontSize = 16.sp,
-                    lineHeight = 26.sp,
+                    fontSize = (16f * scale).sp,
+                    lineHeight = (26f * scale).sp,
                 )
                 Spacer(modifier = Modifier.height(14.dp))
             }
@@ -525,6 +720,7 @@ fun FeedContextBottomSheet(
     feed: FeedItem,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    availableTags: List<String> = emptyList(),
 ) {
     val colors = LocalRocheColors.current
     ModalBottomSheet(
@@ -536,51 +732,184 @@ fun FeedContextBottomSheet(
                 Modifier.fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .testTag("feed_context_bottom_sheet"),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            FeedContextHeaderRow(feed = feed)
+            FeedRenameRow(feed = feed, onAction = onAction)
+            FeedBulkTagRow(feed = feed, availableTags = availableTags, onAction = onAction)
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            FeedContextActionsList(
+                feed = feed,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+        }
+    }
+}
+
+@Composable
+internal fun FeedContextHeaderRow(feed: FeedItem) {
+    val colors = LocalRocheColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(11.dp),
+    ) {
+        SiteFaviconBadge(
+            primaryFaviconUrl = feed.faviconUrl,
+            fallbackFaviconUrl = feed.fallbackFaviconUrl,
+            domain = feed.displayDomain,
+            title = feed.title,
+            feedType = feed.feedType,
+            size = 28.dp,
+        )
+        Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = feed.title,
                 color = colors.textPrimary,
                 fontFamily = FontFamily.Serif,
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = "${feed.feedType.wireValue.uppercase()} · ${feed.url}",
+                text = "${feed.feedType.wireValue.uppercase()} · ${feed.displayDomain}",
                 color = colors.textMuted,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            ContextActionItem(
-                label = "View Feed Items (${feed.unreadCount} unread)",
-                onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
-            )
-            ContextActionItem(
-                label = "Refresh Feed Now",
-                onClick = {
-                    onAction(MainAction.CloseFeedContextSheet)
-                    onAction(MainAction.RefreshFeed(feed.id))
-                },
-            )
-            ContextActionItem(
-                label = "Open Feed / Site URL",
-                onClick = {
-                    onAction(MainAction.CloseFeedContextSheet)
-                    onOpenExternalUrl(feed.siteUrl ?: feed.url)
-                },
-            )
-            ContextActionItem(
-                label = "Unsubscribe from Feed",
-                textColor = colors.accentIndianRed,
-                onClick = { onAction(MainAction.DeleteFeed(feed.id)) },
-                modifier = Modifier.testTag("delete_feed_${feed.id}"),
-            )
-            Spacer(modifier = Modifier.height(14.dp))
         }
     }
+}
+
+@Composable
+internal fun FeedRenameRow(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+) {
+    var titleDraft by rememberSaveable(feed.id) { mutableStateOf(feed.title) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = titleDraft,
+            onValueChange = { titleDraft = it },
+            label = { Text("Display Title", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("feed_rename_input"),
+        )
+        HeaderActionButton(
+            label = "Rename",
+            onClick = {
+                val trimmed = titleDraft.trim()
+                if (trimmed.isNotBlank()) {
+                    onAction(MainAction.RenameFeed(feedId = feed.id, newTitle = trimmed))
+                }
+            },
+            modifier = Modifier.testTag("feed_rename_save_btn"),
+        )
+    }
+}
+
+@Composable
+internal fun FeedBulkTagRow(
+    feed: FeedItem,
+    availableTags: List<String>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var customFeedTag by rememberSaveable(feed.id) { mutableStateOf("") }
+    Text(
+        text = "TAG ACTIVE FEED ITEMS",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 10.sp,
+    )
+    if (availableTags.isNotEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            availableTags.forEach { tag ->
+                FilterChipPill(
+                    label = "+ #$tag",
+                    selected = false,
+                    onClick = {
+                        onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = tag))
+                    },
+                )
+            }
+        }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OutlinedTextField(
+            value = customFeedTag,
+            onValueChange = { customFeedTag = it },
+            placeholder = { Text("Apply #tag to feed items…", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.weight(1f).testTag("feed_tag_input"),
+        )
+        HeaderActionButton(
+            label = "Tag Feed",
+            onClick = {
+                val clean = normalizeTagName(customFeedTag)
+                if (clean.isNotBlank()) {
+                    onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = clean))
+                    customFeedTag = ""
+                }
+            },
+            modifier = Modifier.testTag("feed_tag_apply_btn"),
+        )
+    }
+}
+
+@Composable
+internal fun FeedContextActionsList(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    ContextActionItem(
+        label = "View Feed Items (${feed.unreadCount} unread)",
+        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+    )
+    if (feed.unreadCount > 0) {
+        ContextActionItem(
+            label = "Archive All Unread in Feed (${feed.unreadCount})",
+            onClick = { onAction(MainAction.ArchiveFeedUnread(feed.id)) },
+            modifier = Modifier.testTag("feed_archive_unread_btn"),
+        )
+    }
+    ContextActionItem(
+        label = "Refresh Feed Now",
+        onClick = {
+            onAction(MainAction.CloseFeedContextSheet)
+            onAction(MainAction.RefreshFeed(feed.id))
+        },
+    )
+    ContextActionItem(
+        label = "Open Feed / Site URL",
+        onClick = {
+            onAction(MainAction.CloseFeedContextSheet)
+            onOpenExternalUrl(feed.siteUrl ?: feed.url)
+        },
+    )
+    ContextActionItem(
+        label = "Unsubscribe from Feed",
+        textColor = colors.accentIndianRed,
+        onClick = { onAction(MainAction.DeleteFeed(feed.id)) },
+        modifier = Modifier.testTag("delete_feed_${feed.id}"),
+    )
 }
 
 @Composable
@@ -662,3 +991,8 @@ fun AddUrlOrFeedBottomSheet(
 
 private const val MIN_PROGRESS = 0.08f
 private const val READ_PROGRESS_MIN_DELTA = 0.05
+private const val PERCENT_MULTIPLIER = 100
+private const val READER_SCALE_STEP = 0.10f
+private const val READER_SCALE_EPSILON = 0.03f
+private const val MAX_SECTION_LABEL_CHARS = 32
+private val READER_FONT_PRESETS = listOf(0.88f, 1.0f, 1.15f, 1.30f)

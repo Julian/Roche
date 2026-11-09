@@ -42,6 +42,25 @@ internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean
         InboxFilter.ARCHIVED -> entry.isArchived
     }
 
+internal enum class SearchScopeFilter(val label: String) {
+    ALL("All"),
+    UNREAD("Unread"),
+    STARRED("Starred"),
+    ARTICLES("Articles"),
+    PAPERS("Papers"),
+    VIDEOS("Videos"),
+}
+
+internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilter): Boolean =
+    when (scope) {
+        SearchScopeFilter.ALL -> true
+        SearchScopeFilter.UNREAD -> entry.isUnread
+        SearchScopeFilter.STARRED -> entry.isFavorite
+        SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
+        SearchScopeFilter.PAPERS -> entry.contentType == ContentType.PDF
+        SearchScopeFilter.VIDEOS -> entry.contentType == ContentType.VIDEO
+    }
+
 internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boolean {
     if (normalizedQuery.isBlank()) return true
     val cleanQuery = normalizedQuery.trimStart('#')
@@ -55,3 +74,37 @@ internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boo
         entry.contentHtml.orEmpty().lowercase().contains(cleanQuery) ||
         entry.tags.any { it.lowercase().contains(cleanQuery) }
 }
+
+internal fun extractSearchMatchSnippet(entry: InboxEntry, rawQuery: String): String? {
+    val cleanQuery = rawQuery.trim().trimStart('#')
+    if (cleanQuery.length < MIN_SNIPPET_QUERY_LEN) return null
+    val candidates =
+        listOfNotNull(
+            entry.contentText?.takeIf { it.isNotBlank() },
+            entry.summary?.let { stripBasicHtmlTags(it) }?.takeIf { it.isNotBlank() },
+            entry.contentHtml?.let { stripBasicHtmlTags(it) }?.takeIf { it.isNotBlank() },
+        )
+    for (source in candidates) {
+        val normalizedSource = source.replace(WHITESPACE_REGEX, " ").trim()
+        val matchIndex = normalizedSource.indexOf(cleanQuery, ignoreCase = true)
+        if (matchIndex != -1) {
+            val start = (matchIndex - SNIPPET_CONTEXT_RADIUS).coerceAtLeast(0)
+            val end =
+                (matchIndex + cleanQuery.length + SNIPPET_CONTEXT_RADIUS).coerceAtMost(
+                    normalizedSource.length
+                )
+            val prefix = if (start > 0) "…" else ""
+            val suffix = if (end < normalizedSource.length) "…" else ""
+            return "$prefix${normalizedSource.substring(start, end).trim()}$suffix"
+        }
+    }
+    return null
+}
+
+private fun stripBasicHtmlTags(raw: String): String =
+    raw.replace(HTML_TAG_STRIP_REGEX, " ").replace("&nbsp;", " ")
+
+private const val MIN_SNIPPET_QUERY_LEN = 2
+private const val SNIPPET_CONTEXT_RADIUS = 48
+private val HTML_TAG_STRIP_REGEX = Regex("""<[^>]+>""")
+private val WHITESPACE_REGEX = Regex("""\s+""")

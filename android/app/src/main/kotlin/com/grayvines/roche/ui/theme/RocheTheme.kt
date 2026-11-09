@@ -80,11 +80,13 @@ private val LightRocheColors =
 
 val LocalRocheColors = staticCompositionLocalOf { DarkRocheColors }
 val LocalHeadlineFont = staticCompositionLocalOf { HeadlineFont.SERIF }
+val LocalReaderFontScale = staticCompositionLocalOf { 1.0f }
 
 @Composable
 fun RocheTheme(
     themeMode: ThemeMode = ThemeMode.DARK,
     headlineFont: HeadlineFont = HeadlineFont.SERIF,
+    readerFontScale: Float = 1.0f,
     content: @Composable () -> Unit,
 ) {
     val rocheColors = if (themeMode == ThemeMode.DARK) DarkRocheColors else LightRocheColors
@@ -94,6 +96,7 @@ fun RocheTheme(
     CompositionLocalProvider(
         LocalRocheColors provides rocheColors,
         LocalHeadlineFont provides headlineFont,
+        LocalReaderFontScale provides readerFontScale,
     ) {
         MaterialTheme(
             colorScheme = buildMaterialScheme(rocheColors),

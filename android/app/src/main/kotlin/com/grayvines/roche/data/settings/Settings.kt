@@ -14,6 +14,7 @@ data class Settings(
     val themeMode: ThemeMode = ThemeMode.DARK,
     val headlineFont: HeadlineFont = HeadlineFont.SERIF,
     val ultraDenseRows: Boolean = false,
+    val readerFontScale: Float = DEFAULT_READER_FONT_SCALE,
     val bottomNavTabs: List<AppTab> = AppTab.defaultSideTabs,
     val lastPeerSyncCursor: String = "",
 ) {
@@ -21,6 +22,9 @@ data class Settings(
         const val DEFAULT_SERVER_URL = ""
         const val DEFAULT_PEER_ID = "android-peer"
         const val DEFAULT_DEVICE_NAME = "Roche Android"
+        const val DEFAULT_READER_FONT_SCALE = 1.0f
+        const val MIN_READER_FONT_SCALE = 0.85f
+        const val MAX_READER_FONT_SCALE = 1.35f
     }
 }
 
@@ -30,6 +34,11 @@ fun Settings.clamped(): Settings =
         bearerToken = bearerToken.trim(),
         peerId = peerId.trim().ifBlank { Settings.DEFAULT_PEER_ID },
         deviceName = deviceName.trim().ifBlank { Settings.DEFAULT_DEVICE_NAME },
+        readerFontScale =
+            readerFontScale
+                .takeIf { it.isFinite() }
+                ?.coerceIn(Settings.MIN_READER_FONT_SCALE, Settings.MAX_READER_FONT_SCALE)
+                ?: Settings.DEFAULT_READER_FONT_SCALE,
         bottomNavTabs = AppTab.normalizeSideTabs(bottomNavTabs),
         lastPeerSyncCursor = lastPeerSyncCursor.trim(),
     )

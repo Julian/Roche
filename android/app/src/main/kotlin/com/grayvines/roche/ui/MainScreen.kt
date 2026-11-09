@@ -12,6 +12,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -25,6 +26,7 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
 import com.grayvines.roche.ui.components.UndoOrStatusSnackbar
+import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlinx.coroutines.delay
 
@@ -169,6 +171,7 @@ private fun MainOverlaySheets(
     if (contextFeed != null) {
         FeedContextBottomSheet(
             feed = contextFeed,
+            availableTags = state.tags.map { it.name },
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
         )
@@ -197,13 +200,16 @@ private fun MainBodyContent(
 ) {
     val readerEntry = state.activeReaderEntry
     if (readerEntry != null) {
-        ReaderView(
-            entry = readerEntry,
-            onAction = onAction,
-            onShareEntry = onShareEntry,
-            onOpenExternalUrl = onOpenExternalUrl,
-            backLabel = readerBackLabel(state),
-        )
+        CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
+            ReaderView(
+                entry = readerEntry,
+                settings = state.settings,
+                onAction = onAction,
+                onShareEntry = onShareEntry,
+                onOpenExternalUrl = onOpenExternalUrl,
+                backLabel = readerBackLabel(state),
+            )
+        }
         return
     }
     when (state.activeTab) {

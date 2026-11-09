@@ -292,7 +292,12 @@ fun RocheTopHeader(
 }
 
 @Composable
-fun FilterChipPill(label: String, selected: Boolean, onClick: () -> Unit) {
+fun FilterChipPill(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
     val bg =
@@ -308,7 +313,8 @@ fun FilterChipPill(label: String, selected: Boolean, onClick: () -> Unit) {
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.height(32.dp)
+            modifier
+                .height(32.dp)
                 .clip(shape)
                 .background(bg)
                 .border(width = 1.dp, color = border, shape = shape)

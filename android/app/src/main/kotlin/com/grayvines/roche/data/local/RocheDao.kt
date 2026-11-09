@@ -32,6 +32,15 @@ interface RocheDao {
 
     @Query("DELETE FROM feeds WHERE id = :id") suspend fun deleteFeedById(id: String)
 
+    @Query("UPDATE feeds SET title = :title WHERE id = :feedId")
+    suspend fun updateFeedTitle(feedId: String, title: String)
+
+    @Query("UPDATE items SET feedTitle = :title WHERE feedId = :feedId")
+    suspend fun updateItemsFeedTitle(feedId: String, title: String)
+
+    @Query("SELECT id FROM items WHERE feedId = :feedId AND status != 'archived'")
+    suspend fun getUnarchivedItemIdsForFeed(feedId: String): List<String>
+
     @Query("SELECT * FROM sync_tombstones") suspend fun getAllTombstones(): List<TombstoneEntity>
 
     @Query(
