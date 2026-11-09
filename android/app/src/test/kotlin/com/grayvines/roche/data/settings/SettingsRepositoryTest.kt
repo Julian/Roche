@@ -40,6 +40,12 @@ class SettingsRepositoryTest {
         assertEquals(ThemeMode.LIGHT, current.themeMode)
         assertEquals(HeadlineFont.SANS, current.headlineFont)
         assertEquals(true, current.ultraDenseRows)
+
+        repository.update { it.copy(lastPeerSyncCursor = "2026-06-01T12:01:00Z") }
+        assertEquals("2026-06-01T12:01:00Z", repository.settings.first().lastPeerSyncCursor)
+
+        repository.update { it.copy(bearerToken = "new-token") }
+        assertEquals("", repository.settings.first().lastPeerSyncCursor)
     }
 
     @Test

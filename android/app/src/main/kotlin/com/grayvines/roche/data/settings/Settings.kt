@@ -15,6 +15,7 @@ data class Settings(
     val headlineFont: HeadlineFont = HeadlineFont.SERIF,
     val ultraDenseRows: Boolean = false,
     val bottomNavTabs: List<AppTab> = AppTab.defaultSideTabs,
+    val lastPeerSyncCursor: String = "",
 ) {
     companion object {
         const val DEFAULT_SERVER_URL = ""
@@ -30,6 +31,7 @@ fun Settings.clamped(): Settings =
         peerId = peerId.trim().ifBlank { Settings.DEFAULT_PEER_ID },
         deviceName = deviceName.trim().ifBlank { Settings.DEFAULT_DEVICE_NAME },
         bottomNavTabs = AppTab.normalizeSideTabs(bottomNavTabs),
+        lastPeerSyncCursor = lastPeerSyncCursor.trim(),
     )
 
 internal fun normalizeServerUrl(rawUrl: String): String {

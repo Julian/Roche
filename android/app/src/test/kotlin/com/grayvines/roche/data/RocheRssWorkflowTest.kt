@@ -429,7 +429,7 @@ class RocheRssWorkflowTest {
             // 1. Background sync on CELLULAR sends network_tier=cellular, weight=0.25, and
             // populates activePeers
             val bgSynced = peerRepo.runBackgroundPeerSyncAndPoll().getOrThrow()
-            assertEquals(2, bgSynced)
+            assertEquals(3, bgSynced)
             assertEquals(2, peerRepo.snapshot.first().activePeers.size)
             assertTrue(peerSyncBodies.first().contains(""""network_tier":"cellular""""))
             assertTrue(peerSyncBodies.first().contains(""""weight":0.25"""))
@@ -442,7 +442,141 @@ class RocheRssWorkflowTest {
             // 3. When back on WIFI, manual on-device poll succeeds
             currentTier = NetworkTier.WIFI
             assertEquals(0, peerRepo.pollDueFeedsOnDeviceNow().getOrThrow())
+
+            // 4. Subsequent peer sync sends updated_after cursor, omits unchanged items outbound,
+            // and preserves unchanged local items + tags when server returns a delta items payload
+            assertEquals("2026-06-01T12:01:00Z", settings.settings.first().lastPeerSyncCursor)
+            peerSyncBodies.clear()
+            val afterDeltaCount = peerRepo.syncWithServer().getOrThrow()
+            assertEquals(3, afterDeltaCount)
+            assertEquals(1, peerSyncBodies.size)
+            assertTrue(
+                peerSyncBodies[0].contains(""""updated_after":"2026-06-01T12:01:00Z""""),
+                "Second sync must include updated_after watermark cursor",
+            )
+            assertFalse(
+                peerSyncBodies[0].contains("https://blog.example.com/post-1"),
+                "Unchanged item must not be re-uploaded during delta sync",
+            )
+            val deltaEntries = peerRepo.snapshot.first().entries
+            assertEquals(3, deltaEntries.size)
+            val preservedPost1 = deltaEntries.first { it.url == "https://blog.example.com/post-1" }
+            assertTrue(preservedPost1.isFavorite)
+            assertEquals(listOf("distributed"), preservedPost1.tags)
         }
+
+    @Test
+    fun `initial peer sync oversized response falls back to paginated snapshot and migrations preserve data`() =
+        runTest {
+            verifyRoomMigrationsPreserveData(tempDir)
+            val peerSyncBodies = mutableListOf<String>()
+            val fallbackClient = buildOversizedPeerSyncFallbackClient(peerSyncBodies)
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "tok-peer",
+                    peerId = "android-peer-1",
+                )
+            }
+            val repo =
+                RocheRepository(
+                    database = database,
+                    apiClient = fallbackClient,
+                    settings = settings,
+                )
+            val count = repo.syncWithServer().getOrThrow()
+            assertTrue(count >= 1)
+            assertEquals("2026-06-01T12:01:00Z", settings.settings.first().lastPeerSyncCursor)
+            assertTrue(peerSyncBodies.last().contains(""""updated_after""""))
+        }
+}
+
+private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
+    val driver = BundledSQLiteDriver()
+    val dbFile = File(tempDir, "migrated_v1_to_v4.db")
+    driver.open(dbFile.absolutePath).use { conn ->
+        conn
+            .prepare(
+                "CREATE TABLE feeds (id TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, siteUrl TEXT, feedType TEXT NOT NULL, PRIMARY KEY(id))"
+            )
+            .use { it.step() }
+        conn
+            .prepare(
+                "CREATE TABLE items (id TEXT NOT NULL, feedId TEXT, feedTitle TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, author TEXT, summary TEXT, contentText TEXT, contentHtml TEXT, contentType TEXT NOT NULL, status TEXT NOT NULL, isFavorite INTEGER NOT NULL, isCachedOffline INTEGER NOT NULL, publishedAt TEXT, createdAt TEXT NOT NULL, readProgress REAL NOT NULL, thumbnailMediaId TEXT, duration TEXT, PRIMARY KEY(id))"
+            )
+            .use { it.step() }
+        conn
+            .prepare("CREATE TABLE tags (id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY(id))")
+            .use { it.step() }
+        conn
+            .prepare(
+                "CREATE TABLE item_tags (itemId TEXT NOT NULL, tagId TEXT NOT NULL, PRIMARY KEY(itemId, tagId))"
+            )
+            .use { it.step() }
+        conn
+            .prepare(
+                "INSERT INTO feeds (id, title, url, siteUrl, feedType) VALUES ('f-1', 'Systems Blog', 'https://blog.example.com/rss.xml', null, 'rss')"
+            )
+            .use { it.step() }
+        conn
+            .prepare(
+                "INSERT INTO items (id, feedId, feedTitle, title, url, author, summary, contentText, contentHtml, contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, readProgress, thumbnailMediaId, duration) VALUES ('i-1', 'f-1', 'Systems Blog', 'Existing Article', 'https://blog.example.com/existing', null, 'Saved summary', null, null, 'article', 'unread', 1, 0, null, '2026-06-01T10:00:00Z', 0.0, null, null)"
+            )
+            .use { it.step() }
+        RocheDatabase.MIGRATION_1_2.migrate(conn)
+        RocheDatabase.MIGRATION_2_3.migrate(conn)
+        RocheDatabase.MIGRATION_3_4.migrate(conn)
+        conn.prepare("SELECT COUNT(*) FROM items WHERE id = 'i-1'").use { stmt ->
+            assertTrue(stmt.step())
+            assertEquals(1L, stmt.getLong(0))
+        }
+    }
+}
+
+private fun buildOversizedPeerSyncFallbackClient(
+    peerSyncBodies: MutableList<String>
+): RocheApiClient = RocheApiClient { request ->
+    when {
+        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
+            val body = request.body.orEmpty()
+            peerSyncBodies.add(body)
+            if (!body.contains(""""updated_after"""")) {
+                throw java.io.IOException("Response exceeds maximum allowed size of 67108864 bytes")
+            }
+            mockPeerSyncResponse(body, mutableListOf())
+        }
+        request.method == "GET" && request.url.endsWith("/api/v1/feeds") -> {
+            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"feeds":[{"id":"$feedId","title":"Systems Engineering Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","unread_count":1}]}""",
+            )
+        }
+        request.method == "GET" && request.url.endsWith("/api/v1/tags") -> {
+            val tagId = deterministicTagId("distributed")
+            HttpResponse(
+                statusCode = 200,
+                body = """{"tags":[{"id":"$tagId","name":"distributed","unread_count":0}]}""",
+            )
+        }
+        request.method == "GET" && request.url.contains("/api/v1/items") -> {
+            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
+            val itemId =
+                deterministicItemId(
+                    "https://blog.example.com/rss.xml",
+                    "https://blog.example.com/post-1",
+                )
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"items":[{"id":"$itemId","feed_id":"$feedId","feed_title":"Systems Engineering Blog","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-06-01T12:00:00Z","tag_names":["distributed"]}]}""",
+            )
+        }
+        else -> {
+            HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
 }
 
 internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheApiClient =
@@ -531,12 +665,20 @@ private fun mockPeerSyncResponse(
         )
     val blogFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
     val protectedFeedId = deterministicFeedId("https://protected.example.com/feed.xml")
-    val hasRescued = body.contains("https://protected.example.com/rescued-article")
+    val hasRescued =
+        body.contains("https://protected.example.com/rescued-article") ||
+            body.contains(""""updated_after"""")
+    val isDeltaRequest = body.contains(""""updated_after"""")
     val post1Json =
         """{"id":"$post1Id","feed_id":"$blogFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Systems Engineering Blog","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","summary":"Full article with","content_html":"<p>Full article with <img src=\"https://blog.example.com/images/diagram.png\"></p>","thumbnail_url":"https://blog.example.com/images/diagram.png","content_type":"article","status":"unread","is_favorite":true,"read_at":"2026-06-01T12:00:00Z","created_at":"2026-06-01T12:00:00Z","tag_names":["distributed"]}"""
     val rescuedJson =
         """{"id":"$rescuedId","feed_id":"$protectedFeedId","feed_url":"https://protected.example.com/feed.xml","feed_title":"Protected Feed","title":"Rescued by Android","url":"https://protected.example.com/rescued-article","summary":"Fetched via phone Wi-Fi","content_html":"<p>Fetched via phone Wi-Fi</p>","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-06-01T12:01:00Z","tag_names":[]}"""
-    val itemsJson = if (hasRescued) "[$post1Json,$rescuedJson]" else "[$post1Json]"
+    val itemsJson =
+        when {
+            isDeltaRequest -> "[$rescuedJson]"
+            hasRescued -> "[$post1Json,$rescuedJson]"
+            else -> "[$post1Json]"
+        }
     val protectedFeedState =
         if (hasRescued) {
             """{"id":"$protectedFeedId","title":"Protected Feed","url":"https://protected.example.com/feed.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T12:01:00Z","last_polled_by":"android-peer-1","last_error":null,"last_error_by":null,"is_active":true,"unread_count":1}"""

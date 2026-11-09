@@ -4,7 +4,10 @@ import android.content.Context
 import androidx.room3.Database
 import androidx.room3.Room
 import androidx.room3.RoomDatabase
+import androidx.room3.migration.Migration
+import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.driver.AndroidSQLiteDriver
+import androidx.sqlite.execSQL
 
 @Database(
     entities =
@@ -25,9 +28,68 @@ abstract class RocheDatabase : RoomDatabase() {
     companion object {
         private const val DATABASE_NAME = "roche.db"
 
+        internal val MIGRATION_1_2 =
+            object : Migration(1, 2) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    connection.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `pending_mutations` (" +
+                            "`entityId` TEXT NOT NULL, " +
+                            "`isLocalFeed` INTEGER NOT NULL, " +
+                            "`isLocalItem` INTEGER NOT NULL, " +
+                            "`titleOverride` TEXT, " +
+                            "`dirtyStatus` TEXT, " +
+                            "`dirtyFavorite` INTEGER, " +
+                            "`dirtyReadProgress` REAL, " +
+                            "`addedTagsCsv` TEXT NOT NULL, " +
+                            "`removedTagsCsv` TEXT NOT NULL, " +
+                            "PRIMARY KEY(`entityId`))"
+                    )
+                }
+            }
+
+        internal val MIGRATION_2_3 =
+            object : Migration(2, 3) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    connection.execSQL("ALTER TABLE `items` ADD COLUMN `readAt` TEXT")
+                    connection.execSQL("ALTER TABLE `items` ADD COLUMN `thumbnailUrl` TEXT")
+                    connection.execSQL(
+                        "ALTER TABLE `pending_mutations` ADD COLUMN `dirtyReadAt` TEXT"
+                    )
+                }
+            }
+
+        internal val MIGRATION_3_4 =
+            object : Migration(3, 4) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `description` TEXT")
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `language` TEXT")
+                    connection.execSQL(
+                        "ALTER TABLE `feeds` ADD COLUMN `pollInterval` INTEGER NOT NULL DEFAULT 30"
+                    )
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `lastPolled` TEXT")
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `lastPolledBy` TEXT")
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `lastError` TEXT")
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `lastErrorBy` TEXT")
+                    connection.execSQL(
+                        "ALTER TABLE `feeds` ADD COLUMN `isActive` INTEGER NOT NULL DEFAULT 1"
+                    )
+                    connection.execSQL("ALTER TABLE `items` ADD COLUMN `feedUrl` TEXT")
+                    connection.execSQL("ALTER TABLE `items` ADD COLUMN `interactionUpdatedAt` TEXT")
+                    connection.execSQL("ALTER TABLE `tags` ADD COLUMN `color` TEXT")
+                    connection.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `sync_tombstones` (" +
+                            "`entityType` TEXT NOT NULL, " +
+                            "`naturalKey` TEXT NOT NULL, " +
+                            "`deletedAt` TEXT NOT NULL, " +
+                            "PRIMARY KEY(`entityType`, `naturalKey`))"
+                    )
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }

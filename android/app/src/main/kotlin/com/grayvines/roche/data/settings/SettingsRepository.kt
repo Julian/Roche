@@ -36,7 +36,19 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
     suspend fun update(transform: (Settings) -> Settings) {
         dataStore.edit { prefs ->
             val current = prefs.toSettings()
-            val updated = transform(current).clamped()
+            val transformed = transform(current).clamped()
+            val credentialsChanged =
+                transformed.serverUrl != current.serverUrl ||
+                    transformed.bearerToken != current.bearerToken
+            val updated =
+                if (
+                    credentialsChanged &&
+                        transformed.lastPeerSyncCursor == current.lastPeerSyncCursor
+                ) {
+                    transformed.copy(lastPeerSyncCursor = "")
+                } else {
+                    transformed
+                }
             prefs[KEY_SERVER_URL] = updated.serverUrl
             prefs[KEY_BEARER_TOKEN] = updated.bearerToken
             prefs[KEY_PEER_ID] = updated.peerId
@@ -46,6 +58,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             prefs[KEY_HEADLINE_FONT] = updated.headlineFont.name
             prefs[KEY_ULTRA_DENSE_ROWS] = updated.ultraDenseRows
             prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
+            prefs[KEY_LAST_PEER_SYNC_CURSOR] = updated.lastPeerSyncCursor
         }
     }
 
@@ -75,6 +88,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                             }
                             .let { AppTab.normalizeSideTabs(it) }
                     } ?: AppTab.defaultSideTabs,
+                lastPeerSyncCursor = this[KEY_LAST_PEER_SYNC_CURSOR].orEmpty(),
             )
             .clamped()
 
@@ -89,6 +103,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         private val KEY_HEADLINE_FONT = stringPreferencesKey("headline_font")
         private val KEY_ULTRA_DENSE_ROWS = booleanPreferencesKey("ultra_dense_rows")
         private val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
+        private val KEY_LAST_PEER_SYNC_CURSOR = stringPreferencesKey("last_peer_sync_cursor")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

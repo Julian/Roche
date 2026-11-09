@@ -498,6 +498,9 @@ class RocheRepository(
                         currentSettings = currentSettings,
                         networkTier = currentTier,
                         onPeersUpdated = { activePeersFlow.value = it },
+                        onSyncCursorUpdated = { cursor ->
+                            settings.update { it.copy(lastPeerSyncCursor = cursor) }
+                        },
                     )
                 } else {
                     null
@@ -531,6 +534,9 @@ class RocheRepository(
                         currentSettings = currentSettings,
                         networkTier = currentTier,
                         onPeersUpdated = { activePeersFlow.value = it },
+                        onSyncCursorUpdated = { cursor ->
+                            settings.update { it.copy(lastPeerSyncCursor = cursor) }
+                        },
                     )
                 }
                     .onFailure { if (it is CancellationException) throw it }
@@ -600,7 +606,41 @@ class RocheRepository(
             appliedMutations = pushOutcome.appliedMutations,
             preFetchItemsById = preFetchItemsById,
         )
-        return mergedItems.size
+        bootstrapDeltaPeerSync(
+            currentSettings = currentSettings,
+            hasMergedData = mergedFeeds.isNotEmpty() || mergedItems.isNotEmpty(),
+        )
+        return dao.getAllItems().size
+    }
+
+    private suspend fun bootstrapDeltaPeerSync(
+        currentSettings: Settings,
+        hasMergedData: Boolean,
+    ) {
+        val shouldBootstrap =
+            currentSettings.bearerToken.isNotBlank() &&
+                currentSettings.lastPeerSyncCursor.isBlank() &&
+                hasMergedData
+        if (!shouldBootstrap) return
+        val bootstrapCursor =
+            Instant.now()
+                .minusSeconds(BOOTSTRAP_DELTA_LOOKBACK_SEC)
+                .truncatedTo(ChronoUnit.SECONDS)
+                .toString()
+        settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
+        runCatching {
+            tryPeerSyncAndCooperativePoll(
+                dao = dao,
+                apiClient = apiClient,
+                currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor),
+                networkTier = networkTierProvider.currentNetworkTier(),
+                onPeersUpdated = { activePeersFlow.value = it },
+                onSyncCursorUpdated = { cursor ->
+                    settings.update { it.copy(lastPeerSyncCursor = cursor) }
+                },
+            )
+        }
+            .onFailure { if (it is CancellationException) throw it }
     }
 
     internal suspend fun pushSavedUrlBestEffort(
@@ -643,3 +683,4 @@ class RocheRepository(
 
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
+private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L

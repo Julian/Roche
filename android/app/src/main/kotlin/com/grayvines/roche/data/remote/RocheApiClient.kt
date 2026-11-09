@@ -14,6 +14,7 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.zip.GZIPInputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -79,22 +80,7 @@ class HttpUrlConnectionTransport : HttpTransport {
     }
 
     private fun executeSingleRequest(request: HttpRequest): Pair<HttpResponse, String?> {
-        val sanitizedUrl = request.url.trim().replace(" ", "%20")
-        val connection =
-            (URI.create(sanitizedUrl).toURL().openConnection() as HttpURLConnection).apply {
-                instanceFollowRedirects = false
-                requestMethod = request.method
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                request.headers.forEach { (key, value) -> setRequestProperty(key, value) }
-                if (request.body != null) {
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json")
-                    outputStream.use { out ->
-                        out.write(request.body.toByteArray(Charsets.UTF_8))
-                    }
-                }
-            }
+        val connection = openConfiguredConnection(request)
         try {
             val status = connection.responseCode
             if (status in REDIRECT_STATUS_CODES) {
@@ -105,7 +91,7 @@ class HttpUrlConnectionTransport : HttpTransport {
                 }
             }
             val isSuccess = status in HTTP_OK_START..HTTP_OK_END
-            val stream = if (isSuccess) connection.inputStream else connection.errorStream
+            val stream = openResponseStream(connection, isSuccess)
             val maxBytes =
                 if (request.expectBinary && isSuccess) MAX_MEDIA_BYTES else MAX_RESPONSE_CHARS
             val bytes = stream?.let { input -> readBoundedBytes(input, maxBytes) } ?: ByteArray(0)
@@ -119,6 +105,36 @@ class HttpUrlConnectionTransport : HttpTransport {
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun openConfiguredConnection(request: HttpRequest): HttpURLConnection {
+        val sanitizedUrl = request.url.trim().replace(" ", "%20")
+        return (URI.create(sanitizedUrl).toURL().openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
+            requestMethod = request.method
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+            if (request.headers.keys.none { it.equals("Accept-Encoding", ignoreCase = true) }) {
+                setRequestProperty("Accept-Encoding", "gzip")
+            }
+            request.headers.forEach { (key, value) -> setRequestProperty(key, value) }
+            if (request.body != null) {
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                outputStream.use { out ->
+                    out.write(request.body.toByteArray(Charsets.UTF_8))
+                }
+            }
+        }
+    }
+
+    private fun openResponseStream(
+        connection: HttpURLConnection,
+        isSuccess: Boolean,
+    ): java.io.InputStream? {
+        val rawStream = if (isSuccess) connection.inputStream else connection.errorStream
+        val isGzip = connection.contentEncoding?.equals("gzip", ignoreCase = true) == true
+        return if (rawStream != null && isGzip) GZIPInputStream(rawStream) else rawStream
     }
 
     private companion object {
@@ -187,7 +203,7 @@ internal fun readBoundedText(input: java.io.InputStream): String =
     }
 
 private const val READ_BUFFER_CHARS = 8_192
-private const val MAX_RESPONSE_CHARS = 16 * 1024 * 1024
+private const val MAX_RESPONSE_CHARS = 64 * 1024 * 1024
 private const val MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
