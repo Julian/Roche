@@ -583,32 +583,29 @@ impl<'a> SyncRepo<'a> {
 
         tx.commit().await?;
 
+        let inclusive_since = req.updated_after.map(|ts| ts - chrono::Duration::seconds(1));
         let active_peers = self.list_active_peers(now).await?;
         let feeds = FeedRepo::new(self.pool).list().await?;
-        let items = if let Some(since_ts) = req.updated_after {
-            let mut all_delta = Vec::new();
-            let mut page = 1;
-            loop {
-                let res = ItemRepo::new(self.pool)
-                    .list_filtered_page(&ItemFilter {
-                        updated_after: Some(since_ts),
-                        page: Some(page),
-                        per_page: Some(200),
-                        ..ItemFilter::default()
-                    })
-                    .await?;
-                all_delta.extend(res.items);
-                if !res.has_more || all_delta.len() >= 5_000 {
-                    break;
-                }
-                page += 1;
+        let mut items = Vec::new();
+        let mut page = 1;
+        loop {
+            let res = ItemRepo::new(self.pool)
+                .list_filtered_page(&ItemFilter {
+                    updated_after: inclusive_since,
+                    include_content: Some(page == 1),
+                    page: Some(page),
+                    per_page: Some(200),
+                    ..ItemFilter::default()
+                })
+                .await?;
+            items.extend(res.items);
+            if !res.has_more || items.len() >= 5_000 {
+                break;
             }
-            all_delta
-        } else {
-            ItemRepo::new(self.pool).list(None, None, Some(5_000)).await?
-        };
+            page += 1;
+        }
         let tags = TagRepo::new(self.pool).list().await?;
-        let tombstones = self.list_tombstones(req.updated_after).await?;
+        let tombstones = self.list_tombstones(inclusive_since).await?;
 
         Ok((
             PeerSyncResponse {
@@ -784,6 +781,19 @@ impl<'a> SyncRepo<'a> {
                     }
                     Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
                         .await?;
+                    sqlx::query(
+                        "UPDATE items SET updated_at = ?
+                         WHERE id IN (
+                             SELECT it.item_id FROM item_tags it
+                             JOIN tags t ON t.id = it.tag_id
+                             WHERE LOWER(t.name) = LOWER(?) AND datetime(t.created_at) <= datetime(?)
+                         )",
+                    )
+                    .bind(now)
+                    .bind(key)
+                    .bind(tomb.deleted_at)
+                    .execute(&mut *conn)
+                    .await?;
                     let deleted_id: Option<String> = sqlx::query_scalar(
                         "DELETE FROM tags
                          WHERE LOWER(name) = LOWER(?) AND datetime(created_at) <= datetime(?)
@@ -1422,8 +1432,9 @@ impl<'a> SyncRepo<'a> {
                 TagRepo::get_or_create_and_attach_in_tx(&mut *conn, item_id, &name, now).await?;
         }
 
-        sqlx::query("UPDATE items SET interaction_updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE items SET interaction_updated_at = ?, updated_at = ? WHERE id = ?")
             .bind(preserved_interaction_ts)
+            .bind(now)
             .bind(item_id)
             .execute(&mut *conn)
             .await?;
@@ -1815,5 +1826,40 @@ mod tests {
             merged_post1.tag_names.0,
             vec!["distributed".to_string(), "systems".to_string()]
         );
+
+        // Delta sync: backdate Post 3 so only items modified at or after `watermark` are returned
+        let watermark = now + chrono::Duration::seconds(10);
+        let post3_id = deterministic_item_id(Some(feed_url.as_str()), item3_url.as_str());
+        sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+            .bind(now - chrono::Duration::seconds(60))
+            .bind(&post3_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+            .bind(watermark)
+            .bind(&post1_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let delta_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel 10 Pro".to_string()),
+            network_tier: NetworkTier::Wifi,
+            weight: Some(0.6),
+            updated_after: Some(watermark),
+            feeds: vec![],
+            items: vec![],
+            tags: vec![],
+            tombstones: vec![],
+        };
+        let (delta_resp, _) = db.sync().merge_peer_state(&delta_req).await.unwrap();
+        assert_eq!(
+            delta_resp.items.len(),
+            1,
+            "Delta sync must return only Post 1 (modified at watermark) and omit unchanged Post 3"
+        );
+        assert_eq!(delta_resp.items[0].id, post1_id);
     }
 }

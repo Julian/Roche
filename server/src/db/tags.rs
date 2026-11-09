@@ -102,6 +102,16 @@ impl<'a> TagRepo<'a> {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        if name.is_some() {
+            sqlx::query(
+                "UPDATE items SET updated_at = ?
+                 WHERE id IN (SELECT item_id FROM item_tags WHERE tag_id = ?)",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Tag,
@@ -117,6 +127,14 @@ impl<'a> TagRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE items SET updated_at = ?
+             WHERE id IN (SELECT item_id FROM item_tags WHERE tag_id = ?)",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let deleted_name: Option<String> =
             sqlx::query_scalar("DELETE FROM tags WHERE id = ? RETURNING name")
                 .bind(id)
