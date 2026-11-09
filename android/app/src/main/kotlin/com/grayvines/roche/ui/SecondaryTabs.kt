@@ -161,6 +161,7 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
         SearchResultsBody(
             results = visibleResults,
             searchQuery = state.searchQuery,
+            selectedScope = scopeFilter,
             ultraDense = state.settings.ultraDenseRows,
             swipeToArchive = state.settings.swipeToArchive,
             onAction = onAction,
@@ -192,18 +193,26 @@ internal fun SearchScopeFilterStrip(
 internal fun SearchResultsBody(
     results: List<InboxEntry>,
     searchQuery: String,
+    selectedScope: SearchScopeFilter = SearchScopeFilter.ALL,
     ultraDense: Boolean,
     swipeToArchive: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     if (results.isEmpty()) {
+        val queryLabel = searchQuery.ifBlank { "current filter" }
+        val emptyMessage =
+            if (selectedScope == SearchScopeFilter.ALL) {
+                "No entries match \"$queryLabel\"."
+            } else {
+                "No results in ${selectedScope.label} for \"$queryLabel\"."
+            }
         Box(
             modifier = Modifier.fillMaxSize().padding(32.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = "No entries match \"${searchQuery.ifBlank { "current filter" }}\".",
+                text = emptyMessage,
                 color = colors.textMuted,
                 fontSize = 13.sp,
             )

@@ -436,7 +436,8 @@ class MainViewModelTest {
                 viewModel.uiState.first { state ->
                     state.feeds.any { it.id == "f-polish" && it.title == "Renamed Feed" } &&
                         state.visibleEntries.firstOrNull { it.id == "i-polish" }?.feedTitle ==
-                            "Renamed Feed"
+                            "Renamed Feed" &&
+                        state.statusBanner == "Renamed feed to \"Renamed Feed\""
                 }
             assertEquals(
                 "Renamed Feed",
@@ -446,7 +447,12 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.ApplyTagToFeed("f-polish", "Systems"))
             val tagged =
                 viewModel.uiState.first { state ->
-                    state.visibleEntries.first { it.id == "i-polish" }.tags.contains("systems")
+                    state.visibleEntries
+                        .firstOrNull { it.id == "i-polish" }
+                        ?.tags
+                        ?.contains("systems") == true &&
+                        state.tags.any { it.name == "systems" } &&
+                        state.statusBanner == "Tagged 1 entry with #systems"
                 }
             assertTrue(tagged.tags.any { it.name == "systems" })
 

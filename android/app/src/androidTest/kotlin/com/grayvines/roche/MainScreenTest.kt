@@ -4,6 +4,7 @@ import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -147,7 +148,7 @@ class MainScreenTest {
     }
 
     @Test
-    internal fun readerTypographyDrawerAndSearchScopeFiltersRenderAndDispatch() {
+    fun readerTypographyDrawerAndSearchScopeFiltersRenderAndDispatch() {
         val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
         val entry =
             createSampleEntry()
@@ -173,14 +174,14 @@ class MainScreenTest {
         composeRule.onNodeWithTag("reader_typography_btn").performClick()
         composeRule.onNodeWithTag("reader_typography_drawer").assertExists()
         composeRule.onNodeWithText("§ Architecture").assertExists()
-        composeRule.onNodeWithTag("reader_font_larger_btn").performClick()
+        composeRule.onNodeWithTag("reader_font_larger_btn").performScrollTo().performClick()
         org.junit.Assert.assertTrue(
             dispatched.any { it is com.grayvines.roche.ui.MainAction.SetReaderFontScale }
         )
     }
 
     @Test
-    internal fun searchScopeStripAndMatchSnippetRenderOnSearchTab() {
+    fun searchScopeStripAndMatchSnippetRenderOnSearchTab() {
         val entry = createSampleEntry()
         composeRule.setContent {
             RocheTheme {
@@ -200,7 +201,7 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("search_scope_papers").assertExists()
         composeRule.onNodeWithTag("search_match_snippet_${entry.id}").assertExists()
-        composeRule.onNodeWithTag("search_scope_videos").performClick()
+        composeRule.onNodeWithTag("search_scope_videos").performScrollTo().performClick()
         composeRule.onNodeWithText("No results in Videos for \"Wait-free\".").assertExists()
     }
 
