@@ -20,7 +20,9 @@ import com.grayvines.roche.model.TagItem
 import java.io.File
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
@@ -49,6 +51,7 @@ data class RepositorySnapshot(
     val entries: List<InboxEntry>,
     val feeds: List<FeedItem>,
     val tags: List<TagItem>,
+    val activePeers: List<PeerNodeDto> = emptyList(),
 )
 
 @Suppress("TooManyFunctions")
@@ -57,9 +60,11 @@ class RocheRepository(
     private val apiClient: RocheApiClient,
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
+    private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
+    private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
     private val offlineCacheManager =
         OfflineCacheManager(
             dao = dao,
@@ -74,9 +79,18 @@ class RocheRepository(
             dao.observeFeeds(),
             dao.observeTags(),
             dao.observeItemTags(),
-        ) { items, feeds, tags, itemTags ->
-            buildSnapshot(items = items, feeds = feeds, tags = tags, itemTags = itemTags)
+            activePeersFlow,
+        ) { items, feeds, tags, itemTags, activePeers ->
+            buildSnapshot(
+                items = items,
+                feeds = feeds,
+                tags = tags,
+                itemTags = itemTags,
+                activePeers = activePeers,
+            )
         }
+
+    fun currentNetworkTier(): NetworkTier = networkTierProvider.currentNetworkTier()
 
     suspend fun setArchiveState(itemId: String, archived: Boolean): ItemStatus? =
         setArchiveStateWithSnapshot(itemId = itemId, archived = archived)?.previousStatus
@@ -464,13 +478,16 @@ class RocheRepository(
     suspend fun syncWithServer(): Result<Int> = syncMutex.withLock {
         runCatching {
             val currentSettings = settings.settings.first()
+            val currentTier = networkTierProvider.currentNetworkTier()
             if (currentSettings.serverUrl.isBlank()) {
-                pollCooperativeFeedsOnDevice(
-                    dao = dao,
-                    apiClient = apiClient,
-                    localPeerId = currentSettings.peerId,
-                    activePeers = emptyList(),
-                )
+                if (currentTier != NetworkTier.OFFLINE) {
+                    pollCooperativeFeedsOnDevice(
+                        dao = dao,
+                        apiClient = apiClient,
+                        localPeerId = currentSettings.peerId,
+                        activePeers = emptyList(),
+                    )
+                }
                 error("Configure Server URL in Settings")
             }
             val peerSyncedCount =
@@ -479,11 +496,68 @@ class RocheRepository(
                         dao = dao,
                         apiClient = apiClient,
                         currentSettings = currentSettings,
+                        networkTier = currentTier,
+                        onPeersUpdated = { activePeersFlow.value = it },
                     )
                 } else {
                     null
                 }
             peerSyncedCount ?: syncLegacySnapshot(currentSettings)
+        }
+            .onFailure { if (it is CancellationException) throw it }
+    }
+
+    suspend fun pollDueFeedsOnDeviceNow(): Result<Int> = syncMutex.withLock {
+        runCatching {
+            val currentTier = networkTierProvider.currentNetworkTier()
+            check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
+            val currentSettings = settings.settings.first()
+            val polledCount =
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = apiClient,
+                    localPeerId = currentSettings.peerId,
+                    activePeers = activePeersFlow.value,
+                )
+            if (
+                polledCount > 0 &&
+                    currentSettings.serverUrl.isNotBlank() &&
+                    currentSettings.bearerToken.isNotBlank()
+            ) {
+                runCatching {
+                    tryPeerSyncAndCooperativePoll(
+                        dao = dao,
+                        apiClient = apiClient,
+                        currentSettings = currentSettings,
+                        networkTier = currentTier,
+                        onPeersUpdated = { activePeersFlow.value = it },
+                    )
+                }
+                    .onFailure { if (it is CancellationException) throw it }
+            }
+            polledCount
+        }
+            .onFailure { if (it is CancellationException) throw it }
+    }
+
+    suspend fun runBackgroundPeerSyncAndPoll(): Result<Int> {
+        val currentTier = networkTierProvider.currentNetworkTier()
+        if (currentTier == NetworkTier.OFFLINE) return Result.success(0)
+        val currentSettings = settings.settings.first()
+        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            val syncResult = syncWithServer()
+            if (syncResult.isSuccess) return syncResult
+        }
+        return syncMutex.withLock {
+            runCatching {
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = apiClient,
+                    localPeerId = currentSettings.peerId,
+                    activePeers = activePeersFlow.value,
+                )
+            }
+                .onFailure { if (it is CancellationException) throw it }
         }
     }
 

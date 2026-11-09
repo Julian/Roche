@@ -564,7 +564,38 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
     dao: RocheDao,
     apiClient: RocheApiClient,
     currentSettings: Settings,
+    networkTier: NetworkTier = NetworkTier.WIFI,
+    onPeersUpdated: (List<PeerNodeDto>) -> Unit = {},
 ): Int? {
+    val response =
+        executeSinglePeerSyncRound(dao, apiClient, currentSettings, networkTier) ?: return null
+    onPeersUpdated(response.activePeers)
+    val polledFeedsCount =
+        if (networkTier != NetworkTier.OFFLINE) {
+            pollCooperativeFeedsOnDevice(
+                dao = dao,
+                apiClient = apiClient,
+                localPeerId = currentSettings.peerId,
+                activePeers = response.activePeers,
+            )
+        } else {
+            0
+        }
+    if (polledFeedsCount > 0) {
+        val followUpResp = executeSinglePeerSyncRound(dao, apiClient, currentSettings, networkTier)
+        if (followUpResp != null) {
+            onPeersUpdated(followUpResp.activePeers)
+        }
+    }
+    return dao.getAllItems().size
+}
+
+private suspend fun executeSinglePeerSyncRound(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    currentSettings: Settings,
+    networkTier: NetworkTier,
+): PeerSyncResponseDto? {
     val preFetchItemsById = dao.getAllItems().associateBy { it.id }
     val preSyncMutations = dao.getAllPendingMutations()
     val request =
@@ -572,6 +603,7 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
             dao = dao,
             peerId = currentSettings.peerId,
             deviceName = currentSettings.deviceName,
+            networkTier = networkTier,
         )
     val response =
         apiClient.syncPeer(
@@ -585,38 +617,7 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
         preFetchItemsById = preFetchItemsById,
         preSyncMutations = preSyncMutations,
     )
-    val polledFeedsCount =
-        pollCooperativeFeedsOnDevice(
-            dao = dao,
-            apiClient = apiClient,
-            localPeerId = currentSettings.peerId,
-            activePeers = response.activePeers,
-        )
-    if (polledFeedsCount > 0) {
-        val followUpPreFetch = dao.getAllItems().associateBy { it.id }
-        val followUpPreSyncMutations = dao.getAllPendingMutations()
-        val followUpReq =
-            buildPeerSyncRequest(
-                dao = dao,
-                peerId = currentSettings.peerId,
-                deviceName = currentSettings.deviceName,
-            )
-        val followUpResp =
-            apiClient.syncPeer(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                request = followUpReq,
-            )
-        if (followUpResp != null) {
-            reconcilePeerSyncResponse(
-                dao = dao,
-                response = followUpResp,
-                preFetchItemsById = followUpPreFetch,
-                preSyncMutations = followUpPreSyncMutations,
-            )
-        }
-    }
-    return dao.getAllItems().size
+    return response
 }
 
 internal suspend fun pollCooperativeFeedsOnDevice(

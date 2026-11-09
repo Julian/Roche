@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.FeedEntity
@@ -12,17 +14,39 @@ import kotlin.math.ln
 internal const val SERVER_PEER_ID = "server"
 internal const val DEFAULT_POLL_INTERVAL_MINUTES = 30
 
-enum class NetworkTier(val wireValue: String, val defaultWeight: Double) {
-    WIRED("wired", WIRED_DEFAULT_WEIGHT),
-    WIFI("wifi", WIFI_DEFAULT_WEIGHT),
-    CELLULAR("cellular", CELLULAR_DEFAULT_WEIGHT),
-    OFFLINE("offline", OFFLINE_DEFAULT_WEIGHT);
+enum class NetworkTier(val wireValue: String, val defaultWeight: Double, val displayLabel: String) {
+    WIRED("wired", WIRED_DEFAULT_WEIGHT, "Wired"),
+    WIFI("wifi", WIFI_DEFAULT_WEIGHT, "Wi-Fi"),
+    CELLULAR("cellular", CELLULAR_DEFAULT_WEIGHT, "Cellular"),
+    OFFLINE("offline", OFFLINE_DEFAULT_WEIGHT, "Offline");
 
     companion object {
         fun fromWireValue(raw: String?): NetworkTier =
             entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: WIFI
     }
 }
+
+fun interface NetworkTierProvider {
+    fun currentNetworkTier(): NetworkTier
+}
+
+@Suppress("LongParameterList")
+internal fun classifyNetworkCapabilities(
+    hasInternet: Boolean,
+    isValidated: Boolean,
+    hasEthernet: Boolean,
+    hasWifi: Boolean,
+    hasCellular: Boolean,
+    isMetered: Boolean,
+): NetworkTier =
+    when {
+        !hasInternet || !isValidated -> NetworkTier.OFFLINE
+        hasEthernet -> NetworkTier.WIRED
+        hasWifi && !isMetered -> NetworkTier.WIFI
+        hasWifi || hasCellular -> NetworkTier.CELLULAR
+        !isMetered -> NetworkTier.WIFI
+        else -> NetworkTier.CELLULAR
+    }
 
 data class PeerNodeDto(
     val peerId: String,

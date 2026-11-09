@@ -20,6 +20,7 @@ internal fun buildSnapshot(
     feeds: List<FeedEntity>,
     tags: List<TagEntity>,
     itemTags: List<ItemTagEntity>,
+    activePeers: List<PeerNodeDto> = emptyList(),
 ): RepositorySnapshot {
     val tagsById = tags.associateBy { it.id }
     val tagNamesByItemId =
@@ -57,6 +58,10 @@ internal fun buildSnapshot(
                     siteUrl = feed.siteUrl,
                     feedType = FeedType.fromWireValue(feed.feedType),
                     unreadCount = unreadByFeedId[feed.id] ?: 0,
+                    lastPolled = feed.lastPolled,
+                    lastPolledBy = feed.lastPolledBy,
+                    lastError = feed.lastError,
+                    lastErrorBy = feed.lastErrorBy,
                 )
             }
             .sortedWith(
@@ -89,6 +94,7 @@ internal fun buildSnapshot(
         entries = domainEntries,
         feeds = domainFeeds,
         tags = domainTags,
+        activePeers = activePeers,
     )
 }
 

@@ -13,6 +13,7 @@ import androidx.compose.runtime.getValue
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.remote.readBoundedText
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.MainAction
@@ -49,6 +50,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        PeerSyncScheduler.schedulePeriodicSync(this)
         if (savedInstanceState == null) {
             handleIncomingShareIntent(intent)
             viewModel.triggerStartupSyncIfConfigured()

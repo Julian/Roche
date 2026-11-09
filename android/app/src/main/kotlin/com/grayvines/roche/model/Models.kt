@@ -94,6 +94,11 @@ enum class AppTab(val label: String) {
     }
 }
 
+enum class FeedSortOrder(val label: String) {
+    ALPHABETICAL("Sort: A–Z"),
+    UNREAD_FIRST("Sort: Unread First"),
+}
+
 data class FeedItem(
     val id: String,
     val title: String,
@@ -101,7 +106,33 @@ data class FeedItem(
     val siteUrl: String?,
     val feedType: FeedType,
     val unreadCount: Int,
-)
+    val lastPolled: String? = null,
+    val lastPolledBy: String? = null,
+    val lastError: String? = null,
+    val lastErrorBy: String? = null,
+) {
+    val displayDomain: String = extractCleanDomain(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+
+    val faviconUrl: String? = resolveOriginFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+
+    val fallbackFaviconUrl: String? =
+        resolveFallbackFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+
+    val hasPollError: Boolean = !lastError.isNullOrBlank()
+}
+
+fun FeedItem.isCrossPeerRescueError(localPeerId: String): Boolean =
+    hasPollError && !lastErrorBy.isNullOrBlank() && lastErrorBy != localPeerId
+
+fun FeedItem.pollerAttributionLabel(localPeerId: String): String? =
+    when {
+        isCrossPeerRescueError(localPeerId) -> "Peer error · Rescue ready"
+        hasPollError -> "Poll error"
+        !lastPolledBy.isNullOrBlank() && lastPolledBy == localPeerId -> "Polled on-device"
+        lastPolledBy == "server" || lastPolledBy == "server-default" -> "Polled by Server"
+        !lastPolledBy.isNullOrBlank() -> "Polled by Peer"
+        else -> null
+    }
 
 data class TagItem(val id: String, val name: String, val unreadCount: Int)
 
@@ -151,6 +182,12 @@ data class InboxEntry(
 
     val formattedPublishedLabel: String = formatRelativeTimestamp(publishedAt ?: createdAt)
 
+    val displayDomain: String = extractCleanDomain(url)
+
+    val faviconUrl: String? = resolveOriginFaviconUrl(url)
+
+    val fallbackFaviconUrl: String? = resolveFallbackFaviconUrl(url)
+
     val readEstimateLabel: String =
         when (contentType) {
             ContentType.VIDEO -> duration ?: "Video"
@@ -158,6 +195,48 @@ data class InboxEntry(
             ContentType.ARTICLE ->
                 formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
         }
+}
+
+internal fun extractCleanDomain(rawUrl: String): String {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isBlank()) return ""
+    val host = extractOriginUri(trimmed)?.host?.lowercase(Locale.US)?.removePrefix("www.")
+    return host?.takeIf { it.isNotBlank() } ?: trimmed
+}
+
+internal fun resolveOriginFaviconUrl(rawUrl: String): String? {
+    val uri = extractOriginUri(rawUrl) ?: return null
+    val scheme = uri.scheme?.lowercase(Locale.US) ?: return null
+    val host = uri.host?.lowercase(Locale.US) ?: return null
+    if (scheme != "https" && scheme != "http" || host.isBlank()) return null
+    val portPart = if (uri.port != -1) ":${uri.port}" else ""
+    return "$scheme://$host$portPart/apple-touch-icon.png"
+}
+
+internal fun resolveFallbackFaviconUrl(rawUrl: String): String? {
+    val host =
+        extractOriginUri(rawUrl)?.host?.lowercase(Locale.US)?.removePrefix("www.") ?: return null
+    if (host.isBlank() || !host.contains('.')) return null
+    return "https://icons.duckduckgo.com/ip3/$host.ico"
+}
+
+private fun extractOriginUri(rawUrl: String): URI? {
+    val trimmed = rawUrl.trim()
+    if (trimmed.isBlank()) return null
+    val withoutQueryOrFragment = trimmed.substringBefore('#').substringBefore('?')
+    val schemeSeparatorIndex = withoutQueryOrFragment.indexOf("://")
+    val originCandidate =
+        if (schemeSeparatorIndex != -1) {
+            val slashIndex = withoutQueryOrFragment.indexOf('/', schemeSeparatorIndex + 3)
+            if (slashIndex != -1) {
+                withoutQueryOrFragment.substring(0, slashIndex)
+            } else {
+                withoutQueryOrFragment
+            }
+        } else {
+            withoutQueryOrFragment
+        }
+    return runCatching { URI.create(originCandidate) }.getOrNull()
 }
 
 internal fun isNonThumbnailUrl(url: String): Boolean {

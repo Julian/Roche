@@ -28,12 +28,199 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
+import kotlin.math.abs
+
+/**
+ * Renders a rounded site favicon badge (`28.dp` on Feeds rows, `14.dp` inline in Inbox meta).
+ * Attempts to load and cache the site's favicon via [rememberEntryThumbnailBitmap] and falls back
+ * to a crisp brand/domain emblem when offline or before the icon has been fetched.
+ */
+@Composable
+fun SiteFaviconBadge(
+    primaryFaviconUrl: String?,
+    fallbackFaviconUrl: String?,
+    domain: String,
+    title: String,
+    modifier: Modifier = Modifier,
+    feedType: FeedType? = null,
+    size: Dp = 28.dp,
+) {
+    val colors = LocalRocheColors.current
+    val cornerRadius = if (size >= 22.dp) 7.dp else 3.5.dp
+    val shape = RoundedCornerShape(cornerRadius)
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = primaryFaviconUrl,
+            fallbackKey = fallbackFaviconUrl,
+        )
+    val brandStyle = resolveFaviconBrandStyle(domain = domain, title = title, feedType = feedType)
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .size(size)
+                .clip(shape)
+                .background(brandStyle.backgroundColor)
+                .border(width = 0.75.dp, color = colors.border, shape = shape),
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            SiteFaviconFallbackGlyph(brandStyle = brandStyle, size = size)
+        }
+    }
+}
+
+@Composable
+private fun SiteFaviconFallbackGlyph(brandStyle: FaviconBrandStyle, size: Dp) {
+    when (brandStyle.kind) {
+        FaviconGlyphKind.ARXIV -> {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = this.size.width
+                val h = this.size.height
+                val stroke = Stroke(width = w * 0.12f, cap = StrokeCap.Round)
+                drawLine(
+                    brandStyle.foregroundColor,
+                    Offset(w * 0.28f, h * 0.28f),
+                    Offset(w * 0.72f, h * 0.72f),
+                    stroke.width,
+                    StrokeCap.Round,
+                )
+                drawLine(
+                    brandStyle.foregroundColor,
+                    Offset(w * 0.72f, h * 0.28f),
+                    Offset(w * 0.28f, h * 0.72f),
+                    stroke.width,
+                    StrokeCap.Round,
+                )
+            }
+        }
+        FaviconGlyphKind.YOUTUBE -> {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val w = this.size.width
+                val h = this.size.height
+                val tri =
+                    Path().apply {
+                        moveTo(w * 0.38f, h * 0.30f)
+                        lineTo(w * 0.70f, h * 0.50f)
+                        lineTo(w * 0.38f, h * 0.70f)
+                        close()
+                    }
+                drawPath(path = tri, color = brandStyle.foregroundColor)
+            }
+        }
+        FaviconGlyphKind.MONOGRAM -> {
+            val fontSize = if (size >= 22.dp) 11.sp else 8.sp
+            Text(
+                text = brandStyle.monogram,
+                color = brandStyle.foregroundColor,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = fontSize,
+                lineHeight = fontSize,
+                softWrap = false,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+private enum class FaviconGlyphKind {
+    ARXIV,
+    YOUTUBE,
+    MONOGRAM,
+}
+
+private data class FaviconBrandStyle(
+    val kind: FaviconGlyphKind,
+    val backgroundColor: Color,
+    val foregroundColor: Color,
+    val monogram: String,
+)
+
+private fun resolveFaviconBrandStyle(
+    domain: String,
+    title: String,
+    feedType: FeedType?,
+): FaviconBrandStyle {
+    val cleanDomain = domain.lowercase()
+    val monogram = extractDomainMonogram(cleanDomain.ifBlank { title })
+    val defaultPaletteIndex = abs(cleanDomain.ifBlank { title }.hashCode()) % FAVICON_SWATCHES.size
+    val (defaultBg, defaultFg) = FAVICON_SWATCHES[defaultPaletteIndex]
+    return when {
+        feedType == FeedType.ARXIV || "arxiv" in cleanDomain ->
+            FaviconBrandStyle(
+                kind = FaviconGlyphKind.ARXIV,
+                backgroundColor = ARXIV_BRAND_BG,
+                foregroundColor = Color.White,
+                monogram = "arX",
+            )
+        feedType == FeedType.YOUTUBE || "youtube" in cleanDomain || "youtu.be" in cleanDomain ->
+            FaviconBrandStyle(
+                kind = FaviconGlyphKind.YOUTUBE,
+                backgroundColor = YOUTUBE_BRAND_BG,
+                foregroundColor = Color.White,
+                monogram = "YT",
+            )
+        "ycombinator" in cleanDomain || "hnrss" in cleanDomain ->
+            FaviconBrandStyle(
+                kind = FaviconGlyphKind.MONOGRAM,
+                backgroundColor = HN_BRAND_BG,
+                foregroundColor = Color.White,
+                monogram = "Y",
+            )
+        else ->
+            FaviconBrandStyle(
+                kind = FaviconGlyphKind.MONOGRAM,
+                backgroundColor = defaultBg,
+                foregroundColor = defaultFg,
+                monogram = monogram,
+            )
+    }
+}
+
+private val ARXIV_BRAND_BG = Color(0xFFB31B1B)
+private val YOUTUBE_BRAND_BG = Color(0xFFC13832)
+private val HN_BRAND_BG = Color(0xFFFF6600)
+
+private fun extractDomainMonogram(source: String): String {
+    val token =
+        source
+            .trim()
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .removePrefix("www.")
+            .substringBefore('.')
+            .filter { it.isLetterOrDigit() }
+    return when {
+        token.length >= 2 -> token.take(2).lowercase()
+        token.length == 1 -> token.uppercase()
+        else -> "••"
+    }
+}
+
+private val FAVICON_SWATCHES =
+    listOf(
+        Color(0xFF28485C) to Color(0xFFE4DFDA),
+        Color(0xFF254D4B) to Color(0xFFE4DFDA),
+        Color(0xFF4A3D2C) to Color(0xFFE4DFDA),
+        Color(0xFF4E2D31) to Color(0xFFE4DFDA),
+        Color(0xFF333B42) to Color(0xFFE4DFDA),
+    )
 
 /**
  * Renders row image previews for entries:

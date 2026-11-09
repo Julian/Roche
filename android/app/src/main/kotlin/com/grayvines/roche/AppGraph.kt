@@ -1,6 +1,8 @@
 package com.grayvines.roche
 
 import android.content.Context
+import com.grayvines.roche.data.AndroidNetworkTierProvider
+import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpUrlConnectionTransport
@@ -23,6 +25,10 @@ class AppGraph(context: Context) {
 
     val apiClient: RocheApiClient by lazy { RocheApiClient(HttpUrlConnectionTransport()) }
 
+    val networkTierProvider: NetworkTierProvider by lazy {
+        AndroidNetworkTierProvider(appContext)
+    }
+
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
 
     val repository: RocheRepository by lazy {
@@ -31,6 +37,7 @@ class AppGraph(context: Context) {
             apiClient = apiClient,
             settings = settings,
             cacheDir = offlineCacheDir,
+            networkTierProvider = networkTierProvider,
         )
     }
 

@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
@@ -140,8 +139,9 @@ fun RocheBottomBar(
 @Composable
 private fun RowScope.CenterInboxBarItem(isSelected: Boolean, onClick: () -> Unit) {
     val colors = LocalRocheColors.current
-    val circleBg = if (isSelected) colors.accentBlue else colors.surfaceElevated
-    val circleBorder = if (isSelected) colors.accentBlue else colors.accentBlue.copy(alpha = 0.55f)
+    val pillShape = RoundedCornerShape(14.dp)
+    val pillBg = if (isSelected) colors.accentBlue else colors.surfaceElevated
+    val pillBorder = if (isSelected) colors.accentBlue else colors.accentBlue.copy(alpha = 0.38f)
     val iconTint = if (isSelected) Color.White else colors.accentBlue
     val labelColor = if (isSelected) colors.textPrimary else colors.textSecondary
     val labelWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
@@ -150,27 +150,28 @@ private fun RowScope.CenterInboxBarItem(isSelected: Boolean, onClick: () -> Unit
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
         modifier =
-            Modifier.weight(1.1f)
-                .clip(RoundedCornerShape(12.dp))
+            Modifier.weight(1f)
+                .clip(RoundedCornerShape(10.dp))
                 .clickable(onClick = onClick)
                 .semantics {
                     role = Role.Tab
                     selected = isSelected
                 }
-                .padding(vertical = 2.dp)
+                .padding(vertical = 6.dp)
                 .testTag("bottom_tab_inbox"),
     ) {
         Box(
             modifier =
-                Modifier.size(44.dp)
-                    .clip(CircleShape)
-                    .background(circleBg)
-                    .border(width = 1.5.dp, color = circleBorder, shape = CircleShape),
+                Modifier.width(48.dp)
+                    .height(28.dp)
+                    .clip(pillShape)
+                    .background(pillBg)
+                    .border(width = 1.dp, color = pillBorder, shape = pillShape),
             contentAlignment = Alignment.Center,
         ) {
-            BottomTabIcon(tab = AppTab.INBOX, tint = iconTint, size = 21.dp)
+            BottomTabIcon(tab = AppTab.INBOX, tint = iconTint, size = 19.dp)
         }
-        Spacer(modifier = Modifier.height(2.dp))
+        Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = AppTab.INBOX.label,
             color = labelColor,
@@ -474,5 +475,41 @@ fun UndoOrStatusSnackbar(
                 Text(text = "✕", color = colors.textMuted, fontSize = 12.sp)
             }
         }
+    }
+}
+
+@Composable
+internal fun RocheSectionHeader(
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Text(
+        text = label.uppercase(),
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 10.5.sp,
+        letterSpacing = 0.7.sp,
+        modifier = modifier.padding(horizontal = 4.dp),
+    )
+}
+
+@Composable
+internal fun RocheSurfaceCard(
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(12.dp)
+    Column(
+        modifier =
+            modifier
+                .fillMaxWidth()
+                .clip(shape)
+                .background(colors.surface)
+                .border(width = 1.dp, color = colors.border, shape = shape)
+    ) {
+        content()
     }
 }

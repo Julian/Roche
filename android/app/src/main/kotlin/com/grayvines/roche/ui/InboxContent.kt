@@ -7,6 +7,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,15 +47,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
+import com.grayvines.roche.ui.components.BottomTabIcon
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
+import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -63,57 +71,83 @@ fun InboxTabContent(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    var showTagFilterDrawer by rememberSaveable { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        InboxHeaderSection(state = state, onAction = onAction)
+        InboxHeaderSection(
+            state = state,
+            showTagFilterDrawer = showTagFilterDrawer,
+            onToggleTagDrawer = { showTagFilterDrawer = !showTagFilterDrawer },
+            onAction = onAction,
+        )
         InboxFilterStrip(state = state, onAction = onAction)
         HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (showTagFilterDrawer && state.tags.isNotEmpty()) {
+            InboxTagFilterDrawer(
+                state = state,
+                onSelectTag = { tagName ->
+                    showTagFilterDrawer = false
+                    onAction(MainAction.FilterByTag(tagName))
+                },
+            )
+        }
 
         PullToRefreshBox(
             isRefreshing = state.isSyncing,
             onRefresh = { onAction(MainAction.SyncNow) },
             modifier = Modifier.fillMaxSize().testTag("inbox_pull_to_refresh"),
         ) {
-            if (state.visibleEntries.isEmpty()) {
-                InboxEmptyState(
-                    hasEntriesAtAll = state.allEntries.isNotEmpty(),
-                    onSaveClick = { onAction(MainAction.OpenAddSheet()) },
-                    onSyncClick = { onAction(MainAction.SyncNow) },
+            InboxEntryListBody(state = state, onAction = onAction)
+        }
+    }
+}
+
+@Composable
+internal fun InboxEntryListBody(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (state.visibleEntries.isEmpty()) {
+        InboxEmptyState(
+            hasEntriesAtAll = state.allEntries.isNotEmpty(),
+            onSaveClick = { onAction(MainAction.OpenAddSheet()) },
+            onSyncClick = { onAction(MainAction.SyncNow) },
+        )
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().testTag("inbox_list"),
+            contentPadding = PaddingValues(bottom = 88.dp),
+        ) {
+            items(items = state.visibleEntries, key = { it.id }) { entry ->
+                InboxEntryRowItem(
+                    entry = entry,
+                    ultraDense = state.settings.ultraDenseRows,
+                    swipeToArchiveEnabled = state.settings.swipeToArchive,
+                    onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                    onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                    onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                    onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
                 )
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize().testTag("inbox_list"),
-                    contentPadding = PaddingValues(bottom = 88.dp),
-                ) {
-                    items(items = state.visibleEntries, key = { it.id }) { entry ->
-                        InboxEntryRowItem(
-                            entry = entry,
-                            ultraDense = state.settings.ultraDenseRows,
-                            swipeToArchiveEnabled = state.settings.swipeToArchive,
-                            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                            onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-                        )
-                        HorizontalDivider(color = colors.border, thickness = 1.dp)
-                    }
-                }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
         }
     }
 }
 
 @Composable
-private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+private fun InboxHeaderSection(
+    state: MainUiState,
+    showTagFilterDrawer: Boolean,
+    onToggleTagDrawer: () -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
     val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
     val unarchivedCount = state.visibleEntries.count { !it.isArchived }
-    var showArchiveAllConfirm by remember { mutableStateOf(false) }
-    val title =
-        when {
-            state.selectedFeedId != null -> state.selectedFeedTitle ?: "Feed"
-            state.selectedTag != null -> "#${state.selectedTag}"
-            else -> "Roche"
-        }
+    var showArchiveAllConfirm by rememberSaveable { mutableStateOf(false) }
+    val title = resolveInboxHeaderTitle(state)
+
     RocheTopHeader(
         title = title,
         subtitle = "${state.visibleEntries.size} items",
@@ -130,14 +164,15 @@ private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Uni
                 null
             },
     ) {
-        if (unarchivedCount > 0) {
-            HeaderActionButton(
-                label = "Archive All",
-                onClick = { showArchiveAllConfirm = true },
-                modifier = Modifier.testTag("archive_all_btn"),
-            )
-        }
-        HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+        InboxHeaderActions(
+            state = state,
+            unarchivedCount = unarchivedCount,
+            showTagFilterDrawer = showTagFilterDrawer,
+            onToggleTagDrawer = onToggleTagDrawer,
+            onShowArchiveConfirm = { showArchiveAllConfirm = true },
+            onSync = { onAction(MainAction.SyncNow) },
+            onOpenSettings = { onAction(MainAction.SelectTab(AppTab.SETTINGS)) },
+        )
     }
     if (showArchiveAllConfirm) {
         ArchiveAllConfirmDialog(
@@ -150,6 +185,107 @@ private fun InboxHeaderSection(state: MainUiState, onAction: (MainAction) -> Uni
             },
         )
     }
+}
+
+private fun resolveInboxHeaderTitle(state: MainUiState): String =
+    when {
+        state.selectedFeedId != null -> state.selectedFeedTitle ?: "Feed"
+        state.selectedTag != null -> "#${state.selectedTag}"
+        else -> "Roche"
+    }
+
+@Composable
+internal fun InboxHeaderActions(
+    state: MainUiState,
+    unarchivedCount: Int,
+    showTagFilterDrawer: Boolean,
+    onToggleTagDrawer: () -> Unit,
+    onShowArchiveConfirm: () -> Unit,
+    onSync: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val isSettingsUnpinned =
+        AppTab.SETTINGS !in AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
+    if (state.tags.isNotEmpty()) {
+        val filterTint =
+            if (showTagFilterDrawer || state.selectedTag != null) {
+                colors.accentBlue
+            } else {
+                colors.textSecondary
+            }
+        RocheIconActionButton(
+            contentDescription = "Filter by Tag",
+            onClick = onToggleTagDrawer,
+            modifier = Modifier.testTag("inbox_tag_filter_btn"),
+        ) {
+            FilterFunnelIcon(tint = filterTint, size = 17.dp)
+        }
+    }
+    if (unarchivedCount > 0) {
+        RocheIconActionButton(
+            contentDescription = "Archive All",
+            onClick = onShowArchiveConfirm,
+            modifier = Modifier.testTag("archive_all_btn"),
+        ) {
+            FilingCabinetIcon(tint = colors.textSecondary, isArchived = false, size = 17.dp)
+        }
+    }
+    RocheIconActionButton(
+        contentDescription = "Sync",
+        onClick = onSync,
+        modifier = Modifier.testTag("inbox_sync_btn"),
+    ) {
+        RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+    }
+    if (isSettingsUnpinned) {
+        RocheIconActionButton(
+            contentDescription = "Settings",
+            onClick = onOpenSettings,
+            modifier = Modifier.testTag("inbox_spare_settings_btn"),
+        ) {
+            BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textSecondary, size = 17.dp)
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun InboxTagFilterDrawer(
+    state: MainUiState,
+    onSelectTag: (String?) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surface)
+                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .testTag("inbox_tag_filter_drawer"),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "FILTER BY TAG",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+        )
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            state.tags.forEach { tag ->
+                val isSelected = state.selectedTag == tag.name
+                FilterChipPill(
+                    label = "#${tag.name} (${tag.unreadCount})",
+                    selected = isSelected,
+                    onClick = { onSelectTag(if (isSelected) null else tag.name) },
+                )
+            }
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable
@@ -480,6 +616,13 @@ private fun EntrySourceMetaRow(entry: InboxEntry) {
                         .testTag("unread_dot_${entry.id}")
             )
         }
+        SiteFaviconBadge(
+            primaryFaviconUrl = entry.faviconUrl,
+            fallbackFaviconUrl = entry.fallbackFaviconUrl,
+            domain = entry.displayDomain,
+            title = entry.feedTitle,
+            size = 14.dp,
+        )
         Text(
             text = entry.feedTitle,
             color = feedLabelColor,

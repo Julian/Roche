@@ -1,6 +1,7 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -26,36 +28,33 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.settings.normalizeServerUrl
-import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
-import com.grayvines.roche.model.HeadlineFont
-import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.model.FeedSortOrder
+import com.grayvines.roche.model.isCrossPeerRescueError
+import com.grayvines.roche.model.pollerAttributionLabel
 import com.grayvines.roche.ui.components.FilterChipPill
+import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RefreshIcon
-import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
-import com.grayvines.roche.ui.components.SettingToggleRow
+import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.theme.LocalRocheColors
-import kotlinx.coroutines.delay
 
 @Composable
 fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
@@ -67,7 +66,12 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             title = "Starred",
             subtitle = "${starredEntries.size} saved",
         ) {
-            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+            RocheIconActionButton(
+                contentDescription = "Sync",
+                onClick = { onAction(MainAction.SyncNow) },
+            ) {
+                RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+            }
         }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
@@ -196,95 +200,226 @@ private fun SearchQuickTagStrip(state: MainUiState, onAction: (MainAction) -> Un
 @Composable
 fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Feeds & Tags",
-            subtitle = "${state.feeds.size} feeds",
-        ) {
-            HeaderActionButton(label = "Sync", onClick = { onAction(MainAction.SyncNow) })
+    var showFilterDrawer by rememberSaveable { mutableStateOf(false) }
+    var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
+    var unreadOnly by rememberSaveable { mutableStateOf(false) }
+
+    val totalUnread = remember(state.feeds) { state.feeds.sumOf { it.unreadCount } }
+    val subtitle =
+        if (totalUnread > 0) {
+            "${state.feeds.size} feeds · $totalUnread unread"
+        } else {
+            "${state.feeds.size} feeds"
         }
+    val visibleFeeds =
+        remember(state.feeds, sortOrder, unreadOnly) {
+            sortAndFilterFeeds(state.feeds, sortOrder, unreadOnly)
+        }
+    val hasActiveFilter = showFilterDrawer || unreadOnly || sortOrder != FeedSortOrder.ALPHABETICAL
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        FeedsTopHeaderBar(
+            subtitle = subtitle,
+            hasActiveFilter = hasActiveFilter,
+            onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
+            onSync = { onAction(MainAction.SyncNow) },
+        )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (showFilterDrawer) {
+            FeedsFilterDrawer(
+                state = state,
+                sortOrder = sortOrder,
+                unreadOnly = unreadOnly,
+                onSelectSortOrder = { sortOrder = it },
+                onToggleUnreadOnly = { unreadOnly = !unreadOnly },
+                onSelectTag = { tagName ->
+                    showFilterDrawer = false
+                    onAction(MainAction.FilterByTag(tagName))
+                },
+            )
+        }
 
         PullToRefreshBox(
             isRefreshing = state.isSyncing,
             onRefresh = { onAction(MainAction.SyncNow) },
             modifier = Modifier.fillMaxSize().testTag("feeds_pull_to_refresh"),
         ) {
-            Column(
-                modifier =
-                    Modifier.fillMaxSize()
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp, vertical = 14.dp)
-            ) {
-                TagsSection(state = state, onAction = onAction)
-                Spacer(modifier = Modifier.height(20.dp))
-                SubscribedFeedsSection(state = state, onAction = onAction)
-                Spacer(modifier = Modifier.height(72.dp))
-            }
+            SubscribedFeedsCardList(
+                feeds = visibleFeeds,
+                hasFeedsAtAll = state.feeds.isNotEmpty(),
+                localPeerId = state.settings.peerId,
+                onAction = onAction,
+            )
         }
+    }
+}
+
+@Composable
+internal fun FeedsTopHeaderBar(
+    subtitle: String,
+    hasActiveFilter: Boolean,
+    onToggleFilterDrawer: () -> Unit,
+    onSync: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheTopHeader(
+        title = "Feeds",
+        subtitle = subtitle,
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Filter Feeds & Tags",
+            onClick = onToggleFilterDrawer,
+            modifier = Modifier.testTag("feeds_filter_btn"),
+        ) {
+            FilterFunnelIcon(
+                tint = if (hasActiveFilter) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+            )
+        }
+        RocheIconActionButton(
+            contentDescription = "Sync Feeds",
+            onClick = onSync,
+            modifier = Modifier.testTag("feeds_sync_btn"),
+        ) {
+            RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+        }
+    }
+}
+
+internal fun sortAndFilterFeeds(
+    feeds: List<FeedItem>,
+    sortOrder: FeedSortOrder,
+    unreadOnly: Boolean,
+): List<FeedItem> {
+    val base = if (unreadOnly) feeds.filter { it.unreadCount > 0 } else feeds
+    val alphaComparator =
+        compareBy<FeedItem, String>(String.CASE_INSENSITIVE_ORDER) { it.title }.thenBy { it.title }
+    return when (sortOrder) {
+        FeedSortOrder.ALPHABETICAL -> base.sortedWith(alphaComparator)
+        FeedSortOrder.UNREAD_FIRST ->
+            base.sortedWith(compareByDescending<FeedItem> { it.unreadCount }.then(alphaComparator))
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun TagsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+private fun FeedsFilterDrawer(
+    state: MainUiState,
+    sortOrder: FeedSortOrder,
+    unreadOnly: Boolean,
+    onSelectSortOrder: (FeedSortOrder) -> Unit,
+    onToggleUnreadOnly: () -> Unit,
+    onSelectTag: (String?) -> Unit,
+) {
     val colors = LocalRocheColors.current
-    Text(
-        text = "TAGS",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-    )
-    Spacer(modifier = Modifier.height(8.dp))
-    if (state.tags.isEmpty()) {
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surface)
+                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .testTag("feeds_filter_drawer"),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
         Text(
-            text = "No tags yet. Add tags when saving a link or via an item's menu.",
+            text = "VIEW & SORT",
             color = colors.textMuted,
-            fontSize = 12.5.sp,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
         )
-    } else {
         FlowRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            state.tags.forEach { tag ->
+            FeedSortOrder.entries.forEach { order ->
                 FilterChipPill(
-                    label = "#${tag.name} (${tag.unreadCount})",
-                    selected = state.selectedTag == tag.name,
-                    onClick = { onAction(MainAction.FilterByTag(tag.name)) },
+                    label = order.label,
+                    selected = sortOrder == order,
+                    onClick = { onSelectSortOrder(order) },
                 )
+            }
+            FilterChipPill(
+                label = "Unread Feeds Only",
+                selected = unreadOnly,
+                onClick = onToggleUnreadOnly,
+            )
+        }
+        if (state.tags.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "FILTER INBOX BY TAG",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.5.sp,
+            )
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                state.tags.forEach { tag ->
+                    val isSelected = state.selectedTag == tag.name
+                    FilterChipPill(
+                        label = "#${tag.name} (${tag.unreadCount})",
+                        selected = isSelected,
+                        onClick = { onSelectTag(if (isSelected) null else tag.name) },
+                    )
+                }
             }
         }
     }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable
-internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -> Unit) {
+private fun SubscribedFeedsCardList(
+    feeds: List<FeedItem>,
+    hasFeedsAtAll: Boolean,
+    localPeerId: String,
+    onAction: (MainAction) -> Unit,
+) {
     val colors = LocalRocheColors.current
-    Text(
-        text = "SUBSCRIBED FEEDS",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-    )
-    Spacer(modifier = Modifier.height(8.dp))
-    if (state.feeds.isEmpty()) {
-        Text(
-            text = "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube.",
-            color = colors.textMuted,
-            fontSize = 12.5.sp,
-        )
-    } else {
-        state.feeds.forEach { feed ->
-            SubscribedFeedRow(
-                feed = feed,
-                onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
-                onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
-                onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
-            )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Column(
+        modifier =
+            Modifier.fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 14.dp, vertical = 14.dp)
+    ) {
+        if (feeds.isEmpty()) {
+            val emptyMessage =
+                if (hasFeedsAtAll) {
+                    "No feeds with unread items."
+                } else {
+                    "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube."
+                }
+            Box(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp, horizontal = 16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text = emptyMessage, color = colors.textMuted, fontSize = 13.sp)
+            }
+        } else {
+            RocheSurfaceCard {
+                feeds.forEachIndexed { index, feed ->
+                    if (index > 0) {
+                        HorizontalDivider(
+                            color = colors.border,
+                            thickness = 1.dp,
+                            modifier = Modifier.padding(start = 52.dp),
+                        )
+                    }
+                    SubscribedFeedRow(
+                        feed = feed,
+                        localPeerId = localPeerId,
+                        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                        onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                        onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
+                    )
+                }
+            }
         }
+        Spacer(modifier = Modifier.height(72.dp))
     }
 }
 
@@ -292,6 +427,7 @@ internal fun SubscribedFeedsSection(state: MainUiState, onAction: (MainAction) -
 @Composable
 private fun SubscribedFeedRow(
     feed: FeedItem,
+    localPeerId: String,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
     onRefresh: () -> Unit,
@@ -300,50 +436,113 @@ private fun SubscribedFeedRow(
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .clip(RoundedCornerShape(8.dp))
                 .combinedClickable(onClick = onClick, onLongClick = onLongPress)
-                .padding(vertical = 12.dp, horizontal = 8.dp)
+                .padding(vertical = 11.dp, horizontal = 12.dp)
                 .testTag("feed_row_${feed.id}"),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
-            Text(
-                text = feed.title,
-                color = colors.textPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
+        Row(
+            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SiteFaviconBadge(
+                primaryFaviconUrl = feed.faviconUrl,
+                fallbackFaviconUrl = feed.fallbackFaviconUrl,
+                domain = feed.displayDomain,
+                title = feed.title,
+                feedType = feed.feedType,
+                size = 28.dp,
             )
+            Spacer(modifier = Modifier.width(11.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = feed.title,
+                    color = colors.textPrimary,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                SubscribedFeedMetadataLine(feed = feed, localPeerId = localPeerId)
+            }
+        }
+        SubscribedFeedTrailingActions(feed = feed, onRefresh = onRefresh)
+    }
+}
+
+@Composable
+private fun SubscribedFeedMetadataLine(
+    feed: FeedItem,
+    localPeerId: String,
+) {
+    val colors = LocalRocheColors.current
+    val attribution = feed.pollerAttributionLabel(localPeerId)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = feed.displayDomain,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (attribution != null) {
+            val badgeColor =
+                when {
+                    feed.isCrossPeerRescueError(localPeerId) -> colors.accentEcru
+                    feed.hasPollError -> colors.accentIndianRed
+                    feed.lastPolledBy == localPeerId -> colors.accentVerdigris
+                    else -> colors.textSecondary
+                }
             Text(
-                text = "${feed.feedType.wireValue.uppercase()} · ${feed.url}",
-                color = colors.textMuted,
+                text = "· $attribution",
+                color = badgeColor,
                 fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
+                fontSize = 10.5.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (feed.unreadCount > 0) {
+    }
+}
+
+@Composable
+internal fun SubscribedFeedTrailingActions(
+    feed: FeedItem,
+    onRefresh: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (feed.unreadCount > 0) {
+            Box(
+                modifier =
+                    Modifier.clip(RoundedCornerShape(99.dp))
+                        .background(colors.accentBlue.copy(alpha = 0.16f))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+            ) {
                 Text(
                     text = feed.unreadCount.toString(),
                     color = colors.accentBlue,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
+                    fontSize = 11.5.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
             }
-            RocheIconActionButton(
-                contentDescription = "Refresh ${feed.title}",
-                onClick = onRefresh,
-                outlined = false,
-                modifier = Modifier.testTag("refresh_feed_${feed.id}"),
-            ) {
-                RefreshIcon(tint = colors.textSecondary, size = 18.dp)
-            }
+        }
+        RocheIconActionButton(
+            contentDescription = "Refresh ${feed.title}",
+            onClick = onRefresh,
+            outlined = false,
+            modifier = Modifier.testTag("refresh_feed_${feed.id}"),
+        ) {
+            RefreshIcon(tint = colors.textSecondary, size = 17.dp)
         }
     }
 }
@@ -408,303 +607,5 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 }
             }
         }
-    }
-}
-
-@Composable
-fun SettingsTabContent(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-    onImportOpml: () -> Unit = {},
-    onExportOpml: () -> Unit = {},
-) {
-    val colors = LocalRocheColors.current
-    Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(title = "Settings")
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        Column(
-            modifier =
-                Modifier.fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            AppearanceTogglesSection(state = state, onAction = onAction)
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            BottomNavigationConfigSection(state = state, onAction = onAction)
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            ServerConfigSection(state = state, onAction = onAction)
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            OpmlSubscriptionsSection(onImportOpml = onImportOpml, onExportOpml = onExportOpml)
-            Spacer(modifier = Modifier.height(24.dp))
-        }
-    }
-}
-
-@Composable
-private fun BottomNavigationConfigSection(state: MainUiState, onAction: (MainAction) -> Unit) {
-    val colors = LocalRocheColors.current
-    val currentTabs = AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
-    val slotLabels = listOf("Far Left", "Inner Left", "Inner Right", "Far Right")
-
-    Text(
-        text = "BOTTOM NAVIGATION BAR (INBOX CENTERED)",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-    )
-    slotLabels.forEachIndexed { index, slotLabel ->
-        val selectedTab = currentTabs.getOrElse(index) { AppTab.defaultSideTabs[index] }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = slotLabel,
-                color = colors.textSecondary,
-                fontSize = 12.5.sp,
-                modifier = Modifier.padding(end = 8.dp),
-            )
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                AppTab.sideTabCandidates.forEach { candidate ->
-                    FilterChipPill(
-                        label = candidate.label,
-                        selected = selectedTab == candidate,
-                        onClick = { onAction(MainAction.SetBottomNavSlot(index, candidate)) },
-                    )
-                }
-            }
-        }
-    }
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        HeaderActionButton(
-            label = "Open Offline Vault (${state.offlineEntries.size})",
-            onClick = { onAction(MainAction.SelectTab(AppTab.OFFLINE)) },
-        )
-    }
-}
-
-@Composable
-private fun AppearanceTogglesSection(state: MainUiState, onAction: (MainAction) -> Unit) {
-    SettingToggleRow(
-        title = "Paper Light Mode",
-        subtitle = "Timberwolf editorial paper (#E4DFDA) vs warm charcoal",
-        checked = state.settings.themeMode == ThemeMode.LIGHT,
-        onCheckedChange = { light ->
-            val mode = if (light) ThemeMode.LIGHT else ThemeMode.DARK
-            onAction(MainAction.SetThemeMode(mode))
-        },
-    )
-    SettingToggleRow(
-        title = "Serif Headlines",
-        subtitle = "Editorial serif headlines vs clean sans-serif",
-        checked = state.settings.headlineFont == HeadlineFont.SERIF,
-        onCheckedChange = { serif ->
-            val font = if (serif) HeadlineFont.SERIF else HeadlineFont.SANS
-            onAction(MainAction.SetHeadlineFont(font))
-        },
-    )
-    SettingToggleRow(
-        title = "Ultra-Dense 1-Line Rows",
-        subtitle = "Hide abstract snippet for high-volume triage",
-        checked = state.settings.ultraDenseRows,
-        onCheckedChange = { onAction(MainAction.SetUltraDenseRows(it)) },
-    )
-    SettingToggleRow(
-        title = "Single Swipe-Left to Archive",
-        subtitle = "Optional swipe gesture alongside the archive button",
-        checked = state.settings.swipeToArchive,
-        onCheckedChange = { onAction(MainAction.SetSwipeToArchive(it)) },
-    )
-}
-
-@Composable
-private fun ServerConfigSection(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val keyboardController = LocalSoftwareKeyboardController.current
-    var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
-    var bearerToken by rememberSaveable { mutableStateOf(state.settings.bearerToken) }
-    var pairingCode by rememberSaveable { mutableStateOf("") }
-
-    LaunchedEffect(state.settings.serverUrl) {
-        if (normalizeServerUrl(serverUrl) != state.settings.serverUrl) {
-            serverUrl = state.settings.serverUrl
-        }
-    }
-    LaunchedEffect(state.settings.bearerToken) {
-        if (bearerToken.trim() != state.settings.bearerToken) {
-            bearerToken = state.settings.bearerToken
-        }
-    }
-    ServerConfigAutoSaveEffect(
-        serverUrl = serverUrl,
-        bearerToken = bearerToken,
-        savedServerUrl = state.settings.serverUrl,
-        savedBearerToken = state.settings.bearerToken,
-        onAction = onAction,
-    )
-
-    Text(
-        text = "SELF-HOSTED SERVER",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-    )
-    OutlinedTextField(
-        value = serverUrl,
-        onValueChange = { serverUrl = it },
-        label = { Text("Roche Server URL (Tailscale / LAN)") },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth().testTag("server_url_input"),
-    )
-    PairingCodeRow(
-        pairingCode = pairingCode,
-        onPairingCodeChange = { pairingCode = it },
-        onPairClick = {
-            keyboardController?.hide()
-            onAction(MainAction.PairWithServer(serverUrl, pairingCode))
-        },
-    )
-    OutlinedTextField(
-        value = bearerToken,
-        onValueChange = { bearerToken = it },
-        label = { Text("Bearer Token") },
-        singleLine = true,
-        visualTransformation = PasswordVisualTransformation(),
-        modifier = Modifier.fillMaxWidth().testTag("bearer_token_input"),
-    )
-    ServerConfigActionsRow(
-        serverUrl = serverUrl,
-        bearerToken = bearerToken,
-        onAction = onAction,
-        onHideKeyboard = { keyboardController?.hide() },
-    )
-}
-
-@Composable
-internal fun OpmlSubscriptionsSection(
-    onImportOpml: () -> Unit,
-    onExportOpml: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    Text(
-        text = "OPML SUBSCRIPTIONS",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.sp,
-    )
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        HeaderActionButton(
-            label = "Import OPML…",
-            onClick = onImportOpml,
-            modifier = Modifier.testTag("import_opml_btn"),
-        )
-        HeaderActionButton(
-            label = "Export OPML…",
-            onClick = onExportOpml,
-            modifier = Modifier.testTag("export_opml_btn"),
-        )
-    }
-}
-
-@Composable
-internal fun ServerConfigAutoSaveEffect(
-    serverUrl: String,
-    bearerToken: String,
-    savedServerUrl: String,
-    savedBearerToken: String,
-    onAction: (MainAction) -> Unit,
-) {
-    LaunchedEffect(serverUrl, bearerToken) {
-        val normalizedUrl = normalizeServerUrl(serverUrl)
-        val trimmedToken = bearerToken.trim()
-        if (normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken) {
-            delay(SERVER_CONFIG_AUTOSAVE_DELAY_MS)
-            onAction(
-                MainAction.UpdateServerConfig(
-                    serverUrl = serverUrl,
-                    bearerToken = bearerToken,
-                    feedback = ConfigSaveFeedback.SILENT,
-                )
-            )
-        }
-    }
-}
-
-@Composable
-internal fun ServerConfigActionsRow(
-    serverUrl: String,
-    bearerToken: String,
-    onAction: (MainAction) -> Unit,
-    onHideKeyboard: () -> Unit,
-) {
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        HeaderActionButton(
-            label = "Save Settings",
-            style = RocheButtonStyle.PRIMARY,
-            onClick = {
-                onHideKeyboard()
-                onAction(MainAction.UpdateServerConfig(serverUrl, bearerToken))
-            },
-        )
-        HeaderActionButton(
-            label = "Discover on Tailnet",
-            onClick = {
-                onHideKeyboard()
-                onAction(MainAction.DiscoverServer)
-            },
-        )
-        HeaderActionButton(
-            label = "Sync Now",
-            onClick = {
-                onHideKeyboard()
-                onAction(MainAction.SyncWithServerConfig(serverUrl, bearerToken))
-            },
-        )
-    }
-}
-
-private const val SERVER_CONFIG_AUTOSAVE_DELAY_MS = 350L
-
-@Composable
-private fun PairingCodeRow(
-    pairingCode: String,
-    onPairingCodeChange: (String) -> Unit,
-    onPairClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = pairingCode,
-            onValueChange = onPairingCodeChange,
-            label = { Text("Pairing Code (from roche pair)") },
-            singleLine = true,
-            modifier = Modifier.weight(1f).testTag("pairing_code_input"),
-        )
-        HeaderActionButton(
-            label = "Pair Device",
-            style = RocheButtonStyle.PRIMARY,
-            onClick = onPairClick,
-        )
     }
 }

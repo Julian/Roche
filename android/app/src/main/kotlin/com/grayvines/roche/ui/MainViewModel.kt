@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.data.ArchiveStateSnapshot
+import com.grayvines.roche.data.NetworkTier
+import com.grayvines.roche.data.PeerNodeDto
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.SavedResourceKind
@@ -53,6 +55,8 @@ data class MainUiState(
     val allEntries: List<InboxEntry> = emptyList(),
     val feeds: List<FeedItem> = emptyList(),
     val tags: List<TagItem> = emptyList(),
+    val activePeers: List<PeerNodeDto> = emptyList(),
+    val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val settings: Settings = Settings(),
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
@@ -154,6 +158,8 @@ sealed interface MainAction {
 
     data object SyncNow : Mutation
 
+    data object PollFeedsOnDeviceNow : Mutation
+
     data class SyncWithServerConfig(
         val serverUrl: String,
         val bearerToken: String,
@@ -170,6 +176,8 @@ sealed interface MainAction {
     data class SetSwipeToArchive(val enabled: Boolean) : Mutation
 
     data class SetBottomNavSlot(val slotIndex: Int, val tab: AppTab) : Mutation
+
+    data object ResetBottomNavTabs : Mutation
 
     data class UpdateServerConfig(
         val serverUrl: String,
@@ -218,7 +226,12 @@ class MainViewModel(
                 settingsRepository.settings,
                 transientState,
             ) { snapshot: RepositorySnapshot, settings: Settings, local: TransientUiState ->
-                buildMainUiState(snapshot = snapshot, settings = settings, local = local)
+                buildMainUiState(
+                    snapshot = snapshot,
+                    settings = settings,
+                    local = local,
+                    localNetworkTier = repository.currentNetworkTier(),
+                )
             }
             .stateIn(
                 scope = viewModelScope,
@@ -284,6 +297,7 @@ class MainViewModel(
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
             is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
             MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
+            MainAction.PollFeedsOnDeviceNow -> performPollFeedsOnDevice()
             is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
             MainAction.StartupSyncIfConfigured -> performStartupSync()
             else -> applySettingsMutation(action)
@@ -317,6 +331,8 @@ class MainViewModel(
                         updateBottomNavSlot(current.bottomNavTabs, action.slotIndex, action.tab)
                     current.copy(bottomNavTabs = updatedTabs)
                 }
+            MainAction.ResetBottomNavTabs ->
+                settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
             is MainAction.PairWithServer -> performPairWithServer(action)
             MainAction.DiscoverServer -> performDiscoverServer()
@@ -597,6 +613,29 @@ class MainViewModel(
         }
     }
 
+    internal suspend fun performPollFeedsOnDevice() {
+        if (!tryAcquireSyncLock()) return
+        try {
+            repository
+                .pollDueFeedsOnDeviceNow()
+                .onSuccess { count ->
+                    val msg =
+                        if (count == 0) {
+                            "All cooperative feeds are up to date"
+                        } else {
+                            val noun = if (count == 1) "feed" else "feeds"
+                            "Polled $count due $noun on-device"
+                        }
+                    showStatusMessage(msg)
+                }
+                .onFailure { error ->
+                    showStatusMessage("On-device poll skipped (${error.message ?: "offline"})")
+                }
+        } finally {
+            transientState.update { it.copy(isSyncing = false) }
+        }
+    }
+
     private suspend fun performSync(errorPolicy: SyncErrorPolicy = SyncErrorPolicy.SHOW_BANNER) {
         if (!tryAcquireSyncLock()) return
         try {
@@ -650,21 +689,13 @@ internal fun reduceUiAction(
 ): TransientUiState =
     when (action) {
         is MainAction.SelectTab ->
-            if (action.tab == AppTab.INBOX) {
-                state.copy(
-                    activeTab = AppTab.INBOX,
-                    selectedReaderEntryId = null,
-                    selectedFeedId = null,
-                    selectedTag = null,
-                    scopeOriginTab = null,
-                )
-            } else {
-                state.copy(
-                    activeTab = action.tab,
-                    selectedReaderEntryId = null,
-                    scopeOriginTab = null,
-                )
-            }
+            state.copy(
+                activeTab = action.tab,
+                selectedReaderEntryId = null,
+                selectedFeedId = null,
+                selectedTag = null,
+                scopeOriginTab = null,
+            )
         is MainAction.SelectFilter ->
             state.copy(
                 activeFilter = action.filter,
@@ -765,6 +796,7 @@ internal fun buildMainUiState(
     snapshot: RepositorySnapshot,
     settings: Settings,
     local: TransientUiState,
+    localNetworkTier: NetworkTier = NetworkTier.WIFI,
 ): MainUiState {
     val filtered =
         RocheRepository.filterEntries(
@@ -802,6 +834,8 @@ internal fun buildMainUiState(
         allEntries = snapshot.entries,
         feeds = snapshot.feeds,
         tags = snapshot.tags,
+        activePeers = snapshot.activePeers,
+        localNetworkTier = localNetworkTier,
         settings = settings,
         undoEvent = local.undoEvent,
         statusBanner = local.statusBanner,

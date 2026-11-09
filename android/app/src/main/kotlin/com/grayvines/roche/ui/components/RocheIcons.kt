@@ -336,6 +336,96 @@ private fun DrawScope.drawArrowTray(
     drawPath(path = chevronPath, color = tint, style = stroke)
 }
 
+/** Crisp funnel icon for toggling the filter & tag drawer in Feeds and Inbox headers. */
+@Composable
+internal fun FilterFunnelIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        val funnelPath =
+            Path().apply {
+                moveTo(w * 0.14f, h * 0.18f)
+                lineTo(w * 0.86f, h * 0.18f)
+                lineTo(w * 0.58f, h * 0.52f)
+                lineTo(w * 0.58f, h * 0.84f)
+                lineTo(w * 0.42f, h * 0.76f)
+                lineTo(w * 0.42f, h * 0.52f)
+                close()
+            }
+        drawPath(path = funnelPath, color = tint, style = stroke)
+    }
+}
+
+/** Dual-blade server rack icon for the Server & Sync settings card. */
+@Composable
+internal fun ServerRackIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        val corner = CornerRadius(w * 0.09f, w * 0.09f)
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(w * 0.12f, h * 0.16f),
+            size = Size(w * 0.76f, h * 0.28f),
+            cornerRadius = corner,
+            style = stroke,
+        )
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(w * 0.12f, h * 0.56f),
+            size = Size(w * 0.76f, h * 0.28f),
+            cornerRadius = corner,
+            style = stroke,
+        )
+        drawCircle(color = tint, radius = w * 0.055f, center = Offset(w * 0.28f, h * 0.30f))
+        drawCircle(color = tint, radius = w * 0.055f, center = Offset(w * 0.28f, h * 0.70f))
+    }
+}
+
+/** Document outline icon for OPML import/export actions in Settings. */
+@Composable
+internal fun DocumentOpmlIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        val docPath =
+            Path().apply {
+                moveTo(w * 0.22f, h * 0.12f)
+                lineTo(w * 0.58f, h * 0.12f)
+                lineTo(w * 0.78f, h * 0.32f)
+                lineTo(w * 0.78f, h * 0.88f)
+                lineTo(w * 0.22f, h * 0.88f)
+                close()
+            }
+        drawPath(path = docPath, color = tint, style = stroke)
+        val foldPath =
+            Path().apply {
+                moveTo(w * 0.56f, h * 0.12f)
+                lineTo(w * 0.56f, h * 0.34f)
+                lineTo(w * 0.78f, h * 0.34f)
+            }
+        drawPath(path = foldPath, color = tint, style = stroke)
+    }
+}
+
 private const val STROKE_FRACTION = 0.085f
 private const val CABINET_LEFT = 0.16f
 private const val CABINET_RIGHT = 0.84f

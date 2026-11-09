@@ -345,6 +345,104 @@ class RocheRssWorkflowTest {
                 finalEntries.any { it.url == "https://protected.example.com/rescued-article" }
             )
         }
+
+    @Test
+    fun `classifyNetworkCapabilities maps ethernet wifi cellular and unvalidated states`() {
+        assertEquals(
+            NetworkTier.WIRED,
+            classifyNetworkCapabilities(
+                hasInternet = true,
+                isValidated = true,
+                hasEthernet = true,
+                hasWifi = true,
+                hasCellular = false,
+                isMetered = false,
+            ),
+        )
+        assertEquals(
+            NetworkTier.WIFI,
+            classifyNetworkCapabilities(
+                hasInternet = true,
+                isValidated = true,
+                hasEthernet = false,
+                hasWifi = true,
+                hasCellular = false,
+                isMetered = false,
+            ),
+        )
+        assertEquals(
+            NetworkTier.CELLULAR,
+            classifyNetworkCapabilities(
+                hasInternet = true,
+                isValidated = true,
+                hasEthernet = false,
+                hasWifi = true,
+                hasCellular = false,
+                isMetered = true,
+            ),
+        )
+        assertEquals(
+            NetworkTier.WIFI,
+            classifyNetworkCapabilities(
+                hasInternet = true,
+                isValidated = true,
+                hasEthernet = false,
+                hasWifi = false,
+                hasCellular = false,
+                isMetered = false,
+            ),
+        )
+        assertEquals(
+            NetworkTier.OFFLINE,
+            classifyNetworkCapabilities(
+                hasInternet = true,
+                isValidated = false,
+                hasEthernet = false,
+                hasWifi = true,
+                hasCellular = false,
+                isMetered = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `live network tier provider and background sync adapt weight and offline fallback`() =
+        runTest {
+            val peerSyncBodies = mutableListOf<String>()
+            var currentTier = NetworkTier.CELLULAR
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "tok-peer",
+                    peerId = "android-peer-1",
+                    deviceName = "Pixel 10 Pro",
+                )
+            }
+            val peerRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildPeerSyncAndExternalFeedMockClient(peerSyncBodies),
+                    settings = settings,
+                    networkTierProvider = NetworkTierProvider { currentTier },
+                )
+
+            // 1. Background sync on CELLULAR sends network_tier=cellular, weight=0.25, and
+            // populates activePeers
+            val bgSynced = peerRepo.runBackgroundPeerSyncAndPoll().getOrThrow()
+            assertEquals(2, bgSynced)
+            assertEquals(2, peerRepo.snapshot.first().activePeers.size)
+            assertTrue(peerSyncBodies.first().contains(""""network_tier":"cellular""""))
+            assertTrue(peerSyncBodies.first().contains(""""weight":0.25"""))
+
+            // 2. When OFFLINE, background sync and manual on-device poll respect offline state
+            currentTier = NetworkTier.OFFLINE
+            assertEquals(0, peerRepo.runBackgroundPeerSyncAndPoll().getOrThrow())
+            assertTrue(peerRepo.pollDueFeedsOnDeviceNow().isFailure)
+
+            // 3. When back on WIFI, manual on-device poll succeeds
+            currentTier = NetworkTier.WIFI
+            assertEquals(0, peerRepo.pollDueFeedsOnDeviceNow().getOrThrow())
+        }
 }
 
 internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheApiClient =

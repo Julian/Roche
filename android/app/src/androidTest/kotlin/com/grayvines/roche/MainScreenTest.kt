@@ -3,9 +3,14 @@ package com.grayvines.roche
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
+import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainUiState
 import com.grayvines.roche.ui.theme.RocheTheme
@@ -18,11 +23,22 @@ class MainScreenTest {
     @Test
     fun rendersInboxHeaderPrimaryRowActionsAndFab() {
         val sample = createSampleEntry()
+        val tag = TagItem(id = "tag-1", name = "llm-inference", unreadCount = 1)
+        val unpinnedSettingsNav =
+            listOf(AppTab.FEEDS, AppTab.STARRED, AppTab.SEARCH, AppTab.OFFLINE)
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
                     state =
-                        MainUiState(visibleEntries = listOf(sample), allEntries = listOf(sample)),
+                        MainUiState(
+                            visibleEntries = listOf(sample),
+                            allEntries = listOf(sample),
+                            tags = listOf(tag),
+                            settings =
+                                com.grayvines.roche.data.settings.Settings(
+                                    bottomNavTabs = unpinnedSettingsNav
+                                ),
+                        ),
                     onAction = {},
                     onShareEntry = {},
                     onOpenExternalUrl = {},
@@ -37,11 +53,97 @@ class MainScreenTest {
         composeRule.onNodeWithTag("bottom_tab_search").assertExists()
         composeRule.onNodeWithTag("bottom_tab_feeds").assertExists()
         composeRule.onNodeWithTag("bottom_tab_starred").assertExists()
-        composeRule.onNodeWithTag("bottom_tab_settings").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_offline").assertExists()
+        composeRule.onNodeWithTag("inbox_spare_settings_btn").assertExists()
         composeRule.onNodeWithText(sample.title).assertExists()
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("save_fab").assertExists()
+
+        composeRule.onNodeWithTag("inbox_tag_filter_drawer").assertDoesNotExist()
+        composeRule.onNodeWithTag("inbox_tag_filter_btn").performClick()
+        composeRule.onNodeWithTag("inbox_tag_filter_drawer").assertExists()
+        composeRule.onNodeWithText("#llm-inference (1)").assertExists()
+    }
+
+    @Test
+    fun feedsTabUsesCleanHeaderAndHidesTagsBehindFilterButton() {
+        val feed =
+            FeedItem(
+                id = "feed-1",
+                title = "arXiv cs.LG",
+                url = "https://export.arxiv.org/rss/cs.LG",
+                siteUrl = "https://arxiv.org",
+                feedType = FeedType.ARXIV,
+                unreadCount = 3,
+            )
+        val tag = TagItem(id = "tag-1", name = "ml-systems", unreadCount = 2)
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.FEEDS,
+                            feeds = listOf(feed),
+                            tags = listOf(tag),
+                        ),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Feeds & Tags").assertDoesNotExist()
+        composeRule.onNodeWithTag("feeds_filter_drawer").assertDoesNotExist()
+        composeRule.onNodeWithTag("feed_row_feed-1").assertExists()
+        composeRule.onNodeWithText("arxiv.org").assertExists()
+
+        composeRule.onNodeWithTag("feeds_filter_btn").performClick()
+        composeRule.onNodeWithTag("feeds_filter_drawer").assertExists()
+        composeRule.onNodeWithText("#ml-systems (2)").assertExists()
+    }
+
+    @Test
+    fun settingsTabNavigatesBetweenHubAndVisualDockAndServerSubpages() {
+        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state = MainUiState(activeTab = AppTab.SETTINGS),
+                    onAction = { dispatched.add(it) },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("settings_server_row").assertExists()
+        composeRule.onNodeWithTag("settings_nav_row").assertExists()
+        composeRule.onNodeWithTag("import_opml_btn").assertExists()
+        composeRule.onNodeWithTag("export_opml_btn").assertExists()
+
+        composeRule.onNodeWithTag("settings_nav_row").performClick()
+        composeRule.onNodeWithText("Navigation Bar").assertExists()
+        composeRule.onNodeWithTag("dock_slot_1").performClick()
+        composeRule.onNodeWithTag("dock_candidate_offline").performClick()
+        composeRule.onNodeWithTag("reset_bottom_nav_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(
+                com.grayvines.roche.ui.MainAction.SetBottomNavSlot(1, AppTab.OFFLINE)
+            )
+        )
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.ResetBottomNavTabs)
+        )
+        composeRule.onNodeWithTag("settings_subpage_back_btn").performClick()
+
+        composeRule.onNodeWithTag("settings_server_row").performClick()
+        composeRule.onNodeWithText("Server & Pairing").assertExists()
+        composeRule.onNodeWithTag("server_url_input").assertExists()
+        composeRule.onNodeWithTag("pairing_code_input").assertExists()
+        composeRule.onNodeWithTag("bearer_token_input").assertExists()
     }
 
     private fun createSampleEntry(): InboxEntry =

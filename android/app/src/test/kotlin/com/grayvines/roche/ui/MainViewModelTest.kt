@@ -4,11 +4,20 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
+import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedSortOrder
+import com.grayvines.roche.model.extractCleanDomain
+import com.grayvines.roche.model.pollerAttributionLabel
+import com.grayvines.roche.model.resolveFallbackFaviconUrl
+import com.grayvines.roche.model.resolveOriginFaviconUrl
 import java.io.File
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
@@ -241,30 +250,27 @@ class MainViewModelTest {
             database.dao().upsertItems(SeedData.items)
             val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
 
-            // Scope Inbox to a feed from FEEDS tab, then NavigateBackFromScope returns to FEEDS
-            viewModel.dispatch(MainAction.SelectTab(com.grayvines.roche.model.AppTab.FEEDS))
+            viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
             viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
             val scoped = viewModel.uiState.first { it.selectedFeedId == "feed-arxiv-cs-lg" }
             assertEquals("feed-arxiv-cs-lg", scoped.selectedFeedId)
-            assertEquals(com.grayvines.roche.model.AppTab.FEEDS, scoped.scopeOriginTab)
+            assertEquals(AppTab.FEEDS, scoped.scopeOriginTab)
 
             viewModel.dispatch(MainAction.NavigateBackFromScope)
-            val returnedToFeeds =
+            val returned =
                 viewModel.uiState.first {
-                    it.selectedFeedId == null &&
-                        it.activeTab == com.grayvines.roche.model.AppTab.FEEDS
+                    it.selectedFeedId == null && it.activeTab == AppTab.FEEDS
                 }
-            assertNull(returnedToFeeds.selectedFeedId)
-            assertNull(returnedToFeeds.scopeOriginTab)
+            assertNull(returned.selectedFeedId)
+            assertNull(returned.scopeOriginTab)
 
             viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
             viewModel.uiState.first { it.selectedFeedId == "feed-arxiv-cs-lg" }
-            viewModel.dispatch(MainAction.SelectTab(com.grayvines.roche.model.AppTab.INBOX))
+            viewModel.dispatch(MainAction.SelectTab(AppTab.INBOX))
             val unscoped = viewModel.uiState.first { it.selectedFeedId == null }
             assertNull(unscoped.selectedFeedId)
             assertNull(unscoped.selectedTag)
 
-            // OpenReader marks item-1 as read while keeping it in InboxFilter.ALL
             viewModel.dispatch(MainAction.OpenReader("item-1"))
             val afterRead =
                 viewModel.uiState.first { state ->
@@ -273,37 +279,138 @@ class MainViewModelTest {
             assertTrue(afterRead.visibleEntries.any { it.id == "item-1" })
             assertTrue(!afterRead.allEntries.first { it.id == "item-1" }.readAt.isNullOrBlank())
 
-            // ToggleReadState marks item-1 back as unread
             viewModel.dispatch(MainAction.ToggleReadState("item-1"))
             val afterUnread =
                 viewModel.uiState.first { state ->
                     state.statusBanner == "Marked as unread" &&
                         state.allEntries.any { it.id == "item-1" && !it.isRead && it.isUnread }
                 }
-            assertEquals("Marked as unread", afterUnread.statusBanner)
             assertNull(afterUnread.allEntries.first { it.id == "item-1" }.readAt)
 
-            // Customize bottom navigation slot 1 to OFFLINE
-            viewModel.dispatch(
-                MainAction.SetBottomNavSlot(
-                    slotIndex = 1,
-                    tab = com.grayvines.roche.model.AppTab.OFFLINE,
-                )
-            )
+            viewModel.dispatch(MainAction.SetBottomNavSlot(1, AppTab.OFFLINE))
             val afterNavUpdate =
-                viewModel.uiState.first { state ->
-                    state.settings.bottomNavTabs[1] == com.grayvines.roche.model.AppTab.OFFLINE
-                }
+                viewModel.uiState.first { it.settings.bottomNavTabs[1] == AppTab.OFFLINE }
             assertEquals(
-                listOf(
-                    com.grayvines.roche.model.AppTab.FEEDS,
-                    com.grayvines.roche.model.AppTab.OFFLINE,
-                    com.grayvines.roche.model.AppTab.SEARCH,
-                    com.grayvines.roche.model.AppTab.SETTINGS,
-                ),
+                listOf(AppTab.FEEDS, AppTab.OFFLINE, AppTab.SEARCH, AppTab.SETTINGS),
                 afterNavUpdate.settings.bottomNavTabs,
             )
 
+            viewModel.dispatch(MainAction.ResetBottomNavTabs)
+            val afterNavReset =
+                viewModel.uiState.first { it.settings.bottomNavTabs == AppTab.defaultSideTabs }
+            assertEquals(AppTab.defaultSideTabs, afterNavReset.settings.bottomNavTabs)
             collectJob.cancel()
         }
+
+    @Test
+    internal fun `observeFeeds observeTags and sortAndFilterFeeds sort case insensitively`() =
+        runTest {
+            val mixedFeeds =
+                listOf(
+                    testFeed("f-hn", "Hacker News"),
+                    testFeed("f-arx", "arXiv cs.LG"),
+                    testFeed("f-ars", "Ars Technica"),
+                    testFeed("f-dan", "danluu.com"),
+                )
+            val mixedTags =
+                listOf(
+                    TagEntity(id = "t-sql", name = "SQLite"),
+                    TagEntity(id = "t-arx", name = "arXiv"),
+                    TagEntity(id = "t-dist", name = "Distributed"),
+                    TagEntity(id = "t-comp", name = "compilers"),
+                )
+            database.dao().upsertFeeds(mixedFeeds)
+            database.dao().upsertTags(mixedTags)
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val state =
+                viewModel.uiState.first {
+                    it.feeds.size == mixedFeeds.size && it.tags.size == mixedTags.size
+                }
+            assertEquals(
+                listOf("Ars Technica", "arXiv cs.LG", "danluu.com", "Hacker News"),
+                state.feeds.map { it.title },
+            )
+            assertEquals(
+                listOf("arXiv", "compilers", "Distributed", "SQLite"),
+                state.tags.map { it.name },
+            )
+            val unreadSorted =
+                sortAndFilterFeeds(
+                    feeds = state.feeds.mapIndexed { idx, feed -> feed.copy(unreadCount = idx) },
+                    sortOrder = FeedSortOrder.UNREAD_FIRST,
+                    unreadOnly = true,
+                )
+            assertEquals(
+                listOf("Hacker News", "danluu.com", "arXiv cs.LG"),
+                unreadSorted.map { it.title },
+            )
+            collectJob.cancel()
+        }
+
+    @Test
+    internal fun `extractCleanDomain and favicon resolvers handle unescaped path characters`() {
+        val urlWithSpaces = "https://www.ArsTechnica.com:8443/2026/04/my article [draft]|v2?q=a b#s"
+        assertEquals("arstechnica.com", extractCleanDomain(urlWithSpaces))
+        assertEquals(
+            "https://www.arstechnica.com:8443/apple-touch-icon.png",
+            resolveOriginFaviconUrl(urlWithSpaces),
+        )
+        assertEquals(
+            "https://icons.duckduckgo.com/ip3/arstechnica.com.ico",
+            resolveFallbackFaviconUrl(urlWithSpaces),
+        )
+        assertEquals("", extractCleanDomain("   "))
+        assertNull(resolveOriginFaviconUrl("not a url"))
+        assertNull(resolveFallbackFaviconUrl("http://localhost:8080/feed.xml"))
+    }
+
+    @Test
+    internal fun `feed poller attribution labels and on device poll action update ui state`() =
+        runTest {
+            val localPeerId = "peer-local-1"
+            val onDeviceFeed =
+                FeedItem(
+                    id = "f-1",
+                    title = "Local Feed",
+                    url = "https://example.com/1.xml",
+                    siteUrl = null,
+                    feedType = com.grayvines.roche.model.FeedType.RSS,
+                    unreadCount = 0,
+                    lastPolledBy = localPeerId,
+                )
+            val serverFeed = onDeviceFeed.copy(id = "f-2", lastPolledBy = "server")
+            val rescueFeed =
+                onDeviceFeed.copy(
+                    id = "f-3",
+                    lastPolledBy = "server",
+                    lastError = "HTTP 403",
+                    lastErrorBy = "server",
+                )
+            assertEquals("Polled on-device", onDeviceFeed.pollerAttributionLabel(localPeerId))
+            assertEquals("Polled by Server", serverFeed.pollerAttributionLabel(localPeerId))
+            assertEquals(
+                "Peer error · Rescue ready",
+                rescueFeed.pollerAttributionLabel(localPeerId),
+            )
+            assertEquals(
+                "1 of 3 feeds last polled on-device · 1 peer error rescue ready",
+                buildPeerMeshHealthSummary(
+                    totalFeeds = 3,
+                    onDevicePolledCount = 1,
+                    rescueReadyCount = 1,
+                ),
+            )
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.dispatch(MainAction.PollFeedsOnDeviceNow)
+            val updated =
+                viewModel.uiState.first {
+                    it.statusBanner == "All cooperative feeds are up to date"
+                }
+            assertEquals("All cooperative feeds are up to date", updated.statusBanner)
+            collectJob.cancel()
+        }
+
+    private fun testFeed(id: String, title: String) =
+        FeedEntity(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
 }
