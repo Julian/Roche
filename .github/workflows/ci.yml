@@ -100,11 +100,14 @@ jobs:
           SETUP: ${{ matrix.device.task }}
         run: |
           setup_task=":app:${SETUP%DebugAndroidTest}Setup"
+          extra_flags=""
           for attempt in 1 2 3; do
-            ./android/gradlew -p android "$setup_task" -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect && break
+            ./android/gradlew -p android "$setup_task" $extra_flags -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect && break
             test "$attempt" -lt 3 || exit 1
             pkill -f qemu-system || true
             rm -rf "${ANDROID_HOME:-/usr/local/lib/android/sdk}/.temp"
+            extra_flags="--refresh-dependencies"
+            sleep 5
           done
       - name: Run instrumented tests on the managed device
         env:
@@ -143,11 +146,14 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Fetch the managed AOSP device image
         run: |
+          extra_flags=""
           for attempt in 1 2 3; do
-            ./android/gradlew -p android :baselineprofile:pixel9Api36AospSetup -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect && break
+            ./android/gradlew -p android :baselineprofile:pixel9Api36AospSetup $extra_flags -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect && break
             test "$attempt" -lt 3 || exit 1
             pkill -f qemu-system || true
             rm -rf "${ANDROID_HOME:-/usr/local/lib/android/sdk}/.temp"
+            extra_flags="--refresh-dependencies"
+            sleep 5
           done
       - name: Record the profile on the managed AOSP emulator
         run: ./android/gradlew -p android :app:generateReleaseBaselineProfile -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
