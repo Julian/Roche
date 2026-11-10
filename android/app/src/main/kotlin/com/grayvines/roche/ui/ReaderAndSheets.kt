@@ -890,13 +890,15 @@ internal fun FeedContextActionsList(
             modifier = Modifier.testTag("feed_archive_unread_btn"),
         )
     }
-    ContextActionItem(
-        label = "Refresh Feed Now",
-        onClick = {
-            onAction(MainAction.CloseFeedContextSheet)
-            onAction(MainAction.RefreshFeed(feed.id))
-        },
-    )
+    if (!feed.isArchived) {
+        ContextActionItem(
+            label = "Refresh Feed Now",
+            onClick = {
+                onAction(MainAction.CloseFeedContextSheet)
+                onAction(MainAction.RefreshFeed(feed.id))
+            },
+        )
+    }
     ContextActionItem(
         label = "Open Feed / Site URL",
         onClick = {

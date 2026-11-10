@@ -485,6 +485,90 @@ class RocheRssWorkflowTest {
             assertEquals("2026-06-01T12:01:00Z", settings.settings.first().lastPeerSyncCursor)
             assertTrue(peerSyncBodies.last().contains(""""updated_after""""))
         }
+
+    @Test
+    fun `offline toggleFeedArchive persists pending feed mutation and resubscribing unarchives feed`() =
+        runTest {
+            seedDatabase()
+            val patchedFeeds = mutableListOf<String>()
+            var failPatch = true
+            val client = buildOfflineFeedArchiveMockClient(patchedFeeds) { failPatch }
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val repo = RocheRepository(database = database, apiClient = client, settings = settings)
+
+            // 1. Archive feed while PATCH fails (offline) -> queues pending feed mutation
+            val (title, isArchived) = repo.toggleFeedArchive("feed-arxiv-cs-lg").getOrThrow()
+            assertEquals("arXiv cs.LG", title)
+            assertTrue(isArchived)
+            assertFalse(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
+            assertEquals(
+                FEED_ARCHIVED_STATUS_MUTATION,
+                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.dirtyStatus,
+            )
+
+            // 2. Sync while PATCH still fails must preserve local archived state even if server
+            // returns is_active: true
+            repo.syncWithServer().getOrThrow()
+            assertFalse(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
+
+            // 3. Sync when back online pushes the pending PATCH and clears the mutation
+            failPatch = false
+            repo.syncWithServer().getOrThrow()
+            assertEquals(1, patchedFeeds.size)
+            assertTrue(patchedFeeds.single().contains(""""is_active":false"""))
+            assertEquals(null, database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+
+            // 4. Re-subscribing to the archived feed URL unarchives it in place
+            database.dao().updateFeedActive("feed-arxiv-cs-lg", false)
+            val saved =
+                repo.saveUrlOrFeed(
+                    inputUrl = "https://export.arxiv.org/rss/cs.LG",
+                    titleOverride = null,
+                    tagCsv = "",
+                )
+            assertEquals("arXiv cs.LG", saved.title)
+            assertTrue(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
+        }
+}
+
+private fun buildOfflineFeedArchiveMockClient(
+    patchedFeeds: MutableList<String>,
+    shouldFailPatch: () -> Boolean,
+): RocheApiClient = RocheApiClient { request ->
+    when {
+        request.method == "PATCH" && request.url.contains("/api/v1/feeds/") -> {
+            if (shouldFailPatch()) {
+                throw java.io.IOException("Offline")
+            }
+            patchedFeeds.add("${request.url}:${request.body}")
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/rss/cs.LG","feed_type":"arxiv","is_active":false,"unread_count":1}""",
+            )
+        }
+        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
+            HttpResponse(statusCode = 404, body = "{}")
+        }
+        request.method == "GET" && request.url.endsWith("/api/v1/feeds") -> {
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/rss/cs.LG","feed_type":"arxiv","is_active":true,"unread_count":1}]}""",
+            )
+        }
+        request.method == "GET" && request.url.endsWith("/api/v1/tags") -> {
+            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
+        }
+        request.method == "GET" && request.url.contains("/api/v1/items") -> {
+            HttpResponse(statusCode = 200, body = """{"items":[]}""")
+        }
+        else -> {
+            HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
 }
 
 private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {

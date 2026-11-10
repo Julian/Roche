@@ -877,12 +877,12 @@ internal fun PeerMeshStatusCard(
                 if (state.activePeers.isNotEmpty()) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                     state.activePeers.forEach { peer ->
-                        val polledByPeer = state.feeds.count { it.lastPolledBy == peer.peerId }
+                        val polledByPeer = activeFeeds.count { it.lastPolledBy == peer.peerId }
                         PeerMeshNodeRow(
                             peer = peer,
                             isLocalPeer = peer.peerId == localPeerId,
                             polledFeedCount = polledByPeer,
-                            totalFeeds = state.feeds.size,
+                            totalFeeds = activeFeeds.size,
                         )
                     }
                 }

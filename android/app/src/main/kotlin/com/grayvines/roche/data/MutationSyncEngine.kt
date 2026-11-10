@@ -23,9 +23,22 @@ import kotlinx.coroutines.flow.first
 private const val HTTP_NOT_FOUND = 404
 private const val ARCHIVED_STATUS_WIRE = "archived"
 internal const val DELETED_STATUS_TOMBSTONE = "__deleted__"
+internal const val FEED_ACTIVE_STATUS_MUTATION = "__feed_active__"
+internal const val FEED_ARCHIVED_STATUS_MUTATION = "__feed_archived__"
 
 internal val PendingMutationEntity.isDeletedItem: Boolean
     get() = dirtyStatus == DELETED_STATUS_TOMBSTONE
+
+internal val PendingMutationEntity.dirtyFeedIsActive: Boolean?
+    get() =
+        when (dirtyStatus) {
+            FEED_ACTIVE_STATUS_MUTATION -> true
+            FEED_ARCHIVED_STATUS_MUTATION -> false
+            else -> null
+        }
+
+internal val PendingMutationEntity.isRemoteFeedMutation: Boolean
+    get() = kind == PendingEntityKind.REMOTE_ITEM && dirtyFeedIsActive != null
 
 internal fun PendingMutationEntity.resolveEffectiveReadAt(
     defaultReadAt: String?,
@@ -638,6 +651,19 @@ internal suspend fun subscribeFeedBestEffort(
     val fallbackTitle = cleanTitleOverride ?: extractHostTitle(url)
     val currentSettings = settings.settings.first()
     dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
+
+    val existingLocal =
+        dao.getFeedByUrl(canonicalUrl) ?: dao.getFeedById(deterministicFeedId(canonicalUrl))
+    if (existingLocal != null && !existingLocal.isActive) {
+        return restoreArchivedLocalFeed(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            existingLocal = existingLocal,
+            cleanTitleOverride = cleanTitleOverride,
+        )
+    }
+
     val remoteFeed = runCatching {
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             apiClient.createFeed(
@@ -657,26 +683,18 @@ internal suspend fun subscribeFeedBestEffort(
                 remoteFeed.copy(
                     title = remoteFeed.title.ifBlank { fallbackTitle },
                     url = remoteFeed.url.ifBlank { canonicalUrl },
-                )
+                ),
+                existingLocal,
             )
         } else {
-            val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
-            val localFeed =
-                FeedEntity(
-                    id = deterministicFeedId(canonicalUrl),
-                    title = fallbackTitle,
-                    url = canonicalUrl,
-                    siteUrl = null,
-                    feedType = inferFeedTypeWireValue(url),
-                    lastPolled = nowIso,
-                )
-            dao.upsertPendingMutation(
-                PendingMutationEntity.localFeed(
-                    entityId = localFeed.id,
-                    titleOverride = cleanTitleOverride,
-                )
+            createPendingLocalFeed(
+                dao,
+                existingLocal,
+                canonicalUrl,
+                url,
+                fallbackTitle,
+                cleanTitleOverride,
             )
-            localFeed
         }
     dao.upsertFeed(entity)
     if (remoteFeed == null) {
@@ -688,6 +706,109 @@ internal suspend fun subscribeFeedBestEffort(
         )
     }
     return dao.getFeedById(entity.id)?.title ?: entity.title
+}
+
+@Suppress("LongParameterList")
+private suspend fun createPendingLocalFeed(
+    dao: RocheDao,
+    existingLocal: FeedEntity?,
+    canonicalUrl: String,
+    rawUrl: String,
+    fallbackTitle: String,
+    cleanTitleOverride: String?,
+): FeedEntity {
+    val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+    val localFeed =
+        existingLocal?.copy(
+            title = cleanTitleOverride ?: existingLocal.title,
+            isActive = true,
+        )
+            ?: FeedEntity(
+                id = deterministicFeedId(canonicalUrl),
+                title = fallbackTitle,
+                url = canonicalUrl,
+                siteUrl = null,
+                feedType = inferFeedTypeWireValue(rawUrl),
+                lastPolled = nowIso,
+            )
+    dao.upsertPendingMutation(
+        PendingMutationEntity.localFeed(
+            entityId = localFeed.id,
+            titleOverride = cleanTitleOverride,
+        )
+    )
+    return localFeed
+}
+
+private suspend fun restoreArchivedLocalFeed(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    existingLocal: FeedEntity,
+    cleanTitleOverride: String?,
+): String {
+    val restored =
+        existingLocal.copy(
+            title = cleanTitleOverride ?: existingLocal.title,
+            isActive = true,
+        )
+    dao.upsertFeed(restored)
+    syncFeedArchiveMutation(
+        dao = dao,
+        apiClient = apiClient,
+        settings = settings,
+        feedId = restored.id,
+        isActive = true,
+        titleOverride = cleanTitleOverride,
+    )
+    return restored.title
+}
+
+internal suspend fun syncFeedArchiveMutation(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    feedId: String,
+    isActive: Boolean,
+    titleOverride: String? = null,
+) {
+    val existingMut = dao.getPendingMutation(feedId)
+    if (existingMut?.kind == PendingEntityKind.LOCAL_FEED) {
+        if (titleOverride != null) {
+            dao.upsertPendingMutation(existingMut.copy(titleOverride = titleOverride))
+        }
+        return
+    }
+    val currentSettings = settings.settings.first()
+    val pushed =
+        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+            runCatching {
+                    apiClient.updateFeed(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        feedId = feedId,
+                        title = titleOverride,
+                        isActive = isActive,
+                    )
+                    true
+                }
+                .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }
+                .getOrDefault(false)
+        } else {
+            false
+        }
+    if (pushed) {
+        dao.deletePendingMutation(feedId)
+    } else {
+        dao.upsertPendingMutation(
+            PendingMutationEntity(
+                entityId = feedId,
+                titleOverride = titleOverride ?: existingMut?.titleOverride,
+                dirtyStatus =
+                    if (isActive) FEED_ACTIVE_STATUS_MUTATION else FEED_ARCHIVED_STATUS_MUTATION,
+            )
+        )
+    }
 }
 
 internal suspend fun deleteFeedFromServerOrLocal(
@@ -810,9 +931,14 @@ internal suspend fun pushPendingMutations(
                 }
             }
             PendingEntityKind.REMOTE_ITEM -> {
-                appliedMutations.add(
-                    pushPendingItemMutation(dao, apiClient, serverUrl, token, mutation)
-                )
+                if (mutation.isRemoteFeedMutation) {
+                    pushPendingFeedMutation(dao, apiClient, serverUrl, token, mutation)
+                    appliedMutations.add(mutation)
+                } else {
+                    appliedMutations.add(
+                        pushPendingItemMutation(dao, apiClient, serverUrl, token, mutation)
+                    )
+                }
             }
         }
     }
@@ -821,6 +947,35 @@ internal suspend fun pushPendingMutations(
         savedItems = savedItems,
         appliedMutations = appliedMutations,
     )
+}
+
+internal suspend fun pushPendingFeedMutation(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    serverUrl: String,
+    token: String,
+    mutation: PendingMutationEntity,
+): Boolean {
+    val desiredActive = mutation.dirtyFeedIsActive ?: return false
+    val pushed = runCatching {
+        apiClient.updateFeed(
+            serverUrl = serverUrl,
+            token = token,
+            feedId = mutation.entityId,
+            title = mutation.titleOverride,
+            isActive = desiredActive,
+        )
+        true
+    }
+        .recover { error ->
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            (error as? ProblemDetailsException)?.statusCode == HTTP_NOT_FOUND
+        }
+        .getOrDefault(false)
+    if (pushed) {
+        dao.deletePendingMutation(mutation.entityId)
+    }
+    return pushed
 }
 
 internal suspend fun pushPendingLocalFeed(
@@ -845,18 +1000,30 @@ internal suspend fun pushPendingLocalFeed(
     }
         .getOrNull()
     return if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
+        if (!localFeed.isActive) {
+            runCatching {
+                apiClient.updateFeed(
+                    serverUrl = serverUrl,
+                    token = token,
+                    feedId = remoteFeed.id,
+                    isActive = false,
+                )
+            }
+        }
+        val effectiveRemote = remoteFeed.copy(isActive = localFeed.isActive)
         dao.deleteFeedById(localFeed.id)
         dao.upsertFeed(
             FeedEntity(
-                id = remoteFeed.id,
-                title = remoteFeed.title.ifBlank { localFeed.title },
-                url = remoteFeed.url.ifBlank { localFeed.url },
-                siteUrl = remoteFeed.siteUrl,
-                feedType = remoteFeed.feedType,
+                id = effectiveRemote.id,
+                title = effectiveRemote.title.ifBlank { localFeed.title },
+                url = effectiveRemote.url.ifBlank { localFeed.url },
+                siteUrl = effectiveRemote.siteUrl,
+                feedType = effectiveRemote.feedType,
+                isActive = localFeed.isActive,
             )
         )
         dao.deletePendingMutation(mutation.entityId)
-        remoteFeed
+        effectiveRemote
     } else {
         null
     }

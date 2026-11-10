@@ -524,10 +524,11 @@ private fun SubscribedFeedsCardList(
     ) {
         if (feeds.isEmpty()) {
             val emptyMessage =
-                if (hasFeedsAtAll) {
-                    "No feeds with unread items."
-                } else {
-                    "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube."
+                when {
+                    hasFeedsAtAll -> "No feeds with unread items."
+                    archivedFeeds.isNotEmpty() ->
+                        "No active feeds. Expand Archived Feeds below to unarchive."
+                    else -> "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube."
                 }
             Box(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp, horizontal = 16.dp),
@@ -662,8 +663,14 @@ private fun ArchivedFeedRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                val subtitle =
+                    if (feed.unreadCount > 0) {
+                        "${feed.displayDomain} · ${feed.unreadCount} unread"
+                    } else {
+                        feed.displayDomain
+                    }
                 Text(
-                    text = feed.displayDomain,
+                    text = subtitle,
                     color = colors.textMuted,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,

@@ -981,7 +981,7 @@ impl<'a> SyncRepo<'a> {
         feed_map: &mut HashMap<String, (String, String)>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        type ExistingFeedRow = (String, String, Option<DateTime<Utc>>, bool, DateTime<Utc>);
+        type ExistingFeedRow = (String, String, Option<DateTime<Utc>>, bool);
         let feed_url = f.url.as_str();
         let nat_key = feed_natural_key(feed_url);
         let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
@@ -998,7 +998,7 @@ impl<'a> SyncRepo<'a> {
         }
 
         let existing: Option<ExistingFeedRow> = sqlx::query_as(
-            "SELECT id, url, last_polled, is_active, updated_at FROM feeds WHERE url = ? OR id = ? LIMIT 1",
+            "SELECT id, url, last_polled, is_active FROM feeds WHERE url = ? OR id = ? LIMIT 1",
         )
         .bind(feed_url)
         .bind(&f.id)
@@ -1016,16 +1016,13 @@ impl<'a> SyncRepo<'a> {
             None
         };
 
-        if let Some((local_id, local_url, local_last_polled, local_is_active, local_updated_at)) =
-            existing
-        {
+        if let Some((local_id, local_url, local_last_polled, local_is_active)) = existing {
             Self::update_existing_feed_in_tx(
                 &mut *conn,
                 &local_id,
                 f,
                 local_last_polled,
                 local_is_active,
-                local_updated_at,
                 req_updated_after,
                 clean_title,
                 clean_desc,
@@ -1088,7 +1085,6 @@ impl<'a> SyncRepo<'a> {
         f: &PeerFeedRecord,
         local_last_polled: Option<DateTime<Utc>>,
         local_is_active: bool,
-        local_updated_at: DateTime<Utc>,
         req_updated_after: Option<DateTime<Utc>>,
         clean_title: Option<&str>,
         clean_desc: Option<&str>,
@@ -1143,19 +1139,35 @@ impl<'a> SyncRepo<'a> {
             .await?;
         }
 
-        if f.is_active != local_is_active
-            && req_updated_after.is_none_or(|ua| local_updated_at <= ua)
-        {
-            sqlx::query("UPDATE feeds SET is_active = ?, updated_at = ? WHERE id = ?")
-                .bind(f.is_active)
-                .bind(now)
-                .bind(local_id)
-                .execute(&mut *conn)
-                .await?;
-            let action =
-                if f.is_active { ActivityAction::Unarchive } else { ActivityAction::Archive };
-            Self::record_activity(&mut *conn, ActivityEntityType::Feed, local_id, action, now)
-                .await?;
+        if f.is_active != local_is_active {
+            let last_archive_change_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT MAX(timestamp) FROM activity_log
+                 WHERE entity_type = 'feed' AND entity_id = ? AND action IN ('archive', 'unarchive')",
+            )
+            .bind(local_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+
+            let should_update_active = match (req_updated_after, last_archive_change_at) {
+                (Some(ua), Some(server_ts)) => server_ts <= ua,
+                (Some(_), None) => true,
+                (None, None) => !f.is_active,
+                (None, Some(_)) => false,
+            };
+
+            if should_update_active {
+                sqlx::query("UPDATE feeds SET is_active = ?, updated_at = ? WHERE id = ?")
+                    .bind(f.is_active)
+                    .bind(now)
+                    .bind(local_id)
+                    .execute(&mut *conn)
+                    .await?;
+                let action =
+                    if f.is_active { ActivityAction::Unarchive } else { ActivityAction::Archive };
+                Self::record_activity(&mut *conn, ActivityEntityType::Feed, local_id, action, now)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -1995,5 +2007,66 @@ mod tests {
             "Delta sync must return only Post 1 (modified at watermark) and omit unchanged Post 3"
         );
         assert_eq!(delta_resp.items[0].id, post1_id);
+
+        // Routine server poll bumps feeds.updated_at, but peer archive with an older cursor must still succeed
+        db.feeds().mark_error(&feed.id, "transient error").await.unwrap();
+        let archive_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel 10 Pro".to_string()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: Some(now - chrono::Duration::seconds(30)),
+            feeds: vec![PeerFeedRecord {
+                id: feed.id.clone(),
+                url: feed_url.clone(),
+                title: Some("Example Blog".to_string()),
+                description: None,
+                language: None,
+                feed_type: FeedType::Rss,
+                poll_interval: 30,
+                last_polled: Some(now),
+                last_polled_by: Some("android-peer-1".to_string()),
+                last_error: None,
+                last_error_by: None,
+                is_active: false,
+            }],
+            items: vec![],
+            tags: vec![],
+            tombstones: vec![],
+        };
+        let (archive_resp, _) = db.sync().merge_peer_state(&archive_req).await.unwrap();
+        assert!(!archive_resp.feeds[0].is_active);
+
+        // A second peer doing an initial cursorless sync (updated_after: None) with default is_active: true
+        // must NOT overwrite the server's explicit archive state
+        let peer2_req = PeerSyncRequest {
+            peer_id: "android-peer-2".to_string(),
+            device_name: Some("Tablet".to_string()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: None,
+            feeds: vec![PeerFeedRecord {
+                id: feed.id.clone(),
+                url: feed_url,
+                title: Some("Example Blog".to_string()),
+                description: None,
+                language: None,
+                feed_type: FeedType::Rss,
+                poll_interval: 30,
+                last_polled: None,
+                last_polled_by: None,
+                last_error: None,
+                last_error_by: None,
+                is_active: true,
+            }],
+            items: vec![],
+            tags: vec![],
+            tombstones: vec![],
+        };
+        let (peer2_resp, _) = db.sync().merge_peer_state(&peer2_req).await.unwrap();
+        assert!(
+            !peer2_resp.feeds[0].is_active,
+            "Cursorless initial sync from a second peer must not unarchive a server-archived feed"
+        );
     }
 }

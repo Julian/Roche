@@ -605,6 +605,7 @@ class RocheRepository(
                 PushMutationsOutcome()
             }
         val preFetchItemsById = dao.getAllItems().associateBy { it.id }
+        val preFetchFeedsById = dao.getAllFeeds().associateBy { it.id }
         val remoteFeeds =
             apiClient.fetchFeeds(
                 serverUrl = currentSettings.serverUrl,
@@ -630,6 +631,7 @@ class RocheRepository(
             remoteTags = remoteTags,
             appliedMutations = pushOutcome.appliedMutations,
             preFetchItemsById = preFetchItemsById,
+            preFetchFeedsById = preFetchFeedsById,
         )
         bootstrapDeltaPeerSync(
             currentSettings = currentSettings,
@@ -733,18 +735,13 @@ internal suspend fun toggleFeedArchiveInDbAndRemote(
     val existing = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
     val nextIsActive = !existing.isActive
     dao.updateFeedActive(feedId = feedId, isActive = nextIsActive)
-    val currentSettings = settings.settings.first()
-    if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-        runCatching {
-            apiClient.updateFeed(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                feedId = feedId,
-                isActive = nextIsActive,
-            )
-        }
-            .onFailure { if (it is CancellationException) throw it }
-    }
+    syncFeedArchiveMutation(
+        dao = dao,
+        apiClient = apiClient,
+        settings = settings,
+        feedId = feedId,
+        isActive = nextIsActive,
+    )
     return existing.title.ifBlank { feedId } to !nextIsActive
 }
 

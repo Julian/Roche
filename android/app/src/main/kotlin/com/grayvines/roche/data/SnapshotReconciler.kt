@@ -60,7 +60,7 @@ internal suspend fun attachTagsLocally(
     }
 }
 
-@Suppress("LongMethod")
+@Suppress("LongMethod", "LongParameterList")
 internal suspend fun reconcileRemoteSnapshot(
     dao: RocheDao,
     remoteFeeds: List<RemoteFeedDto>,
@@ -68,6 +68,7 @@ internal suspend fun reconcileRemoteSnapshot(
     remoteTags: List<RemoteTagDto>,
     appliedMutations: List<PendingMutationEntity> = emptyList(),
     preFetchItemsById: Map<String, ItemEntity> = emptyMap(),
+    preFetchFeedsById: Map<String, FeedEntity> = emptyMap(),
     isDeltaItems: Boolean = false,
 ) {
     val allExistingItems = dao.getAllItems()
@@ -111,6 +112,8 @@ internal suspend fun reconcileRemoteSnapshot(
             survivingRemoteFeeds = survivingRemoteFeeds,
             existingFeedsById = existingFeedsById,
             existingFeedsByUrl = existingFeedsByUrl,
+            effectiveMutations = effectiveMutations,
+            preFetchFeedsById = preFetchFeedsById,
         )
     val feedTitlesById = replacementFeeds.associate { it.id to it.title }
     val preservedLocalItems =
@@ -162,6 +165,7 @@ internal suspend fun reconcileRemoteSnapshot(
         dao = dao,
         remainingMutations = remainingMutations,
         survivingItemIds = replacementItems.map { it.id }.toSet(),
+        survivingFeedIds = replacementFeeds.map { it.id }.toSet(),
     )
 }
 
@@ -276,19 +280,60 @@ private fun remapPreservedItemTags(
     canonicalTag?.let { ItemTagEntity(itemId = itemTag.itemId, tagId = it.id) }
 }
 
+@Suppress("LongParameterList")
 private fun buildReplacementFeedEntities(
     unpushedLocalFeeds: List<FeedEntity>,
     survivingRemoteFeeds: List<RemoteFeedDto>,
     existingFeedsById: Map<String, FeedEntity>,
     existingFeedsByUrl: Map<String, FeedEntity>,
+    effectiveMutations: Map<String, PendingMutationEntity> = emptyMap(),
+    preFetchFeedsById: Map<String, FeedEntity> = emptyMap(),
 ): List<FeedEntity> =
     unpushedLocalFeeds +
         survivingRemoteFeeds.map { remoteFeed ->
             val existingFeed =
                 existingFeedsById[remoteFeed.id]
                     ?: existingFeedsByUrl[remoteFeed.url.trim().lowercase()]
-            toRemoteFeedEntity(remoteFeed, existingFeed)
+            val preFetchFeed =
+                preFetchFeedsById[remoteFeed.id] ?: existingFeed?.let { preFetchFeedsById[it.id] }
+            val mutation =
+                effectiveMutations[remoteFeed.id] ?: existingFeed?.let { effectiveMutations[it.id] }
+            val baseEntity = toRemoteFeedEntity(remoteFeed, existingFeed)
+            baseEntity.copy(
+                title =
+                    resolveReplacementFeedTitle(baseEntity, existingFeed, preFetchFeed, mutation),
+                isActive =
+                    resolveReplacementFeedActive(baseEntity, existingFeed, preFetchFeed, mutation),
+            )
         }
+
+private fun resolveReplacementFeedActive(
+    baseEntity: FeedEntity,
+    existingFeed: FeedEntity?,
+    preFetchFeed: FeedEntity?,
+    mutation: PendingMutationEntity?,
+): Boolean =
+    if (
+        preFetchFeed != null &&
+            existingFeed != null &&
+            existingFeed.isActive != preFetchFeed.isActive
+    ) {
+        existingFeed.isActive
+    } else {
+        mutation?.dirtyFeedIsActive ?: baseEntity.isActive
+    }
+
+private fun resolveReplacementFeedTitle(
+    baseEntity: FeedEntity,
+    existingFeed: FeedEntity?,
+    preFetchFeed: FeedEntity?,
+    mutation: PendingMutationEntity?,
+): String =
+    if (preFetchFeed != null && existingFeed != null && existingFeed.title != preFetchFeed.title) {
+        existingFeed.title
+    } else {
+        mutation?.titleOverride?.takeIf { it.isNotBlank() } ?: baseEntity.title
+    }
 
 private fun buildReplacementItemEntities(
     preservedLocalItems: List<ItemEntity>,
@@ -447,9 +492,17 @@ internal suspend fun pruneOrphanedPendingMutations(
     dao: RocheDao,
     remainingMutations: List<PendingMutationEntity>,
     survivingItemIds: Set<String>,
+    survivingFeedIds: Set<String> = emptySet(),
 ) {
     remainingMutations
-        .filter { it.kind == PendingEntityKind.REMOTE_ITEM && it.entityId !in survivingItemIds }
+        .filter { mutation ->
+            mutation.kind == PendingEntityKind.REMOTE_ITEM &&
+                if (mutation.isRemoteFeedMutation) {
+                    mutation.entityId !in survivingFeedIds
+                } else {
+                    mutation.entityId !in survivingItemIds
+                }
+        }
         .forEach { dao.deletePendingMutation(it.entityId) }
 }
 
@@ -668,6 +721,7 @@ internal suspend fun reconcilePeerSyncResponse(
     dao: RocheDao,
     response: PeerSyncResponseDto,
     preFetchItemsById: Map<String, ItemEntity>,
+    preFetchFeedsById: Map<String, FeedEntity> = emptyMap(),
     preSyncMutations: List<PendingMutationEntity> = emptyList(),
     isDeltaItems: Boolean = false,
 ) {
@@ -713,7 +767,7 @@ internal suspend fun reconcilePeerSyncResponse(
     }
     val currentMutationsById = dao.getAllPendingMutations().associateBy { it.entityId }
     for (preMut in preSyncMutations) {
-        if (currentMutationsById[preMut.entityId] == preMut) {
+        if (!preMut.isRemoteFeedMutation && currentMutationsById[preMut.entityId] == preMut) {
             dao.deletePendingMutation(preMut.entityId)
         }
     }
@@ -724,6 +778,7 @@ internal suspend fun reconcilePeerSyncResponse(
         remoteTags = response.tags,
         appliedMutations = emptyList(),
         preFetchItemsById = preFetchItemsById,
+        preFetchFeedsById = preFetchFeedsById,
         isDeltaItems = isDeltaItems,
     )
 }
@@ -756,19 +811,18 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
             currentSettings
         }
     var measuredWeight: Double? = null
-    val polledFeedsCount =
-        if (networkTier != NetworkTier.OFFLINE) {
-            pollCooperativeFeedsOnDevice(
-                dao = dao,
-                apiClient = apiClient,
-                localPeerId = updatedSettings.peerId,
-                activePeers = response.activePeers,
-                onMeasuredWeight = { measuredWeight = it },
-            )
-        } else {
-            0
-        }
-    if (polledFeedsCount > 0) {
+    var attemptedAnyFeed = false
+    if (networkTier != NetworkTier.OFFLINE) {
+        pollCooperativeFeedsOnDevice(
+            dao = dao,
+            apiClient = apiClient,
+            localPeerId = updatedSettings.peerId,
+            activePeers = response.activePeers,
+            onMeasuredWeight = { measuredWeight = it },
+            onAttemptedFeeds = { attemptedAnyFeed = it > 0 },
+        )
+    }
+    if (attemptedAnyFeed) {
         val followUpResp =
             executeSinglePeerSyncRound(
                 dao = dao,
@@ -795,7 +849,17 @@ private suspend fun executeSinglePeerSyncRound(
     networkTier: NetworkTier,
     weightOverride: Double? = null,
 ): PeerSyncResponseDto? {
+    for (mutation in dao.getAllPendingMutations().filter { it.isRemoteFeedMutation }) {
+        pushPendingFeedMutation(
+            dao = dao,
+            apiClient = apiClient,
+            serverUrl = currentSettings.serverUrl,
+            token = currentSettings.bearerToken,
+            mutation = mutation,
+        )
+    }
     val preFetchItemsById = dao.getAllItems().associateBy { it.id }
+    val preFetchFeedsById = dao.getAllFeeds().associateBy { it.id }
     val preSyncMutations = dao.getAllPendingMutations()
     val request =
         buildPeerSyncRequest(
@@ -823,12 +887,14 @@ private suspend fun executeSinglePeerSyncRound(
         dao = dao,
         response = response,
         preFetchItemsById = preFetchItemsById,
+        preFetchFeedsById = preFetchFeedsById,
         preSyncMutations = preSyncMutations,
         isDeltaItems = request.updatedAfter != null,
     )
     return response
 }
 
+@Suppress("LongParameterList")
 internal suspend fun pollCooperativeFeedsOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
@@ -836,8 +902,8 @@ internal suspend fun pollCooperativeFeedsOnDevice(
     activePeers: List<PeerNodeDto>,
     nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
     onMeasuredWeight: (Double) -> Unit = {},
+    onAttemptedFeeds: (Int) -> Unit = {},
 ): Int {
-    val feeds = dao.getAllFeeds()
     val attemptedIds = mutableSetOf<String>()
     var currentPeers = activePeers
     var polledFeedsCount = 0
@@ -847,7 +913,7 @@ internal suspend fun pollCooperativeFeedsOnDevice(
     var keepPolling = true
     while (keepPolling) {
         val slice =
-            feeds
+            dao.getAllFeeds()
                 .filter {
                     it.id !in attemptedIds &&
                         shouldPeerPollFeed(localPeerId, currentPeers, it, nowInstant)
@@ -874,9 +940,7 @@ internal suspend fun pollCooperativeFeedsOnDevice(
             }
 
             val succeededCounts = results.mapNotNull { it.getOrNull() }
-            if (succeededCounts.isEmpty()) {
-                keepPolling = false
-            } else {
+            if (succeededCounts.isNotEmpty()) {
                 polledFeedsCount += succeededCounts.size
                 totalItemsProcessed += succeededCounts.sum()
                 val elapsedSeconds =
@@ -894,6 +958,7 @@ internal suspend fun pollCooperativeFeedsOnDevice(
             }
         }
     }
+    onAttemptedFeeds(attemptedIds.size)
     return polledFeedsCount
 }
 

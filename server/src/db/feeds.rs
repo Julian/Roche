@@ -99,6 +99,46 @@ impl<'a> FeedRepo<'a> {
         )
         .await?;
 
+        let existing_archived_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM feeds WHERE (url = ? OR id = ?) AND is_active = 0 LIMIT 1",
+        )
+        .bind(url.as_str())
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(existing_id) = existing_archived_id {
+            sqlx::query(
+                "UPDATE feeds
+                 SET is_active = 1,
+                     title = COALESCE(?, title),
+                     description = COALESCE(?, description),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(title)
+            .bind(description)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Feed,
+                &existing_id,
+                ActivityAction::Unarchive,
+                now,
+            )
+            .await?;
+
+            tx.commit().await?;
+            return self
+                .get(&existing_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Feed disappeared after unarchive"));
+        }
+
         sqlx::query(
             "INSERT INTO feeds (id, feed_type, url, title, description, poll_interval, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -249,10 +289,10 @@ impl<'a> FeedRepo<'a> {
             return Ok(false);
         }
 
-        let action = match (title, poll_interval, is_active) {
-            (None, None, Some(false)) => ActivityAction::Archive,
-            (None, None, Some(true)) => ActivityAction::Unarchive,
-            _ => ActivityAction::Update,
+        let action = match is_active {
+            Some(false) => ActivityAction::Archive,
+            Some(true) => ActivityAction::Unarchive,
+            None => ActivityAction::Update,
         };
 
         SyncRepo::record_activity(&mut tx, ActivityEntityType::Feed, id, action, now).await?;
@@ -545,5 +585,16 @@ mod tests {
         assert!(unarchived_feed.is_active);
         let active_after = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
         assert_eq!(active_after.len(), 1);
+
+        // Re-subscribing to an archived feed URL unarchives it and preserves its items
+        assert!(feed_repo.archive(&feed.id).await.unwrap());
+        let resubscribed = feed_repo
+            .create(FeedType::Rss, &feed_url, Some("Resubscribed Title"), None)
+            .await
+            .unwrap();
+        assert_eq!(resubscribed.id, feed.id);
+        assert!(resubscribed.is_active);
+        assert_eq!(resubscribed.title.as_deref(), Some("Resubscribed Title"));
+        assert_eq!(resubscribed.unread_count, 1);
     }
 }

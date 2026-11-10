@@ -116,6 +116,7 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("archived_feeds_header").performClick()
         composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertExists()
+        composeRule.onNodeWithText("legacy.example.com · 1 unread").assertExists()
         composeRule.onNodeWithTag("unarchive_feed_feed-archived-1").performClick()
         org.junit.Assert.assertTrue(
             dispatched.contains(
@@ -225,6 +226,40 @@ class MainScreenTest {
         composeRule.onNodeWithTag("search_match_snippet_${entry.id}").assertExists()
         composeRule.onNodeWithTag("search_scope_videos").performScrollTo().performClick()
         composeRule.onNodeWithText("No results in Videos for \"Wait-free\".").assertExists()
+    }
+
+    @Test
+    fun feedsTabShowsArchivedOnlyEmptyMessageWhenAllFeedsAreArchived() {
+        val archivedFeed =
+            FeedItem(
+                id = "feed-archived-only",
+                title = "Archived Journal",
+                url = "https://journal.example.com/rss.xml",
+                siteUrl = "https://journal.example.com",
+                feedType = FeedType.RSS,
+                unreadCount = 0,
+                isActive = false,
+            )
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.FEEDS,
+                            feeds = listOf(archivedFeed),
+                        ),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule
+            .onNodeWithText("No active feeds. Expand Archived Feeds below to unarchive.")
+            .assertExists()
+        composeRule.onNodeWithTag("archived_feeds_header").assertExists()
     }
 
     private fun createSampleEntry(): InboxEntry =
