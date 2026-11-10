@@ -51,8 +51,6 @@ import com.grayvines.roche.data.matchesSearchScopeFilter
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.model.isCrossPeerRescueError
-import com.grayvines.roche.model.pollerAttributionLabel
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -384,7 +382,6 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             SubscribedFeedsCardList(
                 feeds = visibleFeeds,
                 hasFeedsAtAll = state.feeds.isNotEmpty(),
-                localPeerId = state.settings.peerId,
                 onAction = onAction,
             )
         }
@@ -512,7 +509,6 @@ private fun FeedsFilterDrawer(
 private fun SubscribedFeedsCardList(
     feeds: List<FeedItem>,
     hasFeedsAtAll: Boolean,
-    localPeerId: String,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -547,7 +543,6 @@ private fun SubscribedFeedsCardList(
                     }
                     SubscribedFeedRow(
                         feed = feed,
-                        localPeerId = localPeerId,
                         onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
                         onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
                         onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
@@ -563,7 +558,6 @@ private fun SubscribedFeedsCardList(
 @Composable
 private fun SubscribedFeedRow(
     feed: FeedItem,
-    localPeerId: String,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
     onRefresh: () -> Unit,
@@ -600,49 +594,17 @@ private fun SubscribedFeedRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                SubscribedFeedMetadataLine(feed = feed, localPeerId = localPeerId)
+                Text(
+                    text = feed.displayDomain,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
         }
         SubscribedFeedTrailingActions(feed = feed, onRefresh = onRefresh)
-    }
-}
-
-@Composable
-private fun SubscribedFeedMetadataLine(
-    feed: FeedItem,
-    localPeerId: String,
-) {
-    val colors = LocalRocheColors.current
-    val attribution = feed.pollerAttributionLabel(localPeerId)
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        Text(
-            text = feed.displayDomain,
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (attribution != null) {
-            val badgeColor =
-                when {
-                    feed.isCrossPeerRescueError(localPeerId) -> colors.accentEcru
-                    feed.hasPollError -> colors.accentIndianRed
-                    feed.lastPolledBy == localPeerId -> colors.accentVerdigris
-                    else -> colors.textSecondary
-                }
-            Text(
-                text = "· $attribution",
-                color = badgeColor,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.5.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
     }
 }
 

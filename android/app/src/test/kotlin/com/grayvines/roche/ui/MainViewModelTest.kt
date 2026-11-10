@@ -15,7 +15,7 @@ import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
 import com.grayvines.roche.model.extractCleanDomain
-import com.grayvines.roche.model.pollerAttributionLabel
+import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
 import java.io.File
@@ -365,51 +365,45 @@ class MainViewModelTest {
     }
 
     @Test
-    internal fun `feed poller attribution labels and on device poll action update ui state`() =
-        runTest {
-            val localPeerId = "peer-local-1"
-            val onDeviceFeed =
-                FeedItem(
-                    id = "f-1",
-                    title = "Local Feed",
-                    url = "https://example.com/1.xml",
-                    siteUrl = null,
-                    feedType = com.grayvines.roche.model.FeedType.RSS,
-                    unreadCount = 0,
-                    lastPolledBy = localPeerId,
-                )
-            val serverFeed = onDeviceFeed.copy(id = "f-2", lastPolledBy = "server")
-            val rescueFeed =
-                onDeviceFeed.copy(
-                    id = "f-3",
-                    lastPolledBy = "server",
-                    lastError = "HTTP 403",
-                    lastErrorBy = "server",
-                )
-            assertEquals("Polled on-device", onDeviceFeed.pollerAttributionLabel(localPeerId))
-            assertEquals("Polled by Server", serverFeed.pollerAttributionLabel(localPeerId))
-            assertEquals(
-                "Peer error · Rescue ready",
-                rescueFeed.pollerAttributionLabel(localPeerId),
+    internal fun `cross peer rescue check and on device poll action update ui state`() = runTest {
+        val localPeerId = "peer-local-1"
+        val onDeviceFeed =
+            FeedItem(
+                id = "f-1",
+                title = "Local Feed",
+                url = "https://example.com/1.xml",
+                siteUrl = null,
+                feedType = com.grayvines.roche.model.FeedType.RSS,
+                unreadCount = 0,
+                lastPolledBy = localPeerId,
             )
-            assertEquals(
-                "1 of 3 feeds last polled on-device · 1 peer error rescue ready",
-                buildPeerMeshHealthSummary(
-                    totalFeeds = 3,
-                    onDevicePolledCount = 1,
-                    rescueReadyCount = 1,
-                ),
+        val rescueFeed =
+            onDeviceFeed.copy(
+                id = "f-3",
+                lastPolledBy = "server",
+                lastError = "HTTP 403",
+                lastErrorBy = "server",
             )
+        assertFalse(onDeviceFeed.isCrossPeerRescueError(localPeerId))
+        assertTrue(rescueFeed.isCrossPeerRescueError(localPeerId))
+        assertEquals(
+            "1 of 3 feeds last polled on-device · 1 peer error rescue ready",
+            buildPeerMeshHealthSummary(
+                totalFeeds = 3,
+                onDevicePolledCount = 1,
+                rescueReadyCount = 1,
+            ),
+        )
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
-            viewModel.dispatch(MainAction.PollFeedsOnDeviceNow)
-            val updated =
-                viewModel.uiState.first {
-                    it.statusBanner == "All cooperative feeds are up to date"
-                }
-            assertEquals("All cooperative feeds are up to date", updated.statusBanner)
-            collectJob.cancel()
-        }
+        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+        viewModel.dispatch(MainAction.PollFeedsOnDeviceNow)
+        val updated =
+            viewModel.uiState.first {
+                it.statusBanner == "All cooperative feeds are up to date"
+            }
+        assertEquals("All cooperative feeds are up to date", updated.statusBanner)
+        collectJob.cancel()
+    }
 
     @Test
     internal fun `rename feed bulk tag archive unread and reader font scale update state`() =

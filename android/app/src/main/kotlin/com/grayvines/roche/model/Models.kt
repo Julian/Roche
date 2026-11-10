@@ -124,16 +124,6 @@ data class FeedItem(
 fun FeedItem.isCrossPeerRescueError(localPeerId: String): Boolean =
     hasPollError && !lastErrorBy.isNullOrBlank() && lastErrorBy != localPeerId
 
-fun FeedItem.pollerAttributionLabel(localPeerId: String): String? =
-    when {
-        isCrossPeerRescueError(localPeerId) -> "Peer error · Rescue ready"
-        hasPollError -> "Poll error"
-        !lastPolledBy.isNullOrBlank() && lastPolledBy == localPeerId -> "Polled on-device"
-        lastPolledBy == "server" || lastPolledBy == "server-default" -> "Polled by Server"
-        !lastPolledBy.isNullOrBlank() -> "Polled by Peer"
-        else -> null
-    }
-
 data class TagItem(val id: String, val name: String, val unreadCount: Int)
 
 data class InboxEntry(
