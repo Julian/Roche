@@ -1,6 +1,7 @@
 package com.grayvines.roche.ui
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.lifecycle.viewModelScope
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.RocheRepository
@@ -22,6 +23,7 @@ import java.io.File
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -65,6 +67,7 @@ class MainViewModelTest {
 
     @AfterEach
     fun tearDown() {
+        viewModel.viewModelScope.cancel()
         database.close()
         Dispatchers.resetMain()
     }
@@ -482,7 +485,8 @@ class MainViewModelTest {
                 viewModel.uiState.first { state ->
                     state.archivedFeeds.any { it.id == "f-archive" } &&
                         state.activeFeeds.none { it.id == "f-archive" } &&
-                        state.feedContextSheetId == null
+                        state.feedContextSheetId == null &&
+                        state.statusBanner?.startsWith("Archived feed") == true
                 }
             assertTrue(feedArchived.statusBanner?.startsWith("Archived feed") == true)
             assertTrue(feedArchived.allEntries.any { it.id == "i-archive" })
@@ -491,7 +495,8 @@ class MainViewModelTest {
             val feedUnarchived =
                 viewModel.uiState.first { state ->
                     state.activeFeeds.any { it.id == "f-archive" } &&
-                        state.archivedFeeds.none { it.id == "f-archive" }
+                        state.archivedFeeds.none { it.id == "f-archive" } &&
+                        state.statusBanner?.startsWith("Unarchived feed") == true
                 }
             assertTrue(feedUnarchived.statusBanner?.startsWith("Unarchived feed") == true)
             collectJob.cancel()
