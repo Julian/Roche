@@ -905,6 +905,11 @@ internal fun FeedContextActionsList(
         },
     )
     ContextActionItem(
+        label = if (feed.isArchived) "Unarchive Feed" else "Archive Feed",
+        onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
+        modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
+    )
+    ContextActionItem(
         label = "Unsubscribe from Feed",
         textColor = colors.accentIndianRed,
         onClick = { onAction(MainAction.DeleteFeed(feed.id)) },

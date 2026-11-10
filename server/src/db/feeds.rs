@@ -249,17 +249,24 @@ impl<'a> FeedRepo<'a> {
             return Ok(false);
         }
 
-        SyncRepo::record_activity(
-            &mut tx,
-            ActivityEntityType::Feed,
-            id,
-            ActivityAction::Update,
-            now,
-        )
-        .await?;
+        let action = match (title, poll_interval, is_active) {
+            (None, None, Some(false)) => ActivityAction::Archive,
+            (None, None, Some(true)) => ActivityAction::Unarchive,
+            _ => ActivityAction::Update,
+        };
+
+        SyncRepo::record_activity(&mut tx, ActivityEntityType::Feed, id, action, now).await?;
 
         tx.commit().await?;
         Ok(true)
+    }
+
+    pub async fn archive(&self, id: &str) -> Result<bool> {
+        self.update(id, None, None, Some(false)).await
+    }
+
+    pub async fn unarchive(&self, id: &str) -> Result<bool> {
+        self.update(id, None, None, Some(true)).await
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
@@ -494,5 +501,49 @@ mod tests {
 
         assert!(feed_repo.delete(&feed.id).await.unwrap());
         assert!(db.items().get(&item.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_archive_feed_stops_polling_and_preserves_items() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_repo = db.feeds();
+
+        let feed_url = Url::parse("https://example.com/archive-feed.xml").unwrap();
+        let feed = feed_repo
+            .create(FeedType::Rss, &feed_url, Some("Archivable Feed"), None)
+            .await
+            .unwrap();
+
+        let item_url = Url::parse("https://example.com/archive-item-1").unwrap();
+        let item = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: "Preserved Item",
+                url: &item_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        assert!(feed_repo.archive(&feed.id).await.unwrap());
+        let archived_feed = feed_repo.get(&feed.id).await.unwrap().unwrap();
+        assert!(!archived_feed.is_active);
+        assert_eq!(archived_feed.unread_count, 1);
+
+        let active = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
+        assert!(active.is_empty());
+
+        let preserved = db.items().get(&item.id).await.unwrap().unwrap();
+        assert_eq!(preserved.title, "Preserved Item");
+
+        assert!(feed_repo.unarchive(&feed.id).await.unwrap());
+        let unarchived_feed = feed_repo.get(&feed.id).await.unwrap().unwrap();
+        assert!(unarchived_feed.is_active);
+        let active_after = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
+        assert_eq!(active_after.len(), 1);
     }
 }

@@ -467,6 +467,20 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         self.get(id).await
     }
 
+    pub async fn archive(&self, id: &str) -> Result<Feed, ApiError> {
+        if !self.service.db.feeds().archive(id).await? {
+            return Err(ApiError::not_found("Feed not found"));
+        }
+        self.get(id).await
+    }
+
+    pub async fn unarchive(&self, id: &str) -> Result<Feed, ApiError> {
+        if !self.service.db.feeds().unarchive(id).await? {
+            return Err(ApiError::not_found("Feed not found"));
+        }
+        self.get(id).await
+    }
+
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {
         let repo = self.service.db.feeds();
         let media_repo = self.service.db.media();

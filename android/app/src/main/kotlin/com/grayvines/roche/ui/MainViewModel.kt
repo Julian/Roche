@@ -71,6 +71,12 @@ data class MainUiState(
     val contextSheetFeed: FeedItem?
         get() = feeds.firstOrNull { it.id == feedContextSheetId }
 
+    val activeFeeds: List<FeedItem>
+        get() = feeds.filter { !it.isArchived }
+
+    val archivedFeeds: List<FeedItem>
+        get() = feeds.filter { it.isArchived }
+
     val starredEntries: List<InboxEntry>
         get() = allEntries.filter { it.isFavorite }
 
@@ -157,6 +163,8 @@ sealed interface MainAction {
     data class ApplyTagToFeed(val feedId: String, val tagName: String) : Mutation
 
     data class ArchiveFeedUnread(val feedId: String) : Mutation
+
+    data class ToggleFeedArchive(val feedId: String) : Mutation
 
     data class DeleteFeed(val feedId: String) : Mutation
 
@@ -305,6 +313,7 @@ class MainViewModel(
             is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
             is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
             is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
+            is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
             is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
             is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
             MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
@@ -612,6 +621,30 @@ class MainViewModel(
                 )
             }
         }
+    }
+
+    internal suspend fun performToggleFeedArchive(feedId: String) {
+        repository
+            .toggleFeedArchive(feedId)
+            .onSuccess { (title, isArchived) ->
+                val verb = if (isArchived) "Archived feed" else "Unarchived feed"
+                transientState.update { current ->
+                    current.copy(
+                        feedContextSheetId =
+                            if (current.feedContextSheetId == feedId) {
+                                null
+                            } else {
+                                current.feedContextSheetId
+                            },
+                        undoEvent = null,
+                        statusBanner = "$verb \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                        messageSequence = current.messageSequence + 1,
+                    )
+                }
+            }
+            .onFailure { error ->
+                showStatusMessage("Feed update failed (${error.message ?: "error"})")
+            }
     }
 
     internal suspend fun performDeleteFeed(feedId: String) {

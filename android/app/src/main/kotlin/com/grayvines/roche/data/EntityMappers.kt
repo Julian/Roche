@@ -62,6 +62,7 @@ internal fun buildSnapshot(
                     lastPolledBy = feed.lastPolledBy,
                     lastError = feed.lastError,
                     lastErrorBy = feed.lastErrorBy,
+                    isActive = feed.isActive,
                 )
             }
             .sortedWith(

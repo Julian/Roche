@@ -110,7 +110,10 @@ data class FeedItem(
     val lastPolledBy: String? = null,
     val lastError: String? = null,
     val lastErrorBy: String? = null,
+    val isActive: Boolean = true,
 ) {
+    val isArchived: Boolean = !isActive
+
     val displayDomain: String = extractCleanDomain(siteUrl?.takeIf { it.isNotBlank() } ?: url)
 
     val faviconUrl: String? = resolveOriginFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)

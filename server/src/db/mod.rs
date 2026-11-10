@@ -20,8 +20,8 @@ pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo};
 pub use sync::{
-    ActivityEntry, NetworkTier, PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, SyncRepo,
-    should_peer_poll_feed,
+    ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier, PeerSyncRequest, PeerSyncResponse,
+    SERVER_PEER_ID, SyncRepo, compute_throughput_weight, should_peer_poll_feed,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{

@@ -35,6 +35,9 @@ interface RocheDao {
     @Query("UPDATE feeds SET title = :title WHERE id = :feedId")
     suspend fun updateFeedTitle(feedId: String, title: String)
 
+    @Query("UPDATE feeds SET isActive = :isActive WHERE id = :feedId")
+    suspend fun updateFeedActive(feedId: String, isActive: Boolean)
+
     @Query("UPDATE items SET feedTitle = :title WHERE feedId = :feedId")
     suspend fun updateItemsFeedTitle(feedId: String, title: String)
 

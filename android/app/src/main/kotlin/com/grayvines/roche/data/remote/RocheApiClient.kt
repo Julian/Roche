@@ -432,6 +432,33 @@ class RocheApiClient(private val transport: HttpTransport) {
         ensureSuccess(response)
     }
 
+    internal suspend fun updateFeed(
+        serverUrl: String,
+        token: String,
+        feedId: String,
+        title: String? = null,
+        pollInterval: Int? = null,
+        isActive: Boolean? = null,
+    ): RemoteFeedDto {
+        val encodedId = encodePathSegment(feedId)
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = "PATCH",
+                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId",
+                    headers = authHeaders(token),
+                    body =
+                        buildUpdateFeedPayload(
+                            title = title,
+                            pollInterval = pollInterval,
+                            isActive = isActive,
+                        ),
+                )
+            )
+        ensureSuccess(response)
+        return parseFeedJson(response.body)
+    }
+
     suspend fun fetchItems(serverUrl: String, token: String): List<RemoteItemDto> {
         val baseUrl = serverUrl.trimEnd('/')
         val headers = authHeaders(token)

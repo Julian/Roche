@@ -321,6 +321,15 @@ class RocheRepository(
     internal suspend fun renameFeed(feedId: String, newTitle: String): String? =
         renameFeedInLocalDb(dao = dao, feedId = feedId, newTitle = newTitle)
 
+    suspend fun toggleFeedArchive(feedId: String): Result<Pair<String, Boolean>> = runCatching {
+        toggleFeedArchiveInDbAndRemote(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            feedId = feedId,
+        )
+    }
+
     internal suspend fun applyTagToFeedItems(feedId: String, tagName: String): Int =
         applyTagToUnarchivedFeedItems(
             dao = dao,
@@ -528,12 +537,14 @@ class RocheRepository(
             val currentTier = networkTierProvider.currentNetworkTier()
             check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
             val currentSettings = settings.settings.first()
+            var measuredWeight: Double? = null
             val polledCount =
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
                     apiClient = apiClient,
                     localPeerId = currentSettings.peerId,
                     activePeers = activePeersFlow.value,
+                    onMeasuredWeight = { measuredWeight = it },
                 )
             if (
                 polledCount > 0 &&
@@ -550,6 +561,7 @@ class RocheRepository(
                         onSyncCursorUpdated = { cursor ->
                             settings.update { it.copy(lastPeerSyncCursor = cursor) }
                         },
+                        initialWeightOverride = measuredWeight,
                     )
                 }
                     .onFailure { if (it is CancellationException) throw it }
@@ -710,6 +722,30 @@ internal suspend fun renameFeedInLocalDb(
     dao.updateFeedTitle(feedId = feedId, title = cleanTitle)
     dao.updateItemsFeedTitle(feedId = feedId, title = cleanTitle)
     return cleanTitle
+}
+
+internal suspend fun toggleFeedArchiveInDbAndRemote(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    feedId: String,
+): Pair<String, Boolean> {
+    val existing = dao.getFeedById(feedId) ?: error("Feed not found: $feedId")
+    val nextIsActive = !existing.isActive
+    dao.updateFeedActive(feedId = feedId, isActive = nextIsActive)
+    val currentSettings = settings.settings.first()
+    if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+        runCatching {
+            apiClient.updateFeed(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                feedId = feedId,
+                isActive = nextIsActive,
+            )
+        }
+            .onFailure { if (it is CancellationException) throw it }
+    }
+    return existing.title.ifBlank { feedId } to !nextIsActive
 }
 
 internal suspend fun applyTagToUnarchivedFeedItems(

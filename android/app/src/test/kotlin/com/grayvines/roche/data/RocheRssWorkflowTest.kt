@@ -210,50 +210,45 @@ class RocheRssWorkflowTest {
     @Test
     fun `PeerConsensus HRW work splitting and cross-peer error rescue match server protocol`() {
         val feedId1 = deterministicFeedId("https://example.com/feed.xml")
-        val feedId2 = deterministicFeedId("https://example.com/feed.xml")
-        assertEquals(feedId1, feedId2)
+        assertEquals(feedId1, deterministicFeedId("https://example.com/feed.xml"))
         assertEquals(36, feedId1.length)
-
         val itemId1 = deterministicItemId("https://example.com/feed.xml", "https://example.com/1")
-        val itemId2 = deterministicItemId("https://example.com/feed.xml", "https://example.com/1")
-        assertEquals(itemId1, itemId2)
+        assertEquals(
+            itemId1,
+            deterministicItemId("https://example.com/feed.xml", "https://example.com/1"),
+        )
 
         val peers =
             listOf(
-                PeerNodeDto(
-                    peerId = "server",
-                    deviceName = "Headless",
-                    networkTier = "wired",
-                    weight = 1.0,
-                ),
-                PeerNodeDto(
-                    peerId = "android-1",
-                    deviceName = "Pixel",
-                    networkTier = "wifi",
-                    weight = 0.6,
-                ),
+                PeerNodeDto("server", "Headless", "wifi", computeThroughputWeight(0, 0, 0.0)),
+                PeerNodeDto("android-1", "Pixel", "wifi", computeThroughputWeight(0, 0, 0.0)),
             )
-        var serverWins = 0
-        var androidWins = 0
-        for (i in 0 until 100) {
-            val winner =
+        val countWins = { active: List<PeerNodeDto>, targetId: String ->
+            (0 until 100).count { i ->
                 selectFeedPoller(
-                    activePeers = peers,
-                    feedUrl = "https://example.com/feed-$i.xml",
-                    pollIntervalMinutes = 30,
-                    nowEpochSeconds = 1_780_000_000L,
-                    lastPolledBy = null,
-                    lastError = null,
-                    lastErrorBy = null,
-                )
-            if (winner == "server") serverWins++ else if (winner == "android-1") androidWins++
+                    active,
+                    "https://example.com/feed-$i.xml",
+                    30,
+                    1_780_000_000L,
+                    null,
+                    null,
+                    null,
+                ) == targetId
+            }
         }
+        val serverWins = countWins(peers, "server")
+        val androidWins = countWins(peers, "android-1")
         assertEquals(100, serverWins + androidWins)
-        assertTrue(serverWins > 35)
-        assertTrue(androidWins > 15)
+        assertTrue(serverWins in 35..65 && androidWins in 35..65)
 
-        // When a feed fails on "server" (e.g. HTTP 403 Forbidden), "android-1" immediately rescues
-        // it
+        val dynamicPeers =
+            listOf(
+                peers[0].copy(weight = computeThroughputWeight(8, 200, 2.0)),
+                peers[1].copy(weight = computeThroughputWeight(2, 25, 3.0)),
+            )
+        val fasterPeerWins = countWins(dynamicPeers, "server")
+        assertTrue(fasterPeerWins > serverWins && fasterPeerWins >= 75)
+
         val now = java.time.Instant.parse("2026-06-01T12:00:00Z")
         val blockedFeed =
             com.grayvines.roche.data.local.FeedEntity(
@@ -426,13 +421,14 @@ class RocheRssWorkflowTest {
                     networkTierProvider = NetworkTierProvider { currentTier },
                 )
 
-            // 1. Background sync on CELLULAR sends network_tier=cellular, weight=0.25, and
-            // populates activePeers
+            // 1. Pre-poll sync omits weight so previously measured throughput is preserved,
+            // then reports the measured throughput weight on the follow-up round after polling
             val bgSynced = peerRepo.runBackgroundPeerSyncAndPoll().getOrThrow()
             assertEquals(3, bgSynced)
             assertEquals(2, peerRepo.snapshot.first().activePeers.size)
             assertTrue(peerSyncBodies.first().contains(""""network_tier":"cellular""""))
-            assertTrue(peerSyncBodies.first().contains(""""weight":0.25"""))
+            assertFalse(peerSyncBodies.first().contains(""""weight":"""))
+            assertTrue(peerSyncBodies.last().contains(""""weight":10.0"""))
 
             // 2. When OFFLINE, background sync and manual on-device poll respect offline state
             currentTier = NetworkTier.OFFLINE

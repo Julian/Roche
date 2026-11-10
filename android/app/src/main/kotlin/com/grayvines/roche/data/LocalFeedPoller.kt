@@ -113,7 +113,7 @@ internal object LocalFeedPoller {
                 candidates = batch.items,
                 nowIso = nowIso,
             )
-        return Result.success(insertedOrUpdatedCount)
+        return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
     }
 
     private suspend fun upsertPolledItems(

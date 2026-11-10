@@ -63,6 +63,8 @@ impl ApiRoutes {
                     .patch(Self::feeds_update::<F>)
                     .delete(Self::feeds_delete::<F>),
             )
+            .route("/api/v1/feeds/{id}/archive", post(Self::feeds_archive::<F>))
+            .route("/api/v1/feeds/{id}/unarchive", post(Self::feeds_unarchive::<F>))
             .route("/api/v1/feeds/{id}/refresh", post(Self::feeds_refresh::<F>))
             .route("/api/v1/feeds/{id}/items", get(Self::feeds_items::<F>))
             // Items
@@ -228,6 +230,22 @@ impl ApiRoutes {
     ) -> Result<StatusCode, ApiError> {
         service.feeds().delete(&id).await?;
         Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn feeds_archive<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemPath(id): ProblemPath<String>,
+    ) -> Result<Json<Feed>, ApiError> {
+        let archived = service.feeds().archive(&id).await?;
+        Ok(Json(archived))
+    }
+
+    async fn feeds_unarchive<F: FeedFetcher>(
+        State(service): State<Arc<RocheService<F>>>,
+        ProblemPath(id): ProblemPath<String>,
+    ) -> Result<Json<Feed>, ApiError> {
+        let unarchived = service.feeds().unarchive(&id).await?;
+        Ok(Json(unarchived))
     }
 
     async fn feeds_refresh<F: FeedFetcher>(
@@ -1748,6 +1766,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
@@ -1842,7 +1861,76 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(bad_payload.to_string()))
             .unwrap();
-        let ssrf_response = app.oneshot(ssrf_request).await.unwrap();
+        let ssrf_response = app.clone().oneshot(ssrf_request).await.unwrap();
         assert_eq!(ssrf_response.status(), StatusCode::BAD_REQUEST);
+
+        // Peer sync should propagate feed archival (is_active = false) and unarchival without losing reading history
+        let archive_sync_payload = serde_json::json!({
+            "peer_id": "android-peer-1",
+            "device_name": "Pixel 9",
+            "network_tier": "wifi",
+            "feeds": [{
+                "url": "https://blog.example.com/rss.xml",
+                "title": "Example Blog",
+                "feed_type": "rss",
+                "poll_interval": 30,
+                "last_polled": "2026-06-01T12:00:00Z",
+                "last_polled_by": "android-peer-1",
+                "is_active": false
+            }],
+            "items": [],
+            "tags": [],
+            "tombstones": []
+        });
+        let archive_sync_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(archive_sync_payload.to_string()))
+            .unwrap();
+        let archive_sync_response = app.clone().oneshot(archive_sync_request).await.unwrap();
+        assert_eq!(archive_sync_response.status(), StatusCode::OK);
+        let archive_sync_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(archive_sync_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archive_sync_body["feeds"][0]["is_active"], false);
+        let feed_id = archive_sync_body["feeds"][0]["id"].as_str().unwrap().to_string();
+
+        // Unarchive via POST /api/v1/feeds/{id}/unarchive and archive via POST /api/v1/feeds/{id}/archive
+        let unarchive_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/feeds/{feed_id}/unarchive"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let unarchive_response = app.clone().oneshot(unarchive_request).await.unwrap();
+        assert_eq!(unarchive_response.status(), StatusCode::OK);
+        let unarchived_feed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(unarchive_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unarchived_feed["is_active"], true);
+
+        let archive_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/feeds/{feed_id}/archive"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let archive_response = app.oneshot(archive_request).await.unwrap();
+        assert_eq!(archive_response.status(), StatusCode::OK);
+        let archived_feed: serde_json::Value = serde_json::from_slice(
+            &to_bytes(archive_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(archived_feed["is_active"], false);
+
+        // Reading history on items remains untouched
+        let preserved_items = db.items().list(None, Some(&feed_id), Some(50)).await.unwrap();
+        assert_eq!(preserved_items.len(), 1);
+        assert!(preserved_items[0].is_favorite);
+        assert!(preserved_items[0].read_at.is_some());
     }
 }

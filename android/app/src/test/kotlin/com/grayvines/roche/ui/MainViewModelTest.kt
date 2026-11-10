@@ -460,6 +460,44 @@ class MainViewModelTest {
         }
 
     @Test
+    internal fun `toggle feed archive moves feed to archivedFeeds and preserves reading history`() =
+        runTest {
+            database.dao().upsertFeeds(listOf(testFeed("f-archive", "Archivable Feed")))
+            database
+                .dao()
+                .upsertItem(
+                    testItem(
+                        id = "i-archive",
+                        title = "Preserved Entry",
+                        feedId = "f-archive",
+                        status = "unread",
+                    )
+                )
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+
+            viewModel.dispatch(MainAction.OpenFeedContextSheet("f-archive"))
+            viewModel.uiState.first { it.feedContextSheetId == "f-archive" }
+            viewModel.dispatch(MainAction.ToggleFeedArchive("f-archive"))
+            val feedArchived =
+                viewModel.uiState.first { state ->
+                    state.archivedFeeds.any { it.id == "f-archive" } &&
+                        state.activeFeeds.none { it.id == "f-archive" } &&
+                        state.feedContextSheetId == null
+                }
+            assertTrue(feedArchived.statusBanner?.startsWith("Archived feed") == true)
+            assertTrue(feedArchived.allEntries.any { it.id == "i-archive" })
+
+            viewModel.dispatch(MainAction.ToggleFeedArchive("f-archive"))
+            val feedUnarchived =
+                viewModel.uiState.first { state ->
+                    state.activeFeeds.any { it.id == "f-archive" } &&
+                        state.archivedFeeds.none { it.id == "f-archive" }
+                }
+            assertTrue(feedUnarchived.statusBanner?.startsWith("Unarchived feed") == true)
+            collectJob.cancel()
+        }
+
+    @Test
     internal fun `search scope filters match snippets and html headings extract cleanly`() {
         val entry =
             testItem(id = "i-1", title = "Title").let {

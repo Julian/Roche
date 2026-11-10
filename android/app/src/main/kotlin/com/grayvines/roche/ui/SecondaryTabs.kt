@@ -338,16 +338,18 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
     var unreadOnly by rememberSaveable { mutableStateOf(false) }
 
-    val totalUnread = remember(state.feeds) { state.feeds.sumOf { it.unreadCount } }
+    val activeFeeds = state.activeFeeds
+    val archivedFeeds = state.archivedFeeds
+    val totalUnread = remember(activeFeeds) { activeFeeds.sumOf { it.unreadCount } }
     val subtitle =
         if (totalUnread > 0) {
-            "${state.feeds.size} feeds · $totalUnread unread"
+            "${activeFeeds.size} feeds · $totalUnread unread"
         } else {
-            "${state.feeds.size} feeds"
+            "${activeFeeds.size} feeds"
         }
     val visibleFeeds =
-        remember(state.feeds, sortOrder, unreadOnly) {
-            sortAndFilterFeeds(state.feeds, sortOrder, unreadOnly)
+        remember(activeFeeds, sortOrder, unreadOnly) {
+            sortAndFilterFeeds(activeFeeds, sortOrder, unreadOnly)
         }
     val hasActiveFilter = showFilterDrawer || unreadOnly || sortOrder != FeedSortOrder.ALPHABETICAL
 
@@ -381,7 +383,8 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
         ) {
             SubscribedFeedsCardList(
                 feeds = visibleFeeds,
-                hasFeedsAtAll = state.feeds.isNotEmpty(),
+                archivedFeeds = archivedFeeds,
+                hasFeedsAtAll = activeFeeds.isNotEmpty(),
                 onAction = onAction,
             )
         }
@@ -508,6 +511,7 @@ private fun FeedsFilterDrawer(
 @Composable
 private fun SubscribedFeedsCardList(
     feeds: List<FeedItem>,
+    archivedFeeds: List<FeedItem>,
     hasFeedsAtAll: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
@@ -550,7 +554,129 @@ private fun SubscribedFeedsCardList(
                 }
             }
         }
+        if (archivedFeeds.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(16.dp))
+            ArchivedFeedsBinSection(
+                archivedFeeds = archivedFeeds,
+                onAction = onAction,
+            )
+        }
         Spacer(modifier = Modifier.height(72.dp))
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ArchivedFeedsBinSection(
+    archivedFeeds: List<FeedItem>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val chevron = if (expanded) "▾" else "▸"
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { expanded = !expanded }
+                    .padding(vertical = 6.dp, horizontal = 4.dp)
+                    .testTag("archived_feeds_header"),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "$chevron Archived Feeds (${archivedFeeds.size})",
+                color = colors.textSecondary,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "Paused polling",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.5.sp,
+            )
+        }
+        if (expanded) {
+            RocheSurfaceCard {
+                archivedFeeds.forEachIndexed { index, feed ->
+                    if (index > 0) {
+                        HorizontalDivider(
+                            color = colors.border,
+                            thickness = 1.dp,
+                            modifier = Modifier.padding(start = 52.dp),
+                        )
+                    }
+                    ArchivedFeedRow(
+                        feed = feed,
+                        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                        onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                        onUnarchive = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ArchivedFeedRow(
+    feed: FeedItem,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+    onUnarchive: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .padding(vertical = 11.dp, horizontal = 12.dp)
+                .testTag("archived_feed_row_${feed.id}"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SiteFaviconBadge(
+                primaryFaviconUrl = feed.faviconUrl,
+                fallbackFaviconUrl = feed.fallbackFaviconUrl,
+                domain = feed.displayDomain,
+                title = feed.title,
+                feedType = feed.feedType,
+                size = 28.dp,
+            )
+            Spacer(modifier = Modifier.width(11.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = feed.title,
+                    color = colors.textSecondary,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = feed.displayDomain,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HeaderActionButton(
+            label = "Unarchive",
+            onClick = onUnarchive,
+            modifier = Modifier.testTag("unarchive_feed_${feed.id}"),
+        )
     }
 }
 

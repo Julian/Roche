@@ -22,6 +22,9 @@ import java.io.IOException
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 internal fun mergePushedFeeds(
     remoteFeeds: List<RemoteFeedDto>,
@@ -504,12 +507,14 @@ internal fun buildRemoteTagEntityMap(
     return map
 }
 
+@Suppress("LongParameterList")
 internal suspend fun buildPeerSyncRequest(
     dao: RocheDao,
     peerId: String,
     deviceName: String,
     networkTier: NetworkTier = NetworkTier.WIFI,
     updatedAfter: String? = null,
+    weightOverride: Double? = null,
 ): PeerSyncRequestDto {
     val feeds = dao.getAllFeeds()
     val allItems = dao.getAllItems()
@@ -544,11 +549,17 @@ internal suspend fun buildPeerSyncRequest(
                 )
             }
     val tombstones = collectPeerSyncTombstones(dao.getAllTombstones(), inclusiveSinceInstant)
+    val effectiveWeight =
+        if (networkTier == NetworkTier.OFFLINE) {
+            0.0
+        } else {
+            weightOverride
+        }
     return PeerSyncRequestDto(
         peerId = peerId,
         deviceName = deviceName,
         networkTier = networkTier.wireValue,
-        weight = networkTier.defaultWeight,
+        weight = effectiveWeight,
         updatedAfter = sinceInstant?.toString(),
         feeds = feeds.filter { isSyncablePublicUrl(it.url) },
         items = itemPayloads,
@@ -717,6 +728,7 @@ internal suspend fun reconcilePeerSyncResponse(
     )
 }
 
+@Suppress("LongParameterList")
 internal suspend fun tryPeerSyncAndCooperativePoll(
     dao: RocheDao,
     apiClient: RocheApiClient,
@@ -724,9 +736,16 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
     networkTier: NetworkTier = NetworkTier.WIFI,
     onPeersUpdated: (List<PeerNodeDto>) -> Unit = {},
     onSyncCursorUpdated: suspend (String) -> Unit = {},
+    initialWeightOverride: Double? = null,
 ): Int? {
     val response =
-        executeSinglePeerSyncRound(dao, apiClient, currentSettings, networkTier) ?: return null
+        executeSinglePeerSyncRound(
+            dao = dao,
+            apiClient = apiClient,
+            currentSettings = currentSettings,
+            networkTier = networkTier,
+            weightOverride = initialWeightOverride,
+        ) ?: return null
     onPeersUpdated(response.activePeers)
     val latestCursor = response.syncTimestamp.trim()
     val updatedSettings =
@@ -736,6 +755,7 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
         } else {
             currentSettings
         }
+    var measuredWeight: Double? = null
     val polledFeedsCount =
         if (networkTier != NetworkTier.OFFLINE) {
             pollCooperativeFeedsOnDevice(
@@ -743,12 +763,20 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
                 apiClient = apiClient,
                 localPeerId = updatedSettings.peerId,
                 activePeers = response.activePeers,
+                onMeasuredWeight = { measuredWeight = it },
             )
         } else {
             0
         }
     if (polledFeedsCount > 0) {
-        val followUpResp = executeSinglePeerSyncRound(dao, apiClient, updatedSettings, networkTier)
+        val followUpResp =
+            executeSinglePeerSyncRound(
+                dao = dao,
+                apiClient = apiClient,
+                currentSettings = updatedSettings,
+                networkTier = networkTier,
+                weightOverride = measuredWeight,
+            )
         if (followUpResp != null) {
             onPeersUpdated(followUpResp.activePeers)
             val followUpCursor = followUpResp.syncTimestamp.trim()
@@ -765,6 +793,7 @@ private suspend fun executeSinglePeerSyncRound(
     apiClient: RocheApiClient,
     currentSettings: Settings,
     networkTier: NetworkTier,
+    weightOverride: Double? = null,
 ): PeerSyncResponseDto? {
     val preFetchItemsById = dao.getAllItems().associateBy { it.id }
     val preSyncMutations = dao.getAllPendingMutations()
@@ -775,6 +804,7 @@ private suspend fun executeSinglePeerSyncRound(
             deviceName = currentSettings.deviceName,
             networkTier = networkTier,
             updatedAfter = currentSettings.lastPeerSyncCursor,
+            weightOverride = weightOverride,
         )
     val syncedResponse = runCatching {
         apiClient.syncPeer(
@@ -805,23 +835,67 @@ internal suspend fun pollCooperativeFeedsOnDevice(
     localPeerId: String,
     activePeers: List<PeerNodeDto>,
     nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
+    onMeasuredWeight: (Double) -> Unit = {},
 ): Int {
     val feeds = dao.getAllFeeds()
+    val attemptedIds = mutableSetOf<String>()
+    var currentPeers = activePeers
     var polledFeedsCount = 0
-    for (feed in feeds) {
-        if (shouldPeerPollFeed(localPeerId, activePeers, feed, nowInstant)) {
-            val result =
-                LocalFeedPoller.pollFeed(
-                    dao = dao,
-                    apiClient = apiClient,
-                    feed = feed,
-                    localPeerId = localPeerId,
-                    nowInstant = nowInstant,
-                )
-            if (result.isSuccess) {
-                polledFeedsCount++
+    var totalItemsProcessed = 0
+    val startedNanos = System.nanoTime()
+
+    var keepPolling = true
+    while (keepPolling) {
+        val slice =
+            feeds
+                .filter {
+                    it.id !in attemptedIds &&
+                        shouldPeerPollFeed(localPeerId, currentPeers, it, nowInstant)
+                }
+                .take(COOPERATIVE_POLL_SLICE_SIZE)
+        if (slice.isEmpty()) {
+            keepPolling = false
+        } else {
+            slice.forEach { attemptedIds.add(it.id) }
+            val results = coroutineScope {
+                slice
+                    .map { feed ->
+                        async {
+                            LocalFeedPoller.pollFeed(
+                                dao = dao,
+                                apiClient = apiClient,
+                                feed = feed,
+                                localPeerId = localPeerId,
+                                nowInstant = nowInstant,
+                            )
+                        }
+                    }
+                    .awaitAll()
+            }
+
+            val succeededCounts = results.mapNotNull { it.getOrNull() }
+            if (succeededCounts.isEmpty()) {
+                keepPolling = false
+            } else {
+                polledFeedsCount += succeededCounts.size
+                totalItemsProcessed += succeededCounts.sum()
+                val elapsedSeconds =
+                    (System.nanoTime() - startedNanos).toDouble() / NANOS_PER_SECOND
+                val updatedWeight =
+                    computeThroughputWeight(
+                        feedsCompleted = polledFeedsCount,
+                        itemsProcessed = totalItemsProcessed,
+                        elapsedSeconds = elapsedSeconds,
+                    )
+                onMeasuredWeight(updatedWeight)
+                currentPeers = currentPeers.map { peer ->
+                    if (peer.peerId == localPeerId) peer.copy(weight = updatedWeight) else peer
+                }
             }
         }
     }
     return polledFeedsCount
 }
+
+private const val COOPERATIVE_POLL_SLICE_SIZE = 4
+private const val NANOS_PER_SECOND = 1_000_000_000.0

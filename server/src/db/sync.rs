@@ -16,6 +16,7 @@ use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 
 pub const SERVER_PEER_ID: &str = "server";
 pub const PEER_LEASE_TTL_MINUTES: i64 = 120;
+pub const DEFAULT_ONLINE_PEER_WEIGHT: f64 = 1.0;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
@@ -32,9 +33,7 @@ impl NetworkTier {
     #[must_use]
     pub const fn default_weight(self) -> f64 {
         match self {
-            Self::Wired => 1.0,
-            Self::Wifi => 0.6,
-            Self::Cellular => 0.25,
+            Self::Wired | Self::Wifi | Self::Cellular => DEFAULT_ONLINE_PEER_WEIGHT,
             Self::Offline => 0.0,
         }
     }
@@ -228,8 +227,35 @@ pub fn rendezvous_uniform_unit(peer_id: &str, feed_url: &str, epoch: i64) -> f64
     ((top53 as f64) + 0.5) / ((1u64 << 53) as f64)
 }
 
+/// Computes a peer's dynamic polling weight from the work it processed (`feeds_completed`
+/// and `items_processed`) and the wall-clock duration `elapsed_secs`.
+/// Before any work is measured (`feeds_completed == 0`), returns `DEFAULT_ONLINE_PEER_WEIGHT` (1.0)
+/// so all online peers start with an equal preliminary allocation.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn compute_throughput_weight(
+    feeds_completed: usize,
+    items_processed: usize,
+    elapsed_secs: f64,
+) -> f64 {
+    if feeds_completed == 0 {
+        return DEFAULT_ONLINE_PEER_WEIGHT;
+    }
+    let safe_secs = elapsed_secs.max(0.05);
+    let work_units = (feeds_completed as f64) + (items_processed as f64) / 25.0;
+    let units_per_sec = work_units / safe_secs;
+    units_per_sec.clamp(0.2, 10.0)
+}
+
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn peer_liveness_factor(last_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    let stale_secs = (now - last_seen_at).num_seconds();
+    if stale_secs <= 120 { 1.0 } else { 1.0 / (1.0 + ((stale_secs - 120) as f64) / 180.0) }
+}
+
 /// Computes the effective polling weight of `peer` for a specific feed, incorporating
-/// network tier capacity and reachability health (`last_error_by` / `last_polled_by`).
+/// measured throughput (`peer.weight`) and reachability health (`last_error_by` / `last_polled_by`).
 #[must_use]
 pub fn effective_peer_weight(
     peer: &PeerNode,
@@ -255,9 +281,11 @@ pub fn effective_peer_weight(
     }
 }
 
-/// Weighted Rendezvous Hash (Highest Random Weight / HRW) peer selector.
-/// Selects the peer with the highest `-weight / ln(u)` score for `(feed_url, epoch)`.
+/// Dynamic throughput-weighted Rendezvous Hash (HRW) peer selector.
+/// Preliminarily splits feeds equally (`weight = 1.0`) and dynamically shifts larger portions
+/// to whichever peer has higher measured processing throughput (`peer.weight`) and liveness.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn select_feed_poller<'a>(
     peers: &'a [PeerNode],
     feed_url: &str,
@@ -266,13 +294,20 @@ pub fn select_feed_poller<'a>(
     last_polled_by: Option<&str>,
     last_error: Option<&str>,
     last_error_by: Option<&str>,
+    local_boost: Option<(&str, f64)>,
 ) -> Option<&'a str> {
     let interval_secs = poll_interval_mins.max(1).saturating_mul(60);
     let epoch = now.timestamp().div_euclid(interval_secs);
 
     let mut best_peer: Option<(&'a str, f64)> = None;
     for peer in peers {
-        let weight = effective_peer_weight(peer, last_polled_by, last_error, last_error_by);
+        let mut weight = effective_peer_weight(peer, last_polled_by, last_error, last_error_by)
+            * peer_liveness_factor(peer.last_seen_at, now);
+        if let Some((boost_peer_id, factor)) = local_boost
+            && peer.peer_id == boost_peer_id
+        {
+            weight *= factor;
+        }
         if weight <= 0.0 {
             continue;
         }
@@ -294,7 +329,10 @@ pub fn select_feed_poller<'a>(
 }
 
 /// Determines whether `local_peer_id` should poll `feed` at `now` given `active_peers`.
+/// Starts with a preliminary allocation proportional to each peer's throughput weight, and
+/// progressively expands `local_peer_id`'s portion on feeds that remain unpolled past their due time.
 #[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn should_peer_poll_feed(
     local_peer_id: &str,
     active_peers: &[PeerNode],
@@ -322,7 +360,7 @@ pub fn should_peer_poll_feed(
     }
 
     // If a feed is overdue by >= 2x its poll_interval, any active peer can rescue it even if
-    // another peer won the HRW hash for the current epoch.
+    // another peer won the initial allocation for the current epoch.
     if elapsed_secs.is_some_and(|s| s >= interval_secs.saturating_mul(2)) {
         return true;
     }
@@ -330,6 +368,14 @@ pub fn should_peer_poll_feed(
     if active_peers.len() <= 1 {
         return true;
     }
+
+    let overdue_secs = elapsed_secs.map_or(0, |s| (s - interval_secs).max(0));
+    let local_steal_boost = if overdue_secs > 0 {
+        let overdue_ratio = (overdue_secs as f64) / (interval_secs as f64);
+        (4.0 * overdue_ratio).mul_add(overdue_ratio, 1.0)
+    } else {
+        1.0
+    };
 
     select_feed_poller(
         active_peers,
@@ -339,6 +385,7 @@ pub fn should_peer_poll_feed(
         feed.last_polled_by.as_deref(),
         feed.last_error.as_deref(),
         feed.last_error_by.as_deref(),
+        Some((local_peer_id, local_steal_boost)),
     ) == Some(local_peer_id)
 }
 
@@ -544,32 +591,24 @@ impl<'a> SyncRepo<'a> {
         let peer_id = req.peer_id.trim();
         let device_name =
             req.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(peer_id);
-        let peer_weight = if req.network_tier == NetworkTier::Offline {
-            0.0
+        let measured_weight = if req.network_tier == NetworkTier::Offline {
+            Some(0.0)
         } else {
-            req.weight.unwrap_or_else(|| req.network_tier.default_weight()).clamp(0.0, 10.0)
+            req.weight.map(|w| w.clamp(0.2, 10.0))
         };
 
         let mut tx = self.pool.begin().await?;
 
         // Begin `tx` with an immediate write (`INSERT INTO peer_nodes`) so SQLite acquires a
         // write lock right away instead of upgrading a deferred read snapshot later.
-        Self::upsert_peer_in_tx(
-            &mut tx,
-            SERVER_PEER_ID,
-            "Roche Headless Peer",
-            NetworkTier::Wired,
-            NetworkTier::Wired.default_weight(),
-            now,
-        )
-        .await?;
+        Self::ensure_server_peer_in_tx(&mut tx, now).await?;
         if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
             Self::upsert_peer_in_tx(
                 &mut tx,
                 peer_id,
                 device_name,
                 req.network_tier,
-                peer_weight,
+                measured_weight,
                 now,
             )
             .await?;
@@ -577,7 +616,8 @@ impl<'a> SyncRepo<'a> {
 
         Self::apply_incoming_tombstones(&mut tx, &req.tombstones, now).await?;
         Self::merge_incoming_tags(&mut tx, &req.tags, now).await?;
-        let feed_map = Self::merge_incoming_feeds(&mut tx, &req.feeds, now).await?;
+        let feed_map =
+            Self::merge_incoming_feeds(&mut tx, &req.feeds, req.updated_after, now).await?;
         let inserted_candidates =
             Self::merge_incoming_items(&mut tx, &req.items, &feed_map, now).await?;
 
@@ -621,12 +661,8 @@ impl<'a> SyncRepo<'a> {
         ))
     }
 
-    async fn upsert_peer_in_tx(
+    async fn ensure_server_peer_in_tx(
         conn: &mut SqliteConnection,
-        peer_id: &str,
-        device_name: &str,
-        network_tier: NetworkTier,
-        weight: f64,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
         sqlx::query(
@@ -634,15 +670,48 @@ impl<'a> SyncRepo<'a> {
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
                  device_name = excluded.device_name,
+                 last_seen_at = excluded.last_seen_at",
+        )
+        .bind(SERVER_PEER_ID)
+        .bind("Roche Headless Peer")
+        .bind(NetworkTier::Wifi)
+        .bind(DEFAULT_ONLINE_PEER_WEIGHT)
+        .bind(now)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_peer_in_tx(
+        conn: &mut SqliteConnection,
+        peer_id: &str,
+        device_name: &str,
+        network_tier: NetworkTier,
+        measured_weight: Option<f64>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let initial_weight = measured_weight.unwrap_or_else(|| network_tier.default_weight());
+        sqlx::query(
+            "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(peer_id) DO UPDATE SET
+                 device_name = excluded.device_name,
                  network_tier = excluded.network_tier,
-                 weight = excluded.weight,
+                 weight = CASE
+                     WHEN excluded.network_tier = 'offline' THEN 0.0
+                     WHEN ? IS NOT NULL THEN ?
+                     WHEN peer_nodes.weight > 0.0 THEN peer_nodes.weight
+                     ELSE excluded.weight
+                 END,
                  last_seen_at = excluded.last_seen_at",
         )
         .bind(peer_id)
         .bind(device_name)
         .bind(network_tier)
-        .bind(weight)
+        .bind(initial_weight)
         .bind(now)
+        .bind(measured_weight)
+        .bind(measured_weight)
         .execute(conn)
         .await?;
         Ok(())
@@ -894,11 +963,13 @@ impl<'a> SyncRepo<'a> {
     async fn merge_incoming_feeds(
         conn: &mut SqliteConnection,
         feeds: &[PeerFeedRecord],
+        req_updated_after: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> std::result::Result<HashMap<String, (String, String)>, sqlx::Error> {
         let mut feed_map = HashMap::new();
         for f in feeds {
-            Self::merge_single_feed_in_tx(&mut *conn, f, &mut feed_map, now).await?;
+            Self::merge_single_feed_in_tx(&mut *conn, f, req_updated_after, &mut feed_map, now)
+                .await?;
         }
         Ok(feed_map)
     }
@@ -906,9 +977,11 @@ impl<'a> SyncRepo<'a> {
     async fn merge_single_feed_in_tx(
         conn: &mut SqliteConnection,
         f: &PeerFeedRecord,
+        req_updated_after: Option<DateTime<Utc>>,
         feed_map: &mut HashMap<String, (String, String)>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
+        type ExistingFeedRow = (String, String, Option<DateTime<Utc>>, bool, DateTime<Utc>);
         let feed_url = f.url.as_str();
         let nat_key = feed_natural_key(feed_url);
         let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
@@ -924,8 +997,8 @@ impl<'a> SyncRepo<'a> {
             Self::clear_tombstone(&mut *conn, ActivityEntityType::Feed, &nat_key).await?;
         }
 
-        let existing: Option<(String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT id, url, last_polled FROM feeds WHERE url = ? OR id = ? LIMIT 1",
+        let existing: Option<ExistingFeedRow> = sqlx::query_as(
+            "SELECT id, url, last_polled, is_active, updated_at FROM feeds WHERE url = ? OR id = ? LIMIT 1",
         )
         .bind(feed_url)
         .bind(&f.id)
@@ -943,12 +1016,17 @@ impl<'a> SyncRepo<'a> {
             None
         };
 
-        if let Some((local_id, local_url, local_last_polled)) = existing {
+        if let Some((local_id, local_url, local_last_polled, local_is_active, local_updated_at)) =
+            existing
+        {
             Self::update_existing_feed_in_tx(
                 &mut *conn,
                 &local_id,
                 f,
                 local_last_polled,
+                local_is_active,
+                local_updated_at,
+                req_updated_after,
                 clean_title,
                 clean_desc,
                 clean_lang,
@@ -1009,6 +1087,9 @@ impl<'a> SyncRepo<'a> {
         local_id: &str,
         f: &PeerFeedRecord,
         local_last_polled: Option<DateTime<Utc>>,
+        local_is_active: bool,
+        local_updated_at: DateTime<Utc>,
+        req_updated_after: Option<DateTime<Utc>>,
         clean_title: Option<&str>,
         clean_desc: Option<&str>,
         clean_lang: Option<&str>,
@@ -1060,6 +1141,21 @@ impl<'a> SyncRepo<'a> {
             .bind(local_id)
             .execute(&mut *conn)
             .await?;
+        }
+
+        if f.is_active != local_is_active
+            && req_updated_after.is_none_or(|ua| local_updated_at <= ua)
+        {
+            sqlx::query("UPDATE feeds SET is_active = ?, updated_at = ? WHERE id = ?")
+                .bind(f.is_active)
+                .bind(now)
+                .bind(local_id)
+                .execute(&mut *conn)
+                .await?;
+            let action =
+                if f.is_active { ActivityAction::Unarchive } else { ActivityAction::Archive };
+            Self::record_activity(&mut *conn, ActivityEntityType::Feed, local_id, action, now)
+                .await?;
         }
         Ok(())
     }
@@ -1565,25 +1661,25 @@ mod tests {
         assert_ne!(f_id1, i_id1);
 
         let now = SyncRepo::now_utc();
-        let peers = vec![
+        let mut peers = vec![
             PeerNode {
                 peer_id: "server".to_string(),
                 device_name: "Headless".to_string(),
-                network_tier: NetworkTier::Wired,
-                weight: 1.0,
+                network_tier: NetworkTier::Wifi,
+                weight: compute_throughput_weight(0, 0, 0.0),
                 last_seen_at: now,
             },
             PeerNode {
                 peer_id: "android-1".to_string(),
                 device_name: "Pixel".to_string(),
                 network_tier: NetworkTier::Wifi,
-                weight: 0.6,
+                weight: compute_throughput_weight(0, 0, 0.0),
                 last_seen_at: now,
             },
         ];
 
-        // Across 100 feeds, both peers get a non-trivial share proportional to their weights,
-        // and for every single feed, exactly one peer is selected as owner.
+        // 1. Preliminary allocation: both online peers start at weight 1.0 and split feeds roughly
+        // equally, with exactly one peer claiming each due feed.
         let mut server_wins = 0;
         let mut android_wins = 0;
         for idx in 0..100 {
@@ -1612,8 +1708,40 @@ mod tests {
                 android_wins += 1;
             }
         }
-        assert!(server_wins > 35 && server_wins < 85, "server_wins={server_wins}");
+        assert!(server_wins > 35 && server_wins < 65, "server_wins={server_wins}");
         assert_eq!(server_wins + android_wins, 100);
+
+        // 2. Dynamic throughput reallocation: when the faster peer processes more feeds and items
+        // per second, it is dynamically allocated a much larger portion of the remaining feeds.
+        peers[0].weight = compute_throughput_weight(8, 200, 2.0);
+        peers[1].weight = compute_throughput_weight(2, 25, 3.0);
+        assert!(peers[0].weight > peers[1].weight * 4.0);
+        let mut fast_wins = 0;
+        for idx in 0..100 {
+            let feed_url = Url::parse(&format!("https://example.com/feed-{idx}.xml")).unwrap();
+            let feed = Feed {
+                id: deterministic_feed_id(feed_url.as_str()),
+                feed_type: FeedType::Rss,
+                url: feed_url,
+                title: Some(format!("Feed {idx}")),
+                description: None,
+                language: None,
+                poll_interval: 30,
+                last_polled: None,
+                last_polled_by: None,
+                last_error: None,
+                last_error_by: None,
+                is_active: true,
+                unread_count: 0,
+            };
+            if should_peer_poll_feed("server", &peers, &feed, now) {
+                fast_wins += 1;
+            }
+        }
+        assert!(
+            fast_wins > server_wins && fast_wins >= 75,
+            "Faster peer must dynamically receive a larger portion: fast_wins={fast_wins}, initial={server_wins}"
+        );
 
         // When the server fails on a feed (e.g. HTTP 403), Android immediately rescues it even
         // though `last_polled` was 1 minute ago (within the 30m backoff window for the server).
@@ -1716,7 +1844,7 @@ mod tests {
             peer_id: "android-peer-1".to_string(),
             device_name: Some("Pixel 10 Pro".to_string()),
             network_tier: NetworkTier::Wifi,
-            weight: Some(0.6),
+            weight: Some(4.2),
             updated_after: None,
             feeds: vec![PeerFeedRecord {
                 id: "android-local-feed-id".to_string(),
@@ -1847,7 +1975,7 @@ mod tests {
             peer_id: "android-peer-1".to_string(),
             device_name: Some("Pixel 10 Pro".to_string()),
             network_tier: NetworkTier::Wifi,
-            weight: Some(0.6),
+            weight: None,
             updated_after: Some(watermark),
             feeds: vec![],
             items: vec![],
@@ -1855,6 +1983,12 @@ mod tests {
             tombstones: vec![],
         };
         let (delta_resp, _) = db.sync().merge_peer_state(&delta_req).await.unwrap();
+        let android_peer =
+            delta_resp.active_peers.iter().find(|p| p.peer_id == "android-peer-1").unwrap();
+        assert!(
+            (android_peer.weight - 4.2).abs() < 1e-6,
+            "Delta sync without a new poll sample must preserve previously measured throughput weight"
+        );
         assert_eq!(
             delta_resp.items.len(),
             1,

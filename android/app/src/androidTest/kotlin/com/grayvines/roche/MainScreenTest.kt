@@ -78,7 +78,18 @@ class MainScreenTest {
                 feedType = FeedType.ARXIV,
                 unreadCount = 3,
             )
+        val archivedFeed =
+            FeedItem(
+                id = "feed-archived-1",
+                title = "Legacy Blog",
+                url = "https://legacy.example.com/rss.xml",
+                siteUrl = "https://legacy.example.com",
+                feedType = FeedType.RSS,
+                unreadCount = 1,
+                isActive = false,
+            )
         val tag = TagItem(id = "tag-1", name = "ml-systems", unreadCount = 2)
+        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
 
         composeRule.setContent {
             RocheTheme {
@@ -86,10 +97,10 @@ class MainScreenTest {
                     state =
                         MainUiState(
                             activeTab = AppTab.FEEDS,
-                            feeds = listOf(feed),
+                            feeds = listOf(feed, archivedFeed),
                             tags = listOf(tag),
                         ),
-                    onAction = {},
+                    onAction = { dispatched.add(it) },
                     onShareEntry = {},
                     onOpenExternalUrl = {},
                 )
@@ -100,6 +111,17 @@ class MainScreenTest {
         composeRule.onNodeWithTag("feeds_filter_drawer").assertDoesNotExist()
         composeRule.onNodeWithTag("feed_row_feed-1").assertExists()
         composeRule.onNodeWithText("arxiv.org").assertExists()
+        composeRule.onNodeWithTag("archived_feeds_header").assertExists()
+        composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertDoesNotExist()
+
+        composeRule.onNodeWithTag("archived_feeds_header").performClick()
+        composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertExists()
+        composeRule.onNodeWithTag("unarchive_feed_feed-archived-1").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(
+                com.grayvines.roche.ui.MainAction.ToggleFeedArchive("feed-archived-1")
+            )
+        )
 
         composeRule.onNodeWithTag("feeds_filter_btn").performClick()
         composeRule.onNodeWithTag("feeds_filter_drawer").assertExists()

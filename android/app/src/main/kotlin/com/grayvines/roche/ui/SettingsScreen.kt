@@ -222,8 +222,7 @@ private fun resolveServerSummarySubtitle(
     if (!isConfigured) return "Tap to pair device or set Server URL"
     if (state.activePeers.isEmpty()) return "Paired via Tailscale · Tap to configure"
     val peerNoun = if (state.activePeers.size == 1) "peer" else "peers"
-    return "${state.activePeers.size} active $peerNoun · " +
-        "${state.localNetworkTier.displayLabel} (${state.localNetworkTier.defaultWeight}x)"
+    return "${state.activePeers.size} active $peerNoun · Cooperative sync"
 }
 
 @Composable
@@ -843,10 +842,15 @@ internal fun PeerMeshStatusCard(
 ) {
     val colors = LocalRocheColors.current
     val localPeerId = state.settings.peerId
-    val onDevicePolledCount = state.feeds.count { it.lastPolledBy == localPeerId }
-    val rescueReadyCount = state.feeds.count { it.isCrossPeerRescueError(localPeerId) }
+    val activeFeeds = state.activeFeeds
+    val onDevicePolledCount = activeFeeds.count { it.lastPolledBy == localPeerId }
+    val rescueReadyCount = activeFeeds.count { it.isCrossPeerRescueError(localPeerId) }
     val tierLabel =
-        "${state.localNetworkTier.displayLabel} · HRW weight ${state.localNetworkTier.defaultWeight}x"
+        if (state.localNetworkTier == NetworkTier.OFFLINE) {
+            "Offline"
+        } else {
+            "Online · Dynamic cooperative polling"
+        }
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Cooperative Peer Mesh")
@@ -863,7 +867,7 @@ internal fun PeerMeshStatusCard(
                 Text(
                     text =
                         buildPeerMeshHealthSummary(
-                            totalFeeds = state.feeds.size,
+                            totalFeeds = activeFeeds.size,
                             onDevicePolledCount = onDevicePolledCount,
                             rescueReadyCount = rescueReadyCount,
                         ),
@@ -873,7 +877,13 @@ internal fun PeerMeshStatusCard(
                 if (state.activePeers.isNotEmpty()) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                     state.activePeers.forEach { peer ->
-                        PeerMeshNodeRow(peer = peer, isLocalPeer = peer.peerId == localPeerId)
+                        val polledByPeer = state.feeds.count { it.lastPolledBy == peer.peerId }
+                        PeerMeshNodeRow(
+                            peer = peer,
+                            isLocalPeer = peer.peerId == localPeerId,
+                            polledFeedCount = polledByPeer,
+                            totalFeeds = state.feeds.size,
+                        )
                     }
                 }
             }
@@ -919,12 +929,20 @@ internal fun PeerMeshLocalHeaderRow(
 internal fun PeerMeshNodeRow(
     peer: PeerNodeDto,
     isLocalPeer: Boolean,
+    polledFeedCount: Int = 0,
+    totalFeeds: Int = 0,
 ) {
     val colors = LocalRocheColors.current
     val tier = NetworkTier.fromWireValue(peer.networkTier)
     val dotColor =
         if (tier == NetworkTier.OFFLINE) colors.accentIndianRed else colors.accentVerdigris
     val nameLabel = if (isLocalPeer) "${peer.deviceName} · local" else peer.deviceName
+    val statusLabel =
+        when {
+            tier == NetworkTier.OFFLINE -> "Offline"
+            totalFeeds > 0 -> "$polledFeedCount/$totalFeeds feeds"
+            else -> "Online"
+        }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -946,7 +964,7 @@ internal fun PeerMeshNodeRow(
             )
         }
         Text(
-            text = "${tier.displayLabel} · ${peer.weight}x",
+            text = statusLabel,
             color = colors.textMuted,
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
@@ -960,7 +978,7 @@ internal fun buildPeerMeshHealthSummary(
     rescueReadyCount: Int,
 ): String {
     if (totalFeeds == 0) {
-        return "Equal-peer CRDT sync & HRW rendezvous polling active."
+        return "Equal-peer CRDT sync & dynamic cooperative polling active."
     }
     val base = "$onDevicePolledCount of $totalFeeds feeds last polled on-device"
     return if (rescueReadyCount > 0) {

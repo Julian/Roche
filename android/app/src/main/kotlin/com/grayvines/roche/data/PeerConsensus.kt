@@ -130,6 +130,30 @@ internal fun rendezvousUniformUnit(peerId: String, feedUrl: String, epoch: Long)
     return (top53.toDouble() + HRW_HALF_OFFSET) / (1L shl IEEE754_MANTISSA_BITS).toDouble()
 }
 
+internal fun computeThroughputWeight(
+    feedsCompleted: Int,
+    itemsProcessed: Int,
+    elapsedSeconds: Double,
+): Double {
+    if (feedsCompleted <= 0) return DEFAULT_ONLINE_PEER_WEIGHT
+    val safeSecs = elapsedSeconds.coerceAtLeast(MIN_MEASURED_ELAPSED_SECS)
+    val workUnits = feedsCompleted.toDouble() + itemsProcessed.toDouble() / ITEMS_PER_WORK_UNIT
+    val unitsPerSec = workUnits / safeSecs
+    return unitsPerSec.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+}
+
+private fun peerLivenessFactor(lastSeenAtIso: String, nowEpochSeconds: Long): Double {
+    if (lastSeenAtIso.isBlank()) return 1.0
+    val seenEpoch =
+        runCatching { Instant.parse(lastSeenAtIso.trim()).epochSecond }.getOrNull() ?: return 1.0
+    val staleSecs = nowEpochSeconds - seenEpoch
+    return if (staleSecs <= LIVENESS_GRACE_SECONDS) {
+        1.0
+    } else {
+        1.0 / (1.0 + (staleSecs - LIVENESS_GRACE_SECONDS).toDouble() / LIVENESS_DECAY_SECONDS)
+    }
+}
+
 internal fun effectivePeerWeight(
     peer: PeerNodeDto,
     lastPolledBy: String?,
@@ -155,6 +179,7 @@ internal fun effectivePeerWeight(
     return base * factor
 }
 
+@Suppress("LongParameterList")
 internal fun selectFeedPoller(
     activePeers: List<PeerNodeDto>,
     feedUrl: String,
@@ -163,6 +188,8 @@ internal fun selectFeedPoller(
     lastPolledBy: String?,
     lastError: String?,
     lastErrorBy: String?,
+    localBoostPeerId: String? = null,
+    localBoostFactor: Double = 1.0,
 ): String? {
     if (activePeers.isEmpty()) return null
     val intervalSecs = pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES) * 60L
@@ -171,7 +198,12 @@ internal fun selectFeedPoller(
     var bestPeer: String? = null
     var bestScore = Double.NEGATIVE_INFINITY
     for (peer in activePeers) {
-        val weight = effectivePeerWeight(peer, lastPolledBy, lastError, lastErrorBy)
+        var weight =
+            effectivePeerWeight(peer, lastPolledBy, lastError, lastErrorBy) *
+                peerLivenessFactor(peer.lastSeenAt, nowEpochSeconds)
+        if (localBoostPeerId != null && peer.peerId == localBoostPeerId) {
+            weight *= localBoostFactor
+        }
         if (weight <= 0.0) continue
         val u = rendezvousUniformUnit(peer.peerId, feedUrl, epoch)
         val score = -weight / ln(u)
@@ -210,6 +242,7 @@ internal fun shouldPeerPollFeed(
 ): Boolean {
     if (!isFeedDueOrRescueForPeer(localPeerId, feed, nowInstant)) return false
     val intervalMinutes = feed.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong()
+    val intervalSecs = intervalMinutes * 60L
     val lastPolledInstant =
         feed.lastPolled
             ?.trim()
@@ -217,14 +250,19 @@ internal fun shouldPeerPollFeed(
             ?.let {
                 runCatching { Instant.parse(it) }.getOrNull()
             }
-    if (
-        lastPolledInstant != null &&
-            Duration.between(lastPolledInstant, nowInstant) >=
-                Duration.ofMinutes(intervalMinutes * OVERDUE_RESCUE_MULTIPLIER)
-    ) {
+    val elapsedSecs = lastPolledInstant?.let { Duration.between(it, nowInstant).seconds }
+    if (elapsedSecs != null && elapsedSecs >= intervalSecs * OVERDUE_RESCUE_MULTIPLIER) {
         return true
     }
     if (activePeers.size <= 1) return true
+    val overdueSecs = elapsedSecs?.let { (it - intervalSecs).coerceAtLeast(0L) } ?: 0L
+    val localStealBoost =
+        if (overdueSecs > 0L) {
+            val overdueRatio = overdueSecs.toDouble() / intervalSecs.toDouble()
+            1.0 + OVERDUE_STEAL_SCALE * overdueRatio * overdueRatio
+        } else {
+            1.0
+        }
     return selectFeedPoller(
         activePeers = activePeers,
         feedUrl = feed.url,
@@ -233,6 +271,8 @@ internal fun shouldPeerPollFeed(
         lastPolledBy = feed.lastPolledBy,
         lastError = feed.lastError,
         lastErrorBy = feed.lastErrorBy,
+        localBoostPeerId = localPeerId,
+        localBoostFactor = localStealBoost,
     ) == localPeerId
 }
 
@@ -250,9 +290,10 @@ private fun isPublicHost(host: String): Boolean =
 
 private val DISALLOWED_SYNC_HOSTS = setOf("localhost", "127.0.0.1", "0.0.0.0", "::1")
 private val DISALLOWED_SYNC_HOST_PREFIXES = listOf("10.", "192.168.", "169.254.")
-private const val WIRED_DEFAULT_WEIGHT = 1.0
-private const val WIFI_DEFAULT_WEIGHT = 0.6
-private const val CELLULAR_DEFAULT_WEIGHT = 0.25
+internal const val DEFAULT_ONLINE_PEER_WEIGHT = 1.0
+private const val WIRED_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
+private const val WIFI_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
+private const val CELLULAR_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
 private const val OFFLINE_DEFAULT_WEIGHT = 0.0
 private const val UUID_BYTE_LENGTH = 16
 private const val UUID_VERSION_BYTE_INDEX = 6
@@ -264,7 +305,13 @@ private const val UUID_VARIANT_RFC4122_BITS = 0x80
 private const val HRW_SHIFT_BITS = 11
 private const val HRW_HALF_OFFSET = 0.5
 private const val IEEE754_MANTISSA_BITS = 53
+private const val MIN_PEER_WEIGHT = 0.2
 private const val MAX_PEER_WEIGHT = 10.0
+private const val MIN_MEASURED_ELAPSED_SECS = 0.05
+private const val ITEMS_PER_WORK_UNIT = 25.0
+private const val LIVENESS_GRACE_SECONDS = 120L
+private const val LIVENESS_DECAY_SECONDS = 180.0
+private const val OVERDUE_STEAL_SCALE = 4.0
 private const val FAILING_PEER_PENALTY_FACTOR = 0.05
 private const val RESCUE_PEER_BOOST_FACTOR = 2.0
 private const val HEALTHY_AFFINITY_FACTOR = 1.1

@@ -92,6 +92,23 @@ internal fun buildUpdateItemPayload(
 }
     .toString()
 
+internal fun buildUpdateFeedPayload(
+    title: String? = null,
+    pollInterval: Int? = null,
+    isActive: Boolean? = null,
+): String = buildJsonObject {
+    if (title != null) {
+        put(KEY_TITLE, title)
+    }
+    if (pollInterval != null) {
+        put(KEY_POLL_INTERVAL, pollInterval)
+    }
+    if (isActive != null) {
+        put(KEY_IS_ACTIVE, isActive)
+    }
+}
+    .toString()
+
 internal fun buildArchiveBatchPayload(
     itemIds: List<String>,
     feedId: String?,
