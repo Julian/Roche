@@ -19,25 +19,26 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
-import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.resolveArticleImageUrl
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.components.drawArticleImagePlaceholder
+import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.util.Locale
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
 
 internal sealed interface InlineImageLoadState {
     data object Loading : InlineImageLoadState
@@ -47,32 +48,22 @@ internal sealed interface InlineImageLoadState {
     data object Error : InlineImageLoadState
 }
 
-internal fun parseFigureBlocks(
-    figureInner: String,
+internal fun parseFigureElement(
+    figure: Element,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
 ) {
-    val captionMatch = FIGCAPTION_REGEX.find(figureInner)
-    val explicitCaption =
-        captionMatch
-            ?.groupValues
-            ?.get(1)
-            ?.let(::normalizeInlineBlockHtml)
-            ?.takeIf(::hasVisibleHtmlText)
-    val withoutCaption =
-        if (captionMatch != null) {
-            figureInner.removeRange(captionMatch.range)
-        } else {
-            figureInner
-        }
+    val figcaption = figure.selectFirst(TAG_FIGCAPTION)
+    val (explicitCaption, trailingCaptionBlocks) = splitFigcaptionContent(figcaption, baseUrl)
+    val withoutCaption = figure.clone()
+    withoutCaption.select(TAG_FIGCAPTION).remove()
 
-    val images =
-        IMG_TAG_REGEX.findAll(withoutCaption).mapNotNull { parseImgTag(it.value, baseUrl) }.toList()
-
-    if (images.isNotEmpty()) {
+    val images = withoutCaption.select(TAG_IMG).mapNotNull { parseImgElement(it, baseUrl) }
+    val hasCompositeBlocks = withoutCaption.selectFirst(COMPOSITE_FIGURE_QUERY) != null
+    if (images.isNotEmpty() && !hasCompositeBlocks) {
         val fallbackCaption =
             if (explicitCaption == null) {
-                normalizeInlineBlockHtml(withoutCaption).takeIf(::hasVisibleHtmlText)
+                normalizeDomElementInlineHtml(withoutCaption).takeIf(::hasVisibleHtmlText)
             } else {
                 null
             }
@@ -82,57 +73,165 @@ internal fun parseFigureBlocks(
             out.add(img.copy(captionHtml = attachedCaption))
         }
     } else {
-        val textFallback = normalizeInlineBlockHtml(figureInner)
-        if (hasVisibleHtmlText(textFallback)) {
-            out.add(ArticleBlock.Paragraph(textFallback))
-        }
+        appendCompositeFigureBlocks(withoutCaption, explicitCaption, baseUrl, out)
     }
+    out.addAll(trailingCaptionBlocks)
 }
 
-internal fun parseParagraphWithImages(
-    htmlFragment: String,
+internal fun splitFigcaptionContent(
+    figcaption: Element?,
+    baseUrl: String?,
+): Pair<String?, List<ArticleBlock>> {
+    if (figcaption == null) return null to emptyList()
+    if (figcaption.selectFirst(COMPOSITE_FIGURE_QUERY) == null) {
+        val caption = normalizeDomElementInlineHtml(figcaption).takeIf(::hasVisibleHtmlText)
+        return caption to emptyList()
+    }
+    val captionBox = Element(TAG_DIV)
+    val remainderBox = Element(TAG_DIV)
+    var inRemainder = false
+    for (node in figcaption.childNodes()) {
+        val hasCaptionAlready = hasVisibleDomText(captionBox)
+        if (!inRemainder && shouldBreakFigcaption(node, hasCaptionAlready)) {
+            inRemainder = true
+        }
+        if (inRemainder) {
+            remainderBox.appendChild(node.clone())
+        } else {
+            captionBox.appendChild(node.clone())
+        }
+    }
+    val caption = normalizeDomElementInlineHtml(captionBox).takeIf(::hasVisibleHtmlText)
+    val trailingBlocks = mutableListOf<ArticleBlock>()
+    walkDomContainer(remainderBox, baseUrl, trailingBlocks)
+    return caption to trailingBlocks
+}
+
+internal fun shouldBreakFigcaption(node: Node, hasCaptionAlready: Boolean): Boolean {
+    if (node !is Element) return false
+    val tag = node.normalName()
+    val hasEmbeddedBlock = node.selectFirst(COMPOSITE_FIGURE_QUERY) != null
+    return hasEmbeddedBlock ||
+        tag in COMPOSITE_CAPTION_BREAK_TAGS ||
+        tag == "p" && hasCaptionAlready
+}
+
+internal fun appendCompositeFigureBlocks(
+    withoutCaption: Element,
+    explicitCaption: String?,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
 ) {
-    if (!htmlFragment.contains("<img", ignoreCase = true)) {
-        val clean = stripMediaTags(htmlFragment).trim()
-        if (hasVisibleHtmlText(clean)) {
-            out.add(ArticleBlock.Paragraph(clean))
+    val figureBlocks = mutableListOf<ArticleBlock>()
+    walkDomContainer(withoutCaption, baseUrl, figureBlocks)
+    if (figureBlocks.isNotEmpty()) {
+        if (explicitCaption != null) {
+            attachFigureCaption(figureBlocks, explicitCaption)
         }
-        return
+        out.addAll(figureBlocks)
+    } else if (explicitCaption != null) {
+        out.add(ArticleBlock.Paragraph("<em>$explicitCaption</em>"))
     }
+}
 
-    var cursor = 0
-    for (match in INLINE_IMG_MATCH_REGEX.findAll(htmlFragment)) {
-        if (match.range.first > cursor) {
-            val textSlice =
-                cleanInlineTextSegment(htmlFragment.substring(cursor, match.range.first))
-            if (hasVisibleHtmlText(textSlice)) {
-                out.add(ArticleBlock.Paragraph(textSlice))
+internal fun attachFigureCaption(blocks: MutableList<ArticleBlock>, captionHtml: String) {
+    val lastIdx = blocks.lastIndex
+    when (val last = blocks[lastIdx]) {
+        is ArticleBlock.ImageBlock -> {
+            if (last.captionHtml == null) {
+                blocks[lastIdx] = last.copy(captionHtml = captionHtml)
+            } else {
+                blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
             }
         }
-        val imgTag = match.groupValues[1]
-        parseImgTag(imgTag, baseUrl)?.let { out.add(it) }
-        cursor = match.range.last + 1
-    }
-    if (cursor < htmlFragment.length) {
-        val tailSlice = cleanInlineTextSegment(htmlFragment.substring(cursor))
-        if (hasVisibleHtmlText(tailSlice)) {
-            out.add(ArticleBlock.Paragraph(tailSlice))
+        is ArticleBlock.Blockquote -> {
+            if (last.attributionHtml == null) {
+                blocks[lastIdx] = last.copy(attributionHtml = captionHtml)
+            } else {
+                blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
+            }
+        }
+        else -> {
+            blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
         }
     }
 }
 
-internal fun parseImgTag(imgTagHtml: String, baseUrl: String?): ArticleBlock.ImageBlock? {
-    val rawSrc = extractHtmlAttribute(imgTagHtml, "src")?.let(::decodeBasicHtmlEntities)
-    val width = extractHtmlAttribute(imgTagHtml, "width")?.let(::parseHtmlPixelDimension)
-    val height = extractHtmlAttribute(imgTagHtml, "height")?.let(::parseHtmlPixelDimension)
-    val classAttr = extractHtmlAttribute(imgTagHtml, "class")?.lowercase(Locale.US)
-    val alt =
-        (extractHtmlAttribute(imgTagHtml, "alt") ?: extractHtmlAttribute(imgTagHtml, "title"))
-            ?.let(::decodeBasicHtmlEntities)
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
+internal fun flushInlineNodes(
+    nodes: List<Node>,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+    splitDoubleBrIntoParagraphs: Boolean = false,
+) {
+    if (nodes.isEmpty()) return
+    val scratchDoc = Jsoup.parseBodyFragment("")
+    scratchDoc.outputSettings().prettyPrint(false)
+    val buffer = scratchDoc.body()
+
+    for (node in nodes) {
+        if (node is Element && node.normalName() == TAG_IMG) {
+            flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
+            parseImgElement(node, baseUrl)?.let { out.add(it) }
+        } else if (node is Element && node.selectFirst(TAG_IMG) != null) {
+            appendElementWithImages(
+                element = node,
+                buffer = buffer,
+                baseUrl = baseUrl,
+                out = out,
+                splitDoubleBrIntoParagraphs = splitDoubleBrIntoParagraphs,
+            )
+        } else {
+            buffer.appendChild(node.clone())
+        }
+    }
+    flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
+}
+
+internal fun appendElementWithImages(
+    element: Element,
+    buffer: Element,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+    splitDoubleBrIntoParagraphs: Boolean,
+) {
+    val images = element.select(TAG_IMG).mapNotNull { parseImgElement(it, baseUrl) }
+    if (hasVisibleDomText(element)) {
+        val textClone = element.clone()
+        textClone.select(TAG_IMG).remove()
+        buffer.appendChild(textClone)
+    }
+    flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
+    out.addAll(images)
+}
+
+internal fun flushInlineScratchBuffer(
+    buffer: Element,
+    out: MutableList<ArticleBlock>,
+    splitDoubleBrIntoParagraphs: Boolean,
+) {
+    if (buffer.childNodeSize() == 0) return
+    val normalized = normalizeDomElementInlineHtml(buffer)
+    buffer.empty()
+    if (!hasVisibleHtmlText(normalized)) return
+
+    if (splitDoubleBrIntoParagraphs && DOUBLE_BR_XHTML in normalized) {
+        for (segment in normalized.split(DOUBLE_BR_XHTML)) {
+            val trimmed = segment.trim()
+            if (hasVisibleHtmlText(trimmed)) {
+                out.add(ArticleBlock.Paragraph(trimmed))
+            }
+        }
+    } else {
+        out.add(ArticleBlock.Paragraph(normalized))
+    }
+}
+
+internal fun parseImgElement(img: Element, baseUrl: String?): ArticleBlock.ImageBlock? {
+    val rawSrc = img.attr("src").trim().takeIf { it.isNotEmpty() }
+    val width = img.attr("width").takeIf { it.isNotBlank() }?.let(::parseHtmlPixelDimension)
+    val height = img.attr("height").takeIf { it.isNotBlank() }?.let(::parseHtmlPixelDimension)
+    val classAttr = img.attr("class").lowercase(Locale.US)
+    val alt = img.attr("alt").ifBlank { img.attr("title") }.trim().takeIf { it.isNotEmpty() }
 
     val resolvedUrl = rawSrc?.let { resolveArticleImageUrl(it, baseUrl) }
     val isAllowedImage =
@@ -163,31 +262,13 @@ private fun isEmojiOrSmileyClass(classAttr: String?): Boolean =
             classAttr.contains("emoji") ||
             classAttr.contains("smiley"))
 
-private fun isFootnoteBackarrowAlt(alt: String?): Boolean = alt == "↩" || alt == "↩︎"
-
-internal fun extractHtmlAttribute(tagHtml: String, attrName: String): String? {
-    val pattern =
-        Regex(
-            """\b$attrName\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))""",
-            RegexOption.IGNORE_CASE,
-        )
-    val match = pattern.find(tagHtml) ?: return null
-    return match.groups[ATTR_GROUP_DOUBLE_QUOTED]?.value
-        ?: match.groups[ATTR_GROUP_SINGLE_QUOTED]?.value
-        ?: match.groups[ATTR_GROUP_UNQUOTED]?.value
-}
+internal fun isFootnoteBackarrowAlt(alt: String?): Boolean = alt == "↩" || alt == "↩︎"
 
 internal fun parseHtmlPixelDimension(raw: String): Int? {
     val trimmed = raw.trim()
     if (trimmed.endsWith("%")) return null
     return trimmed.removeSuffix("px").removeSuffix("PX").trim().toIntOrNull()?.takeIf { it > 0 }
 }
-
-private fun cleanInlineTextSegment(segment: String): String =
-    stripNonImageMediaTags(segment).replace(LEADING_TRAILING_BR_REGEX, "").trim()
-
-internal fun stripNonImageMediaTags(htmlFragment: String): String =
-    htmlFragment.replace(NON_IMG_MEDIA_TAG_REGEX, "")
 
 @Composable
 internal fun RenderImageBlock(block: ArticleBlock.ImageBlock, linkStyles: TextLinkStyles) {
@@ -275,6 +356,7 @@ private fun RenderErrorInlineImage(
 ) {
     if (block.captionHtml.isNullOrBlank() && block.alt.isNullOrBlank()) return
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val shape = RoundedCornerShape(8.dp)
     Column(modifier = Modifier.fillMaxWidth().testTag(READER_INLINE_IMAGE_TAG)) {
         if (!block.alt.isNullOrBlank()) {
@@ -290,8 +372,8 @@ private fun RenderErrorInlineImage(
                     text = block.alt,
                     color = colors.textMuted,
                     fontFamily = FontFamily.SansSerif,
-                    fontSize = 12.5.sp,
-                    lineHeight = 18.sp,
+                    fontSize = (12.5f * scale).sp,
+                    lineHeight = (18f * scale).sp,
                 )
             }
         }
@@ -303,25 +385,32 @@ private fun RenderErrorInlineImage(
 }
 
 private fun resolvePlaceholderAspectRatio(width: Int?, height: Int?): Float {
-    val w = width?.takeIf { it > 0 } ?: return DEFAULT_INLINE_ASPECT_RATIO
-    val h = height?.takeIf { it > 0 } ?: return DEFAULT_INLINE_ASPECT_RATIO
-    return (w.toFloat() / h.toFloat()).coerceIn(MIN_INLINE_ASPECT_RATIO, MAX_INLINE_ASPECT_RATIO)
+    val w = width?.takeIf { it > 0 }
+    val h = height?.takeIf { it > 0 }
+    return if (w != null && h != null) {
+        (w.toFloat() / h.toFloat()).coerceIn(MIN_INLINE_ASPECT_RATIO, MAX_INLINE_ASPECT_RATIO)
+    } else {
+        DEFAULT_INLINE_ASPECT_RATIO
+    }
 }
 
 @Composable
 private fun RenderImageCaption(captionHtml: String, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
     val annotated =
-        remember(captionHtml, linkStyles) {
-            AnnotatedString.fromHtml(htmlString = captionHtml, linkStyles = linkStyles)
-        }
+        rememberRichHtmlText(
+            html = captionHtml,
+            linkStyles = linkStyles,
+            codeBackground = colors.surfaceElevated,
+        )
     Text(
         text = annotated,
         color = colors.textSecondary,
         fontFamily = FontFamily.Serif,
         fontStyle = FontStyle.Italic,
-        fontSize = 13.sp,
-        lineHeight = 19.sp,
+        fontSize = (13f * scale).sp,
+        lineHeight = (19f * scale).sp,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
     )
 }
@@ -352,34 +441,15 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
     return state
 }
 
-private const val ATTR_GROUP_DOUBLE_QUOTED = 1
-private const val ATTR_GROUP_SINGLE_QUOTED = 2
-private const val ATTR_GROUP_UNQUOTED = 3
 private const val MIN_INLINE_IMG_DIMENSION_PX = 32
 private const val MIN_INLINE_ASPECT_RATIO = 0.25f
 private const val MAX_INLINE_ASPECT_RATIO = 5.0f
 private const val DEFAULT_INLINE_ASPECT_RATIO = 1.777f
 private const val READER_INLINE_IMAGE_TAG = "reader_inline_image"
-
-private val FIGCAPTION_REGEX =
-    Regex(
-        """<figcaption\b[^>]*>(.*?)</figcaption>""",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-
-private val IMG_TAG_REGEX = Regex("""<img\b[^>]*/?>""", RegexOption.IGNORE_CASE)
-
-private val INLINE_IMG_MATCH_REGEX =
-    Regex(
-        """(?:<a\b[^>]*>\s*)?(<img\b[^>]*/?>)(?:\s*</a>)?""",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-
-private val NON_IMG_MEDIA_TAG_REGEX =
-    Regex(
-        """<(?:svg\b[^>]*>.*?</svg>|iframe\b[^>]*>.*?</iframe>)""",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-
-private val LEADING_TRAILING_BR_REGEX =
-    Regex("""^(?:\s*<br\b[^>]*/?>\s*)+|(?:\s*<br\b[^>]*/?>\s*)+$""", RegexOption.IGNORE_CASE)
+private const val TAG_FIGCAPTION = "figcaption"
+private const val TAG_IMG = "img"
+private const val TAG_DIV = "div"
+private const val DOUBLE_BR_XHTML = "<br/><br/>"
+private const val COMPOSITE_FIGURE_QUERY = "blockquote, pre, table"
+private val COMPOSITE_CAPTION_BREAK_TAGS =
+    setOf("blockquote", "pre", "table", "ul", "ol", "hr", "figure", "div")

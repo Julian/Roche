@@ -111,6 +111,7 @@ android {
         disable += "NewerVersionAvailable"
         disable += "GradleDependency"
         disable += "AndroidGradlePluginVersion"
+        disable += "InvalidPackage"
     }
 
     testOptions {
@@ -182,6 +183,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.jsoup)
     implementation(libs.room3.runtime)
     implementation(libs.sqlite.framework)
     ksp(libs.room3.compiler)

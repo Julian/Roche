@@ -1,3 +1,5 @@
+@file:Suppress("LongMethod")
+
 package com.grayvines.roche.data
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
@@ -15,6 +17,7 @@ import com.grayvines.roche.ui.ArticleBlock
 import com.grayvines.roche.ui.MainViewModel
 import com.grayvines.roche.ui.extractInboxSnippet
 import com.grayvines.roche.ui.parseHtmlArticleBlocks
+import com.grayvines.roche.ui.prepareInlineHtmlForCompose
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -159,6 +162,120 @@ class RocheRssWorkflowTest {
             (blocks[2] as ArticleBlock.Paragraph).html,
         )
         assertEquals("Visible paragraph", (blocks[3] as ArticleBlock.Paragraph).html)
+    }
+
+    @Test
+    fun `parseHtmlArticleBlocks separates blockquote attribution from quote body`() {
+        val html =
+            "<blockquote>\n" +
+                "<p>We mathematicians need to put far greater effort into communicating " +
+                "mathematical ideas. To accomplish this, we need to pay much more attention " +
+                "to communicating not just our definitions, theorems, and proofs, but also " +
+                "our ways of thinking.</p>\n" +
+                "<cite>William P. Thurston, <em>On Proof and Progress in Mathematics</em> (1994)</cite></blockquote>" +
+                """<figure><blockquote>Agents make it easy to build personal tools.</blockquote>""" +
+                """<figcaption>— <a href="https://x.com/ycombinator">Y Combinator</a></figcaption></figure>""" +
+                """<blockquote><p>“Every child comes with the message that God is not yet discouraged of man.”</p><p>— Rabindranath Tagore</p></blockquote>""" +
+                """<blockquote><p>I watched <cite>Voyager</cite> last night.</p></blockquote>"""
+
+        val blocks = parseHtmlArticleBlocks(rawHtml = html)
+        assertEquals(4, blocks.size)
+
+        val xenaQuote = blocks[0] as ArticleBlock.Blockquote
+        assertEquals(
+            "We mathematicians need to put far greater effort into communicating mathematical ideas. " +
+                "To accomplish this, we need to pay much more attention to communicating not just " +
+                "our definitions, theorems, and proofs, but also our ways of thinking.",
+            xenaQuote.html,
+        )
+        assertEquals(
+            "William P. Thurston, <em>On Proof and Progress in Mathematics</em> (1994)",
+            xenaQuote.attributionHtml,
+        )
+
+        val figureQuote = blocks[1] as ArticleBlock.Blockquote
+        assertEquals("Agents make it easy to build personal tools.", figureQuote.html)
+        assertEquals(
+            """— <a href="https://x.com/ycombinator">Y Combinator</a>""",
+            figureQuote.attributionHtml,
+        )
+
+        val dashQuote = blocks[2] as ArticleBlock.Blockquote
+        assertEquals(
+            "“Every child comes with the message that God is not yet discouraged of man.”",
+            dashQuote.html,
+        )
+        assertEquals("— Rabindranath Tagore", dashQuote.attributionHtml)
+
+        val inlineCiteQuote = blocks[3] as ArticleBlock.Blockquote
+        assertEquals("I watched <cite>Voyager</cite> last night.", inlineCiteQuote.html)
+        assertEquals(null, inlineCiteQuote.attributionHtml)
+
+        val richHtml =
+            """<p>Assume <img src="https://s0.wp.com/latex.php?latex=p%5Cgeq+17" alt="p\geq 17">""" +
+                """ and smile <img src="https://s0.wp.com/wp-content/mu-plugins/wpcom-smileys/twemoji/2/svg/1f61b.svg" alt="😛">.</p>""" +
+                """<ol><li><img src="https://s0.wp.com/wp-content/mu-plugins/wpcom-smileys/twemoji/2/svg/1f389.svg" alt="🎉"> """ +
+                """<a href="#identifier_0_3289"><img src="https://s.w.org/images/core/emoji/17.0.2/72x72/21a9.png" alt="↩">︎</a></li></ol>""" +
+                "<ul><li>Outer 1<ul><li>Nested 1a</li><li>Nested 1b</li></ul></li><li>Outer 2</li></ul>" +
+                "<table><tbody><tr><td><pre>1\n2</pre></td>" +
+                "<td><pre><code>val x = 1\nval y = 2</code></pre></td></tr></tbody></table>" +
+                "<table><thead><tr><th>Name</th><th>Score</th></tr></thead>" +
+                "<tbody><tr><td>Alice</td><td>99</td></tr></tbody></table>"
+
+        val richBlocks = parseHtmlArticleBlocks(rawHtml = richHtml)
+        assertEquals(5, richBlocks.size)
+        assertEquals(
+            "Assume <em>p ≥ 17</em> and smile 😛.",
+            (richBlocks[0] as ArticleBlock.Paragraph).html,
+        )
+        assertEquals(
+            listOf("🎉"),
+            (richBlocks[1] as ArticleBlock.ListBlock).itemsHtml,
+        )
+        assertEquals(
+            listOf(
+                "Outer 1<br/>&nbsp;&nbsp;◦ Nested 1a<br/>&nbsp;&nbsp;◦ Nested 1b",
+                "Outer 2",
+            ),
+            (richBlocks[2] as ArticleBlock.ListBlock).itemsHtml,
+        )
+        assertEquals(
+            "val x = 1\nval y = 2",
+            (richBlocks[3] as ArticleBlock.CodeBlock).code,
+        )
+        val tableBlock = richBlocks[4] as ArticleBlock.TableBlock
+        assertEquals(listOf("Name", "Score"), tableBlock.headers)
+        assertEquals(listOf(listOf("Alice", "99")), tableBlock.rows)
+        assertEquals(
+            "Run <tt>cargo test</tt> with <tt>Ctrl+C</tt> for <em>x</em>",
+            prepareInlineHtmlForCompose(
+                "Run <code>cargo test</code> with <kbd>Ctrl+C</kbd> for <var>x</var>"
+            ),
+        )
+
+        val edgeHtml =
+            "<p>Check out\n<a href=\"https://example.com\">this tool</a>\nto run.</p>" +
+                "<ul><b><li>Bold item</li></b></ul>" +
+                "<dl><dt>Term</dt><dd>Definition</dd></dl>" +
+                "<blockquote><p>Before code</p><pre><code>val a = 1</code></pre><p>After code</p><cite>Author</cite></blockquote>"
+        val edgeBlocks = parseHtmlArticleBlocks(rawHtml = edgeHtml)
+        assertEquals(6, edgeBlocks.size)
+        assertEquals(
+            """Check out <a href="https://example.com">this tool</a> to run.""",
+            (edgeBlocks[0] as ArticleBlock.Paragraph).html,
+        )
+        assertEquals(
+            listOf("<b>Bold item</b>"),
+            (edgeBlocks[1] as ArticleBlock.ListBlock).itemsHtml,
+        )
+        assertEquals(
+            "<strong>Term</strong><br/>Definition",
+            (edgeBlocks[2] as ArticleBlock.Paragraph).html,
+        )
+        assertEquals("Before code", (edgeBlocks[3] as ArticleBlock.Blockquote).html)
+        assertEquals("val a = 1", (edgeBlocks[4] as ArticleBlock.CodeBlock).code)
+        assertEquals("After code", (edgeBlocks[5] as ArticleBlock.Blockquote).html)
+        assertEquals("Author", (edgeBlocks[5] as ArticleBlock.Blockquote).attributionHtml)
     }
 
     @Test

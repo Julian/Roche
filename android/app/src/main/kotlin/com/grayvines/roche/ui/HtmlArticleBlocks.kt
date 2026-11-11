@@ -24,13 +24,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,19 +36,32 @@ import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
+import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
 
 internal sealed interface ArticleBlock {
     data class Heading(val level: Int, val html: String) : ArticleBlock
 
     data class CodeBlock(val code: String) : ArticleBlock
 
-    data class Blockquote(val html: String) : ArticleBlock
+    data class Blockquote(val html: String, val attributionHtml: String? = null) : ArticleBlock
 
-    data class ListBlock(val ordered: Boolean, val itemsHtml: List<String>) : ArticleBlock
+    data class ListBlock(
+        val ordered: Boolean,
+        val itemsHtml: List<String>,
+        val startIndex: Int = 1,
+    ) : ArticleBlock
 
     data object HorizontalRule : ArticleBlock
 
     data class Paragraph(val html: String) : ArticleBlock
+
+    data class TableBlock(
+        val headers: List<String>,
+        val rows: List<List<String>>,
+    ) : ArticleBlock
 
     data class ImageBlock(
         val url: String,
@@ -65,175 +76,391 @@ internal fun extractInboxSnippet(rawSummary: String): String =
     if ('<' !in rawSummary && '&' !in rawSummary) {
         rawSummary.replace('\n', ' ').trim()
     } else {
-        AnnotatedString.fromHtml(rawSummary).text.replace('\n', ' ').trim()
+        Jsoup.parseBodyFragment(rawSummary).text().trim()
     }
 
 internal fun parseHtmlArticleBlocks(
     rawHtml: String,
     baseUrl: String? = null,
 ): List<ArticleBlock> {
-    val trimmed = rawHtml.trim()
-    if (trimmed.isEmpty()) return emptyList()
-
+    if (rawHtml.isBlank()) return emptyList()
+    val body = parsePreprocessedHtmlBody(rawHtml, baseUrl)
     val blocks = mutableListOf<ArticleBlock>()
-    var cursor = 0
-    for (match in TOP_BLOCK_REGEX.findAll(trimmed)) {
-        if (match.range.first > cursor) {
-            appendGapParagraphs(trimmed.substring(cursor, match.range.first), baseUrl, blocks)
-        }
-        appendMatchedBlocks(match, baseUrl, blocks)
-        cursor = match.range.last + 1
-    }
-    if (cursor < trimmed.length) {
-        appendGapParagraphs(trimmed.substring(cursor), baseUrl, blocks)
-    }
-    if (blocks.isEmpty()) {
-        parseParagraphWithImages(trimmed, baseUrl, blocks)
-    }
+    walkDomContainer(body, baseUrl, blocks)
     return blocks
 }
 
-internal fun appendMatchedBlocks(
-    match: MatchResult,
+internal fun walkDomContainer(
+    container: Element,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
 ) {
-    val preInner = match.groups[GROUP_PRE_INNER]?.value
-    if (preInner != null) {
-        val code = decodeHtmlCodeBlock(preInner)
-        if (code.isNotBlank()) {
-            out.add(ArticleBlock.CodeBlock(code))
+    val inlineNodes = mutableListOf<Node>()
+    for (node in container.childNodes()) {
+        if (node is Element && isBlockLevelTag(node.normalName())) {
+            flushInlineNodes(
+                nodes = inlineNodes,
+                baseUrl = baseUrl,
+                out = out,
+                splitDoubleBrIntoParagraphs = true,
+            )
+            inlineNodes.clear()
+            appendBlockElement(node, baseUrl, out)
+        } else {
+            inlineNodes.add(node)
         }
-        return
     }
-    if (match.groups[GROUP_HR]?.value != null) {
-        out.add(ArticleBlock.HorizontalRule)
-        return
-    }
-    val figureInner = match.groups[GROUP_FIGURE_INNER]?.value
-    if (figureInner != null) {
-        parseFigureBlocks(figureInner, baseUrl, out)
-        return
-    }
-    val paraInner = match.groups[GROUP_PARA_INNER]?.value
-    if (paraInner != null) {
-        parseParagraphWithImages(paraInner, baseUrl, out)
-        return
-    }
-    (parseHeadingOrQuoteBlock(match) ?: parseListBlock(match))?.let { out.add(it) }
+    flushInlineNodes(
+        nodes = inlineNodes,
+        baseUrl = baseUrl,
+        out = out,
+        splitDoubleBrIntoParagraphs = true,
+    )
 }
 
-internal fun parseHeadingOrQuoteBlock(match: MatchResult): ArticleBlock? {
-    val headingLevel = match.groups[GROUP_HEADING_LEVEL]?.value
-    val headingInner = match.groups[GROUP_HEADING_INNER]?.value
-    if (headingLevel != null && headingInner != null) {
-        val clean = stripMediaTags(headingInner).trim()
-        return clean
-            .takeIf { hasVisibleHtmlText(it) }
-            ?.let {
-                ArticleBlock.Heading(
-                    level = headingLevel.toIntOrNull()?.coerceIn(MIN_HEADING, MAX_HEADING) ?: 2,
-                    html = it,
-                )
-            }
-    }
-    val quoteInner = match.groups[GROUP_QUOTE_INNER]?.value ?: return null
-    val clean = normalizeInlineBlockHtml(quoteInner)
-    return clean.takeIf { hasVisibleHtmlText(it) }?.let { ArticleBlock.Blockquote(it) }
-}
+private fun isBlockLevelTag(tag: String): Boolean = tag in BLOCK_LEVEL_TAGS
 
-internal fun parseListBlock(match: MatchResult): ArticleBlock? {
-    val listTag = match.groups[GROUP_LIST_TAG]?.value
-    val listInner = match.groups[GROUP_LIST_INNER]?.value
-    if (listTag != null && listInner != null) {
-        val items =
-            LI_ITEM_REGEX.findAll(listInner)
-                .map { normalizeInlineBlockHtml(it.groupValues[1]) }
-                .filter { hasVisibleHtmlText(it) }
-                .toList()
-        return items
-            .takeIf { it.isNotEmpty() }
-            ?.let {
-                ArticleBlock.ListBlock(
-                    ordered = listTag.equals("ol", ignoreCase = true),
-                    itemsHtml = it,
-                )
-            }
-    }
-    return null
-}
-
-internal fun normalizeInlineBlockHtml(htmlFragment: String): String =
-    stripMediaTags(htmlFragment)
-        .replace(ADJACENT_P_TAGS_REGEX, "<br/><br/>")
-        .replace(SINGLE_P_TAG_REGEX, "")
-        .trim()
-
-internal fun appendGapParagraphs(
-    gapHtml: String,
+private fun appendBlockElement(
+    element: Element,
     baseUrl: String?,
     out: MutableList<ArticleBlock>,
 ) {
-    val cleanedGap = stripNonImageMediaTags(gapHtml).replace(CONTAINER_TAG_REGEX, "\n\n")
-    for (segment in cleanedGap.split(PARAGRAPH_BREAK_REGEX)) {
-        val trimmed = segment.trim()
-        if (trimmed.isNotEmpty()) {
-            parseParagraphWithImages(trimmed, baseUrl, out)
+    when (val tag = element.normalName()) {
+        "pre" -> appendPreBlock(element, out)
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6" -> parseHeadingElement(element, tag)?.let { out.add(it) }
+        "blockquote" -> appendQuoteBlocks(element, baseUrl, out)
+        "ul",
+        "ol" -> appendListBlocks(element, ordered = tag == "ol", baseUrl = baseUrl, out = out)
+        "dl" -> appendDefinitionListBlocks(element, baseUrl, out)
+        "dt" -> appendStandaloneTermBlock(element, out)
+        "hr" -> out.add(ArticleBlock.HorizontalRule)
+        "figure" -> parseFigureElement(element, baseUrl, out)
+        "p" ->
+            flushInlineNodes(
+                nodes = element.childNodes(),
+                baseUrl = baseUrl,
+                out = out,
+                splitDoubleBrIntoParagraphs = false,
+            )
+        "table" -> appendTableBlocks(element, out)
+        else -> walkDomContainer(element, baseUrl, out)
+    }
+}
+
+private fun appendPreBlock(element: Element, out: MutableList<ArticleBlock>) {
+    extractPreCodeText(element)
+        .takeIf { it.isNotBlank() }
+        ?.let { out.add(ArticleBlock.CodeBlock(it)) }
+}
+
+private fun parseHeadingElement(element: Element, tag: String): ArticleBlock.Heading? {
+    val cleanHtml = normalizeDomElementInlineHtml(element)
+    if (!hasVisibleHtmlText(cleanHtml)) return null
+    val level = tag.substring(1).toIntOrNull()?.coerceIn(MIN_HEADING, MAX_HEADING) ?: 2
+    return ArticleBlock.Heading(level = level, html = cleanHtml)
+}
+
+internal fun appendQuoteBlocks(
+    quoteElement: Element,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+    fallbackAttributionHtml: String? = null,
+) {
+    val clone = quoteElement.clone()
+    val extractedAttribution = extractQuoteAttribution(clone)
+    val attribution =
+        (extractedAttribution ?: fallbackAttributionHtml)?.takeIf(::hasVisibleHtmlText)
+    if (clone.selectFirst(EMBEDDED_QUOTE_BLOCKS_QUERY) == null) {
+        val cleanBody = normalizeDomElementInlineHtml(clone)
+        if (hasVisibleHtmlText(cleanBody)) {
+            out.add(ArticleBlock.Blockquote(html = cleanBody, attributionHtml = attribution))
+        }
+    } else {
+        appendComplexQuoteBlocks(clone, attribution, baseUrl, out)
+    }
+}
+
+internal fun appendComplexQuoteBlocks(
+    quoteClone: Element,
+    attribution: String?,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
+    val innerBlocks = mutableListOf<ArticleBlock>()
+    walkDomContainer(quoteClone, baseUrl, innerBlocks)
+    val coalesced = coalesceQuoteInnerBlocks(innerBlocks)
+    if (attribution != null) {
+        attachAttributionToQuote(coalesced, attribution)
+    }
+    out.addAll(coalesced)
+}
+
+internal fun coalesceQuoteInnerBlocks(innerBlocks: List<ArticleBlock>): MutableList<ArticleBlock> {
+    val result = mutableListOf<ArticleBlock>()
+    val pendingTextSegments = mutableListOf<String>()
+    for (block in innerBlocks) {
+        val fragment = quoteTextFragment(block)
+        if (fragment != null) {
+            pendingTextSegments.add(fragment)
+        } else {
+            flushQuoteTextSegments(pendingTextSegments, result)
+            result.add(block)
+        }
+    }
+    flushQuoteTextSegments(pendingTextSegments, result)
+    return result
+}
+
+internal fun flushQuoteTextSegments(
+    segments: MutableList<String>,
+    out: MutableList<ArticleBlock>,
+) {
+    if (segments.isNotEmpty()) {
+        val joined = segments.joinToString(DOUBLE_BR_XHTML)
+        segments.clear()
+        if (hasVisibleHtmlText(joined)) {
+            out.add(ArticleBlock.Blockquote(html = joined))
         }
     }
 }
 
-internal fun hasVisibleHtmlText(htmlFragment: String): Boolean {
-    if (htmlFragment.isBlank()) return false
-    val stripped = htmlFragment.replace(ANY_HTML_TAG_REGEX, "").replace("&nbsp;", " ").trim()
-    return stripped.isNotEmpty()
-}
-
-internal fun stripMediaTags(htmlFragment: String): String =
-    htmlFragment.replace(MEDIA_TAG_REGEX, "")
-
-internal fun decodeHtmlCodeBlock(rawPreInner: String): String {
-    val withNewlines = rawPreInner.replace(BR_TAG_REGEX, "\n")
-    val withoutTags = withNewlines.replace(ANY_HTML_TAG_REGEX, "")
-    return decodeBasicHtmlEntities(withoutTags).trim('\r', '\n')
-}
-
-internal fun decodeBasicHtmlEntities(text: String): String {
-    if ('&' !in text) return text
-    return ENTITY_REGEX.replace(text) { match ->
-        when (val entity = match.groupValues[1]) {
-            "lt" -> "<"
-            "gt" -> ">"
-            "amp" -> "&"
-            "quot" -> "\""
-            "apos",
-            "#39",
-            "#x27",
-            "#X27" -> "'"
-            "nbsp" -> " "
-            "mdash" -> "—"
-            "ndash" -> "–"
-            else -> decodeNumericEntity(entity) ?: match.value
-        }
-    }
-}
-
-private fun decodeNumericEntity(entity: String): String? =
-    when {
-        entity.startsWith("#x", ignoreCase = true) ->
-            entity
-                .substring(HEX_PREFIX_LEN)
-                .toIntOrNull(HEX_RADIX)
-                ?.takeIf { it in MIN_CODEPOINT..MAX_CODEPOINT }
-                ?.let { String(Character.toChars(it)) }
-        entity.startsWith("#") ->
-            entity
-                .substring(1)
-                .toIntOrNull()
-                ?.takeIf { it in MIN_CODEPOINT..MAX_CODEPOINT }
-                ?.let { String(Character.toChars(it)) }
+internal fun quoteTextFragment(block: ArticleBlock): String? =
+    when (block) {
+        is ArticleBlock.Paragraph -> block.html
+        is ArticleBlock.Heading -> ensureStrongHtml(block.html)
+        is ArticleBlock.Blockquote ->
+            if (block.attributionHtml != null) {
+                "${block.html}$BR_XHTML${block.attributionHtml}"
+            } else {
+                block.html
+            }
+        is ArticleBlock.ListBlock ->
+            block.itemsHtml
+                .mapIndexed { idx, item ->
+                    val marker = if (block.ordered) "${block.startIndex + idx}." else "•"
+                    "$marker $item"
+                }
+                .joinToString(BR_XHTML)
         else -> null
     }
+
+internal fun attachAttributionToQuote(
+    blocks: MutableList<ArticleBlock>,
+    attributionHtml: String,
+) {
+    val lastQuoteIndex = blocks.indexOfLast { it is ArticleBlock.Blockquote }
+    if (lastQuoteIndex >= 0) {
+        val quote = blocks[lastQuoteIndex] as ArticleBlock.Blockquote
+        blocks[lastQuoteIndex] = quote.copy(attributionHtml = attributionHtml)
+    } else {
+        blocks.add(ArticleBlock.Blockquote(html = attributionHtml))
+    }
+}
+
+internal fun extractQuoteAttribution(quoteClone: Element): String? {
+    val lastElement = quoteClone.children().lastOrNull() ?: return null
+    val bodyProbe = quoteClone.clone()
+    bodyProbe.children().lastOrNull()?.remove()
+    val canExtract = !hasTrailingVisibleTextAfter(lastElement) && hasVisibleDomText(bodyProbe)
+    return if (canExtract) {
+        extractTrailingAttributionHtml(lastElement, bodyProbe.text())
+    } else {
+        null
+    }
+}
+
+internal fun extractTrailingAttributionHtml(
+    lastElement: Element,
+    precedingBodyPlainText: String,
+): String? {
+    val tag = lastElement.normalName()
+    val isCitationTag = tag == TAG_CITE || tag == "footer" || tag == "figcaption"
+    val isCiteParagraph = tag == "p" && startsWithCiteElement(lastElement)
+    val isDashParagraph =
+        tag == "p" &&
+            startsWithAttributionDashText(lastElement.text()) &&
+            !startsWithAttributionDashText(precedingBodyPlainText)
+
+    return if (isCitationTag || isCiteParagraph || isDashParagraph) {
+        lastElement.remove()
+        val attrClone = lastElement.clone()
+        if (isCitationTag || isCiteParagraph) {
+            attrClone.select(TAG_CITE).forEach {
+                if (it != attrClone) {
+                    it.unwrap()
+                }
+            }
+        }
+        normalizeDomElementInlineHtml(attrClone)
+    } else {
+        null
+    }
+}
+
+internal fun hasTrailingVisibleTextAfter(child: Element): Boolean {
+    var sibling = child.nextSibling()
+    var hasText = false
+    while (sibling != null && !hasText) {
+        hasText = sibling is TextNode && sibling.wholeText.isNotBlank()
+        sibling = sibling.nextSibling()
+    }
+    return hasText
+}
+
+internal fun startsWithCiteElement(element: Element): Boolean {
+    val firstMeaningfulNode =
+        element.childNodes().firstOrNull { node ->
+            when (node) {
+                is TextNode -> stripAttributionDashPrefix(node.wholeText).trim().isNotEmpty()
+                is Element -> true
+                else -> false
+            }
+        }
+    return firstMeaningfulNode is Element && firstMeaningfulNode.normalName() == TAG_CITE
+}
+
+internal fun startsWithAttributionDashText(plainText: String): Boolean {
+    val trimmed = plainText.replace('\u00A0', ' ').trimStart()
+    return trimmed.startsWith("—") || trimmed.startsWith("–") || trimmed.startsWith("-- ")
+}
+
+internal fun stripAttributionDashPrefix(text: String): String =
+    text.replace('\u00A0', ' ').trimStart().removePrefix("—").removePrefix("–").removePrefix("--")
+
+internal fun appendListBlocks(
+    listElement: Element,
+    ordered: Boolean,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
+    val liElements = selectOwnListItems(listElement)
+    if (liElements.isEmpty()) {
+        walkDomContainer(listElement, baseUrl, out)
+        return
+    }
+    var nextIndex = listElement.attr("start").toIntOrNull()?.takeIf { it > 0 } ?: 1
+    val currentItems = mutableListOf<String>()
+    for (li in liElements) {
+        val itemHtml = formatListItemElementHtml(li, listElement)
+        if (hasVisibleHtmlText(itemHtml)) {
+            currentItems.add(itemHtml)
+        }
+        val liImages = li.select("img").mapNotNull { parseImgElement(it, baseUrl) }
+        if (liImages.isNotEmpty()) {
+            nextIndex = flushListItems(ordered, nextIndex, currentItems, out)
+            out.addAll(liImages)
+        }
+    }
+    flushListItems(ordered, nextIndex, currentItems, out)
+}
+
+internal fun flushListItems(
+    ordered: Boolean,
+    startIndex: Int,
+    currentItems: MutableList<String>,
+    out: MutableList<ArticleBlock>,
+): Int {
+    if (currentItems.isEmpty()) return startIndex
+    val nextIndex = startIndex + currentItems.size
+    out.add(
+        ArticleBlock.ListBlock(
+            ordered = ordered,
+            itemsHtml = currentItems.toList(),
+            startIndex = startIndex,
+        )
+    )
+    currentItems.clear()
+    return nextIndex
+}
+
+internal fun appendDefinitionListBlocks(
+    dlElement: Element,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
+    val dlClone = dlElement.clone()
+    for (wrapper in dlClone.children().filter { it.normalName() == "div" }) {
+        wrapper.unwrap()
+    }
+    var pendingTermHtml: String? = null
+    for (child in dlClone.children()) {
+        when (child.normalName()) {
+            "dt" -> {
+                if (pendingTermHtml != null) {
+                    out.add(ArticleBlock.Paragraph(ensureStrongHtml(pendingTermHtml)))
+                }
+                pendingTermHtml = normalizeDomElementInlineHtml(child).takeIf(::hasVisibleHtmlText)
+            }
+            "dd" -> {
+                appendDefinitionDescBlocks(child, pendingTermHtml, baseUrl, out)
+                pendingTermHtml = null
+            }
+            else -> {
+                walkDomContainer(child, baseUrl, out)
+            }
+        }
+    }
+    if (pendingTermHtml != null) {
+        out.add(ArticleBlock.Paragraph(ensureStrongHtml(pendingTermHtml)))
+    }
+}
+
+private fun appendDefinitionDescBlocks(
+    ddElement: Element,
+    pendingTermHtml: String?,
+    baseUrl: String?,
+    out: MutableList<ArticleBlock>,
+) {
+    val ddBlocks = mutableListOf<ArticleBlock>()
+    walkDomContainer(ddElement, baseUrl, ddBlocks)
+    if (pendingTermHtml != null) {
+        val termHtml = ensureStrongHtml(pendingTermHtml)
+        val firstBlock = ddBlocks.firstOrNull()
+        if (firstBlock is ArticleBlock.Paragraph) {
+            ddBlocks[0] = ArticleBlock.Paragraph("$termHtml$BR_XHTML${firstBlock.html}")
+        } else {
+            ddBlocks.add(0, ArticleBlock.Paragraph(termHtml))
+        }
+    }
+    out.addAll(ddBlocks)
+}
+
+private fun appendStandaloneTermBlock(element: Element, out: MutableList<ArticleBlock>) {
+    normalizeDomElementInlineHtml(element).takeIf(::hasVisibleHtmlText)?.let {
+        out.add(ArticleBlock.Paragraph(ensureStrongHtml(it)))
+    }
+}
+
+private fun appendTableBlocks(element: Element, out: MutableList<ArticleBlock>) {
+    val tableBlock = parseTableElement(element) ?: return
+    val caption =
+        element
+            .children()
+            .firstOrNull { it.normalName() == "caption" }
+            ?.let { normalizeDomElementInlineHtml(it) }
+            ?.takeIf(::hasVisibleHtmlText)
+    if (caption != null) {
+        out.add(ArticleBlock.Paragraph(ensureStrongHtml(caption)))
+    }
+    out.add(tableBlock)
+}
+
+internal fun hasVisibleDomText(element: Element): Boolean =
+    element.text().replace('\u00A0', ' ').isNotBlank()
+
+internal fun hasVisibleHtmlText(htmlFragment: String): Boolean =
+    htmlFragment.isNotBlank() && hasVisibleDomText(Jsoup.parseBodyFragment(htmlFragment).body())
+
+internal fun extractPreCodeText(preElement: Element): String {
+    val clone = preElement.clone()
+    clone.select("br").forEach { it.replaceWith(TextNode("\n")) }
+    return clone.wholeText().trim('\r', '\n')
+}
 
 @Composable
 internal fun StructuredHtmlArticleContent(blocks: List<ArticleBlock>) {
@@ -271,6 +498,7 @@ private fun RenderArticleBlock(block: ArticleBlock, linkStyles: TextLinkStyles) 
             )
         is ArticleBlock.Paragraph ->
             RenderParagraphBlock(html = block.html, linkStyles = linkStyles)
+        is ArticleBlock.TableBlock -> RenderTableBlock(block = block, linkStyles = linkStyles)
         is ArticleBlock.ImageBlock -> RenderImageBlock(block = block, linkStyles = linkStyles)
     }
 }
@@ -286,9 +514,11 @@ internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLin
             FontFamily.SansSerif
         }
     val annotated =
-        remember(block.html, linkStyles) {
-            AnnotatedString.fromHtml(htmlString = block.html, linkStyles = linkStyles)
-        }
+        rememberRichHtmlText(
+            html = block.html,
+            linkStyles = linkStyles,
+            codeBackground = colors.surfaceElevated,
+        )
     val baseFontSize =
         when (block.level) {
             1 -> 20.5f
@@ -341,9 +571,21 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val annotated =
-        remember(block.html, linkStyles) {
-            AnnotatedString.fromHtml(htmlString = block.html, linkStyles = linkStyles)
-        }
+        rememberRichHtmlText(
+            html = block.html,
+            linkStyles = linkStyles,
+            codeBackground = colors.surfaceElevated,
+        )
+    val attributionAnnotated =
+        block.attributionHtml
+            ?.takeIf { it.isNotBlank() }
+            ?.let {
+                rememberRichHtmlText(
+                    html = it,
+                    linkStyles = linkStyles,
+                    codeBackground = colors.surfaceElevated,
+                )
+            }
     Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
         Box(
             modifier =
@@ -353,15 +595,29 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
                     .background(colors.accentVerdigris)
         )
         Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = annotated,
-            color = colors.textSecondary,
-            fontFamily = FontFamily.Serif,
-            fontStyle = FontStyle.Italic,
-            fontSize = (15.5f * scale).sp,
-            lineHeight = (24.5f * scale).sp,
+        Column(
             modifier = Modifier.weight(1f),
-        )
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = annotated,
+                color = colors.textSecondary,
+                fontFamily = FontFamily.Serif,
+                fontStyle = FontStyle.Italic,
+                fontSize = (15.5f * scale).sp,
+                lineHeight = (24.5f * scale).sp,
+            )
+            if (attributionAnnotated != null) {
+                Text(
+                    text = attributionAnnotated,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Serif,
+                    fontStyle = FontStyle.Normal,
+                    fontSize = (13.5f * scale).sp,
+                    lineHeight = (20f * scale).sp,
+                )
+            }
+        }
     }
 }
 
@@ -371,11 +627,13 @@ internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLink
     val scale = LocalReaderFontScale.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         block.itemsHtml.forEachIndexed { index, itemHtml ->
-            val marker = if (block.ordered) "${index + 1}." else "•"
+            val marker = if (block.ordered) "${block.startIndex + index}." else "•"
             val annotated =
-                remember(itemHtml, linkStyles) {
-                    AnnotatedString.fromHtml(htmlString = itemHtml, linkStyles = linkStyles)
-                }
+                rememberRichHtmlText(
+                    html = itemHtml,
+                    linkStyles = linkStyles,
+                    codeBackground = colors.surfaceElevated,
+                )
             Row(modifier = Modifier.fillMaxWidth()) {
                 Text(
                     text = marker,
@@ -403,9 +661,11 @@ internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val annotated =
-        remember(html, linkStyles) {
-            AnnotatedString.fromHtml(htmlString = html, linkStyles = linkStyles)
-        }
+        rememberRichHtmlText(
+            html = html,
+            linkStyles = linkStyles,
+            codeBackground = colors.surfaceElevated,
+        )
     Text(
         text = annotated,
         color = colors.textPrimary,
@@ -415,64 +675,156 @@ internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
     )
 }
 
+@Composable
+internal fun RenderTableBlock(block: ArticleBlock.TableBlock, linkStyles: TextLinkStyles) {
+    val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
+    val colWidths = remember(block) { computeTableColumnWidths(block) }
+    if (colWidths.isEmpty()) return
+
+    Box(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(colors.surface)
+                .border(1.dp, colors.border, RoundedCornerShape(8.dp))
+                .horizontalScroll(rememberScrollState())
+    ) {
+        Column {
+            if (block.headers.isNotEmpty()) {
+                RenderTableRow(
+                    cells = block.headers,
+                    colWidths = colWidths,
+                    isHeader = true,
+                    scale = scale,
+                    linkStyles = linkStyles,
+                )
+                if (block.rows.isNotEmpty()) {
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+            }
+            block.rows.forEachIndexed { index, row ->
+                RenderTableRow(
+                    cells = row,
+                    colWidths = colWidths,
+                    isHeader = false,
+                    scale = scale,
+                    linkStyles = linkStyles,
+                )
+                if (index < block.rows.lastIndex) {
+                    HorizontalDivider(color = colors.border, thickness = 0.5.dp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenderTableRow(
+    cells: List<String>,
+    colWidths: List<Int>,
+    isHeader: Boolean,
+    scale: Float,
+    linkStyles: TextLinkStyles,
+) {
+    val colors = LocalRocheColors.current
+    val rowBackground = if (isHeader) colors.surfaceElevated else colors.surface
+    Row(
+        modifier =
+            Modifier.background(rowBackground)
+                .padding(horizontal = 10.dp, vertical = if (isHeader) 8.dp else 7.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        colWidths.forEachIndexed { colIndex, widthDp ->
+            val cellHtml = cells.getOrNull(colIndex).orEmpty()
+            val annotated =
+                rememberRichHtmlText(
+                    html = cellHtml,
+                    linkStyles = linkStyles,
+                    codeBackground = colors.surfaceElevated,
+                )
+            Text(
+                text = annotated,
+                color = if (isHeader) colors.textPrimary else colors.textSecondary,
+                fontFamily = if (isHeader) FontFamily.SansSerif else FontFamily.Serif,
+                fontWeight = if (isHeader) FontWeight.SemiBold else FontWeight.Normal,
+                fontSize = (13.5f * scale).sp,
+                lineHeight = (20f * scale).sp,
+                modifier = Modifier.width(widthDp.dp),
+            )
+        }
+    }
+}
+
+internal fun computeTableColumnWidths(block: ArticleBlock.TableBlock): List<Int> {
+    val columnCount =
+        maxOf(
+            block.headers.size,
+            block.rows.maxOfOrNull { it.size } ?: 0,
+        )
+    if (columnCount == 0) return emptyList()
+    return (0 until columnCount).map { colIndex ->
+        val headerLen = plainCellLength(block.headers.getOrNull(colIndex))
+        val maxRowLen = block.rows.maxOfOrNull { plainCellLength(it.getOrNull(colIndex)) } ?: 0
+        val maxChars = maxOf(headerLen, maxRowLen)
+        (maxChars * TABLE_CHAR_WIDTH_DP + TABLE_CELL_PADDING_DP).coerceIn(
+            MIN_TABLE_COL_WIDTH_DP,
+            MAX_TABLE_COL_WIDTH_DP,
+        )
+    }
+}
+
+internal fun plainCellLength(cellHtml: String?): Int {
+    if (cellHtml.isNullOrBlank()) return 0
+    val doc = Jsoup.parseBodyFragment(cellHtml)
+    doc.select("br").forEach { it.replaceWith(TextNode("\n")) }
+    return doc.body().wholeText().lines().maxOfOrNull { it.trim().length } ?: 0
+}
+
 internal fun extractPlainTextHeadings(blocks: List<ArticleBlock>): List<String> =
     blocks
         .filterIsInstance<ArticleBlock.Heading>()
-        .map { heading ->
-            decodeBasicHtmlEntities(heading.html.replace(ANY_HTML_TAG_REGEX, " "))
-                .replace(Regex("""\s+"""), " ")
-                .trim()
-        }
+        .map { heading -> Jsoup.parseBodyFragment(heading.html).text().trim() }
         .filter { it.isNotEmpty() }
         .distinct()
 
-private const val GROUP_PRE_INNER = 1
-private const val GROUP_HEADING_LEVEL = 2
-private const val GROUP_HEADING_INNER = 3
-private const val GROUP_QUOTE_INNER = 4
-private const val GROUP_LIST_TAG = 5
-private const val GROUP_LIST_INNER = 6
-private const val GROUP_HR = 7
-private const val GROUP_FIGURE_INNER = 8
-private const val GROUP_PARA_INNER = 9
-
 private const val MIN_HEADING = 1
 private const val MAX_HEADING = 6
-private const val HEX_PREFIX_LEN = 2
-private const val HEX_RADIX = 16
-private const val MIN_CODEPOINT = 1
-private const val MAX_CODEPOINT = 0x10FFFF
+private const val TABLE_CHAR_WIDTH_DP = 7
+private const val TABLE_CELL_PADDING_DP = 24
+private const val MIN_TABLE_COL_WIDTH_DP = 72
+private const val MAX_TABLE_COL_WIDTH_DP = 240
+private const val TAG_CITE = "cite"
+private const val BR_XHTML = "<br/>"
+private const val DOUBLE_BR_XHTML = "<br/><br/>"
+private const val EMBEDDED_QUOTE_BLOCKS_QUERY = "pre, img, figure, table"
 
-private val TOP_BLOCK_REGEX =
-    Regex(
-        """<pre\b[^>]*>(.*?)</pre>|<h([1-6])\b[^>]*>(.*?)</h\2>|<blockquote\b[^>]*>(.*?)</blockquote>|<(ul|ol)\b[^>]*>(.*?)</\5>|(<hr\b[^>]*/?>)|<figure\b[^>]*>(.*?)</figure>|<p\b[^>]*>(.*?)</p>""",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+private val BLOCK_LEVEL_TAGS =
+    setOf(
+        "pre",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "blockquote",
+        "ul",
+        "ol",
+        "hr",
+        "figure",
+        "p",
+        "table",
+        "div",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "main",
+        "aside",
+        "center",
+        "nav",
+        "dl",
+        "dd",
+        "dt",
     )
-
-private val LI_ITEM_REGEX =
-    Regex("""<li\b[^>]*>(.*?)</li>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
-
-private val BR_TAG_REGEX = Regex("""<br\b[^>]*/?>""", RegexOption.IGNORE_CASE)
-
-private val MEDIA_TAG_REGEX =
-    Regex(
-        """<(?:figure\b[^>]*>.*?</figure>|img\b[^>]*/?>|svg\b[^>]*>.*?</svg>|iframe\b[^>]*>.*?</iframe>)""",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-
-private val CONTAINER_TAG_REGEX =
-    Regex(
-        """</?(?:div|section|article|header|footer|main|aside|details|summary|center|span)\b[^>]*>""",
-        RegexOption.IGNORE_CASE,
-    )
-
-private val PARAGRAPH_BREAK_REGEX =
-    Regex("""(?:<br\b[^>]*/?>\s*){2,}|\n\s*\n""", RegexOption.IGNORE_CASE)
-
-private val ANY_HTML_TAG_REGEX = Regex("""<[^>]+>""")
-
-private val ADJACENT_P_TAGS_REGEX = Regex("""</p>\s*<p\b[^>]*>""", RegexOption.IGNORE_CASE)
-
-private val SINGLE_P_TAG_REGEX = Regex("""</?p\b[^>]*>""", RegexOption.IGNORE_CASE)
-
-private val ENTITY_REGEX = Regex("""&([a-zA-Z0-9#]+);""")
