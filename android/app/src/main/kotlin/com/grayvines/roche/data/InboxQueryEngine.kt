@@ -38,6 +38,7 @@ internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean
         InboxFilter.ARTICLES -> !entry.isArchived && entry.contentType == ContentType.ARTICLE
         InboxFilter.PAPERS -> !entry.isArchived && entry.contentType == ContentType.PDF
         InboxFilter.VIDEOS -> !entry.isArchived && entry.contentType == ContentType.VIDEO
+        InboxFilter.PODCASTS -> !entry.isArchived && entry.contentType == ContentType.AUDIO
         InboxFilter.STARRED -> entry.isFavorite
         InboxFilter.ARCHIVED -> entry.isArchived
     }
@@ -49,6 +50,7 @@ internal enum class SearchScopeFilter(val label: String) {
     ARTICLES("Articles"),
     PAPERS("Papers"),
     VIDEOS("Videos"),
+    PODCASTS("Podcasts"),
 }
 
 internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilter): Boolean =
@@ -59,6 +61,7 @@ internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilte
         SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
         SearchScopeFilter.PAPERS -> entry.contentType == ContentType.PDF
         SearchScopeFilter.VIDEOS -> entry.contentType == ContentType.VIDEO
+        SearchScopeFilter.PODCASTS -> entry.contentType == ContentType.AUDIO
     }
 
 internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boolean {

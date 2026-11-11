@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -41,6 +43,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -48,10 +53,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.ui.components.BottomTabIcon
+import com.grayvines.roche.ui.components.DownloadTrayIcon
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
@@ -139,10 +146,13 @@ internal fun InboxEntryListBody(
                     entry = entry,
                     ultraDense = state.settings.ultraDenseRows,
                     swipeToArchiveEnabled = state.settings.swipeToArchive,
+                    isPlayingAudio = entry.id == state.playerState.currentEntryId,
+                    isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
                     onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                     onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                     onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                     onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                    onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                 )
                 HorizontalDivider(color = colors.border, thickness = 1.dp)
             }
@@ -422,15 +432,21 @@ internal fun InboxEntryRowItem(
     onLongPress: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    isPlayingAudio: Boolean = false,
+    isQueuedNextAudio: Boolean = false,
+    onDownloadOffline: (() -> Unit)? = null,
 ) {
     if (!swipeToArchiveEnabled) {
         InboxEntryRowSurface(
             entry = entry,
             ultraDense = ultraDense,
+            isPlayingAudio = isPlayingAudio,
+            isQueuedNextAudio = isQueuedNextAudio,
             onOpen = onOpen,
             onLongPress = onLongPress,
             onToggleStar = onToggleStar,
             onToggleArchive = onToggleArchive,
+            onDownloadOffline = onDownloadOffline,
         )
         return
     }
@@ -466,10 +482,13 @@ internal fun InboxEntryRowItem(
         InboxEntryRowSurface(
             entry = entry,
             ultraDense = ultraDense,
+            isPlayingAudio = isPlayingAudio,
+            isQueuedNextAudio = isQueuedNextAudio,
             onOpen = onOpen,
             onLongPress = onLongPress,
             onToggleStar = onToggleStar,
             onToggleArchive = onToggleArchive,
+            onDownloadOffline = onDownloadOffline,
         )
     }
 }
@@ -479,26 +498,60 @@ internal fun InboxEntryRowItem(
 private fun InboxEntryRowSurface(
     entry: InboxEntry,
     ultraDense: Boolean,
+    isPlayingAudio: Boolean,
+    isQueuedNextAudio: Boolean,
     onOpen: () -> Unit,
     onLongPress: () -> Unit,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    onDownloadOffline: (() -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
     val verticalPadding = if (ultraDense) 9.dp else 12.dp
     val rowAlpha = if (entry.isArchived) ARCHIVED_ROW_ALPHA else 1f
+    val rowBackground =
+        when {
+            isPlayingAudio -> colors.accentBlue.copy(alpha = 0.12f)
+            isQueuedNextAudio -> colors.accentVerdigris.copy(alpha = 0.11f)
+            else -> colors.background
+        }
+    val leftAccentColor =
+        when {
+            isPlayingAudio -> colors.accentBlue
+            isQueuedNextAudio -> colors.accentVerdigris
+            else -> null
+        }
 
     Row(
         modifier =
             Modifier.fillMaxWidth()
-                .background(colors.background)
+                .background(rowBackground)
+                .drawBehind {
+                    if (leftAccentColor != null) {
+                        drawRect(
+                            color = leftAccentColor,
+                            topLeft = Offset.Zero,
+                            size = Size(width = 3.dp.toPx(), height = size.height),
+                        )
+                    }
+                }
                 .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
-                .padding(horizontal = 16.dp, vertical = verticalPadding)
+                .padding(
+                    start = 10.dp,
+                    end = 12.dp,
+                    top = verticalPadding,
+                    bottom = verticalPadding,
+                )
                 .alpha(rowAlpha)
                 .testTag("entry_row_${entry.id}"),
         verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        EntryLeadingStarButton(
+            entry = entry,
+            onToggleStar = onToggleStar,
+        )
+
         if (entry.showsThumbnailPreview) {
             EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
         }
@@ -509,41 +562,67 @@ private fun InboxEntryRowSurface(
             modifier = Modifier.weight(1f),
         )
 
-        EntryPrimaryActionButtons(
+        EntryTrailingActionButtons(
             entry = entry,
-            onToggleStar = onToggleStar,
+            onDownloadOffline = onDownloadOffline,
             onToggleArchive = onToggleArchive,
         )
     }
 }
 
 @Composable
-private fun EntryPrimaryActionButtons(
+private fun EntryLeadingStarButton(
     entry: InboxEntry,
     onToggleStar: () -> Unit,
-    onToggleArchive: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val starDescription = if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}"
+    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
+
+    RocheIconActionButton(
+        contentDescription = starDescription,
+        onClick = onToggleStar,
+        outlined = false,
+        modifier = Modifier.testTag("star_btn_${entry.id}"),
+    ) {
+        StarIcon(
+            tint = starTint,
+            isStarred = entry.isFavorite,
+            size = 17.dp,
+        )
+    }
+}
+
+@Composable
+private fun EntryTrailingActionButtons(
+    entry: InboxEntry,
+    onDownloadOffline: (() -> Unit)?,
+    onToggleArchive: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
     val archiveDescription =
         if (entry.isArchived) "Unarchive ${entry.title}" else "Archive ${entry.title}"
-    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        RocheIconActionButton(
-            contentDescription = starDescription,
-            onClick = onToggleStar,
-            outlined = false,
-            modifier = Modifier.testTag("star_btn_${entry.id}"),
+        if (
+            entry.contentType == ContentType.AUDIO &&
+                !entry.isCachedOffline &&
+                onDownloadOffline != null
         ) {
-            StarIcon(
-                tint = starTint,
-                isStarred = entry.isFavorite,
-                size = 17.dp,
-            )
+            RocheIconActionButton(
+                contentDescription = "Download ${entry.title}",
+                onClick = onDownloadOffline,
+                outlined = false,
+                modifier = Modifier.testTag("download_btn_${entry.id}"),
+            ) {
+                DownloadTrayIcon(
+                    tint = colors.accentBlue,
+                    size = 17.dp,
+                )
+            }
         }
         RocheIconActionButton(
             contentDescription = archiveDescription,
@@ -567,24 +646,12 @@ private fun InboxEntryTextColumn(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
-    val (titleColor, titleWeight) =
-        if (entry.isUnread) {
-            colors.textPrimary to FontWeight.SemiBold
-        } else {
-            colors.textSecondary to FontWeight.Normal
-        }
+    val isSerif = LocalHeadlineFont.current == HeadlineFont.SERIF
+    val headlineFamily = if (isSerif) FontFamily.Serif else FontFamily.SansSerif
+    val titleColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
+    val titleWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Normal
     val (titleSize, titleLineHeight, maxTitleLines) =
-        if (ultraDense) {
-            Triple(14.sp, 19.sp, 1)
-        } else {
-            Triple(15.5.sp, 21.sp, 2)
-        }
+        if (ultraDense) Triple(14.sp, 19.sp, 1) else Triple(15.5.sp, 21.sp, 2)
     val snippet =
         androidx.compose.runtime.remember(entry.summary, ultraDense) {
             if (ultraDense) "" else extractInboxSnippet(entry.summary.orEmpty())
@@ -612,6 +679,18 @@ private fun InboxEntryTextColumn(
                 lineHeight = 17.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        entry.formattedListeningHistoryLabel?.let { historyLabel ->
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = historyLabel,
+                color = colors.accentVerdigris,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.testTag("listening_history_badge_${entry.id}"),
             )
         }
     }

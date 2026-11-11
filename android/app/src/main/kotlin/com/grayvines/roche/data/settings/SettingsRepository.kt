@@ -61,9 +61,14 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             prefs[KEY_READER_FONT_SCALE] = updated.readerFontScale
             prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
             prefs[KEY_LAST_PEER_SYNC_CURSOR] = updated.lastPeerSyncCursor
+            prefs[KEY_QUEUE_ITEM_IDS] = updated.queueItemIds.joinToString(",")
+            prefs[KEY_DEFAULT_PLAYBACK_SPEED] = updated.defaultPlaybackSpeed
+            prefs[KEY_SKIP_SILENCE_ENABLED] = updated.skipSilenceEnabled
+            prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
         }
     }
 
+    @Suppress("CyclomaticComplexMethod")
     private fun Preferences.toSettings(): Settings =
         Settings(
                 serverUrl = this[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
@@ -92,6 +97,17 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                             .let { AppTab.normalizeSideTabs(it) }
                     } ?: AppTab.defaultSideTabs,
                 lastPeerSyncCursor = this[KEY_LAST_PEER_SYNC_CURSOR].orEmpty(),
+                queueItemIds =
+                    this[KEY_QUEUE_ITEM_IDS]
+                        ?.split(',')
+                        ?.map { it.trim() }
+                        ?.filter { it.isNotBlank() }
+                        ?.distinct()
+                        .orEmpty(),
+                defaultPlaybackSpeed =
+                    this[KEY_DEFAULT_PLAYBACK_SPEED] ?: Settings.DEFAULT_PLAYBACK_SPEED,
+                skipSilenceEnabled = this[KEY_SKIP_SILENCE_ENABLED] ?: false,
+                smartRewindEnabled = this[KEY_SMART_REWIND_ENABLED] ?: true,
             )
             .clamped()
 
@@ -108,6 +124,10 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         private val KEY_READER_FONT_SCALE = floatPreferencesKey("reader_font_scale")
         private val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
         private val KEY_LAST_PEER_SYNC_CURSOR = stringPreferencesKey("last_peer_sync_cursor")
+        private val KEY_QUEUE_ITEM_IDS = stringPreferencesKey("queue_item_ids")
+        private val KEY_DEFAULT_PLAYBACK_SPEED = floatPreferencesKey("default_playback_speed")
+        private val KEY_SKIP_SILENCE_ENABLED = booleanPreferencesKey("skip_silence_enabled")
+        private val KEY_SMART_REWIND_ENABLED = booleanPreferencesKey("smart_rewind_enabled")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

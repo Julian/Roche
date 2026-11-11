@@ -11,7 +11,8 @@ import java.util.Locale
 enum class ContentType(val wireValue: String) {
     ARTICLE("article"),
     PDF("pdf"),
-    VIDEO("video");
+    VIDEO("video"),
+    AUDIO("audio");
 
     companion object {
         fun fromWireValue(value: String): ContentType =
@@ -19,6 +20,8 @@ enum class ContentType(val wireValue: String) {
                 value.equals("paper", ignoreCase = true) ||
                     value.equals("pdf", ignoreCase = true) -> PDF
                 value.equals("video", ignoreCase = true) -> VIDEO
+                value.equals("audio", ignoreCase = true) ||
+                    value.equals("podcast", ignoreCase = true) -> AUDIO
                 else -> ARTICLE
             }
     }
@@ -38,6 +41,7 @@ enum class FeedType(val wireValue: String) {
     RSS("rss"),
     ARXIV("arxiv"),
     YOUTUBE("youtube"),
+    PODCAST("podcast"),
     SAVED("saved");
 
     companion object {
@@ -62,12 +66,14 @@ enum class InboxFilter(val label: String) {
     ARTICLES("Articles"),
     PAPERS("Papers"),
     VIDEOS("Videos"),
+    PODCASTS("Podcasts"),
     STARRED("Starred"),
     ARCHIVED("Archived"),
 }
 
 enum class AppTab(val label: String) {
     FEEDS("Feeds"),
+    QUEUE("Queue"),
     STARRED("Starred"),
     INBOX("Inbox"),
     SEARCH("Search"),
@@ -76,8 +82,9 @@ enum class AppTab(val label: String) {
 
     companion object {
         const val SIDE_TAB_COUNT = 4
-        val sideTabCandidates: List<AppTab> = listOf(FEEDS, STARRED, SEARCH, OFFLINE, SETTINGS)
-        val defaultSideTabs: List<AppTab> = listOf(FEEDS, STARRED, SEARCH, SETTINGS)
+        val sideTabCandidates: List<AppTab> =
+            listOf(FEEDS, QUEUE, STARRED, SEARCH, OFFLINE, SETTINGS)
+        val defaultSideTabs: List<AppTab> = listOf(FEEDS, QUEUE, SEARCH, SETTINGS)
 
         fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {
             val distinctValid = tabs.filter { it != INBOX && it in sideTabCandidates }.distinct()
@@ -111,6 +118,8 @@ data class FeedItem(
     val lastError: String? = null,
     val lastErrorBy: String? = null,
     val isActive: Boolean = true,
+    val autoDownloadEpisodes: Boolean = false,
+    val customPlaybackSpeed: Float? = null,
 ) {
     val isArchived: Boolean = !isActive
 
@@ -151,6 +160,7 @@ data class InboxEntry(
     val tags: List<String>,
     val readAt: String? = null,
     val thumbnailUrl: String? = null,
+    val audioUrl: String? = null,
 ) {
     val isRead: Boolean
         get() = !readAt.isNullOrBlank()
@@ -170,10 +180,31 @@ data class InboxEntry(
             ContentType.ARTICLE ->
                 !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
             ContentType.PDF,
-            ContentType.VIDEO -> true
+            ContentType.VIDEO,
+            ContentType.AUDIO -> true
         }
 
     val formattedPublishedLabel: String = formatRelativeTimestamp(publishedAt ?: createdAt)
+
+    val formattedReadAtLabel: String? =
+        readAt?.trim()?.takeIf { it.isNotBlank() }?.let { formatRelativeTimestamp(it) }
+
+    val formattedListeningHistoryLabel: String?
+        get() {
+            if (contentType != ContentType.AUDIO) return null
+            val hasPlayed = !readAt.isNullOrBlank() || readProgress > 0.0 || isArchived
+            if (!hasPlayed) return null
+            val whenLabel = formattedReadAtLabel
+            val pct = (readProgress * PERCENT_SCALE).toInt().coerceIn(1, MAX_PARTIAL_PCT)
+            return when {
+                readProgress >= COMPLETED_PROGRESS_THRESHOLD || isArchived ->
+                    whenLabel?.let { "Played $it · Completed" } ?: "Completed"
+                readProgress > 0.0 ->
+                    whenLabel?.let { "Played $it · $pct% listened" } ?: "$pct% listened"
+                whenLabel != null -> "Played $whenLabel"
+                else -> null
+            }
+        }
 
     val displayDomain: String = extractCleanDomain(url)
 
@@ -185,9 +216,33 @@ data class InboxEntry(
         when (contentType) {
             ContentType.VIDEO -> duration ?: "Video"
             ContentType.PDF -> duration ?: "PDF"
+            ContentType.AUDIO -> formatAudioDurationEstimate(duration) ?: "Audio"
             ContentType.ARTICLE ->
                 formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
         }
+}
+
+internal fun formatAudioDurationEstimate(raw: String?): String? {
+    val clean = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    val totalSeconds =
+        clean.toLongOrNull()
+            ?: run {
+                val parts = clean.split(':').map { it.trim().toLongOrNull() ?: return clean }
+                when (parts.size) {
+                    2 -> parts[0] * 60L + parts[1]
+                    3 -> parts[0] * 3_600L + parts[1] * 60L + parts[2]
+                    else -> return clean
+                }
+            }
+    if (totalSeconds <= 0L) return clean
+    val hours = totalSeconds / SECONDS_PER_HOUR
+    val minutes = totalSeconds % SECONDS_PER_HOUR / SECONDS_PER_MIN
+    return when {
+        hours > 0L && minutes > 0L -> "${hours}h ${minutes}m"
+        hours > 0L -> "${hours}h"
+        minutes > 0L -> "${minutes}m"
+        else -> "${totalSeconds}s"
+    }
 }
 
 internal fun extractCleanDomain(rawUrl: String): String {
@@ -354,6 +409,9 @@ private const val SECONDS_PER_HOUR = 3_600L
 private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
 private const val ARTICLE_WORDS_PER_MINUTE = 180
+private const val COMPLETED_PROGRESS_THRESHOLD = 0.98
+private const val PERCENT_SCALE = 100
+private const val MAX_PARTIAL_PCT = 99
 private val IMG_SRC_REGEX =
     Regex("""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

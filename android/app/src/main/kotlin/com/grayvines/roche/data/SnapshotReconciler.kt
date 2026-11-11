@@ -716,7 +716,25 @@ private fun toPeerSyncItemPayload(
         readProgress = mut?.dirtyReadProgress ?: item.readProgress,
         interactionUpdatedAt = effectiveInterTs,
         tagNames = baseTags.sorted(),
+        audioUrl = item.audioUrl,
+        duration = parseDurationToSecondsLong(item.duration),
     )
+}
+
+internal fun parseDurationToSecondsLong(raw: String?): Long? {
+    val clean = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    val seconds =
+        clean.toLongOrNull()
+            ?: run {
+                val parts = clean.split(':').map { it.trim().toLongOrNull() ?: -1L }
+                when {
+                    parts.any { it < 0L } -> -1L
+                    parts.size == 2 -> parts[0] * 60L + parts[1]
+                    parts.size == 3 -> parts[0] * 3_600L + parts[1] * 60L + parts[2]
+                    else -> -1L
+                }
+            }
+    return seconds.takeIf { it > 0L }
 }
 
 private const val MAX_PEER_SYNC_ITEMS = 2_000

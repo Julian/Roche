@@ -19,7 +19,7 @@ interface RocheDao {
             "SUBSTR(contentHtml, 1, 65536) AS contentHtml, " +
             "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
             "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC"
+            "interactionUpdatedAt, audioUrl FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC"
     )
     fun observeItems(): Flow<List<ItemEntity>>
 
@@ -45,6 +45,12 @@ interface RocheDao {
 
     @Query("UPDATE feeds SET isActive = :isActive WHERE id = :feedId")
     suspend fun updateFeedActive(feedId: String, isActive: Boolean)
+
+    @Query("UPDATE feeds SET autoDownloadEpisodes = :enabled WHERE id = :feedId")
+    suspend fun updateFeedAutoDownload(feedId: String, enabled: Boolean)
+
+    @Query("UPDATE feeds SET customPlaybackSpeed = :speed WHERE id = :feedId")
+    suspend fun updateFeedPlaybackSpeed(feedId: String, speed: Float?)
 
     @Query("UPDATE items SET feedTitle = :title WHERE feedId = :feedId")
     suspend fun updateItemsFeedTitle(feedId: String, title: String)
@@ -104,7 +110,7 @@ interface RocheDao {
             "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
             "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
             "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt FROM items"
+            "interactionUpdatedAt, audioUrl FROM items"
     )
     suspend fun getAllItems(): List<ItemEntity>
 
@@ -115,7 +121,7 @@ interface RocheDao {
             "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
             "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
             "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt FROM items WHERE id = :id LIMIT 1"
+            "interactionUpdatedAt, audioUrl FROM items WHERE id = :id LIMIT 1"
     )
     suspend fun getItemById(id: String): ItemEntity?
 

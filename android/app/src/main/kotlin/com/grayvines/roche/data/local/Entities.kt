@@ -19,6 +19,8 @@ data class FeedEntity(
     val lastError: String? = null,
     val lastErrorBy: String? = null,
     val isActive: Boolean = true,
+    val autoDownloadEpisodes: Boolean = false,
+    val customPlaybackSpeed: Float? = null,
 )
 
 @Entity(
@@ -54,6 +56,7 @@ data class ItemEntity(
     val thumbnailUrl: String? = null,
     val feedUrl: String? = null,
     val interactionUpdatedAt: String? = null,
+    val audioUrl: String? = null,
 )
 
 @Entity(tableName = "tags", indices = [Index(value = ["name"], unique = true)])

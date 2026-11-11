@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions", "MagicNumber")
+
 package com.grayvines.roche.ui.components
 
 import androidx.compose.foundation.Canvas
@@ -176,6 +178,13 @@ private fun resolveFaviconBrandStyle(
                 foregroundColor = Color.White,
                 monogram = "YT",
             )
+        feedType == FeedType.PODCAST ->
+            FaviconBrandStyle(
+                kind = FaviconGlyphKind.MONOGRAM,
+                backgroundColor = PODCAST_BRAND_BG,
+                foregroundColor = Color(0xFFE4DFDA),
+                monogram = monogram,
+            )
         "ycombinator" in cleanDomain || "hnrss" in cleanDomain ->
             FaviconBrandStyle(
                 kind = FaviconGlyphKind.MONOGRAM,
@@ -195,6 +204,7 @@ private fun resolveFaviconBrandStyle(
 
 private val ARXIV_BRAND_BG = Color(0xFFB31B1B)
 private val YOUTUBE_BRAND_BG = Color(0xFFC13832)
+private val PODCAST_BRAND_BG = Color(0xFF28485C)
 private val HN_BRAND_BG = Color(0xFFFF6600)
 
 private fun extractDomainMonogram(source: String): String {
@@ -235,6 +245,65 @@ fun EntryThumbnailPreview(entry: InboxEntry, modifier: Modifier = Modifier) {
         ContentType.ARTICLE -> ArticleImageThumbnail(entry = entry, modifier = modifier)
         ContentType.PDF -> PaperFirstPageThumbnail(entry = entry, modifier = modifier)
         ContentType.VIDEO -> VideoFrameThumbnail(entry = entry, modifier = modifier)
+        ContentType.AUDIO -> PodcastEpisodeThumbnail(entry = entry, modifier = modifier)
+    }
+}
+
+@Composable
+private fun PodcastEpisodeThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(10.dp)
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl ?: entry.faviconUrl,
+        )
+    Box(
+        modifier =
+            modifier
+                .size(56.dp)
+                .clip(shape)
+                .background(Color(0xFF1A242D))
+                .border(width = 1.dp, color = colors.border, shape = shape)
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) { drawPodcastArtworkCanvas(colors) }
+        }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.align(Alignment.BottomEnd)
+                    .padding(3.dp)
+                    .size(18.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(colors.accentBlue),
+        ) {
+            PlayPauseIcon(isPlaying = false, tint = Color.White, size = 10.dp)
+        }
+    }
+}
+
+internal fun DrawScope.drawPodcastArtworkCanvas(colors: RocheColors) {
+    val w = size.width
+    val h = size.height
+    val barWidths = w * 0.08f
+    val heights = listOf(0.28f, 0.56f, 0.74f, 0.44f, 0.62f, 0.32f)
+    heights.forEachIndexed { idx, frac ->
+        val x = w * (0.16f + idx * 0.125f)
+        val barH = h * frac
+        drawRoundRect(
+            color = colors.accentBlue.copy(alpha = 0.72f),
+            topLeft = Offset(x, (h - barH) * 0.5f),
+            size = Size(barWidths, barH),
+            cornerRadius = CornerRadius(barWidths * 0.5f, barWidths * 0.5f),
+        )
     }
 }
 

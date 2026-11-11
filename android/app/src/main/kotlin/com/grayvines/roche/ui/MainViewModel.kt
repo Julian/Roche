@@ -12,7 +12,9 @@ import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.SavedResourceKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.AppTab
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
@@ -61,10 +63,54 @@ data class MainUiState(
     val activePeers: List<PeerNodeDto> = emptyList(),
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val settings: Settings = Settings(),
+    val playerState: PodcastPlayerState = PodcastPlayerState(),
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
 ) {
+    val activePlayerEntry: InboxEntry?
+        get() {
+            val activeId = playerState.currentEntryId ?: return null
+            val base = allEntries.firstOrNull { it.id == activeId } ?: return null
+            val full = readerContent?.takeIf { it.itemId == base.id } ?: return base
+            val mergedHtml = pickLongerReaderText(full.contentHtml, base.contentHtml)
+            val mergedText = pickLongerReaderText(full.contentText, base.contentText)
+            return if (mergedHtml != base.contentHtml || mergedText != base.contentText) {
+                base.copy(
+                    contentHtml = mergedHtml,
+                    contentText = mergedText,
+                )
+            } else {
+                base
+            }
+        }
+
+    val activePlayerFeed: FeedItem?
+        get() =
+            activePlayerEntry?.feedId?.let { fid ->
+                feeds.firstOrNull { it.id == fid }
+            }
+
+    val queueEntries: List<InboxEntry>
+        get() {
+            if (settings.queueItemIds.isEmpty()) return emptyList()
+            val byId = allEntries.associateBy { it.id }
+            return settings.queueItemIds.mapNotNull { id ->
+                byId[id]?.takeIf { !it.isArchived }
+            }
+        }
+
+    val nextQueuedAudioEntry: InboxEntry?
+        get() {
+            val activeAudioId = playerState.currentEntryId
+            return queueEntries.firstOrNull { entry ->
+                entry.contentType == ContentType.AUDIO && entry.id != activeAudioId
+            }
+        }
+
+    val nextQueuedAudioEntryId: String?
+        get() = nextQueuedAudioEntry?.id
+
     val activeReaderEntry: InboxEntry?
         get() {
             val base = allEntries.firstOrNull { it.id == selectedReaderEntryId } ?: return null
@@ -96,12 +142,29 @@ data class MainUiState(
     val starredEntries: List<InboxEntry>
         get() = allEntries.filter { it.isFavorite }
 
+    val listeningHistoryEntries: List<InboxEntry>
+        get() =
+            allEntries
+                .filter { entry ->
+                    entry.contentType == ContentType.AUDIO &&
+                        (!entry.readAt.isNullOrBlank() ||
+                            entry.readProgress > 0.0 ||
+                            entry.isArchived)
+                }
+                .sortedByDescending { entry ->
+                    entry.readAt?.takeIf { it.isNotBlank() }
+                        ?: entry.publishedAt?.takeIf { it.isNotBlank() }
+                        ?: entry.createdAt
+                }
+
     val offlineEntries: List<InboxEntry>
         get() = allEntries.filter { it.isCachedOffline }
 
     val selectedFeedTitle: String?
         get() = feeds.firstOrNull { it.id == selectedFeedId }?.title
 }
+
+fun MainUiState.isEntryInQueue(entryId: String): Boolean = entryId in settings.queueItemIds
 
 enum class ConfigSaveFeedback {
     SHOW_BANNER,
@@ -150,6 +213,68 @@ sealed interface MainAction {
     data object CloseAddSheet : Ui
 
     data object DismissMessages : Ui
+
+    data object OpenFullscreenPlayer : Ui
+
+    data object CloseFullscreenPlayer : Ui
+
+    data class SetPlayerSpeedSheetOpen(val open: Boolean) : Ui
+
+    data class SelectPlayerDrawerTab(val tab: PlayerDrawerTab?) : Ui
+
+    data object RequestAudioOutputCast : Ui
+
+    data class PlayAudioEntry(
+        val entryId: String,
+        val openFullscreen: Boolean = true,
+    ) : Mutation
+
+    data object TogglePlayPause : Mutation
+
+    data class SeekPlayerToFraction(val fraction: Float) : Mutation
+
+    data class SeekPlayerToMs(val positionMs: Long) : Mutation
+
+    data class SkipPlayerBySeconds(val deltaSeconds: Int) : Mutation
+
+    data object SkipToNextQueuedAudio : Mutation
+
+    data class SetPlaybackSpeed(
+        val speed: Float,
+        val applyToCurrentPodcast: Boolean? = null,
+    ) : Mutation
+
+    data class SetRememberPodcastSpeed(
+        val feedId: String,
+        val enabled: Boolean,
+    ) : Mutation
+
+    data class SetSkipSilence(val enabled: Boolean) : Mutation
+
+    data class SetSleepTimerMinutes(val minutes: Int?) : Mutation
+
+    data class SetFeedAutoDownload(
+        val feedId: String,
+        val enabled: Boolean,
+    ) : Mutation
+
+    data class SetFeedPlaybackSpeed(
+        val feedId: String,
+        val speed: Float?,
+    ) : Mutation
+
+    data class ToggleQueueMembership(val entryId: String) : Mutation
+
+    data class AddToQueue(
+        val entryId: String,
+        val playNext: Boolean = false,
+    ) : Mutation
+
+    data class RemoveFromQueue(val entryId: String) : Mutation
+
+    data class MoveQueueItemUp(val entryId: String) : Mutation
+
+    data class MoveQueueItemToTop(val entryId: String) : Mutation
 
     data class ToggleArchive(val entry: InboxEntry) : Mutation
 
@@ -246,24 +371,52 @@ internal data class TransientUiState(
     val messageSequence: Long = 0L,
 )
 
+@Suppress("TooManyFunctions", "LargeClass")
 class MainViewModel(
     private val repository: RocheRepository,
     private val settingsRepository: SettingsRepository,
+    playerBackend: AudioPlayerBackend = ResilientMediaPlayerBackend(),
 ) : ViewModel() {
 
     private val transientState = MutableStateFlow(TransientUiState())
+
+    internal val playerController =
+        PodcastPlayerController(
+            scope = viewModelScope,
+            backend = playerBackend,
+            onProgressChanged = { entryId, progress ->
+                viewModelScope.launch {
+                    repository.updateReadProgress(
+                        itemId = entryId,
+                        progress = progress,
+                        recordPlayedTimestamp = true,
+                    )
+                }
+            },
+            onEpisodeCompleted = { completedEntryId ->
+                viewModelScope.launch {
+                    handleAudioEpisodeCompleted(completedEntryId)
+                }
+            },
+        )
 
     val uiState: StateFlow<MainUiState> =
         combine(
                 repository.snapshot,
                 settingsRepository.settings,
                 transientState,
-            ) { snapshot: RepositorySnapshot, settings: Settings, local: TransientUiState ->
+                playerController.state,
+            ) {
+                snapshot: RepositorySnapshot,
+                settings: Settings,
+                local: TransientUiState,
+                playerState: PodcastPlayerState ->
                 buildMainUiState(
                     snapshot = snapshot,
                     settings = settings,
                     local = local,
                     localNetworkTier = repository.currentNetworkTier(),
+                    playerState = playerState,
                 )
             }
             .stateIn(
@@ -272,9 +425,26 @@ class MainViewModel(
                 initialValue = MainUiState(isInitialLoading = true),
             )
 
+    override fun onCleared() {
+        playerController.stopAndClear()
+    }
+
     fun dispatch(action: MainAction) {
         when (action) {
             is MainAction.Ui -> {
+                if (handlePlayerUiAction(action)) return
+                if (action is MainAction.OpenReader) {
+                    val existing = uiState.value.allEntries.firstOrNull { it.id == action.entryId }
+                    if (existing?.contentType == ContentType.AUDIO) {
+                        viewModelScope.launch {
+                            performPlayAudioEntry(
+                                entryId = action.entryId,
+                                openFullscreen = true,
+                            )
+                        }
+                        return
+                    }
+                }
                 transientState.update { reduceUiAction(it, action) }
                 if (action is MainAction.OpenReader) {
                     viewModelScope.launch {
@@ -294,6 +464,33 @@ class MainViewModel(
             }
         }
     }
+
+    private fun handlePlayerUiAction(action: MainAction.Ui): Boolean =
+        when (action) {
+            MainAction.OpenFullscreenPlayer -> {
+                playerController.openFullscreen()
+                true
+            }
+            MainAction.CloseFullscreenPlayer -> {
+                playerController.closeFullscreen()
+                true
+            }
+            is MainAction.SetPlayerSpeedSheetOpen -> {
+                playerController.setSpeedSheetOpen(action.open)
+                true
+            }
+            is MainAction.SelectPlayerDrawerTab -> {
+                playerController.selectDrawerTab(action.tab)
+                true
+            }
+            MainAction.RequestAudioOutputCast -> {
+                showStatusMessage("Use system output switcher for Cast / Bluetooth audio")
+                true
+            }
+            else -> {
+                false
+            }
+        }
 
     internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
 
@@ -326,8 +523,57 @@ class MainViewModel(
                 repository.updateReadProgress(itemId = action.entryId, progress = action.progress)
             is MainAction.SaveUrlOrFeed ->
                 performSaveUrl(action.url, action.titleOverride, action.tagCsv)
+            else -> executePlayerMutation(action)
+        }
+    }
+
+    internal suspend fun executePlayerMutation(action: MainAction.Mutation) {
+        when (action) {
+            is MainAction.PlayAudioEntry ->
+                performPlayAudioEntry(action.entryId, action.openFullscreen)
+            MainAction.TogglePlayPause ->
+                playerController.togglePlayPause(
+                    smartRewindEnabled = uiState.value.settings.smartRewindEnabled
+                )
+            is MainAction.SeekPlayerToFraction -> playerController.seekToFraction(action.fraction)
+            is MainAction.SeekPlayerToMs -> playerController.seekToMs(action.positionMs)
+            is MainAction.SkipPlayerBySeconds -> playerController.skipBySeconds(action.deltaSeconds)
+            MainAction.SkipToNextQueuedAudio -> performSkipToNextQueuedAudio()
+            is MainAction.SetPlaybackSpeed ->
+                performSetPlaybackSpeed(action.speed, action.applyToCurrentPodcast)
+            is MainAction.SetRememberPodcastSpeed ->
+                performSetRememberPodcastSpeed(action.feedId, action.enabled)
+            is MainAction.SetSkipSilence -> performSetSkipSilence(action.enabled)
+            is MainAction.SetSleepTimerMinutes -> performSetSleepTimerMinutes(action.minutes)
+            is MainAction.SetFeedAutoDownload ->
+                performSetFeedAutoDownload(action.feedId, action.enabled)
+            is MainAction.SetFeedPlaybackSpeed ->
+                performSetFeedPlaybackSpeed(action.feedId, action.speed)
+            else -> executeQueueOrSyncMutation(action)
+        }
+    }
+
+    internal suspend fun executeQueueOrSyncMutation(action: MainAction.Mutation) {
+        when (action) {
+            is MainAction.ToggleQueueMembership -> performToggleQueueMembership(action.entryId)
+            is MainAction.AddToQueue -> performAddToQueue(action.entryId, action.playNext)
+            is MainAction.RemoveFromQueue ->
+                performRemoveFromQueue(action.entryId, showBanner = true)
+            is MainAction.MoveQueueItemUp -> performMoveQueueItemUp(action.entryId)
+            is MainAction.MoveQueueItemToTop -> performMoveQueueItemToTop(action.entryId)
             else -> executeSyncOrSettingsMutation(action)
         }
+    }
+
+    internal fun performSetSleepTimerMinutes(minutes: Int?) {
+        playerController.setSleepTimerMinutes(minutes)
+        val msg =
+            if (minutes == null) {
+                "Sleep timer off"
+            } else {
+                "Sleep timer set for ${minutes}m"
+            }
+        showStatusMessage(msg)
     }
 
     internal suspend fun executeSyncOrSettingsMutation(action: MainAction.Mutation) {
@@ -453,14 +699,248 @@ class MainViewModel(
                 applyReaderContentIfActive(entryId, content)
             }
         }
-        val msg = if (cached) "Cached local copy" else "Removed local offline copy"
+        val entry = uiState.value.allEntries.firstOrNull { it.id == entryId }
+        val isAudio = entry?.contentType == ContentType.AUDIO
+        val msg =
+            when {
+                cached && isAudio -> "Downloaded episode for offline playback"
+                !cached && isAudio -> "Deleted local episode download"
+                cached -> "Cached local copy"
+                else -> "Removed local offline copy"
+            }
         showStatusMessage(msg)
+    }
+
+    internal suspend fun performPlayAudioEntry(
+        entryId: String,
+        openFullscreen: Boolean = true,
+    ) {
+        val currentUi = uiState.value
+        val entry = currentUi.allEntries.firstOrNull { it.id == entryId } ?: return
+        if (playerController.state.value.currentEntryId == entryId) {
+            if (openFullscreen) {
+                playerController.openFullscreen()
+            } else {
+                playerController.togglePlayPause(currentUi.settings.smartRewindEnabled)
+            }
+            transientState.update { it.copy(contextSheetEntryId = null) }
+            return
+        }
+        val feed = entry.feedId?.let { fid -> currentUi.feeds.firstOrNull { it.id == fid } }
+        val effectiveSpeed = feed?.customPlaybackSpeed ?: currentUi.settings.defaultPlaybackSpeed
+        val source = repository.resolveAudioPlaybackSource(entry)
+        // Ensure the currently playing episode is at the front of the queue if not already queued
+        settingsRepository.update { current ->
+            val updatedQueue =
+                if (entryId in current.queueItemIds) {
+                    current.queueItemIds
+                } else {
+                    listOf(entryId) + current.queueItemIds
+                }
+            current.copy(queueItemIds = updatedQueue)
+        }
+        playerController.playEntry(
+            entry = entry,
+            sourceUriOrPath = source,
+            speed = effectiveSpeed,
+            skipSilenceEnabled = currentUi.settings.skipSilenceEnabled,
+            openFullscreen = openFullscreen,
+        )
+        transientState.update { it.copy(contextSheetEntryId = null) }
+        repository.recordEpisodePlaybackStarted(entryId)
+        viewModelScope.launch {
+            val hydrated =
+                repository.hydrateItemContentIfNeeded(entryId) { localContent ->
+                    applyReaderContentIfActive(entryId, localContent)
+                }
+            if (hydrated != null) {
+                applyReaderContentIfActive(entryId, hydrated)
+            }
+        }
+    }
+
+    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
+        val currentUi = uiState.value
+        val nextAudio =
+            currentUi.queueEntries.firstOrNull {
+                it.contentType == ContentType.AUDIO && it.id != completedEntryId && !it.isArchived
+            }
+        repository.updateReadProgress(itemId = completedEntryId, progress = 1.0)
+        repository.setArchiveStateWithSnapshot(itemId = completedEntryId, archived = true)
+        settingsRepository.update { current ->
+            current.copy(queueItemIds = current.queueItemIds.filterNot { it == completedEntryId })
+        }
+        if (nextAudio != null) {
+            val wasFullscreen = playerController.state.value.isFullscreenOpen
+            performPlayAudioEntry(
+                entryId = nextAudio.id,
+                openFullscreen = wasFullscreen,
+            )
+            showStatusMessage("Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}")
+        } else {
+            playerController.stopAndClear()
+            showStatusMessage("Finished episode · Archived & deleted download")
+        }
+    }
+
+    internal suspend fun performSkipToNextQueuedAudio() {
+        val currentId = playerController.state.value.currentEntryId
+        val nextAudio = uiState.value.nextQueuedAudioEntry
+        if (nextAudio == null) {
+            showStatusMessage("No next audio episode in Queue")
+            return
+        }
+        if (currentId != null) {
+            handleAudioEpisodeCompleted(currentId)
+        } else {
+            performPlayAudioEntry(entryId = nextAudio.id, openFullscreen = true)
+        }
+    }
+
+    internal suspend fun performSetPlaybackSpeed(
+        speed: Float,
+        applyToCurrentPodcast: Boolean?,
+    ) {
+        val clamped = clampPlaybackSpeed(speed)
+        playerController.setPlaybackSpeed(clamped)
+        val activeFeed = uiState.value.activePlayerFeed
+        val rememberForFeed = applyToCurrentPodcast ?: (activeFeed?.customPlaybackSpeed != null)
+        if (rememberForFeed && activeFeed != null) {
+            repository.setFeedPlaybackSpeed(feedId = activeFeed.id, speed = clamped)
+        } else {
+            settingsRepository.update { it.copy(defaultPlaybackSpeed = clamped) }
+        }
+    }
+
+    internal suspend fun performSetRememberPodcastSpeed(
+        feedId: String,
+        enabled: Boolean,
+    ) {
+        val currentSpeed = playerController.state.value.playbackSpeed
+        if (enabled) {
+            repository.setFeedPlaybackSpeed(feedId = feedId, speed = currentSpeed)
+        } else {
+            repository.setFeedPlaybackSpeed(feedId = feedId, speed = null)
+        }
+    }
+
+    internal suspend fun performSetSkipSilence(enabled: Boolean) {
+        playerController.setSkipSilence(enabled)
+        settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
+    }
+
+    internal suspend fun performSetFeedAutoDownload(
+        feedId: String,
+        enabled: Boolean,
+    ) {
+        repository.setFeedAutoDownload(feedId = feedId, enabled = enabled)
+        val msg =
+            if (enabled) {
+                "Auto-downloading new episodes for this podcast"
+            } else {
+                "Disabled auto-download for this podcast"
+            }
+        showStatusMessage(msg)
+    }
+
+    internal suspend fun performSetFeedPlaybackSpeed(
+        feedId: String,
+        speed: Float?,
+    ) {
+        val clamped = speed?.let(::clampPlaybackSpeed)
+        repository.setFeedPlaybackSpeed(feedId = feedId, speed = clamped)
+        if (uiState.value.activePlayerFeed?.id == feedId && clamped != null) {
+            playerController.setPlaybackSpeed(clamped)
+        }
+    }
+
+    internal suspend fun performToggleQueueMembership(entryId: String) {
+        val inQueue = uiState.value.isEntryInQueue(entryId)
+        if (inQueue) {
+            performRemoveFromQueue(entryId, showBanner = true)
+        } else {
+            performAddToQueue(entryId, playNext = false)
+        }
+    }
+
+    internal suspend fun performAddToQueue(
+        entryId: String,
+        playNext: Boolean = false,
+    ) {
+        val activeAudioId = playerController.state.value.currentEntryId
+        settingsRepository.update { current ->
+            val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
+            if (playNext) {
+                val insertIndex =
+                    if (activeAudioId != null && withoutTarget.firstOrNull() == activeAudioId) {
+                        1
+                    } else {
+                        0
+                    }
+                withoutTarget.add(insertIndex.coerceAtMost(withoutTarget.size), entryId)
+            } else {
+                withoutTarget.add(entryId)
+            }
+            current.copy(queueItemIds = withoutTarget)
+        }
+        transientState.update { it.copy(contextSheetEntryId = null) }
+        showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
+    }
+
+    internal suspend fun performRemoveFromQueue(
+        entryId: String,
+        showBanner: Boolean = true,
+    ) {
+        settingsRepository.update { current ->
+            current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
+        }
+        transientState.update { it.copy(contextSheetEntryId = null) }
+        if (showBanner) {
+            showStatusMessage("Removed from Queue")
+        }
+    }
+
+    internal suspend fun performMoveQueueItemUp(entryId: String) {
+        settingsRepository.update { current ->
+            val list = current.queueItemIds.toMutableList()
+            val idx = list.indexOf(entryId)
+            if (idx > 0) {
+                val prev = list[idx - 1]
+                list[idx - 1] = entryId
+                list[idx] = prev
+            }
+            current.copy(queueItemIds = list)
+        }
+    }
+
+    internal suspend fun performMoveQueueItemToTop(entryId: String) {
+        val activeAudioId = playerController.state.value.currentEntryId
+        settingsRepository.update { current ->
+            val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
+            val targetIdx =
+                if (activeAudioId != null && withoutTarget.firstOrNull() == activeAudioId) {
+                    1
+                } else {
+                    0
+                }
+            withoutTarget.add(targetIdx.coerceAtMost(withoutTarget.size), entryId)
+            current.copy(queueItemIds = withoutTarget)
+        }
+        showStatusMessage("Moved to top of Queue")
     }
 
     internal suspend fun performToggleArchive(entry: InboxEntry) {
         val targetArchived = !entry.isArchived
         val snapshot =
             repository.setArchiveStateWithSnapshot(itemId = entry.id, archived = targetArchived)
+        if (targetArchived) {
+            settingsRepository.update { current ->
+                current.copy(queueItemIds = current.queueItemIds.filterNot { it == entry.id })
+            }
+            if (playerController.state.value.currentEntryId == entry.id) {
+                playerController.stopAndClear()
+            }
+        }
         val previousStatus = snapshot?.previousStatus ?: entry.status
         val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
         val label = if (targetArchived) "Archived" else "Restored to Unread"
@@ -518,6 +998,13 @@ class MainViewModel(
                         currentUi.activeFilter == InboxFilter.UNREAD,
             )
         if (snapshots.isNotEmpty()) {
+            val archivedIds = snapshots.map { it.itemId }.toSet()
+            settingsRepository.update { current ->
+                current.copy(queueItemIds = current.queueItemIds.filterNot { it in archivedIds })
+            }
+            if (playerController.state.value.currentEntryId in archivedIds) {
+                playerController.stopAndClear()
+            }
             val archivedCount = snapshots.size
             val noun = entryCountNoun(archivedCount)
             val first = snapshots.first()
@@ -632,6 +1119,13 @@ class MainViewModel(
                 allUnread = false,
             )
         if (snapshots.isNotEmpty()) {
+            val archivedIds = snapshots.map { it.itemId }.toSet()
+            settingsRepository.update { current ->
+                current.copy(queueItemIds = current.queueItemIds.filterNot { it in archivedIds })
+            }
+            if (playerController.state.value.currentEntryId in archivedIds) {
+                playerController.stopAndClear()
+            }
             val count = snapshots.size
             val noun = entryCountNoun(count)
             val first = snapshots.first()
@@ -678,9 +1172,21 @@ class MainViewModel(
     }
 
     internal suspend fun performDeleteFeed(feedId: String) {
+        val feedEntryIds =
+            uiState.value.allEntries.filter { it.feedId == feedId }.map { it.id }.toSet()
         repository
             .deleteFeed(feedId)
             .onSuccess { title ->
+                if (feedEntryIds.isNotEmpty()) {
+                    settingsRepository.update { current ->
+                        current.copy(
+                            queueItemIds = current.queueItemIds.filterNot { it in feedEntryIds }
+                        )
+                    }
+                    if (playerController.state.value.currentEntryId in feedEntryIds) {
+                        playerController.stopAndClear()
+                    }
+                }
                 transientState.update { current ->
                     val nextFeedId =
                         if (current.selectedFeedId == feedId) null else current.selectedFeedId
@@ -708,6 +1214,12 @@ class MainViewModel(
         repository
             .deleteItem(entryId)
             .onSuccess { title ->
+                settingsRepository.update { current ->
+                    current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
+                }
+                if (playerController.state.value.currentEntryId == entryId) {
+                    playerController.stopAndClear()
+                }
                 transientState.update { current ->
                     val nextReaderId =
                         if (current.selectedReaderEntryId == entryId) {
@@ -786,12 +1298,27 @@ class MainViewModel(
     }
 
     private fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
+        val activePlayerId = playerController.state.value.currentEntryId
         transientState.update { current ->
-            if (current.selectedReaderEntryId == entryId) {
+            if (current.selectedReaderEntryId == entryId || activePlayerId == entryId) {
                 current.copy(readerContent = content)
             } else {
                 current
             }
+        }
+        if (activePlayerId == entryId) {
+            uiState.value.allEntries
+                .firstOrNull { it.id == entryId }
+                ?.let { base ->
+                    playerController.refreshChaptersFromEntry(
+                        base.copy(
+                            contentHtml =
+                                pickLongerReaderText(content.contentHtml, base.contentHtml),
+                            contentText =
+                                pickLongerReaderText(content.contentText, base.contentText),
+                        )
+                    )
+                }
         }
     }
 
@@ -957,6 +1484,7 @@ internal fun buildMainUiState(
     settings: Settings,
     local: TransientUiState,
     localNetworkTier: NetworkTier = NetworkTier.WIFI,
+    playerState: PodcastPlayerState = PodcastPlayerState(),
 ): MainUiState {
     val filtered =
         RocheRepository.filterEntries(
@@ -999,6 +1527,7 @@ internal fun buildMainUiState(
         activePeers = snapshot.activePeers,
         localNetworkTier = localNetworkTier,
         settings = settings,
+        playerState = playerState,
         undoEvent = local.undoEvent,
         statusBanner = local.statusBanner,
         messageSequence = local.messageSequence,

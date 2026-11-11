@@ -483,7 +483,15 @@ impl FeedIngester {
                     .into_iter()
                     .filter_map(|item| {
                         let url = item.link?;
-                        let content_type = classify_url(&url);
+                        let content_type = if item.audio_url.is_some() {
+                            ContentType::Audio
+                        } else {
+                            classify_url(&url)
+                        };
+                        let audio_url = item.audio_url.map(String::from).or_else(|| {
+                            (content_type == ContentType::Audio).then(|| url.as_str().to_owned())
+                        });
+                        let duration = item.duration;
                         let raw_img = item
                             .content_html
                             .as_deref()
@@ -527,6 +535,8 @@ impl FeedIngester {
                             summary,
                             content_html,
                             thumbnail_url,
+                            audio_url,
+                            duration,
                             content_type,
                         })
                     })
@@ -566,6 +576,8 @@ impl FeedIngester {
                             published_at: video.published_at,
                             content_html: Some(clean_desc),
                             thumbnail_url,
+                            audio_url: None,
+                            duration: None,
                             summary,
                             content_type: ContentType::Video,
                         }
@@ -599,6 +611,8 @@ impl FeedIngester {
                             published_at: paper.published_at,
                             content_html: Some(clean_summary),
                             thumbnail_url: None,
+                            audio_url: None,
+                            duration: None,
                             summary,
                             content_type: ContentType::Paper,
                         })
@@ -703,6 +717,12 @@ mod tests {
                         <link>https://example.com/doc.pdf</link>
                         <description>PDF</description>
                     </item>
+                    <item>
+                        <title>Podcast Episode</title>
+                        <link>https://example.com/episodes/42</link>
+                        <description>Audio show notes</description>
+                        <enclosure url="https://cdn.example.com/ep42.mp3" length="50000000" type="audio/mpeg"/>
+                    </item>
                 </channel>
                 </rss>"#
                     .to_string()))
@@ -735,12 +755,18 @@ mod tests {
         FeedIngester::poll_with_media(&ctx, &feed).await.unwrap();
 
         let items = db.items().list(None, Some(&feed.id), None).await.unwrap();
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 4);
         let by_title: std::collections::HashMap<_, _> =
             items.iter().map(|i| (i.title.as_str(), i)).collect();
         assert_eq!(by_title["Video Link"].content_type, ContentType::Video);
         assert_eq!(by_title["Arxiv Link"].content_type, ContentType::Paper);
         assert_eq!(by_title["Direct PDF Link"].content_type, ContentType::Pdf);
+        assert_eq!(by_title["Podcast Episode"].content_type, ContentType::Audio);
+        assert_eq!(
+            by_title["Podcast Episode"].audio_url.as_deref(),
+            Some("https://cdn.example.com/ep42.mp3")
+        );
+        assert_eq!(by_title["Podcast Episode"].url.as_str(), "https://example.com/episodes/42");
 
         // Both paper and direct PDF items have ingested PDF media
         assert_eq!(db.media().list_for_item(&by_title["Arxiv Link"].id).await.unwrap().len(), 1);

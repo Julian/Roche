@@ -1,3 +1,5 @@
+@file:Suppress("LongMethod")
+
 package com.grayvines.roche
 
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -279,6 +281,124 @@ class MainScreenTest {
         composeRule.onNodeWithText("Loading inbox…").assertExists()
         composeRule.onNodeWithText("Loading…").assertExists()
         composeRule.onNodeWithText("Your inbox is empty.").assertDoesNotExist()
+    }
+
+    @Test
+    fun queueTabMiniPlayerAndFullscreenPodcastPlayerRenderAndDispatchActions() {
+        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val audioEntry =
+            createSampleEntry()
+                .copy(
+                    id = "ep-audio-1",
+                    feedId = "feed-podcast-1",
+                    feedTitle = "Oxide and Friends",
+                    title = "Async Rust in Production",
+                    contentType = ContentType.AUDIO,
+                    audioUrl = "https://cdn.oxide.computer/ep1.mp3",
+                    duration = "01:12:00",
+                    isCachedOffline = false,
+                )
+        val articleEntry =
+            createSampleEntry()
+                .copy(
+                    id = "art-queued-1",
+                    title = "Wait-Free Ring Buffers",
+                    contentType = ContentType.ARTICLE,
+                )
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.QUEUE,
+                            allEntries = listOf(audioEntry, articleEntry),
+                            visibleEntries = listOf(audioEntry, articleEntry),
+                            settings =
+                                com.grayvines.roche.data.settings.Settings(
+                                    queueItemIds = listOf(audioEntry.id, articleEntry.id)
+                                ),
+                            playerState =
+                                com.grayvines.roche.ui.PodcastPlayerState(
+                                    currentEntryId = audioEntry.id,
+                                    isPlaying = true,
+                                    positionMs = 120_000L,
+                                    durationMs = 3_600_000L,
+                                    playbackSpeed = 2.65f,
+                                    isFullscreenOpen = true,
+                                ),
+                        ),
+                    onAction = { dispatched.add(it) },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        // Fullscreen player renders album art (tap to toggle play/pause), 5 transport buttons, and
+        // top bar
+        composeRule.onNodeWithTag("fullscreen_podcast_player").assertExists()
+        composeRule.onNodeWithTag("player_album_artwork").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.TogglePlayPause)
+        )
+        composeRule.onNodeWithTag("player_speed_btn").assertExists()
+        composeRule.onNodeWithTag("player_rewind_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipPlayerBySeconds(-15))
+        )
+        composeRule.onNodeWithTag("player_ff_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipPlayerBySeconds(30))
+        )
+        composeRule.onNodeWithTag("player_skip_next_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipToNextQueuedAudio)
+        )
+        composeRule.onNodeWithTag("player_favorite_btn").performClick()
+        org.junit.Assert.assertTrue(
+            dispatched.contains(com.grayvines.roche.ui.MainAction.ToggleStar(audioEntry.id))
+        )
+    }
+
+    @Test
+    fun queueTabListeningHistoryModeDisplaysPlayedEpisodesAndTimestamps() {
+        val playedEpisode =
+            createSampleEntry()
+                .copy(
+                    id = "ep-history-1",
+                    feedId = "feed-podcast-1",
+                    feedTitle = "Oxide and Friends",
+                    title = "Ep 42: Compiler Backends",
+                    contentType = ContentType.AUDIO,
+                    audioUrl = "https://cdn.oxide.computer/ep42.mp3",
+                    duration = "58:10",
+                    status = ItemStatus.ARCHIVED,
+                    readProgress = 1.0,
+                    readAt = java.time.Instant.now().toString(),
+                )
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.QUEUE,
+                            allEntries = listOf(playedEpisode),
+                            visibleEntries = emptyList(),
+                        ),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("queue_mode_up_next").assertExists()
+        composeRule.onNodeWithTag("queue_mode_history").performClick()
+        composeRule.onNodeWithTag("listening_history_list").assertExists()
+        composeRule.onNodeWithTag("history_row_ep-history-1").assertExists()
+        composeRule.onNodeWithTag("history_timestamp_ep-history-1").assertExists()
     }
 
     private fun createSampleEntry(): InboxEntry =

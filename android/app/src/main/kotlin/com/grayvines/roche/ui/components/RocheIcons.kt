@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions", "MagicNumber")
+
 package com.grayvines.roche.ui.components
 
 import androidx.compose.foundation.Canvas
@@ -34,6 +36,8 @@ fun BottomTabIcon(
         when (tab) {
             AppTab.INBOX ->
                 drawInboxTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+            AppTab.QUEUE ->
+                drawQueueTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
             AppTab.STARRED ->
                 drawPath(
                     path = buildStarPath(width = this.size.width, height = this.size.height),
@@ -84,6 +88,41 @@ private fun DrawScope.drawInboxTabIcon(tint: Color, stroke: Stroke, strokeWidth:
         strokeWidth = strokeWidth,
         cap = StrokeCap.Round,
     )
+}
+
+private fun DrawScope.drawQueueTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
+    val w = size.width
+    val h = size.height
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.14f, h * 0.24f),
+        end = Offset(w * 0.84f, h * 0.24f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.14f, h * 0.50f),
+        end = Offset(w * 0.54f, h * 0.50f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.14f, h * 0.76f),
+        end = Offset(w * 0.54f, h * 0.76f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    val playPath =
+        Path().apply {
+            moveTo(w * 0.66f, h * 0.46f)
+            lineTo(w * 0.88f, h * 0.63f)
+            lineTo(w * 0.66f, h * 0.80f)
+            close()
+        }
+    drawPath(path = playPath, color = tint, style = Fill)
+    drawPath(path = playPath, color = tint, style = stroke)
 }
 
 private fun DrawScope.drawSearchTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
@@ -423,6 +462,150 @@ internal fun DocumentOpmlIcon(
                 lineTo(w * 0.78f, h * 0.34f)
             }
         drawPath(path = foldPath, color = tint, style = stroke)
+    }
+}
+
+/** Downward arrow into tray icon for 1-tap offline download on podcast episode rows. */
+@Composable
+fun DownloadTrayIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawArrowTray(
+            tint = tint,
+            stroke = stroke,
+            strokeWidth = strokeWidth,
+            arrowTipY = ARROW_BOTTOM_Y,
+            chevronWingY = OFFLINE_CHEVRON_WING_Y,
+        )
+    }
+}
+
+/** Standard double-triangle Rewind (`◀◀`) icon without any embedded numbers. */
+@Composable
+fun RewindIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val leftTri =
+            Path().apply {
+                moveTo(w * 0.10f, h * 0.50f)
+                lineTo(w * 0.48f, h * 0.22f)
+                lineTo(w * 0.48f, h * 0.78f)
+                close()
+            }
+        val rightTri =
+            Path().apply {
+                moveTo(w * 0.48f, h * 0.50f)
+                lineTo(w * 0.88f, h * 0.22f)
+                lineTo(w * 0.88f, h * 0.78f)
+                close()
+            }
+        drawPath(path = leftTri, color = tint, style = Fill)
+        drawPath(path = rightTri, color = tint, style = Fill)
+    }
+}
+
+/** Standard double-triangle Fast-Forward (`▶▶`) icon without any embedded numbers. */
+@Composable
+fun FastForwardIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val leftTri =
+            Path().apply {
+                moveTo(w * 0.52f, h * 0.50f)
+                lineTo(w * 0.12f, h * 0.22f)
+                lineTo(w * 0.12f, h * 0.78f)
+                close()
+            }
+        val rightTri =
+            Path().apply {
+                moveTo(w * 0.90f, h * 0.50f)
+                lineTo(w * 0.52f, h * 0.22f)
+                lineTo(w * 0.52f, h * 0.78f)
+                close()
+            }
+        drawPath(path = leftTri, color = tint, style = Fill)
+        drawPath(path = rightTri, color = tint, style = Fill)
+    }
+}
+
+/** Play (`▶`) or Pause (`⏸`) transport icon. */
+@Composable
+fun PlayPauseIcon(
+    isPlaying: Boolean,
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 20.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        if (isPlaying) {
+            val barWidth = w * 0.20f
+            val corner = CornerRadius(w * 0.05f, w * 0.05f)
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(w * 0.22f, h * 0.18f),
+                size = Size(barWidth, h * 0.64f),
+                cornerRadius = corner,
+            )
+            drawRoundRect(
+                color = tint,
+                topLeft = Offset(w * 0.58f, h * 0.18f),
+                size = Size(barWidth, h * 0.64f),
+                cornerRadius = corner,
+            )
+        } else {
+            val playTri =
+                Path().apply {
+                    moveTo(w * 0.24f, h * 0.16f)
+                    lineTo(w * 0.84f, h * 0.50f)
+                    lineTo(w * 0.24f, h * 0.84f)
+                    close()
+                }
+            drawPath(path = playTri, color = tint, style = Fill)
+        }
+    }
+}
+
+/** Skip to Next Episode (`⏭`) icon with a forward triangle and vertical bar. */
+@Composable
+fun SkipNextIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val w = this.size.width
+        val h = this.size.height
+        val tri =
+            Path().apply {
+                moveTo(w * 0.16f, h * 0.20f)
+                lineTo(w * 0.68f, h * 0.50f)
+                lineTo(w * 0.16f, h * 0.80f)
+                close()
+            }
+        drawPath(path = tri, color = tint, style = Fill)
+        drawRoundRect(
+            color = tint,
+            topLeft = Offset(w * 0.72f, h * 0.20f),
+            size = Size(w * 0.12f, h * 0.60f),
+            cornerRadius = CornerRadius(w * 0.04f, w * 0.04f),
+        )
     }
 }
 

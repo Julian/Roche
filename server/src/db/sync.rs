@@ -12,7 +12,7 @@ use super::{
     ActivityAction, ActivityEntityType, ContentType, Feed, FeedRepo, FeedType, HexColor, Item,
     ItemFilter, ItemRepo, ItemStatus, PollItemCandidate, Tag, TagRepo,
 };
-use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
+use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient};
 
 pub const SERVER_PEER_ID: &str = "server";
 pub const PEER_LEASE_TTL_MINUTES: i64 = 120;
@@ -97,6 +97,10 @@ pub struct PeerItemRecord {
     pub summary: Option<String>,
     pub content_html: Option<String>,
     pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub audio_url: Option<String>,
+    #[serde(default)]
+    pub duration: Option<i64>,
     #[serde(default)]
     pub content_type: ContentType,
     #[serde(default)]
@@ -1269,13 +1273,28 @@ impl<'a> SyncRepo<'a> {
                         HtmlSanitizer::extract_first_image_url_with_base(h, Some(&inc.url))
                     })
                 });
+            let clean_audio_url = inc
+                .audio_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|u| SafeHttpClient::parse_url(u).ok())
+                .map(String::from)
+                .or_else(|| {
+                    (inc.content_type == ContentType::Audio
+                        && crate::content::fetcher::is_direct_audio_url(&inc.url))
+                    .then(|| inc.url.as_str().to_owned())
+                });
+            let clean_duration = inc.duration.filter(|&d| d > 0);
+            let resolved_content_type =
+                if clean_audio_url.is_some() { ContentType::Audio } else { inc.content_type };
             let clamped_progress =
                 if inc.read_progress.is_finite() { inc.read_progress.clamp(0.0, 1.0) } else { 0.0 };
 
             let existing: Option<ExistingItemRow> = if let Some(ref fid) = resolved_feed_id {
                 sqlx::query_as(
                     "SELECT id, title, author, published_at, summary, content_html, thumbnail_url,
-                            status, is_favorite, read_at, read_progress, interaction_updated_at
+                            audio_url, duration, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at
                      FROM items
                      WHERE (feed_id = ? AND url = ?) OR id = ?
                      LIMIT 1",
@@ -1288,7 +1307,7 @@ impl<'a> SyncRepo<'a> {
             } else {
                 sqlx::query_as(
                     "SELECT id, title, author, published_at, summary, content_html, thumbnail_url,
-                            status, is_favorite, read_at, read_progress, interaction_updated_at
+                            audio_url, duration, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at
                      FROM items
                      WHERE (feed_id IS NULL AND url = ?) OR id = ?
                      LIMIT 1",
@@ -1309,6 +1328,9 @@ impl<'a> SyncRepo<'a> {
                     clean_summary.as_deref(),
                     clean_html.as_deref(),
                     clean_thumb.as_deref(),
+                    clean_audio_url.as_deref(),
+                    clean_duration,
+                    resolved_content_type,
                     clamped_progress,
                     now,
                 )
@@ -1324,8 +1346,8 @@ impl<'a> SyncRepo<'a> {
                 };
                 let res = sqlx::query(
                     "INSERT OR IGNORE INTO items
-                     (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, audio_url, duration, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&item_id)
                 .bind(resolved_feed_id.as_deref())
@@ -1336,7 +1358,9 @@ impl<'a> SyncRepo<'a> {
                 .bind(clean_summary.as_deref())
                 .bind(clean_html.as_deref())
                 .bind(clean_thumb.as_deref())
-                .bind(inc.content_type)
+                .bind(clean_audio_url.as_deref())
+                .bind(clean_duration)
+                .bind(resolved_content_type)
                 .bind(inc.status)
                 .bind(inc.is_favorite)
                 .bind(insert_read_at)
@@ -1375,7 +1399,9 @@ impl<'a> SyncRepo<'a> {
                             summary: clean_summary.unwrap_or_default(),
                             content_html: clean_html,
                             thumbnail_url: clean_thumb,
-                            content_type: inc.content_type,
+                            audio_url: clean_audio_url,
+                            duration: clean_duration,
+                            content_type: resolved_content_type,
                         },
                     ));
                 }
@@ -1395,6 +1421,9 @@ impl<'a> SyncRepo<'a> {
         clean_summary: Option<&str>,
         clean_html: Option<&str>,
         clean_thumb: Option<&str>,
+        clean_audio_url: Option<&str>,
+        clean_duration: Option<i64>,
+        resolved_content_type: ContentType,
         clamped_progress: f64,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
@@ -1410,13 +1439,26 @@ impl<'a> SyncRepo<'a> {
         let merged_summary = pick_richer_text(ex.summary.as_deref(), clean_summary);
         let merged_html = pick_richer_text(ex.content_html.as_deref(), clean_html);
         let merged_thumb = ex.thumbnail_url.as_deref().or(clean_thumb);
+        let merged_audio_url = ex.audio_url.as_deref().or(clean_audio_url);
+        let merged_duration = ex.duration.or(clean_duration);
+        let merged_content_type = if merged_audio_url.is_some()
+            || ex.content_type == ContentType::Audio
+            || resolved_content_type == ContentType::Audio
+        {
+            ContentType::Audio
+        } else {
+            ex.content_type
+        };
 
         let content_changed = merged_title != ex.title
             || merged_author != ex.author.as_deref()
             || merged_pub != ex.published_at
             || merged_summary != ex.summary.as_deref()
             || merged_html != ex.content_html.as_deref()
-            || merged_thumb != ex.thumbnail_url.as_deref();
+            || merged_thumb != ex.thumbnail_url.as_deref()
+            || merged_audio_url != ex.audio_url.as_deref()
+            || merged_duration != ex.duration
+            || merged_content_type != ex.content_type;
 
         let (target_status, target_fav, target_read_at, target_prog, target_inter_ts, tag_mode) =
             resolve_merged_interaction_state(ex, inc, clamped_progress, now);
@@ -1430,17 +1472,9 @@ impl<'a> SyncRepo<'a> {
         if content_changed || interaction_changed {
             sqlx::query(
                 "UPDATE items
-                 SET title = ?,
-                     author = ?,
-                     published_at = ?,
-                     summary = ?,
-                     content_html = ?,
-                     thumbnail_url = ?,
-                     status = ?,
-                     is_favorite = ?,
-                     read_at = ?,
-                     read_progress = ?,
-                     interaction_updated_at = ?,
+                 SET title = ?, author = ?, published_at = ?, summary = ?, content_html = ?,
+                     thumbnail_url = ?, audio_url = ?, duration = ?, content_type = ?, status = ?,
+                     is_favorite = ?, read_at = ?, read_progress = ?, interaction_updated_at = ?,
                      updated_at = ?
                  WHERE id = ?",
             )
@@ -1450,6 +1484,9 @@ impl<'a> SyncRepo<'a> {
             .bind(merged_summary)
             .bind(merged_html)
             .bind(merged_thumb)
+            .bind(merged_audio_url)
+            .bind(merged_duration)
+            .bind(merged_content_type)
             .bind(target_status)
             .bind(target_fav)
             .bind(target_read_at)
@@ -1470,30 +1507,17 @@ impl<'a> SyncRepo<'a> {
             .await?;
         }
 
-        match tag_mode {
-            TagMergeMode::Replace => {
-                Self::replace_item_tags_in_tx(
-                    &mut *conn,
-                    &ex.id,
-                    &inc.tag_names,
-                    now,
-                    true,
-                    target_inter_ts,
-                )
-                .await?;
-            }
-            TagMergeMode::Union => {
-                Self::replace_item_tags_in_tx(
-                    &mut *conn,
-                    &ex.id,
-                    &inc.tag_names,
-                    now,
-                    false,
-                    target_inter_ts,
-                )
-                .await?;
-            }
-            TagMergeMode::KeepExisting => {}
+        if let TagMergeMode::Replace | TagMergeMode::Union = tag_mode {
+            let clear_unlisted = matches!(tag_mode, TagMergeMode::Replace);
+            Self::replace_item_tags_in_tx(
+                &mut *conn,
+                &ex.id,
+                &inc.tag_names,
+                now,
+                clear_unlisted,
+                target_inter_ts,
+            )
+            .await?;
         }
 
         Ok(())
@@ -1566,6 +1590,9 @@ struct ExistingItemRow {
     summary: Option<String>,
     content_html: Option<String>,
     thumbnail_url: Option<String>,
+    audio_url: Option<String>,
+    duration: Option<i64>,
+    content_type: ContentType,
     status: ItemStatus,
     is_favorite: bool,
     read_at: Option<DateTime<Utc>>,
@@ -1672,7 +1699,7 @@ mod tests {
         assert_eq!(i_id1, i_id2);
         assert_ne!(f_id1, i_id1);
 
-        let now = SyncRepo::now_utc();
+        let now = DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z").unwrap().with_timezone(&Utc);
         let mut peers = vec![
             PeerNode {
                 peer_id: "server".to_string(),
@@ -1802,6 +1829,8 @@ mod tests {
                             summary: "Short".to_string(),
                             content_html: Some("<p>Short</p>".to_string()),
                             thumbnail_url: None,
+                            audio_url: None,
+                            duration: None,
                             content_type: ContentType::Article,
                         },
                         PollItemCandidate {
@@ -1812,6 +1841,8 @@ mod tests {
                             summary: "To be deleted".to_string(),
                             content_html: None,
                             thumbnail_url: None,
+                            audio_url: None,
+                            duration: None,
                             content_type: ContentType::Article,
                         },
                     ],
@@ -1838,6 +1869,8 @@ mod tests {
                         summary: "To be deleted".to_string(),
                         content_html: None,
                         thumbnail_url: None,
+                        audio_url: None,
+                        duration: None,
                         content_type: ContentType::Article,
                     }],
                 },
@@ -1887,6 +1920,8 @@ mod tests {
                         "<p>Much longer full article body from peer</p>".to_string(),
                     ),
                     thumbnail_url: Some("https://example.com/hero.jpg".to_string()),
+                    audio_url: None,
+                    duration: None,
                     content_type: ContentType::Article,
                     status: ItemStatus::Archived,
                     is_favorite: true,
@@ -1907,6 +1942,8 @@ mod tests {
                     summary: Some("Old".to_string()),
                     content_html: None,
                     thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
                     content_type: ContentType::Article,
                     status: ItemStatus::Unread,
                     is_favorite: false,
@@ -1927,6 +1964,8 @@ mod tests {
                     summary: Some("Fetched by phone".to_string()),
                     content_html: Some("<p>Fetched by phone</p>".to_string()),
                     thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
                     content_type: ContentType::Article,
                     status: ItemStatus::Unread,
                     is_favorite: false,

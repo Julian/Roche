@@ -822,6 +822,17 @@ pub fn is_direct_pdf_url(url: &Url) -> bool {
 }
 
 #[must_use]
+pub fn is_direct_audio_url(url: &Url) -> bool {
+    let raw_path = url.path();
+    std::path::Path::new(raw_path).extension().is_some_and(|ext| {
+        matches!(
+            ext.to_str().unwrap_or("").to_ascii_lowercase().as_str(),
+            "mp3" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "wav" | "flac"
+        )
+    })
+}
+
+#[must_use]
 pub fn classify_url(url: &Url) -> ContentType {
     if ArxivParser::pdf_url_for_paper(url).is_some() {
         ContentType::Paper
@@ -829,6 +840,8 @@ pub fn classify_url(url: &Url) -> ContentType {
         ContentType::Video
     } else if is_direct_pdf_url(url) {
         ContentType::Pdf
+    } else if is_direct_audio_url(url) {
+        ContentType::Audio
     } else {
         ContentType::Article
     }

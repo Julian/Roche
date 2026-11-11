@@ -48,6 +48,8 @@ pub struct PollItemCandidate {
     pub summary: String,
     pub content_html: Option<String>,
     pub thumbnail_url: Option<String>,
+    pub audio_url: Option<String>,
+    pub duration: Option<i64>,
     pub content_type: ContentType,
 }
 
@@ -397,14 +399,9 @@ impl<'a> FeedRepo<'a> {
 
         sqlx::query(
             "UPDATE feeds
-             SET title = COALESCE(title, ?),
-                 description = COALESCE(description, ?),
-                 language = COALESCE(language, ?),
-                 last_polled = ?,
-                 last_polled_by = ?,
-                 last_error = NULL,
-                 last_error_by = NULL,
-                 updated_at = ?
+             SET title = COALESCE(title, ?), description = COALESCE(description, ?),
+                 language = COALESCE(language, ?), last_polled = ?, last_polled_by = ?,
+                 last_error = NULL, last_error_by = NULL, updated_at = ?
              WHERE id = ?",
         )
         .bind(new_title)
@@ -432,10 +429,11 @@ impl<'a> FeedRepo<'a> {
         for item in &batch.items {
             let natural_key = item_natural_key(feed_url.as_deref(), item.url.as_str());
             let id = deterministic_item_id(feed_url.as_deref(), item.url.as_str());
+            let clean_duration = item.duration.filter(|&d| d > 0);
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO items
-                 (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, created_at, updated_at)
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, audio_url, duration, content_type, created_at, updated_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                  WHERE NOT EXISTS (
                      SELECT 1 FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ?
                  )",
@@ -449,6 +447,8 @@ impl<'a> FeedRepo<'a> {
             .bind(&item.summary)
             .bind(item.content_html.as_deref())
             .bind(item.thumbnail_url.as_deref())
+            .bind(item.audio_url.as_deref())
+            .bind(clean_duration)
             .bind(item.content_type)
             .bind(now)
             .bind(now)
@@ -466,11 +466,82 @@ impl<'a> FeedRepo<'a> {
                 )
                 .await?;
                 inserted.push((id, item.clone()));
+            } else {
+                Self::backfill_existing_poll_item_in_tx(
+                    &mut tx,
+                    feed_id,
+                    item,
+                    clean_duration,
+                    now,
+                )
+                .await?;
             }
         }
 
         tx.commit().await?;
         Ok(inserted)
+    }
+
+    async fn backfill_existing_poll_item_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        feed_id: &str,
+        item: &PollItemCandidate,
+        clean_duration: Option<i64>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        if item.audio_url.is_none()
+            && clean_duration.is_none()
+            && item.thumbnail_url.is_none()
+            && item.author.is_none()
+        {
+            return Ok(());
+        }
+        let existing_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM items WHERE feed_id = ? AND url = ? LIMIT 1")
+                .bind(feed_id)
+                .bind(item.url.as_str())
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some(existing_id) = existing_id {
+            let update_res = sqlx::query(
+                "UPDATE items
+                 SET audio_url = COALESCE(audio_url, ?),
+                     duration = COALESCE(duration, ?),
+                     thumbnail_url = COALESCE(thumbnail_url, ?),
+                     author = COALESCE(author, ?),
+                     content_type = CASE WHEN ? IS NOT NULL THEN 'audio' ELSE content_type END,
+                     updated_at = ?
+                 WHERE id = ?
+                   AND ((audio_url IS NULL AND ? IS NOT NULL)
+                        OR (duration IS NULL AND ? IS NOT NULL)
+                        OR (thumbnail_url IS NULL AND ? IS NOT NULL)
+                        OR (author IS NULL AND ? IS NOT NULL))",
+            )
+            .bind(item.audio_url.as_deref())
+            .bind(clean_duration)
+            .bind(item.thumbnail_url.as_deref())
+            .bind(item.author.as_deref())
+            .bind(item.audio_url.as_deref())
+            .bind(now)
+            .bind(&existing_id)
+            .bind(item.audio_url.as_deref())
+            .bind(clean_duration)
+            .bind(item.thumbnail_url.as_deref())
+            .bind(item.author.as_deref())
+            .execute(&mut *conn)
+            .await?;
+            if update_res.rows_affected() > 0 {
+                SyncRepo::record_activity(
+                    &mut *conn,
+                    ActivityEntityType::Item,
+                    &existing_id,
+                    ActivityAction::Update,
+                    now,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn mark_error(&self, id: &str, error: &str) -> Result<()> {

@@ -19,7 +19,7 @@ import androidx.sqlite.execSQL
             PendingMutationEntity::class,
             TombstoneEntity::class,
         ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -86,10 +86,21 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_4_5 =
+            object : Migration(4, 5) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    connection.execSQL(
+                        "ALTER TABLE `feeds` ADD COLUMN `autoDownloadEpisodes` INTEGER NOT NULL DEFAULT 0"
+                    )
+                    connection.execSQL("ALTER TABLE `feeds` ADD COLUMN `customPlaybackSpeed` REAL")
+                    connection.execSQL("ALTER TABLE `items` ADD COLUMN `audioUrl` TEXT")
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }

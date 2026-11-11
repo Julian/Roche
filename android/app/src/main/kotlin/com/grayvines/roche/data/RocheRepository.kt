@@ -61,7 +61,7 @@ data class RepositorySnapshot(
     val activePeers: List<PeerNodeDto> = emptyList(),
 )
 
-@Suppress("TooManyFunctions")
+@Suppress("TooManyFunctions", "LargeClass")
 class RocheRepository(
     private val database: RocheDatabase,
     private val apiClient: RocheApiClient,
@@ -115,13 +115,23 @@ class RocheRepository(
                 previousReadAt = current.readAt,
             )
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
+        val isAudioItem =
+            current.contentType.equals("audio", ignoreCase = true) ||
+                !current.audioUrl.isNullOrBlank()
         val newReadAt =
             if (archived) {
-                current.readAt?.takeIf { it.isNotBlank() } ?: Instant.now().toString()
+                if (isAudioItem) {
+                    Instant.now().toString()
+                } else {
+                    current.readAt?.takeIf { it.isNotBlank() } ?: Instant.now().toString()
+                }
             } else {
                 null
             }
         dao.updateItemStatusAndReadAt(itemId, newStatus.wireValue, newReadAt)
+        if (archived && current.isCachedOffline && isAudioItem) {
+            offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = false)
+        }
         syncStatusMutation(
             dao = dao,
             apiClient = apiClient,
@@ -250,15 +260,48 @@ class RocheRepository(
         entryIds: List<String>,
         feedId: String? = null,
         allUnread: Boolean = false,
-    ): List<ArchiveStateSnapshot> =
-        syncArchiveBatchMutation(
-            dao = dao,
-            apiClient = apiClient,
-            settings = settings,
-            itemIds = entryIds,
-            feedId = feedId,
-            allUnread = allUnread,
-        )
+    ): List<ArchiveStateSnapshot> {
+        val snapshots =
+            syncArchiveBatchMutation(
+                dao = dao,
+                apiClient = apiClient,
+                settings = settings,
+                itemIds = entryIds,
+                feedId = feedId,
+                allUnread = allUnread,
+            )
+        for (snap in snapshots) {
+            val entity = dao.getItemById(snap.itemId) ?: continue
+            if (
+                entity.isCachedOffline &&
+                    (entity.contentType.equals("audio", ignoreCase = true) ||
+                        !entity.audioUrl.isNullOrBlank())
+            ) {
+                offlineCacheManager.setOfflineCacheState(itemId = entity.id, enabled = false)
+            }
+        }
+        return snapshots
+    }
+
+    suspend fun setFeedAutoDownload(feedId: String, enabled: Boolean) {
+        dao.updateFeedAutoDownload(feedId = feedId, enabled = enabled)
+        if (enabled) {
+            offlineCacheManager.autoDownloadNewEpisodes()
+        }
+    }
+
+    suspend fun setFeedPlaybackSpeed(feedId: String, speed: Float?) {
+        val clamped =
+            speed
+                ?.takeIf { it.isFinite() }
+                ?.let { (kotlin.math.round(it * 20f) / 20f).coerceIn(0.50f, 3.50f) }
+        dao.updateFeedPlaybackSpeed(feedId = feedId, speed = clamped)
+    }
+
+    fun resolveAudioPlaybackSource(entry: InboxEntry): String =
+        resolveCachedAudioFile(cacheDir = cacheDir, itemId = entry.id)?.absolutePath
+            ?: entry.audioUrl?.takeIf { it.isNotBlank() }
+            ?: entry.url
 
     internal suspend fun importOpml(opmlXml: String): Result<Int> = runCatching {
         val trimmed = opmlXml.trim()
@@ -292,16 +335,44 @@ class RocheRepository(
         }
     }
 
-    internal suspend fun updateReadProgress(itemId: String, progress: Double) {
+    internal suspend fun updateReadProgress(
+        itemId: String,
+        progress: Double,
+        recordPlayedTimestamp: Boolean = false,
+    ) {
         if (!progress.isFinite() || dao.getItemById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
         dao.updateReadProgress(itemId, clamped)
+        if (recordPlayedTimestamp) {
+            val nowIso = Instant.now().toString()
+            dao.updateItemReadAt(itemId, nowIso)
+            syncReadAtMutation(
+                dao = dao,
+                apiClient = apiClient,
+                settings = settings,
+                itemId = itemId,
+                readAt = nowIso,
+            )
+        }
         syncReadProgressMutation(
             dao = dao,
             apiClient = apiClient,
             settings = settings,
             itemId = itemId,
             progress = clamped,
+        )
+    }
+
+    internal suspend fun recordEpisodePlaybackStarted(itemId: String) {
+        if (dao.getItemById(itemId) == null) return
+        val nowIso = Instant.now().toString()
+        dao.updateItemReadAt(itemId, nowIso)
+        syncReadAtMutation(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            itemId = itemId,
+            readAt = nowIso,
         )
     }
 
@@ -358,13 +429,16 @@ class RocheRepository(
         )
 
     suspend fun refreshFeed(feedId: String): Result<String> = runCatching {
-        refreshFeedOnlineOrOnDevice(
-            dao = dao,
-            apiClient = apiClient,
-            settings = settings,
-            feedId = feedId,
-            onSyncWithServer = { syncWithServer() },
-        )
+        val title =
+            refreshFeedOnlineOrOnDevice(
+                dao = dao,
+                apiClient = apiClient,
+                settings = settings,
+                feedId = feedId,
+                onSyncWithServer = { syncWithServer() },
+            )
+        offlineCacheManager.autoDownloadNewEpisodes()
+        title
     }
 
     suspend fun deleteFeed(feedId: String): Result<String> = runCatching {
@@ -545,7 +619,9 @@ class RocheRepository(
                 } else {
                     null
                 }
-            peerSyncedCount ?: syncLegacySnapshot(currentSettings)
+            val count = peerSyncedCount ?: syncLegacySnapshot(currentSettings)
+            offlineCacheManager.autoDownloadNewEpisodes()
+            count
         }
             .onFailure { if (it is CancellationException) throw it }
     }
@@ -584,6 +660,7 @@ class RocheRepository(
                 }
                     .onFailure { if (it is CancellationException) throw it }
             }
+            offlineCacheManager.autoDownloadNewEpisodes()
             polledCount
         }
             .onFailure { if (it is CancellationException) throw it }

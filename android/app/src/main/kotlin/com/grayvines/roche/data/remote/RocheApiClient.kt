@@ -249,6 +249,7 @@ data class RemoteItemDto(
     val thumbnailUrl: String? = null,
     val feedUrl: String? = null,
     val interactionUpdatedAt: String? = null,
+    val audioUrl: String? = null,
 )
 
 data class RemoteTagDto(
@@ -277,6 +278,8 @@ data class PeerSyncItemPayload(
     val readProgress: Double,
     val interactionUpdatedAt: String?,
     val tagNames: List<String>,
+    val audioUrl: String? = null,
+    val duration: Long? = null,
 )
 
 data class PeerSyncRequestDto(
@@ -562,7 +565,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                     url = trimmed,
                     headers =
                         mapOf(
-                            "User-Agent" to EXTERNAL_IMAGE_USER_AGENT,
+                            HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
                             "Accept" to EXTERNAL_IMAGE_ACCEPT,
                         ),
                     expectBinary = true,
@@ -574,6 +577,56 @@ class RocheApiClient(private val transport: HttpTransport) {
     }
         .onFailure { if (it is CancellationException) throw it }
         .getOrNull()
+
+    internal suspend fun streamExternalBinaryToFile(
+        fileUrl: String,
+        targetFile: java.io.File,
+        maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
+    ): Boolean = runCatching {
+        val trimmed = fileUrl.trim()
+        val validScheme =
+            trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
+                trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
+        when {
+            !validScheme -> false
+            transport !is HttpUrlConnectionTransport ->
+                streamFakeTransportToFile(trimmed, targetFile, maxBytes)
+            else ->
+                withContext(Dispatchers.IO) {
+                    streamUrlConnectionToFile(trimmed, targetFile, maxBytes)
+                }
+        }
+    }
+        .onFailure { if (it is CancellationException) throw it }
+        .getOrDefault(false)
+
+    private suspend fun streamFakeTransportToFile(
+        trimmedUrl: String,
+        targetFile: java.io.File,
+        maxBytes: Long,
+    ): Boolean {
+        val response =
+            transport.execute(
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = trimmedUrl,
+                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                    expectBinary = true,
+                )
+            )
+        val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
+        val valid =
+            response.statusCode in HTTP_OK_START..HTTP_OK_END &&
+                bytes.isNotEmpty() &&
+                bytes.size <= maxBytes
+        return if (!valid) {
+            false
+        } else {
+            withContext(Dispatchers.IO) {
+                writeBytesAtomicallyToFile(bytes, targetFile)
+            }
+        }
+    }
 
     internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> = runCatching {
         val trimmed = feedUrl.trim()
@@ -590,7 +643,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                     url = trimmed,
                     headers =
                         mapOf(
-                            "User-Agent" to EXTERNAL_IMAGE_USER_AGENT,
+                            HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
                             "Accept" to EXTERNAL_FEED_ACCEPT,
                         ),
                 )
@@ -815,8 +868,148 @@ class RocheApiClient(private val transport: HttpTransport) {
     }
 }
 
+private const val HEADER_USER_AGENT = "User-Agent"
 private const val HTTP_OK_START = 200
 private const val HTTP_OK_END = 299
+internal const val MAX_AUDIO_ENCLOSURE_BYTES = 500L * 1024L * 1024L
+private const val AUDIO_CONNECT_TIMEOUT_MS = 15_000
+private const val AUDIO_READ_TIMEOUT_MS = 60_000
+private const val AUDIO_MAX_REDIRECTS = 5
+private val AUDIO_REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
+
+internal fun writeBytesAtomicallyToFile(bytes: ByteArray, targetFile: java.io.File): Boolean {
+    targetFile.parentFile?.mkdirs()
+    val temp = java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
+    return try {
+        temp.writeBytes(bytes)
+        if (!temp.renameTo(targetFile)) {
+            temp.copyTo(targetFile, overwrite = true)
+        }
+        true
+    } finally {
+        if (temp.exists()) temp.delete()
+    }
+}
+
+internal fun streamUrlConnectionToFile(
+    initialUrl: String,
+    targetFile: java.io.File,
+    maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
+): Boolean {
+    var currentUrl: String? = initialUrl.trim()
+    var step = 0
+    var success = false
+    while (currentUrl != null && step <= AUDIO_MAX_REDIRECTS && !success) {
+        val nextOrDone =
+            executeAudioStreamAttempt(
+                url = currentUrl,
+                targetFile = targetFile,
+                maxBytes = maxBytes,
+            )
+        when (nextOrDone) {
+            is AudioStreamStepResult.Redirect -> currentUrl = nextOrDone.nextUrl
+            AudioStreamStepResult.Success -> success = true
+            AudioStreamStepResult.Failed -> currentUrl = null
+        }
+        step++
+    }
+    return success
+}
+
+private sealed interface AudioStreamStepResult {
+    data class Redirect(val nextUrl: String) : AudioStreamStepResult
+
+    data object Success : AudioStreamStepResult
+
+    data object Failed : AudioStreamStepResult
+}
+
+private fun executeAudioStreamAttempt(
+    url: String,
+    targetFile: java.io.File,
+    maxBytes: Long,
+): AudioStreamStepResult {
+    val connection =
+        (URI.create(url.replace(" ", "%20")).toURL().openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
+            requestMethod = "GET"
+            connectTimeout = AUDIO_CONNECT_TIMEOUT_MS
+            readTimeout = AUDIO_READ_TIMEOUT_MS
+            setRequestProperty(HEADER_USER_AGENT, "Roche-Android/1.0")
+        }
+    return try {
+        val status = connection.responseCode
+        when {
+            status in AUDIO_REDIRECT_CODES -> {
+                val loc = connection.getHeaderField("Location")?.trim()?.takeIf { it.isNotBlank() }
+                val next = loc?.let { resolveRedirectUrl(url, it) }
+                if (next != null) {
+                    AudioStreamStepResult.Redirect(next)
+                } else {
+                    AudioStreamStepResult.Failed
+                }
+            }
+            status in HTTP_OK_START..HTTP_OK_END && connection.contentLengthLong <= maxBytes -> {
+                if (copyStreamAtomicallyToFile(connection, targetFile, maxBytes)) {
+                    AudioStreamStepResult.Success
+                } else {
+                    AudioStreamStepResult.Failed
+                }
+            }
+            else -> {
+                AudioStreamStepResult.Failed
+            }
+        }
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun copyStreamAtomicallyToFile(
+    connection: HttpURLConnection,
+    targetFile: java.io.File,
+    maxBytes: Long,
+): Boolean {
+    targetFile.parentFile?.mkdirs()
+    val tempFile =
+        java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
+    return try {
+        val total =
+            connection.inputStream.use { input ->
+                tempFile.outputStream().use { out ->
+                    copyBoundStreamBytes(input, out, maxBytes)
+                }
+            }
+        val wroteBytes = total > 0L
+        if (wroteBytes && !tempFile.renameTo(targetFile)) {
+            tempFile.copyTo(targetFile, overwrite = true)
+        }
+        wroteBytes
+    } finally {
+        if (tempFile.exists()) {
+            tempFile.delete()
+        }
+    }
+}
+
+private fun copyBoundStreamBytes(
+    input: java.io.InputStream,
+    out: java.io.OutputStream,
+    maxBytes: Long,
+): Long {
+    var total = 0L
+    val buffer = ByteArray(READ_BUFFER_CHARS)
+    var read = input.read(buffer)
+    while (read != -1) {
+        total += read
+        if (total > maxBytes) {
+            throw IOException("Audio stream exceeds maximum allowed size")
+        }
+        out.write(buffer, 0, read)
+        read = input.read(buffer)
+    }
+    return total
+}
 
 internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
     "${serverUrl.trimEnd('/')}/api/v1/items/${encodePathSegment(itemId)}"

@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions", "LongMethod", "CognitiveComplexMethod")
+
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -36,6 +38,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -48,9 +53,13 @@ import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.SearchScopeFilter
 import com.grayvines.roche.data.extractSearchMatchSnippet
 import com.grayvines.roche.data.matchesSearchScopeFilter
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
+import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.components.EntryThumbnailPreview
+import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -59,12 +68,20 @@ import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
+import com.grayvines.roche.ui.components.StarIcon
+import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
 @Composable
 fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    val starredEntries = state.starredEntries
+    var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
+    val allStarred = state.starredEntries
+    val starredEntries =
+        remember(allStarred, selectedTypeFilter) {
+            val filter = selectedTypeFilter
+            if (filter == null) allStarred else allStarred.filter { it.contentType == filter }
+        }
 
     Column(modifier = Modifier.fillMaxSize()) {
         RocheTopHeader(
@@ -77,6 +94,45 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             ) {
                 RefreshIcon(tint = colors.textSecondary, size = 17.dp)
             }
+        }
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .background(colors.surface)
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            FilterChipPill(
+                label = "All (${allStarred.size})",
+                selected = selectedTypeFilter == null,
+                onClick = { selectedTypeFilter = null },
+                modifier = Modifier.testTag("starred_filter_all"),
+            )
+            FilterChipPill(
+                label = "Podcasts",
+                selected = selectedTypeFilter == ContentType.AUDIO,
+                onClick = { selectedTypeFilter = ContentType.AUDIO },
+                modifier = Modifier.testTag("starred_filter_podcasts"),
+            )
+            FilterChipPill(
+                label = "Articles",
+                selected = selectedTypeFilter == ContentType.ARTICLE,
+                onClick = { selectedTypeFilter = ContentType.ARTICLE },
+                modifier = Modifier.testTag("starred_filter_articles"),
+            )
+            FilterChipPill(
+                label = "Papers",
+                selected = selectedTypeFilter == ContentType.PDF,
+                onClick = { selectedTypeFilter = ContentType.PDF },
+                modifier = Modifier.testTag("starred_filter_papers"),
+            )
+            FilterChipPill(
+                label = "Videos",
+                selected = selectedTypeFilter == ContentType.VIDEO,
+                onClick = { selectedTypeFilter = ContentType.VIDEO },
+                modifier = Modifier.testTag("starred_filter_videos"),
+            )
         }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
@@ -101,10 +157,13 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                         entry = entry,
                         ultraDense = state.settings.ultraDenseRows,
                         swipeToArchiveEnabled = state.settings.swipeToArchive,
+                        isPlayingAudio = entry.id == state.playerState.currentEntryId,
+                        isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
                         onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                         onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                         onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                         onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                        onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                     )
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
@@ -162,6 +221,8 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             selectedScope = scopeFilter,
             ultraDense = state.settings.ultraDenseRows,
             swipeToArchive = state.settings.swipeToArchive,
+            playingEntryId = state.playerState.currentEntryId,
+            nextQueuedAudioEntryId = state.nextQueuedAudioEntryId,
             onAction = onAction,
         )
     }
@@ -194,6 +255,8 @@ internal fun SearchResultsBody(
     selectedScope: SearchScopeFilter = SearchScopeFilter.ALL,
     ultraDense: Boolean,
     swipeToArchive: Boolean,
+    playingEntryId: String? = null,
+    nextQueuedAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -225,10 +288,14 @@ internal fun SearchResultsBody(
                     entry = entry,
                     ultraDense = ultraDense,
                     swipeToArchiveEnabled = swipeToArchive,
+                    isPlayingAudio = playingEntryId == entry.id,
+                    isQueuedNextAudio =
+                        nextQueuedAudioEntryId == entry.id && playingEntryId != entry.id,
                     onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                     onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                     onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                     onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                    onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                 )
                 val matchSnippet =
                     remember(entry.id, searchQuery) {
@@ -836,6 +903,383 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                     }
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun QueueTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    var showHistory by rememberSaveable { mutableStateOf(false) }
+    val queueEntries = state.queueEntries
+    val historyEntries = state.listeningHistoryEntries
+    val audioCount = queueEntries.count { it.contentType == ContentType.AUDIO }
+    val subtitle =
+        when {
+            showHistory -> "${historyEntries.size} played"
+            queueEntries.isEmpty() -> "0 items"
+            audioCount > 0 -> "${queueEntries.size} items · $audioCount audio"
+            else -> "${queueEntries.size} items"
+        }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(
+            title = "Queue",
+            subtitle = subtitle,
+        ) {
+            if (state.nextQueuedAudioEntry != null && state.playerState.currentEntryId == null) {
+                HeaderActionButton(
+                    label = "▶ Play Audio",
+                    onClick = { onAction(MainAction.SkipToNextQueuedAudio) },
+                    modifier = Modifier.testTag("queue_play_audio_btn"),
+                )
+            }
+        }
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .background(colors.surface)
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            FilterChipPill(
+                label = "Up Next (${queueEntries.size})",
+                selected = !showHistory,
+                onClick = { showHistory = false },
+                modifier = Modifier.testTag("queue_mode_up_next"),
+            )
+            FilterChipPill(
+                label = "Listening History (${historyEntries.size})",
+                selected = showHistory,
+                onClick = { showHistory = true },
+                modifier = Modifier.testTag("queue_mode_history"),
+            )
+        }
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (showHistory) {
+            ListeningHistoryListContent(
+                historyEntries = historyEntries,
+                state = state,
+                onAction = onAction,
+            )
+        } else if (queueEntries.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp).testTag("queue_empty_state"),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text =
+                        "Your Queue is empty. Long-press any article, paper, video, or podcast episode in Inbox to add it to your Queue.",
+                    color = colors.textMuted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().testTag("queue_list"),
+                contentPadding = PaddingValues(bottom = 96.dp),
+            ) {
+                items(items = queueEntries, key = { it.id }) { entry ->
+                    val index = queueEntries.indexOfFirst { it.id == entry.id }
+                    QueueEntryRowItem(
+                        entry = entry,
+                        canMoveUp = index > 0,
+                        isPlayingAudio = entry.id == state.playerState.currentEntryId,
+                        isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
+                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                        onMoveUp = { onAction(MainAction.MoveQueueItemUp(entry.id)) },
+                        onRemoveFromQueue = { onAction(MainAction.RemoveFromQueue(entry.id)) },
+                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                    )
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ListeningHistoryListContent(
+    historyEntries: List<InboxEntry>,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+    if (historyEntries.isEmpty()) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(32.dp).testTag("listening_history_empty"),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text =
+                    "No podcast episodes played yet. Episodes you listen to appear here with their playback timestamp and progress.",
+                color = colors.textMuted,
+                fontSize = 13.sp,
+            )
+        }
+    } else {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().testTag("listening_history_list"),
+            contentPadding = PaddingValues(bottom = 96.dp),
+        ) {
+            items(items = historyEntries, key = { it.id }) { entry ->
+                val isPlaying = entry.id == state.playerState.currentEntryId
+                val inQueue = state.isEntryInQueue(entry.id)
+                val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
+                val historyLabel = entry.formattedListeningHistoryLabel ?: "Played"
+                val rowBg =
+                    if (isPlaying) {
+                        colors.accentBlue.copy(alpha = 0.12f)
+                    } else {
+                        colors.background
+                    }
+                val starDesc =
+                    if (entry.isFavorite) {
+                        "Unstar ${entry.title}"
+                    } else {
+                        "Star ${entry.title}"
+                    }
+                Row(
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .background(rowBg)
+                            .combinedClickable(
+                                onClick = { onAction(MainAction.PlayAudioEntry(entry.id)) },
+                                onLongClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                            )
+                            .padding(start = 10.dp, end = 12.dp, top = 11.dp, bottom = 11.dp)
+                            .testTag("history_row_${entry.id}"),
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    RocheIconActionButton(
+                        contentDescription = starDesc,
+                        onClick = { onAction(MainAction.ToggleStar(entry.id)) },
+                        outlined = false,
+                        modifier = Modifier.testTag("history_star_btn_${entry.id}"),
+                    ) {
+                        StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
+                    }
+                    EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "${entry.feedTitle} · ${entry.readEstimateLabel}",
+                            color = colors.textSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = entry.title,
+                            color = colors.textPrimary,
+                            fontFamily = headlineFamily,
+                            fontSize = 15.sp,
+                            lineHeight = 20.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Spacer(modifier = Modifier.height(3.dp))
+                        Text(
+                            text = historyLabel,
+                            color = colors.accentVerdigris,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (!inQueue) {
+                        HeaderActionButton(
+                            label = "+ Queue",
+                            onClick = { onAction(MainAction.AddToQueue(entry.id)) },
+                            modifier = Modifier.testTag("history_requeue_btn_${entry.id}"),
+                        )
+                    }
+                }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun QueueEntryRowItem(
+    entry: InboxEntry,
+    canMoveUp: Boolean,
+    isPlayingAudio: Boolean,
+    isQueuedNextAudio: Boolean,
+    onOpen: () -> Unit,
+    onLongPress: () -> Unit,
+    onToggleStar: () -> Unit,
+    onMoveUp: () -> Unit,
+    onRemoveFromQueue: () -> Unit,
+    onToggleArchive: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+    val rowBackground =
+        when {
+            isPlayingAudio -> colors.accentBlue.copy(alpha = 0.12f)
+            isQueuedNextAudio -> colors.accentVerdigris.copy(alpha = 0.11f)
+            else -> colors.background
+        }
+    val leftAccentColor =
+        when {
+            isPlayingAudio -> colors.accentBlue
+            isQueuedNextAudio -> colors.accentVerdigris
+            else -> null
+        }
+    val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
+
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(rowBackground)
+                .drawBehind {
+                    if (leftAccentColor != null) {
+                        drawRect(
+                            color = leftAccentColor,
+                            topLeft = Offset.Zero,
+                            size = Size(width = 3.dp.toPx(), height = size.height),
+                        )
+                    }
+                }
+                .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
+                .padding(start = 10.dp, end = 12.dp, top = 11.dp, bottom = 11.dp)
+                .testTag("queue_row_${entry.id}"),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        // Left: Star action separated from right-side destructive actions
+        RocheIconActionButton(
+            contentDescription =
+                if (entry.isFavorite) "Unstar ${entry.title}" else "Star ${entry.title}",
+            onClick = onToggleStar,
+            outlined = false,
+            modifier = Modifier.testTag("queue_star_btn_${entry.id}"),
+        ) {
+            StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
+        }
+
+        if (entry.showsThumbnailPreview) {
+            EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
+        }
+
+        Column(modifier = Modifier.weight(1f)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                SiteFaviconBadge(
+                    primaryFaviconUrl = entry.faviconUrl,
+                    fallbackFaviconUrl = entry.fallbackFaviconUrl,
+                    domain = entry.displayDomain,
+                    title = entry.feedTitle,
+                    size = 14.dp,
+                )
+                Text(
+                    text = entry.feedTitle,
+                    color = colors.textSecondary,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(
+                    text =
+                        "· ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.5.sp,
+                    maxLines = 1,
+                )
+                if (entry.isCachedOffline) {
+                    Text(
+                        text = "↓",
+                        color = colors.accentVerdigris,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = entry.title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 15.sp,
+                lineHeight = 20.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            if (canMoveUp) {
+                RocheIconActionButton(
+                    contentDescription = "Move up ${entry.title}",
+                    onClick = onMoveUp,
+                    outlined = false,
+                    modifier = Modifier.testTag("queue_up_btn_${entry.id}"),
+                ) {
+                    Text(
+                        text = "↑",
+                        color = colors.textSecondary,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 14.sp,
+                    )
+                }
+            }
+            RocheIconActionButton(
+                contentDescription = "Remove ${entry.title} from Queue",
+                onClick = onRemoveFromQueue,
+                outlined = false,
+                modifier = Modifier.testTag("queue_remove_btn_${entry.id}"),
+            ) {
+                Text(
+                    text = "✕",
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp,
+                )
+            }
+            RocheIconActionButton(
+                contentDescription = "Archive ${entry.title}",
+                onClick = onToggleArchive,
+                outlined = false,
+                modifier = Modifier.testTag("queue_archive_btn_${entry.id}"),
+            ) {
+                FilingCabinetIcon(
+                    tint = colors.textMuted,
+                    isArchived = entry.isArchived,
+                    size = 17.dp,
+                )
             }
         }
     }

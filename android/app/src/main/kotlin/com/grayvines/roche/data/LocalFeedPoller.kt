@@ -28,6 +28,8 @@ internal data class ParsedFeedCandidateItem(
     val contentHtml: String?,
     val thumbnailUrl: String?,
     val contentType: String,
+    val audioUrl: String? = null,
+    val duration: String? = null,
 )
 
 internal data class ParsedFeedBatch(
@@ -87,23 +89,7 @@ internal object LocalFeedPoller {
                 return Result.failure(error)
             }
 
-        val resolvedTitle =
-            feed.title.takeIf {
-                it.isNotBlank() &&
-                    !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
-                    it != "YouTube Channel"
-            } ?: batch.title?.takeIf { it.isNotBlank() } ?: feed.title
-        val updatedFeed =
-            feed.copy(
-                title = resolvedTitle,
-                siteUrl = feed.siteUrl ?: batch.siteUrl,
-                description = feed.description ?: batch.description,
-                language = feed.language ?: batch.language,
-                lastPolled = nowIso,
-                lastPolledBy = localPeerId,
-                lastError = null,
-                lastErrorBy = null,
-            )
+        val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId)
         dao.upsertFeed(updatedFeed)
 
         val insertedOrUpdatedCount =
@@ -114,6 +100,39 @@ internal object LocalFeedPoller {
                 nowIso = nowIso,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
+    }
+
+    private fun buildUpdatedPolledFeed(
+        feed: FeedEntity,
+        batch: ParsedFeedBatch,
+        nowIso: String,
+        localPeerId: String,
+    ): FeedEntity {
+        val resolvedTitle =
+            feed.title.takeIf {
+                it.isNotBlank() &&
+                    !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
+                    it != "YouTube Channel"
+            } ?: batch.title?.takeIf { it.isNotBlank() } ?: feed.title
+        val hasAudio =
+            batch.items.any { it.contentType == CONTENT_TYPE_AUDIO || !it.audioUrl.isNullOrBlank() }
+        val resolvedFeedType =
+            if (hasAudio && feed.feedType.equals("rss", ignoreCase = true)) {
+                "podcast"
+            } else {
+                feed.feedType
+            }
+        return feed.copy(
+            title = resolvedTitle,
+            siteUrl = feed.siteUrl ?: batch.siteUrl,
+            feedType = resolvedFeedType,
+            description = feed.description ?: batch.description,
+            language = feed.language ?: batch.language,
+            lastPolled = nowIso,
+            lastPolledBy = localPeerId,
+            lastError = null,
+            lastErrorBy = null,
+        )
     }
 
     private suspend fun upsertPolledItems(
@@ -189,10 +208,11 @@ internal object LocalFeedPoller {
             createdAt = nowIso,
             readProgress = 0.0,
             thumbnailMediaId = null,
-            duration = null,
+            duration = candidate.duration,
             readAt = null,
             thumbnailUrl = candidate.thumbnailUrl,
             interactionUpdatedAt = null,
+            audioUrl = candidate.audioUrl,
         )
 
     private fun mergePolledCandidate(
@@ -209,6 +229,9 @@ internal object LocalFeedPoller {
         val richerHtml =
             pickRicherString(existing.contentHtml, candidate.contentHtml)
                 ?.take(MAX_SQLITE_HTML_CHARS)
+        val mergedAudioUrl = existing.audioUrl?.takeIf { it.isNotBlank() } ?: candidate.audioUrl
+        val mergedContentType =
+            if (!mergedAudioUrl.isNullOrBlank()) "audio" else existing.contentType
         return existing.copy(
             feedId = existing.feedId ?: feed.id,
             feedUrl = existing.feedUrl ?: feed.url,
@@ -223,6 +246,9 @@ internal object LocalFeedPoller {
             contentHtml = richerHtml,
             thumbnailUrl =
                 existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: candidate.thumbnailUrl,
+            audioUrl = mergedAudioUrl,
+            duration = existing.duration?.takeIf { it.isNotBlank() } ?: candidate.duration,
+            contentType = mergedContentType,
         )
     }
 
@@ -291,7 +317,8 @@ internal object LocalFeedPoller {
         feedUrl: String,
         feedType: String,
     ): ParsedFeedCandidateItem? {
-        val rawUrl = extractAtomEntryUrl(entry, feedUrl) ?: return null
+        val audioUrl = extractAudioEnclosureUrl(entry, feedUrl)
+        val rawUrl = extractAtomEntryUrl(entry, feedUrl) ?: audioUrl ?: return null
         val resolvedUrl = canonicalizeEntryUrl(rawUrl, feedType)
         val rawTitle =
             entry.firstDirectChildText(XML_TAG_TITLE)?.let(::decodeHtmlText)?.trim().orEmpty()
@@ -304,7 +331,18 @@ internal object LocalFeedPoller {
                 ?: mediaGroup?.firstDirectChildText(XML_TAG_DESCRIPTION)
         val sanitizedHtml = sanitizeCandidateHtml(rawContent, resolvedUrl)
         val summaryText = rawContent?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
-        val thumbnailUrl = extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, resolvedUrl)
+        val thumbnailUrl =
+            extractItunesImageHref(entry, resolvedUrl)
+                ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, resolvedUrl)
+        val duration = extractPodcastDurationLabel(entry)
+        val effectiveType =
+            if (audioUrl != null) {
+                CONTENT_TYPE_AUDIO
+            } else {
+                resolveCandidateContentType(feedType, resolvedUrl)
+            }
+        val effectiveAudioUrl =
+            audioUrl ?: resolvedUrl.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
 
         return ParsedFeedCandidateItem(
             title = rawTitle.ifBlank { resolvedUrl },
@@ -314,7 +352,9 @@ internal object LocalFeedPoller {
             summary = summaryText,
             contentHtml = sanitizedHtml,
             thumbnailUrl = thumbnailUrl,
-            contentType = resolveCandidateContentType(feedType, resolvedUrl),
+            contentType = effectiveType,
+            audioUrl = effectiveAudioUrl,
+            duration = duration,
         )
     }
 
@@ -332,11 +372,19 @@ internal object LocalFeedPoller {
             channel.firstDirectChildText(XML_TAG_LINK)?.trim()?.let {
                 resolveRelativeUrl(feedUrl, it)
             }
+        val channelArtworkUrl = extractChannelArtworkUrl(channel, siteUrl ?: feedUrl)
+        val channelAuthor = extractRssAuthor(channel)
 
         val itemElements =
             (channel.directChildElements("item") + root.directChildElements("item")).distinct()
         val items = itemElements.mapNotNull { item ->
-            parseRssItem(item = item, feedUrl = feedUrl, feedType = feedType)
+            parseRssItem(
+                item = item,
+                feedUrl = feedUrl,
+                feedType = feedType,
+                channelArtworkUrl = channelArtworkUrl,
+                channelAuthor = channelAuthor,
+            )
         }
         return ParsedFeedBatch(
             title = title,
@@ -351,13 +399,16 @@ internal object LocalFeedPoller {
         item: Element,
         feedUrl: String,
         feedType: String,
+        channelArtworkUrl: String? = null,
+        channelAuthor: String? = null,
     ): ParsedFeedCandidateItem? {
-        val linkText = extractRssItemUrl(item, feedUrl) ?: return null
+        val audioUrl = extractAudioEnclosureUrl(item, feedUrl)
+        val linkText = extractRssItemUrl(item, feedUrl) ?: audioUrl ?: return null
         val resolvedUrl =
             canonicalizeEntryUrl(resolveRelativeUrl(feedUrl, linkText) ?: linkText, feedType)
         val rawTitle =
             item.firstDirectChildText(XML_TAG_TITLE)?.let(::decodeHtmlText)?.trim().orEmpty()
-        val author = extractRssAuthor(item)
+        val author = extractRssAuthor(item) ?: channelAuthor?.takeIf { audioUrl != null }
         val publishedIso = extractElementPublishedIso(item)
 
         val encodedContent = item.firstDirectChildText("encoded")
@@ -366,10 +417,21 @@ internal object LocalFeedPoller {
         val sanitizedHtml = sanitizeCandidateHtml(primaryHtml, resolvedUrl)
         val summarySource = description?.takeIf { it.isNotBlank() } ?: encodedContent
         val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
+        val duration = extractPodcastDurationLabel(item)
+        val effectiveType =
+            if (audioUrl != null) {
+                CONTENT_TYPE_AUDIO
+            } else {
+                resolveCandidateContentType(feedType, resolvedUrl)
+            }
+        val effectiveAudioUrl =
+            audioUrl ?: resolvedUrl.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
         val thumbnailUrl =
-            extractMediaThumbnail(item, resolvedUrl)
+            extractItunesImageHref(item, resolvedUrl)
+                ?: extractMediaThumbnail(item, resolvedUrl)
                 ?: extractEnclosureImage(item, resolvedUrl)
                 ?: sanitizedHtml?.let { extractFirstImgUrl(it, resolvedUrl) }
+                ?: channelArtworkUrl?.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
 
         return ParsedFeedCandidateItem(
             title = rawTitle.ifBlank { resolvedUrl },
@@ -379,7 +441,9 @@ internal object LocalFeedPoller {
             summary = summaryText,
             contentHtml = sanitizedHtml,
             thumbnailUrl = thumbnailUrl,
-            contentType = resolveCandidateContentType(feedType, resolvedUrl),
+            contentType = effectiveType,
+            audioUrl = effectiveAudioUrl,
+            duration = duration,
         )
     }
 }
@@ -445,8 +509,95 @@ internal fun resolveCandidateContentType(feedType: String, itemUrl: String): Str
         feedType.equals("youtube", ignoreCase = true) ||
             itemUrl.contains("youtube.com", ignoreCase = true) ||
             itemUrl.contains("youtu.be", ignoreCase = true) -> "video"
+        feedType.equals("podcast", ignoreCase = true) || isDirectAudioUrl(itemUrl) ->
+            CONTENT_TYPE_AUDIO
         else -> "article"
     }
+
+internal fun extractAudioEnclosureUrl(item: Element, baseUrl: String): String? {
+    val rawCandidate =
+        findEnclosureTagAudioUrl(item)
+            ?: findMediaContentAudioUrl(item)
+            ?: findAtomLinkEnclosureAudioUrl(item)
+    return rawCandidate?.let { raw -> resolveRelativeUrl(baseUrl, raw) ?: raw }
+}
+
+private fun findEnclosureTagAudioUrl(item: Element): String? =
+    item
+        .directChildElements(XML_TAG_ENCLOSURE)
+        .mapNotNull { enc ->
+            val url = enc.getAttribute(ATTR_URL).ifBlank { enc.getAttribute("href") }.trim()
+            val type = enc.getAttribute("type").lowercase()
+            url.takeIf {
+                it.isNotBlank() && (type.startsWith(MIME_AUDIO_PREFIX) || isDirectAudioUrl(it))
+            }
+        }
+        .firstOrNull()
+
+private fun findMediaContentAudioUrl(item: Element): String? =
+    item
+        .directChildElements(XML_TAG_CONTENT)
+        .mapNotNull { media ->
+            val url = media.getAttribute(ATTR_URL).trim()
+            val medium = media.getAttribute("medium").lowercase()
+            val type = media.getAttribute("type").lowercase()
+            url.takeIf {
+                it.isNotBlank() &&
+                    (medium == CONTENT_TYPE_AUDIO ||
+                        type.startsWith(MIME_AUDIO_PREFIX) ||
+                        isDirectAudioUrl(it))
+            }
+        }
+        .firstOrNull()
+
+private fun findAtomLinkEnclosureAudioUrl(item: Element): String? =
+    item
+        .directChildElements(XML_TAG_LINK)
+        .mapNotNull { link ->
+            val rel = link.getAttribute("rel").trim().lowercase()
+            val href = link.getAttribute("href").trim()
+            val type = link.getAttribute("type").lowercase()
+            href.takeIf {
+                rel == XML_TAG_ENCLOSURE &&
+                    it.isNotBlank() &&
+                    (type.startsWith(MIME_AUDIO_PREFIX) || isDirectAudioUrl(it))
+            }
+        }
+        .firstOrNull()
+
+internal fun extractPodcastDurationLabel(item: Element): String? {
+    val raw =
+        item.firstDirectChildText("duration")
+            ?: item
+                .directChildElements(XML_TAG_CONTENT)
+                .map { it.getAttribute("duration").trim() }
+                .firstOrNull { it.isNotBlank() }
+            ?: return null
+    val seconds = parseDurationToSecondsLong(raw) ?: return raw
+    val minutes = seconds / SECONDS_PER_MIN
+    val remSeconds = seconds % SECONDS_PER_MIN
+    return "%d:%02d".format(java.util.Locale.US, minutes, remSeconds)
+}
+
+internal fun extractItunesImageHref(parent: Element, baseUrl: String): String? {
+    val imgEl =
+        parent.directChildElements(XML_TAG_IMAGE).firstOrNull {
+            it.getAttribute("href").isNotBlank()
+        } ?: return null
+    val href = imgEl.getAttribute("href").trim()
+    return resolveRelativeUrl(baseUrl, href)
+}
+
+internal fun extractChannelArtworkUrl(channel: Element, baseUrl: String): String? {
+    val itunesImage = extractItunesImageHref(channel, baseUrl)
+    val rssImage =
+        channel
+            .directChildElements(XML_TAG_IMAGE)
+            .mapNotNull { it.firstDirectChildText(ATTR_URL) }
+            .firstOrNull { it.isNotBlank() }
+            ?.let { resolveRelativeUrl(baseUrl, it) }
+    return itunesImage ?: rssImage
+}
 
 internal fun canonicalizeEntryUrl(rawUrl: String, feedType: String): String {
     val trimmed = rawUrl.trim()
@@ -469,7 +620,11 @@ internal fun extractAtomLink(
             links.firstOrNull {
                 val rel = it.getAttribute("rel").trim().lowercase()
                 (rel.isEmpty() || rel == "alternate") && it.getAttribute("href").isNotBlank()
-            } ?: links.firstOrNull { it.getAttribute("href").isNotBlank() }
+            }
+                ?: links.firstOrNull {
+                    val rel = it.getAttribute("rel").trim().lowercase()
+                    rel != "enclosure" && it.getAttribute("href").isNotBlank()
+                }
         } else {
             links.firstOrNull { it.getAttribute("href").isNotBlank() }
         }
@@ -502,7 +657,7 @@ internal fun extractMediaThumbnail(parent: Element, baseUrl: String): String? {
                 val medium = media.getAttribute("medium").lowercase()
                 val type = media.getAttribute("type").lowercase()
                 val url = media.getAttribute(ATTR_URL).trim()
-                url.isNotBlank() && (medium == "image" || type.startsWith("image/"))
+                url.isNotBlank() && (medium == XML_TAG_IMAGE || type.startsWith("image/"))
             }
             ?.let { resolveRelativeUrl(baseUrl, it.getAttribute(ATTR_URL).trim()) }
     return fromThumbTag ?: fromMediaContent
@@ -510,7 +665,7 @@ internal fun extractMediaThumbnail(parent: Element, baseUrl: String): String? {
 
 internal fun extractEnclosureImage(item: Element, baseUrl: String): String? =
     item
-        .directChildElements("enclosure")
+        .directChildElements(XML_TAG_ENCLOSURE)
         .firstOrNull { enclosure ->
             val type = enclosure.getAttribute("type").lowercase()
             val url = enclosure.getAttribute(ATTR_URL).trim()
@@ -656,6 +811,11 @@ private const val XML_TAG_CONTENT = "content"
 private const val XML_TAG_LANGUAGE = "language"
 private const val XML_TAG_LINK = "link"
 private const val XML_TAG_AUTHOR = "author"
+private const val XML_TAG_ENCLOSURE = "enclosure"
+private const val XML_TAG_IMAGE = "image"
+private const val CONTENT_TYPE_AUDIO = "audio"
+private const val MIME_AUDIO_PREFIX = "audio/"
+private const val SECONDS_PER_MIN = 60L
 private const val ATTR_URL = "url"
 private const val HTTP_PREFIX = "http://"
 private const val HTTPS_PREFIX = "https://"

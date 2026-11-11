@@ -20,10 +20,10 @@ macro_rules! item_select_sql {
             "SELECT i.id, i.feed_id, f.url AS feed_url, f.title AS feed_title, i.title, i.url, i.author,
        i.published_at, i.created_at, i.summary, ",
             $content_html_expr,
-            " AS content_html, i.thumbnail_url, i.content_type, i.status,
+            " AS content_html, i.thumbnail_url, i.audio_url, i.content_type, i.status,
        i.is_favorite, i.read_at, i.read_progress, i.interaction_updated_at,
        (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
-       (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1) AS duration,
+       COALESCE(i.duration, (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1)) AS duration,
        COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
 FROM items i
 LEFT JOIN feeds f ON i.feed_id = f.id"
@@ -70,6 +70,8 @@ pub struct Item {
     pub summary: Option<String>,
     pub content_html: Option<String>,
     pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub audio_url: Option<String>,
     pub content_type: ContentType,
     pub status: ItemStatus,
     pub is_favorite: bool,
@@ -103,6 +105,8 @@ pub struct ManualItemInput<'a> {
     pub summary: Option<&'a str>,
     pub content_html: Option<&'a str>,
     pub thumbnail_url: Option<&'a str>,
+    pub audio_url: Option<&'a str>,
+    pub duration: Option<i64>,
     pub content_type: ContentType,
     pub tags: &'a [String],
 }
@@ -315,6 +319,7 @@ impl<'a> ItemRepo<'a> {
             summary: new_item.summary.map(String::from),
             content_html: new_item.summary.map(String::from),
             thumbnail_url: None,
+            audio_url: None,
             content_type: new_item.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
@@ -340,6 +345,8 @@ impl<'a> ItemRepo<'a> {
             summary: None,
             content_html: None,
             thumbnail_url: None,
+            audio_url: None,
+            duration: None,
             content_type: ContentType::Article,
             tags,
         })
@@ -352,6 +359,7 @@ impl<'a> ItemRepo<'a> {
     ) -> std::result::Result<(Item, Vec<Tag>), sqlx::Error> {
         let item_id = deterministic_item_id(None, input.url.as_str());
         let now = SyncRepo::now_utc();
+        let clean_duration = input.duration.filter(|&d| d > 0);
         let mut tx = self.pool.begin().await?;
 
         SyncRepo::clear_tombstone(
@@ -363,8 +371,8 @@ impl<'a> ItemRepo<'a> {
 
         sqlx::query(
             "INSERT INTO items
-             (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, content_type, created_at, updated_at)
-             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+             (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, audio_url, duration, content_type, created_at, updated_at)
+             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&item_id)
         .bind(input.title)
@@ -372,6 +380,8 @@ impl<'a> ItemRepo<'a> {
         .bind(input.summary)
         .bind(input.content_html)
         .bind(input.thumbnail_url)
+        .bind(input.audio_url)
+        .bind(clean_duration)
         .bind(input.content_type)
         .bind(now)
         .bind(now)
@@ -415,6 +425,7 @@ impl<'a> ItemRepo<'a> {
             summary: input.summary.map(String::from),
             content_html: input.content_html.map(String::from),
             thumbnail_url: input.thumbnail_url.map(String::from),
+            audio_url: input.audio_url.map(String::from),
             content_type: input.content_type,
             status: ItemStatus::Unread,
             is_favorite: false,
@@ -422,7 +433,7 @@ impl<'a> ItemRepo<'a> {
             read_progress: 0.0,
             interaction_updated_at: None,
             thumbnail_media_id: None,
-            duration: None,
+            duration: clean_duration,
             tag_names,
         };
 
@@ -1113,6 +1124,8 @@ mod tests {
                     "<p>Modern distributed systems rely on state machine replication and optimizing latency.</p>",
                 ),
                 thumbnail_url: None,
+                audio_url: None,
+                duration: None,
                 content_type: ContentType::Article,
                 tags: &[],
             })
@@ -1395,6 +1408,8 @@ mod tests {
                 summary: Some("Short summary"),
                 content_html: Some(&huge_html),
                 thumbnail_url: Some("https://example.com/cover.jpg"),
+                audio_url: None,
+                duration: None,
                 content_type: ContentType::Article,
                 tags: &[],
             })

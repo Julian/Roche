@@ -602,7 +602,8 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         let explicit_title = title.map(str::trim).filter(|t| !t.is_empty());
 
         let should_fetch_html = content_type == ContentType::Article
-            || (explicit_title.is_none() && content_type != ContentType::Pdf);
+            || (explicit_title.is_none()
+                && !matches!(content_type, ContentType::Pdf | ContentType::Audio));
         let snapshot = if should_fetch_html {
             match tokio::time::timeout(
                 Duration::from_secs(10),
@@ -646,6 +647,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             .then(|| snapshot.as_ref().map(|s| s.content_html.as_str()))
             .flatten()
             .filter(|html| !html.trim().is_empty());
+        let audio_url = (content_type == ContentType::Audio).then(|| url.as_str());
 
         let (item, _) = self
             .service
@@ -657,6 +659,8 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
                 summary,
                 content_html,
                 thumbnail_url,
+                audio_url,
+                duration: None,
                 content_type,
                 tags,
             })

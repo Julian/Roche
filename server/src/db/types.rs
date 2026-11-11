@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum FeedType {
     #[default]
+    #[serde(alias = "podcast")]
     Rss,
     Youtube,
     Arxiv,
@@ -117,6 +118,7 @@ pub enum ContentType {
     Article,
     Video,
     Paper,
+    #[serde(alias = "podcast")]
     Audio,
     Pdf,
 }

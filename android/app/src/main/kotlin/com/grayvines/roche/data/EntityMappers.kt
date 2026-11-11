@@ -48,21 +48,36 @@ internal fun buildSnapshot(
             .groupingBy { it.feedId!! }
             .eachCount()
 
+    val podcastFeedIds =
+        domainEntries
+            .filter { it.contentType == ContentType.AUDIO && it.feedId != null }
+            .mapNotNull { it.feedId }
+            .toSet()
+
     val domainFeeds =
         feeds
             .map { feed ->
+                val baseType = FeedType.fromWireValue(feed.feedType)
+                val effectiveType =
+                    if (baseType == FeedType.RSS && feed.id in podcastFeedIds) {
+                        FeedType.PODCAST
+                    } else {
+                        baseType
+                    }
                 FeedItem(
                     id = feed.id,
                     title = feed.title,
                     url = feed.url,
                     siteUrl = feed.siteUrl,
-                    feedType = FeedType.fromWireValue(feed.feedType),
+                    feedType = effectiveType,
                     unreadCount = unreadByFeedId[feed.id] ?: 0,
                     lastPolled = feed.lastPolled,
                     lastPolledBy = feed.lastPolledBy,
                     lastError = feed.lastError,
                     lastErrorBy = feed.lastErrorBy,
                     isActive = feed.isActive,
+                    autoDownloadEpisodes = feed.autoDownloadEpisodes,
+                    customPlaybackSpeed = feed.customPlaybackSpeed,
                 )
             }
             .sortedWith(
@@ -122,8 +137,10 @@ internal fun toInboxEntry(entity: ItemEntity, tags: List<String>): InboxEntry =
         tags = tags,
         readAt = entity.readAt,
         thumbnailUrl = entity.thumbnailUrl,
+        audioUrl = entity.audioUrl,
     )
 
+@Suppress("CyclomaticComplexMethod")
 internal fun toRemoteFeedEntity(
     remote: RemoteFeedDto,
     existing: FeedEntity? = null,
@@ -133,12 +150,21 @@ internal fun toRemoteFeedEntity(
             existing.lastPolled != null &&
             (remote.lastPolled == null || existing.lastPolled > remote.lastPolled)
     val pollSource = if (useExistingPoll) existing else null
+    val resolvedFeedType =
+        if (
+            existing?.feedType?.equals("podcast", ignoreCase = true) == true &&
+                remote.feedType == "rss"
+        ) {
+            "podcast"
+        } else {
+            remote.feedType
+        }
     return FeedEntity(
         id = remote.id,
         title = remote.title.ifBlank { existing?.title.orEmpty() },
         url = remote.url.ifBlank { existing?.url.orEmpty() },
         siteUrl = remote.siteUrl ?: existing?.siteUrl,
-        feedType = remote.feedType,
+        feedType = resolvedFeedType,
         description = remote.description ?: existing?.description,
         language = remote.language ?: existing?.language,
         pollInterval = remote.pollInterval,
@@ -147,6 +173,8 @@ internal fun toRemoteFeedEntity(
         lastError = pollSource?.lastError ?: remote.lastError,
         lastErrorBy = pollSource?.lastErrorBy ?: remote.lastErrorBy,
         isActive = remote.isActive,
+        autoDownloadEpisodes = existing?.autoDownloadEpisodes ?: false,
+        customPlaybackSpeed = existing?.customPlaybackSpeed,
     )
 }
 
@@ -168,6 +196,13 @@ internal fun toRemoteItemEntity(
         )
     val richerHtml =
         pickRicherString(existing?.contentHtml, remote.contentHtml)?.take(MAX_SQLITE_HTML_CHARS)
+    val resolvedAudioUrl = remote.audioUrl.nonBlankOr(existing?.audioUrl)
+    val resolvedContentType =
+        if (!resolvedAudioUrl.isNullOrBlank()) {
+            ContentType.AUDIO.wireValue
+        } else {
+            remote.contentType.ifBlank { existing?.contentType ?: "article" }
+        }
     return ItemEntity(
         id = remote.id,
         feedId = resolvedFeedId,
@@ -178,7 +213,7 @@ internal fun toRemoteItemEntity(
         summary = richerSummary,
         contentText = richerText,
         contentHtml = richerHtml,
-        contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
+        contentType = resolvedContentType,
         status = remote.status,
         isFavorite = remote.isFavorite,
         isCachedOffline = isCachedOffline,
@@ -198,6 +233,7 @@ internal fun toRemoteItemEntity(
         feedUrl = resolvedFeedUrl,
         interactionUpdatedAt =
             newerIsoTimestamp(remote.interactionUpdatedAt, existing?.interactionUpdatedAt),
+        audioUrl = resolvedAudioUrl,
     )
 }
 
@@ -247,6 +283,7 @@ internal fun reconcileSavedItemEntity(
         thumbnailMediaId = remoteSaved.thumbnailMediaId ?: localEntity.thumbnailMediaId,
         duration = remoteSaved.duration ?: localEntity.duration,
         thumbnailUrl = remoteSaved.thumbnailUrl ?: localEntity.thumbnailUrl,
+        audioUrl = remoteSaved.audioUrl ?: localEntity.audioUrl,
     )
 
 internal fun createSavedItemEntity(
@@ -263,6 +300,7 @@ internal fun createSavedItemEntity(
             when (type) {
                 ContentType.PDF -> "arXiv / PDF"
                 ContentType.VIDEO -> "YouTube"
+                ContentType.AUDIO -> "Podcast / Audio"
                 ContentType.ARTICLE -> hostTitle
             },
         title = title,
@@ -280,6 +318,7 @@ internal fun createSavedItemEntity(
         readProgress = 0.0,
         thumbnailMediaId = null,
         duration = null,
+        audioUrl = if (type == ContentType.AUDIO) url else null,
     )
 }
 

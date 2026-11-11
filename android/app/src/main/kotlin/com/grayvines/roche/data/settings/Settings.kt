@@ -17,6 +17,10 @@ data class Settings(
     val readerFontScale: Float = DEFAULT_READER_FONT_SCALE,
     val bottomNavTabs: List<AppTab> = AppTab.defaultSideTabs,
     val lastPeerSyncCursor: String = "",
+    val queueItemIds: List<String> = emptyList(),
+    val defaultPlaybackSpeed: Float = DEFAULT_PLAYBACK_SPEED,
+    val skipSilenceEnabled: Boolean = false,
+    val smartRewindEnabled: Boolean = true,
 ) {
     companion object {
         const val DEFAULT_SERVER_URL = ""
@@ -25,8 +29,27 @@ data class Settings(
         const val DEFAULT_READER_FONT_SCALE = 1.0f
         const val MIN_READER_FONT_SCALE = 0.85f
         const val MAX_READER_FONT_SCALE = 1.35f
+        const val DEFAULT_PLAYBACK_SPEED = 1.0f
+        const val MIN_PLAYBACK_SPEED = 0.50f
+        const val MAX_PLAYBACK_SPEED = 3.50f
+        const val PLAYBACK_SPEED_STEP = 0.05f
     }
 }
+
+fun clampPlaybackSpeed(raw: Float): Float =
+    if (!raw.isFinite()) {
+        Settings.DEFAULT_PLAYBACK_SPEED
+    } else {
+        (kotlin.math.round(raw * PLAYBACK_SPEED_STEPS_PER_UNIT) / PLAYBACK_SPEED_STEPS_PER_UNIT)
+            .coerceIn(
+                Settings.MIN_PLAYBACK_SPEED,
+                Settings.MAX_PLAYBACK_SPEED,
+            )
+    }
+
+val PLAYBACK_SPEED_PRESETS: List<Float> = listOf(1.0f, 1.25f, 1.5f, 2.0f, 2.5f, 3.0f)
+
+private const val PLAYBACK_SPEED_STEPS_PER_UNIT = 20f
 
 fun Settings.clamped(): Settings =
     copy(
@@ -41,6 +64,8 @@ fun Settings.clamped(): Settings =
                 ?: Settings.DEFAULT_READER_FONT_SCALE,
         bottomNavTabs = AppTab.normalizeSideTabs(bottomNavTabs),
         lastPeerSyncCursor = lastPeerSyncCursor.trim(),
+        queueItemIds = queueItemIds.map { it.trim() }.filter { it.isNotBlank() }.distinct(),
+        defaultPlaybackSpeed = clampPlaybackSpeed(defaultPlaybackSpeed),
     )
 
 internal fun normalizeServerUrl(rawUrl: String): String {

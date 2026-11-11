@@ -50,13 +50,24 @@ internal class OfflineCacheManager(
         val currentSettings = settings.settings.first()
         val serverUrl = currentSettings.serverUrl
         val token = currentSettings.bearerToken
-        if (serverUrl.isBlank() || token.isBlank()) return
+        val hasServerAuth = serverUrl.isNotBlank() && token.isNotBlank()
 
-        val hydrated = hydrateItemDetailBestEffort(serverUrl, token, itemId)
+        val hydrated =
+            if (hasServerAuth) {
+                hydrateItemDetailBestEffort(serverUrl, token, itemId)
+            } else {
+                null
+            }
         val latest = dao.getItemById(itemId)
         if (latest?.isCachedOffline != true) {
             evictCachedItemFiles(itemId)
             return
+        }
+        val audioUrl =
+            (hydrated?.audioUrl ?: latest.audioUrl)?.trim()?.takeIf { it.isNotBlank() }
+                ?: latest.url.takeIf { latest.contentType.equals("audio", ignoreCase = true) }
+        if (!audioUrl.isNullOrBlank()) {
+            cacheAudioEnclosureBestEffort(itemId = itemId, audioUrl = audioUrl)
         }
         val thumbId = hydrated?.thumbnailMediaId ?: latest.thumbnailMediaId
         val htmlContent = hydrated?.contentHtml ?: latest.contentHtml
@@ -78,6 +89,50 @@ internal class OfflineCacheManager(
             thumbnailMediaId = thumbId,
             externalImageUrls = externalImageUrls,
         )
+    }
+
+    internal suspend fun autoDownloadNewEpisodes() {
+        val autoDownloadFeedIds =
+            dao.getAllFeeds()
+                .filter { it.isActive && it.autoDownloadEpisodes }
+                .map { it.id }
+                .toSet()
+        if (autoDownloadFeedIds.isEmpty()) return
+        val candidates =
+            dao.getAllItems().filter { item ->
+                item.feedId in autoDownloadFeedIds &&
+                    item.status != "archived" &&
+                    item.readAt.isNullOrBlank() &&
+                    !item.isCachedOffline &&
+                    (item.contentType.equals("audio", ignoreCase = true) ||
+                        !item.audioUrl.isNullOrBlank())
+            }
+        for (item in candidates) {
+            setOfflineCacheState(itemId = item.id, enabled = true)
+        }
+    }
+
+    private suspend fun cacheAudioEnclosureBestEffort(
+        itemId: String,
+        audioUrl: String,
+    ) {
+        val rootDir = cacheDir ?: return
+        if (dao.getItemById(itemId)?.isCachedOffline != true) return
+        val targetFile =
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val itemsRoot = File(rootDir, ITEMS_SUBDIR)
+                    itemsRoot.mkdirs()
+                    val itemDir = resolveSafeChildFile(itemsRoot, itemId)
+                    itemDir.mkdirs()
+                    resolveSafeChildFile(itemDir, AUDIO_ENCLOSURE_FILE_NAME)
+                }
+                    .getOrNull()
+            } ?: return
+        val streamed = apiClient.streamExternalBinaryToFile(audioUrl, targetFile)
+        if (!streamed && dao.getItemById(itemId)?.isCachedOffline != true) {
+            evictCachedItemFiles(itemId)
+        }
     }
 
     private suspend fun hydrateItemDetailBestEffort(
@@ -117,12 +172,21 @@ internal class OfflineCacheManager(
         externalImageUrls: List<String> = emptyList(),
     ) {
         val rootDir = cacheDir ?: return
-        val remoteMedia = runCatching {
-            apiClient.fetchItemMedia(serverUrl, token, itemId)
-        }
-            .onFailure { if (it is CancellationException) throw it }
-            .getOrDefault(emptyList())
-        val eligibleIds = collectEligibleMediaIds(remoteMedia, thumbnailMediaId)
+        val hasServerAuth = serverUrl.isNotBlank() && token.isNotBlank()
+        val remoteMedia =
+            if (hasServerAuth) {
+                runCatching { apiClient.fetchItemMedia(serverUrl, token, itemId) }
+                    .onFailure { if (it is CancellationException) throw it }
+                    .getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+        val eligibleIds =
+            if (hasServerAuth) {
+                collectEligibleMediaIds(remoteMedia, thumbnailMediaId)
+            } else {
+                emptyList()
+            }
         val thumbnailIds =
             remoteMedia
                 .filter { it.mediaType.equals("thumbnail", ignoreCase = true) }
@@ -257,6 +321,7 @@ internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): 
             detail.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: local.thumbnailMediaId,
         thumbnailUrl = detail.thumbnailUrl?.takeIf { it.isNotBlank() } ?: local.thumbnailUrl,
         duration = detail.duration?.takeIf { it.isNotBlank() } ?: local.duration,
+        audioUrl = detail.audioUrl?.takeIf { it.isNotBlank() } ?: local.audioUrl,
         status = local.status,
         isFavorite = local.isFavorite,
         readProgress = local.readProgress,
@@ -328,8 +393,21 @@ internal fun diskCacheKey(mediaOrUrl: String): String =
         mediaOrUrl
     }
 
+internal fun resolveCachedAudioFile(cacheDir: File?, itemId: String): File? {
+    val rootDir = cacheDir ?: return null
+    return runCatching {
+        val itemsRoot = File(rootDir, ITEMS_SUBDIR)
+        if (!itemsRoot.exists()) return null
+        val itemDir = resolveSafeChildFile(itemsRoot, itemId)
+        val audioFile = resolveSafeChildFile(itemDir, AUDIO_ENCLOSURE_FILE_NAME)
+        audioFile.takeIf { it.isFile && it.length() > 0L }
+    }
+        .getOrNull()
+}
+
 internal const val ITEMS_SUBDIR = "items"
 internal const val THUMBNAILS_SUBDIR = "thumbnails"
+internal const val AUDIO_ENCLOSURE_FILE_NAME = "audio_enclosure"
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
 private const val MAX_OFFLINE_EXTERNAL_IMAGES = 16

@@ -66,6 +66,14 @@ internal fun inferFeedTypeWireValue(url: String): String =
         else -> "rss"
     }
 
+internal fun isDirectAudioUrl(url: String): Boolean {
+    val cleanPath = url.trim().substringBefore('#').substringBefore('?').trimEnd('/').lowercase()
+    return AUDIO_EXTENSIONS.any { ext -> cleanPath.endsWith(ext) }
+}
+
+private val AUDIO_EXTENSIONS =
+    listOf(".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac")
+
 internal fun inferContentType(url: String): ContentType {
     val cleanPath = url.trim().substringBefore('#').substringBefore('?').trimEnd('/')
     return when {
@@ -74,6 +82,7 @@ internal fun inferContentType(url: String): ContentType {
             cleanPath.endsWith("/pdf", ignoreCase = true) -> ContentType.PDF
         url.contains("youtube.com", ignoreCase = true) ||
             url.contains("youtu.be", ignoreCase = true) -> ContentType.VIDEO
+        isDirectAudioUrl(url) -> ContentType.AUDIO
         else -> ContentType.ARTICLE
     }
 }

@@ -1,3 +1,5 @@
+@file:Suppress("LongMethod")
+
 package com.grayvines.roche.ui
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
@@ -41,6 +43,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
 @OptIn(ExperimentalCoroutinesApi::class)
+@Suppress("LargeClass")
 class MainViewModelTest {
     @TempDir lateinit var tempDir: File
 
@@ -586,6 +589,112 @@ class MainViewModelTest {
 
             val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
             assertEquals("3m", com.grayvines.roche.model.formatArticleMinutes(mathPlainText))
+
+            collectJob.cancel()
+        }
+
+    @Test
+    internal fun `interleaved queue and audio autoplay skip non-audio articles and apply podcast speed`() =
+        runTest {
+            val podcastFeed =
+                FeedEntity(
+                    id = "f-podcast",
+                    title = "Oxide and Friends",
+                    url = "https://oxide.computer/podcasts/rss.xml",
+                    siteUrl = "https://oxide.computer",
+                    feedType = "podcast",
+                    autoDownloadEpisodes = true,
+                    customPlaybackSpeed = 2.65f,
+                )
+            val ep1 =
+                testItem(id = "ep-1", title = "Ep 1: Async Rust", feedId = "f-podcast")
+                    .copy(
+                        feedTitle = "Oxide and Friends",
+                        contentType = "audio",
+                        audioUrl = "https://cdn.oxide.computer/ep1.mp3",
+                        duration = "01:12:00",
+                        summary = "<p>00:00 Intro<br/>12:30 Tokio Internals<br/>45:10 Q&amp;A</p>",
+                    )
+            val articleMid =
+                testItem(id = "art-mid", title = "Interleaved Article", feedId = "f-1")
+                    .copy(contentType = "article")
+            val ep2 =
+                testItem(id = "ep-2", title = "Ep 2: Hubris OS", feedId = "f-podcast")
+                    .copy(
+                        feedTitle = "Oxide and Friends",
+                        contentType = "audio",
+                        audioUrl = "https://cdn.oxide.computer/ep2.mp3",
+                        duration = "54:20",
+                    )
+            database.dao().upsertFeeds(listOf(testFeed("f-1", "Systems Blog"), podcastFeed))
+            database.dao().upsertItems(listOf(ep1, articleMid, ep2))
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 3 }
+
+            // Queue: ep-1, art-mid, ep-2
+            viewModel.dispatch(MainAction.AddToQueue("ep-1"))
+            viewModel.dispatch(MainAction.AddToQueue("art-mid"))
+            viewModel.dispatch(MainAction.AddToQueue("ep-2"))
+            val queuedState = viewModel.uiState.first { it.queueEntries.size == 3 }
+            assertEquals(listOf("ep-1", "art-mid", "ep-2"), queuedState.queueEntries.map { it.id })
+            assertEquals("ep-1", queuedState.nextQueuedAudioEntryId)
+
+            // Play ep-1: applies podcast customPlaybackSpeed (2.65x), parses chapters, sets
+            // nextQueuedAudioEntryId to ep-2 (skipping art-mid)
+            viewModel.dispatch(MainAction.PlayAudioEntry("ep-1", openFullscreen = true))
+            val playingEp1 =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == "ep-1" && it.playerState.isFullscreenOpen
+                }
+            assertEquals(2.65f, playingEp1.playerState.playbackSpeed, 1e-3f)
+            assertEquals(3, playingEp1.playerState.chapters.size)
+            assertEquals("Tokio Internals", playingEp1.playerState.chapters[1].title)
+            assertEquals("ep-2", playingEp1.nextQueuedAudioEntryId)
+
+            // SkipToNextQueuedAudio (or episode completion) marks ep-1 read & archived, leaves
+            // art-mid in queue, and plays ep-2
+            viewModel.dispatch(MainAction.SkipToNextQueuedAudio)
+            val playingEp2 =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == "ep-2" &&
+                        it.allEntries.first { e -> e.id == "ep-1" }.isArchived &&
+                        it.listeningHistoryEntries.size == 2
+                }
+            assertEquals(listOf("art-mid", "ep-2"), playingEp2.queueEntries.map { it.id })
+            assertFalse(playingEp2.allEntries.first { it.id == "art-mid" }.isArchived)
+
+            // Verify listening history records both episodes with timestamps and status labels
+            val ep1History = playingEp2.listeningHistoryEntries.first { it.id == "ep-1" }
+            val ep2History = playingEp2.listeningHistoryEntries.first { it.id == "ep-2" }
+            assertTrue(!ep1History.readAt.isNullOrBlank())
+            assertTrue(!ep2History.readAt.isNullOrBlank())
+            assertEquals("Played now · Completed", ep1History.formattedListeningHistoryLabel)
+
+            // Verify favoriting/starring a podcast episode adds it to starredEntries
+            viewModel.dispatch(MainAction.ToggleStar("ep-1"))
+            val starredState =
+                viewModel.uiState.first { state ->
+                    state.starredEntries.any { it.id == "ep-1" }
+                }
+            assertTrue(starredState.allEntries.first { it.id == "ep-1" }.isFavorite)
+
+            // Reorder queue and test speed & podcast settings
+            viewModel.dispatch(MainAction.MoveQueueItemUp("ep-2"))
+            val reordered =
+                viewModel.uiState.first {
+                    it.queueEntries.map { e -> e.id } == listOf("ep-2", "art-mid")
+                }
+            assertEquals(listOf("ep-2", "art-mid"), reordered.queueEntries.map { it.id })
+
+            viewModel.dispatch(
+                MainAction.SetPlaybackSpeed(speed = 2.75f, applyToCurrentPodcast = true)
+            )
+            val updatedFeedSpeed =
+                viewModel.uiState.first {
+                    abs((it.activePlayerFeed?.customPlaybackSpeed ?: 0f) - 2.75f) < 1e-3f
+                }
+            assertEquals(2.75f, updatedFeedSpeed.playerState.playbackSpeed, 1e-3f)
 
             collectJob.cancel()
         }

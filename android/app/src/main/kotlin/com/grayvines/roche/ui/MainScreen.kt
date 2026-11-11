@@ -1,3 +1,5 @@
+@file:Suppress("LongMethod", "CognitiveComplexMethod")
+
 package com.grayvines.roche.ui
 
 import androidx.activity.compose.BackHandler
@@ -41,7 +43,9 @@ fun MainScreen(
     onExportOpml: () -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
-    val showChrome = state.activeReaderEntry == null
+    val activePlayerEntry = state.activePlayerEntry
+    val isFullscreenPlayerOpen = state.playerState.isFullscreenOpen && activePlayerEntry != null
+    val showChrome = state.activeReaderEntry == null && !isFullscreenPlayerOpen
     val hasFab = showChrome && state.activeTab != AppTab.SETTINGS
     val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
 
@@ -63,11 +67,20 @@ fun MainScreen(
         },
         bottomBar = {
             if (showChrome) {
-                RocheBottomBar(
-                    activeTab = state.activeTab,
-                    sideTabs = state.settings.bottomNavTabs,
-                    onSelectTab = { onAction(MainAction.SelectTab(it)) },
-                )
+                androidx.compose.foundation.layout.Column {
+                    if (activePlayerEntry != null) {
+                        DockedMiniPlayer(
+                            entry = activePlayerEntry,
+                            playerState = state.playerState,
+                            onAction = onAction,
+                        )
+                    }
+                    RocheBottomBar(
+                        activeTab = state.activeTab,
+                        sideTabs = state.settings.bottomNavTabs,
+                        onSelectTab = { onAction(MainAction.SelectTab(it)) },
+                    )
+                }
             }
         },
     ) { innerPadding ->
@@ -161,6 +174,7 @@ private fun MainOverlaySheets(
         EntryContextBottomSheet(
             entry = contextEntry,
             availableTags = state.tags.map { it.name },
+            isInQueue = state.isEntryInQueue(contextEntry.id),
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
@@ -198,6 +212,19 @@ private fun MainBodyContent(
     onImportOpml: () -> Unit,
     onExportOpml: () -> Unit,
 ) {
+    val activePlayerEntry = state.activePlayerEntry
+    if (state.playerState.isFullscreenOpen && activePlayerEntry != null) {
+        FullscreenPodcastPlayer(
+            entry = activePlayerEntry,
+            feed = state.activePlayerFeed,
+            playerState = state.playerState,
+            nextQueuedAudioEntry = state.nextQueuedAudioEntry,
+            onAction = onAction,
+            onShareEntry = onShareEntry,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+        return
+    }
     val readerEntry = state.activeReaderEntry
     if (readerEntry != null) {
         CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
@@ -214,6 +241,7 @@ private fun MainBodyContent(
     }
     when (state.activeTab) {
         AppTab.INBOX -> InboxTabContent(state = state, onAction = onAction)
+        AppTab.QUEUE -> QueueTabContent(state = state, onAction = onAction)
         AppTab.STARRED -> StarredTabContent(state = state, onAction = onAction)
         AppTab.SEARCH -> SearchTabContent(state = state, onAction = onAction)
         AppTab.FEEDS -> FeedsAndTagsTabContent(state = state, onAction = onAction)
@@ -230,6 +258,7 @@ private fun MainBodyContent(
 
 private fun readerBackLabel(state: MainUiState): String =
     when (state.activeTab) {
+        AppTab.QUEUE -> "← Queue"
         AppTab.STARRED -> "← Starred"
         AppTab.SEARCH -> "← Search"
         AppTab.OFFLINE -> "← Offline"

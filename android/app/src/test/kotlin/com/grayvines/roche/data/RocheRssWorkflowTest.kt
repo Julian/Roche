@@ -606,9 +606,21 @@ private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
         RocheDatabase.MIGRATION_1_2.migrate(conn)
         RocheDatabase.MIGRATION_2_3.migrate(conn)
         RocheDatabase.MIGRATION_3_4.migrate(conn)
+        RocheDatabase.MIGRATION_4_5.migrate(conn)
         conn.prepare("SELECT COUNT(*) FROM items WHERE id = 'i-1'").use { stmt ->
             assertTrue(stmt.step())
             assertEquals(1L, stmt.getLong(0))
+        }
+        conn
+            .prepare("SELECT autoDownloadEpisodes, customPlaybackSpeed FROM feeds WHERE id = 'f-1'")
+            .use { stmt ->
+                assertTrue(stmt.step())
+                assertEquals(0L, stmt.getLong(0))
+                assertTrue(stmt.isNull(1))
+            }
+        conn.prepare("SELECT audioUrl FROM items WHERE id = 'i-1'").use { stmt ->
+            assertTrue(stmt.step())
+            assertTrue(stmt.isNull(0))
         }
     }
 }

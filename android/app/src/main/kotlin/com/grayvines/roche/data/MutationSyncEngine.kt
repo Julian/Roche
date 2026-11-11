@@ -1018,8 +1018,15 @@ internal suspend fun pushPendingLocalFeed(
                 title = effectiveRemote.title.ifBlank { localFeed.title },
                 url = effectiveRemote.url.ifBlank { localFeed.url },
                 siteUrl = effectiveRemote.siteUrl,
-                feedType = effectiveRemote.feedType,
+                feedType =
+                    if (localFeed.feedType.equals("podcast", ignoreCase = true)) {
+                        "podcast"
+                    } else {
+                        effectiveRemote.feedType
+                    },
                 isActive = localFeed.isActive,
+                autoDownloadEpisodes = localFeed.autoDownloadEpisodes,
+                customPlaybackSpeed = localFeed.customPlaybackSpeed,
             )
         )
         dao.deletePendingMutation(mutation.entityId)

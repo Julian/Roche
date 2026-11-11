@@ -43,8 +43,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ThemeMode
@@ -53,6 +56,7 @@ import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
@@ -143,7 +147,7 @@ internal fun ReaderScrollProgressEffect(
     onAction: (MainAction) -> Unit,
 ) {
     val bodyLengthBucket = (entry.contentHtml?.length ?: 0) + (entry.contentText?.length ?: 0)
-    var restoredBodyBucket by remember(entry.id) { mutableStateOf(-1) }
+    var restoredBodyBucket by remember(entry.id) { androidx.compose.runtime.mutableIntStateOf(-1) }
     var hasUserScrolled by remember(entry.id) { mutableStateOf(false) }
 
     LaunchedEffect(entry.id, bodyLengthBucket, scrollState.maxValue) {
@@ -539,6 +543,7 @@ fun EntryContextBottomSheet(
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    isInQueue: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
     val allTags = remember(availableTags, entry.tags) { (availableTags + entry.tags).distinct() }
@@ -562,6 +567,7 @@ fun EntryContextBottomSheet(
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             ContextSheetActionsList(
                 entry = entry,
+                isInQueue = isInQueue,
                 onAction = onAction,
                 onShare = {
                     onAction(MainAction.CloseContextSheet)
@@ -679,18 +685,36 @@ internal fun ContextSheetTagsEditor(
 @Composable
 private fun ContextSheetActionsList(
     entry: InboxEntry,
+    isInQueue: Boolean,
     onAction: (MainAction) -> Unit,
     onShare: () -> Unit,
     onOpenExternalUrl: () -> Unit,
 ) {
+    val isAudio = entry.contentType == ContentType.AUDIO
     val readToggleLabel = if (entry.isRead) "Mark as Unread" else "Mark as Read"
     val offlineLabel =
-        if (entry.isCachedOffline) {
-            "Remove Local Offline Copy"
-        } else {
-            "Download Local Offline Copy"
+        when {
+            isAudio && entry.isCachedOffline -> "Delete Local Episode Download"
+            isAudio -> "Download Episode for Offline Playback"
+            entry.isCachedOffline -> "Remove Local Offline Copy"
+            else -> "Download Local Offline Copy"
         }
 
+    if (isAudio) {
+        ContextActionItem(
+            label = "▶ Play Episode Now",
+            textColor = LocalRocheColors.current.accentBlue,
+            onClick = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = true)) },
+        )
+    }
+    ContextActionItem(
+        label = "Play Next in Queue",
+        onClick = { onAction(MainAction.AddToQueue(entryId = entry.id, playNext = true)) },
+    )
+    ContextActionItem(
+        label = if (isInQueue) "Remove from Queue" else "Add to Queue",
+        onClick = { onAction(MainAction.ToggleQueueMembership(entry.id)) },
+    )
     ContextActionItem(
         label = readToggleLabel,
         onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
@@ -736,6 +760,7 @@ fun FeedContextBottomSheet(
         ) {
             FeedContextHeaderRow(feed = feed)
             FeedRenameRow(feed = feed, onAction = onAction)
+            FeedPodcastSettingsSection(feed = feed, onAction = onAction)
             FeedBulkTagRow(feed = feed, availableTags = availableTags, onAction = onAction)
             HorizontalDivider(color = colors.border, thickness = 1.dp)
             FeedContextActionsList(
@@ -814,6 +839,58 @@ internal fun FeedRenameRow(
             modifier = Modifier.testTag("feed_rename_save_btn"),
         )
     }
+}
+
+@Composable
+internal fun FeedPodcastSettingsSection(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val isPodcast =
+        feed.feedType == FeedType.PODCAST ||
+            feed.autoDownloadEpisodes ||
+            feed.customPlaybackSpeed != null
+    if (!isPodcast) return
+
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    SettingToggleRow(
+        title = "Always download new episodes of this podcast",
+        subtitle = "Automatically cache new episodes from ${feed.title} on this device",
+        checked = feed.autoDownloadEpisodes,
+        onCheckedChange = { enabled ->
+            onAction(MainAction.SetFeedAutoDownload(feedId = feed.id, enabled = enabled))
+        },
+    )
+    Text(
+        text = "PODCAST PLAYBACK SPEED OVERRIDE",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 10.sp,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        FilterChipPill(
+            label = "Default",
+            selected = feed.customPlaybackSpeed == null,
+            onClick = { onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = null)) },
+        )
+        PLAYBACK_SPEED_PRESETS.forEach { preset ->
+            val label = formatPlaybackSpeedLabel(preset)
+            val isSelected =
+                feed.customPlaybackSpeed != null && abs(feed.customPlaybackSpeed - preset) < 0.02f
+            FilterChipPill(
+                label = label,
+                selected = isSelected,
+                onClick = {
+                    onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = preset))
+                },
+            )
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable

@@ -213,7 +213,9 @@ internal fun buildPeerSyncRequestPayload(request: PeerSyncRequestDto): String = 
 
 private fun buildPeerFeedJsonObject(feed: FeedEntity): JsonObject = buildJsonObject {
     put(KEY_ID, feed.id)
-    put(KEY_FEED_TYPE, feed.feedType)
+    val wireFeedType =
+        if (feed.feedType.equals("podcast", ignoreCase = true)) "rss" else feed.feedType
+    put(KEY_FEED_TYPE, wireFeedType)
     put(KEY_URL, feed.url)
     feed.title.takeIf { it.isNotBlank() }?.let { put(KEY_TITLE, it) }
     feed.description?.takeIf { it.isNotBlank() }?.let { put(KEY_DESCRIPTION, it) }
@@ -238,6 +240,8 @@ private fun buildPeerItemJsonObject(item: PeerSyncItemPayload): JsonObject = bui
     item.summary?.takeIf { it.isNotBlank() }?.let { put(KEY_SUMMARY, it) }
     item.contentHtml?.takeIf { it.isNotBlank() }?.let { put(KEY_CONTENT_HTML, it) }
     item.thumbnailUrl?.takeIf { it.isNotBlank() }?.let { put(KEY_THUMBNAIL_URL, it) }
+    item.audioUrl?.takeIf { it.isNotBlank() }?.let { put(KEY_AUDIO_URL, it) }
+    item.duration?.takeIf { it > 0L }?.let { put("duration", it) }
     put(KEY_CONTENT_TYPE, item.contentType)
     put(KEY_STATUS, item.status)
     put(KEY_IS_FAVORITE, item.isFavorite)
@@ -412,6 +416,7 @@ private fun parseItemJsonObject(obj: JsonObject): RemoteItemDto =
         thumbnailUrl = obj.nullableString(KEY_THUMBNAIL_URL),
         feedUrl = obj.nullableString(KEY_FEED_URL),
         interactionUpdatedAt = obj.nullableString(KEY_INTERACTION_UPDATED_AT),
+        audioUrl = obj.nullableString(KEY_AUDIO_URL),
     )
 
 private fun JsonObject.parseItemReadAt(): String? =
@@ -506,6 +511,7 @@ private const val KEY_AUTHOR = "author"
 private const val KEY_SUMMARY = "summary"
 private const val KEY_CONTENT_HTML = "content_html"
 private const val KEY_THUMBNAIL_URL = "thumbnail_url"
+private const val KEY_AUDIO_URL = "audio_url"
 private const val KEY_CONTENT_TYPE = "content_type"
 private const val KEY_INTERACTION_UPDATED_AT = "interaction_updated_at"
 private const val KEY_TAG_NAMES = "tag_names"
