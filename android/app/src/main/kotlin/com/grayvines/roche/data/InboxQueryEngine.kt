@@ -65,14 +65,14 @@ internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boo
     if (normalizedQuery.isBlank()) return true
     val cleanQuery = normalizedQuery.trimStart('#')
     if (cleanQuery.isBlank()) return true
-    return entry.title.lowercase().contains(cleanQuery) ||
-        entry.feedTitle.lowercase().contains(cleanQuery) ||
-        entry.author.orEmpty().lowercase().contains(cleanQuery) ||
-        entry.url.lowercase().contains(cleanQuery) ||
-        entry.summary.orEmpty().lowercase().contains(cleanQuery) ||
-        entry.contentText.orEmpty().lowercase().contains(cleanQuery) ||
-        entry.contentHtml.orEmpty().lowercase().contains(cleanQuery) ||
-        entry.tags.any { it.lowercase().contains(cleanQuery) }
+    return entry.title.contains(cleanQuery, ignoreCase = true) ||
+        entry.feedTitle.contains(cleanQuery, ignoreCase = true) ||
+        entry.author?.contains(cleanQuery, ignoreCase = true) == true ||
+        entry.url.contains(cleanQuery, ignoreCase = true) ||
+        entry.summary?.contains(cleanQuery, ignoreCase = true) == true ||
+        entry.contentText?.contains(cleanQuery, ignoreCase = true) == true ||
+        entry.contentHtml?.contains(cleanQuery, ignoreCase = true) == true ||
+        entry.tags.any { it.contains(cleanQuery, ignoreCase = true) }
 }
 
 internal fun extractSearchMatchSnippet(entry: InboxEntry, rawQuery: String): String? {

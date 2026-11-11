@@ -12,7 +12,15 @@ interface RocheDao {
     @Query("SELECT * FROM feeds ORDER BY title COLLATE NOCASE ASC, title ASC")
     fun observeFeeds(): Flow<List<FeedEntity>>
 
-    @Query("SELECT * FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC")
+    @Query(
+        "SELECT id, feedId, feedTitle, title, url, author, " +
+            "SUBSTR(summary, 1, 16384) AS summary, " +
+            "SUBSTR(contentText, 1, 65536) AS contentText, " +
+            "SUBSTR(contentHtml, 1, 65536) AS contentHtml, " +
+            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
+            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
+            "interactionUpdatedAt FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC"
+    )
     fun observeItems(): Flow<List<ItemEntity>>
 
     @Query("SELECT * FROM tags ORDER BY name COLLATE NOCASE ASC, name ASC")
@@ -89,9 +97,26 @@ interface RocheDao {
     @Query("DELETE FROM pending_mutations WHERE entityId = :entityId")
     suspend fun deletePendingMutation(entityId: String)
 
-    @Query("SELECT * FROM items") suspend fun getAllItems(): List<ItemEntity>
+    @Query(
+        "SELECT id, feedId, feedTitle, title, url, author, " +
+            "SUBSTR(summary, 1, 16384) AS summary, " +
+            "SUBSTR(contentText, 1, 262144) AS contentText, " +
+            "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
+            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
+            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
+            "interactionUpdatedAt FROM items"
+    )
+    suspend fun getAllItems(): List<ItemEntity>
 
-    @Query("SELECT * FROM items WHERE id = :id LIMIT 1")
+    @Query(
+        "SELECT id, feedId, feedTitle, title, url, author, " +
+            "SUBSTR(summary, 1, 16384) AS summary, " +
+            "SUBSTR(contentText, 1, 262144) AS contentText, " +
+            "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
+            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
+            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
+            "interactionUpdatedAt FROM items WHERE id = :id LIMIT 1"
+    )
     suspend fun getItemById(id: String): ItemEntity?
 
     @Query("DELETE FROM items WHERE id = :id") suspend fun deleteItemById(id: String)

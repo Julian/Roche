@@ -568,13 +568,17 @@ internal suspend fun buildPeerSyncRequest(
     networkTier: NetworkTier = NetworkTier.WIFI,
     updatedAfter: String? = null,
     weightOverride: Double? = null,
+    preloadedFeeds: List<FeedEntity>? = null,
+    preloadedItems: List<ItemEntity>? = null,
+    preloadedMutations: List<PendingMutationEntity>? = null,
 ): PeerSyncRequestDto {
-    val feeds = dao.getAllFeeds()
-    val allItems = dao.getAllItems()
+    val feeds = preloadedFeeds ?: dao.getAllFeeds()
+    val allItems = preloadedItems ?: dao.getAllItems()
     val feedUrlsById = feeds.associate { it.id to it.url }
     val tags = dao.getAllTags()
     val itemTagsByItemId = buildItemTagNamesByItemId(dao, tags)
-    val mutationsById = dao.getAllPendingMutations().associateBy { it.entityId }
+    val mutationsById =
+        (preloadedMutations ?: dao.getAllPendingMutations()).associateBy { it.entityId }
     val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
     val sinceInstant =
         resolveDeltaSinceInstant(updatedAfter, feeds.isNotEmpty() || allItems.isNotEmpty())
@@ -839,7 +843,7 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
             }
         }
     }
-    return dao.getAllItems().size
+    return dao.countItems()
 }
 
 private suspend fun executeSinglePeerSyncRound(
@@ -858,8 +862,8 @@ private suspend fun executeSinglePeerSyncRound(
             mutation = mutation,
         )
     }
-    val preFetchItemsById = dao.getAllItems().associateBy { it.id }
-    val preFetchFeedsById = dao.getAllFeeds().associateBy { it.id }
+    val preFetchItems = dao.getAllItems()
+    val preFetchFeeds = dao.getAllFeeds()
     val preSyncMutations = dao.getAllPendingMutations()
     val request =
         buildPeerSyncRequest(
@@ -869,6 +873,9 @@ private suspend fun executeSinglePeerSyncRound(
             networkTier = networkTier,
             updatedAfter = currentSettings.lastPeerSyncCursor,
             weightOverride = weightOverride,
+            preloadedFeeds = preFetchFeeds,
+            preloadedItems = preFetchItems,
+            preloadedMutations = preSyncMutations,
         )
     val syncedResponse = runCatching {
         apiClient.syncPeer(
@@ -886,8 +893,8 @@ private suspend fun executeSinglePeerSyncRound(
     reconcilePeerSyncResponse(
         dao = dao,
         response = response,
-        preFetchItemsById = preFetchItemsById,
-        preFetchFeedsById = preFetchFeedsById,
+        preFetchItemsById = preFetchItems.associateBy { it.id },
+        preFetchFeedsById = preFetchFeeds.associateBy { it.id },
         preSyncMutations = preSyncMutations,
         isDeltaItems = request.updatedAfter != null,
     )

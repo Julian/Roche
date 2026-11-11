@@ -48,6 +48,12 @@ data class ArchiveStateSnapshot(
     val previousReadAt: String?,
 )
 
+data class ReaderItemContent(
+    val itemId: String,
+    val contentHtml: String?,
+    val contentText: String?,
+)
+
 data class RepositorySnapshot(
     val entries: List<InboxEntry>,
     val feeds: List<FeedItem>,
@@ -212,8 +218,20 @@ class RocheRepository(
         return updated
     }
 
-    internal suspend fun hydrateItemContentIfNeeded(itemId: String) {
+    internal suspend fun hydrateItemContentIfNeeded(
+        itemId: String,
+        onLocalLoaded: (ReaderItemContent) -> Unit = {},
+    ): ReaderItemContent? {
+        dao.getItemById(itemId)?.let { local ->
+            onLocalLoaded(ReaderItemContent(local.id, local.contentHtml, local.contentText))
+        }
         offlineCacheManager.hydrateItemForReader(itemId)
+        val entity = dao.getItemById(itemId) ?: return null
+        return ReaderItemContent(
+            itemId = entity.id,
+            contentHtml = entity.contentHtml,
+            contentText = entity.contentText,
+        )
     }
 
     internal suspend fun archiveEntriesBatch(
@@ -633,41 +651,16 @@ class RocheRepository(
             preFetchItemsById = preFetchItemsById,
             preFetchFeedsById = preFetchFeedsById,
         )
-        bootstrapDeltaPeerSync(
+        bootstrapDeltaPeerSyncIfNeeded(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
             currentSettings = currentSettings,
+            networkTier = networkTierProvider.currentNetworkTier(),
             hasMergedData = mergedFeeds.isNotEmpty() || mergedItems.isNotEmpty(),
+            onPeersUpdated = { activePeersFlow.value = it },
         )
-        return dao.getAllItems().size
-    }
-
-    private suspend fun bootstrapDeltaPeerSync(
-        currentSettings: Settings,
-        hasMergedData: Boolean,
-    ) {
-        val shouldBootstrap =
-            currentSettings.bearerToken.isNotBlank() &&
-                currentSettings.lastPeerSyncCursor.isBlank() &&
-                hasMergedData
-        if (!shouldBootstrap) return
-        val bootstrapCursor =
-            Instant.now()
-                .minusSeconds(BOOTSTRAP_DELTA_LOOKBACK_SEC)
-                .truncatedTo(ChronoUnit.SECONDS)
-                .toString()
-        settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
-        runCatching {
-            tryPeerSyncAndCooperativePoll(
-                dao = dao,
-                apiClient = apiClient,
-                currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor),
-                networkTier = networkTierProvider.currentNetworkTier(),
-                onPeersUpdated = { activePeersFlow.value = it },
-                onSyncCursorUpdated = { cursor ->
-                    settings.update { it.copy(lastPeerSyncCursor = cursor) }
-                },
-            )
-        }
-            .onFailure { if (it is CancellationException) throw it }
+        return dao.countItems()
     }
 
     internal suspend fun pushSavedUrlBestEffort(
@@ -711,6 +704,42 @@ class RocheRepository(
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
 private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L
+
+@Suppress("LongParameterList")
+internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    currentSettings: Settings,
+    networkTier: NetworkTier,
+    hasMergedData: Boolean,
+    onPeersUpdated: (List<PeerNodeDto>) -> Unit,
+) {
+    val shouldBootstrap =
+        currentSettings.bearerToken.isNotBlank() &&
+            currentSettings.lastPeerSyncCursor.isBlank() &&
+            hasMergedData
+    if (!shouldBootstrap) return
+    val bootstrapCursor =
+        Instant.now()
+            .minusSeconds(BOOTSTRAP_DELTA_LOOKBACK_SEC)
+            .truncatedTo(ChronoUnit.SECONDS)
+            .toString()
+    settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
+    runCatching {
+        tryPeerSyncAndCooperativePoll(
+            dao = dao,
+            apiClient = apiClient,
+            currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor),
+            networkTier = networkTier,
+            onPeersUpdated = onPeersUpdated,
+            onSyncCursorUpdated = { cursor ->
+                settings.update { it.copy(lastPeerSyncCursor = cursor) }
+            },
+        )
+    }
+        .onFailure { if (it is CancellationException) throw it }
+}
 
 internal suspend fun renameFeedInLocalDb(
     dao: RocheDao,

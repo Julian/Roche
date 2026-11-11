@@ -549,6 +549,47 @@ class MainViewModelTest {
         )
     }
 
+    @Test
+    internal fun `initial load emits persisted Room items before startup sync and reader loads full oversized html`() =
+        runTest {
+            val oversizedHtml = "<p>" + "A".repeat(100_000) + "</p><p>Tail Marker</p>"
+            database
+                .dao()
+                .upsertItem(
+                    testItem(id = "item-large", title = "Persisted Oversized Entry")
+                        .copy(contentHtml = oversizedHtml, contentText = "B".repeat(90_000))
+                )
+
+            assertTrue(viewModel.uiState.value.isInitialLoading)
+            assertTrue(viewModel.uiState.value.visibleEntries.isEmpty())
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val loadedState = viewModel.uiState.first { !it.isInitialLoading }
+            assertFalse(loadedState.isInitialLoading)
+            assertEquals(1, loadedState.visibleEntries.size)
+            val listEntry = loadedState.visibleEntries.single()
+            assertEquals("Persisted Oversized Entry", listEntry.title)
+            assertEquals(65_536, listEntry.contentHtml?.length)
+            assertEquals(65_536, listEntry.contentText?.length)
+
+            viewModel.dispatch(MainAction.OpenReader("item-large"))
+            val readerState =
+                viewModel.uiState.first {
+                    it.activeReaderEntry?.isRead == true &&
+                        it.activeReaderEntry?.contentHtml?.contains("Tail Marker") == true
+                }
+            assertEquals(oversizedHtml.length, readerState.activeReaderEntry?.contentHtml?.length)
+
+            viewModel.dispatch(MainAction.CloseReader)
+            val closedState = viewModel.uiState.first { it.selectedReaderEntryId == null }
+            assertNull(closedState.readerContent)
+
+            val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
+            assertEquals("3m", com.grayvines.roche.model.formatArticleMinutes(mathPlainText))
+
+            collectJob.cancel()
+        }
+
     private fun testFeed(id: String, title: String) =
         FeedEntity(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
 

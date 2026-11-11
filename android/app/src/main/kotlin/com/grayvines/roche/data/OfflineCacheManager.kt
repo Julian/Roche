@@ -241,8 +241,14 @@ internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): 
     local.copy(
         title = detail.title.takeIf { it.isNotBlank() } ?: local.title,
         author = detail.author?.takeIf { it.isNotBlank() } ?: local.author,
-        summary = detail.summary?.takeIf { it.isNotBlank() } ?: local.summary,
-        contentText = detail.contentText?.takeIf { it.isNotBlank() } ?: local.contentText,
+        summary =
+            (detail.summary?.takeIf { it.isNotBlank() } ?: local.summary)?.take(
+                MAX_SQLITE_SUMMARY_CHARS
+            ),
+        contentText =
+            (detail.contentText?.takeIf { it.isNotBlank() } ?: local.contentText)?.take(
+                MAX_SQLITE_TEXT_CHARS
+            ),
         contentHtml =
             (detail.contentHtml?.takeIf { it.isNotBlank() } ?: local.contentHtml)?.take(
                 MAX_SQLITE_HTML_CHARS

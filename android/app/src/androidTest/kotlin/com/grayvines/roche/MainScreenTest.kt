@@ -262,6 +262,25 @@ class MainScreenTest {
         composeRule.onNodeWithTag("archived_feeds_header").assertExists()
     }
 
+    @Test
+    fun inboxShowsLoadingStateInsteadOfEmptyMessageDuringInitialDbLoad() {
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state = MainUiState(isInitialLoading = true),
+                    onAction = {},
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("inbox_loading_state").assertExists()
+        composeRule.onNodeWithText("Loading inbox…").assertExists()
+        composeRule.onNodeWithText("Loading…").assertExists()
+        composeRule.onNodeWithText("Your inbox is empty.").assertDoesNotExist()
+    }
+
     private fun createSampleEntry(): InboxEntry =
         InboxEntry(
             id = "item-1",

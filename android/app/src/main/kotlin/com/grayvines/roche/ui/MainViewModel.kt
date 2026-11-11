@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.data.ArchiveStateSnapshot
 import com.grayvines.roche.data.NetworkTier
 import com.grayvines.roche.data.PeerNodeDto
+import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.SavedResourceKind
@@ -44,11 +45,13 @@ data class MainUiState(
     val selectedFeedId: String? = null,
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
+    val readerContent: ReaderItemContent? = null,
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
+    val isInitialLoading: Boolean = false,
     val isSyncing: Boolean = false,
     val visibleEntries: List<InboxEntry> = emptyList(),
     val searchResults: List<InboxEntry> = emptyList(),
@@ -63,7 +66,20 @@ data class MainUiState(
     val messageSequence: Long = 0L,
 ) {
     val activeReaderEntry: InboxEntry?
-        get() = allEntries.firstOrNull { it.id == selectedReaderEntryId }
+        get() {
+            val base = allEntries.firstOrNull { it.id == selectedReaderEntryId } ?: return null
+            val full = readerContent?.takeIf { it.itemId == base.id } ?: return base
+            val mergedHtml = pickLongerReaderText(full.contentHtml, base.contentHtml)
+            val mergedText = pickLongerReaderText(full.contentText, base.contentText)
+            return if (mergedHtml != base.contentHtml || mergedText != base.contentText) {
+                base.copy(
+                    contentHtml = mergedHtml,
+                    contentText = mergedText,
+                )
+            } else {
+                base
+            }
+        }
 
     val contextSheetEntry: InboxEntry?
         get() = allEntries.firstOrNull { it.id == contextSheetEntryId }
@@ -218,6 +234,7 @@ internal data class TransientUiState(
     val selectedFeedId: String? = null,
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
+    val readerContent: ReaderItemContent? = null,
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -252,7 +269,7 @@ class MainViewModel(
             .stateIn(
                 scope = viewModelScope,
                 started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
-                initialValue = MainUiState(),
+                initialValue = MainUiState(isInitialLoading = true),
             )
 
     fun dispatch(action: MainAction) {
@@ -261,9 +278,15 @@ class MainViewModel(
                 transientState.update { reduceUiAction(it, action) }
                 if (action is MainAction.OpenReader) {
                     viewModelScope.launch {
-                        repository.setReadState(action.entryId, true)
-                        repository.hydrateItemContentIfNeeded(action.entryId)
+                        val hydrated =
+                            repository.hydrateItemContentIfNeeded(action.entryId) { localContent ->
+                                applyReaderContentIfActive(action.entryId, localContent)
+                            }
+                        if (hydrated != null) {
+                            applyReaderContentIfActive(action.entryId, hydrated)
+                        }
                     }
+                    viewModelScope.launch { repository.setReadState(action.entryId, true) }
                 }
             }
             is MainAction.Mutation -> {
@@ -425,6 +448,11 @@ class MainViewModel(
 
     internal suspend fun performToggleOffline(entryId: String) {
         val cached = repository.toggleOfflineCache(entryId)
+        if (cached && transientState.value.selectedReaderEntryId == entryId) {
+            repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
+                applyReaderContentIfActive(entryId, content)
+            }
+        }
         val msg = if (cached) "Cached local copy" else "Removed local offline copy"
         showStatusMessage(msg)
     }
@@ -445,6 +473,7 @@ class MainViewModel(
                 }
             current.copy(
                 selectedReaderEntryId = nextReaderId,
+                readerContent = nextReaderId?.let { current.readerContent },
                 contextSheetEntryId = null,
                 statusBanner = null,
                 messageSequence = current.messageSequence + 1,
@@ -545,6 +574,7 @@ class MainViewModel(
                 prefilledShareUrl = "",
                 prefilledShareTitle = "",
                 selectedReaderEntryId = null,
+                readerContent = null,
                 activeTab = nextTab,
                 activeFilter = InboxFilter.ALL,
                 undoEvent = null,
@@ -693,6 +723,7 @@ class MainViewModel(
                         }
                     current.copy(
                         selectedReaderEntryId = nextReaderId,
+                        readerContent = nextReaderId?.let { current.readerContent },
                         contextSheetEntryId = nextSheetId,
                         undoEvent = null,
                         statusBanner = "Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
@@ -706,7 +737,8 @@ class MainViewModel(
     }
 
     internal suspend fun performStartupSync() {
-        val currentSettings = settingsRepository.settings.first()
+        val initialState = uiState.first { !it.isInitialLoading }
+        val currentSettings = initialState.settings
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             performSync(errorPolicy = SyncErrorPolicy.SILENT)
         }
@@ -753,6 +785,16 @@ class MainViewModel(
         }
     }
 
+    private fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
+        transientState.update { current ->
+            if (current.selectedReaderEntryId == entryId) {
+                current.copy(readerContent = content)
+            } else {
+                current
+            }
+        }
+    }
+
     internal fun tryAcquireSyncLock(): Boolean {
         var acquired = false
         transientState.update { current ->
@@ -791,6 +833,7 @@ internal fun reduceUiAction(
             state.copy(
                 activeTab = action.tab,
                 selectedReaderEntryId = null,
+                readerContent = null,
                 selectedFeedId = null,
                 selectedTag = null,
                 scopeOriginTab = null,
@@ -809,6 +852,7 @@ internal fun reduceUiAction(
                 selectedFeedId = null,
                 scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
                 selectedReaderEntryId = null,
+                readerContent = null,
                 contextSheetEntryId = null,
             )
         is MainAction.FilterByFeed ->
@@ -818,6 +862,7 @@ internal fun reduceUiAction(
                 selectedTag = null,
                 scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
                 selectedReaderEntryId = null,
+                readerContent = null,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
             )
@@ -828,12 +873,24 @@ internal fun reduceUiAction(
                 selectedTag = null,
                 scopeOriginTab = null,
                 selectedReaderEntryId = null,
+                readerContent = null,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
             )
         is MainAction.UpdateSearchQuery -> state.copy(searchQuery = action.query)
         else -> reduceOverlayUiAction(state, action)
     }
+
+internal fun pickLongerReaderText(first: String?, second: String?): String? {
+    val a = first?.takeIf { it.isNotBlank() }
+    val b = second?.takeIf { it.isNotBlank() }
+    return when {
+        a == null -> b
+        b == null -> a
+        a.length >= b.length -> a
+        else -> b
+    }
+}
 
 private fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
     when {
@@ -848,8 +905,12 @@ private fun reduceOverlayUiAction(
 ): TransientUiState =
     when (action) {
         is MainAction.OpenReader ->
-            state.copy(selectedReaderEntryId = action.entryId, contextSheetEntryId = null)
-        MainAction.CloseReader -> state.copy(selectedReaderEntryId = null)
+            state.copy(
+                selectedReaderEntryId = action.entryId,
+                readerContent = null,
+                contextSheetEntryId = null,
+            )
+        MainAction.CloseReader -> state.copy(selectedReaderEntryId = null, readerContent = null)
         is MainAction.OpenContextSheet -> state.copy(contextSheetEntryId = action.entryId)
         MainAction.CloseContextSheet -> state.copy(contextSheetEntryId = null)
         is MainAction.OpenFeedContextSheet -> state.copy(feedContextSheetId = action.feedId)
@@ -922,11 +983,13 @@ internal fun buildMainUiState(
         selectedFeedId = local.selectedFeedId,
         scopeOriginTab = local.scopeOriginTab,
         selectedReaderEntryId = local.selectedReaderEntryId,
+        readerContent = local.readerContent,
         contextSheetEntryId = local.contextSheetEntryId,
         feedContextSheetId = local.feedContextSheetId,
         isAddSheetOpen = local.isAddSheetOpen,
         prefilledShareUrl = local.prefilledShareUrl,
         prefilledShareTitle = local.prefilledShareTitle,
+        isInitialLoading = false,
         isSyncing = local.isSyncing,
         visibleEntries = filtered,
         searchResults = searchResults,

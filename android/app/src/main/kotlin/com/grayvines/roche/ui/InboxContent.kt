@@ -110,11 +110,25 @@ internal fun InboxEntryListBody(
 ) {
     val colors = LocalRocheColors.current
     if (state.visibleEntries.isEmpty()) {
-        InboxEmptyState(
-            hasEntriesAtAll = state.allEntries.isNotEmpty(),
-            onSaveClick = { onAction(MainAction.OpenAddSheet()) },
-            onSyncClick = { onAction(MainAction.SyncNow) },
-        )
+        if (state.isInitialLoading) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp).testTag("inbox_loading_state"),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "Loading inbox…",
+                    color = colors.textMuted,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        } else {
+            InboxEmptyState(
+                hasEntriesAtAll = state.allEntries.isNotEmpty(),
+                onSaveClick = { onAction(MainAction.OpenAddSheet()) },
+                onSyncClick = { onAction(MainAction.SyncNow) },
+            )
+        }
     } else {
         LazyColumn(
             modifier = Modifier.fillMaxSize().testTag("inbox_list"),
@@ -147,10 +161,16 @@ private fun InboxHeaderSection(
     val unarchivedCount = state.visibleEntries.count { !it.isArchived }
     var showArchiveAllConfirm by rememberSaveable { mutableStateOf(false) }
     val title = resolveInboxHeaderTitle(state)
+    val subtitle =
+        if (state.isInitialLoading && state.visibleEntries.isEmpty()) {
+            "Loading…"
+        } else {
+            "${state.visibleEntries.size} items"
+        }
 
     RocheTopHeader(
         title = title,
-        subtitle = "${state.visibleEntries.size} items",
+        subtitle = subtitle,
         navigationAction =
             if (hasScopeFilter) {
                 {

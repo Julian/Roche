@@ -178,8 +178,8 @@ internal object LocalFeedPoller {
             title = candidate.title.ifBlank { cleanUrl },
             url = cleanUrl,
             author = candidate.author,
-            summary = candidate.summary.takeIf { it.isNotBlank() },
-            contentText = candidate.summary.takeIf { it.isNotBlank() },
+            summary = candidate.summary.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_SUMMARY_CHARS),
+            contentText = candidate.summary.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_TEXT_CHARS),
             contentHtml = candidate.contentHtml?.take(MAX_SQLITE_HTML_CHARS),
             contentType = candidate.contentType,
             status = ItemStatus.UNREAD.wireValue,
@@ -200,7 +200,12 @@ internal object LocalFeedPoller {
         feed: FeedEntity,
         candidate: ParsedFeedCandidateItem,
     ): ItemEntity {
-        val richerSummary = pickRicherString(existing.summary, candidate.summary)
+        val richerSummary =
+            pickRicherString(existing.summary, candidate.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
+        val richerText =
+            (existing.contentText?.takeIf { it.isNotBlank() } ?: richerSummary)?.take(
+                MAX_SQLITE_TEXT_CHARS
+            )
         val richerHtml =
             pickRicherString(existing.contentHtml, candidate.contentHtml)
                 ?.take(MAX_SQLITE_HTML_CHARS)
@@ -214,7 +219,7 @@ internal object LocalFeedPoller {
             author = existing.author?.takeIf { it.isNotBlank() } ?: candidate.author,
             publishedAt = existing.publishedAt?.takeIf { it.isNotBlank() } ?: candidate.publishedAt,
             summary = richerSummary,
-            contentText = existing.contentText?.takeIf { it.isNotBlank() } ?: richerSummary,
+            contentText = richerText,
             contentHtml = richerHtml,
             thumbnailUrl =
                 existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: candidate.thumbnailUrl,

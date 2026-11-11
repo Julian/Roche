@@ -160,7 +160,12 @@ internal fun toRemoteItemEntity(
     val resolvedFeedId = remote.feedId ?: existing?.feedId
     val resolvedFeedUrl =
         remote.feedUrl ?: resolvedFeedId?.let { feedUrlsById[it] } ?: existing?.feedUrl
-    val richerSummary = pickRicherString(existing?.summary, remote.summary)
+    val richerSummary =
+        pickRicherString(existing?.summary, remote.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
+    val richerText =
+        (remote.contentText.nonBlankOr(existing?.contentText) ?: richerSummary)?.take(
+            MAX_SQLITE_TEXT_CHARS
+        )
     val richerHtml =
         pickRicherString(existing?.contentHtml, remote.contentHtml)?.take(MAX_SQLITE_HTML_CHARS)
     return ItemEntity(
@@ -171,7 +176,7 @@ internal fun toRemoteItemEntity(
         url = remote.url.ifBlank { existing?.url.orEmpty() },
         author = remote.author.nonBlankOr(existing?.author),
         summary = richerSummary,
-        contentText = remote.contentText.nonBlankOr(existing?.contentText) ?: richerSummary,
+        contentText = richerText,
         contentHtml = richerHtml,
         contentType = remote.contentType.ifBlank { existing?.contentType ?: "article" },
         status = remote.status,
@@ -230,8 +235,9 @@ internal fun reconcileSavedItemEntity(
     localEntity.copy(
         id = remoteSaved.id,
         title = remoteSaved.title.ifBlank { localEntity.title },
-        summary = remoteSaved.summary ?: localEntity.summary,
-        contentText = remoteSaved.contentText ?: localEntity.contentText,
+        summary = (remoteSaved.summary ?: localEntity.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
+        contentText =
+            (remoteSaved.contentText ?: localEntity.contentText)?.take(MAX_SQLITE_TEXT_CHARS),
         contentHtml =
             (remoteSaved.contentHtml?.takeIf { it.isNotBlank() } ?: localEntity.contentHtml)?.take(
                 MAX_SQLITE_HTML_CHARS
@@ -277,4 +283,6 @@ internal fun createSavedItemEntity(
     )
 }
 
+internal const val MAX_SQLITE_SUMMARY_CHARS = 16_384
+internal const val MAX_SQLITE_TEXT_CHARS = 262_144
 internal const val MAX_SQLITE_HTML_CHARS = 512_000

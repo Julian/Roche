@@ -308,19 +308,52 @@ internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now())
 }
 
 internal fun formatArticleMinutes(text: String): String {
-    val plainText = text.replace(HTML_TAG_STRIP_REGEX, " ")
-    val wordCount = plainText.split(WHITESPACE_REGEX_TOP).count { it.isNotBlank() }
+    val wordCount = countPlainTextWords(text)
     val minutes = (wordCount / ARTICLE_WORDS_PER_MINUTE).coerceAtLeast(1)
     return "${minutes}m"
 }
 
+private fun countPlainTextWords(text: String): Int {
+    var wordCount = 0
+    var inWord = false
+    var i = 0
+    val len = text.length
+    while (i < len) {
+        val ch = text[i]
+        val tagEnd = findClosingHtmlTagIndex(text, i, len)
+        if (tagEnd != -1) {
+            inWord = false
+            i = tagEnd + 1
+        } else {
+            if (ch.isWhitespace()) {
+                inWord = false
+            } else if (!inWord) {
+                inWord = true
+                wordCount++
+            }
+            i++
+        }
+    }
+    return wordCount
+}
+
+private fun findClosingHtmlTagIndex(text: String, start: Int, len: Int): Int {
+    if (text[start] != '<' || start + 1 >= len) return -1
+    val next = text[start + 1]
+    val isTagStart = next.isLetter() || next == '/' || next == '!' || next == '?'
+    if (!isTagStart) return -1
+    val minCloseIdx = start + 2
+    val maxCloseIdx = start + MAX_HTML_TAG_SCAN_CHARS
+    val closeIdx = text.indexOf('>', minCloseIdx)
+    return if (closeIdx in minCloseIdx..maxCloseIdx) closeIdx else -1
+}
+
+private const val MAX_HTML_TAG_SCAN_CHARS = 2_048
 private const val SECONDS_PER_MIN = 60L
 private const val SECONDS_PER_HOUR = 3_600L
 private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
 private const val ARTICLE_WORDS_PER_MINUTE = 180
-private val HTML_TAG_STRIP_REGEX = Regex("""<[^>]+>""")
 private val IMG_SRC_REGEX =
     Regex("""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-private val WHITESPACE_REGEX_TOP = Regex("""\s+""")
 private val SHORT_DATE_FORMATTER = DateTimeFormatter.ofPattern("MMM d", Locale.US)

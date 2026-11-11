@@ -142,15 +142,15 @@ internal fun ReaderScrollProgressEffect(
     scrollState: androidx.compose.foundation.ScrollState,
     onAction: (MainAction) -> Unit,
 ) {
-    val hasHydratedBody = !entry.contentHtml.isNullOrBlank() || !entry.contentText.isNullOrBlank()
-    var restoredHydratedState by remember(entry.id) { mutableStateOf<Boolean?>(null) }
+    val bodyLengthBucket = (entry.contentHtml?.length ?: 0) + (entry.contentText?.length ?: 0)
+    var restoredBodyBucket by remember(entry.id) { mutableStateOf(-1) }
     var hasUserScrolled by remember(entry.id) { mutableStateOf(false) }
 
-    LaunchedEffect(entry.id, hasHydratedBody, scrollState.maxValue) {
+    LaunchedEffect(entry.id, bodyLengthBucket, scrollState.maxValue) {
         if (
-            scrollState.maxValue > 0 && !hasUserScrolled && restoredHydratedState != hasHydratedBody
+            scrollState.maxValue > 0 && !hasUserScrolled && restoredBodyBucket != bodyLengthBucket
         ) {
-            restoredHydratedState = hasHydratedBody
+            restoredBodyBucket = bodyLengthBucket
             val targetScroll =
                 (entry.readProgress.coerceIn(0.0, 1.0) * scrollState.maxValue).toInt()
             scrollState.scrollTo(targetScroll)
