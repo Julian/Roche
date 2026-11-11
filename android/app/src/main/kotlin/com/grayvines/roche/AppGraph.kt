@@ -8,6 +8,8 @@ import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpUrlConnectionTransport
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.ui.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.ui.PodcastMediaSessionBridge
 import com.grayvines.roche.ui.components.ThumbnailLoader
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
@@ -47,5 +49,9 @@ class AppGraph(context: Context) {
             settings = settings,
             cacheDir = offlineCacheDir,
         )
+    }
+
+    val mediaSessionBridge: PodcastMediaSessionBridge by lazy {
+        AndroidPodcastMediaSessionBridge(appContext)
     }
 }

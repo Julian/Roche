@@ -25,10 +25,12 @@ import java.io.File
 import kotlin.math.abs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -50,6 +52,7 @@ class MainViewModelTest {
     private lateinit var database: RocheDatabase
     private lateinit var settings: SettingsRepository
     private lateinit var repository: RocheRepository
+    private lateinit var mediaSessionBridge: RecordingMediaSessionBridge
     private lateinit var viewModel: MainViewModel
 
     @BeforeEach
@@ -65,12 +68,18 @@ class MainViewModelTest {
         val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
         repository =
             RocheRepository(database = database, apiClient = apiClient, settings = settings)
-        viewModel = MainViewModel(repository = repository, settingsRepository = settings)
+        mediaSessionBridge = RecordingMediaSessionBridge()
+        viewModel =
+            MainViewModel(
+                repository = repository,
+                settingsRepository = settings,
+                mediaSessionBridge = mediaSessionBridge,
+            )
     }
 
     @AfterEach
     fun tearDown() {
-        viewModel.viewModelScope.cancel()
+        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
         database.close()
         Dispatchers.resetMain()
     }
@@ -698,6 +707,126 @@ class MainViewModelTest {
 
             collectJob.cancel()
         }
+
+    @Test
+    fun `mediaSessionBridge handles lock screen transport audio focus and bluetooth headset keys`() =
+        runTest {
+            val podcastFeed = testFeed("f-pod", "Systems Cast").copy(feedType = "podcast")
+            val ep1 =
+                testItem("ep-a", "Episode A", "f-pod")
+                    .copy(
+                        feedTitle = "Systems Cast",
+                        contentType = "audio",
+                        audioUrl = "https://example.com/a.mp3",
+                        duration = "30:00",
+                    )
+            val ep2 =
+                testItem("ep-b", "Episode B", "f-pod")
+                    .copy(
+                        feedTitle = "Systems Cast",
+                        contentType = "audio",
+                        audioUrl = "https://example.com/b.mp3",
+                        duration = "40:00",
+                    )
+            database.dao().upsertFeeds(listOf(podcastFeed))
+            database.dao().upsertItems(listOf(ep1, ep2))
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 2 }
+            viewModel.dispatch(MainAction.AddToQueue("ep-a"))
+            viewModel.dispatch(MainAction.AddToQueue("ep-b"))
+            viewModel.uiState.first { it.queueEntries.size == 2 }
+            viewModel.dispatch(MainAction.PlayAudioEntry("ep-a"))
+
+            viewModel.uiState.first {
+                it.playerState.currentEntryId == "ep-a" && it.playerState.hasNextQueuedAudio
+            }
+            assertTrue(mediaSessionBridge.focusRequestedCount > 0)
+            assertEquals("Episode A", mediaSessionBridge.latestSnapshot?.episodeTitle)
+            assertTrue(mediaSessionBridge.latestSnapshot?.hasNextQueuedAudio == true)
+
+            // Seek, Fast-forward 30s & Rewind 15s via MediaSession commands
+            mediaSessionBridge.callbacks?.onSeekToMs(60_000L)
+            assertEquals(60_000L, viewModel.playerController.state.value.positionMs)
+            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
+            assertEquals(90_000L, viewModel.playerController.state.value.positionMs)
+            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.REWIND_15S)
+            assertEquals(75_000L, viewModel.playerController.state.value.positionMs)
+
+            // Transient audio focus loss pauses playback; regaining focus auto-resumes
+            mediaSessionBridge.callbacks?.onAudioFocusLost(transient = true)
+            assertFalse(viewModel.playerController.state.value.isPlaying)
+            mediaSessionBridge.callbacks?.onAudioFocusGained()
+            assertTrue(viewModel.playerController.state.value.isPlaying)
+
+            // Unplugging headphones (AUDIO_BECOMING_NOISY) pauses and does not auto-resume
+            mediaSessionBridge.callbacks?.onAudioBecomingNoisy()
+            assertFalse(viewModel.playerController.state.value.isPlaying)
+            mediaSessionBridge.callbacks?.onAudioFocusGained()
+            assertFalse(viewModel.playerController.state.value.isPlaying)
+
+            // Hardware keycode mapping & lock-screen Skip to Next advances to ep-b even when
+            // uiState has zero active UI subscribers (app in background).
+            collectJob.cancel()
+            assertEquals(
+                MediaSessionCommand.TOGGLE_PLAY_PAUSE,
+                mapMediaKeyCodeToCommand(android.view.KeyEvent.KEYCODE_HEADSETHOOK),
+            )
+            assertEquals(
+                MediaSessionCommand.SKIP_TO_NEXT,
+                mapMediaKeyCodeToCommand(android.view.KeyEvent.KEYCODE_MEDIA_NEXT),
+            )
+            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
+            viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
+            assertEquals("Episode B", mediaSessionBridge.latestSnapshot?.episodeTitle)
+            assertFalse(mediaSessionBridge.latestSnapshot?.hasNextQueuedAudio == true)
+
+            // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
+            viewModel.dispatch(MainAction.SetRememberPodcastSpeed("f-pod", true))
+            repository.snapshot.first { snap ->
+                snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed != null
+            }
+            mediaSessionBridge.callbacks?.onSetPlaybackSpeed(1.75f)
+            val updatedSnap =
+                repository.snapshot.first { snap ->
+                    val spd = snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed ?: 0f
+                    abs(spd - 1.75f) < 1e-3f
+                }
+            assertEquals(1.75f, viewModel.playerController.state.value.playbackSpeed, 1e-3f)
+            assertEquals(
+                1.75f,
+                updatedSnap.feeds.first { it.id == "f-pod" }.customPlaybackSpeed ?: 0f,
+                1e-3f,
+            )
+        }
+
+    private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
+        var callbacks: PodcastMediaSessionCallbacks? = null
+        var focusRequestedCount: Int = 0
+        var focusAbandonedCount: Int = 0
+        var latestSnapshot: MediaSessionMetadataSnapshot? = null
+
+        override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
+            this.callbacks = callbacks
+        }
+
+        override fun requestAudioFocus(): Boolean {
+            focusRequestedCount++
+            return true
+        }
+
+        override fun abandonAudioFocus() {
+            focusAbandonedCount++
+        }
+
+        override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
+            latestSnapshot = snapshot
+        }
+
+        override fun release() {
+            latestSnapshot = null
+        }
+    }
 
     private fun testFeed(id: String, title: String) =
         FeedEntity(id, title, "https://example.com/$id.xml", "https://example.com", "rss")

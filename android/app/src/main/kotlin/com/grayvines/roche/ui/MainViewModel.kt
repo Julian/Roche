@@ -376,6 +376,7 @@ class MainViewModel(
     private val repository: RocheRepository,
     private val settingsRepository: SettingsRepository,
     playerBackend: AudioPlayerBackend = ResilientMediaPlayerBackend(),
+    private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
 ) : ViewModel() {
 
     private val transientState = MutableStateFlow(TransientUiState())
@@ -384,6 +385,7 @@ class MainViewModel(
         PodcastPlayerController(
             scope = viewModelScope,
             backend = playerBackend,
+            mediaSessionBridge = mediaSessionBridge,
             onProgressChanged = { entryId, progress ->
                 viewModelScope.launch {
                     repository.updateReadProgress(
@@ -396,6 +398,16 @@ class MainViewModel(
             onEpisodeCompleted = { completedEntryId ->
                 viewModelScope.launch {
                     handleAudioEpisodeCompleted(completedEntryId)
+                }
+            },
+            onSkipToNextRequested = {
+                viewModelScope.launch {
+                    performSkipToNextQueuedAudio()
+                }
+            },
+            onSpeedChangedFromSession = { speed ->
+                viewModelScope.launch {
+                    performSetPlaybackSpeed(speed = speed, applyToCurrentPodcast = null)
                 }
             },
         )
@@ -412,12 +424,18 @@ class MainViewModel(
                 local: TransientUiState,
                 playerState: PodcastPlayerState ->
                 buildMainUiState(
-                    snapshot = snapshot,
-                    settings = settings,
-                    local = local,
-                    localNetworkTier = repository.currentNetworkTier(),
-                    playerState = playerState,
-                )
+                        snapshot = snapshot,
+                        settings = settings,
+                        local = local,
+                        localNetworkTier = repository.currentNetworkTier(),
+                        playerState = playerState,
+                    )
+                    .also { built ->
+                        playerController.updateHasNextQueuedAudio(
+                            built.nextQueuedAudioEntryId != null
+                        )
+                        playerController.updateSmartRewindEnabled(settings.smartRewindEnabled)
+                    }
             }
             .stateIn(
                 scope = viewModelScope,
@@ -426,7 +444,7 @@ class MainViewModel(
             )
 
     override fun onCleared() {
-        playerController.stopAndClear()
+        playerController.releaseController()
     }
 
     fun dispatch(action: MainAction) {
@@ -533,7 +551,7 @@ class MainViewModel(
                 performPlayAudioEntry(action.entryId, action.openFullscreen)
             MainAction.TogglePlayPause ->
                 playerController.togglePlayPause(
-                    smartRewindEnabled = uiState.value.settings.smartRewindEnabled
+                    smartRewindEnabled = settingsRepository.settings.first().smartRewindEnabled
                 )
             is MainAction.SeekPlayerToFraction -> playerController.seekToFraction(action.fraction)
             is MainAction.SeekPlayerToMs -> playerController.seekToMs(action.positionMs)
@@ -715,36 +733,47 @@ class MainViewModel(
         entryId: String,
         openFullscreen: Boolean = true,
     ) {
-        val currentUi = uiState.value
-        val entry = currentUi.allEntries.firstOrNull { it.id == entryId } ?: return
+        val latestSnapshot = repository.snapshot.first()
+        val latestSettings = settingsRepository.settings.first()
+        val allEntries = latestSnapshot.entries
+        val allFeeds = latestSnapshot.feeds
+        val entry = allEntries.firstOrNull { it.id == entryId } ?: return
         if (playerController.state.value.currentEntryId == entryId) {
             if (openFullscreen) {
                 playerController.openFullscreen()
+                if (!playerController.state.value.isPlaying) {
+                    playerController.togglePlayPause(latestSettings.smartRewindEnabled)
+                }
             } else {
-                playerController.togglePlayPause(currentUi.settings.smartRewindEnabled)
+                playerController.togglePlayPause(latestSettings.smartRewindEnabled)
             }
             transientState.update { it.copy(contextSheetEntryId = null) }
             return
         }
-        val feed = entry.feedId?.let { fid -> currentUi.feeds.firstOrNull { it.id == fid } }
-        val effectiveSpeed = feed?.customPlaybackSpeed ?: currentUi.settings.defaultPlaybackSpeed
+        val feed = entry.feedId?.let { fid -> allFeeds.firstOrNull { it.id == fid } }
+        val effectiveSpeed = feed?.customPlaybackSpeed ?: latestSettings.defaultPlaybackSpeed
         val source = repository.resolveAudioPlaybackSource(entry)
-        // Ensure the currently playing episode is at the front of the queue if not already queued
-        settingsRepository.update { current ->
-            val updatedQueue =
-                if (entryId in current.queueItemIds) {
-                    current.queueItemIds
-                } else {
-                    listOf(entryId) + current.queueItemIds
-                }
-            current.copy(queueItemIds = updatedQueue)
+        val updatedQueue =
+            if (entryId in latestSettings.queueItemIds) {
+                latestSettings.queueItemIds
+            } else {
+                listOf(entryId) + latestSettings.queueItemIds
+            }
+        settingsRepository.update { current -> current.copy(queueItemIds = updatedQueue) }
+        val entriesById = allEntries.associateBy { it.id }
+        val hasNextAudio = updatedQueue.any { id ->
+            id != entryId &&
+                entriesById[id]?.let { !it.isArchived && it.contentType == ContentType.AUDIO } ==
+                    true
         }
         playerController.playEntry(
             entry = entry,
             sourceUriOrPath = source,
             speed = effectiveSpeed,
-            skipSilenceEnabled = currentUi.settings.skipSilenceEnabled,
+            skipSilenceEnabled = latestSettings.skipSilenceEnabled,
             openFullscreen = openFullscreen,
+            hasNextQueuedAudio = hasNextAudio,
+            smartRewindEnabled = latestSettings.smartRewindEnabled,
         )
         transientState.update { it.copy(contextSheetEntryId = null) }
         repository.recordEpisodePlaybackStarted(entryId)
@@ -759,19 +788,29 @@ class MainViewModel(
         }
     }
 
-    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
-        val currentUi = uiState.value
-        val nextAudio =
-            currentUi.queueEntries.firstOrNull {
-                it.contentType == ContentType.AUDIO && it.id != completedEntryId && !it.isArchived
+    private suspend fun syncActivePlayerQueueState() {
+        val currentId = playerController.state.value.currentEntryId ?: return
+        val latestSettings = settingsRepository.settings.first()
+        val latestEntries = repository.snapshot.first().entries
+        val byId = latestEntries.associateBy { it.id }
+        val hasNext =
+            latestSettings.queueItemIds.any { id ->
+                id != currentId &&
+                    byId[id]?.let { !it.isArchived && it.contentType == ContentType.AUDIO } == true
             }
+        playerController.updateHasNextQueuedAudio(hasNext)
+        playerController.updateSmartRewindEnabled(latestSettings.smartRewindEnabled)
+    }
+
+    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
+        val wasFullscreen = playerController.state.value.isFullscreenOpen
         repository.updateReadProgress(itemId = completedEntryId, progress = 1.0)
         repository.setArchiveStateWithSnapshot(itemId = completedEntryId, archived = true)
         settingsRepository.update { current ->
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == completedEntryId })
         }
+        val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = completedEntryId)
         if (nextAudio != null) {
-            val wasFullscreen = playerController.state.value.isFullscreenOpen
             performPlayAudioEntry(
                 entryId = nextAudio.id,
                 openFullscreen = wasFullscreen,
@@ -785,7 +824,7 @@ class MainViewModel(
 
     internal suspend fun performSkipToNextQueuedAudio() {
         val currentId = playerController.state.value.currentEntryId
-        val nextAudio = uiState.value.nextQueuedAudioEntry
+        val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = currentId)
         if (nextAudio == null) {
             showStatusMessage("No next audio episode in Queue")
             return
@@ -797,13 +836,30 @@ class MainViewModel(
         }
     }
 
+    private suspend fun resolveNextQueuedAudioEntry(excludeEntryId: String?): InboxEntry? {
+        val latestSettings = settingsRepository.settings.first()
+        val latestEntries = repository.snapshot.first().entries
+        val byId = latestEntries.associateBy { it.id }
+        return latestSettings.queueItemIds
+            .mapNotNull { byId[it] }
+            .firstOrNull {
+                !it.isArchived && it.contentType == ContentType.AUDIO && it.id != excludeEntryId
+            }
+    }
+
     internal suspend fun performSetPlaybackSpeed(
         speed: Float,
         applyToCurrentPodcast: Boolean?,
     ) {
         val clamped = clampPlaybackSpeed(speed)
         playerController.setPlaybackSpeed(clamped)
-        val activeFeed = uiState.value.activePlayerFeed
+        val currentEntryId = playerController.state.value.currentEntryId
+        val latestSnapshot = repository.snapshot.first()
+        val activeEntry = currentEntryId?.let { id ->
+            latestSnapshot.entries.firstOrNull { it.id == id }
+        }
+        val activeFeed =
+            activeEntry?.feedId?.let { fid -> latestSnapshot.feeds.firstOrNull { it.id == fid } }
         val rememberForFeed = applyToCurrentPodcast ?: (activeFeed?.customPlaybackSpeed != null)
         if (rememberForFeed && activeFeed != null) {
             repository.setFeedPlaybackSpeed(feedId = activeFeed.id, speed = clamped)
@@ -849,13 +905,17 @@ class MainViewModel(
     ) {
         val clamped = speed?.let(::clampPlaybackSpeed)
         repository.setFeedPlaybackSpeed(feedId = feedId, speed = clamped)
-        if (uiState.value.activePlayerFeed?.id == feedId && clamped != null) {
+        val currentEntryId = playerController.state.value.currentEntryId
+        val activeEntry = currentEntryId?.let { id ->
+            repository.snapshot.first().entries.firstOrNull { it.id == id }
+        }
+        if (activeEntry?.feedId == feedId && clamped != null) {
             playerController.setPlaybackSpeed(clamped)
         }
     }
 
     internal suspend fun performToggleQueueMembership(entryId: String) {
-        val inQueue = uiState.value.isEntryInQueue(entryId)
+        val inQueue = entryId in settingsRepository.settings.first().queueItemIds
         if (inQueue) {
             performRemoveFromQueue(entryId, showBanner = true)
         } else {
@@ -883,6 +943,7 @@ class MainViewModel(
             }
             current.copy(queueItemIds = withoutTarget)
         }
+        syncActivePlayerQueueState()
         transientState.update { it.copy(contextSheetEntryId = null) }
         showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
     }
@@ -894,6 +955,7 @@ class MainViewModel(
         settingsRepository.update { current ->
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
         }
+        syncActivePlayerQueueState()
         transientState.update { it.copy(contextSheetEntryId = null) }
         if (showBanner) {
             showStatusMessage("Removed from Queue")
@@ -911,6 +973,7 @@ class MainViewModel(
             }
             current.copy(queueItemIds = list)
         }
+        syncActivePlayerQueueState()
     }
 
     internal suspend fun performMoveQueueItemToTop(entryId: String) {
@@ -926,6 +989,7 @@ class MainViewModel(
             withoutTarget.add(targetIdx.coerceAtMost(withoutTarget.size), entryId)
             current.copy(queueItemIds = withoutTarget)
         }
+        syncActivePlayerQueueState()
         showStatusMessage("Moved to top of Queue")
     }
 
@@ -1307,18 +1371,13 @@ class MainViewModel(
             }
         }
         if (activePlayerId == entryId) {
-            uiState.value.allEntries
-                .firstOrNull { it.id == entryId }
-                ?.let { base ->
-                    playerController.refreshChaptersFromEntry(
-                        base.copy(
-                            contentHtml =
-                                pickLongerReaderText(content.contentHtml, base.contentHtml),
-                            contentText =
-                                pickLongerReaderText(content.contentText, base.contentText),
-                        )
-                    )
-                }
+            val base = uiState.value.allEntries.firstOrNull { it.id == entryId }
+            playerController.refreshChaptersFromNotes(
+                entryId = entryId,
+                pickLongerReaderText(content.contentHtml, base?.contentHtml),
+                pickLongerReaderText(content.contentText, base?.contentText),
+                base?.summary,
+            )
         }
     }
 
@@ -1339,10 +1398,16 @@ class MainViewModel(
     class Factory(
         private val repository: RocheRepository,
         private val settings: SettingsRepository,
+        private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
-            MainViewModel(repository = repository, settingsRepository = settings) as T
+            MainViewModel(
+                repository = repository,
+                settingsRepository = settings,
+                mediaSessionBridge = mediaSessionBridge,
+            )
+                as T
     }
 
     private companion object {

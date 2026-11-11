@@ -130,9 +130,12 @@ internal fun appendCompositeFigureBlocks(
         }
         out.addAll(figureBlocks)
     } else if (explicitCaption != null) {
-        out.add(ArticleBlock.Paragraph("<em>$explicitCaption</em>"))
+        out.add(italicCaptionParagraph(explicitCaption))
     }
 }
+
+private fun italicCaptionParagraph(captionHtml: String): ArticleBlock.Paragraph =
+    ArticleBlock.Paragraph("<em>$captionHtml</em>")
 
 internal fun attachFigureCaption(blocks: MutableList<ArticleBlock>, captionHtml: String) {
     val lastIdx = blocks.lastIndex
@@ -141,18 +144,18 @@ internal fun attachFigureCaption(blocks: MutableList<ArticleBlock>, captionHtml:
             if (last.captionHtml == null) {
                 blocks[lastIdx] = last.copy(captionHtml = captionHtml)
             } else {
-                blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
+                blocks.add(italicCaptionParagraph(captionHtml))
             }
         }
         is ArticleBlock.Blockquote -> {
             if (last.attributionHtml == null) {
                 blocks[lastIdx] = last.copy(attributionHtml = captionHtml)
             } else {
-                blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
+                blocks.add(italicCaptionParagraph(captionHtml))
             }
         }
         else -> {
-            blocks.add(ArticleBlock.Paragraph("<em>$captionHtml</em>"))
+            blocks.add(italicCaptionParagraph(captionHtml))
         }
     }
 }

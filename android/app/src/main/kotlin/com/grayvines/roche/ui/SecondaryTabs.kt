@@ -1101,6 +1101,7 @@ private fun ListeningHistoryListContent(
                             fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("history_timestamp_${entry.id}"),
                         )
                     }
                     if (!inQueue) {

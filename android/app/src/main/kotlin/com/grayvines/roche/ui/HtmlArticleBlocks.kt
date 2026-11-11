@@ -728,11 +728,11 @@ private fun RenderTableRow(
     linkStyles: TextLinkStyles,
 ) {
     val colors = LocalRocheColors.current
-    val rowBackground = if (isHeader) colors.surfaceElevated else colors.surface
+    val style = resolveTableRowStyle(isHeader, colors)
     Row(
         modifier =
-            Modifier.background(rowBackground)
-                .padding(horizontal = 10.dp, vertical = if (isHeader) 8.dp else 7.dp),
+            Modifier.background(style.background)
+                .padding(horizontal = 10.dp, vertical = style.verticalPad),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         colWidths.forEachIndexed { colIndex, widthDp ->
@@ -745,9 +745,9 @@ private fun RenderTableRow(
                 )
             Text(
                 text = annotated,
-                color = if (isHeader) colors.textPrimary else colors.textSecondary,
-                fontFamily = if (isHeader) FontFamily.SansSerif else FontFamily.Serif,
-                fontWeight = if (isHeader) FontWeight.SemiBold else FontWeight.Normal,
+                color = style.textColor,
+                fontFamily = style.fontFamily,
+                fontWeight = style.fontWeight,
                 fontSize = (13.5f * scale).sp,
                 lineHeight = (20f * scale).sp,
                 modifier = Modifier.width(widthDp.dp),
@@ -755,6 +755,36 @@ private fun RenderTableRow(
         }
     }
 }
+
+private data class TableRowStyle(
+    val background: androidx.compose.ui.graphics.Color,
+    val verticalPad: androidx.compose.ui.unit.Dp,
+    val textColor: androidx.compose.ui.graphics.Color,
+    val fontFamily: FontFamily,
+    val fontWeight: FontWeight,
+)
+
+private fun resolveTableRowStyle(
+    isHeader: Boolean,
+    colors: com.grayvines.roche.ui.theme.RocheColors,
+): TableRowStyle =
+    if (isHeader) {
+        TableRowStyle(
+            background = colors.surfaceElevated,
+            verticalPad = 8.dp,
+            textColor = colors.textPrimary,
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.SemiBold,
+        )
+    } else {
+        TableRowStyle(
+            background = colors.surface,
+            verticalPad = 7.dp,
+            textColor = colors.textSecondary,
+            fontFamily = FontFamily.Serif,
+            fontWeight = FontWeight.Normal,
+        )
+    }
 
 internal fun computeTableColumnWidths(block: ArticleBlock.TableBlock): List<Int> {
     val columnCount =

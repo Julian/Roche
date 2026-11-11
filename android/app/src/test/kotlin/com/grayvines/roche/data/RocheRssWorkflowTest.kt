@@ -254,7 +254,9 @@ class RocheRssWorkflowTest {
         )
 
         val edgeHtml =
-            "<p>Check out\n<a href=\"https://example.com\">this tool</a>\nto run.</p>" +
+            "<p>Check out\n" +
+                """<a href="https://example.com">this tool</a>""" +
+                "\nto run.</p>" +
                 "<ul><b><li>Bold item</li></b></ul>" +
                 "<dl><dt>Term</dt><dd>Definition</dd></dl>" +
                 "<blockquote><p>Before code</p><pre><code>val a = 1</code></pre><p>After code</p><cite>Author</cite></blockquote>"

@@ -355,7 +355,7 @@ class MainScreenTest {
         org.junit.Assert.assertTrue(
             dispatched.contains(com.grayvines.roche.ui.MainAction.SkipToNextQueuedAudio)
         )
-        composeRule.onNodeWithTag("player_favorite_btn").performClick()
+        composeRule.onNodeWithTag("player_star_btn").performClick()
         org.junit.Assert.assertTrue(
             dispatched.contains(com.grayvines.roche.ui.MainAction.ToggleStar(audioEntry.id))
         )
@@ -398,7 +398,9 @@ class MainScreenTest {
         composeRule.onNodeWithTag("queue_mode_history").performClick()
         composeRule.onNodeWithTag("listening_history_list").assertExists()
         composeRule.onNodeWithTag("history_row_ep-history-1").assertExists()
-        composeRule.onNodeWithTag("history_timestamp_ep-history-1").assertExists()
+        composeRule
+            .onNodeWithTag("history_timestamp_ep-history-1", useUnmergedTree = true)
+            .assertExists()
     }
 
     private fun createSampleEntry(): InboxEntry =

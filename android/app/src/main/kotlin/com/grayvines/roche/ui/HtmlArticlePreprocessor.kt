@@ -361,24 +361,26 @@ internal fun flattenListsInDom(root: Element, rootIsListItem: Boolean) {
     while (pass < MAX_NESTING_PASSES) {
         val leafLists = root.select("ul, ol").filter { it != root && it.select("ul, ol").size == 1 }
         if (leafLists.isEmpty()) break
-        for (leaf in leafLists) {
-            val nestedInList =
-                rootIsListItem ||
-                    leaf.parents().any {
-                        it != root && (it.normalName() == "ul" || it.normalName() == "ol")
-                    }
-            val ordered = leaf.normalName() == "ol"
-            val indent = if (nestedInList) "&nbsp;&nbsp;" else ""
-            val bullet = if (nestedInList) "◦" else "•"
-            val inlineListHtml = formatDomListItemsInline(leaf, ordered, indent, bullet)
-            trimWhitespaceBeforeNode(leaf)
-            if (inlineListHtml.isNotEmpty()) {
-                leaf.before(inlineListHtml)
-            }
-            leaf.remove()
-        }
+        leafLists.forEach { leaf -> flattenSingleLeafList(leaf, root, rootIsListItem) }
         pass++
     }
+}
+
+private fun flattenSingleLeafList(leaf: Element, root: Element, rootIsListItem: Boolean) {
+    val nestedInList =
+        rootIsListItem ||
+            leaf.parents().any {
+                it != root && (it.normalName() == "ul" || it.normalName() == "ol")
+            }
+    val ordered = leaf.normalName() == "ol"
+    val indent = if (nestedInList) "&nbsp;&nbsp;" else ""
+    val bullet = if (nestedInList) "◦" else "•"
+    val inlineListHtml = formatDomListItemsInline(leaf, ordered, indent, bullet)
+    trimWhitespaceBeforeNode(leaf)
+    if (inlineListHtml.isNotEmpty()) {
+        leaf.before(inlineListHtml)
+    }
+    leaf.remove()
 }
 
 internal fun formatDomListItemsInline(

@@ -19,6 +19,7 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
+import com.grayvines.roche.ui.PodcastPlaybackService
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
@@ -29,7 +30,11 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels {
         val graph = (application as RocheApp).graph
-        MainViewModel.Factory(repository = graph.repository, settings = graph.settings)
+        MainViewModel.Factory(
+            repository = graph.repository,
+            settings = graph.settings,
+            mediaSessionBridge = graph.mediaSessionBridge,
+        )
     }
 
     private val importOpmlLauncher =
@@ -72,6 +77,7 @@ class MainActivity : ComponentActivity() {
                         onOpenExternalUrl = ::openUrlInBrowser,
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
+                        onMoveTaskToBack = { moveTaskToBack(true) },
                     )
                 }
             }
@@ -86,6 +92,18 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingShareIntent(intent: Intent?) {
         val currentIntent = intent ?: return
+        if (
+            currentIntent.action == PodcastPlaybackService.ACTION_OPEN_PLAYER ||
+                currentIntent.getBooleanExtra(
+                    PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER,
+                    false,
+                )
+        ) {
+            currentIntent.removeExtra(PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER)
+            currentIntent.action = Intent.ACTION_MAIN
+            viewModel.dispatch(MainAction.OpenFullscreenPlayer)
+            return
+        }
         val payload =
             extractSharedLink(
                 action = currentIntent.action,

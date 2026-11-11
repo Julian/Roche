@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.ui
 
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import com.grayvines.roche.data.parseDurationToSecondsLong
@@ -35,14 +36,82 @@ data class PodcastChapter(
         get() = formatPlaybackClock(startMs)
 }
 
+enum class MediaSessionCommand {
+    PLAY,
+    PAUSE,
+    TOGGLE_PLAY_PAUSE,
+    REWIND_15S,
+    FAST_FORWARD_30S,
+    SKIP_TO_NEXT,
+    STOP,
+}
+
+data class MediaSessionMetadataSnapshot(
+    val entryId: String,
+    val episodeTitle: String,
+    val podcastTitle: String,
+    val artworkUrl: String?,
+    val isPlaying: Boolean,
+    val isBuffering: Boolean,
+    val positionMs: Long,
+    val durationMs: Long,
+    val playbackSpeed: Float,
+    val hasNextQueuedAudio: Boolean,
+)
+
+interface PodcastMediaSessionCallbacks {
+    fun onMediaCommand(command: MediaSessionCommand)
+
+    fun onSeekToMs(positionMs: Long)
+
+    fun onSetPlaybackSpeed(speed: Float)
+
+    fun onAudioFocusLost(transient: Boolean)
+
+    fun onAudioFocusGained()
+
+    fun onAudioBecomingNoisy()
+}
+
+interface PodcastMediaSessionBridge {
+    fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks)
+
+    fun unbindCallbacks(callbacks: PodcastMediaSessionCallbacks) = Unit
+
+    fun requestAudioFocus(): Boolean
+
+    fun abandonAudioFocus()
+
+    fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?)
+
+    fun release()
+}
+
+object NoOpPodcastMediaSessionBridge : PodcastMediaSessionBridge {
+    override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) = Unit
+
+    override fun requestAudioFocus(): Boolean = true
+
+    override fun abandonAudioFocus() = Unit
+
+    override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) = Unit
+
+    override fun release() = Unit
+}
+
 data class PodcastPlayerState(
     val currentEntryId: String? = null,
+    val currentEpisodeTitle: String = "",
+    val currentPodcastTitle: String = "",
+    val currentArtworkUrl: String? = null,
+    val hasNextQueuedAudio: Boolean = false,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
     val playbackSpeed: Float = Settings.DEFAULT_PLAYBACK_SPEED,
     val skipSilenceEnabled: Boolean = false,
+    val smartRewindEnabled: Boolean = true,
     val sleepTimerRemainingSec: Int? = null,
     val isFullscreenOpen: Boolean = false,
     val isSpeedSheetOpen: Boolean = false,
@@ -122,6 +191,7 @@ interface AudioPlayerBackend {
         initialPositionMs: Long,
         fallbackDurationMs: Long,
         speed: Float,
+        playWhenReady: Boolean = true,
         onPrepared: (durationMs: Long) -> Unit,
         onCompletion: () -> Unit,
         onError: () -> Unit,
@@ -141,11 +211,14 @@ interface AudioPlayerBackend {
 
     fun isPlaying(): Boolean
 
+    fun isUsingNativePlayer(): Boolean = false
+
     fun release()
 }
 
 internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
     private var mediaPlayer: MediaPlayer? = null
+    private var isPrepared: Boolean = false
     private var simulatedPositionMs: Long = 0L
     private var simulatedDurationMs: Long = DEFAULT_FALLBACK_DURATION_MS
     private var simulatedIsPlaying: Boolean = false
@@ -156,6 +229,7 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
         initialPositionMs: Long,
         fallbackDurationMs: Long,
         speed: Float,
+        playWhenReady: Boolean,
         onPrepared: (durationMs: Long) -> Unit,
         onCompletion: () -> Unit,
         onError: () -> Unit,
@@ -168,20 +242,30 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
         currentSpeed = speed
         simulatedDurationMs = fallbackDurationMs.takeIf { it > 0L } ?: DEFAULT_FALLBACK_DURATION_MS
         simulatedPositionMs = initialPositionMs.coerceIn(0L, simulatedDurationMs)
+        simulatedIsPlaying = playWhenReady
 
         val startedNative = runCatching {
             val mp = MediaPlayer()
             mediaPlayer = mp
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             mp.setDataSource(source)
             mp.setOnPreparedListener { player ->
+                isPrepared = true
                 val dur = player.duration.toLong().takeIf { it > 0L } ?: simulatedDurationMs
                 simulatedDurationMs = dur
-                if (initialPositionMs in 1 until dur) {
-                    player.seekTo(initialPositionMs.toInt())
+                val seekTarget = simulatedPositionMs.coerceIn(0L, dur)
+                if (seekTarget in 1 until dur) {
+                    player.seekTo(seekTarget.toInt())
                 }
-                applyPlaybackSpeedBestEffort(player, currentSpeed)
-                player.start()
-                simulatedIsPlaying = true
+                if (simulatedIsPlaying) {
+                    applyPlaybackSpeedBestEffort(player, currentSpeed)
+                    player.start()
+                }
                 onPrepared(dur)
             }
             mp.setOnCompletionListener {
@@ -189,11 +273,11 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
                 onCompletion()
             }
             mp.setOnErrorListener { player, _, _ ->
+                isPrepared = false
                 runCatching { player.release() }
                 if (mediaPlayer === player) {
                     mediaPlayer = null
                 }
-                simulatedIsPlaying = true
                 onPrepared(simulatedDurationMs)
                 true
             }
@@ -204,13 +288,14 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
 
         if (!startedNative) {
             release()
-            simulatedIsPlaying = true
+            simulatedIsPlaying = playWhenReady
             onPrepared(simulatedDurationMs)
         }
     }
 
     override fun play() {
         simulatedIsPlaying = true
+        if (!isPrepared) return
         runCatching {
             mediaPlayer?.let { player ->
                 applyPlaybackSpeedBestEffort(player, currentSpeed)
@@ -221,6 +306,7 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
 
     override fun pause() {
         simulatedIsPlaying = false
+        if (!isPrepared) return
         runCatching {
             val player = mediaPlayer
             if (player != null && player.isPlaying) {
@@ -233,28 +319,27 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
     override fun seekTo(positionMs: Long) {
         val clamped = positionMs.coerceIn(0L, simulatedDurationMs)
         simulatedPositionMs = clamped
+        if (!isPrepared) return
         runCatching { mediaPlayer?.seekTo(clamped.toInt()) }
     }
 
     override fun setSpeed(speed: Float) {
         currentSpeed = speed
+        if (!isPrepared || !simulatedIsPlaying) return
         runCatching { mediaPlayer?.let { applyPlaybackSpeedBestEffort(it, speed) } }
     }
 
     override fun currentPositionMs(): Long {
+        if (!isPrepared) return simulatedPositionMs
         val nativePos = runCatching {
-            val player = mediaPlayer
-            if (player != null && player.isPlaying) {
-                player.currentPosition.toLong().takeIf { it >= 0L }
-            } else {
-                null
-            }
+            mediaPlayer?.currentPosition?.toLong()?.takeIf { it >= 0L }
         }
             .getOrNull()
         return nativePos ?: simulatedPositionMs
     }
 
     override fun durationMs(): Long {
+        if (!isPrepared) return simulatedDurationMs
         val nativeDur = runCatching {
             mediaPlayer?.duration?.toLong()?.takeIf { it > 0L }
         }
@@ -262,14 +347,24 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
         return nativeDur ?: simulatedDurationMs
     }
 
-    override fun isPlaying(): Boolean =
-        runCatching { mediaPlayer?.isPlaying }.getOrNull() ?: simulatedIsPlaying
+    override fun isPlaying(): Boolean {
+        if (!isPrepared) return simulatedIsPlaying
+        return runCatching { mediaPlayer?.isPlaying }.getOrNull() ?: simulatedIsPlaying
+    }
+
+    override fun isUsingNativePlayer(): Boolean = mediaPlayer != null && isPrepared
 
     override fun release() {
+        isPrepared = false
         simulatedIsPlaying = false
         val player = mediaPlayer
         mediaPlayer = null
         if (player != null) {
+            runCatching {
+                player.setOnPreparedListener(null)
+                player.setOnCompletionListener(null)
+                player.setOnErrorListener(null)
+            }
             runCatching { player.stop() }
             runCatching { player.release() }
         }
@@ -285,14 +380,23 @@ internal class ResilientMediaPlayerBackend : AudioPlayerBackend {
 class PodcastPlayerController(
     private val scope: CoroutineScope,
     private val backend: AudioPlayerBackend = ResilientMediaPlayerBackend(),
+    private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     private val onProgressChanged: (entryId: String, progress: Double) -> Unit = { _, _ -> },
     private val onEpisodeCompleted: (entryId: String) -> Unit = {},
-) {
+    private val onSkipToNextRequested: () -> Unit = {},
+    private val onSpeedChangedFromSession: (Float) -> Unit = {},
+) : PodcastMediaSessionCallbacks {
     private val _state = MutableStateFlow(PodcastPlayerState())
     val state: StateFlow<PodcastPlayerState> = _state.asStateFlow()
 
     private var tickerJob: Job? = null
     private var pausedAtEpochMs: Long? = null
+    private var resumeAfterTransientFocusLoss: Boolean = false
+    private var pendingResumeProgress: Double? = null
+
+    init {
+        mediaSessionBridge.bindCallbacks(this)
+    }
 
     fun playEntry(
         entry: InboxEntry,
@@ -300,53 +404,113 @@ class PodcastPlayerController(
         speed: Float,
         skipSilenceEnabled: Boolean,
         openFullscreen: Boolean = true,
+        hasNextQueuedAudio: Boolean = _state.value.hasNextQueuedAudio,
+        smartRewindEnabled: Boolean = _state.value.smartRewindEnabled,
     ) {
+        tickerJob?.cancel()
+        val hasFocus = mediaSessionBridge.requestAudioFocus()
         val clampedSpeed = clampPlaybackSpeed(speed)
+        val parsedDurationSeconds = parseDurationToSecondsLong(entry.duration)
         val estimatedDurationMs =
-            parseDurationToSecondsLong(entry.duration)?.times(1_000L)
-                ?: DEFAULT_FALLBACK_DURATION_MS
+            parsedDurationSeconds?.times(1_000L) ?: DEFAULT_FALLBACK_DURATION_MS
+        val hasValidResumeProgress = entry.readProgress in 0.01..0.98
+        pendingResumeProgress =
+            if (parsedDurationSeconds == null && hasValidResumeProgress) {
+                entry.readProgress
+            } else {
+                null
+            }
         val initialPositionMs =
-            if (entry.readProgress in 0.01..0.98) {
+            if (hasValidResumeProgress) {
                 (estimatedDurationMs * entry.readProgress).roundToLong()
             } else {
                 0L
             }
         val parsedChapters = extractBestChaptersFromEntry(entry)
         pausedAtEpochMs = null
+        resumeAfterTransientFocusLoss = false
         _state.update { current ->
             current.copy(
                 currentEntryId = entry.id,
-                isPlaying = true,
+                currentEpisodeTitle = entry.title,
+                currentPodcastTitle = entry.feedTitle,
+                currentArtworkUrl = entry.thumbnailUrl,
+                hasNextQueuedAudio = hasNextQueuedAudio,
+                isPlaying = hasFocus,
                 isBuffering = true,
                 positionMs = initialPositionMs,
                 durationMs = estimatedDurationMs,
                 playbackSpeed = clampedSpeed,
                 skipSilenceEnabled = skipSilenceEnabled,
+                smartRewindEnabled = smartRewindEnabled,
                 isFullscreenOpen = openFullscreen,
                 activeDrawerTab = null,
                 chapters = parsedChapters,
             )
         }
+        syncMediaSessionBridge()
         backend.loadAndPlay(
             source = sourceUriOrPath,
             initialPositionMs = initialPositionMs,
             fallbackDurationMs = estimatedDurationMs,
             speed = clampedSpeed,
-            onPrepared = { dur ->
-                _state.update {
-                    it.copy(
-                        isBuffering = false,
-                        isPlaying = true,
-                        durationMs = dur.coerceAtLeast(1_000L),
-                    )
-                }
-                startTicker()
-            },
+            playWhenReady = hasFocus,
+            onPrepared = { dur -> handleBackendPrepared(entry.id, dur) },
             onCompletion = { handleActiveEpisodeFinished() },
             onError = {
+                tickerJob?.cancel()
+                mediaSessionBridge.abandonAudioFocus()
                 _state.update { it.copy(isBuffering = false, isPlaying = false) }
+                syncMediaSessionBridge()
             },
         )
+    }
+
+    private fun handleBackendPrepared(entryId: String, durationMs: Long) {
+        if (_state.value.currentEntryId != entryId) return
+        val safeDurationMs = durationMs.coerceAtLeast(1_000L)
+        val resumeProgress = pendingResumeProgress
+        pendingResumeProgress = null
+        val correctedPositionMs =
+            if (resumeProgress != null) {
+                val target =
+                    (safeDurationMs * resumeProgress).roundToLong().coerceIn(0L, safeDurationMs)
+                backend.seekTo(target)
+                target
+            } else {
+                _state.value.positionMs.coerceIn(0L, safeDurationMs)
+            }
+        val stillPlaying = _state.value.isPlaying
+        if (stillPlaying) {
+            backend.play()
+        } else {
+            backend.pause()
+        }
+        _state.update {
+            it.copy(
+                isBuffering = false,
+                isPlaying = stillPlaying,
+                positionMs = correctedPositionMs,
+                durationMs = safeDurationMs,
+            )
+        }
+        syncMediaSessionBridge()
+        if (stillPlaying) {
+            startTicker()
+        }
+    }
+
+    fun updateHasNextQueuedAudio(hasNext: Boolean) {
+        if (_state.value.hasNextQueuedAudio != hasNext) {
+            _state.update { it.copy(hasNextQueuedAudio = hasNext) }
+            syncMediaSessionBridge()
+        }
+    }
+
+    fun updateSmartRewindEnabled(enabled: Boolean) {
+        if (_state.value.smartRewindEnabled != enabled) {
+            _state.update { it.copy(smartRewindEnabled = enabled) }
+        }
     }
 
     fun refreshChaptersFromEntry(entry: InboxEntry) {
@@ -357,37 +521,73 @@ class PodcastPlayerController(
         }
     }
 
+    fun refreshChaptersFromNotes(entryId: String, vararg notesCandidates: String?) {
+        if (_state.value.currentEntryId != entryId) return
+        val updated =
+            notesCandidates
+                .filterNotNull()
+                .firstNotNullOfOrNull { notes ->
+                    parseChaptersFromEpisodeNotes(notes).takeIf { it.isNotEmpty() }
+                }
+                .orEmpty()
+        if (updated.isNotEmpty() && updated != _state.value.chapters) {
+            _state.update { it.copy(chapters = updated) }
+        }
+    }
+
     fun togglePlayPause(
-        smartRewindEnabled: Boolean = true,
+        smartRewindEnabled: Boolean = _state.value.smartRewindEnabled,
         nowEpochMs: Long = System.currentTimeMillis(),
     ) {
         val current = _state.value
         if (!current.hasActiveEpisode) return
+        resumeAfterTransientFocusLoss = false
         if (current.isPlaying) {
-            backend.pause()
-            pausedAtEpochMs = nowEpochMs
-            _state.update { it.copy(isPlaying = false) }
-            persistCurrentProgress()
+            pausePlaybackInternal(nowEpochMs = nowEpochMs, abandonFocus = true)
         } else {
-            val pausedAt = pausedAtEpochMs
-            if (smartRewindEnabled && pausedAt != null) {
-                val pausedDurationMs = (nowEpochMs - pausedAt).coerceAtLeast(0L)
-                val rewindMs =
-                    when {
-                        pausedDurationMs >= SMART_REWIND_LONG_PAUSE_MS -> SMART_REWIND_LONG_MS
-                        pausedDurationMs >= SMART_REWIND_SHORT_PAUSE_MS -> SMART_REWIND_SHORT_MS
-                        else -> 0L
-                    }
-                if (rewindMs > 0L) {
-                    val target = (current.positionMs - rewindMs).coerceAtLeast(0L)
-                    backend.seekTo(target)
-                    _state.update { it.copy(positionMs = target) }
-                }
-            }
+            if (!mediaSessionBridge.requestAudioFocus()) return
+            applySmartRewindIfEligible(
+                current = current,
+                smartRewindEnabled = smartRewindEnabled,
+                nowEpochMs = nowEpochMs,
+            )
             pausedAtEpochMs = null
             backend.play()
             _state.update { it.copy(isPlaying = true) }
+            syncMediaSessionBridge()
             startTicker()
+        }
+    }
+
+    private fun pausePlaybackInternal(nowEpochMs: Long, abandonFocus: Boolean) {
+        backend.pause()
+        if (abandonFocus) {
+            mediaSessionBridge.abandonAudioFocus()
+        }
+        pausedAtEpochMs = nowEpochMs
+        _state.update { it.copy(isPlaying = false) }
+        syncMediaSessionBridge()
+        persistCurrentProgress()
+    }
+
+    private fun applySmartRewindIfEligible(
+        current: PodcastPlayerState,
+        smartRewindEnabled: Boolean,
+        nowEpochMs: Long,
+    ) {
+        val pausedAt = pausedAtEpochMs ?: return
+        if (!smartRewindEnabled) return
+        val pausedDurationMs = (nowEpochMs - pausedAt).coerceAtLeast(0L)
+        val rewindMs =
+            when {
+                pausedDurationMs >= SMART_REWIND_LONG_PAUSE_MS -> SMART_REWIND_LONG_MS
+                pausedDurationMs >= SMART_REWIND_SHORT_PAUSE_MS -> SMART_REWIND_SHORT_MS
+                else -> 0L
+            }
+        if (rewindMs > 0L) {
+            val target = (current.positionMs - rewindMs).coerceAtLeast(0L)
+            backend.seekTo(target)
+            _state.update { it.copy(positionMs = target) }
         }
     }
 
@@ -404,6 +604,7 @@ class PodcastPlayerController(
         val clamped = positionMs.coerceIn(0L, current.durationMs.coerceAtLeast(1L))
         backend.seekTo(clamped)
         _state.update { it.copy(positionMs = clamped) }
+        syncMediaSessionBridge()
         persistCurrentProgress()
     }
 
@@ -422,6 +623,7 @@ class PodcastPlayerController(
         val clamped = clampPlaybackSpeed(speed)
         backend.setSpeed(clamped)
         _state.update { it.copy(playbackSpeed = clamped) }
+        syncMediaSessionBridge()
     }
 
     fun setSkipSilence(enabled: Boolean) {
@@ -466,13 +668,80 @@ class PodcastPlayerController(
 
     fun stopAndClear() {
         tickerJob?.cancel()
+        resumeAfterTransientFocusLoss = false
+        pendingResumeProgress = null
+        mediaSessionBridge.abandonAudioFocus()
         backend.release()
         _state.value = PodcastPlayerState()
+        mediaSessionBridge.updatePlaybackSession(null)
+    }
+
+    fun releaseController() {
+        stopAndClear()
+        mediaSessionBridge.unbindCallbacks(this)
+    }
+
+    override fun onMediaCommand(command: MediaSessionCommand) {
+        when (command) {
+            MediaSessionCommand.PLAY ->
+                if (!_state.value.isPlaying && _state.value.hasActiveEpisode) {
+                    togglePlayPause()
+                }
+            MediaSessionCommand.PAUSE ->
+                if (_state.value.isPlaying) {
+                    togglePlayPause()
+                }
+            MediaSessionCommand.TOGGLE_PLAY_PAUSE -> togglePlayPause()
+            MediaSessionCommand.REWIND_15S -> skipBySeconds(-15)
+            MediaSessionCommand.FAST_FORWARD_30S -> skipBySeconds(30)
+            MediaSessionCommand.SKIP_TO_NEXT -> onSkipToNextRequested()
+            MediaSessionCommand.STOP -> stopAndClear()
+        }
+    }
+
+    override fun onSeekToMs(positionMs: Long) {
+        seekToMs(positionMs)
+    }
+
+    override fun onSetPlaybackSpeed(speed: Float) {
+        setPlaybackSpeed(speed)
+        onSpeedChangedFromSession(_state.value.playbackSpeed)
+    }
+
+    override fun onAudioFocusLost(transient: Boolean) {
+        val current = _state.value
+        if (current.isPlaying) {
+            resumeAfterTransientFocusLoss = transient
+            pausePlaybackInternal(
+                nowEpochMs = System.currentTimeMillis(),
+                abandonFocus = !transient,
+            )
+        } else if (!transient) {
+            resumeAfterTransientFocusLoss = false
+            mediaSessionBridge.abandonAudioFocus()
+        }
+    }
+
+    override fun onAudioFocusGained() {
+        val current = _state.value
+        if (resumeAfterTransientFocusLoss && current.hasActiveEpisode && !current.isPlaying) {
+            resumeAfterTransientFocusLoss = false
+            togglePlayPause()
+        }
+    }
+
+    override fun onAudioBecomingNoisy() {
+        resumeAfterTransientFocusLoss = false
+        if (_state.value.isPlaying) {
+            pausePlaybackInternal(nowEpochMs = System.currentTimeMillis(), abandonFocus = true)
+        }
     }
 
     private fun handleActiveEpisodeFinished() {
         val completedId = _state.value.currentEntryId ?: return
         tickerJob?.cancel()
+        resumeAfterTransientFocusLoss = false
+        pendingResumeProgress = null
         backend.release()
         _state.update {
             it.copy(
@@ -481,6 +750,32 @@ class PodcastPlayerController(
             )
         }
         onEpisodeCompleted(completedId)
+        if (_state.value.currentEntryId == completedId && !_state.value.isPlaying) {
+            syncMediaSessionBridge()
+        }
+    }
+
+    private fun syncMediaSessionBridge() {
+        val s = _state.value
+        val entryId = s.currentEntryId
+        if (entryId.isNullOrBlank()) {
+            mediaSessionBridge.updatePlaybackSession(null)
+            return
+        }
+        mediaSessionBridge.updatePlaybackSession(
+            MediaSessionMetadataSnapshot(
+                entryId = entryId,
+                episodeTitle = s.currentEpisodeTitle,
+                podcastTitle = s.currentPodcastTitle,
+                artworkUrl = s.currentArtworkUrl,
+                isPlaying = s.isPlaying,
+                isBuffering = s.isBuffering,
+                positionMs = s.positionMs,
+                durationMs = s.durationMs,
+                playbackSpeed = s.playbackSpeed,
+                hasNextQueuedAudio = s.hasNextQueuedAudio,
+            )
+        )
     }
 
     private fun persistCurrentProgress() {
@@ -509,43 +804,55 @@ class PodcastPlayerController(
         val s = _state.value
         var keepRunning = s.isPlaying
         if (keepRunning) {
-            val stepMs = (1_000f * s.playbackSpeed).roundToLong()
-            val backendPos = backend.currentPositionMs()
-            val nextPos =
-                if (backendPos > s.positionMs) {
-                    backendPos
-                } else {
-                    (s.positionMs + stepMs).coerceAtMost(s.durationMs)
-                }
+            val usingNative = backend.isUsingNativePlayer()
+            val nextPos = computeNextTickPositionMs(s, usingNative)
+            val updatedDuration = maxOf(s.durationMs, nextPos)
             val nextSleep = s.sleepTimerRemainingSec?.let { (it - 1).coerceAtLeast(0) }
             if (nextSleep != null && nextSleep == 0) {
+                resumeAfterTransientFocusLoss = false
+                pausedAtEpochMs = System.currentTimeMillis()
                 backend.pause()
+                mediaSessionBridge.abandonAudioFocus()
                 _state.update {
                     it.copy(
                         positionMs = nextPos,
+                        durationMs = updatedDuration,
                         isPlaying = false,
                         sleepTimerRemainingSec = null,
                     )
                 }
+                syncMediaSessionBridge()
                 persistCurrentProgress()
                 keepRunning = false
             } else {
                 _state.update {
                     it.copy(
                         positionMs = nextPos,
+                        durationMs = updatedDuration,
                         sleepTimerRemainingSec = nextSleep,
                     )
                 }
                 if (tickCount % 5 == 0) {
+                    syncMediaSessionBridge()
                     persistCurrentProgress()
                 }
-                if (s.durationMs > 0L && nextPos >= s.durationMs) {
+                if (!usingNative && updatedDuration > 0L && nextPos >= updatedDuration) {
                     handleActiveEpisodeFinished()
                     keepRunning = false
                 }
             }
         }
         return keepRunning
+    }
+
+    private fun computeNextTickPositionMs(s: PodcastPlayerState, usingNative: Boolean): Long {
+        val stepMs = (1_000f * s.playbackSpeed).roundToLong()
+        val backendPos = backend.currentPositionMs()
+        return when {
+            usingNative -> backendPos.coerceAtLeast(0L)
+            backendPos > s.positionMs -> backendPos
+            else -> (s.positionMs + stepMs).coerceAtMost(s.durationMs)
+        }
     }
 
     companion object {

@@ -41,6 +41,7 @@ fun MainScreen(
     modifier: Modifier = Modifier,
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
+    onMoveTaskToBack: () -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     val activePlayerEntry = state.activePlayerEntry
@@ -48,12 +49,13 @@ fun MainScreen(
     val showChrome = state.activeReaderEntry == null && !isFullscreenPlayerOpen
     val hasFab = showChrome && state.activeTab != AppTab.SETTINGS
     val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
+    val hasInnerBack = hasScopeFilter || state.activeTab != AppTab.INBOX
 
-    BackHandler(enabled = showChrome && (hasScopeFilter || state.activeTab != AppTab.INBOX)) {
-        if (hasScopeFilter) {
-            onAction(MainAction.NavigateBackFromScope)
-        } else {
-            onAction(MainAction.SelectTab(AppTab.INBOX))
+    BackHandler(enabled = showChrome && (hasInnerBack || activePlayerEntry != null)) {
+        when {
+            hasScopeFilter -> onAction(MainAction.NavigateBackFromScope)
+            state.activeTab != AppTab.INBOX -> onAction(MainAction.SelectTab(AppTab.INBOX))
+            else -> onMoveTaskToBack()
         }
     }
 
