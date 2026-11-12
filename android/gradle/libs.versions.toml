@@ -3,7 +3,7 @@
 agp = "9.5.0"
 kotlin = "2.4.21"
 ksp = "2.3.13"
-spotless = "8.10.4"
+spotless = "8.11.0"
 ktfmt = "0.64"
 detekt = "2.0.0-alpha.6"
 
