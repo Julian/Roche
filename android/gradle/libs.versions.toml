@@ -2,7 +2,7 @@
 # Toolchain (versions verified against Maven metadata)
 agp = "9.5.0"
 kotlin = "2.4.21"
-ksp = "2.3.12"
+ksp = "2.3.13"
 spotless = "8.10.4"
 ktfmt = "0.64"
 detekt = "2.0.0-alpha.6"
