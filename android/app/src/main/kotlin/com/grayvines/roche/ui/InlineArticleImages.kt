@@ -274,13 +274,35 @@ internal fun parseHtmlPixelDimension(raw: String): Int? {
 }
 
 @Composable
-internal fun RenderImageBlock(block: ArticleBlock.ImageBlock, linkStyles: TextLinkStyles) {
+internal fun RenderImageBlock(
+    block: ArticleBlock.ImageBlock,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     when (val state = rememberInlineImageState(block.url)) {
         is InlineImageLoadState.Success ->
-            RenderLoadedInlineImage(bitmap = state.bitmap, block = block, linkStyles = linkStyles)
+            RenderLoadedInlineImage(
+                bitmap = state.bitmap,
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         InlineImageLoadState.Loading ->
-            RenderLoadingInlineImage(block = block, linkStyles = linkStyles)
-        InlineImageLoadState.Error -> RenderErrorInlineImage(block = block, linkStyles = linkStyles)
+            RenderLoadingInlineImage(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
+        InlineImageLoadState.Error ->
+            RenderErrorInlineImage(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
     }
 }
 
@@ -289,6 +311,8 @@ private fun RenderLoadedInlineImage(
     bitmap: ImageBitmap,
     block: ArticleBlock.ImageBlock,
     linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
@@ -318,7 +342,12 @@ private fun RenderLoadedInlineImage(
         }
         if (!block.captionHtml.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
-            RenderImageCaption(captionHtml = block.captionHtml, linkStyles = linkStyles)
+            RenderImageCaption(
+                captionHtml = block.captionHtml,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         }
     }
 }
@@ -327,6 +356,8 @@ private fun RenderLoadedInlineImage(
 private fun RenderLoadingInlineImage(
     block: ArticleBlock.ImageBlock,
     linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
@@ -347,7 +378,12 @@ private fun RenderLoadingInlineImage(
         }
         if (!block.captionHtml.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
-            RenderImageCaption(captionHtml = block.captionHtml, linkStyles = linkStyles)
+            RenderImageCaption(
+                captionHtml = block.captionHtml,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         }
     }
 }
@@ -356,6 +392,8 @@ private fun RenderLoadingInlineImage(
 private fun RenderErrorInlineImage(
     block: ArticleBlock.ImageBlock,
     linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
 ) {
     if (block.captionHtml.isNullOrBlank() && block.alt.isNullOrBlank()) return
     val colors = LocalRocheColors.current
@@ -382,7 +420,12 @@ private fun RenderErrorInlineImage(
         }
         if (!block.captionHtml.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
-            RenderImageCaption(captionHtml = block.captionHtml, linkStyles = linkStyles)
+            RenderImageCaption(
+                captionHtml = block.captionHtml,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         }
     }
 }
@@ -398,7 +441,12 @@ private fun resolvePlaceholderAspectRatio(width: Int?, height: Int?): Float {
 }
 
 @Composable
-private fun RenderImageCaption(captionHtml: String, linkStyles: TextLinkStyles) {
+private fun RenderImageCaption(
+    captionHtml: String,
+    linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val annotated =
@@ -406,6 +454,8 @@ private fun RenderImageCaption(captionHtml: String, linkStyles: TextLinkStyles) 
             html = captionHtml,
             linkStyles = linkStyles,
             codeBackground = colors.surfaceElevated,
+            baseUrl = baseUrl,
+            onOpenUrl = onOpenUrl,
         )
     Text(
         text = annotated,

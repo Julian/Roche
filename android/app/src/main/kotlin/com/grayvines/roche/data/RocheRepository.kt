@@ -21,7 +21,6 @@ import com.grayvines.roche.model.TagItem
 import java.io.File
 import java.time.Instant
 import java.time.temporal.ChronoUnit
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -224,8 +223,7 @@ class RocheRepository(
     suspend fun toggleOfflineCache(itemId: String): Boolean {
         val current = dao.getItemById(itemId) ?: return false
         val updated = !current.isCachedOffline
-        offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = updated)
-        return updated
+        return offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = updated)
     }
 
     internal suspend fun hydrateItemContentIfNeeded(
@@ -303,7 +301,7 @@ class RocheRepository(
             ?: entry.audioUrl?.takeIf { it.isNotBlank() }
             ?: entry.url
 
-    internal suspend fun importOpml(opmlXml: String): Result<Int> = runCatching {
+    internal suspend fun importOpml(opmlXml: String): Result<Int> = runSuspendCatching {
         val trimmed = opmlXml.trim()
         check(trimmed.isNotBlank()) { "OPML file is empty" }
         val currentSettings = settings.settings.first()
@@ -320,10 +318,10 @@ class RocheRepository(
         imported
     }
 
-    internal suspend fun exportOpml(): Result<String> = runCatching {
+    internal suspend fun exportOpml(): Result<String> = runSuspendCatching {
         val currentSettings = settings.settings.first()
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-            runCatching {
+            runSuspendCatching {
                 apiClient.exportOpml(
                     serverUrl = currentSettings.serverUrl,
                     token = currentSettings.bearerToken,
@@ -408,16 +406,23 @@ class RocheRepository(
     }
 
     internal suspend fun renameFeed(feedId: String, newTitle: String): String? =
-        renameFeedInLocalDb(dao = dao, feedId = feedId, newTitle = newTitle)
-
-    suspend fun toggleFeedArchive(feedId: String): Result<Pair<String, Boolean>> = runCatching {
-        toggleFeedArchiveInDbAndRemote(
+        renameFeedInDbAndRemote(
             dao = dao,
             apiClient = apiClient,
             settings = settings,
             feedId = feedId,
+            newTitle = newTitle,
         )
-    }
+
+    suspend fun toggleFeedArchive(feedId: String): Result<Pair<String, Boolean>> =
+        runSuspendCatching {
+            toggleFeedArchiveInDbAndRemote(
+                dao = dao,
+                apiClient = apiClient,
+                settings = settings,
+                feedId = feedId,
+            )
+        }
 
     internal suspend fun applyTagToFeedItems(feedId: String, tagName: String): Int =
         applyTagToUnarchivedFeedItems(
@@ -428,7 +433,7 @@ class RocheRepository(
             tagName = tagName,
         )
 
-    suspend fun refreshFeed(feedId: String): Result<String> = runCatching {
+    suspend fun refreshFeed(feedId: String): Result<String> = runSuspendCatching {
         val title =
             refreshFeedOnlineOrOnDevice(
                 dao = dao,
@@ -441,7 +446,7 @@ class RocheRepository(
         title
     }
 
-    suspend fun deleteFeed(feedId: String): Result<String> = runCatching {
+    suspend fun deleteFeed(feedId: String): Result<String> = runSuspendCatching {
         deleteFeedFromServerOrLocal(
             dao = dao,
             apiClient = apiClient,
@@ -451,7 +456,7 @@ class RocheRepository(
         )
     }
 
-    suspend fun deleteItem(itemId: String): Result<String> = runCatching {
+    suspend fun deleteItem(itemId: String): Result<String> = runSuspendCatching {
         val existing = dao.getItemById(itemId)
         if (existing != null) {
             val feedUrl =
@@ -542,7 +547,7 @@ class RocheRepository(
 
     internal suspend fun discoverServer(
         tailnetDomains: List<String> = emptyList()
-    ): Result<String> = runCatching {
+    ): Result<String> = runSuspendCatching {
         val discovered =
             apiClient.discoverServer(tailnetDomains = tailnetDomains)
                 ?: error("No Roche server found on Tailnet (tried roche:8080 / svc:roche)")
@@ -559,7 +564,7 @@ class RocheRepository(
         serverUrl: String,
         pairingCode: String,
         deviceName: String,
-    ): Result<String> = runCatching {
+    ): Result<String> = runSuspendCatching {
         val (parsedUrl, cleanCode) = parsePairingInput(serverUrl, pairingCode)
         check(cleanCode.isNotBlank()) { "Enter a valid pairing code" }
         val resolvedUrl =
@@ -590,7 +595,7 @@ class RocheRepository(
     }
 
     suspend fun syncWithServer(): Result<Int> = syncMutex.withLock {
-        runCatching {
+        runSuspendCatching {
             val currentSettings = settings.settings.first()
             val currentTier = networkTierProvider.currentNetworkTier()
             if (currentSettings.serverUrl.isBlank()) {
@@ -623,11 +628,10 @@ class RocheRepository(
             offlineCacheManager.autoDownloadNewEpisodes()
             count
         }
-            .onFailure { if (it is CancellationException) throw it }
     }
 
     suspend fun pollDueFeedsOnDeviceNow(): Result<Int> = syncMutex.withLock {
-        runCatching {
+        runSuspendCatching {
             val currentTier = networkTierProvider.currentNetworkTier()
             check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
             val currentSettings = settings.settings.first()
@@ -645,7 +649,7 @@ class RocheRepository(
                     currentSettings.serverUrl.isNotBlank() &&
                     currentSettings.bearerToken.isNotBlank()
             ) {
-                runCatching {
+                runSuspendCatching {
                     tryPeerSyncAndCooperativePoll(
                         dao = dao,
                         apiClient = apiClient,
@@ -658,12 +662,10 @@ class RocheRepository(
                         initialWeightOverride = measuredWeight,
                     )
                 }
-                    .onFailure { if (it is CancellationException) throw it }
             }
             offlineCacheManager.autoDownloadNewEpisodes()
             polledCount
         }
-            .onFailure { if (it is CancellationException) throw it }
     }
 
     suspend fun runBackgroundPeerSyncAndPoll(): Result<Int> {
@@ -675,7 +677,7 @@ class RocheRepository(
             if (syncResult.isSuccess) return syncResult
         }
         return syncMutex.withLock {
-            runCatching {
+            runSuspendCatching {
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
                     apiClient = apiClient,
@@ -683,7 +685,6 @@ class RocheRepository(
                     activePeers = activePeersFlow.value,
                 )
             }
-                .onFailure { if (it is CancellationException) throw it }
         }
     }
 
@@ -744,7 +745,7 @@ class RocheRepository(
         url: String,
         titleOverride: String?,
         tags: List<String>,
-    ): RemoteItemDto? = runCatching {
+    ): RemoteItemDto? = runSuspendCatching {
         val currentSettings = settings.settings.first()
         if (currentSettings.serverUrl.isBlank() || currentSettings.bearerToken.isBlank()) {
             null
@@ -803,7 +804,7 @@ internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
             .truncatedTo(ChronoUnit.SECONDS)
             .toString()
     settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
-    runCatching {
+    runSuspendCatching {
         tryPeerSyncAndCooperativePoll(
             dao = dao,
             apiClient = apiClient,
@@ -815,20 +816,29 @@ internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
             },
         )
     }
-        .onFailure { if (it is CancellationException) throw it }
 }
 
-internal suspend fun renameFeedInLocalDb(
+internal suspend fun renameFeedInDbAndRemote(
     dao: RocheDao,
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
     feedId: String,
     newTitle: String,
 ): String? {
     val cleanTitle = newTitle.trim()
-    if (cleanTitle.isBlank()) return null
-    val existing = dao.getFeedById(feedId) ?: return null
-    if (existing.title == cleanTitle) return cleanTitle
-    dao.updateFeedTitle(feedId = feedId, title = cleanTitle)
-    dao.updateItemsFeedTitle(feedId = feedId, title = cleanTitle)
+    val existing = if (cleanTitle.isNotBlank()) dao.getFeedById(feedId) else null
+    if (existing == null) return null
+    if (existing.title != cleanTitle) {
+        dao.updateFeedTitle(feedId = feedId, title = cleanTitle)
+        dao.updateItemsFeedTitle(feedId = feedId, title = cleanTitle)
+        syncFeedRenameMutation(
+            dao = dao,
+            apiClient = apiClient,
+            settings = settings,
+            feedId = feedId,
+            cleanTitle = cleanTitle,
+        )
+    }
     return cleanTitle
 }
 

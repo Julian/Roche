@@ -29,6 +29,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -327,13 +328,7 @@ internal fun NavigationSummaryCardSection(
     val currentTabs = AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
     val leftSummary = currentTabs.take(2).joinToString(" · ") { it.label }
     val rightSummary = currentTabs.drop(2).take(2).joinToString(" · ") { it.label }
-    val unpinnedTab = AppTab.sideTabCandidates.firstOrNull { it !in currentTabs } ?: AppTab.OFFLINE
-    val unpinnedSubtitle =
-        if (unpinnedTab == AppTab.OFFLINE) {
-            "Quick access to your unpinned 5th tab (${state.offlineEntries.size} cached)"
-        } else {
-            "Quick access to your unpinned 5th tab"
-        }
+    val unpinnedTabs = AppTab.sideTabCandidates.filter { it !in currentTabs }
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Navigation")
@@ -346,14 +341,25 @@ internal fun NavigationSummaryCardSection(
             ) {
                 BottomTabIcon(tab = AppTab.INBOX, tint = colors.accentBlue, size = 18.dp)
             }
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            SettingsDrilldownRow(
-                title = "Open ${unpinnedTab.label}",
-                subtitle = unpinnedSubtitle,
-                onClick = { onAction(MainAction.SelectTab(unpinnedTab)) },
-                modifier = Modifier.testTag("settings_unpinned_tab_row"),
-            ) {
-                BottomTabIcon(tab = unpinnedTab, tint = colors.accentEcru, size = 18.dp)
+            unpinnedTabs.forEach { unpinnedTab ->
+                val unpinnedSubtitle =
+                    when (unpinnedTab) {
+                        AppTab.OFFLINE ->
+                            "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
+                        AppTab.STARRED ->
+                            "Quick access to your unpinned tab (${state.starredEntries.size} starred)"
+                        else -> "Quick access to your unpinned tab"
+                    }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+                SettingsDrilldownRow(
+                    title = "Open ${unpinnedTab.label}",
+                    subtitle = unpinnedSubtitle,
+                    onClick = { onAction(MainAction.SelectTab(unpinnedTab)) },
+                    modifier =
+                        Modifier.testTag("settings_unpinned_tab_${unpinnedTab.name.lowercase()}"),
+                ) {
+                    BottomTabIcon(tab = unpinnedTab, tint = colors.accentEcru, size = 18.dp)
+                }
             }
         }
     }
@@ -731,18 +737,16 @@ internal fun SettingsServerPage(
 ) {
     val colors = LocalRocheColors.current
     var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
-    var bearerToken by rememberSaveable { mutableStateOf(state.settings.bearerToken) }
+    var bearerToken by
+        remember(state.settings.bearerToken) {
+            mutableStateOf(state.settings.bearerToken)
+        }
     var pairingCode by rememberSaveable { mutableStateOf("") }
     var revealToken by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(state.settings.serverUrl) {
         if (normalizeServerUrl(serverUrl) != state.settings.serverUrl) {
             serverUrl = state.settings.serverUrl
-        }
-    }
-    LaunchedEffect(state.settings.bearerToken) {
-        if (bearerToken.trim() != state.settings.bearerToken) {
-            bearerToken = state.settings.bearerToken
         }
     }
     ServerConfigAutoSaveEffect(
@@ -1174,8 +1178,10 @@ internal fun ServerConfigAutoSaveEffect(
 ) {
     LaunchedEffect(serverUrl, bearerToken) {
         val normalizedUrl = normalizeServerUrl(serverUrl)
+        val isIncompleteUrl = serverUrl.isNotBlank() && normalizedUrl.isEmpty()
         val trimmedToken = bearerToken.trim()
-        if (normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken) {
+        val hasChanges = normalizedUrl != savedServerUrl || trimmedToken != savedBearerToken
+        if (!isIncompleteUrl && hasChanges) {
             delay(SERVER_CONFIG_AUTOSAVE_DELAY_MS)
             onAction(
                 MainAction.UpdateServerConfig(

@@ -123,12 +123,20 @@ data class FeedItem(
 ) {
     val isArchived: Boolean = !isActive
 
-    val displayDomain: String = extractCleanDomain(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+    val displayDomain: String by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            extractCleanDomain(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+        }
 
-    val faviconUrl: String? = resolveOriginFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+    val faviconUrl: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            resolveOriginFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+        }
 
-    val fallbackFaviconUrl: String? =
-        resolveFallbackFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+    val fallbackFaviconUrl: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            resolveFallbackFaviconUrl(siteUrl?.takeIf { it.isNotBlank() } ?: url)
+        }
 
     val hasPollError: Boolean = !lastError.isNullOrBlank()
 }
@@ -171,23 +179,30 @@ data class InboxEntry(
     val isUnread: Boolean
         get() = status == ItemStatus.UNREAD && !isRead
 
-    val effectiveThumbnailUrl: String? =
-        thumbnailUrl?.trim()?.takeIf { it.isNotBlank() && !isNonThumbnailUrl(it) }
-            ?: extractFirstImageUrlFromHtml(contentHtml, baseUrl = url)
-
-    val showsThumbnailPreview: Boolean =
-        when (contentType) {
-            ContentType.ARTICLE ->
-                !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
-            ContentType.PDF,
-            ContentType.VIDEO,
-            ContentType.AUDIO -> true
+    val effectiveThumbnailUrl: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            thumbnailUrl?.trim()?.takeIf { it.isNotBlank() && !isNonThumbnailUrl(it) }
+                ?: extractFirstImageUrlFromHtml(contentHtml, baseUrl = url)
         }
 
-    val formattedPublishedLabel: String = formatRelativeTimestamp(publishedAt ?: createdAt)
+    val showsThumbnailPreview: Boolean by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            when (contentType) {
+                ContentType.ARTICLE ->
+                    !thumbnailMediaId.isNullOrBlank() || !effectiveThumbnailUrl.isNullOrBlank()
+                ContentType.PDF,
+                ContentType.VIDEO,
+                ContentType.AUDIO -> true
+            }
+        }
 
-    val formattedReadAtLabel: String? =
-        readAt?.trim()?.takeIf { it.isNotBlank() }?.let { formatRelativeTimestamp(it) }
+    val formattedPublishedLabel: String by
+        lazy(LazyThreadSafetyMode.PUBLICATION) { formatRelativeTimestamp(publishedAt ?: createdAt) }
+
+    val formattedReadAtLabel: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            readAt?.trim()?.takeIf { it.isNotBlank() }?.let { formatRelativeTimestamp(it) }
+        }
 
     val formattedListeningHistoryLabel: String?
         get() {
@@ -206,19 +221,23 @@ data class InboxEntry(
             }
         }
 
-    val displayDomain: String = extractCleanDomain(url)
+    val displayDomain: String by lazy(LazyThreadSafetyMode.PUBLICATION) { extractCleanDomain(url) }
 
-    val faviconUrl: String? = resolveOriginFaviconUrl(url)
+    val faviconUrl: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) { resolveOriginFaviconUrl(url) }
 
-    val fallbackFaviconUrl: String? = resolveFallbackFaviconUrl(url)
+    val fallbackFaviconUrl: String? by
+        lazy(LazyThreadSafetyMode.PUBLICATION) { resolveFallbackFaviconUrl(url) }
 
-    val readEstimateLabel: String =
-        when (contentType) {
-            ContentType.VIDEO -> duration ?: "Video"
-            ContentType.PDF -> duration ?: "PDF"
-            ContentType.AUDIO -> formatAudioDurationEstimate(duration) ?: "Audio"
-            ContentType.ARTICLE ->
-                formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
+    val readEstimateLabel: String by
+        lazy(LazyThreadSafetyMode.PUBLICATION) {
+            when (contentType) {
+                ContentType.VIDEO -> duration ?: "Video"
+                ContentType.PDF -> duration ?: "PDF"
+                ContentType.AUDIO -> formatAudioDurationEstimate(duration) ?: "Audio"
+                ContentType.ARTICLE ->
+                    formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
+            }
         }
 }
 

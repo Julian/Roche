@@ -3,9 +3,14 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.LinkInteractionListener
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
@@ -13,6 +18,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.fromHtml
 import androidx.compose.ui.text.style.BaselineShift
 import androidx.compose.ui.unit.em
+import java.net.URI
 import java.util.Locale
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -26,46 +32,132 @@ internal fun parsePreprocessedHtmlBody(rawHtml: String, baseUrl: String? = null)
     body.select(STRIPPED_MEDIA_QUERY).remove()
     removeFootnoteBacklinks(body)
     transformInlineImages(body, baseUrl)
+    sanitizeAnchorLinks(body, baseUrl)
     unwrapLineNumberTables(body)
     transformDetailsElements(body)
     return body
 }
 
-internal fun prepareInlineHtmlForCompose(htmlFragment: String): String {
+internal fun prepareInlineHtmlForCompose(htmlFragment: String, baseUrl: String? = null): String {
     if (!containsCustomInlineTags(htmlFragment)) return htmlFragment
-    val doc = Jsoup.parseBodyFragment(htmlFragment)
+    val doc = Jsoup.parseBodyFragment(htmlFragment, baseUrl.orEmpty())
     doc.outputSettings().prettyPrint(false)
     val body = doc.body()
+    sanitizeAnchorLinks(body, baseUrl)
     body.select("code, kbd, samp").forEach { it.tagName(TAG_TT) }
     body.select("var").forEach { it.tagName(TAG_EM) }
     return body.html()
 }
 
 private fun containsCustomInlineTags(html: String): Boolean =
-    html.contains("<code", ignoreCase = true) ||
+    html.contains("<a", ignoreCase = true) ||
+        html.contains("<code", ignoreCase = true) ||
         html.contains("<kbd", ignoreCase = true) ||
         html.contains("<samp", ignoreCase = true) ||
         html.contains("<var", ignoreCase = true)
+
+internal fun sanitizeAnchorLinks(root: Element, baseUrl: String?) {
+    for (anchor in root.select("a").toList()) {
+        val safeHref = resolveSafeAnchorHref(anchor.attr("href"), baseUrl)
+        if (safeHref != null) {
+            anchor.attr("href", safeHref)
+        } else {
+            anchor.unwrap()
+        }
+    }
+}
+
+internal fun resolveSafeAnchorHref(rawHref: String, baseUrl: String?): String? {
+    val trimmed = rawHref.trim()
+    if (trimmed.isEmpty()) return null
+    val resolved =
+        if (!baseUrl.isNullOrBlank()) {
+            runCatching { URI(baseUrl.trim()).resolve(trimmed).toString() }.getOrElse { trimmed }
+        } else {
+            trimmed
+        }
+    return resolved.takeIf(::isAllowedAnchorUrl)
+}
+
+internal fun isAllowedAnchorUrl(url: String): Boolean {
+    val lower = url.lowercase(Locale.US)
+    return lower.startsWith("https://") && url.length > HTTPS_SCHEME_PREFIX_LEN ||
+        lower.startsWith("http://") && url.length > HTTP_SCHEME_PREFIX_LEN ||
+        lower.startsWith("mailto:") && url.length > MAILTO_SCHEME_PREFIX_LEN
+}
+
+internal fun htmlToComposeAnnotatedString(
+    html: String,
+    linkStyles: TextLinkStyles,
+    codeBackground: Color,
+    baseUrl: String? = null,
+    linkInteractionListener: LinkInteractionListener? = null,
+): AnnotatedString {
+    val prepared = prepareInlineHtmlForCompose(html, baseUrl)
+    val base =
+        AnnotatedString.fromHtml(
+            htmlString = prepared,
+            linkStyles = linkStyles,
+            linkInteractionListener = linkInteractionListener,
+        )
+    val needsCustomSpans =
+        base.spanStyles.any {
+            it.item.fontFamily == FontFamily.Monospace || isSubOrSuperscript(it.item)
+        }
+    return if (!needsCustomSpans) {
+        base
+    } else {
+        applyRichInlineSpanStyles(base, codeBackground)
+    }
+}
 
 @Composable
 internal fun rememberRichHtmlText(
     html: String,
     linkStyles: TextLinkStyles,
     codeBackground: Color,
-): AnnotatedString =
-    remember(html, linkStyles, codeBackground) {
-        val prepared = prepareInlineHtmlForCompose(html)
-        val base = AnnotatedString.fromHtml(htmlString = prepared, linkStyles = linkStyles)
-        val needsCustomSpans =
-            base.spanStyles.any {
-                it.item.fontFamily == FontFamily.Monospace || isSubOrSuperscript(it.item)
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+): AnnotatedString {
+    val uriHandler = LocalUriHandler.current
+    val currentOnOpenUrl by rememberUpdatedState(onOpenUrl)
+    val currentUriHandler by rememberUpdatedState(uriHandler)
+    val linkListener =
+        remember(baseUrl) {
+            LinkInteractionListener { link ->
+                handleRichHtmlLinkClick(
+                    link = link,
+                    baseUrl = baseUrl,
+                    onOpenUrl = currentOnOpenUrl,
+                    fallbackOpenUri = { url -> currentUriHandler.openUri(url) },
+                )
             }
-        if (!needsCustomSpans) {
-            base
-        } else {
-            applyRichInlineSpanStyles(base, codeBackground)
         }
+    return remember(html, linkStyles, codeBackground, baseUrl, linkListener) {
+        htmlToComposeAnnotatedString(
+            html = html,
+            linkStyles = linkStyles,
+            codeBackground = codeBackground,
+            baseUrl = baseUrl,
+            linkInteractionListener = linkListener,
+        )
     }
+}
+
+private fun handleRichHtmlLinkClick(
+    link: LinkAnnotation,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
+    fallbackOpenUri: (String) -> Unit,
+) {
+    val rawUrl = (link as? LinkAnnotation.Url)?.url ?: return
+    val safeUrl = resolveSafeAnchorHref(rawUrl, baseUrl) ?: return
+    if (onOpenUrl != null) {
+        runCatching { onOpenUrl(safeUrl) }
+    } else {
+        runCatching { fallbackOpenUri(safeUrl) }
+    }
+}
 
 private fun isSubOrSuperscript(style: SpanStyle): Boolean =
     style.baselineShift == BaselineShift.Superscript ||
@@ -710,6 +802,9 @@ private const val LINE_NUMBER_TABLE_PRE_COUNT = 2
 private const val LATEX_SCRIPT_BRACE_OFFSET = 2
 private const val BLANK_LINE_NEWLINES = 2
 private const val MAX_TABLE_COLSPAN = 8
+private const val HTTPS_SCHEME_PREFIX_LEN = 8
+private const val HTTP_SCHEME_PREFIX_LEN = 7
+private const val MAILTO_SCHEME_PREFIX_LEN = 7
 private const val PLAIN_BULLET_PREFIX = "- "
 
 private const val TAG_IMG = "img"

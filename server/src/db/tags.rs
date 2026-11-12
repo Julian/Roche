@@ -11,7 +11,7 @@ use super::{
 macro_rules! tag_select_sql {
     ($suffix:literal) => {
         concat!(
-            "SELECT t.id, t.name, t.color,
+            "SELECT t.id, t.name, t.color, t.created_at,
        (SELECT COUNT(*) FROM item_tags it JOIN items i ON i.id = it.item_id WHERE it.tag_id = t.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
 FROM tags t ",
             $suffix
@@ -24,6 +24,7 @@ pub struct Tag {
     pub id: String,
     pub name: String,
     pub color: Option<HexColor>,
+    pub created_at: DateTime<Utc>,
     pub unread_count: i64,
 }
 
@@ -69,7 +70,13 @@ impl<'a> TagRepo<'a> {
 
         tx.commit().await?;
 
-        Ok(Tag { id, name: name.to_string(), color: color.cloned(), unread_count: 0 })
+        Ok(Tag {
+            id,
+            name: name.to_string(),
+            color: color.cloned(),
+            created_at: now,
+            unread_count: 0,
+        })
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Tag>> {

@@ -96,12 +96,22 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
     private var mediaSession: MediaSession? = null
     private var audioFocusRequest: AudioFocusRequest? = null
     private var noisyReceiverRegistered: Boolean = false
+    private var dismissReceiverRegistered: Boolean = false
 
     private val becomingNoisyReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
                     callbacks?.onAudioBecomingNoisy()
+                }
+            }
+        }
+
+    private val notificationDismissReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == PodcastPlaybackService.ACTION_DISMISS_NOTIFICATION) {
+                    callbacks?.onMediaCommand(MediaSessionCommand.STOP)
                 }
             }
         }
@@ -170,6 +180,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
             lastMetadataKey = null
             lastNotificationKey = null
             unregisterNoisyReceiver()
+            unregisterDismissReceiver()
             runCatching { mediaSession?.isActive = false }
             if (!inServiceCommand) {
                 stopPlaybackService()
@@ -177,6 +188,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
             return
         }
         val session = ensureMediaSession()
+        registerDismissReceiver()
         syncNoisyReceiver(snapshot.isPlaying)
         session.isActive = true
         val metadataKey = snapshot.toMetadataKey()
@@ -192,6 +204,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
 
     override fun release() {
         unregisterNoisyReceiver()
+        unregisterDismissReceiver()
         abandonAudioFocus()
         latestSnapshot = null
         lastMetadataKey = null
@@ -204,28 +217,33 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
         stopPlaybackService()
     }
 
+    internal fun dispatchActionFromSession(action: String?) {
+        executeActionCommand(action)
+    }
+
     internal fun dispatchServiceAction(action: String?) {
-        val target = callbacks ?: return
         inServiceCommand = true
         try {
-            when (action) {
-                PodcastPlaybackService.ACTION_PLAY ->
-                    target.onMediaCommand(MediaSessionCommand.PLAY)
-                PodcastPlaybackService.ACTION_PAUSE ->
-                    target.onMediaCommand(MediaSessionCommand.PAUSE)
-                PodcastPlaybackService.ACTION_TOGGLE_PLAY_PAUSE ->
-                    target.onMediaCommand(MediaSessionCommand.TOGGLE_PLAY_PAUSE)
-                PodcastPlaybackService.ACTION_REWIND_15 ->
-                    target.onMediaCommand(MediaSessionCommand.REWIND_15S)
-                PodcastPlaybackService.ACTION_FF_30 ->
-                    target.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
-                PodcastPlaybackService.ACTION_SKIP_NEXT ->
-                    target.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
-                PodcastPlaybackService.ACTION_STOP ->
-                    target.onMediaCommand(MediaSessionCommand.STOP)
-            }
+            executeActionCommand(action)
         } finally {
             inServiceCommand = false
+        }
+    }
+
+    private fun executeActionCommand(action: String?) {
+        val target = callbacks ?: return
+        when (action) {
+            PodcastPlaybackService.ACTION_PLAY -> target.onMediaCommand(MediaSessionCommand.PLAY)
+            PodcastPlaybackService.ACTION_PAUSE -> target.onMediaCommand(MediaSessionCommand.PAUSE)
+            PodcastPlaybackService.ACTION_TOGGLE_PLAY_PAUSE ->
+                target.onMediaCommand(MediaSessionCommand.TOGGLE_PLAY_PAUSE)
+            PodcastPlaybackService.ACTION_REWIND_15 ->
+                target.onMediaCommand(MediaSessionCommand.REWIND_15S)
+            PodcastPlaybackService.ACTION_FF_30 ->
+                target.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
+            PodcastPlaybackService.ACTION_SKIP_NEXT ->
+                target.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
+            PodcastPlaybackService.ACTION_STOP -> target.onMediaCommand(MediaSessionCommand.STOP)
         }
     }
 
@@ -251,7 +269,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
                 .setContentText(snapshot.podcastTitle.ifBlank { "Roche Podcasts" })
                 .setSubText(formatPlaybackSpeedLabel(snapshot.playbackSpeed))
                 .setContentIntent(createOpenPlayerPendingIntent())
-                .setDeleteIntent(serviceActionPendingIntent(PodcastPlaybackService.ACTION_STOP, 10))
+                .setDeleteIntent(createDismissPendingIntent())
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setOnlyAlertOnce(true)
                 .setOngoing(snapshot.isPlaying)
@@ -339,6 +357,16 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+    private fun createDismissPendingIntent(): PendingIntent =
+        PendingIntent.getBroadcast(
+            appContext,
+            REQUEST_DISMISS_NOTIFICATION,
+            Intent(PodcastPlaybackService.ACTION_DISMISS_NOTIFICATION).apply {
+                setPackage(appContext.packageName)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
     private fun ensureMediaSession(): MediaSession {
         mediaSession?.let {
             return it
@@ -394,7 +422,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
             }
 
             override fun onCustomAction(action: String, extras: Bundle?) {
-                dispatchServiceAction(action)
+                dispatchActionFromSession(action)
             }
 
             override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
@@ -498,44 +526,80 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
         runCatching { appContext.unregisterReceiver(becomingNoisyReceiver) }
     }
 
+    private fun registerDismissReceiver() {
+        if (dismissReceiverRegistered) return
+        runCatching {
+            appContext.registerReceiver(
+                notificationDismissReceiver,
+                IntentFilter(PodcastPlaybackService.ACTION_DISMISS_NOTIFICATION),
+                Context.RECEIVER_NOT_EXPORTED,
+            )
+            dismissReceiverRegistered = true
+        }
+    }
+
+    private fun unregisterDismissReceiver() {
+        if (!dismissReceiverRegistered) return
+        dismissReceiverRegistered = false
+        runCatching { appContext.unregisterReceiver(notificationDismissReceiver) }
+    }
+
     private fun syncForegroundService(snapshot: MediaSessionMetadataSnapshot) {
         runCatching {
             val notifKey = snapshot.toNotificationKey()
             val notificationChanged = notifKey != lastNotificationKey
             lastNotificationKey = notifKey
             if (snapshot.isPlaying) {
-                if (!serviceRunningInForeground && !pendingForegroundStart) {
-                    pendingForegroundStart = true
-                    val intent =
-                        Intent(appContext, PodcastPlaybackService::class.java).apply {
-                            action = PodcastPlaybackService.ACTION_SYNC_NOTIFICATION
-                            putExtra(PodcastPlaybackService.EXTRA_STARTED_FOREGROUND, true)
-                        }
-                    appContext.startForegroundService(intent)
-                } else if (notificationChanged && serviceRunningInForeground) {
-                    buildMediaNotification()?.let { notification ->
-                        notificationManager?.notify(
-                            PodcastPlaybackService.NOTIFICATION_ID,
-                            notification,
-                        )
-                    }
-                }
+                syncPlayingForegroundService(notificationChanged)
             } else {
-                if (serviceRunningInForeground || pendingForegroundStart) {
-                    val intent =
-                        Intent(appContext, PodcastPlaybackService::class.java).apply {
-                            action = PodcastPlaybackService.ACTION_DEMOTE_FOREGROUND
-                        }
-                    appContext.startService(intent)
-                } else if (notificationChanged) {
-                    buildMediaNotification()?.let { notification ->
-                        notificationManager?.notify(
-                            PodcastPlaybackService.NOTIFICATION_ID,
-                            notification,
+                syncPausedForegroundService(notificationChanged)
+            }
+        }
+    }
+
+    private fun syncPlayingForegroundService(notificationChanged: Boolean) {
+        if (!serviceRunningInForeground && !pendingForegroundStart) {
+            pendingForegroundStart = true
+            val intent =
+                Intent(appContext, PodcastPlaybackService::class.java).apply {
+                    action = PodcastPlaybackService.ACTION_SYNC_NOTIFICATION
+                    putExtra(PodcastPlaybackService.EXTRA_STARTED_FOREGROUND, true)
+                }
+            runCatching { appContext.startForegroundService(intent) }
+                .onFailure {
+                    pendingForegroundStart = false
+                    lastNotificationKey = null
+                }
+        } else if (notificationChanged && serviceRunningInForeground) {
+            postMediaNotificationIfPresent()
+        }
+    }
+
+    private fun syncPausedForegroundService(notificationChanged: Boolean) {
+        if (serviceRunningInForeground || pendingForegroundStart) {
+            val intent =
+                Intent(appContext, PodcastPlaybackService::class.java).apply {
+                    action = PodcastPlaybackService.ACTION_DEMOTE_FOREGROUND
+                }
+            runCatching { appContext.startService(intent) }
+                .onFailure {
+                    pendingForegroundStart = false
+                    serviceRunningInForeground = false
+                    runCatching {
+                        appContext.stopService(
+                            Intent(appContext, PodcastPlaybackService::class.java)
                         )
                     }
+                    postMediaNotificationIfPresent()
                 }
-            }
+        } else if (notificationChanged) {
+            postMediaNotificationIfPresent()
+        }
+    }
+
+    private fun postMediaNotificationIfPresent() {
+        buildMediaNotification()?.let { notification ->
+            notificationManager?.notify(PodcastPlaybackService.NOTIFICATION_ID, notification)
         }
     }
 
@@ -548,7 +612,14 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
                     Intent(appContext, PodcastPlaybackService::class.java).apply {
                         action = PodcastPlaybackService.ACTION_STOP_SERVICE_SAFE
                     }
-                appContext.startService(intent)
+                runCatching { appContext.startService(intent) }
+                    .onFailure {
+                        pendingForegroundStart = false
+                        serviceRunningInForeground = false
+                        appContext.stopService(
+                            Intent(appContext, PodcastPlaybackService::class.java)
+                        )
+                    }
             } else {
                 appContext.stopService(Intent(appContext, PodcastPlaybackService::class.java))
             }
@@ -591,6 +662,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
 
     private companion object {
         private const val REQUEST_OPEN_PLAYER = 400
+        private const val REQUEST_DISMISS_NOTIFICATION = 401
     }
 }
 
@@ -707,6 +779,7 @@ class PodcastPlaybackService : Service() {
         const val ACTION_FF_30 = "com.grayvines.roche.action.FF_30"
         const val ACTION_SKIP_NEXT = "com.grayvines.roche.action.SKIP_NEXT"
         const val ACTION_STOP = "com.grayvines.roche.action.STOP"
+        const val ACTION_DISMISS_NOTIFICATION = "com.grayvines.roche.action.DISMISS_NOTIFICATION"
         const val EXTRA_STARTED_FOREGROUND = "extra_started_foreground"
         const val EXTRA_OPEN_FULLSCREEN_PLAYER = "extra_open_fullscreen_player"
         private const val MAX_WAKE_LOCK_DURATION_MS = 4L * 60L * 60L * 1_000L

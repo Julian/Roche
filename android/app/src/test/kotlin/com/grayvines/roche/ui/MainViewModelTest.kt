@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.ui
 
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
 import androidx.room3.Room
@@ -21,7 +22,11 @@ import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
+import com.grayvines.roche.ui.components.MAX_BITMAP_DIMENSION_PX
+import com.grayvines.roche.ui.components.ThumbnailLoader
+import com.grayvines.roche.ui.components.calculateInSampleSize
 import java.io.File
+import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
@@ -57,6 +62,7 @@ class MainViewModelTest {
     private lateinit var database: RocheDatabase
     private lateinit var settings: SettingsRepository
     private lateinit var repository: RocheRepository
+    private lateinit var playerBackend: FakeAudioPlayerBackend
     private lateinit var mediaSessionBridge: RecordingMediaSessionBridge
     private lateinit var viewModel: MainViewModel
 
@@ -75,12 +81,13 @@ class MainViewModelTest {
         val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
         repository =
             RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        playerBackend = FakeAudioPlayerBackend()
         mediaSessionBridge = RecordingMediaSessionBridge()
         viewModel =
             MainViewModel(
                 repository = repository,
                 settingsRepository = settings,
-                playerBackend = DeterministicTestAudioBackend(),
+                playerBackend = playerBackend,
                 mediaSessionBridge = mediaSessionBridge,
             )
     }
@@ -673,25 +680,42 @@ class MainViewModelTest {
             assertEquals("Tokio Internals", playingEp1.playerState.chapters[1].title)
             assertEquals("ep-2", playingEp1.nextQueuedAudioEntryId)
 
-            // SkipToNextQueuedAudio (or episode completion) marks ep-1 read & archived, leaves
-            // art-mid in queue, and plays ep-2
+            // Seek ep-1 to 25%, then SkipToNextQueuedAudio: must NOT archive ep-1 or mark its
+            // progress 1.0; rotates ep-1 behind ep-2 and starts ep-2
+            viewModel.dispatch(MainAction.SeekPlayerToFraction(0.25f))
+            viewModel.uiState.first {
+                abs(it.allEntries.first { e -> e.id == "ep-1" }.readProgress - 0.25) < 1e-2
+            }
             viewModel.dispatch(MainAction.SkipToNextQueuedAudio)
             val playingEp2 =
                 viewModel.uiState.first {
                     it.playerState.currentEntryId == "ep-2" &&
-                        it.allEntries.first { e -> e.id == "ep-1" }.isArchived &&
-                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2") &&
+                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2", "ep-1") &&
                         it.listeningHistoryEntries.size == 2
                 }
-            assertEquals(listOf("art-mid", "ep-2"), playingEp2.queueEntries.map { it.id })
+            val skippedEp1 = playingEp2.allEntries.first { it.id == "ep-1" }
+            assertFalse(skippedEp1.isArchived)
+            assertEquals(0.25, skippedEp1.readProgress, 1e-2)
+            assertEquals(
+                listOf("art-mid", "ep-2", "ep-1"),
+                playingEp2.queueEntries.map { it.id },
+            )
             assertFalse(playingEp2.allEntries.first { it.id == "art-mid" }.isArchived)
 
-            // Verify listening history records both episodes with timestamps and status labels
-            val ep1History = playingEp2.listeningHistoryEntries.first { it.id == "ep-1" }
-            val ep2History = playingEp2.listeningHistoryEntries.first { it.id == "ep-2" }
+            // Actual episode completion DOES mark ep-2 100% read & archived and autoplays ep-1
+            viewModel.playerController.completeActiveEpisodeNow()
+            val afterEp2Completed =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == "ep-1" &&
+                        it.allEntries.first { e -> e.id == "ep-2" }.isArchived
+                }
+            val ep2History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-2" }
+            val ep1History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-1" }
+            assertEquals(1.0, ep2History.readProgress, 1e-3)
             assertTrue(!ep1History.readAt.isNullOrBlank())
             assertTrue(!ep2History.readAt.isNullOrBlank())
-            assertEquals("Played now · Completed", ep1History.formattedListeningHistoryLabel)
+            assertEquals("Played now · Completed", ep2History.formattedListeningHistoryLabel)
+            assertEquals(listOf("art-mid", "ep-1"), afterEp2Completed.queueEntries.map { it.id })
 
             // Verify favoriting/starring a podcast episode adds it to starredEntries
             viewModel.dispatch(MainAction.ToggleStar("ep-1"))
@@ -702,12 +726,12 @@ class MainViewModelTest {
             assertTrue(starredState.allEntries.first { it.id == "ep-1" }.isFavorite)
 
             // Reorder queue and test speed & podcast settings
-            viewModel.dispatch(MainAction.MoveQueueItemUp("ep-2"))
+            viewModel.dispatch(MainAction.MoveQueueItemUp("ep-1"))
             val reordered =
                 viewModel.uiState.first {
-                    it.queueEntries.map { e -> e.id } == listOf("ep-2", "art-mid")
+                    it.queueEntries.map { e -> e.id } == listOf("ep-1", "art-mid")
                 }
-            assertEquals(listOf("ep-2", "art-mid"), reordered.queueEntries.map { it.id })
+            assertEquals(listOf("ep-1", "art-mid"), reordered.queueEntries.map { it.id })
 
             viewModel.dispatch(
                 MainAction.SetPlaybackSpeed(speed = 2.75f, applyToCurrentPodcast = true)
@@ -718,6 +742,7 @@ class MainViewModelTest {
                 }
             assertEquals(2.75f, updatedFeedSpeed.playerState.playbackSpeed, 1e-3f)
 
+            viewModel.playerController.stopAndClear()
             collectJob.cancel()
         }
 
@@ -795,9 +820,13 @@ class MainViewModelTest {
             )
             mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
             viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
-            val epBSnapshot = mediaSessionBridge.snapshots.first { it?.entryId == "ep-b" }
+            val epBSnapshot =
+                mediaSessionBridge.snapshots.first {
+                    it?.entryId == "ep-b" && it.hasNextQueuedAudio
+                }
             assertEquals("Episode B", epBSnapshot?.episodeTitle)
-            assertFalse(epBSnapshot?.hasNextQueuedAudio == true)
+            assertTrue(epBSnapshot?.hasNextQueuedAudio == true)
+            assertFalse(repository.snapshot.first().entries.first { it.id == "ep-a" }.isArchived)
 
             // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
             viewModel.dispatch(MainAction.SetRememberPodcastSpeed("f-pod", true))
@@ -816,12 +845,134 @@ class MainViewModelTest {
                 updatedSnap.feeds.first { it.id == "f-pod" }.customPlaybackSpeed ?: 0f,
                 1e-3f,
             )
+            viewModel.playerController.stopAndClear()
         }
 
-    private class DeterministicTestAudioBackend : AudioPlayerBackend {
+    @Test
+    internal fun `playback backend failure stops playback without silent ticking and SetSmartRewind persists`() =
+        runTest {
+            val podcastFeed = testFeed("f-pod", "Systems Cast").copy(feedType = "podcast")
+            val ep =
+                testItem("ep-fail", "Unreachable Episode", "f-pod")
+                    .copy(
+                        feedTitle = "Systems Cast",
+                        contentType = "audio",
+                        audioUrl = "https://example.com/unreachable.mp3",
+                        duration = "20:00",
+                    )
+            database.dao().upsertFeeds(listOf(podcastFeed))
+            database.dao().upsertItems(listOf(ep))
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 1 }
+
+            playerBackend.failNextLoad = true
+            viewModel.dispatch(MainAction.PlayAudioEntry("ep-fail"))
+            val failedState =
+                viewModel.uiState.first {
+                    it.statusBanner == PodcastPlayerController.DEFAULT_PLAYBACK_ERROR_MESSAGE
+                }
+            assertFalse(failedState.playerState.isPlaying)
+            assertFalse(failedState.playerState.isBuffering)
+            assertFalse(failedState.allEntries.first { it.id == "ep-fail" }.isArchived)
+            assertEquals(
+                0.0,
+                failedState.allEntries.first { it.id == "ep-fail" }.readProgress,
+                1e-4,
+            )
+
+            // Recovering when connection returns reloads and plays cleanly
+            playerBackend.failNextLoad = false
+            viewModel.dispatch(MainAction.TogglePlayPause)
+            val resumedState = viewModel.uiState.first { it.playerState.isPlaying }
+            assertTrue(resumedState.playerState.isPlaying)
+
+            // Toggle Smart Rewind off and back on
+            viewModel.dispatch(MainAction.SetSmartRewind(false))
+            val rewindOff = viewModel.uiState.first { !it.settings.smartRewindEnabled }
+            assertFalse(rewindOff.playerState.smartRewindEnabled)
+            viewModel.dispatch(MainAction.SetSmartRewind(true))
+            val rewindOn = viewModel.uiState.first { it.settings.smartRewindEnabled }
+            assertTrue(rewindOn.playerState.smartRewindEnabled)
+
+            viewModel.playerController.stopAndClear()
+            collectJob.cancel()
+        }
+
+    @Test
+    internal fun `HTML anchor sanitizer resolves relative links and ThumbnailLoader enforces bounds and cooldown`() =
+        runTest {
+            assertEquals(
+                "https://blog.example.com/2026/other-post",
+                resolveSafeAnchorHref("/2026/other-post", "https://blog.example.com/posts/intro"),
+            )
+            assertEquals(
+                "https://blog.example.com/posts/part-2.html",
+                resolveSafeAnchorHref("part-2.html", "https://blog.example.com/posts/intro"),
+            )
+            assertEquals(
+                "mailto:editor@example.com",
+                resolveSafeAnchorHref("mailto:editor@example.com", "https://blog.example.com"),
+            )
+            assertNull(resolveSafeAnchorHref("javascript:alert(1)", "https://blog.example.com"))
+            assertNull(resolveSafeAnchorHref("/relative/only", null))
+
+            val blocks =
+                parseHtmlArticleBlocks(
+                    rawHtml =
+                        """<p>Read <a href="/archive">the archive</a> or <a href="javascript:void(0)">bad link</a>.</p>""",
+                    baseUrl = "https://blog.example.com/entry/1",
+                )
+            val paragraphHtml = (blocks.single() as ArticleBlock.Paragraph).html
+            assertTrue("""href="https://blog.example.com/archive"""" in paragraphHtml)
+            assertFalse("javascript:" in paragraphHtml)
+            assertTrue("bad link" in paragraphHtml)
+
+            // Tall 1200x12000 image is downsampled so neither dimension exceeds 2048px
+            val tallSample = calculateInSampleSize(1200, 12_000, 1440, 1440)
+            assertTrue(12_000 / tallSample <= MAX_BITMAP_DIMENSION_PX)
+
+            // ThumbnailLoader retries transient failures after FAILED_RETRY_COOLDOWN_MS
+            var nowMs = 1_000L
+            var networkSucceeds = false
+            var fetchCalls = 0
+            val flakyClient = RocheApiClient {
+                fetchCalls++
+                if (networkSucceeds) {
+                    HttpResponse(statusCode = 200, body = "img", bodyBytes = byteArrayOf(1, 2, 3))
+                } else {
+                    HttpResponse(statusCode = 503, body = "")
+                }
+            }
+            val loader =
+                ThumbnailLoader(
+                    apiClient = flakyClient,
+                    settings = settings,
+                    decoder = { fakeImageBitmap(width = 64, height = 64) },
+                    clockMs = { nowMs },
+                )
+            assertNull(loader.loadThumbnail("https://example.com/thumb.jpg"))
+            assertEquals(1, fetchCalls)
+
+            // Within 60s cooldown, avoids hammering failed URL
+            networkSucceeds = true
+            nowMs += 10_000L
+            assertNull(loader.loadThumbnail("https://example.com/thumb.jpg"))
+            assertEquals(1, fetchCalls)
+
+            // After 60s cooldown expires, retries and caches decoded bitmap
+            nowMs += ThumbnailLoader.FAILED_RETRY_COOLDOWN_MS
+            val recovered = loader.loadThumbnail("https://example.com/thumb.jpg")
+            assertEquals(64, recovered?.width)
+            assertEquals(2, fetchCalls)
+        }
+
+    private class FakeAudioPlayerBackend : AudioPlayerBackend {
+        var failNextLoad: Boolean = false
         private var positionMs: Long = 0L
         private var durationMs: Long = 1_800_000L
         private var playing: Boolean = false
+        private var speed: Float = 1.0f
 
         override fun loadAndPlay(
             source: String,
@@ -833,13 +984,14 @@ class MainViewModelTest {
             onCompletion: () -> Unit,
             onError: () -> Unit,
         ) {
-            if (source.isBlank()) {
+            if (failNextLoad || source.isBlank()) {
                 playing = false
                 onError()
                 return
             }
             durationMs = fallbackDurationMs.takeIf { it > 0L } ?: 1_800_000L
             positionMs = initialPositionMs.coerceIn(0L, durationMs)
+            this.speed = speed
             playing = playWhenReady
             onPrepared(durationMs)
         }
@@ -856,7 +1008,9 @@ class MainViewModelTest {
             this.positionMs = positionMs.coerceIn(0L, durationMs)
         }
 
-        override fun setSpeed(speed: Float) = Unit
+        override fun setSpeed(speed: Float) {
+            this.speed = speed
+        }
 
         override fun currentPositionMs(): Long = positionMs
 
@@ -868,6 +1022,22 @@ class MainViewModelTest {
             playing = false
         }
     }
+
+    private fun fakeImageBitmap(width: Int, height: Int): ImageBitmap =
+        Proxy.newProxyInstance(
+            ImageBitmap::class.java.classLoader,
+            arrayOf(ImageBitmap::class.java),
+        ) { proxy, method, args ->
+            when (method.name) {
+                "getWidth" -> width
+                "getHeight" -> height
+                "getHasAlpha" -> true
+                "equals" -> proxy === args?.firstOrNull()
+                "hashCode" -> System.identityHashCode(proxy)
+                "toString" -> "FakeImageBitmap(${width}x$height)"
+                else -> null
+            }
+        } as ImageBitmap
 
     private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
         @Volatile var callbacks: PodcastMediaSessionCallbacks? = null

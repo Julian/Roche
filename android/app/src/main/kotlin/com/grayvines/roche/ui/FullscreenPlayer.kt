@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -36,6 +37,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -48,10 +50,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -78,6 +83,7 @@ import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlin.math.abs
+import kotlin.math.roundToLong
 
 /**
  * Persistent docked mini-player rendered directly above the bottom navigation bar across all tabs
@@ -284,7 +290,7 @@ fun FullscreenPodcastPlayer(
             playerState = playerState,
             activeTab = drawerTab,
             onAction = onAction,
-            onOpenExternalUrl = { onOpenExternalUrl(entry.url) },
+            onOpenExternalUrl = onOpenExternalUrl,
         )
     }
 }
@@ -578,12 +584,24 @@ private fun PlayerScrubberSection(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val speedLabel = formatPlaybackSpeedLabel(playerState.playbackSpeed)
+    var previewFraction by remember { mutableStateOf<Float?>(null) }
+    val previewState =
+        previewFraction?.let { frac ->
+            val previewPosMs =
+                (playerState.durationMs * frac.coerceIn(0f, 1f))
+                    .roundToLong()
+                    .coerceIn(0L, playerState.durationMs.coerceAtLeast(0L))
+            playerState.copy(positionMs = previewPosMs)
+        } ?: playerState
+    val speedLabel = formatPlaybackSpeedLabel(previewState.playbackSpeed)
 
     Column(modifier = Modifier.fillMaxWidth()) {
         RocheInteractiveSlider(
             fraction = playerState.progressFraction,
-            onFractionChange = { fraction -> onAction(MainAction.SeekPlayerToFraction(fraction)) },
+            onFractionChangeFinished = { fraction ->
+                onAction(MainAction.SeekPlayerToFraction(fraction))
+            },
+            onDragPreviewChange = { previewFraction = it },
             modifier = Modifier.fillMaxWidth().testTag("player_scrubber_slider"),
         )
         Row(
@@ -592,20 +610,20 @@ private fun PlayerScrubberSection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = playerState.elapsedFormatted,
+                text = previewState.elapsedFormatted,
                 color = colors.textSecondary,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.5.sp,
             )
             Text(
-                text = "${playerState.speedAdjustedRemainingLabel} (at $speedLabel)",
+                text = "${previewState.speedAdjustedRemainingLabel} (at $speedLabel)",
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
             )
             Text(
-                text = playerState.remainingFormatted,
+                text = previewState.remainingFormatted,
                 color = colors.textSecondary,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.5.sp,
@@ -771,8 +789,14 @@ fun PlaybackSpeedAndPodcastSheet(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val speedRange = Settings.MAX_PLAYBACK_SPEED - Settings.MIN_PLAYBACK_SPEED
+    var previewSpeedFraction by remember { mutableStateOf<Float?>(null) }
     val currentSpeed = playerState.playbackSpeed
-    val speedFormatted = formatPlaybackSpeedLabel(currentSpeed)
+    val displayedSpeed =
+        previewSpeedFraction?.let { frac ->
+            clampPlaybackSpeed(Settings.MIN_PLAYBACK_SPEED + frac * speedRange)
+        } ?: currentSpeed
+    val speedFormatted = formatPlaybackSpeedLabel(displayedSpeed)
     val podcastTitle = feed?.title ?: entry.feedTitle
     val rememberSpeedForPodcast = feed?.customPlaybackSpeed != null
     val autoDownloadEpisodes = feed?.autoDownloadEpisodes == true
@@ -849,15 +873,15 @@ fun PlaybackSpeedAndPodcastSheet(
                 )
             }
 
-            val speedRange = Settings.MAX_PLAYBACK_SPEED - Settings.MIN_PLAYBACK_SPEED
             val speedFraction =
                 ((currentSpeed - Settings.MIN_PLAYBACK_SPEED) / speedRange).coerceIn(0f, 1f)
             RocheInteractiveSlider(
                 fraction = speedFraction,
-                onFractionChange = { frac ->
+                onFractionChangeFinished = { frac ->
                     val raw = Settings.MIN_PLAYBACK_SPEED + frac * speedRange
                     onAction(MainAction.SetPlaybackSpeed(clampPlaybackSpeed(raw)))
                 },
+                onDragPreviewChange = { previewSpeedFraction = it },
                 modifier = Modifier.fillMaxWidth().testTag("speed_slider"),
             )
 
@@ -890,10 +914,10 @@ fun PlaybackSpeedAndPodcastSheet(
             }
 
             SettingToggleRow(
-                title = "Skip silence",
-                subtitle = "Trim dead air without distorting voice pitch",
-                checked = playerState.skipSilenceEnabled,
-                onCheckedChange = { enabled -> onAction(MainAction.SetSkipSilence(enabled)) },
+                title = "Smart rewind",
+                subtitle = "Rewind a few seconds when resuming after a pause",
+                checked = playerState.smartRewindEnabled,
+                onCheckedChange = { enabled -> onAction(MainAction.SetSmartRewind(enabled)) },
             )
 
             if (feed != null) {
@@ -919,7 +943,7 @@ private fun PlayerContentDrawerSheet(
     playerState: PodcastPlayerState,
     activeTab: PlayerDrawerTab,
     onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     ModalBottomSheet(
@@ -987,13 +1011,15 @@ private fun PlayerContentDrawerSheet(
                                 ?: entry.summary?.takeIf { it.isNotBlank() }
                                 ?: "No episode transcript is embedded in this feed."
                         }
-                    Text(
-                        text = transcriptText,
-                        color = colors.textPrimary,
-                        fontFamily = FontFamily.Serif,
-                        fontSize = 15.sp,
-                        lineHeight = 23.sp,
-                    )
+                    SelectionContainer {
+                        Text(
+                            text = transcriptText,
+                            color = colors.textPrimary,
+                            fontFamily = FontFamily.Serif,
+                            fontSize = 15.sp,
+                            lineHeight = 23.sp,
+                        )
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(20.dp))
@@ -1004,29 +1030,66 @@ private fun PlayerContentDrawerSheet(
 @Composable
 internal fun RocheInteractiveSlider(
     fraction: Float,
-    onFractionChange: (Float) -> Unit,
+    onFractionChangeFinished: (Float) -> Unit,
     modifier: Modifier = Modifier,
+    onDragPreviewChange: ((Float?) -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
-    val clamped = fraction.coerceIn(0f, 1f)
+    var dragFraction by remember { mutableStateOf<Float?>(null) }
+    val currentOnFinished by rememberUpdatedState(onFractionChangeFinished)
+    val currentOnPreview by rememberUpdatedState(onDragPreviewChange)
+    val displayFraction = (dragFraction ?: fraction).coerceIn(0f, 1f)
     Canvas(
         modifier =
             modifier
                 .height(28.dp)
-                .pointerInput(onFractionChange) {
+                .semantics {
+                    progressBarRangeInfo = ProgressBarRangeInfo(displayFraction, 0f..1f)
+                    setProgress { targetValue ->
+                        val target = targetValue.coerceIn(0f, 1f)
+                        dragFraction = null
+                        currentOnPreview?.invoke(null)
+                        currentOnFinished(target)
+                        true
+                    }
+                }
+                .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         if (size.width > 0) {
-                            onFractionChange((offset.x / size.width.toFloat()).coerceIn(0f, 1f))
+                            val target = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                            dragFraction = null
+                            currentOnPreview?.invoke(null)
+                            currentOnFinished(target)
                         }
                     }
                 }
-                .pointerInput(onFractionChange) {
-                    detectHorizontalDragGestures { change, _ ->
+                .pointerInput(Unit) {
+                    detectHorizontalDragGestures(
+                        onDragStart = { startOffset ->
+                            if (size.width > 0) {
+                                val next = (startOffset.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                dragFraction = next
+                                currentOnPreview?.invoke(next)
+                            }
+                        },
+                        onDragEnd = {
+                            val committed = dragFraction
+                            dragFraction = null
+                            currentOnPreview?.invoke(null)
+                            if (committed != null) {
+                                currentOnFinished(committed)
+                            }
+                        },
+                        onDragCancel = {
+                            dragFraction = null
+                            currentOnPreview?.invoke(null)
+                        },
+                    ) { change, _ ->
                         change.consume()
                         if (size.width > 0) {
-                            onFractionChange(
-                                (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                            )
+                            val next = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
+                            dragFraction = next
+                            currentOnPreview?.invoke(next)
                         }
                     }
                 }
@@ -1034,7 +1097,7 @@ internal fun RocheInteractiveSlider(
         val trackHeight = 4.dp.toPx()
         val thumbRadius = 7.dp.toPx()
         val centerY = size.height * 0.5f
-        val activeWidth = (size.width * clamped).coerceIn(0f, size.width)
+        val activeWidth = (size.width * displayFraction).coerceIn(0f, size.width)
         val corner = CornerRadius(trackHeight * 0.5f, trackHeight * 0.5f)
         drawRoundRect(
             color = colors.border,

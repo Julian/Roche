@@ -1,5 +1,8 @@
 package com.grayvines.roche.ui.theme
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
@@ -8,12 +11,15 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowInsetsControllerCompat
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 
@@ -90,8 +96,21 @@ fun RocheTheme(
     content: @Composable () -> Unit,
 ) {
     val rocheColors = if (themeMode == ThemeMode.DARK) DarkRocheColors else LightRocheColors
+    val darkTheme = rocheColors.isDark
     val headlineFamily =
         if (headlineFont == HeadlineFont.SERIF) FontFamily.Serif else FontFamily.SansSerif
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as? Activity ?: view.context.findActivity())?.window
+            if (window != null) {
+                WindowInsetsControllerCompat(window, view).apply {
+                    isAppearanceLightStatusBars = !darkTheme
+                    isAppearanceLightNavigationBars = !darkTheme
+                }
+            }
+        }
+    }
 
     CompositionLocalProvider(
         LocalRocheColors provides rocheColors,
@@ -105,6 +124,13 @@ fun RocheTheme(
         )
     }
 }
+
+private tailrec fun Context.findActivity(): Activity? =
+    when (this) {
+        is Activity -> this
+        is ContextWrapper -> baseContext.findActivity()
+        else -> null
+    }
 
 private fun buildMaterialScheme(rocheColors: RocheColors): ColorScheme =
     if (rocheColors.isDark) {

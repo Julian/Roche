@@ -1,8 +1,14 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.data
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.data.local.FeedEntity
+import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.PendingMutationEntity
+import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.remote.HttpResponse
@@ -12,6 +18,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -23,11 +30,14 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
+@Suppress("LargeClass")
 class RocheRepositoryTest {
     @TempDir lateinit var tempDir: File
 
@@ -645,6 +655,194 @@ class RocheRepositoryTest {
             assertFalse(managedRepo.snapshot.first().feeds.any { it.id == "feed-arxiv-cs-lg" })
             assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-fresh" })
         }
+
+    @Test
+    internal fun `remote sync leaves contentText null when server sends summary and long content_html`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val longHtml =
+                "<article><p>" + List(2_200) { "essayword$it" }.joinToString(" ") + "</p></article>"
+            val syncedRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildLongHtmlSyncMockClient(longHtml),
+                    settings = settings,
+                )
+            syncedRepo.syncWithServer().getOrThrow()
+
+            assertNull(database.dao().getItemById("item-long-essay")?.contentText)
+            val entry = syncedRepo.snapshot.first().entries.first { it.id == "item-long-essay" }
+            assertNull(entry.contentText)
+            assertEquals("12m", entry.readEstimateLabel)
+        }
+
+    @Test
+    internal fun `local LAN feed items tags and overflow items survive syncWithServer intact`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            seedLanFeedAndOverflowDataset(database)
+            val peerSyncBodies = mutableListOf<String>()
+            val syncedRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildLanAndOverflowPeerSyncMockClient(peerSyncBodies),
+                    settings = settings,
+                )
+
+            syncedRepo.syncWithServer().getOrThrow()
+            assertEquals(1, peerSyncBodies.size)
+            assertFalse(peerSyncBodies.first().contains("192.168.1.50"))
+            assertFalse(peerSyncBodies.first().contains("item-pub-2002"))
+
+            val pass1Snapshot = syncedRepo.snapshot.first()
+            assertTrue(pass1Snapshot.feeds.any { it.url == "http://192.168.1.50/rss.xml" })
+            val lanEntry = pass1Snapshot.entries.first { it.id == "lan-item-1" }
+            assertEquals(listOf("homelab"), lanEntry.tags)
+            assertTrue(pass1Snapshot.entries.any { it.id == "item-pub-2002" && it.isFavorite })
+            assertEquals(true, database.dao().getPendingMutation("item-pub-2002")?.dirtyFavorite)
+
+            // Second pass (delta sync) sends the previously overflowed mutation and still keeps LAN
+            // data
+            syncedRepo.syncWithServer().getOrThrow()
+            assertEquals(2, peerSyncBodies.size)
+            assertTrue(peerSyncBodies[1].contains("item-pub-2002"))
+            assertNull(database.dao().getPendingMutation("item-pub-2002"))
+            assertTrue(
+                syncedRepo.snapshot.first().feeds.any { it.url == "http://192.168.1.50/rss.xml" }
+            )
+            assertTrue(syncedRepo.snapshot.first().entries.any { it.id == "lan-item-1" })
+        }
+
+    @Test
+    internal fun `renameFeed updates server online and preserves pending rename across offline sync`() =
+        runTest {
+            seedTestDatabase()
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            var patchAvailable = false
+            val patchBodies = mutableListOf<String>()
+            val renameRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient =
+                        buildRenameFeedSyncMockClient(
+                            isPatchAvailable = { patchAvailable },
+                            patchBodies = patchBodies,
+                        ),
+                    settings = settings,
+                )
+
+            renameRepo.renameFeed("feed-arxiv-cs-lg", "  Custom ML Papers  ")
+            assertEquals(
+                MutationAction.RENAME_FEED,
+                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.dirtyStatus,
+            )
+            assertEquals(
+                "Custom ML Papers",
+                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.titleOverride,
+            )
+
+            // Sync while PATCH still fails: stale server title must NOT clobber uncommitted rename
+            renameRepo.syncWithServer().getOrThrow()
+            val afterOfflineSync = renameRepo.snapshot.first()
+            assertEquals(
+                "Custom ML Papers",
+                afterOfflineSync.feeds.first { it.id == "feed-arxiv-cs-lg" }.title,
+            )
+            assertEquals(
+                "Custom ML Papers",
+                afterOfflineSync.entries.first { it.id == "item-1" }.feedTitle,
+            )
+
+            // Server recovers: pending rename replays via PATCH and clears mutation
+            patchAvailable = true
+            renameRepo.syncWithServer().getOrThrow()
+            assertTrue(patchBodies.contains("""{"title":"Custom ML Papers"}"""))
+            assertNull(database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+
+            renameRepo.renameFeed("feed-arxiv-cs-lg", "Online Direct Title")
+            assertTrue(patchBodies.contains("""{"title":"Online Direct Title"}"""))
+            assertNull(database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+        }
+
+    @Test
+    internal fun `toggleOfflineCache leaves isCachedOffline false when audio download fails`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            database
+                .dao()
+                .upsertItem(
+                    ItemEntity(
+                        id = "item-audio-broken",
+                        feedId = null,
+                        feedTitle = "Podcast",
+                        title = "Broken Episode",
+                        url = "https://podcasts.example.com/ep-1",
+                        author = null,
+                        summary = "Episode summary",
+                        contentText = null,
+                        contentHtml = null,
+                        contentType = "podcast",
+                        status = "unread",
+                        isFavorite = false,
+                        isCachedOffline = false,
+                        publishedAt = "2026-04-01T10:00:00Z",
+                        createdAt = "2026-04-01T10:00:00Z",
+                        readProgress = 0.0,
+                        thumbnailMediaId = null,
+                        duration = "12:00",
+                        audioUrl = "https://cdn.example.com/broken.mp3",
+                    )
+                )
+            val cacheDir = File(tempDir, "broken_audio_cache")
+            val brokenRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildFailingAudioCacheMockClient(),
+                    settings = settings,
+                    cacheDir = cacheDir,
+                )
+
+            assertFalse(brokenRepo.toggleOfflineCache("item-audio-broken"))
+            val entry = brokenRepo.snapshot.first().entries.first { it.id == "item-audio-broken" }
+            assertFalse(entry.isCachedOffline)
+            assertFalse(File(File(cacheDir, "items"), "item-audio-broken").exists())
+        }
+
+    @Test
+    internal fun `suspend operations propagate CancellationException without recording bogus mutations`() =
+        runTest {
+            seedTestDatabase()
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            val cancellingRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = RocheApiClient { throw CancellationException("cancelled") },
+                    settings = settings,
+                    cacheDir = File(tempDir, "cancel_cache"),
+                )
+
+            assertThrows(CancellationException::class.java) {
+                runBlocking { cancellingRepo.syncWithServer() }
+            }
+            assertThrows(CancellationException::class.java) {
+                runBlocking { cancellingRepo.setArchiveState("item-1", archived = true) }
+            }
+            assertThrows(CancellationException::class.java) {
+                runBlocking { cancellingRepo.toggleOfflineCache("item-5") }
+            }
+            assertNull(database.dao().getPendingMutation("item-1"))
+            assertNull(database.dao().getPendingMutation("item-5"))
+        }
 }
 
 internal fun buildFeedAndItemManagementMockClient(requests: MutableList<String>): RocheApiClient =
@@ -842,4 +1040,189 @@ internal suspend fun assertReadTimestampSync(
                 body == """{"read_at":null}"""
         }
     )
+}
+
+private fun buildLongHtmlSyncMockClient(longHtml: String): RocheApiClient =
+    RocheApiClient { request ->
+        when {
+            request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
+                HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
+            request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
+                HttpResponse(statusCode = 200, body = """{"tags":[]}""")
+            request.method == "GET" && request.url.contains("/api/v1/items") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"items":[{"id":"item-long-essay","title":"Ten Thousand Words","url":"https://example.com/long-essay","summary":"Short 320-char excerpt.","content_html":"$longHtml","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z"}]}""",
+                )
+            else -> HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
+
+private suspend fun seedLanFeedAndOverflowDataset(database: RocheDatabase) {
+    val dao = database.dao()
+    val lanFeedId = deterministicFeedId("http://192.168.1.50/rss.xml")
+    val pubFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
+    dao.upsertFeeds(
+        listOf(
+            FeedEntity(
+                id = lanFeedId,
+                title = "Homelab LAN RSS",
+                url = "http://192.168.1.50/rss.xml",
+                siteUrl = "http://192.168.1.50",
+                feedType = "rss",
+                lastPolled = "2099-01-01T00:00:00Z",
+            ),
+            FeedEntity(
+                id = pubFeedId,
+                title = "Public Blog",
+                url = "https://blog.example.com/rss.xml",
+                siteUrl = "https://blog.example.com",
+                feedType = "rss",
+                lastPolled = "2099-01-01T00:00:00Z",
+            ),
+        )
+    )
+    dao.upsertItem(
+        ItemEntity(
+            id = "lan-item-1",
+            feedId = lanFeedId,
+            feedUrl = "http://192.168.1.50/rss.xml",
+            feedTitle = "Homelab LAN RSS",
+            title = "NAS Status Alert",
+            url = "http://192.168.1.50/post-1",
+            author = null,
+            summary = "All disks healthy",
+            contentText = null,
+            contentHtml = "<p>All disks healthy</p>",
+            contentType = "article",
+            status = "unread",
+            isFavorite = false,
+            isCachedOffline = false,
+            publishedAt = "2026-05-01T10:00:00Z",
+            createdAt = "2026-05-01T10:00:00Z",
+            readProgress = 0.0,
+            thumbnailMediaId = null,
+            duration = null,
+        )
+    )
+    attachTagsLocally(dao = dao, itemId = "lan-item-1", tagNames = listOf("homelab"))
+    seedOverflowPublicItems(dao = dao, pubFeedId = pubFeedId)
+}
+
+private suspend fun seedOverflowPublicItems(
+    dao: RocheDao,
+    pubFeedId: String,
+) {
+    val bulkItems =
+        (1..2_002).map { idx ->
+            val padded = idx.toString().padStart(4, '0')
+            val isOverflowTarget = idx == 2_002
+            val ts = if (isOverflowTarget) "2025-01-01T00:00:00Z" else "2026-05-02T12:00:00Z"
+            ItemEntity(
+                id = "item-pub-$padded",
+                feedId = pubFeedId,
+                feedUrl = "https://blog.example.com/rss.xml",
+                feedTitle = "Public Blog",
+                title = "Public Post $padded",
+                url = "https://blog.example.com/post-$padded",
+                author = null,
+                summary = "Summary $padded",
+                contentText = null,
+                contentHtml = null,
+                contentType = "article",
+                status = "unread",
+                isFavorite = isOverflowTarget,
+                isCachedOffline = false,
+                publishedAt = ts,
+                createdAt = ts,
+                interactionUpdatedAt = ts,
+                readProgress = 0.0,
+                thumbnailMediaId = null,
+                duration = null,
+            )
+        }
+    dao.upsertItems(bulkItems)
+    dao.upsertPendingMutation(
+        PendingMutationEntity(entityId = "item-pub-2002", dirtyFavorite = true)
+    )
+}
+
+private fun buildLanAndOverflowPeerSyncMockClient(
+    peerSyncBodies: MutableList<String>
+): RocheApiClient = RocheApiClient { request ->
+    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+        val body = request.body.orEmpty()
+        peerSyncBodies.add(body)
+        val pubFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
+        val isDelta = body.contains(""""updated_after"""")
+        val itemsJson =
+            if (isDelta) {
+                """[{"id":"item-pub-2002","feed_id":"$pubFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Public Blog","title":"Public Post 2002","url":"https://blog.example.com/post-2002","content_type":"article","status":"unread","is_favorite":true,"created_at":"2025-01-01T00:00:00Z","tag_names":[]}]"""
+            } else {
+                """[{"id":"item-pub-0001","feed_id":"$pubFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Public Blog","title":"Public Post 0001","url":"https://blog.example.com/post-0001","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-05-02T12:00:00Z","tag_names":[]}]"""
+            }
+        HttpResponse(
+            statusCode = 200,
+            body =
+                """{"server_peer_id":"server","sync_timestamp":"2026-05-03T00:00:00Z",""" +
+                    """"active_peers":[{"peer_id":"server","device_name":"Server","network_tier":"wired","weight":1.0,"last_seen_at":"2026-05-03T00:00:00Z"}],""" +
+                    """"feeds":[{"id":"$pubFeedId","title":"Public Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2099-01-01T00:00:00Z","is_active":true,"unread_count":1}],""" +
+                    """"items":$itemsJson,"tags":[],"tombstones":[]}""",
+        )
+    } else {
+        HttpResponse(statusCode = 404, body = "{}")
+    }
+}
+
+private fun buildRenameFeedSyncMockClient(
+    isPatchAvailable: () -> Boolean,
+    patchBodies: MutableList<String>,
+): RocheApiClient = RocheApiClient { request ->
+    when {
+        request.method == "PATCH" && request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg") ->
+            if (isPatchAvailable()) {
+                patchBodies.add(request.body.orEmpty())
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"id":"feed-arxiv-cs-lg","title":"Custom ML Papers","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":1}""",
+                )
+            } else {
+                HttpResponse(statusCode = 503, body = """{"title":"Unavailable"}""")
+            }
+        request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":1}]}""",
+            )
+        request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
+            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
+        request.method == "GET" && request.url.contains("/api/v1/items") ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"created_at":"2026-03-29T10:00:00Z"}]}""",
+            )
+        else -> HttpResponse(statusCode = 404, body = "{}")
+    }
+}
+
+private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient { request ->
+    when (request.url) {
+        "http://100.64.0.12:8080/api/v1/items/item-audio-broken" ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"item-audio-broken","title":"Broken Episode","url":"https://podcasts.example.com/ep-1","content_type":"podcast","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","audio_url":"https://cdn.example.com/broken.mp3"}""",
+            )
+        "http://100.64.0.12:8080/api/v1/items/item-audio-broken/media" ->
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"media":[{"id":"audio-broken","item_id":"item-audio-broken","media_type":"audio","file_size":2048}]}""",
+            )
+        else -> HttpResponse(statusCode = 503, body = """{"title":"Media Unavailable"}""")
+    }
 }

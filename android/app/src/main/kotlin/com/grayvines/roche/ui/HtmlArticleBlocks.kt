@@ -463,7 +463,11 @@ internal fun extractPreCodeText(preElement: Element): String {
 }
 
 @Composable
-internal fun StructuredHtmlArticleContent(blocks: List<ArticleBlock>) {
+internal fun StructuredHtmlArticleContent(
+    blocks: List<ArticleBlock>,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val linkStyles =
         remember(colors.accentBlue) {
@@ -478,18 +482,46 @@ internal fun StructuredHtmlArticleContent(blocks: List<ArticleBlock>) {
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         blocks.forEach { block ->
-            RenderArticleBlock(block = block, linkStyles = linkStyles)
+            RenderArticleBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         }
     }
 }
 
 @Composable
-private fun RenderArticleBlock(block: ArticleBlock, linkStyles: TextLinkStyles) {
+private fun RenderArticleBlock(
+    block: ArticleBlock,
+    linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
+) {
     when (block) {
-        is ArticleBlock.Heading -> RenderHeadingBlock(block = block, linkStyles = linkStyles)
+        is ArticleBlock.Heading ->
+            RenderHeadingBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         is ArticleBlock.CodeBlock -> RenderCodeBlock(code = block.code)
-        is ArticleBlock.Blockquote -> RenderBlockquoteBlock(block = block, linkStyles = linkStyles)
-        is ArticleBlock.ListBlock -> RenderListBlock(block = block, linkStyles = linkStyles)
+        is ArticleBlock.Blockquote ->
+            RenderBlockquoteBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
+        is ArticleBlock.ListBlock ->
+            RenderListBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
         ArticleBlock.HorizontalRule ->
             HorizontalDivider(
                 color = LocalRocheColors.current.border,
@@ -497,14 +529,36 @@ private fun RenderArticleBlock(block: ArticleBlock, linkStyles: TextLinkStyles) 
                 modifier = Modifier.padding(vertical = 4.dp),
             )
         is ArticleBlock.Paragraph ->
-            RenderParagraphBlock(html = block.html, linkStyles = linkStyles)
-        is ArticleBlock.TableBlock -> RenderTableBlock(block = block, linkStyles = linkStyles)
-        is ArticleBlock.ImageBlock -> RenderImageBlock(block = block, linkStyles = linkStyles)
+            RenderParagraphBlock(
+                html = block.html,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
+        is ArticleBlock.TableBlock ->
+            RenderTableBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
+        is ArticleBlock.ImageBlock ->
+            RenderImageBlock(
+                block = block,
+                linkStyles = linkStyles,
+                baseUrl = baseUrl,
+                onOpenUrl = onOpenUrl,
+            )
     }
 }
 
 @Composable
-internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLinkStyles) {
+internal fun RenderHeadingBlock(
+    block: ArticleBlock.Heading,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val headlineFamily =
@@ -518,6 +572,8 @@ internal fun RenderHeadingBlock(block: ArticleBlock.Heading, linkStyles: TextLin
             html = block.html,
             linkStyles = linkStyles,
             codeBackground = colors.surfaceElevated,
+            baseUrl = baseUrl,
+            onOpenUrl = onOpenUrl,
         )
     val baseFontSize =
         when (block.level) {
@@ -567,7 +623,12 @@ internal fun RenderCodeBlock(code: String) {
 }
 
 @Composable
-internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: TextLinkStyles) {
+internal fun RenderBlockquoteBlock(
+    block: ArticleBlock.Blockquote,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val annotated =
@@ -575,6 +636,8 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
             html = block.html,
             linkStyles = linkStyles,
             codeBackground = colors.surfaceElevated,
+            baseUrl = baseUrl,
+            onOpenUrl = onOpenUrl,
         )
     val attributionAnnotated =
         block.attributionHtml
@@ -584,6 +647,8 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
                     html = it,
                     linkStyles = linkStyles,
                     codeBackground = colors.surfaceElevated,
+                    baseUrl = baseUrl,
+                    onOpenUrl = onOpenUrl,
                 )
             }
     Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
@@ -622,7 +687,12 @@ internal fun RenderBlockquoteBlock(block: ArticleBlock.Blockquote, linkStyles: T
 }
 
 @Composable
-internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLinkStyles) {
+internal fun RenderListBlock(
+    block: ArticleBlock.ListBlock,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -633,6 +703,8 @@ internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLink
                     html = itemHtml,
                     linkStyles = linkStyles,
                     codeBackground = colors.surfaceElevated,
+                    baseUrl = baseUrl,
+                    onOpenUrl = onOpenUrl,
                 )
             Row(modifier = Modifier.fillMaxWidth()) {
                 Text(
@@ -657,7 +729,12 @@ internal fun RenderListBlock(block: ArticleBlock.ListBlock, linkStyles: TextLink
 }
 
 @Composable
-internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
+internal fun RenderParagraphBlock(
+    html: String,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val annotated =
@@ -665,6 +742,8 @@ internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
             html = html,
             linkStyles = linkStyles,
             codeBackground = colors.surfaceElevated,
+            baseUrl = baseUrl,
+            onOpenUrl = onOpenUrl,
         )
     Text(
         text = annotated,
@@ -676,7 +755,12 @@ internal fun RenderParagraphBlock(html: String, linkStyles: TextLinkStyles) {
 }
 
 @Composable
-internal fun RenderTableBlock(block: ArticleBlock.TableBlock, linkStyles: TextLinkStyles) {
+internal fun RenderTableBlock(
+    block: ArticleBlock.TableBlock,
+    linkStyles: TextLinkStyles,
+    baseUrl: String? = null,
+    onOpenUrl: ((String) -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val colWidths = remember(block) { computeTableColumnWidths(block) }
@@ -698,6 +782,8 @@ internal fun RenderTableBlock(block: ArticleBlock.TableBlock, linkStyles: TextLi
                     isHeader = true,
                     scale = scale,
                     linkStyles = linkStyles,
+                    baseUrl = baseUrl,
+                    onOpenUrl = onOpenUrl,
                 )
                 if (block.rows.isNotEmpty()) {
                     HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -710,6 +796,8 @@ internal fun RenderTableBlock(block: ArticleBlock.TableBlock, linkStyles: TextLi
                     isHeader = false,
                     scale = scale,
                     linkStyles = linkStyles,
+                    baseUrl = baseUrl,
+                    onOpenUrl = onOpenUrl,
                 )
                 if (index < block.rows.lastIndex) {
                     HorizontalDivider(color = colors.border, thickness = 0.5.dp)
@@ -726,6 +814,8 @@ private fun RenderTableRow(
     isHeader: Boolean,
     scale: Float,
     linkStyles: TextLinkStyles,
+    baseUrl: String?,
+    onOpenUrl: ((String) -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
     val style = resolveTableRowStyle(isHeader, colors)
@@ -742,6 +832,8 @@ private fun RenderTableRow(
                     html = cellHtml,
                     linkStyles = linkStyles,
                     codeBackground = colors.surfaceElevated,
+                    baseUrl = baseUrl,
+                    onOpenUrl = onOpenUrl,
                 )
             Text(
                 text = annotated,

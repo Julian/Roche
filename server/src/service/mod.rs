@@ -25,8 +25,51 @@ use crate::{
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
+const MAX_SYNC_URL_LEN: usize = 2048;
 const PAIR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
+
+#[derive(Debug, Default)]
+struct PairingRateLimiter {
+    state: Mutex<(Option<String>, VecDeque<Instant>)>,
+}
+
+impl PairingRateLimiter {
+    fn check_and_record(&self, active_hash: &str) -> bool {
+        let now = Instant::now();
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.0.as_deref() != Some(active_hash) {
+            guard.0 = Some(active_hash.to_owned());
+            guard.1.clear();
+        }
+        while let Some(&front) = guard.1.front() {
+            if now.duration_since(front) >= PAIR_RATE_LIMIT_WINDOW {
+                guard.1.pop_front();
+            } else {
+                break;
+            }
+        }
+        if guard.1.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
+            return false;
+        }
+        guard.1.push_back(now);
+        true
+    }
+
+    fn reset(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.0 = None;
+        guard.1.clear();
+    }
+}
+
+fn is_valid_sync_item_url(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.as_str().len() <= MAX_SYNC_URL_LEN
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ItemDetail {
@@ -74,7 +117,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
-    failed_pair_attempts: Arc<Mutex<(Option<String>, VecDeque<Instant>)>>,
+    pairing_limiter: Arc<PairingRateLimiter>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
 }
 
@@ -87,7 +130,7 @@ impl<F> Clone for RocheService<F> {
             media_store: self.media_store.clone(),
             ytdlp_worker: self.ytdlp_worker.clone(),
             download_semaphore: Arc::clone(&self.download_semaphore),
-            failed_pair_attempts: Arc::clone(&self.failed_pair_attempts),
+            pairing_limiter: Arc::clone(&self.pairing_limiter),
             node_identity: self.node_identity.clone(),
         }
     }
@@ -107,7 +150,7 @@ impl<F: FeedFetcher> RocheService<F> {
             media_store,
             ytdlp_worker,
             download_semaphore,
-            failed_pair_attempts: Arc::new(Mutex::new((None, VecDeque::new()))),
+            pairing_limiter: Arc::new(PairingRateLimiter::default()),
             node_identity: None,
         }
     }
@@ -247,28 +290,79 @@ impl<F: FeedFetcher> RocheService<F> {
             ));
         }
 
-        let mut valid_feeds = Vec::with_capacity(req.feeds.len().min(500));
-        for mut f in req.feeds.into_iter().take(500) {
-            SafeHttpClient::validate_url(&f.url)
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let (resolved_type, validated_url) = FeedSource::Url(f.url.clone())
-                .into_feed_url(f.feed_type)
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            f.feed_type = resolved_type;
-            f.url = validated_url;
-            valid_feeds.push(f);
-        }
-        req.feeds = valid_feeds;
+        req.feeds.truncate(500);
+        req.feeds.retain_mut(|f| {
+            if let Err(err) = SafeHttpClient::validate_url(&f.url) {
+                tracing::warn!(
+                    url = %f.url,
+                    error = %err,
+                    "Skipping non-public or disallowed feed URL in peer_sync"
+                );
+                return false;
+            }
+            match FeedSource::Url(f.url.clone()).into_feed_url(f.feed_type) {
+                Ok((resolved_type, validated_url)) => {
+                    f.feed_type = resolved_type;
+                    f.url = validated_url;
+                    true
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        url = %f.url,
+                        error = %err,
+                        "Skipping incompatible feed URL in peer_sync"
+                    );
+                    false
+                }
+            }
+        });
 
-        for item in req.items.iter().take(2_000) {
-            SafeHttpClient::validate_url(&item.url)
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        }
         req.items.truncate(2_000);
+        req.items.retain_mut(|item| {
+            if !is_valid_sync_item_url(&item.url) {
+                tracing::warn!(
+                    url = %item.url,
+                    "Skipping item with invalid permalink URL in peer_sync"
+                );
+                return false;
+            }
+            if let Some(ref feed_url) = item.feed_url
+                && !is_valid_sync_item_url(feed_url)
+            {
+                tracing::warn!(
+                    url = %item.url,
+                    feed_url = %feed_url,
+                    "Skipping item with invalid feed_url in peer_sync"
+                );
+                return false;
+            }
+            if item
+                .audio_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some_and(|u| !Url::parse(u).as_ref().is_ok_and(is_valid_sync_item_url))
+            {
+                tracing::warn!(
+                    url = %item.url,
+                    "Clearing invalid audio_url on synced item in peer_sync"
+                );
+                item.audio_url = None;
+            }
+            if item.thumbnail_url.as_deref().is_some_and(|u| u.trim().len() > MAX_SYNC_URL_LEN) {
+                tracing::warn!(
+                    url = %item.url,
+                    "Clearing oversized thumbnail_url on synced item in peer_sync"
+                );
+                item.thumbnail_url = None;
+            }
+            true
+        });
         req.tags.truncate(500);
         req.tombstones.truncate(2_000);
 
-        let (response, inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
+        let (response, mut inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
+        inserted_candidates.retain(|(_, c)| SafeHttpClient::validate_url(&c.url).is_ok());
 
         if !inserted_candidates.is_empty() {
             let service_clone = self.clone();
@@ -290,10 +384,7 @@ impl<F: FeedFetcher> AuthService<'_, F> {
     pub async fn issue_pairing_code(&self) -> Result<String, ApiError> {
         let pairing = PairingManager::new(self.service.db.auth());
         let code = pairing.create_code(self.service.config.auth.pairing_code_ttl).await?;
-        if let Ok(mut guard) = self.service.failed_pair_attempts.lock() {
-            guard.0 = None;
-            guard.1.clear();
-        }
+        self.service.pairing_limiter.reset();
         Ok(code)
     }
 
@@ -316,51 +407,18 @@ impl<F: FeedFetcher> AuthService<'_, F> {
             return Err(ApiError::unauthorized("Invalid or expired pairing code"));
         };
 
-        {
-            let now = Instant::now();
-            let mut guard = self
-                .service
-                .failed_pair_attempts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.0.as_deref() != Some(active_hash.as_str()) {
-                guard.0 = Some(active_hash.clone());
-                guard.1.clear();
-            }
-            while let Some(&front) = guard.1.front() {
-                if now.duration_since(front) >= PAIR_RATE_LIMIT_WINDOW {
-                    guard.1.pop_front();
-                } else {
-                    break;
-                }
-            }
-            if guard.1.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
-                return Err(ApiError::too_many_requests(
-                    "Too many failed pairing attempts; please wait before retrying",
-                ));
-            }
+        if !self.service.pairing_limiter.check_and_record(&active_hash) {
+            return Err(ApiError::too_many_requests(
+                "Too many failed pairing attempts; please wait before retrying",
+            ));
         }
 
         let pairing = PairingManager::new(self.service.db.auth());
-        let consumed = pairing.consume_valid_code(pairing_code.trim()).await?;
-        if !consumed {
-            {
-                let mut guard = self
-                    .service
-                    .failed_pair_attempts
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if guard.0.as_deref() == Some(active_hash.as_str()) {
-                    guard.1.push_back(Instant::now());
-                }
-            }
+        if !pairing.consume_valid_code(pairing_code.trim()).await? {
             return Err(ApiError::unauthorized("Invalid or expired pairing code"));
         }
 
-        if let Ok(mut guard) = self.service.failed_pair_attempts.lock() {
-            guard.0 = None;
-            guard.1.clear();
-        }
+        self.service.pairing_limiter.reset();
 
         let tokens = TokenManager::new(self.service.db.auth());
         let token = tokens.create(trimmed_name, self.service.config.auth.token_length).await?;

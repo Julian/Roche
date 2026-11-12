@@ -104,6 +104,12 @@ interface RocheDao {
     suspend fun deletePendingMutation(entityId: String)
 
     @Query(
+        "SELECT * FROM items WHERE feedId = :feedId " +
+            "OR (feedUrl IS NOT NULL AND LOWER(feedUrl) = LOWER(:feedUrl))"
+    )
+    suspend fun getItemsForFeed(feedId: String, feedUrl: String): List<ItemEntity>
+
+    @Query(
         "SELECT id, feedId, feedTitle, title, url, author, " +
             "SUBSTR(summary, 1, 16384) AS summary, " +
             "SUBSTR(contentText, 1, 262144) AS contentText, " +

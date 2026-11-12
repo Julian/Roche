@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
@@ -114,5 +115,30 @@ class SettingsRepositoryTest {
             "" to "",
             parsePairingInput("", "javascript:alert(1)#1234-code"),
         )
+    }
+
+    @Test
+    fun `peerId is generated once on first read and persisted across cold starts`() = runTest {
+        val prefsFile = File(tempDir, "cold_start_peer_id.preferences_pb")
+
+        val scope1 = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val store1 =
+            PreferenceDataStoreFactory.create(
+                scope = scope1,
+                produceFile = { prefsFile },
+            )
+        val firstBootPeerId = SettingsRepository(store1).settings.first().peerId
+        assertTrue(firstBootPeerId.startsWith("android-"))
+        scope1.coroutineContext[Job]?.cancelAndJoin()
+
+        val scope2 = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val store2 =
+            PreferenceDataStoreFactory.create(
+                scope = scope2,
+                produceFile = { prefsFile },
+            )
+        val secondBootPeerId = SettingsRepository(store2).settings.first().peerId
+        assertEquals(firstBootPeerId, secondBootPeerId)
+        scope2.coroutineContext[Job]?.cancelAndJoin()
     }
 }

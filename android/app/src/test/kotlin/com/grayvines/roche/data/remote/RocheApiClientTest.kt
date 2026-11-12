@@ -1,16 +1,22 @@
 package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.model.ContentType
+import java.io.File
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 
 class RocheApiClientTest {
+    @TempDir lateinit var tempDir: File
 
     @Test
     fun `fetchItems parses enriched item fields from server`() = runTest {
@@ -424,5 +430,124 @@ class RocheApiClientTest {
             val exported = client.exportOpml(serverUrl = "http://localhost:8080", token = "tok-123")
             assertEquals("""<?xml version="1.0"?><opml version="2.0"><body/></opml>""", exported)
             assertEquals(3, recorded.size)
+        }
+
+    @Test
+    internal fun `redirect strips Authorization header on https to http downgrade port change and cross host`() {
+        val httpsOrigin = "https://roche.example.com/api/v1/feeds"
+        assertFalse(isSameOriginHost(httpsOrigin, "http://roche.example.com/a"))
+        assertFalse(isSameOriginHost(httpsOrigin, "https://roche.example.com:8443/a"))
+        assertFalse(isSameOriginHost(httpsOrigin, "https://cdn.example.com/a"))
+        assertTrue(isSameOriginHost(httpsOrigin, "https://roche.example.com:443/a"))
+
+        val authed =
+            HttpRequest(
+                method = "POST",
+                url = "https://roche.example.com/api/v1/sync/peer",
+                headers =
+                    mapOf("Authorization" to "Bearer secret-tok", "Accept" to "application/json"),
+                body = """{"peer_id":"p1"}""",
+            )
+        val downgraded =
+            buildRedirectedRequest(
+                currentRequest = authed,
+                statusCode = 302,
+                nextUrl = "http://roche.example.com/api/v1/sync/peer",
+            )
+        assertFalse("Authorization" in downgraded.headers)
+        assertEquals("GET", downgraded.method)
+        assertEquals(null, downgraded.body)
+
+        val crossPort =
+            buildRedirectedRequest(
+                currentRequest = authed,
+                statusCode = 307,
+                nextUrl = "https://roche.example.com:8443/api/v1/sync/peer",
+            )
+        assertFalse("Authorization" in crossPort.headers)
+
+        val sameOrigin =
+            buildRedirectedRequest(
+                currentRequest = authed,
+                statusCode = 307,
+                nextUrl = "https://roche.example.com:443/api/v1/sync/peer?v=2",
+            )
+        assertEquals("Bearer secret-tok", sameOrigin.headers["Authorization"])
+        assertEquals("POST", sameOrigin.method)
+    }
+
+    @Test
+    internal fun `updateFeedTitle sends PATCH with title payload`() = runTest {
+        var capturedPatch: HttpRequest? = null
+        val client = RocheApiClient { request ->
+            capturedPatch = request
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"feed-7","title":"Renamed Title","url":"https://example.com/rss","feed_type":"rss","unread_count":1}""",
+            )
+        }
+        val updated =
+            client.updateFeedTitle(
+                serverUrl = "http://localhost:8080",
+                bearerToken = "tok-rename",
+                feedId = "feed-7",
+                title = "Renamed Title",
+            )
+        assertEquals("Renamed Title", updated.title)
+        assertEquals("PATCH", capturedPatch?.method)
+        assertEquals("http://localhost:8080/api/v1/feeds/feed-7", capturedPatch?.url)
+        assertEquals("Bearer tok-rename", capturedPatch?.headers?.get("Authorization"))
+        assertEquals("""{"title":"Renamed Title"}""", capturedPatch?.body)
+    }
+
+    @Test
+    internal fun `streamMediaToFile streams authenticated bytes and cleans up on error or overflow`() =
+        runTest {
+            val mediaPayload = byteArrayOf(0x49, 0x44, 0x33, 0x04, 0x00, 0x01, 0x02)
+            var capturedMediaAuth: String? = null
+            val client = RocheApiClient { request ->
+                if (request.url == "http://localhost:8080/api/v1/media/audio-7") {
+                    capturedMediaAuth = request.headers["Authorization"]
+                    HttpResponse(statusCode = 200, body = "", bodyBytes = mediaPayload)
+                } else {
+                    HttpResponse(statusCode = 503, body = "{}")
+                }
+            }
+
+            val targetFile = File(tempDir, "streamed_audio.mp3")
+            assertTrue(
+                client.streamMediaToFile(
+                    "http://localhost:8080",
+                    "tok-media",
+                    "audio-7",
+                    targetFile,
+                )
+            )
+            assertEquals("Bearer tok-media", capturedMediaAuth)
+            assertArrayEquals(mediaPayload, targetFile.readBytes())
+
+            val oversizedFile = File(tempDir, "oversized_audio.mp3")
+            assertFalse(
+                client.streamMediaToFile(
+                    serverUrl = "http://localhost:8080",
+                    token = "tok-media",
+                    mediaId = "audio-7",
+                    targetFile = oversizedFile,
+                    maxBytes = 4L,
+                )
+            )
+            assertFalse(oversizedFile.exists())
+
+            val failedFile = File(tempDir, "failed_audio.mp3")
+            assertFalse(
+                client.streamMediaToFile(
+                    serverUrl = "http://localhost:8080",
+                    token = "tok-media",
+                    mediaId = "missing-audio",
+                    targetFile = failedFile,
+                )
+            )
+            assertFalse(failedFile.exists())
         }
 }

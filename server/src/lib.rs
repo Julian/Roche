@@ -93,9 +93,33 @@ impl RocheServer {
     }
 
     async fn shutdown_signal() {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %e, "Failed to listen for shutdown signal");
+        let ctrl_c = async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!(error = %e, "Failed to listen for Ctrl+C signal");
+            }
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to listen for SIGTERM signal");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            () = ctrl_c => {}
+            () = terminate => {}
         }
+
         tracing::info!("Shutdown signal received, stopping server");
     }
 

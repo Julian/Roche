@@ -59,7 +59,7 @@ fun SiteFaviconBadge(
     val cornerRadius = if (size >= 22.dp) 7.dp else 3.5.dp
     val shape = RoundedCornerShape(cornerRadius)
     val bitmap =
-        rememberEntryThumbnailBitmap(
+        rememberFaviconBitmap(
             primaryKey = primaryFaviconUrl,
             fallbackKey = fallbackFaviconUrl,
         )
@@ -525,6 +525,39 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
                     .padding(horizontal = 4.dp, vertical = 1.dp),
         )
     }
+}
+
+@Composable
+internal fun rememberFaviconBitmap(
+    primaryKey: String?,
+    fallbackKey: String? = null,
+): ImageBitmap? {
+    val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
+    val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
+    val effectivePrimary = cleanPrimary ?: cleanFallback ?: return null
+    val loader = LocalThumbnailLoader.current ?: return null
+    val initialCached =
+        loader.getCachedFavicon(effectivePrimary)
+            ?: cleanFallback?.let { loader.getCachedFavicon(it) }
+    val bitmap by
+        produceState<ImageBitmap?>(
+            initialValue = initialCached,
+            key1 = effectivePrimary,
+            key2 = cleanFallback,
+            key3 = loader,
+        ) {
+            if (value == null) {
+                val loadedPrimary = loader.loadFavicon(effectivePrimary)
+                value =
+                    loadedPrimary
+                        ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
+                            loader.loadFavicon(cleanFallback)
+                        } else {
+                            null
+                        }
+            }
+        }
+    return bitmap
 }
 
 @Composable

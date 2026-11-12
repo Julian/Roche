@@ -75,7 +75,7 @@ internal object LocalFeedPoller {
             )
             return Result.failure(error)
         }
-        val batch = runCatching {
+        val batch = runSuspendCatching {
             parseFeedXml(xml = xml, feedUrl = fetchUrl, feedType = feed.feedType)
         }
             .getOrElse { error ->
@@ -141,20 +141,13 @@ internal object LocalFeedPoller {
         candidates: List<ParsedFeedCandidateItem>,
         nowIso: String,
     ): Int {
-        val existingItems = dao.getAllItems()
+        val existingItems = dao.getItemsForFeed(feedId = feed.id, feedUrl = feed.url)
         val tombstones =
             dao.getAllTombstones()
                 .filter { it.entityType.equals("item", ignoreCase = true) }
                 .map { it.naturalKey }
                 .toSet()
-        val byNaturalUrl =
-            existingItems
-                .filter {
-                    it.feedId == feed.id ||
-                        it.feedUrl != null && it.feedUrl.equals(feed.url, ignoreCase = true)
-                }
-                .associateBy { it.url.trim() }
-                .toMutableMap()
+        val byNaturalUrl = existingItems.associateBy { canonicalizeSyncUrl(it.url) }.toMutableMap()
         val byId = existingItems.associateBy { it.id }.toMutableMap()
 
         var newCount = 0
@@ -164,8 +157,9 @@ internal object LocalFeedPoller {
         }
         for (candidate in validCandidates) {
             val cleanUrl = candidate.url.trim()
+            val canonicalUrlKey = canonicalizeSyncUrl(cleanUrl)
             val detId = deterministicItemId(feed.url, cleanUrl)
-            val existing = byNaturalUrl[cleanUrl] ?: byId[detId]
+            val existing = byNaturalUrl[canonicalUrlKey] ?: byId[detId]
             if (existing != null) {
                 val merged = mergePolledCandidate(existing, feed, candidate)
                 if (merged != existing) {
@@ -174,7 +168,7 @@ internal object LocalFeedPoller {
             } else {
                 val created = buildNewPolledItemEntity(detId, feed, candidate, cleanUrl, nowIso)
                 dao.upsertItem(created)
-                byNaturalUrl[cleanUrl] = created
+                byNaturalUrl[canonicalUrlKey] = created
                 byId[detId] = created
                 newCount++
             }
@@ -198,7 +192,7 @@ internal object LocalFeedPoller {
             url = cleanUrl,
             author = candidate.author,
             summary = candidate.summary.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_SUMMARY_CHARS),
-            contentText = candidate.summary.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_TEXT_CHARS),
+            contentText = null,
             contentHtml = candidate.contentHtml?.take(MAX_SQLITE_HTML_CHARS),
             contentType = candidate.contentType,
             status = ItemStatus.UNREAD.wireValue,
@@ -223,9 +217,9 @@ internal object LocalFeedPoller {
         val richerSummary =
             pickRicherString(existing.summary, candidate.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
         val richerText =
-            (existing.contentText?.takeIf { it.isNotBlank() } ?: richerSummary)?.take(
-                MAX_SQLITE_TEXT_CHARS
-            )
+            existing.contentText
+                ?.takeIf { it.isNotBlank() && it != existing.summary }
+                ?.take(MAX_SQLITE_TEXT_CHARS)
         val richerHtml =
             pickRicherString(existing.contentHtml, candidate.contentHtml)
                 ?.take(MAX_SQLITE_HTML_CHARS)

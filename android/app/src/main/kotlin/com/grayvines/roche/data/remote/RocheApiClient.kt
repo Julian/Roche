@@ -5,6 +5,7 @@ import com.grayvines.roche.data.PeerNodeDto
 import com.grayvines.roche.data.SyncTombstoneDto
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
@@ -15,7 +16,6 @@ import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.zip.GZIPInputStream
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -54,29 +54,6 @@ class HttpUrlConnectionTransport : HttpTransport {
             currentRequest = buildRedirectedRequest(currentRequest, response.statusCode, nextUrl)
         }
         return executeSingleRequest(currentRequest).first
-    }
-
-    private fun buildRedirectedRequest(
-        currentRequest: HttpRequest,
-        statusCode: Int,
-        nextUrl: String,
-    ): HttpRequest {
-        val switchToGet =
-            statusCode in REDIRECT_SWITCH_TO_GET_CODES &&
-                currentRequest.method != "GET" &&
-                currentRequest.method != "HEAD"
-        val nextHeaders =
-            if (isSameOriginHost(currentRequest.url, nextUrl)) {
-                currentRequest.headers
-            } else {
-                currentRequest.headers.filterKeys { !it.equals("Authorization", ignoreCase = true) }
-            }
-        return currentRequest.copy(
-            method = if (switchToGet) "GET" else currentRequest.method,
-            url = nextUrl,
-            headers = nextHeaders,
-            body = if (switchToGet) null else currentRequest.body,
-        )
     }
 
     private fun executeSingleRequest(request: HttpRequest): Pair<HttpResponse, String?> {
@@ -142,8 +119,34 @@ class HttpUrlConnectionTransport : HttpTransport {
         private const val READ_TIMEOUT_MS = 15_000
         private const val MAX_REDIRECTS = 5
         private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
-        private val REDIRECT_SWITCH_TO_GET_CODES = setOf(301, 302, 303)
     }
+}
+
+private val REDIRECT_SWITCH_TO_GET_CODES = setOf(301, 302, 303)
+
+internal fun buildRedirectedRequest(
+    currentRequest: HttpRequest,
+    statusCode: Int,
+    nextUrl: String,
+): HttpRequest {
+    val switchToGet =
+        statusCode in REDIRECT_SWITCH_TO_GET_CODES &&
+            currentRequest.method != "GET" &&
+            currentRequest.method != "HEAD"
+    val nextHeaders =
+        if (isSameOriginHost(currentRequest.url, nextUrl)) {
+            currentRequest.headers
+        } else {
+            currentRequest.headers.filterKeys {
+                !it.equals(HEADER_AUTHORIZATION, ignoreCase = true)
+            }
+        }
+    return currentRequest.copy(
+        method = if (switchToGet) "GET" else currentRequest.method,
+        url = nextUrl,
+        headers = nextHeaders,
+        body = if (switchToGet) null else currentRequest.body,
+    )
 }
 
 internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = runCatching {
@@ -162,9 +165,18 @@ private const val HTTP_SCHEME_HTTPS = "https://"
 private const val HTTP_SCHEME_HTTP = "http://"
 
 internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
-    val u1 = URI.create(firstUrl)
-    val u2 = URI.create(secondUrl)
-    u1.host.equals(u2.host, ignoreCase = true) && u1.port == u2.port
+    val origin = URI.create(firstUrl.trim()).toURL()
+    val target = URI.create(secondUrl.trim()).toURL()
+    val originHost = origin.host
+    val targetHost = target.host
+    val sameProtocol = origin.protocol.equals(target.protocol, ignoreCase = true)
+    val originPort = origin.port.takeIf { it != -1 } ?: origin.defaultPort
+    val targetPort = target.port.takeIf { it != -1 } ?: target.defaultPort
+    originHost.isNotBlank() &&
+        originHost.equals(targetHost, ignoreCase = true) &&
+        sameProtocol &&
+        originPort != -1 &&
+        originPort == targetPort
 }
     .getOrDefault(false)
 
@@ -324,7 +336,7 @@ data class DiscoveredServerDto(
 class RocheApiClient(private val transport: HttpTransport) {
 
     internal suspend fun probeServerHealth(candidateUrl: String): DiscoveredServerDto? =
-        runCatching {
+        runSuspendCatching {
             val base = candidateUrl.trim().trimEnd('/')
             if (base.isBlank()) return null
             val response =
@@ -435,6 +447,19 @@ class RocheApiClient(private val transport: HttpTransport) {
         ensureSuccess(response)
     }
 
+    internal suspend fun updateFeedTitle(
+        serverUrl: String,
+        bearerToken: String,
+        feedId: String,
+        title: String,
+    ): RemoteFeedDto =
+        updateFeed(
+            serverUrl = serverUrl,
+            token = bearerToken,
+            feedId = feedId,
+            title = title,
+        )
+
     internal suspend fun updateFeed(
         serverUrl: String,
         token: String,
@@ -532,7 +557,7 @@ class RocheApiClient(private val transport: HttpTransport) {
         serverUrl: String,
         token: String,
         mediaId: String,
-    ): ByteArray? = runCatching {
+    ): ByteArray? = runSuspendCatching {
         val encodedId = encodePathSegment(mediaId)
         val response =
             transport.execute(
@@ -547,42 +572,71 @@ class RocheApiClient(private val transport: HttpTransport) {
         val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
         bytes.takeIf { it.size in 1..MAX_MEDIA_BYTES }
     }
-        .onFailure { if (it is CancellationException) throw it }
         .getOrNull()
 
-    internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? = runCatching {
-        val trimmed = imageUrl.trim()
-        if (
-            !trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) &&
-                !trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-        ) {
-            return null
+    internal suspend fun streamMediaToFile(
+        serverUrl: String,
+        token: String,
+        mediaId: String,
+        targetFile: java.io.File,
+        maxBytes: Long = MAX_MEDIA_BYTES.toLong(),
+    ): Boolean = runSuspendCatching {
+        val encodedId = encodePathSegment(mediaId)
+        val mediaUrl = "${serverUrl.trimEnd('/')}/api/v1/media/$encodedId"
+        val validScheme =
+            mediaUrl.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
+                mediaUrl.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
+        val headers = authHeaders(token)
+        when {
+            !validScheme -> false
+            transport !is HttpUrlConnectionTransport ->
+                streamFakeTransportToFile(mediaUrl, targetFile, maxBytes, headers)
+            else ->
+                withContext(Dispatchers.IO) {
+                    streamUrlConnectionToFile(
+                        initialUrl = mediaUrl,
+                        targetFile = targetFile,
+                        maxBytes = maxBytes,
+                        initialHeaders = headers,
+                    )
+                }
         }
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = trimmed,
-                    headers =
-                        mapOf(
-                            HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                            "Accept" to EXTERNAL_IMAGE_ACCEPT,
-                        ),
-                    expectBinary = true,
-                )
-            )
-        if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
-        val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
-        bytes.takeIf { it.size in 1..MAX_MEDIA_BYTES }
     }
-        .onFailure { if (it is CancellationException) throw it }
+        .getOrDefault(false)
+
+    internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? =
+        runSuspendCatching {
+            val trimmed = imageUrl.trim()
+            if (
+                !trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) &&
+                    !trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
+            ) {
+                return null
+            }
+            val response =
+                transport.execute(
+                    HttpRequest(
+                        method = METHOD_GET,
+                        url = trimmed,
+                        headers =
+                            mapOf(
+                                HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
+                                "Accept" to EXTERNAL_IMAGE_ACCEPT,
+                            ),
+                        expectBinary = true,
+                    )
+                )
+            if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
+            val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
+            bytes.takeIf { it.size in 1..MAX_MEDIA_BYTES }
+        }
         .getOrNull()
 
     internal suspend fun streamExternalBinaryToFile(
         fileUrl: String,
         targetFile: java.io.File,
         maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
-    ): Boolean = runCatching {
+    ): Boolean = runSuspendCatching {
         val trimmed = fileUrl.trim()
         val validScheme =
             trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
@@ -590,27 +644,32 @@ class RocheApiClient(private val transport: HttpTransport) {
         when {
             !validScheme -> false
             transport !is HttpUrlConnectionTransport ->
-                streamFakeTransportToFile(trimmed, targetFile, maxBytes)
+                streamFakeTransportToFile(
+                    trimmedUrl = trimmed,
+                    targetFile = targetFile,
+                    maxBytes = maxBytes,
+                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                )
             else ->
                 withContext(Dispatchers.IO) {
                     streamUrlConnectionToFile(trimmed, targetFile, maxBytes)
                 }
         }
     }
-        .onFailure { if (it is CancellationException) throw it }
         .getOrDefault(false)
 
     private suspend fun streamFakeTransportToFile(
         trimmedUrl: String,
         targetFile: java.io.File,
         maxBytes: Long,
+        headers: Map<String, String>,
     ): Boolean {
         val response =
             transport.execute(
                 HttpRequest(
                     method = METHOD_GET,
                     url = trimmedUrl,
-                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                    headers = headers,
                     expectBinary = true,
                 )
             )
@@ -628,30 +687,30 @@ class RocheApiClient(private val transport: HttpTransport) {
         }
     }
 
-    internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> = runCatching {
-        val trimmed = feedUrl.trim()
-        require(
-            trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
-                trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-        ) {
-            "Feed URL must use http:// or https://"
-        }
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = trimmed,
-                    headers =
-                        mapOf(
-                            HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                            "Accept" to EXTERNAL_FEED_ACCEPT,
-                        ),
+    internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> =
+        runSuspendCatching {
+            val trimmed = feedUrl.trim()
+            require(
+                trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
+                    trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
+            ) {
+                "Feed URL must use http:// or https://"
+            }
+            val response =
+                transport.execute(
+                    HttpRequest(
+                        method = METHOD_GET,
+                        url = trimmed,
+                        headers =
+                            mapOf(
+                                HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
+                                "Accept" to EXTERNAL_FEED_ACCEPT,
+                            ),
+                    )
                 )
-            )
-        ensureSuccess(response)
-        response.body
-    }
-        .onFailure { if (it is CancellationException) throw it }
+            ensureSuccess(response)
+            response.body
+        }
 
     internal suspend fun syncPeer(
         serverUrl: String,
@@ -895,21 +954,36 @@ internal fun streamUrlConnectionToFile(
     initialUrl: String,
     targetFile: java.io.File,
     maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
+    initialHeaders: Map<String, String> = emptyMap(),
 ): Boolean {
     var currentUrl: String? = initialUrl.trim()
+    var currentHeaders = initialHeaders
     var step = 0
     var success = false
     while (currentUrl != null && step <= AUDIO_MAX_REDIRECTS && !success) {
+        val activeUrl = currentUrl
         val nextOrDone =
             executeAudioStreamAttempt(
-                url = currentUrl,
+                url = activeUrl,
                 targetFile = targetFile,
                 maxBytes = maxBytes,
+                headers = currentHeaders,
             )
         when (nextOrDone) {
-            is AudioStreamStepResult.Redirect -> currentUrl = nextOrDone.nextUrl
-            AudioStreamStepResult.Success -> success = true
-            AudioStreamStepResult.Failed -> currentUrl = null
+            is AudioStreamStepResult.Redirect -> {
+                if (!isSameOriginHost(activeUrl, nextOrDone.nextUrl)) {
+                    currentHeaders = currentHeaders.filterKeys {
+                        !it.equals(HEADER_AUTHORIZATION, ignoreCase = true)
+                    }
+                }
+                currentUrl = nextOrDone.nextUrl
+            }
+            AudioStreamStepResult.Success -> {
+                success = true
+            }
+            AudioStreamStepResult.Failed -> {
+                currentUrl = null
+            }
         }
         step++
     }
@@ -928,6 +1002,7 @@ private fun executeAudioStreamAttempt(
     url: String,
     targetFile: java.io.File,
     maxBytes: Long,
+    headers: Map<String, String>,
 ): AudioStreamStepResult {
     val connection =
         (URI.create(url.replace(" ", "%20")).toURL().openConnection() as HttpURLConnection).apply {
@@ -936,6 +1011,7 @@ private fun executeAudioStreamAttempt(
             connectTimeout = AUDIO_CONNECT_TIMEOUT_MS
             readTimeout = AUDIO_READ_TIMEOUT_MS
             setRequestProperty(HEADER_USER_AGENT, "Roche-Android/1.0")
+            headers.forEach { (key, value) -> setRequestProperty(key, value) }
         }
     return try {
         val status = connection.responseCode
@@ -974,12 +1050,18 @@ private fun copyStreamAtomicallyToFile(
     val tempFile =
         java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
     return try {
-        val total =
-            connection.inputStream.use { input ->
-                tempFile.outputStream().use { out ->
-                    copyBoundStreamBytes(input, out, maxBytes)
-                }
+        val rawStream = connection.inputStream
+        val stream =
+            if (connection.contentEncoding?.equals("gzip", ignoreCase = true) == true) {
+                GZIPInputStream(rawStream)
+            } else {
+                rawStream
             }
+        val total = stream.use { input ->
+            tempFile.outputStream().use { out ->
+                copyBoundStreamBytes(input, out, maxBytes)
+            }
+        }
         val wroteBytes = total > 0L
         if (wroteBytes && !tempFile.renameTo(targetFile)) {
             tempFile.copyTo(targetFile, overwrite = true)
@@ -1017,11 +1099,13 @@ internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
 internal fun encodePathSegment(raw: String): String =
     URLEncoder.encode(raw, StandardCharsets.UTF_8.name()).replace("+", "%20")
 
+private const val HEADER_AUTHORIZATION = "Authorization"
+
 internal fun authHeaders(token: String): Map<String, String> =
     if (token.isBlank()) {
         emptyMap()
     } else {
-        mapOf("Authorization" to "Bearer $token")
+        mapOf(HEADER_AUTHORIZATION to "Bearer $token")
     }
 
 internal fun ensureSuccess(response: HttpResponse) {

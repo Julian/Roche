@@ -251,6 +251,8 @@ sealed interface MainAction {
 
     data class SetSkipSilence(val enabled: Boolean) : Mutation
 
+    data class SetSmartRewind(val enabled: Boolean) : Mutation
+
     data class SetSleepTimerMinutes(val minutes: Int?) : Mutation
 
     data class SetFeedAutoDownload(
@@ -410,6 +412,7 @@ class MainViewModel(
                     performSetPlaybackSpeed(speed = speed, applyToCurrentPodcast = null)
                 }
             },
+            onPlaybackError = { message -> showStatusMessage(message) },
         )
 
     val uiState: StateFlow<MainUiState> =
@@ -428,7 +431,8 @@ class MainViewModel(
                         settings = settings,
                         local = local,
                         localNetworkTier = repository.currentNetworkTier(),
-                        playerState = playerState,
+                        playerState =
+                            playerState.copy(smartRewindEnabled = settings.smartRewindEnabled),
                     )
                     .also { built ->
                         playerController.updateHasNextQueuedAudio(
@@ -562,17 +566,18 @@ class MainViewModel(
             is MainAction.SetRememberPodcastSpeed ->
                 performSetRememberPodcastSpeed(action.feedId, action.enabled)
             is MainAction.SetSkipSilence -> performSetSkipSilence(action.enabled)
+            is MainAction.SetSmartRewind -> performSetSmartRewind(action.enabled)
             is MainAction.SetSleepTimerMinutes -> performSetSleepTimerMinutes(action.minutes)
-            is MainAction.SetFeedAutoDownload ->
-                performSetFeedAutoDownload(action.feedId, action.enabled)
-            is MainAction.SetFeedPlaybackSpeed ->
-                performSetFeedPlaybackSpeed(action.feedId, action.speed)
             else -> executeQueueOrSyncMutation(action)
         }
     }
 
     internal suspend fun executeQueueOrSyncMutation(action: MainAction.Mutation) {
         when (action) {
+            is MainAction.SetFeedAutoDownload ->
+                performSetFeedAutoDownload(action.feedId, action.enabled)
+            is MainAction.SetFeedPlaybackSpeed ->
+                performSetFeedPlaybackSpeed(action.feedId, action.speed)
             is MainAction.ToggleQueueMembership -> performToggleQueueMembership(action.entryId)
             is MainAction.AddToQueue -> performAddToQueue(action.entryId, action.playNext)
             is MainAction.RemoveFromQueue ->
@@ -711,19 +716,23 @@ class MainViewModel(
     }
 
     internal suspend fun performToggleOffline(entryId: String) {
+        val prevEntry = uiState.value.allEntries.firstOrNull { it.id == entryId }
+        val wasCached = prevEntry?.isCachedOffline == true
         val cached = repository.toggleOfflineCache(entryId)
         if (cached && transientState.value.selectedReaderEntryId == entryId) {
             repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
                 applyReaderContentIfActive(entryId, content)
             }
         }
-        val entry = uiState.value.allEntries.firstOrNull { it.id == entryId }
+        val entry = uiState.value.allEntries.firstOrNull { it.id == entryId } ?: prevEntry
         val isAudio = entry?.contentType == ContentType.AUDIO
         val msg =
             when {
                 cached && isAudio -> "Downloaded episode for offline playback"
-                !cached && isAudio -> "Deleted local episode download"
                 cached -> "Cached local copy"
+                !wasCached && isAudio -> "Failed to download episode for offline playback"
+                !wasCached -> "Failed to cache offline copy"
+                isAudio -> "Deleted local episode download"
                 else -> "Removed local offline copy"
             }
         showStatusMessage(msg)
@@ -823,17 +832,29 @@ class MainViewModel(
     }
 
     internal suspend fun performSkipToNextQueuedAudio() {
-        val currentId = playerController.state.value.currentEntryId
+        val currentState = playerController.state.value
+        val currentId = currentState.currentEntryId
         val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = currentId)
         if (nextAudio == null) {
             showStatusMessage("No next audio episode in Queue")
             return
         }
         if (currentId != null) {
-            handleAudioEpisodeCompleted(currentId)
-        } else {
-            performPlayAudioEntry(entryId = nextAudio.id, openFullscreen = true)
+            playerController.flushCurrentProgressIfNeeded()
+            settingsRepository.update { current ->
+                if (currentId in current.queueItemIds) {
+                    current.copy(
+                        queueItemIds =
+                            current.queueItemIds.filterNot { it == currentId } + currentId
+                    )
+                } else {
+                    current
+                }
+            }
         }
+        val openFullscreen = if (currentId != null) currentState.isFullscreenOpen else true
+        performPlayAudioEntry(entryId = nextAudio.id, openFullscreen = openFullscreen)
+        showStatusMessage("Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}")
     }
 
     private suspend fun resolveNextQueuedAudioEntry(excludeEntryId: String?): InboxEntry? {
@@ -883,6 +904,11 @@ class MainViewModel(
     internal suspend fun performSetSkipSilence(enabled: Boolean) {
         playerController.setSkipSilence(enabled)
         settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
+    }
+
+    internal suspend fun performSetSmartRewind(enabled: Boolean) {
+        settingsRepository.update { it.copy(smartRewindEnabled = enabled) }
+        playerController.updateSmartRewindEnabled(enabled)
     }
 
     internal suspend fun performSetFeedAutoDownload(

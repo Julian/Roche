@@ -18,6 +18,7 @@ macro_rules! feed_select_sql {
         concat!(
             "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
        f.poll_interval, f.last_polled, f.last_polled_by, f.last_error, f.last_error_by, f.is_active,
+       f.created_at,
        (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
 FROM feeds f ",
             $suffix
@@ -43,6 +44,7 @@ pub struct Feed {
     #[serde(default)]
     pub last_error_by: Option<String>,
     pub is_active: bool,
+    pub created_at: DateTime<Utc>,
     pub unread_count: i64,
 }
 
@@ -187,6 +189,7 @@ impl<'a> FeedRepo<'a> {
             last_error: None,
             last_error_by: None,
             is_active: true,
+            created_at: now,
             unread_count: 0,
         })
     }
@@ -201,59 +204,113 @@ impl<'a> FeedRepo<'a> {
         let mut imported = Vec::new();
 
         for outline in outlines {
-            let id = deterministic_feed_id(outline.xml_url.as_str());
-            SyncRepo::clear_tombstone(
-                &mut tx,
-                ActivityEntityType::Feed,
-                &feed_natural_key(outline.xml_url.as_str()),
-            )
-            .await?;
-
-            let res = sqlx::query(
-                "INSERT OR IGNORE INTO feeds
-                 (id, feed_type, url, title, description, poll_interval, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
-            )
-            .bind(&id)
-            .bind(outline.feed_type)
-            .bind(outline.xml_url.as_str())
-            .bind(outline.title.as_deref())
-            .bind(default_interval)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            if res.rows_affected() > 0 {
-                SyncRepo::record_activity(
-                    &mut tx,
-                    ActivityEntityType::Feed,
-                    &id,
-                    ActivityAction::Create,
-                    now,
-                )
-                .await?;
-
-                imported.push(Feed {
-                    id,
-                    feed_type: outline.feed_type,
-                    url: outline.xml_url,
-                    title: outline.title,
-                    description: None,
-                    language: None,
-                    poll_interval: default_interval,
-                    last_polled: None,
-                    last_polled_by: None,
-                    last_error: None,
-                    last_error_by: None,
-                    is_active: true,
-                    unread_count: 0,
-                });
+            if let Some(feed) =
+                Self::import_single_outline_in_tx(&mut tx, outline, default_interval, now).await?
+            {
+                imported.push(feed);
             }
         }
 
         tx.commit().await?;
         Ok(imported)
+    }
+
+    async fn import_single_outline_in_tx(
+        tx: &mut sqlx::SqliteConnection,
+        outline: OpmlOutline,
+        default_interval: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Feed>> {
+        let id = deterministic_feed_id(outline.xml_url.as_str());
+        let clean_title = outline.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        SyncRepo::clear_tombstone(
+            &mut *tx,
+            ActivityEntityType::Feed,
+            &feed_natural_key(outline.xml_url.as_str()),
+        )
+        .await?;
+
+        let existing_archived_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM feeds WHERE (url = ? OR id = ?) AND is_active = 0 LIMIT 1",
+        )
+        .bind(outline.xml_url.as_str())
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(existing_id) = existing_archived_id {
+            sqlx::query(
+                "UPDATE feeds
+                 SET is_active = 1,
+                     title = COALESCE(title, ?),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(clean_title)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+
+            SyncRepo::record_activity(
+                &mut *tx,
+                ActivityEntityType::Feed,
+                &existing_id,
+                ActivityAction::Unarchive,
+                now,
+            )
+            .await?;
+
+            return Ok(sqlx::query_as::<_, Feed>(feed_select_sql!("WHERE f.id = ?"))
+                .bind(&existing_id)
+                .fetch_optional(&mut *tx)
+                .await?);
+        }
+
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO feeds
+             (id, feed_type, url, title, description, poll_interval, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(outline.feed_type)
+        .bind(outline.xml_url.as_str())
+        .bind(clean_title)
+        .bind(default_interval)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        SyncRepo::record_activity(
+            &mut *tx,
+            ActivityEntityType::Feed,
+            &id,
+            ActivityAction::Create,
+            now,
+        )
+        .await?;
+
+        Ok(Some(Feed {
+            id,
+            feed_type: outline.feed_type,
+            url: outline.xml_url,
+            title: clean_title.map(String::from),
+            description: None,
+            language: None,
+            poll_interval: default_interval,
+            last_polled: None,
+            last_polled_by: None,
+            last_error: None,
+            last_error_by: None,
+            is_active: true,
+            created_at: now,
+            unread_count: 0,
+        }))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Feed>> {
@@ -580,7 +637,10 @@ impl<'a> FeedRepo<'a> {
 mod tests {
     use url::Url;
 
-    use crate::db::{ContentType, Db, FeedType, NewItem};
+    use crate::{
+        db::{ActivityAction, ActivityEntityType, ContentType, Db, FeedType, NewItem},
+        feeds::OpmlOutline,
+    };
 
     #[tokio::test]
     async fn test_polling_backoff_and_cascade_delete() {
@@ -678,5 +738,76 @@ mod tests {
         assert!(resubscribed.is_active);
         assert_eq!(resubscribed.title.as_deref(), Some("Resubscribed Title"));
         assert_eq!(resubscribed.unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_import_outlines_unarchives_archived_feed_and_records_activity() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_repo = db.feeds();
+
+        let renamed_url = Url::parse("https://example.com/custom-title.xml").unwrap();
+        let renamed_feed = feed_repo
+            .create(FeedType::Rss, &renamed_url, Some("My Custom Title"), None)
+            .await
+            .unwrap();
+
+        let item_url = Url::parse("https://example.com/item-1").unwrap();
+        db.items()
+            .create(&NewItem {
+                feed_id: Some(&renamed_feed.id),
+                title: "Existing Item",
+                url: &item_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        let untitled_url = Url::parse("https://example.com/untitled.xml").unwrap();
+        let untitled_feed =
+            feed_repo.create(FeedType::Rss, &untitled_url, None, None).await.unwrap();
+
+        assert!(feed_repo.archive(&renamed_feed.id).await.unwrap());
+        assert!(feed_repo.archive(&untitled_feed.id).await.unwrap());
+
+        let before_activity_id = db.sync().latest_activity_id().await.unwrap();
+        let canon_variant_url = Url::parse("HTTPS://EXAMPLE.COM:443/custom-title.xml").unwrap();
+
+        let imported = feed_repo
+            .import_outlines(
+                vec![
+                    OpmlOutline {
+                        feed_type: FeedType::Rss,
+                        xml_url: canon_variant_url,
+                        title: Some("OPML Title".to_string()),
+                    },
+                    OpmlOutline {
+                        feed_type: FeedType::Rss,
+                        xml_url: untitled_url,
+                        title: Some("Backfilled Title".to_string()),
+                    },
+                ],
+                30,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].id, renamed_feed.id);
+        assert!(imported[0].is_active);
+        assert_eq!(imported[0].title.as_deref(), Some("My Custom Title"));
+        assert_eq!(imported[0].unread_count, 1);
+
+        assert_eq!(imported[1].id, untitled_feed.id);
+        assert!(imported[1].is_active);
+        assert_eq!(imported[1].title.as_deref(), Some("Backfilled Title"));
+
+        let changes = db.sync().list_changes_since(before_activity_id, 10).await.unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| {
+            c.entity_type == ActivityEntityType::Feed && c.action == ActivityAction::Unarchive
+        }));
     }
 }

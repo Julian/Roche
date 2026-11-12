@@ -34,12 +34,14 @@ import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
 @OptIn(ExperimentalCoroutinesApi::class)
+@Suppress("LargeClass")
 class RocheRssWorkflowTest {
     @TempDir lateinit var tempDir: File
 
@@ -661,6 +663,98 @@ class RocheRssWorkflowTest {
                 )
             assertEquals("arXiv cs.LG", saved.title)
             assertTrue(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
+        }
+
+    @Test
+    fun `canonicalizeSyncUrl isSyncablePublicUrl and isSyncableItemUrl align with server rules`() {
+        assertEquals("https://example.com/", canonicalizeSyncUrl("HTTPS://Example.COM:443"))
+        assertEquals(
+            "http://example.com/rss?a=1#top",
+            canonicalizeSyncUrl("http://Example.com:80/rss?a=1#top"),
+        )
+        assertEquals(
+            deterministicFeedId("https://example.com"),
+            deterministicFeedId("HTTPS://EXAMPLE.COM:443/"),
+        )
+        assertEquals(
+            deterministicItemId("https://example.com", "https://example.com:8443/post"),
+            deterministicItemId("https://example.com/", "HTTPS://EXAMPLE.COM:8443/post"),
+        )
+
+        val blockedFeedUrls =
+            listOf(
+                "http://intranet/rss.xml",
+                "https://user:pass@example.com/rss.xml",
+                "https://example.com:8443/rss.xml",
+                "http://127.0.0.1/rss.xml",
+                "http://[::1]/rss.xml",
+                "http://10.0.0.1/rss.xml",
+                "http://192.168.1.50/rss.xml",
+                "http://172.16.0.1/rss.xml",
+                "http://172.31.255.254/rss.xml",
+                "http://169.254.169.254/rss.xml",
+                "http://100.64.0.1/rss.xml",
+                "http://100.127.255.1/rss.xml",
+                "http://0.0.0.0/rss.xml",
+                "http://nas.local/rss.xml",
+                "http://router.lan/rss.xml",
+                "http://svc.internal/rss.xml",
+                "http://hub.home.arpa/rss.xml",
+                "https://box.tail9876.ts.net/rss.xml",
+                "http://dev.localhost/rss.xml",
+            )
+        blockedFeedUrls.forEach { url -> assertFalse(isSyncablePublicUrl(url), url) }
+
+        assertTrue(isSyncablePublicUrl("https://blog.example.com/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://172.15.0.1/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://172.32.0.1/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://100.63.255.1/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://100.128.0.1/rss.xml"))
+
+        assertTrue(isSyncableItemUrl("https://example.com:8443/article"))
+        assertFalse(isSyncableItemUrl("https://user:pass@example.com/article"))
+        assertFalse(isSyncableItemUrl("ftp://example.com/file"))
+    }
+
+    @Test
+    fun `LocalFeedPoller leaves contentText null and computes reading estimate from long HTML`() =
+        runTest {
+            seedDatabase()
+            val longHtmlBody = "<p>" + List(2_200) { "word$it" }.joinToString(" ") + "</p>"
+            val rssXml =
+                """<?xml version="1.0" encoding="UTF-8"?>""" +
+                    """<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">""" +
+                    """<channel><title>Longform Essays</title><link>https://essays.example.com</link>""" +
+                    """<item><title>Deep Architecture Essay</title>""" +
+                    """<link>https://essays.example.com/deep-essay</link>""" +
+                    """<description>Short teaser excerpt only.</description>""" +
+                    """<content:encoded><![CDATA[$longHtmlBody]]></content:encoded></item>""" +
+                    """</channel></rss>"""
+            val pollClient = RocheApiClient { request ->
+                if (request.url == "https://essays.example.com/rss.xml") {
+                    HttpResponse(statusCode = 200, body = rssXml)
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+            val pollRepo =
+                RocheRepository(database = database, apiClient = pollClient, settings = settings)
+            pollRepo.saveUrlOrFeed(
+                inputUrl = "https://essays.example.com/rss.xml",
+                titleOverride = null,
+                tagCsv = "",
+            )
+
+            val essayId =
+                deterministicItemId(
+                    "https://essays.example.com/rss.xml",
+                    "https://essays.example.com/deep-essay",
+                )
+            val storedEntity = database.dao().getItemById(essayId)
+            assertNull(storedEntity?.contentText)
+            val entry = pollRepo.snapshot.first().entries.first { it.id == essayId }
+            assertNull(entry.contentText)
+            assertEquals("12m", entry.readEstimateLabel)
         }
 }
 

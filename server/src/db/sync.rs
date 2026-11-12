@@ -73,6 +73,8 @@ pub struct PeerFeedRecord {
     pub last_error_by: Option<String>,
     #[serde(default = "default_true")]
     pub is_active: bool,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 const fn default_poll_interval() -> i64 {
@@ -121,6 +123,8 @@ pub struct PeerTagRecord {
     pub id: String,
     pub name: String,
     pub color: Option<HexColor>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -179,15 +183,22 @@ pub fn deterministic_entity_uuid(kind: &str, natural_key: &str) -> String {
 }
 
 #[must_use]
+pub fn canonicalize_sync_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    Url::parse(trimmed).map_or_else(|_| trimmed.to_ascii_lowercase(), String::from)
+}
+
+#[must_use]
 pub fn feed_natural_key(url: &str) -> String {
-    url.trim().to_owned()
+    canonicalize_sync_url(url)
 }
 
 #[must_use]
 pub fn item_natural_key(feed_url: Option<&str>, item_url: &str) -> String {
+    let canon_item = canonicalize_sync_url(item_url);
     feed_url.map(str::trim).filter(|s| !s.is_empty()).map_or_else(
-        || format!("manual\0{}", item_url.trim()),
-        |f_url| format!("{f_url}\0{}", item_url.trim()),
+        || format!("manual\0{canon_item}"),
+        |f_url| format!("{}\0{canon_item}", canonicalize_sync_url(f_url)),
     )
 }
 
@@ -403,11 +414,10 @@ impl<'a> SyncRepo<'a> {
         Self { pool }
     }
 
-    /// Returns the current UTC timestamp truncated to whole seconds so SQLite RFC3339 strings
-    /// have a uniform width (`YYYY-MM-DDTHH:MM:SS+00:00`) for B-tree index comparisons.
+    /// Returns the current UTC timestamp truncated to milliseconds (`YYYY-MM-DDTHH:MM:SS.sss+00:00`).
     #[must_use]
     pub fn now_utc() -> DateTime<Utc> {
-        Utc::now().trunc_subsecs(0)
+        Utc::now().trunc_subsecs(3)
     }
 
     pub async fn record_activity(
@@ -441,7 +451,7 @@ impl<'a> SyncRepo<'a> {
              VALUES (?, ?, ?)
              ON CONFLICT(entity_type, natural_key) DO UPDATE SET
                  deleted_at = CASE
-                     WHEN datetime(excluded.deleted_at) > datetime(sync_tombstones.deleted_at)
+                     WHEN strftime('%Y-%m-%dT%H:%M:%fZ', excluded.deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', sync_tombstones.deleted_at)
                      THEN excluded.deleted_at
                      ELSE sync_tombstones.deleted_at
                  END",
@@ -475,7 +485,7 @@ impl<'a> SyncRepo<'a> {
             Ok(sqlx::query_as::<_, SyncTombstone>(
                 "SELECT entity_type, natural_key, deleted_at
                  FROM sync_tombstones
-                 WHERE datetime(deleted_at) >= datetime(?)
+                 WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                  ORDER BY deleted_at DESC
                  LIMIT 5000",
             )
@@ -528,7 +538,7 @@ impl<'a> SyncRepo<'a> {
         Ok(sqlx::query_as::<_, PeerNode>(
             "SELECT peer_id, device_name, network_tier, weight, last_seen_at
              FROM peer_nodes
-             WHERE datetime(last_seen_at) >= datetime(?)
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', last_seen_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
              ORDER BY peer_id ASC",
         )
         .bind(cutoff)
@@ -575,15 +585,20 @@ impl<'a> SyncRepo<'a> {
 
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
-        let result =
-            sqlx::query("DELETE FROM activity_log WHERE datetime(timestamp) < datetime(?)")
-                .bind(cutoff)
-                .execute(self.pool)
-                .await?;
-        let _ = sqlx::query("DELETE FROM sync_tombstones WHERE datetime(deleted_at) < datetime(?)")
-            .bind(cutoff)
-            .execute(self.pool)
-            .await;
+        let result = sqlx::query(
+            "DELETE FROM activity_log
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', timestamp) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+        )
+        .bind(cutoff)
+        .execute(self.pool)
+        .await?;
+        let _ = sqlx::query(
+            "DELETE FROM sync_tombstones
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+        )
+        .bind(cutoff)
+        .execute(self.pool)
+        .await;
         Ok(result.rows_affected())
     }
 
@@ -636,7 +651,7 @@ impl<'a> SyncRepo<'a> {
             let res = ItemRepo::new(self.pool)
                 .list_filtered_page(&ItemFilter {
                     updated_after: inclusive_since,
-                    include_content: Some(page == 1),
+                    include_content: Some(true),
                     page: Some(page),
                     per_page: Some(200),
                     ..ItemFilter::default()
@@ -734,24 +749,37 @@ impl<'a> SyncRepo<'a> {
             }
             match tomb.entity_type {
                 ActivityEntityType::Feed => {
+                    let canon_key = feed_natural_key(key);
+                    let det_id = deterministic_feed_id(&canon_key);
                     let newer_live: Option<i64> = sqlx::query_scalar(
-                        "SELECT 1 FROM feeds WHERE url = ? AND datetime(created_at) > datetime(?) LIMIT 1",
+                        "SELECT 1 FROM feeds
+                         WHERE (url = ? OR id = ?)
+                           AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                         LIMIT 1",
                     )
-                    .bind(key)
+                    .bind(&canon_key)
+                    .bind(&det_id)
                     .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
                     if newer_live.is_some() {
                         continue;
                     }
-                    Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
-                        .await?;
+                    Self::record_tombstone(
+                        &mut *conn,
+                        tomb.entity_type,
+                        &canon_key,
+                        tomb.deleted_at,
+                    )
+                    .await?;
                     let deleted_id: Option<String> = sqlx::query_scalar(
                         "DELETE FROM feeds
-                         WHERE url = ? AND datetime(created_at) <= datetime(?)
+                         WHERE (url = ? OR id = ?)
+                           AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          RETURNING id",
                     )
-                    .bind(key)
+                    .bind(&canon_key)
+                    .bind(&det_id)
                     .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
@@ -767,112 +795,152 @@ impl<'a> SyncRepo<'a> {
                     }
                 }
                 ActivityEntityType::Item => {
-                    let newer_live: Option<i64> = if let Some(item_url) =
-                        key.strip_prefix("manual\0")
-                    {
-                        sqlx::query_scalar(
-                                "SELECT 1 FROM items
-                                 WHERE feed_id IS NULL AND url = ? AND datetime(created_at) > datetime(?)
-                                 LIMIT 1",
-                            )
-                            .bind(item_url)
-                            .bind(tomb.deleted_at)
-                            .fetch_optional(&mut *conn)
-                            .await?
-                    } else if let Some((feed_url, item_url)) = key.split_once('\0') {
-                        sqlx::query_scalar(
+                    if let Some(item_url) = key.strip_prefix("manual\0") {
+                        let canon_item = canonicalize_sync_url(item_url);
+                        let canon_key = item_natural_key(None, &canon_item);
+                        let det_id = deterministic_item_id(None, &canon_item);
+                        let newer_live: Option<i64> = sqlx::query_scalar(
                             "SELECT 1 FROM items
-                                 WHERE url = ?
-                                   AND feed_id IN (SELECT id FROM feeds WHERE url = ?)
-                                   AND datetime(created_at) > datetime(?)
-                                 LIMIT 1",
+                             WHERE (id = ? OR (feed_id IS NULL AND url = ?))
+                               AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                             LIMIT 1",
                         )
-                        .bind(item_url)
-                        .bind(feed_url)
+                        .bind(&det_id)
+                        .bind(&canon_item)
                         .bind(tomb.deleted_at)
                         .fetch_optional(&mut *conn)
-                        .await?
-                    } else {
-                        None
-                    };
-                    if newer_live.is_some() {
-                        continue;
-                    }
-                    Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
                         .await?;
-                    let deleted_id: Option<String> = if let Some(item_url) =
-                        key.strip_prefix("manual\0")
-                    {
-                        sqlx::query_scalar(
-                                "DELETE FROM items
-                                 WHERE feed_id IS NULL AND url = ? AND datetime(created_at) <= datetime(?)
-                                 RETURNING id",
-                            )
-                            .bind(item_url)
-                            .bind(tomb.deleted_at)
-                            .fetch_optional(&mut *conn)
-                            .await?
-                    } else if let Some((feed_url, item_url)) = key.split_once('\0') {
-                        sqlx::query_scalar(
-                            "DELETE FROM items
-                                 WHERE url = ?
-                                   AND feed_id IN (SELECT id FROM feeds WHERE url = ?)
-                                   AND datetime(created_at) <= datetime(?)
-                                 RETURNING id",
-                        )
-                        .bind(item_url)
-                        .bind(feed_url)
-                        .bind(tomb.deleted_at)
-                        .fetch_optional(&mut *conn)
-                        .await?
-                    } else {
-                        None
-                    };
-                    if let Some(iid) = deleted_id {
-                        Self::record_activity(
+                        if newer_live.is_some() {
+                            continue;
+                        }
+                        Self::record_tombstone(
                             &mut *conn,
-                            ActivityEntityType::Item,
-                            &iid,
-                            ActivityAction::Delete,
-                            now,
+                            tomb.entity_type,
+                            &canon_key,
+                            tomb.deleted_at,
                         )
                         .await?;
+                        let deleted_id: Option<String> = sqlx::query_scalar(
+                            "DELETE FROM items
+                             WHERE (id = ? OR (feed_id IS NULL AND url = ?))
+                               AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                             RETURNING id",
+                        )
+                        .bind(&det_id)
+                        .bind(&canon_item)
+                        .bind(tomb.deleted_at)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                        if let Some(iid) = deleted_id {
+                            Self::record_activity(
+                                &mut *conn,
+                                ActivityEntityType::Item,
+                                &iid,
+                                ActivityAction::Delete,
+                                now,
+                            )
+                            .await?;
+                        }
+                    } else if let Some((feed_url, item_url)) = key.split_once('\0') {
+                        let canon_feed = canonicalize_sync_url(feed_url);
+                        let canon_item = canonicalize_sync_url(item_url);
+                        let canon_key = item_natural_key(Some(&canon_feed), &canon_item);
+                        let det_feed_id = deterministic_feed_id(&canon_feed);
+                        let det_id = deterministic_item_id(Some(&canon_feed), &canon_item);
+                        let newer_live: Option<i64> = sqlx::query_scalar(
+                            "SELECT 1 FROM items
+                             WHERE (id = ? OR (url = ? AND feed_id IN (SELECT id FROM feeds WHERE url = ? OR id = ?)))
+                               AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                             LIMIT 1",
+                        )
+                        .bind(&det_id)
+                        .bind(&canon_item)
+                        .bind(&canon_feed)
+                        .bind(&det_feed_id)
+                        .bind(tomb.deleted_at)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                        if newer_live.is_some() {
+                            continue;
+                        }
+                        Self::record_tombstone(
+                            &mut *conn,
+                            tomb.entity_type,
+                            &canon_key,
+                            tomb.deleted_at,
+                        )
+                        .await?;
+                        let deleted_id: Option<String> = sqlx::query_scalar(
+                            "DELETE FROM items
+                             WHERE (id = ? OR (url = ? AND feed_id IN (SELECT id FROM feeds WHERE url = ? OR id = ?)))
+                               AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                             RETURNING id",
+                        )
+                        .bind(&det_id)
+                        .bind(&canon_item)
+                        .bind(&canon_feed)
+                        .bind(&det_feed_id)
+                        .bind(tomb.deleted_at)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                        if let Some(iid) = deleted_id {
+                            Self::record_activity(
+                                &mut *conn,
+                                ActivityEntityType::Item,
+                                &iid,
+                                ActivityAction::Delete,
+                                now,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
+                            .await?;
                     }
                 }
                 ActivityEntityType::Tag => {
+                    let canon_key = tag_natural_key(key);
                     let newer_live: Option<i64> = sqlx::query_scalar(
                         "SELECT 1 FROM tags
-                         WHERE LOWER(name) = LOWER(?) AND datetime(created_at) > datetime(?)
+                         WHERE LOWER(name) = LOWER(?)
+                           AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          LIMIT 1",
                     )
-                    .bind(key)
+                    .bind(&canon_key)
                     .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
                     if newer_live.is_some() {
                         continue;
                     }
-                    Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
-                        .await?;
+                    Self::record_tombstone(
+                        &mut *conn,
+                        tomb.entity_type,
+                        &canon_key,
+                        tomb.deleted_at,
+                    )
+                    .await?;
                     sqlx::query(
                         "UPDATE items SET updated_at = ?
                          WHERE id IN (
                              SELECT it.item_id FROM item_tags it
                              JOIN tags t ON t.id = it.tag_id
-                             WHERE LOWER(t.name) = LOWER(?) AND datetime(t.created_at) <= datetime(?)
+                             WHERE LOWER(t.name) = LOWER(?)
+                               AND strftime('%Y-%m-%dT%H:%M:%fZ', t.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          )",
                     )
                     .bind(now)
-                    .bind(key)
+                    .bind(&canon_key)
                     .bind(tomb.deleted_at)
                     .execute(&mut *conn)
                     .await?;
                     let deleted_id: Option<String> = sqlx::query_scalar(
                         "DELETE FROM tags
-                         WHERE LOWER(name) = LOWER(?) AND datetime(created_at) <= datetime(?)
+                         WHERE LOWER(name) = LOWER(?)
+                           AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          RETURNING id",
                     )
-                    .bind(key)
+                    .bind(&canon_key)
                     .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
@@ -904,14 +972,17 @@ impl<'a> SyncRepo<'a> {
                 continue;
             }
             let nat_key = tag_natural_key(clean_name);
-            let is_tombstoned: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM sync_tombstones WHERE entity_type = 'tag' AND natural_key = ?",
+            let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT deleted_at FROM sync_tombstones WHERE entity_type = 'tag' AND natural_key = ?",
             )
             .bind(&nat_key)
             .fetch_optional(&mut *conn)
             .await?;
-            if is_tombstoned.is_some() {
-                continue;
+            if let Some(del_at) = tomb_ts {
+                if t.created_at.is_none_or(|c| c <= del_at) {
+                    continue;
+                }
+                Self::clear_tombstone(&mut *conn, ActivityEntityType::Tag, &nat_key).await?;
             }
 
             let det_id = deterministic_tag_id(clean_name);
@@ -940,13 +1011,14 @@ impl<'a> SyncRepo<'a> {
                     .await?;
                 }
             } else {
+                let created_at = t.created_at.unwrap_or(now);
                 let res = sqlx::query(
                     "INSERT OR IGNORE INTO tags (id, name, color, created_at) VALUES (?, ?, ?, ?)",
                 )
                 .bind(&det_id)
                 .bind(clean_name)
                 .bind(&t.color)
-                .bind(now)
+                .bind(created_at)
                 .execute(&mut *conn)
                 .await?;
                 if res.rows_affected() > 0 {
@@ -988,6 +1060,7 @@ impl<'a> SyncRepo<'a> {
         type ExistingFeedRow = (String, String, Option<DateTime<Utc>>, bool);
         let feed_url = f.url.as_str();
         let nat_key = feed_natural_key(feed_url);
+        let det_id = deterministic_feed_id(feed_url);
         let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT deleted_at FROM sync_tombstones WHERE entity_type = 'feed' AND natural_key = ?",
         )
@@ -995,17 +1068,21 @@ impl<'a> SyncRepo<'a> {
         .fetch_optional(&mut *conn)
         .await?;
         if let Some(del_at) = tomb_ts {
-            if f.last_polled.is_none_or(|lp| lp <= del_at) {
+            if f.created_at.is_none_or(|c| c <= del_at) {
                 return Ok(());
             }
             Self::clear_tombstone(&mut *conn, ActivityEntityType::Feed, &nat_key).await?;
         }
 
         let existing: Option<ExistingFeedRow> = sqlx::query_as(
-            "SELECT id, url, last_polled, is_active FROM feeds WHERE url = ? OR id = ? LIMIT 1",
+            "SELECT id, url, last_polled, is_active
+             FROM feeds
+             WHERE url = ? OR id = ? OR id = ?
+             LIMIT 1",
         )
         .bind(feed_url)
         .bind(&f.id)
+        .bind(&det_id)
         .fetch_optional(&mut *conn)
         .await?;
 
@@ -1042,8 +1119,9 @@ impl<'a> SyncRepo<'a> {
             }
             feed_map.insert(local_id.clone(), (local_id, local_url));
         } else {
-            let local_id = deterministic_feed_id(feed_url);
+            let local_id = det_id;
             let interval = f.poll_interval.clamp(5, 1440);
+            let created_at = f.created_at.unwrap_or(now);
             sqlx::query(
                 "INSERT OR IGNORE INTO feeds
                  (id, feed_type, url, title, description, language, poll_interval, last_polled, last_polled_by, last_error, last_error_by, is_active, created_at, updated_at)
@@ -1061,7 +1139,7 @@ impl<'a> SyncRepo<'a> {
             .bind(clean_err)
             .bind(clean_err_by)
             .bind(f.is_active)
-            .bind(now)
+            .bind(created_at)
             .bind(now)
             .execute(&mut *conn)
             .await?;
@@ -1106,7 +1184,7 @@ impl<'a> SyncRepo<'a> {
         if incoming_poll_newer {
             sqlx::query(
                 "UPDATE feeds
-                 SET title = COALESCE(?, title),
+                 SET title = COALESCE(title, ?),
                      description = COALESCE(?, description),
                      language = COALESCE(?, language),
                      last_polled = ?,
@@ -1185,9 +1263,11 @@ impl<'a> SyncRepo<'a> {
             return Ok(Some((None, None)));
         }
         if let Some(ref f_url) = inc.feed_url {
+            let det_fid = deterministic_feed_id(f_url.as_str());
             let found: Option<(String, String)> =
-                sqlx::query_as("SELECT id, url FROM feeds WHERE url = ? LIMIT 1")
+                sqlx::query_as("SELECT id, url FROM feeds WHERE url = ? OR id = ? LIMIT 1")
                     .bind(f_url.as_str())
+                    .bind(&det_fid)
                     .fetch_optional(&mut *conn)
                     .await?;
             if let Some((fid, url)) = found {
@@ -1291,17 +1371,19 @@ impl<'a> SyncRepo<'a> {
             let clamped_progress =
                 if inc.read_progress.is_finite() { inc.read_progress.clamp(0.0, 1.0) } else { 0.0 };
 
+            let det_item_id = deterministic_item_id(resolved_feed_url.as_deref(), inc.url.as_str());
             let existing: Option<ExistingItemRow> = if let Some(ref fid) = resolved_feed_id {
                 sqlx::query_as(
                     "SELECT id, title, author, published_at, summary, content_html, thumbnail_url,
                             audio_url, duration, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at
                      FROM items
-                     WHERE (feed_id = ? AND url = ?) OR id = ?
+                     WHERE (feed_id = ? AND url = ?) OR id = ? OR id = ?
                      LIMIT 1",
                 )
                 .bind(fid)
                 .bind(inc.url.as_str())
                 .bind(&inc.id)
+                .bind(&det_item_id)
                 .fetch_optional(&mut *conn)
                 .await?
             } else {
@@ -1309,11 +1391,12 @@ impl<'a> SyncRepo<'a> {
                     "SELECT id, title, author, published_at, summary, content_html, thumbnail_url,
                             audio_url, duration, content_type, status, is_favorite, read_at, read_progress, interaction_updated_at
                      FROM items
-                     WHERE (feed_id IS NULL AND url = ?) OR id = ?
+                     WHERE (feed_id IS NULL AND url = ?) OR id = ? OR id = ?
                      LIMIT 1",
                 )
                 .bind(inc.url.as_str())
                 .bind(&inc.id)
+                .bind(&det_item_id)
                 .fetch_optional(&mut *conn)
                 .await?
             };
@@ -1336,9 +1419,9 @@ impl<'a> SyncRepo<'a> {
                 )
                 .await?;
             } else {
-                let item_id = deterministic_item_id(resolved_feed_url.as_deref(), inc.url.as_str());
+                let item_id = det_item_id;
                 let created_at = inc.created_at.unwrap_or(now);
-                let insert_inter_ts = inc.interaction_updated_at.map(|ts| ts.trunc_subsecs(0));
+                let insert_inter_ts = inc.interaction_updated_at.map(|ts| ts.trunc_subsecs(3));
                 let insert_read_at = if inc.status == ItemStatus::Archived {
                     inc.read_at.or(insert_inter_ts).or(Some(now))
                 } else {
@@ -1627,8 +1710,8 @@ fn resolve_merged_interaction_state(
     clamped_progress: f64,
     now: DateTime<Utc>,
 ) -> MergedInteractionState {
-    let inc_norm = inc.interaction_updated_at.map(|ts| ts.trunc_subsecs(0));
-    let loc_norm = ex.interaction_updated_at.map(|ts| ts.trunc_subsecs(0));
+    let inc_norm = inc.interaction_updated_at.map(|ts| ts.trunc_subsecs(3));
+    let loc_norm = ex.interaction_updated_at.map(|ts| ts.trunc_subsecs(3));
     let (status, fav, raw_read_at, prog, inter_ts, tag_mode) = match (inc_norm, loc_norm) {
         (Some(inc_ts), None) => (
             inc.status,
@@ -1736,6 +1819,7 @@ mod tests {
                 last_error: None,
                 last_error_by: None,
                 is_active: true,
+                created_at: now,
                 unread_count: 0,
             };
             let s_polls = should_peer_poll_feed("server", &peers, &feed, now);
@@ -1771,6 +1855,7 @@ mod tests {
                 last_error: None,
                 last_error_by: None,
                 is_active: true,
+                created_at: now,
                 unread_count: 0,
             };
             if should_peer_poll_feed("server", &peers, &feed, now) {
@@ -1798,6 +1883,7 @@ mod tests {
             last_error: Some("Upstream server returned HTTP 403 Forbidden".to_string()),
             last_error_by: Some("server".to_string()),
             is_active: true,
+            created_at: now,
             unread_count: 0,
         };
         assert!(!should_peer_poll_feed("server", &peers, &blocked_feed, now));
@@ -1904,6 +1990,7 @@ mod tests {
                 last_error: None,
                 last_error_by: None,
                 is_active: true,
+                created_at: None,
             }],
             items: vec![
                 PeerItemRecord {
@@ -2068,6 +2155,7 @@ mod tests {
                 last_error: None,
                 last_error_by: None,
                 is_active: false,
+                created_at: None,
             }],
             items: vec![],
             tags: vec![],
@@ -2097,6 +2185,7 @@ mod tests {
                 last_error: None,
                 last_error_by: None,
                 is_active: true,
+                created_at: None,
             }],
             items: vec![],
             tags: vec![],
@@ -2107,5 +2196,245 @@ mod tests {
             !peer2_resp.feeds[0].is_active,
             "Cursorless initial sync from a second peer must not unarchive a server-archived feed"
         );
+    }
+
+    #[test]
+    fn test_canonical_sync_urls_and_deterministic_ids() {
+        assert_eq!(canonicalize_sync_url("  HTTPS://Example.COM:443  "), "https://example.com/");
+        assert_eq!(
+            canonicalize_sync_url("http://Example.COM:80/Feed.xml"),
+            "http://example.com/Feed.xml"
+        );
+        assert_eq!(
+            canonicalize_sync_url("https://Example.COM:8443/demo"),
+            "https://example.com:8443/demo"
+        );
+        assert_eq!(canonicalize_sync_url("  NOT A VALID URL  "), "not a valid url");
+
+        assert_eq!(
+            feed_natural_key("HTTPS://Example.COM:443"),
+            feed_natural_key("https://example.com/")
+        );
+        assert_eq!(
+            deterministic_feed_id("HTTPS://Example.COM:443"),
+            deterministic_feed_id("https://example.com/")
+        );
+        assert_eq!(
+            deterministic_item_id(
+                Some("HTTP://Example.COM:80/rss.xml"),
+                "HTTPS://Example.COM:443/post-1"
+            ),
+            deterministic_item_id(Some("http://example.com/rss.xml"), "https://example.com/post-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subsecond_delta_sync_and_multipage_content_html() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/subsec-rss.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Subsec"), None).await.unwrap();
+
+        let batch_items: Vec<PollItemCandidate> = (0..205)
+            .map(|idx| PollItemCandidate {
+                title: format!("Article {idx}"),
+                url: Url::parse(&format!("https://example.com/article-{idx}")).unwrap(),
+                author: None,
+                published_at: None,
+                summary: format!("Summary {idx}"),
+                content_html: Some(format!("<p>Body content {idx}</p>")),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+            })
+            .collect();
+
+        db.feeds()
+            .record_poll_batch(
+                &feed.id,
+                &PollBatch {
+                    title: Some("Subsec".to_string()),
+                    description: None,
+                    language: None,
+                    items: batch_items,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Full sync with >200 items must include content_html on ALL pages (not just page 1)
+        let full_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel".to_string()),
+            network_tier: NetworkTier::Wifi,
+            ..PeerSyncRequest::default()
+        };
+        let (full_resp, _) = db.sync().merge_peer_state(&full_req).await.unwrap();
+        assert_eq!(full_resp.items.len(), 205);
+        assert!(
+            full_resp.items.iter().all(|item| item.content_html.is_some()),
+            "Every synced item across page 1 and page 2 must retain inline content_html"
+        );
+
+        // Subsecond updated_after: item updated 500ms after `since` within the same second MUST be returned
+        let old_ts =
+            DateTime::parse_from_rfc3339("2026-11-11T20:00:00Z").unwrap().with_timezone(&Utc)
+                - chrono::Duration::seconds(30);
+        sqlx::query("UPDATE items SET updated_at = ?")
+            .bind(old_ts)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let since =
+            DateTime::parse_from_rfc3339("2026-11-11T20:00:00.100Z").unwrap().with_timezone(&Utc);
+        let before_in_same_sec =
+            DateTime::parse_from_rfc3339("2026-11-11T20:00:00.050Z").unwrap().with_timezone(&Utc);
+        let after_500ms = since + chrono::Duration::milliseconds(500);
+
+        let id0 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-0");
+        let id1 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-1");
+
+        sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+            .bind(before_in_same_sec)
+            .bind(&id0)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+            .bind(after_500ms)
+            .bind(&id1)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let filtered = db
+            .items()
+            .list_filtered_page(&ItemFilter { updated_after: Some(since), ..ItemFilter::default() })
+            .await
+            .unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].id, id1);
+
+        let delta_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel".to_string()),
+            network_tier: NetworkTier::Wifi,
+            updated_after: Some(since),
+            ..PeerSyncRequest::default()
+        };
+        let (delta_resp, _) = db.sync().merge_peer_state(&delta_req).await.unwrap();
+        assert!(
+            delta_resp.items.iter().any(|i| i.id == id1 && i.content_html.is_some()),
+            "Delta merge_peer_state must return item updated 500ms after since within same second"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tombstone_resurrection_requires_newer_created_at_and_preserves_custom_feed_title()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/tombstone-feed.xml").unwrap();
+        let feed =
+            db.feeds().create(FeedType::Rss, &feed_url, Some("Original"), None).await.unwrap();
+        let tag = db.tags().create("ephemeral", None).await.unwrap();
+
+        assert!(db.feeds().delete(&feed.id).await.unwrap());
+        assert!(db.tags().delete(&tag.id).await.unwrap());
+        let del_after = SyncRepo::now_utc();
+
+        // Stale offline poll (last_polled > del_at, created_at: None / older) must NOT resurrect feed or tag
+        let stale_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel".to_string()),
+            network_tier: NetworkTier::Wifi,
+            feeds: vec![PeerFeedRecord {
+                id: feed.id.clone(),
+                feed_type: FeedType::Rss,
+                url: feed_url.clone(),
+                title: Some("Stale Offline Copy".to_string()),
+                description: None,
+                language: None,
+                poll_interval: 30,
+                last_polled: Some(del_after + chrono::Duration::minutes(5)),
+                last_polled_by: Some("android-peer-1".to_string()),
+                last_error: None,
+                last_error_by: None,
+                is_active: true,
+                created_at: None,
+            }],
+            tags: vec![PeerTagRecord {
+                id: tag.id.clone(),
+                name: "ephemeral".to_string(),
+                color: None,
+                created_at: Some(del_after - chrono::Duration::minutes(5)),
+            }],
+            ..PeerSyncRequest::default()
+        };
+        let (stale_resp, _) = db.sync().merge_peer_state(&stale_req).await.unwrap();
+        assert!(stale_resp.feeds.is_empty(), "Stale last_polled must not resurrect deleted feed");
+        assert!(stale_resp.tags.is_empty(), "Older created_at must not resurrect deleted tag");
+
+        // Explicit re-creation with created_at > del_at clears tombstones and recreates feed + tag
+        let recreate_ts = del_after + chrono::Duration::seconds(10);
+        let recreate_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel".to_string()),
+            network_tier: NetworkTier::Wifi,
+            feeds: vec![PeerFeedRecord {
+                id: feed.id.clone(),
+                feed_type: FeedType::Rss,
+                url: feed_url.clone(),
+                title: Some("Recreated Feed".to_string()),
+                description: None,
+                language: None,
+                poll_interval: 30,
+                last_polled: Some(recreate_ts),
+                last_polled_by: Some("android-peer-1".to_string()),
+                last_error: None,
+                last_error_by: None,
+                is_active: true,
+                created_at: Some(recreate_ts),
+            }],
+            tags: vec![PeerTagRecord {
+                id: tag.id.clone(),
+                name: "ephemeral".to_string(),
+                color: None,
+                created_at: Some(recreate_ts),
+            }],
+            ..PeerSyncRequest::default()
+        };
+        let (recreate_resp, _) = db.sync().merge_peer_state(&recreate_req).await.unwrap();
+        assert_eq!(recreate_resp.feeds.len(), 1);
+        assert_eq!(recreate_resp.tags.len(), 1);
+
+        // User renames feed on server; subsequent peer poll with raw RSS title must NOT clobber custom title
+        assert!(
+            db.feeds().update(&feed.id, Some("My Custom Feed Name"), None, None).await.unwrap()
+        );
+        let poll_bump_req = PeerSyncRequest {
+            peer_id: "android-peer-1".to_string(),
+            device_name: Some("Pixel".to_string()),
+            network_tier: NetworkTier::Wifi,
+            feeds: vec![PeerFeedRecord {
+                id: feed.id.clone(),
+                feed_type: FeedType::Rss,
+                url: feed_url,
+                title: Some("Raw Upstream RSS Title".to_string()),
+                description: Some("Updated desc".to_string()),
+                language: None,
+                poll_interval: 30,
+                last_polled: Some(recreate_ts + chrono::Duration::minutes(30)),
+                last_polled_by: Some("android-peer-1".to_string()),
+                last_error: None,
+                last_error_by: None,
+                is_active: true,
+                created_at: Some(recreate_ts),
+            }],
+            ..PeerSyncRequest::default()
+        };
+        let (bump_resp, _) = db.sync().merge_peer_state(&poll_bump_req).await.unwrap();
+        assert_eq!(bump_resp.feeds[0].title.as_deref(), Some("My Custom Feed Name"));
+        assert_eq!(bump_resp.feeds[0].description.as_deref(), Some("Updated desc"));
     }
 }

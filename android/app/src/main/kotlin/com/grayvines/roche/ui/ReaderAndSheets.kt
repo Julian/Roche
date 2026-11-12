@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -94,11 +95,7 @@ fun ReaderView(
             }
         }
 
-    ReaderScrollProgressEffect(
-        entry = entry,
-        scrollState = scrollState,
-        onAction = onAction,
-    )
+    ReaderScrollProgressEffect(entry = entry, scrollState = scrollState, onAction = onAction)
 
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
@@ -135,7 +132,7 @@ fun ReaderView(
             entry = entry,
             scrollState = scrollState,
             onSelectTag = { onAction(MainAction.FilterByTag(it)) },
-            onOpenExternalUrl = { onOpenExternalUrl(entry.url) },
+            onOpenExternalUrl = onOpenExternalUrl,
         )
     }
 }
@@ -415,49 +412,20 @@ private fun CompactStarAndArchiveButtons(
 }
 
 @Composable
-private fun ReaderArticleBody(
+internal fun ReaderArticleBody(
     entry: InboxEntry,
     scrollState: androidx.compose.foundation.ScrollState,
     onSelectTag: (String) -> Unit,
-    onOpenExternalUrl: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
-
     Column(
         modifier =
             Modifier.fillMaxSize()
                 .verticalScroll(scrollState)
                 .padding(horizontal = 20.dp, vertical = 18.dp)
     ) {
-        Text(
-            text =
-                "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
-            color = colors.accentBlue,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = entry.title,
-            color = colors.textPrimary,
-            fontFamily = headlineFamily,
-            fontSize = 23.sp,
-            lineHeight = 29.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = formatReaderByline(entry),
-            color = colors.textSecondary,
-            fontSize = 12.sp,
-        )
+        ReaderArticleHeader(entry = entry)
 
         if (entry.tags.isNotEmpty()) {
             Spacer(modifier = Modifier.height(10.dp))
@@ -485,7 +453,45 @@ private fun ReaderArticleBody(
 }
 
 @Composable
-internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit = {}) {
+internal fun ReaderArticleHeader(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+    SelectionContainer {
+        Column {
+            Text(
+                text =
+                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+                color = colors.accentBlue,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = entry.title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 23.sp,
+                lineHeight = 29.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = formatReaderByline(entry),
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: (String) -> Unit = {}) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val htmlBody =
@@ -495,36 +501,47 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: () -> Unit 
         remember(htmlBody, entry.url) {
             htmlBody?.let { parseHtmlArticleBlocks(rawHtml = it, baseUrl = entry.url) }.orEmpty()
         }
-    if (htmlBlocks.isNotEmpty()) {
-        StructuredHtmlArticleContent(blocks = htmlBlocks)
-    } else {
-        val bodyParagraphs =
-            (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
-                .split("\n\n")
-                .filter { it.isNotBlank() }
-
-        if (bodyParagraphs.isEmpty()) {
-            Text(
-                text = "Full article text is not cached locally for this item.",
-                color = colors.textMuted,
-                fontSize = 14.sp,
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-        } else {
-            bodyParagraphs.forEach { paragraph ->
-                Text(
-                    text = paragraph.trim(),
-                    color = colors.textPrimary,
-                    fontFamily = FontFamily.Serif,
-                    fontSize = (16f * scale).sp,
-                    lineHeight = (26f * scale).sp,
+    SelectionContainer {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            if (htmlBlocks.isNotEmpty()) {
+                StructuredHtmlArticleContent(
+                    blocks = htmlBlocks,
+                    baseUrl = entry.url,
+                    onOpenUrl = onOpenExternalUrl,
                 )
-                Spacer(modifier = Modifier.height(14.dp))
+            } else {
+                val bodyParagraphs =
+                    (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
+                        .split("\n\n")
+                        .filter { it.isNotBlank() }
+
+                if (bodyParagraphs.isEmpty()) {
+                    Text(
+                        text = "Full article text is not cached locally for this item.",
+                        color = colors.textMuted,
+                        fontSize = 14.sp,
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                } else {
+                    bodyParagraphs.forEach { paragraph ->
+                        Text(
+                            text = paragraph.trim(),
+                            color = colors.textPrimary,
+                            fontFamily = FontFamily.Serif,
+                            fontSize = (16f * scale).sp,
+                            lineHeight = (26f * scale).sp,
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                    }
+                }
             }
         }
     }
     Spacer(modifier = Modifier.height(8.dp))
-    HeaderActionButton(label = "Open Original Link ↗", onClick = onOpenExternalUrl)
+    HeaderActionButton(
+        label = "Open Original Link ↗",
+        onClick = { onOpenExternalUrl(entry.url) },
+    )
 }
 
 private fun formatReaderByline(entry: InboxEntry): String = buildString {

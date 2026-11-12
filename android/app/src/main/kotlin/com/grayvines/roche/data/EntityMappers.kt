@@ -191,9 +191,11 @@ internal fun toRemoteItemEntity(
     val richerSummary =
         pickRicherString(existing?.summary, remote.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
     val richerText =
-        (remote.contentText.nonBlankOr(existing?.contentText) ?: richerSummary)?.take(
-            MAX_SQLITE_TEXT_CHARS
-        )
+        remote.contentText?.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_TEXT_CHARS)
+            ?: existing
+                ?.contentText
+                ?.takeIf { it.isNotBlank() && it != existing.summary }
+                ?.take(MAX_SQLITE_TEXT_CHARS)
     val richerHtml =
         pickRicherString(existing?.contentHtml, remote.contentHtml)?.take(MAX_SQLITE_HTML_CHARS)
     val resolvedAudioUrl = remote.audioUrl.nonBlankOr(existing?.audioUrl)
@@ -206,7 +208,7 @@ internal fun toRemoteItemEntity(
     return ItemEntity(
         id = remote.id,
         feedId = resolvedFeedId,
-        feedTitle = resolveRemoteFeedTitle(remote, feedTitlesById, existing),
+        feedTitle = resolveRemoteFeedTitle(remote, feedTitlesById, existing, resolvedFeedId),
         title = remote.title.ifBlank { existing?.title.orEmpty() },
         url = remote.url.ifBlank { existing?.url.orEmpty() },
         author = remote.author.nonBlankOr(existing?.author),
@@ -255,10 +257,11 @@ private fun resolveRemoteFeedTitle(
     remote: RemoteItemDto,
     feedTitlesById: Map<String, String>,
     existing: ItemEntity?,
+    resolvedFeedId: String?,
 ): String =
-    remote.feedTitle
-        ?: remote.feedId?.let { feedTitlesById[it] }
-        ?: existing?.feedTitle
+    resolvedFeedId?.let { feedTitlesById[it] }?.takeIf { it.isNotBlank() }
+        ?: remote.feedTitle?.takeIf { it.isNotBlank() }
+        ?: existing?.feedTitle?.takeIf { it.isNotBlank() }
         ?: DEFAULT_SAVED_HOST
 
 private fun String?.nonBlankOr(fallback: String?): String? =

@@ -13,7 +13,7 @@ axum-extra = { version = "0.12", features = ["typed-header"] }
 headers = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.7", features = ["cors", "limit", "compression-full", "trace"] }
+tower-http = { version = "0.7", features = ["limit", "compression-full", "trace"] }
 
 # Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }

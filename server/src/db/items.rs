@@ -523,7 +523,11 @@ impl<'a> ItemRepo<'a> {
             qb.push(" AND i.is_favorite = ").push_bind(fav);
         }
         if let Some(ts) = filter.updated_after {
-            qb.push(" AND datetime(i.updated_at) > datetime(").push_bind(ts).push(")");
+            qb.push(
+                " AND strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ",
+            )
+            .push_bind(ts)
+            .push(")");
         }
         if let Some(search) = trimmed_search {
             Self::append_search_where_clause(&mut qb, search, &search_terms);

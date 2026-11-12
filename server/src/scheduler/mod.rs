@@ -358,100 +358,117 @@ impl FeedIngester {
     ) {
         match content_type {
             ContentType::Paper | ContentType::Pdf => {
-                let Some(pdf_url) = resolve_pdf_url(url) else {
-                    return;
-                };
-                let _permit = match ctx.download_semaphore {
-                    Some(sem) => sem.acquire().await.ok(),
-                    None => None,
-                };
-                match ctx.fetcher.fetch_pdf(&pdf_url).await {
-                    Ok(Some(bytes)) if is_valid_pdf_bytes(&bytes) => {
-                        let rel_path = format!("pdfs/{item_id}.pdf");
-                        match ctx.media_store.write_bytes(&rel_path, &bytes).await {
-                            Ok(file_size) => {
-                                if let Err(e) = ctx
-                                    .db
-                                    .media()
-                                    .create(
-                                        item_id,
-                                        MediaType::Pdf,
-                                        &rel_path,
-                                        Some(file_size),
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    let _ = ctx.media_store.delete_file(&rel_path).await;
-                                    tracing::warn!(
-                                        item_id = %item_id,
-                                        error = %e,
-                                        "Failed to record PDF media row"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    item_id = %item_id,
-                                    error = %e,
-                                    "Failed to write PDF file to media_dir"
-                                );
-                            }
+                Self::ingest_pdf_media(ctx, item_id, url).await;
+            }
+            ContentType::Video => {
+                Self::ingest_video_media(ctx, item_id, url).await;
+            }
+            ContentType::Article | ContentType::Audio => {}
+        }
+    }
+
+    async fn ingest_pdf_media<F: FeedFetcher>(
+        ctx: &MediaIngestContext<'_, F>,
+        item_id: &str,
+        url: &Url,
+    ) {
+        let Some(pdf_url) = resolve_pdf_url(url) else {
+            return;
+        };
+        if SafeHttpClient::validate_url(&pdf_url).is_err() {
+            return;
+        }
+        let fetched = {
+            let _permit = match ctx.download_semaphore {
+                Some(sem) => sem.acquire().await.ok(),
+                None => None,
+            };
+            ctx.fetcher.fetch_pdf(&pdf_url).await
+        };
+        match fetched {
+            Ok(Some(bytes)) if is_valid_pdf_bytes(&bytes) => {
+                let rel_path = format!("pdfs/{item_id}.pdf");
+                match ctx.media_store.write_bytes(&rel_path, &bytes).await {
+                    Ok(file_size) => {
+                        if let Err(e) = ctx
+                            .db
+                            .media()
+                            .create(item_id, MediaType::Pdf, &rel_path, Some(file_size), None)
+                            .await
+                        {
+                            let _ = ctx.media_store.delete_file(&rel_path).await;
+                            tracing::warn!(
+                                item_id = %item_id,
+                                error = %e,
+                                "Failed to record PDF media row"
+                            );
                         }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(
                             item_id = %item_id,
-                            pdf_url = %pdf_url,
                             error = %e,
-                            "Failed to download PDF for item"
+                            "Failed to write PDF file to media_dir"
                         );
                     }
                 }
             }
-            ContentType::Video => {
-                let Some(worker) = ctx.ytdlp_worker.cloned() else {
-                    return;
-                };
-                let db = ctx.db.clone();
-                let sem = ctx.download_semaphore.cloned();
-                let item_id_owned = item_id.to_owned();
-                let url_owned = url.clone();
-                tokio::spawn(async move {
-                    let _permit = match sem {
-                        Some(ref s) => s.acquire().await.ok(),
-                        None => None,
-                    };
-                    let media_repo = db.media();
-                    match worker.download_for_item(&media_repo, &item_id_owned, &url_owned).await {
-                        Ok((_, meta)) => {
-                            let clean_desc = meta
-                                .description
-                                .as_deref()
-                                .map(|d| HtmlSanitizer::plain_text_truncate(d, MAX_SUMMARY_CHARS));
-                            let _ = db
-                                .items()
-                                .backfill_metadata(
-                                    &item_id_owned,
-                                    meta.title.as_deref(),
-                                    meta.uploader.as_deref(),
-                                    clean_desc.as_deref(),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                item_id = %item_id_owned,
-                                url = %url_owned,
-                                error = %e,
-                                "Skipped or failed yt-dlp download for video item"
-                            );
-                        }
-                    }
-                });
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    item_id = %item_id,
+                    pdf_url = %pdf_url,
+                    error = %e,
+                    "Failed to download PDF for item"
+                );
             }
-            ContentType::Article | ContentType::Audio => {}
+        }
+    }
+
+    async fn ingest_video_media<F: FeedFetcher>(
+        ctx: &MediaIngestContext<'_, F>,
+        item_id: &str,
+        url: &Url,
+    ) {
+        let Some(worker) = ctx.ytdlp_worker else {
+            return;
+        };
+        if SafeHttpClient::validate_url(url).is_err() {
+            return;
+        }
+        let download_res = {
+            let _permit = match ctx.download_semaphore {
+                Some(sem) => sem.acquire().await.ok(),
+                None => None,
+            };
+            let media_repo = ctx.db.media();
+            worker.download_for_item(&media_repo, item_id, url).await
+        };
+        match download_res {
+            Ok((_, meta)) => {
+                let clean_desc = meta
+                    .description
+                    .as_deref()
+                    .map(|d| HtmlSanitizer::plain_text_truncate(d, MAX_SUMMARY_CHARS));
+                let _ = ctx
+                    .db
+                    .items()
+                    .backfill_metadata(
+                        item_id,
+                        meta.title.as_deref(),
+                        meta.uploader.as_deref(),
+                        clean_desc.as_deref(),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    item_id = %item_id,
+                    url = %url,
+                    error = %e,
+                    "Skipped or failed yt-dlp download for video item"
+                );
+            }
         }
     }
 

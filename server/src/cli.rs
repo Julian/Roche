@@ -111,13 +111,13 @@ impl Cli {
                         println!("No paired devices.");
                     } else {
                         for d in devices {
+                            let safe_name = sanitize_terminal_text(&d.device_name);
                             let last = d
                                 .last_used_at
                                 .map_or_else(|| "never".to_string(), |ts| ts.to_rfc3339());
                             println!(
-                                "{}\t{}\tcreated={}\tlast_used={last}",
+                                "{}\t{safe_name}\tcreated={}\tlast_used={last}",
                                 d.id,
-                                d.device_name,
                                 d.created_at.to_rfc3339()
                             );
                         }

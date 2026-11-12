@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
+import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -19,12 +20,14 @@ import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 
 class SettingsRepository(private val dataStore: DataStore<Preferences>) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
 
     val settings: Flow<Settings> =
         dataStore.data
+            .onEach { prefs -> ensurePeerIdPersisted(prefs) }
             .catch { exception ->
                 if (exception is IOException) {
                     emit(emptyPreferences())
@@ -33,6 +36,17 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                 }
             }
             .map { prefs -> prefs.toSettings() }
+
+    private suspend fun ensurePeerIdPersisted(prefs: Preferences) {
+        if (!prefs[KEY_PEER_ID].isNullOrBlank()) return
+        runSuspendCatching {
+            dataStore.edit { mutablePrefs ->
+                if (mutablePrefs[KEY_PEER_ID].isNullOrBlank()) {
+                    mutablePrefs[KEY_PEER_ID] = fallbackPeerId
+                }
+            }
+        }
+    }
 
     suspend fun update(transform: (Settings) -> Settings) {
         dataStore.edit { prefs ->

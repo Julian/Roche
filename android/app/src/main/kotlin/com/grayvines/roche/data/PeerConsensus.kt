@@ -3,6 +3,9 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.FeedEntity
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -88,14 +91,54 @@ internal fun deterministicEntityUuid(kind: String, naturalKey: String): String {
     return UUID(msb, lsb).toString()
 }
 
-internal fun feedNaturalKey(url: String): String = url.trim()
+internal fun canonicalizeSyncUrl(raw: String): String {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return ""
+    val canonical = runCatching {
+        val uri = URI(trimmed)
+        val scheme = uri.scheme?.lowercase()
+        val host = uri.host?.lowercase()
+        if (scheme.isNullOrBlank() || host.isNullOrBlank()) {
+            null
+        } else {
+            buildCanonicalHttpUriString(uri = uri, scheme = scheme, host = host)
+        }
+    }
+        .getOrNull()
+    return canonical ?: trimmed.lowercase()
+}
+
+private fun buildCanonicalHttpUriString(uri: URI, scheme: String, host: String): String {
+    val isHttpOrHttps = scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS
+    val defaultPort =
+        when (scheme) {
+            SCHEME_HTTP -> DEFAULT_HTTP_PORT
+            SCHEME_HTTPS -> DEFAULT_HTTPS_PORT
+            else -> -1
+        }
+    val portPart =
+        if (uri.port != -1 && uri.port != defaultPort) {
+            ":${uri.port}"
+        } else {
+            ""
+        }
+    val userInfoPart = uri.rawUserInfo?.let { "$it@" }.orEmpty()
+    val rawPath = uri.rawPath.orEmpty()
+    val normalizedPath = if (isHttpOrHttps && rawPath.isEmpty()) "/" else rawPath
+    val queryPart = uri.rawQuery?.let { "?$it" }.orEmpty()
+    val fragmentPart = uri.rawFragment?.let { "#$it" }.orEmpty()
+    return "$scheme://$userInfoPart$host$portPart$normalizedPath$queryPart$fragmentPart"
+}
+
+internal fun feedNaturalKey(url: String): String = canonicalizeSyncUrl(url)
 
 internal fun itemNaturalKey(feedUrl: String?, itemUrl: String): String {
-    val cleanFeedUrl = feedUrl?.trim()?.takeIf { it.isNotEmpty() }
+    val cleanFeedUrl = feedUrl?.trim()?.takeIf { it.isNotEmpty() }?.let(::canonicalizeSyncUrl)
+    val cleanItemUrl = canonicalizeSyncUrl(itemUrl)
     return if (cleanFeedUrl != null) {
-        "$cleanFeedUrl\u0000${itemUrl.trim()}"
+        "$cleanFeedUrl\u0000$cleanItemUrl"
     } else {
-        "manual\u0000${itemUrl.trim()}"
+        "manual\u0000$cleanItemUrl"
     }
 }
 
@@ -254,7 +297,7 @@ internal fun shouldPeerPollFeed(
     if (elapsedSecs != null && elapsedSecs >= intervalSecs * OVERDUE_RESCUE_MULTIPLIER) {
         return true
     }
-    if (activePeers.size <= 1) return true
+    if (!isSyncablePublicUrl(feed.url) || activePeers.size <= 1) return true
     val overdueSecs = elapsedSecs?.let { (it - intervalSecs).coerceAtLeast(0L) } ?: 0L
     val localStealBoost =
         if (overdueSecs > 0L) {
@@ -277,19 +320,116 @@ internal fun shouldPeerPollFeed(
 }
 
 internal fun isSyncablePublicUrl(rawUrl: String): Boolean {
-    val uri = runCatching { java.net.URI(rawUrl.trim()) }.getOrNull() ?: return false
+    val uri = runCatching { URI(rawUrl.trim()) }.getOrNull() ?: return false
     val scheme = uri.scheme?.lowercase()
-    val host = uri.host?.lowercase()?.trim('[', ']')
-    return (scheme == "http" || scheme == "https") && !host.isNullOrEmpty() && isPublicHost(host)
+    val rawHost = uri.host?.lowercase()
+    val allowedScheme = scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS
+    val allowedPort =
+        uri.port == -1 || uri.port == DEFAULT_HTTP_PORT || uri.port == DEFAULT_HTTPS_PORT
+    return allowedScheme &&
+        uri.rawUserInfo == null &&
+        allowedPort &&
+        !rawHost.isNullOrBlank() &&
+        isPublicHost(rawHost)
 }
 
-private fun isPublicHost(host: String): Boolean =
-    host !in DISALLOWED_SYNC_HOSTS &&
-        !host.endsWith(".local") &&
-        DISALLOWED_SYNC_HOST_PREFIXES.none { host.startsWith(it) }
+internal fun isSyncableItemUrl(rawUrl: String): Boolean {
+    val uri = runCatching { URI(rawUrl.trim()) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase()
+    val host = uri.host?.trim('[', ']')
+    return (scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS) &&
+        uri.rawUserInfo == null &&
+        !host.isNullOrBlank()
+}
 
-private val DISALLOWED_SYNC_HOSTS = setOf("localhost", "127.0.0.1", "0.0.0.0", "::1")
-private val DISALLOWED_SYNC_HOST_PREFIXES = listOf("10.", "192.168.", "169.254.")
+private fun isPublicHost(rawHost: String): Boolean {
+    if (rawHost.startsWith("[") && rawHost.endsWith("]")) {
+        return isPublicIpv6Literal(rawHost)
+    }
+    val normalized = rawHost.trimEnd('.')
+    val labels = normalized.split('.')
+    return when {
+        normalized.isEmpty() || '.' !in normalized || labels.any { it.isEmpty() } -> false
+        normalized.all { it.isDigit() || it == '.' } -> isPublicIpv4Literal(normalized)
+        labels.last().all { it.isDigit() } -> false
+        else -> DISALLOWED_DOMAIN_SUFFIXES.none { normalized.endsWith(it) }
+    }
+}
+
+private fun isPublicIpv4Literal(host: String): Boolean {
+    val octets =
+        host.split('.').mapNotNull { part ->
+            part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
+        }
+    return octets.size == IPV4_OCTET_COUNT && isPublicIpv4Octets(octets[0], octets[1])
+}
+
+private fun isPublicIpv4Bytes(bytes: ByteArray): Boolean =
+    bytes.size == IPV4_OCTET_COUNT &&
+        isPublicIpv4Octets(
+            bytes[0].toInt() and IPV4_OCTET_MAX,
+            bytes[1].toInt() and IPV4_OCTET_MAX,
+        )
+
+private fun isPublicIpv4Octets(first: Int, second: Int): Boolean {
+    val isRfc1918 =
+        first == IPV4_PRIVATE_10 ||
+            first == IPV4_PRIVATE_192 && second == IPV4_PRIVATE_168 ||
+            first == IPV4_PRIVATE_172 && second in IPV4_PRIVATE_172_MIN..IPV4_PRIVATE_172_MAX
+    val isReservedOrLocal =
+        first == 0 ||
+            first == IPV4_LOOPBACK_127 ||
+            first >= IPV4_MULTICAST_START ||
+            first == IPV4_LINK_LOCAL_169 && second == IPV4_LINK_LOCAL_254 ||
+            first == IPV4_CGNAT_100 && second in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
+    return !isRfc1918 && !isReservedOrLocal
+}
+
+private fun isPublicIpv6Literal(bracketedHost: String): Boolean = runCatching {
+    val addr = InetAddress.getByName(bracketedHost)
+    if (addr is Inet4Address) {
+        isPublicIpv4Bytes(addr.address)
+    } else {
+        isPublicIpv6Address(addr)
+    }
+}
+    .getOrDefault(false)
+
+private fun isPublicIpv6Address(addr: InetAddress): Boolean {
+    val bytes = addr.address
+    val firstByte = bytes[0].toInt() and IPV4_OCTET_MAX
+    val isUniqueLocal = firstByte and IPV6_ULA_MASK == IPV6_ULA_PREFIX
+    return !isUniqueLocal &&
+        !addr.isLoopbackAddress &&
+        !addr.isAnyLocalAddress &&
+        !addr.isLinkLocalAddress &&
+        !addr.isSiteLocalAddress &&
+        !addr.isMulticastAddress
+}
+
+private const val SCHEME_HTTP = "http"
+private const val SCHEME_HTTPS = "https"
+private const val DEFAULT_HTTP_PORT = 80
+private const val DEFAULT_HTTPS_PORT = 443
+private const val IPV4_OCTET_COUNT = 4
+private const val IPV4_OCTET_MAX = 255
+private const val IPV4_PRIVATE_10 = 10
+private const val IPV4_PRIVATE_172 = 172
+private const val IPV4_PRIVATE_172_MIN = 16
+private const val IPV4_PRIVATE_172_MAX = 31
+private const val IPV4_PRIVATE_192 = 192
+private const val IPV4_PRIVATE_168 = 168
+private const val IPV4_LOOPBACK_127 = 127
+private const val IPV4_LINK_LOCAL_169 = 169
+private const val IPV4_LINK_LOCAL_254 = 254
+private const val IPV4_CGNAT_100 = 100
+private const val IPV4_CGNAT_MIN = 64
+private const val IPV4_CGNAT_MAX = 127
+private const val IPV4_MULTICAST_START = 224
+private const val IPV6_ULA_MASK = 0xfe
+private const val IPV6_ULA_PREFIX = 0xfc
+private val DISALLOWED_DOMAIN_SUFFIXES =
+    listOf(".local", ".lan", ".internal", ".home.arpa", ".ts.net", ".localhost", ".home")
 internal const val DEFAULT_ONLINE_PEER_WEIGHT = 1.0
 private const val WIRED_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
 private const val WIFI_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT

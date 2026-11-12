@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -17,7 +17,6 @@ use tower_http::{
         CompressionLayer,
         predicate::{DefaultPredicate, NotForContentType, Predicate},
     },
-    cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     trace::TraceLayer,
 };
@@ -49,6 +48,7 @@ impl ApiRoutes {
         let large_body_routes = Router::new()
             .route("/api/v1/import/opml", post(Self::import_opml::<F>))
             .route("/api/v1/sync/peer", post(Self::sync_peer::<F>))
+            .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
             .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
 
         let protected = Router::new()
@@ -96,6 +96,7 @@ impl ApiRoutes {
             // Sync
             .route("/api/v1/sync/status", get(Self::sync_status::<F>))
             .route("/api/v1/sync/changes", get(Self::sync_changes::<F>))
+            .layer(DefaultBodyLimit::max(64 * 1024))
             .layer(RequestBodyLimitLayer::new(64 * 1024))
             .merge(large_body_routes)
             .route_layer(middleware::from_fn_with_state(
@@ -106,6 +107,7 @@ impl ApiRoutes {
         let public_pair = Router::new()
             .route("/auth/pair", post(Self::auth_pair::<F>))
             .route("/api/v1/auth/pair", post(Self::auth_pair::<F>))
+            .layer(DefaultBodyLimit::max(16 * 1024))
             .layer(RequestBodyLimitLayer::new(16 * 1024));
 
         let compression = CompressionLayer::new().compress_when(
@@ -123,7 +125,6 @@ impl ApiRoutes {
             .method_not_allowed_fallback(Self::handle_method_not_allowed)
             .layer(TraceLayer::new_for_http())
             .layer(compression)
-            .layer(CorsLayer::new())
             .with_state(service)
     }
 
@@ -1843,7 +1844,7 @@ mod tests {
         let all_items = db.items().list(None, None, Some(50)).await.unwrap();
         assert_eq!(all_items.len(), 1);
 
-        // Reject SSRF feed URLs in peer sync with 400 Bad Request
+        // Skip non-public SSRF feed URLs in peer sync without failing the sync request
         let bad_payload = serde_json::json!({
             "peer_id": "android-peer-1",
             "device_name": "Pixel 9",
@@ -1862,7 +1863,8 @@ mod tests {
             .body(Body::from(bad_payload.to_string()))
             .unwrap();
         let ssrf_response = app.clone().oneshot(ssrf_request).await.unwrap();
-        assert_eq!(ssrf_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ssrf_response.status(), StatusCode::OK);
+        assert_eq!(db.feeds().list().await.unwrap().len(), 1);
 
         // Peer sync should propagate feed archival (is_active = false) and unarchival without losing reading history
         let archive_sync_payload = serde_json::json!({
@@ -1932,5 +1934,186 @@ mod tests {
         assert_eq!(preserved_items.len(), 1);
         assert!(preserved_items[0].is_favorite);
         assert!(preserved_items[0].read_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_large_body_routes_accept_payloads_over_2_mib() {
+        let (app, auth) = setup_app().await;
+        let padding = "x".repeat(2_300_000);
+
+        let large_opml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <!-- {padding} -->
+  <body>
+    <outline type="rss" text="Large OPML Feed" xmlUrl="https://example.com/large-opml.xml" />
+  </body>
+</opml>"#
+        );
+        assert!(large_opml.len() > 2 * 1024 * 1024);
+
+        let opml_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/import/opml")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/xml")
+            .body(Body::from(large_opml))
+            .unwrap();
+        let opml_response = app.clone().oneshot(opml_request).await.unwrap();
+        assert_eq!(opml_response.status(), StatusCode::OK);
+        let opml_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(opml_response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(opml_body["imported_count"], 1);
+
+        let html_chunk = format!("<p>{}</p>", "a".repeat(40_000));
+        let items: Vec<serde_json::Value> = (0..60)
+            .map(|idx| {
+                serde_json::json!({
+                    "url": format!("https://example.com/large-sync-item-{idx}"),
+                    "title": format!("Large Item {idx}"),
+                    "content_html": html_chunk,
+                    "content_type": "article",
+                    "status": "unread"
+                })
+            })
+            .collect();
+        let large_sync_json = serde_json::json!({
+            "peer_id": "android-large-sync",
+            "device_name": "Pixel 10",
+            "network_tier": "wifi",
+            "items": items
+        })
+        .to_string();
+        assert!(large_sync_json.len() > 2 * 1024 * 1024);
+
+        let sync_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(large_sync_json))
+            .unwrap();
+        let sync_response = app.oneshot(sync_request).await.unwrap();
+        assert_eq!(sync_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_peer_sync_skips_lan_feeds_and_accepts_non_standard_port_items() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
+        let auth = format!("Bearer {token}");
+        let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
+
+        let payload = serde_json::json!({
+            "peer_id": "android-peer-1",
+            "device_name": "Pixel 10",
+            "network_tier": "wifi",
+            "feeds": [
+                {
+                    "url": "http://192.168.1.50/rss.xml",
+                    "title": "Home Router Feed",
+                    "feed_type": "rss"
+                },
+                {
+                    "url": "https://valid.example.com/rss.xml",
+                    "title": "Valid Public Feed",
+                    "feed_type": "rss"
+                }
+            ],
+            "items": [
+                {
+                    "url": "https://example.com:8443/demo",
+                    "title": "Port 8443 Demo",
+                    "content_type": "article",
+                    "status": "unread"
+                },
+                {
+                    "url": "https://intranet.tailnet.ts.net:9443/internal-note",
+                    "title": "Tailnet Non-Standard Port Item",
+                    "content_type": "article",
+                    "status": "unread"
+                },
+                {
+                    "feed_url": "https://valid.example.com/rss.xml",
+                    "url": "https://valid.example.com:8443/post-1",
+                    "title": "Valid Feed Item With Port",
+                    "content_type": "article",
+                    "status": "unread"
+                },
+                {
+                    "url": "https://user:secret@example.com/disallowed-creds",
+                    "title": "Credentials In Permalink",
+                    "content_type": "article",
+                    "status": "unread"
+                }
+            ]
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sync/peer")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+        let feeds = body["feeds"].as_array().unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0]["url"], "https://valid.example.com/rss.xml");
+
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let synced_urls: Vec<&str> = items.iter().map(|i| i["url"].as_str().unwrap()).collect();
+        assert!(synced_urls.contains(&"https://example.com:8443/demo"));
+        assert!(synced_urls.contains(&"https://intranet.tailnet.ts.net:9443/internal-note"));
+        assert!(synced_urls.contains(&"https://valid.example.com:8443/post-1"));
+    }
+
+    #[tokio::test]
+    async fn test_pairing_rate_limit_is_atomic_under_concurrent_burst() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let service =
+            RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+        let valid_code = service.auth().issue_pairing_code().await.unwrap();
+        let app = ApiRoutes::router_with_service(service);
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for idx in 0..10 {
+            let router = app.clone();
+            join_set.spawn(async move {
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/auth/pair")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"device_name":"burst-{idx}","pairing_code":"0000-wrong"}}"#
+                    )))
+                    .unwrap();
+                router.oneshot(req).await.unwrap().status()
+            });
+        }
+
+        let mut unauthorized_count = 0usize;
+        let mut throttled_count = 0usize;
+        while let Some(res) = join_set.join_next().await {
+            match res.unwrap() {
+                StatusCode::UNAUTHORIZED => unauthorized_count += 1,
+                StatusCode::TOO_MANY_REQUESTS => throttled_count += 1,
+                other => panic!("unexpected status: {other}"),
+            }
+        }
+
+        assert_eq!(unauthorized_count, 4);
+        assert_eq!(throttled_count, 6);
+        assert!(
+            db.auth().active_pairing_code_hash().await.unwrap().is_some(),
+            "Active pairing code must survive concurrent wrong burst without TOCTOU burnout"
+        );
+        assert_ne!(valid_code, "");
     }
 }

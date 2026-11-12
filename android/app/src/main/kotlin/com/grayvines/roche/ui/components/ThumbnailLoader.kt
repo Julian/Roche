@@ -1,6 +1,7 @@
 package com.grayvines.roche.ui.components
 
 import android.graphics.BitmapFactory
+import androidx.collection.LruCache
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -12,6 +13,7 @@ import com.grayvines.roche.data.resolveSafeChildFile
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.writeBytesAtomically
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -26,71 +28,98 @@ class ThumbnailLoader(
     private val decoder: (ByteArray) -> ImageBitmap? = ::decodeBitmapBytes,
     private val inlineDecoder: (ByteArray) -> ImageBitmap? =
         if (decoder === ::decodeBitmapBytes) ::decodeInlineBitmapBytes else decoder,
+    private val clockMs: () -> Long = System::currentTimeMillis,
 ) {
-    private val memoryCache =
-        object : LinkedHashMap<String, ImageBitmap>(INITIAL_CACHE_CAPACITY, LOAD_FACTOR, true) {
-            override fun removeEldestEntry(
-                eldest: MutableMap.MutableEntry<String, ImageBitmap>?
-            ): Boolean = size > MAX_MEMORY_THUMBNAILS
-        }
+    private val imageCache: LruCache<String, ImageBitmap> =
+        createBitmapLruCache(MAX_IMAGE_CACHE_KIB)
 
-    private val inlineMemoryCache =
-        object : LinkedHashMap<String, ImageBitmap>(INITIAL_CACHE_CAPACITY, LOAD_FACTOR, true) {
-            override fun removeEldestEntry(
-                eldest: MutableMap.MutableEntry<String, ImageBitmap>?
-            ): Boolean = size > MAX_MEMORY_INLINE_IMAGES
-        }
+    private val faviconCache: LruCache<String, ImageBitmap> =
+        createBitmapLruCache(MAX_FAVICON_CACHE_KIB)
 
-    private val failedKeys = LinkedHashSet<String>()
+    private val faviconDecoder: (ByteArray) -> ImageBitmap? =
+        if (decoder === ::decodeBitmapBytes) ::decodeFaviconBitmapBytes else decoder
+
+    private val failedKeys = ConcurrentHashMap<String, Long>()
 
     fun getCached(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
         if (cleanId.isBlank()) return null
-        return synchronized(memoryCache) { memoryCache[cleanId] }
+        return imageCache["$THUMB_KEY_PREFIX$cleanId"]
     }
 
     fun getCachedInlineImage(imageUrl: String): ImageBitmap? {
         val cleanId = imageUrl.trim()
         if (cleanId.isBlank()) return null
-        return synchronized(inlineMemoryCache) { inlineMemoryCache[cleanId] }
+        return imageCache["$INLINE_KEY_PREFIX$cleanId"]
+    }
+
+    internal fun getCachedFavicon(faviconUrl: String): ImageBitmap? {
+        val cleanId = faviconUrl.trim()
+        if (cleanId.isBlank()) return null
+        return faviconCache[cleanId]
     }
 
     suspend fun loadThumbnail(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
         if (cleanId.isBlank()) return null
-        getCached(cleanId)?.let {
-            return it
-        }
-
-        return withContext(Dispatchers.IO) {
-            loadOrFetchImage(cleanId = cleanId, targetCache = memoryCache, decode = decoder)
-        }
-    }
-
-    suspend fun loadInlineImage(imageUrl: String): ImageBitmap? {
-        val cleanId = imageUrl.trim()
-        if (cleanId.isBlank()) return null
-        getCachedInlineImage(cleanId)?.let {
+        val cacheKey = "$THUMB_KEY_PREFIX$cleanId"
+        imageCache[cacheKey]?.let {
             return it
         }
 
         return withContext(Dispatchers.IO) {
             loadOrFetchImage(
                 cleanId = cleanId,
-                targetCache = inlineMemoryCache,
+                cacheKey = cacheKey,
+                targetCache = imageCache,
+                decode = decoder,
+            )
+        }
+    }
+
+    suspend fun loadInlineImage(imageUrl: String): ImageBitmap? {
+        val cleanId = imageUrl.trim()
+        if (cleanId.isBlank()) return null
+        val cacheKey = "$INLINE_KEY_PREFIX$cleanId"
+        imageCache[cacheKey]?.let {
+            return it
+        }
+
+        return withContext(Dispatchers.IO) {
+            loadOrFetchImage(
+                cleanId = cleanId,
+                cacheKey = cacheKey,
+                targetCache = imageCache,
                 decode = inlineDecoder,
+            )
+        }
+    }
+
+    internal suspend fun loadFavicon(faviconUrl: String): ImageBitmap? {
+        val cleanId = faviconUrl.trim()
+        if (cleanId.isBlank()) return null
+        faviconCache[cleanId]?.let {
+            return it
+        }
+
+        return withContext(Dispatchers.IO) {
+            loadOrFetchImage(
+                cleanId = cleanId,
+                cacheKey = cleanId,
+                targetCache = faviconCache,
+                decode = faviconDecoder,
             )
         }
     }
 
     private suspend fun loadOrFetchImage(
         cleanId: String,
-        targetCache: LinkedHashMap<String, ImageBitmap>,
+        cacheKey: String,
+        targetCache: LruCache<String, ImageBitmap>,
         decode: (ByteArray) -> ImageBitmap?,
     ): ImageBitmap? {
         val diskBytes = readDiskCachedBytes(cleanId)
-        val alreadyFailed = synchronized(failedKeys) { cleanId in failedKeys }
-        if (diskBytes == null && alreadyFailed) return null
+        if (diskBytes == null && isRecentlyFailed(cleanId)) return null
         val (bytes, attemptedNetwork) =
             if (diskBytes != null) {
                 diskBytes to false
@@ -99,22 +128,34 @@ class ThumbnailLoader(
             }
         val bitmap = bytes?.let { runCatching { decode(it) }.getOrNull() }
         if (bitmap != null) {
-            synchronized(targetCache) { targetCache[cleanId] = bitmap }
-            synchronized(failedKeys) { failedKeys.remove(cleanId) }
+            targetCache.put(cacheKey, bitmap)
+            failedKeys.remove(cleanId)
         } else if (attemptedNetwork || diskBytes != null) {
             recordFailedKey(cleanId)
         }
         return bitmap
     }
 
-    private fun recordFailedKey(key: String) {
-        synchronized(failedKeys) {
-            if (failedKeys.size >= MAX_FAILED_THUMBNAILS && failedKeys.isNotEmpty()) {
-                val eldest = failedKeys.first()
-                failedKeys.remove(eldest)
-            }
-            failedKeys.add(key)
+    internal fun isRecentlyFailed(key: String): Boolean {
+        val failedAt = failedKeys[key] ?: return false
+        val elapsed = clockMs() - failedAt
+        return if (elapsed in 0L until FAILED_RETRY_COOLDOWN_MS) {
+            true
+        } else {
+            failedKeys.remove(key, failedAt)
+            false
         }
+    }
+
+    internal fun recordFailedKey(key: String) {
+        val now = clockMs()
+        if (failedKeys.size >= MAX_FAILED_THUMBNAILS) {
+            failedKeys.entries.removeIf { now - it.value >= FAILED_RETRY_COOLDOWN_MS }
+            if (failedKeys.size >= MAX_FAILED_THUMBNAILS) {
+                failedKeys.keys.firstOrNull()?.let { failedKeys.remove(it) }
+            }
+        }
+        failedKeys[key] = now
     }
 
     private fun readDiskCachedBytes(mediaId: String): ByteArray? = runCatching {
@@ -167,21 +208,33 @@ class ThumbnailLoader(
         }
     }
 
-    private companion object {
-        private const val INITIAL_CACHE_CAPACITY = 16
-        private const val LOAD_FACTOR = 0.75f
-        private const val MAX_MEMORY_THUMBNAILS = 64
-        private const val MAX_MEMORY_INLINE_IMAGES = 24
+    internal companion object {
+        internal const val FAILED_RETRY_COOLDOWN_MS = 60_000L
+        private const val THUMB_KEY_PREFIX = "thumb:"
+        private const val INLINE_KEY_PREFIX = "inline:"
+        private const val MAX_IMAGE_CACHE_KIB = 32 * 1024
+        private const val MAX_FAVICON_CACHE_KIB = 4 * 1024
         private const val MAX_FAILED_THUMBNAILS = 256
         private const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
     }
 }
 
-private fun decodeBitmapBytes(bytes: ByteArray): ImageBitmap? =
+internal fun createBitmapLruCache(maxSizeKiB: Int): LruCache<String, ImageBitmap> =
+    object : LruCache<String, ImageBitmap>(maxSizeKiB) {
+        override fun sizeOf(key: String, value: ImageBitmap): Int =
+            (value.width.toLong() * value.height.toLong() * BYTES_PER_PIXEL / KIB_BYTES)
+                .toInt()
+                .coerceAtLeast(1)
+    }
+
+internal fun decodeBitmapBytes(bytes: ByteArray): ImageBitmap? =
     decodeBitmapBytesAtSize(bytes, TARGET_THUMBNAIL_PX)
 
-private fun decodeInlineBitmapBytes(bytes: ByteArray): ImageBitmap? =
+internal fun decodeInlineBitmapBytes(bytes: ByteArray): ImageBitmap? =
     decodeBitmapBytesAtSize(bytes, TARGET_INLINE_IMAGE_PX)
+
+internal fun decodeFaviconBitmapBytes(bytes: ByteArray): ImageBitmap? =
+    decodeBitmapBytesAtSize(bytes, TARGET_FAVICON_PX)
 
 private fun decodeBitmapBytesAtSize(bytes: ByteArray, targetPx: Int): ImageBitmap? {
     val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -211,13 +264,23 @@ internal fun calculateInSampleSize(
     if (rawHeight > reqHeight || rawWidth > reqWidth) {
         val halfHeight = rawHeight / SAMPLE_DIVISOR
         val halfWidth = rawWidth / SAMPLE_DIVISOR
-        while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
+        while (halfHeight / inSampleSize >= reqHeight || halfWidth / inSampleSize >= reqWidth) {
             inSampleSize *= SAMPLE_DIVISOR
         }
+    }
+    while (
+        rawHeight / inSampleSize > MAX_BITMAP_DIMENSION_PX ||
+            rawWidth / inSampleSize > MAX_BITMAP_DIMENSION_PX
+    ) {
+        inSampleSize *= SAMPLE_DIVISOR
     }
     return inSampleSize
 }
 
+internal const val MAX_BITMAP_DIMENSION_PX = 2048
+private const val TARGET_FAVICON_PX = 128
 private const val TARGET_THUMBNAIL_PX = 256
 private const val TARGET_INLINE_IMAGE_PX = 1440
 private const val SAMPLE_DIVISOR = 2
+internal const val BYTES_PER_PIXEL = 4L
+internal const val KIB_BYTES = 1024L

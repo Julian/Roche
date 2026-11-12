@@ -141,7 +141,7 @@ class MainActivity : ComponentActivity() {
     private fun openUrlInBrowser(url: String) {
         runCatching {
             val uri = url.trim().toUri()
-            if (uri.scheme?.lowercase() in ALLOWED_HTTP_SCHEMES) {
+            if (uri.scheme?.lowercase() in ALLOWED_EXTERNAL_SCHEMES) {
                 startActivity(Intent(Intent.ACTION_VIEW, uri))
             }
         }
@@ -191,7 +191,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
-        private val ALLOWED_HTTP_SCHEMES = setOf("http", "https")
+        private val ALLOWED_EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
         private val OPML_MIME_TYPES = arrayOf("text/xml", "application/xml", "text/x-opml", "*/*")
     }
 }
