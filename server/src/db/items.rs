@@ -31,8 +31,6 @@ LEFT JOIN feeds f ON i.feed_id = f.id"
     };
 }
 
-const ITEM_SELECT: &str = item_select_sql!("i.content_html");
-
 /// List query projection that caps inline `content_html` at 64 KB so multi-hundred-KB full-book
 /// essays do not blow up bulk sync page responses or Android's 2 MB SQLite `CursorWindow`;
 /// oversized articles are lazy-hydrated via `GET /api/v1/items/{id}` (`ItemRepo::get`).
@@ -441,8 +439,13 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Item>> {
-        let sql = format!("{ITEM_SELECT} WHERE i.id = ?");
-        Ok(sqlx::query_as::<_, Item>(&sql).bind(id).fetch_optional(self.pool).await?)
+        Ok(sqlx::query_as::<_, Item>(concat!(
+            item_select_sql!("i.content_html"),
+            " WHERE i.id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?)
     }
 
     pub async fn list(
@@ -559,7 +562,7 @@ impl<'a> ItemRepo<'a> {
     }
 
     fn append_search_where_clause(
-        qb: &mut QueryBuilder<'_, sqlx::Sqlite>,
+        qb: &mut QueryBuilder<sqlx::Sqlite>,
         raw_search: &str,
         search_terms: &[SearchTerm],
     ) {

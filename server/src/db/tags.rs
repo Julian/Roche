@@ -8,9 +8,16 @@ use super::{
     sync::{deterministic_tag_id, tag_natural_key},
 };
 
-const TAG_SELECT: &str = "SELECT t.id, t.name, t.color,
+macro_rules! tag_select_sql {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT t.id, t.name, t.color,
        (SELECT COUNT(*) FROM item_tags it JOIN items i ON i.id = it.item_id WHERE it.tag_id = t.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
-FROM tags t";
+FROM tags t ",
+            $suffix
+        )
+    };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Tag {
@@ -66,13 +73,16 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Tag>> {
-        let sql = format!("{TAG_SELECT} WHERE t.id = ?");
-        Ok(sqlx::query_as::<_, Tag>(&sql).bind(id).fetch_optional(self.pool).await?)
+        Ok(sqlx::query_as::<_, Tag>(tag_select_sql!("WHERE t.id = ?"))
+            .bind(id)
+            .fetch_optional(self.pool)
+            .await?)
     }
 
     pub async fn list(&self) -> Result<Vec<Tag>> {
-        let sql = format!("{TAG_SELECT} ORDER BY t.name");
-        Ok(sqlx::query_as::<_, Tag>(&sql).fetch_all(self.pool).await?)
+        Ok(sqlx::query_as::<_, Tag>(tag_select_sql!("ORDER BY t.name"))
+            .fetch_all(self.pool)
+            .await?)
     }
 
     pub async fn update(
@@ -211,8 +221,10 @@ impl<'a> TagRepo<'a> {
 
         Self::attach_in_tx(&mut *conn, item_id, &tag_id, now).await?;
 
-        let sql = format!("{TAG_SELECT} WHERE t.id = ?");
-        let tag: Tag = sqlx::query_as(&sql).bind(&tag_id).fetch_one(&mut *conn).await?;
+        let tag: Tag = sqlx::query_as(tag_select_sql!("WHERE t.id = ?"))
+            .bind(&tag_id)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(tag)
     }
 
@@ -292,13 +304,14 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn list_for_item(&self, item_id: &str) -> Result<Vec<Tag>> {
-        let sql = format!(
-            "{TAG_SELECT}
-             JOIN item_tags it ON t.id = it.tag_id
+        Ok(sqlx::query_as::<_, Tag>(tag_select_sql!(
+            "JOIN item_tags it ON t.id = it.tag_id
              WHERE it.item_id = ?
              ORDER BY t.name"
-        );
-        Ok(sqlx::query_as::<_, Tag>(&sql).bind(item_id).fetch_all(self.pool).await?)
+        ))
+        .bind(item_id)
+        .fetch_all(self.pool)
+        .await?)
     }
 
     pub async fn list_all_item_tags(&self) -> Result<Vec<ItemTag>> {
