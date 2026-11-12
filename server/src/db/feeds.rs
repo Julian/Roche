@@ -13,10 +13,17 @@ use super::{
 };
 use crate::feeds::OpmlOutline;
 
-const FEED_SELECT: &str = "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
+macro_rules! feed_select_sql {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT f.id, f.feed_type, f.url, f.title, f.description, f.language,
        f.poll_interval, f.last_polled, f.last_polled_by, f.last_error, f.last_error_by, f.is_active,
        (SELECT COUNT(*) FROM items i WHERE i.feed_id = f.id AND i.status = 'unread' AND i.read_at IS NULL) AS unread_count
-FROM feeds f";
+FROM feeds f ",
+            $suffix
+        )
+    };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
@@ -250,13 +257,16 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Feed>> {
-        let sql = format!("{FEED_SELECT} WHERE f.id = ?");
-        Ok(sqlx::query_as::<_, Feed>(&sql).bind(id).fetch_optional(self.pool).await?)
+        Ok(sqlx::query_as::<_, Feed>(feed_select_sql!("WHERE f.id = ?"))
+            .bind(id)
+            .fetch_optional(self.pool)
+            .await?)
     }
 
     pub async fn list(&self) -> Result<Vec<Feed>> {
-        let sql = format!("{FEED_SELECT} ORDER BY f.created_at DESC");
-        Ok(sqlx::query_as::<_, Feed>(&sql).fetch_all(self.pool).await?)
+        Ok(sqlx::query_as::<_, Feed>(feed_select_sql!("ORDER BY f.created_at DESC"))
+            .fetch_all(self.pool)
+            .await?)
     }
 
     pub async fn update(
@@ -345,16 +355,17 @@ impl<'a> FeedRepo<'a> {
         &self,
         local_peer_id: &str,
     ) -> Result<Vec<Feed>> {
-        let sql = format!(
-            "{FEED_SELECT}
-             WHERE f.is_active = 1
+        Ok(sqlx::query_as::<_, Feed>(feed_select_sql!(
+            "WHERE f.is_active = 1
                AND (
                    f.last_polled IS NULL
                    OR datetime(f.last_polled) < datetime('now', '-' || f.poll_interval || ' minutes')
                    OR (f.last_error IS NOT NULL AND f.last_error_by IS NOT NULL AND f.last_error_by != ?)
                )"
-        );
-        Ok(sqlx::query_as::<_, Feed>(&sql).bind(local_peer_id).fetch_all(self.pool).await?)
+        ))
+        .bind(local_peer_id)
+        .fetch_all(self.pool)
+        .await?)
     }
 
     pub async fn record_poll_batch(
