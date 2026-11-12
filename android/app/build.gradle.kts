@@ -28,7 +28,14 @@ val commitCount =
         .asText
         .map { it.trim().toIntOrNull() ?: 1 }
 
-val wantsRelease = gradle.startParameter.taskNames.any { "Release" in it }
+fun isReleaseSigningTask(taskName: String): Boolean {
+    val task = taskName.substringAfterLast(':')
+    return "Release" in task &&
+        !task.contains("UnitTest", ignoreCase = true) &&
+        !task.contains("Lint", ignoreCase = true)
+}
+
+val wantsRelease = gradle.startParameter.taskNames.any(::isReleaseSigningTask)
 val keychainPassword =
     if (wantsRelease) {
         providers

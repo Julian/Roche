@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 
 use super::SyncRepo;
 
-const MAX_PAIRING_ATTEMPTS: i64 = 5;
+const MAX_PAIRING_ATTEMPTS: i64 = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DeviceToken {

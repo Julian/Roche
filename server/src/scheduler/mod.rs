@@ -318,36 +318,20 @@ impl FeedIngester {
         ctx: &MediaIngestContext<'_, F>,
         inserted: &[(String, PollItemCandidate)],
     ) {
-        let mut futures: Vec<Option<_>> = inserted
-            .iter()
-            .map(|(item_id, candidate)| {
-                Some(Box::pin(Self::ingest_item_media(
-                    ctx,
-                    item_id,
-                    candidate.content_type,
-                    &candidate.url,
-                )))
-            })
-            .collect();
-
-        if futures.is_empty() {
+        if inserted.is_empty() {
             return;
         }
-
-        std::future::poll_fn(move |cx| {
-            let mut all_done = true;
-            for slot in &mut futures {
-                if let Some(fut) = slot {
-                    if fut.as_mut().poll(cx).is_ready() {
-                        *slot = None;
-                    } else {
-                        all_done = false;
-                    }
-                }
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let worker = || async {
+            loop {
+                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((item_id, candidate)) = inserted.get(idx) else {
+                    break;
+                };
+                Self::ingest_item_media(ctx, item_id, candidate.content_type, &candidate.url).await;
             }
-            if all_done { std::task::Poll::Ready(()) } else { std::task::Poll::Pending }
-        })
-        .await;
+        };
+        tokio::join!(worker(), worker(), worker(), worker());
     }
 
     pub async fn ingest_item_media<F: FeedFetcher>(
@@ -799,6 +783,97 @@ mod tests {
         FeedIngester::ingest_item_media(&ctx, "non-existent-item", ContentType::Pdf, &pdf_url)
             .await;
         assert!(!temp_dir.join("pdfs/non-existent-item.pdf").exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_ingest_items_concurrently_bounds_active_workers_to_four() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConcurrencyProbeFetcher {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for ConcurrencyProbeFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                std::future::ready(Ok(String::new()))
+            }
+
+            fn fetch_pdf(
+                &self,
+                _url: &Url,
+            ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> {
+                let active = Arc::clone(&self.active);
+                let peak = Arc::clone(&self.peak);
+                async move {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(Some(b"%PDF-1.5\n%bounded-test\n%%EOF".to_vec()))
+                }
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/papers.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let batch_items: Vec<PollItemCandidate> = (0..12)
+            .map(|idx| PollItemCandidate {
+                title: format!("Paper {idx}"),
+                url: Url::parse(&format!("https://example.com/paper-{idx}.pdf")).unwrap(),
+                author: None,
+                published_at: None,
+                summary: format!("Summary {idx}"),
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Pdf,
+            })
+            .collect();
+        let inserted = db
+            .feeds()
+            .record_poll_batch(
+                &feed.id,
+                &PollBatch {
+                    title: Some("Papers".to_string()),
+                    description: None,
+                    language: None,
+                    items: batch_items,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted.len(), 12);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-bounded-ingest-{}", uuid::Uuid::new_v4()));
+        let store = MediaStore::new(&temp_dir);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let fetcher = ConcurrencyProbeFetcher { active, peak: Arc::clone(&peak) };
+        let ctx = MediaIngestContext {
+            db: &db,
+            media_store: &store,
+            ytdlp_worker: None,
+            download_semaphore: None,
+            fetcher: &fetcher,
+        };
+
+        FeedIngester::ingest_items_concurrently(&ctx, &inserted).await;
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=4).contains(&observed_peak),
+            "Expected bounded concurrency between 2 and 4, got {observed_peak}"
+        );
+        for (item_id, _) in &inserted {
+            assert_eq!(db.media().list_for_item(item_id).await.unwrap().len(), 1);
+        }
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

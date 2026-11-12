@@ -2437,4 +2437,113 @@ mod tests {
         assert_eq!(bump_resp.feeds[0].title.as_deref(), Some("My Custom Feed Name"));
         assert_eq!(bump_resp.feeds[0].description.as_deref(), Some("Updated desc"));
     }
+
+    #[test]
+    fn test_cross_stack_golden_vectors() {
+        #[derive(Deserialize)]
+        struct CanonicalUrlVector {
+            input: String,
+            expected: String,
+        }
+
+        #[derive(Deserialize)]
+        struct EntityIdVector {
+            feed_url: String,
+            item_url: String,
+            tag_name: String,
+            expected_feed_id: String,
+            expected_item_id: String,
+            expected_tag_id: String,
+        }
+
+        #[derive(Deserialize)]
+        struct HrwPeerInput {
+            peer_id: String,
+            weight: f64,
+        }
+
+        #[derive(Deserialize)]
+        struct HrwElectionVector {
+            feed_url: String,
+            peers: Vec<HrwPeerInput>,
+            expected_winner: String,
+        }
+
+        #[derive(Deserialize)]
+        struct GoldenVectors {
+            canonical_urls: Vec<CanonicalUrlVector>,
+            entity_ids: Vec<EntityIdVector>,
+            hrw_elections: Vec<HrwElectionVector>,
+        }
+
+        let vectors_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../testdata/cross_stack_vectors.json");
+        let raw = std::fs::read_to_string(&vectors_path).unwrap();
+        let vectors: GoldenVectors = serde_json::from_str(&raw).unwrap();
+
+        assert!(vectors.canonical_urls.len() >= 6);
+        for case in &vectors.canonical_urls {
+            assert_eq!(
+                canonicalize_sync_url(&case.input),
+                case.expected,
+                "canonical_urls mismatch for input '{}'",
+                case.input
+            );
+        }
+
+        assert!(vectors.entity_ids.len() >= 3);
+        for case in &vectors.entity_ids {
+            assert_eq!(
+                deterministic_feed_id(&case.feed_url),
+                case.expected_feed_id,
+                "feed_id mismatch for '{}'",
+                case.feed_url
+            );
+            assert_eq!(
+                deterministic_item_id(Some(&case.feed_url), &case.item_url),
+                case.expected_item_id,
+                "item_id mismatch for ('{}', '{}')",
+                case.feed_url,
+                case.item_url
+            );
+            assert_eq!(
+                deterministic_tag_id(&case.tag_name),
+                case.expected_tag_id,
+                "tag_id mismatch for '{}'",
+                case.tag_name
+            );
+        }
+
+        assert!(vectors.hrw_elections.len() >= 3);
+        let epoch_zero = DateTime::UNIX_EPOCH;
+        for case in &vectors.hrw_elections {
+            let peer_nodes: Vec<PeerNode> = case
+                .peers
+                .iter()
+                .map(|p| PeerNode {
+                    peer_id: p.peer_id.clone(),
+                    device_name: p.peer_id.clone(),
+                    network_tier: NetworkTier::Wifi,
+                    weight: p.weight,
+                    last_seen_at: epoch_zero,
+                })
+                .collect();
+            let winner = select_feed_poller(
+                &peer_nodes,
+                &case.feed_url,
+                30,
+                epoch_zero,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                winner,
+                Some(case.expected_winner.as_str()),
+                "hrw_elections mismatch for '{}'",
+                case.feed_url
+            );
+        }
+    }
 }

@@ -162,7 +162,7 @@ internal suspend fun reconcileRemoteSnapshot(
             feedUrlsById = feedUrlsById,
         )
 
-    dao.replaceSnapshotAtomically(
+    dao.reconcileSnapshotDiff(
         feeds = replacementFeeds,
         tags = tagEntitiesByName.values.toList(),
         items = replacementItems,

@@ -7,6 +7,8 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.data.NetworkTier
+import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.RocheDatabase
@@ -967,12 +969,169 @@ class MainViewModelTest {
             assertEquals(2, fetchCalls)
         }
 
+    @Test
+    internal fun `uiState caches localNetworkTier without IPC on ticks and refreshes on sync`() =
+        runTest {
+            var currentTier = NetworkTier.CELLULAR
+            var tierQueryCount = 0
+            val countingRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                    settings = settings,
+                    networkTierProvider =
+                        NetworkTierProvider {
+                            tierQueryCount++
+                            currentTier
+                        },
+                )
+            val localBackend = FakeAudioPlayerBackend()
+            val localVm =
+                MainViewModel(
+                    repository = countingRepo,
+                    settingsRepository = settings,
+                    playerBackend = localBackend,
+                    mediaSessionBridge = RecordingMediaSessionBridge(),
+                )
+            assertEquals(1, tierQueryCount)
+
+            val collectJob = backgroundScope.launch { localVm.uiState.collect() }
+            val initial = localVm.uiState.first { !it.isInitialLoading }
+            assertEquals(NetworkTier.CELLULAR, initial.localNetworkTier)
+            assertEquals(1, tierQueryCount)
+
+            val podcastFeed = testFeed("f-tier-pod", "Systems Cast").copy(feedType = "podcast")
+            val episode =
+                testItem("ep-tier-1", "Episode 1", "f-tier-pod")
+                    .copy(
+                        contentType = "audio",
+                        audioUrl = "https://example.com/tier-1.mp3",
+                        duration = "10:00",
+                    )
+            database.dao().upsertFeeds(listOf(podcastFeed))
+            database.dao().upsertItems(listOf(episode))
+            localVm.uiState.first { it.allEntries.size == 1 }
+
+            localVm.dispatch(MainAction.SelectTab(AppTab.FEEDS))
+            localVm.uiState.first { it.activeTab == AppTab.FEEDS }
+            localVm.dispatch(MainAction.UpdateSearchQuery("Episode"))
+            localVm.uiState.first { it.searchQuery == "Episode" }
+            localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
+            localVm.uiState.first { it.playerState.currentEntryId == "ep-tier-1" }
+            localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
+            localVm.uiState.first { it.playerState.positionMs == 10_100L }
+            assertEquals(1, tierQueryCount)
+
+            var playerEmissions = 0
+            val playerCollectJob =
+                backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                    localVm.playerController.state.collect { playerEmissions++ }
+                }
+            assertEquals(1, playerEmissions)
+
+            // Stalled and sub-second ticks within the same whole second do not emit state updates
+            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 1))
+            assertEquals(1, playerEmissions)
+            localBackend.setSimulatedPositionMs(10_850L)
+            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 2))
+            assertEquals(1, playerEmissions)
+
+            // Crossing a whole-second boundary emits once and still avoids ConnectivityManager IPC
+            localBackend.setSimulatedPositionMs(11_200L)
+            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 3))
+            assertEquals(2, playerEmissions)
+            assertEquals(11_200L, localVm.uiState.value.playerState.positionMs)
+            assertEquals(1, tierQueryCount)
+
+            // Active sleep timer ticks still emit countdown updates even when position is stalled
+            localVm.playerController.setSleepTimerMinutes(1)
+            assertEquals(3, playerEmissions)
+            assertTrue(localVm.playerController.advanceSingleTick(tickCount = 4))
+            assertEquals(4, playerEmissions)
+            assertEquals(59, localVm.playerController.state.value.sleepTimerRemainingSec)
+            playerCollectJob.cancel()
+
+            // SyncNow and PollFeedsOnDeviceNow refresh localNetworkTier in TransientUiState
+            currentTier = NetworkTier.WIFI
+            assertEquals(NetworkTier.CELLULAR, localVm.uiState.value.localNetworkTier)
+            localVm.dispatch(MainAction.SyncNow)
+            val afterSync =
+                localVm.uiState.first {
+                    !it.isSyncing && it.localNetworkTier == NetworkTier.WIFI
+                }
+            assertEquals(NetworkTier.WIFI, afterSync.localNetworkTier)
+            assertTrue(tierQueryCount > 1)
+
+            currentTier = NetworkTier.OFFLINE
+            localVm.dispatch(MainAction.PollFeedsOnDeviceNow)
+            val afterPoll =
+                localVm.uiState.first {
+                    !it.isSyncing && it.localNetworkTier == NetworkTier.OFFLINE
+                }
+            assertEquals(NetworkTier.OFFLINE, afterPoll.localNetworkTier)
+
+            localVm.playerController.stopAndClear()
+            collectJob.cancel()
+            localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+        }
+
+    @Test
+    internal fun `reader section outline heading map and scroll target use measured Y offsets`() {
+        val html =
+            "<p>Lead paragraph</p>" +
+                "<h2>Overview</h2>" +
+                "<p>Long uneven section with figures</p>" +
+                "<h2>Overview</h2>" +
+                "<h3>   </h3>" +
+                "<h2>Benchmarks</h2>" +
+                "<p>Short conclusion</p>"
+        val blocks = parseHtmlArticleBlocks(rawHtml = html, baseUrl = "https://example.com/post")
+        val headings = extractPlainTextHeadings(blocks)
+        val blockHeadingMap = mapBlockHeadingIndices(blocks)
+
+        assertEquals(listOf("Overview", "Benchmarks"), headings)
+        assertEquals(mapOf(1 to 0, 4 to 1), blockHeadingMap)
+
+        val measuredOffsets = mapOf(0 to 780, 1 to 4_650)
+        assertEquals(
+            780,
+            resolveHeadingScrollPx(
+                headingIndex = 0,
+                totalHeadings = headings.size,
+                maxScrollPx = 4_000,
+                measuredOffsetsPx = measuredOffsets,
+            ),
+        )
+        assertEquals(
+            4_000,
+            resolveHeadingScrollPx(
+                headingIndex = 1,
+                totalHeadings = headings.size,
+                maxScrollPx = 4_000,
+                measuredOffsetsPx = measuredOffsets,
+            ),
+        )
+        assertEquals(
+            2_000,
+            resolveHeadingScrollPx(
+                headingIndex = 1,
+                totalHeadings = headings.size,
+                maxScrollPx = 4_000,
+                measuredOffsetsPx = mapOf(0 to 780),
+            ),
+        )
+    }
+
     private class FakeAudioPlayerBackend : AudioPlayerBackend {
         var failNextLoad: Boolean = false
         private var positionMs: Long = 0L
         private var durationMs: Long = 1_800_000L
         private var playing: Boolean = false
         private var speed: Float = 1.0f
+
+        fun setSimulatedPositionMs(nextPositionMs: Long) {
+            positionMs = nextPositionMs.coerceAtLeast(0L)
+        }
 
         override fun loadAndPlay(
             source: String,

@@ -7,10 +7,12 @@ import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.ItemTagEntity
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
+import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -843,6 +845,45 @@ class RocheRepositoryTest {
             assertNull(database.dao().getPendingMutation("item-1"))
             assertNull(database.dao().getPendingMutation("item-5"))
         }
+
+    @Test
+    internal fun `reconcileSnapshotDiff applies targeted diffs chunks deletes and skips 0-change writes`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            }
+            var syncRound = 1
+            val diffRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildTargetedDiffSyncMockClient { syncRound },
+                    settings = settings,
+                )
+
+            // Round 1: initial snapshot with i-keep (oversized summary), i-edit, i-drop, 2 tags
+            assertEquals(3, diffRepo.syncWithServer().getOrThrow())
+            assertEquals(
+                setOf("keep", "drop"),
+                diffRepo.snapshot.first().tags.map { it.name }.toSet(),
+            )
+
+            // Round 2: 0-change sync preserves all rows identically
+            diffRepo.syncWithServer().getOrThrow()
+            assertEquals(3, diffRepo.snapshot.first().entries.size)
+
+            // Round 3: insert i-new, update i-edit, delete i-drop and drop tag
+            syncRound = 2
+            assertEquals(3, diffRepo.syncWithServer().getOrThrow())
+            val afterDiff = diffRepo.snapshot.first()
+            val byId = afterDiff.entries.associateBy { it.id }
+            assertEquals(setOf("i-keep", "i-edit", "i-new"), byId.keys)
+            assertEquals("Edited Title", byId.getValue("i-edit").title)
+            assertTrue(byId.getValue("i-edit").isFavorite)
+            assertEquals(listOf("keep"), byId.getValue("i-new").tags)
+            assertEquals(listOf("keep"), afterDiff.tags.map { it.name })
+
+            verifyDaoDiffSkipsZeroChangeAndChunksDeletes(database.dao())
+        }
 }
 
 internal fun buildFeedAndItemManagementMockClient(requests: MutableList<String>): RocheApiClient =
@@ -1224,5 +1265,187 @@ private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient 
                     """{"media":[{"id":"audio-broken","item_id":"item-audio-broken","media_type":"audio","file_size":2048}]}""",
             )
         else -> HttpResponse(statusCode = 503, body = """{"title":"Media Unavailable"}""")
+    }
+}
+
+internal fun buildTargetedDiffSyncMockClient(roundProvider: () -> Int): RocheApiClient {
+    val oversizedSummary = "s".repeat(17_000)
+    return RocheApiClient { request ->
+        val round = roundProvider()
+        when {
+            request.url.endsWith("/api/v1/feeds") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"feeds":[{"id":"f-1","title":"Feed","url":"https://example.com/rss","feed_type":"rss","unread_count":2}]}""",
+                )
+            request.url.endsWith("/api/v1/tags") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        if (round == 1) {
+                            """{"tags":[{"id":"t-keep","name":"keep","unread_count":1},{"id":"t-drop","name":"drop","unread_count":1}]}"""
+                        } else {
+                            """{"tags":[{"id":"t-keep","name":"keep","unread_count":2}]}"""
+                        },
+                )
+            request.url.contains("/api/v1/items") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body = buildTargetedDiffItemsJson(round, oversizedSummary),
+                )
+            else -> HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
+}
+
+internal fun buildTargetedDiffItemsJson(round: Int, oversizedSummary: String): String =
+    if (round == 1) {
+        """{"items":[""" +
+            """{"id":"i-keep","feed_id":"f-1","feed_title":"Feed","title":"Keep","url":"https://example.com/keep","summary":"$oversizedSummary","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","tag_names":["keep"]},""" +
+            """{"id":"i-edit","feed_id":"f-1","feed_title":"Feed","title":"Original","url":"https://example.com/edit","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T09:00:00Z","tag_names":[]},""" +
+            """{"id":"i-drop","feed_id":"f-1","feed_title":"Feed","title":"Drop","url":"https://example.com/drop","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T08:00:00Z","tag_names":["drop"]}]}"""
+    } else {
+        """{"items":[""" +
+            """{"id":"i-keep","feed_id":"f-1","feed_title":"Feed","title":"Keep","url":"https://example.com/keep","summary":"$oversizedSummary","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","tag_names":["keep"]},""" +
+            """{"id":"i-edit","feed_id":"f-1","feed_title":"Feed","title":"Edited Title","url":"https://example.com/edit","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-04-01T09:00:00Z","tag_names":[]},""" +
+            """{"id":"i-new","feed_id":"f-1","feed_title":"Feed","title":"New","url":"https://example.com/new","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T11:00:00Z","tag_names":["keep"]}]}"""
+    }
+
+internal suspend fun verifyDaoDiffSkipsZeroChangeAndChunksDeletes(baseDao: RocheDao) {
+    val spy = RecordingRocheDao(baseDao)
+    val feeds = baseDao.getAllFeeds()
+    val tags = baseDao.getAllTags()
+    val itemsWithOversizedSummary =
+        baseDao.getAllItems().map { item ->
+            if (item.id == "i-keep") item.copy(summary = "s".repeat(17_000)) else item
+        }
+    val itemTags = baseDao.getAllItemTags()
+
+    // 0-change reconcile (even when input summary exceeds 16384 chars) performs 0 writes/deletes
+    spy.resetCounts()
+    spy.reconcileSnapshotDiff(feeds, tags, itemsWithOversizedSummary, itemTags)
+    assertEquals(0, spy.totalWriteAndDeleteCalls)
+    assertEquals(0, spy.fullClearCalls)
+
+    // Seed 505 transient items, then reconcile back to the 3 surviving items -> 2 delete chunks
+    val transientItems =
+        (1..505).map { idx ->
+            itemsWithOversizedSummary
+                .first()
+                .copy(
+                    id = "temp-$idx",
+                    url = "https://example.com/temp-$idx",
+                )
+        }
+    baseDao.upsertItems(transientItems)
+    spy.resetCounts()
+    spy.reconcileSnapshotDiff(feeds, tags, itemsWithOversizedSummary, itemTags)
+    assertEquals(listOf(500, 5), spy.deletedItemChunks.map { it.size })
+    assertTrue(spy.upsertedItemIds.isEmpty())
+    assertEquals(0, spy.fullClearCalls)
+}
+
+internal class RecordingRocheDao(private val delegate: RocheDao) : RocheDao by delegate {
+    val upsertedFeedIds = mutableListOf<String>()
+    val upsertedTagIds = mutableListOf<String>()
+    val upsertedItemIds = mutableListOf<String>()
+    val insertedItemTags = mutableListOf<ItemTagEntity>()
+    val deletedItemChunks = mutableListOf<List<String>>()
+    val deletedFeedChunks = mutableListOf<List<String>>()
+    val deletedTagChunks = mutableListOf<List<String>>()
+    val deletedItemTags = mutableListOf<ItemTagEntity>()
+    var fullClearCalls = 0
+
+    val totalWriteAndDeleteCalls: Int
+        get() =
+            upsertedFeedIds.size +
+                upsertedTagIds.size +
+                upsertedItemIds.size +
+                insertedItemTags.size +
+                deletedItemChunks.size +
+                deletedFeedChunks.size +
+                deletedTagChunks.size +
+                deletedItemTags.size
+
+    fun resetCounts() {
+        upsertedFeedIds.clear()
+        upsertedTagIds.clear()
+        upsertedItemIds.clear()
+        insertedItemTags.clear()
+        deletedItemChunks.clear()
+        deletedFeedChunks.clear()
+        deletedTagChunks.clear()
+        deletedItemTags.clear()
+        fullClearCalls = 0
+    }
+
+    override suspend fun reconcileSnapshotDiff(
+        feeds: List<FeedEntity>,
+        tags: List<TagEntity>,
+        items: List<ItemEntity>,
+        itemTags: List<ItemTagEntity>,
+    ) {
+        super.reconcileSnapshotDiff(feeds, tags, items, itemTags)
+    }
+
+    override suspend fun upsertFeeds(feeds: List<FeedEntity>) {
+        upsertedFeedIds += feeds.map { it.id }
+        delegate.upsertFeeds(feeds)
+    }
+
+    override suspend fun upsertTags(tags: List<TagEntity>) {
+        upsertedTagIds += tags.map { it.id }
+        delegate.upsertTags(tags)
+    }
+
+    override suspend fun upsertItems(items: List<ItemEntity>) {
+        upsertedItemIds += items.map { it.id }
+        delegate.upsertItems(items)
+    }
+
+    override suspend fun insertItemTags(itemTags: List<ItemTagEntity>) {
+        insertedItemTags += itemTags
+        delegate.insertItemTags(itemTags)
+    }
+
+    override suspend fun deleteItemsByIds(ids: List<String>) {
+        deletedItemChunks += ids
+        delegate.deleteItemsByIds(ids)
+    }
+
+    override suspend fun deleteFeedsByIds(ids: List<String>) {
+        deletedFeedChunks += ids
+        delegate.deleteFeedsByIds(ids)
+    }
+
+    override suspend fun deleteTagsByIds(ids: List<String>) {
+        deletedTagChunks += ids
+        delegate.deleteTagsByIds(ids)
+    }
+
+    override suspend fun deleteItemTag(itemId: String, tagId: String) {
+        deletedItemTags += ItemTagEntity(itemId = itemId, tagId = tagId)
+        delegate.deleteItemTag(itemId, tagId)
+    }
+
+    override suspend fun clearAllItems() {
+        fullClearCalls++
+        delegate.clearAllItems()
+    }
+
+    override suspend fun clearAllFeeds() {
+        fullClearCalls++
+        delegate.clearAllFeeds()
+    }
+
+    override suspend fun clearAllTags() {
+        fullClearCalls++
+        delegate.clearAllTags()
+    }
+
+    override suspend fun clearAllItemTags() {
+        fullClearCalls++
+        delegate.clearAllItemTags()
     }
 }

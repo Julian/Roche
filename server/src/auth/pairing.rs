@@ -96,9 +96,14 @@ mod tests {
         assert!(pairing.consume_valid_code(&code.to_ascii_uppercase()).await.unwrap());
         assert!(!pairing.consume_valid_code(&code).await.unwrap());
 
-        // Brute-force protection: 5 wrong attempts invalidate the active code
+        // Brute-force protection: 5 wrong attempts from a single IP do not burn the code,
+        // while 25 wrong attempts across IPs invalidate the active code
         let code2 = pairing.create_code(300).await.unwrap();
         for _ in 0..5 {
+            assert!(!pairing.consume_valid_code("0000-wrong-code").await.unwrap());
+        }
+        assert!(db.auth().active_pairing_code_hash().await.unwrap().is_some());
+        for _ in 5..25 {
             assert!(!pairing.consume_valid_code("0000-wrong-code").await.unwrap());
         }
         assert!(!pairing.consume_valid_code(&code2).await.unwrap());

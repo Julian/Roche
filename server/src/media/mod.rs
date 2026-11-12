@@ -94,18 +94,26 @@ impl MediaStore {
         Ok(norm_cand)
     }
 
+    async fn validate_path_async(&self, candidate: &Path) -> Result<PathBuf> {
+        let store = self.clone();
+        let cand = candidate.to_path_buf();
+        tokio::task::spawn_blocking(move || store.validate_path(&cand))
+            .await
+            .map_err(|e| anyhow::anyhow!("Media path validation task failed: {e}"))?
+    }
+
     pub async fn open_file(&self, stored_path: &str) -> Result<tokio::fs::File> {
-        let safe_path = self.validate_path(Path::new(stored_path))?;
+        let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
         Ok(tokio::fs::File::open(&safe_path).await?)
     }
 
     pub async fn write_bytes(&self, stored_path: &str, bytes: &[u8]) -> Result<i64> {
-        let safe_path = self.validate_path(Path::new(stored_path))?;
+        let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
         if let Some(parent) = safe_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         // Re-validate after creating parent directories to guard against TOCTOU symlink swaps
-        let verified_path = self.validate_path(&safe_path)?;
+        let verified_path = self.validate_path_async(&safe_path).await?;
         let file_name = verified_path.file_name().and_then(|n| n.to_str()).unwrap_or("media");
         let temp_name = format!(".tmp-{}-{file_name}", uuid::Uuid::new_v4());
         let temp_path = verified_path.with_file_name(temp_name);
@@ -184,7 +192,7 @@ impl MediaStore {
     }
 
     pub async fn remove(&self, stored_path: &str) -> Result<()> {
-        let safe_path = self.validate_path(Path::new(stored_path))?;
+        let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
         match tokio::fs::remove_file(&safe_path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

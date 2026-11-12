@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State, rejection::ExtensionRejection},
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -161,9 +164,12 @@ impl ApiRoutes {
 
     async fn auth_pair<F: FeedFetcher>(
         State(service): State<Arc<RocheService<F>>>,
+        connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
         ProblemJson(req): ProblemJson<PairRequest>,
     ) -> Result<Json<serde_json::Value>, ApiError> {
-        let token = service.auth().pair_device(&req.device_name, &req.pairing_code).await?;
+        let client_ip =
+            connect_info.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ConnectInfo(addr)| addr.ip());
+        let token = service.pair_device(&req.device_name, &req.pairing_code, client_ip).await?;
         Ok(Json(serde_json::json!({
             "token": token,
             "expires_at": null,
@@ -2115,5 +2121,67 @@ mod tests {
             "Active pairing code must survive concurrent wrong burst without TOCTOU burnout"
         );
         assert_ne!(valid_code, "");
+    }
+
+    #[tokio::test]
+    async fn test_per_ip_pairing_rate_limit_isolates_attacker_from_legitimate_ip() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let service =
+            RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+        let valid_code = service.auth().issue_pairing_code().await.unwrap();
+        let app = ApiRoutes::router_with_service(service);
+
+        let attacker_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 51000);
+        let legit_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 52000);
+
+        // 5 bad guesses from 192.0.2.10: first 4 return 401, 5th is rate-limited with 429
+        for attempt in 0..5 {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/auth/pair")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_name":"attacker-{attempt}","pairing_code":"0000-wrong-guess"}}"#
+                )))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(attacker_addr));
+            let res = app.clone().oneshot(req).await.unwrap();
+            if attempt < 4 {
+                assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            } else {
+                assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+
+        // Subsequent attempt from 192.0.2.10 remains blocked even with the right code
+        let mut blocked_request = Request::builder()
+            .method("POST")
+            .uri("/auth/pair")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"device_name":"attacker-late","pairing_code":"{valid_code}"}}"#
+            )))
+            .unwrap();
+        blocked_request.extensions_mut().insert(ConnectInfo(attacker_addr));
+        let blocked_response = app.clone().oneshot(blocked_request).await.unwrap();
+        assert_eq!(blocked_response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Legitimate client on 192.0.2.20 is NOT rate-limited and pairs cleanly with active code
+        let mut legit_request = Request::builder()
+            .method("POST")
+            .uri("/auth/pair")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"device_name":"legit-pixel","pairing_code":"{valid_code}"}}"#
+            )))
+            .unwrap();
+        legit_request.extensions_mut().insert(ConnectInfo(legit_addr));
+        let legit_response = app.oneshot(legit_request).await.unwrap();
+        assert_eq!(legit_response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(legit_response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_ne!(body["token"].as_str().unwrap(), "");
     }
 }

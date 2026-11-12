@@ -1,0 +1,132 @@
+{
+  "canonical_urls": [
+    {
+      "input": "https://example.com",
+      "expected": "https://example.com/"
+    },
+    {
+      "input": "http://example.com:80/feed.xml",
+      "expected": "http://example.com/feed.xml"
+    },
+    {
+      "input": "https://example.com:443/atom.xml",
+      "expected": "https://example.com/atom.xml"
+    },
+    {
+      "input": "http://example.com:8080/api/rss",
+      "expected": "http://example.com:8080/api/rss"
+    },
+    {
+      "input": "HTTPS://Blog.Example.COM/Posts/Index.XML",
+      "expected": "https://blog.example.com/Posts/Index.XML"
+    },
+    {
+      "input": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "expected": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA"
+    },
+    {
+      "input": "https://arxiv.org/abs/2301.07041",
+      "expected": "https://arxiv.org/abs/2301.07041"
+    }
+  ],
+  "entity_ids": [
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "item_url": "https://blog.rust-lang.org/2026/05/01/rust.html",
+      "tag_name": "rust-lang",
+      "expected_feed_id": "06890597-e45d-5598-982b-d412998d0712",
+      "expected_item_id": "af903f9e-774e-5f56-8729-5a0c74c0d020",
+      "expected_tag_id": "ccaf8bbc-0b93-5616-a67b-cf894f7e88aa"
+    },
+    {
+      "feed_url": "HTTPS://Example.COM:443/rss.xml",
+      "item_url": "HTTP://Example.COM:80/posts/42?ref=rss",
+      "tag_name": "  Distributed Systems  ",
+      "expected_feed_id": "9685ae5c-7416-51e5-a398-0344776c97a8",
+      "expected_item_id": "75b6c3b7-3768-5798-9058-f56dd435492e",
+      "expected_tag_id": "6ec32a59-2213-5c47-a94b-b64e9fe4ca02"
+    },
+    {
+      "feed_url": "https://feeds.example.org:8443/podcast.xml",
+      "item_url": "https://podcast.example.org",
+      "tag_name": "Audio & Podcasts",
+      "expected_feed_id": "8dfd4ceb-41e9-552c-b788-bc0f7c75f7b0",
+      "expected_item_id": "f2883154-ec66-5c3c-882a-4ca16280f4f0",
+      "expected_tag_id": "d7ebd9c7-92ca-5c9c-b616-c47f4b03fa42"
+    }
+  ],
+  "hrw_elections": [
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "peers": [
+        {
+          "peer_id": "server",
+          "weight": 1.0
+        },
+        {
+          "peer_id": "android-pixel",
+          "weight": 1.0
+        },
+        {
+          "peer_id": "android-tablet",
+          "weight": 1.0
+        }
+      ],
+      "expected_winner": "server"
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "peers": [
+        {
+          "peer_id": "server",
+          "weight": 4.5
+        },
+        {
+          "peer_id": "android-pixel",
+          "weight": 0.8
+        },
+        {
+          "peer_id": "android-tablet",
+          "weight": 1.2
+        }
+      ],
+      "expected_winner": "android-tablet"
+    },
+    {
+      "feed_url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "peers": [
+        {
+          "peer_id": "server",
+          "weight": 0.4
+        },
+        {
+          "peer_id": "android-pixel",
+          "weight": 3.6
+        },
+        {
+          "peer_id": "laptop-peer",
+          "weight": 0.9
+        }
+      ],
+      "expected_winner": "laptop-peer"
+    },
+    {
+      "feed_url": "https://acquired.fm/rss.xml",
+      "peers": [
+        {
+          "peer_id": "server",
+          "weight": 0.0
+        },
+        {
+          "peer_id": "android-pixel",
+          "weight": 1.0
+        },
+        {
+          "peer_id": "android-tablet",
+          "weight": 2.5
+        }
+      ],
+      "expected_winner": "android-pixel"
+    }
+  ]
+}

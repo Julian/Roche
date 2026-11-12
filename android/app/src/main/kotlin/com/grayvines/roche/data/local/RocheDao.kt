@@ -5,6 +5,9 @@ import androidx.room3.Insert
 import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
+import com.grayvines.roche.data.MAX_SQLITE_HTML_CHARS
+import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
+import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -138,6 +141,12 @@ interface RocheDao {
     @Query("DELETE FROM item_tags WHERE itemId = :itemId")
     suspend fun deleteItemTagsForItem(itemId: String)
 
+    @Query("DELETE FROM feeds WHERE id IN (:ids)") suspend fun deleteFeedsByIds(ids: List<String>)
+
+    @Query("DELETE FROM tags WHERE id IN (:ids)") suspend fun deleteTagsByIds(ids: List<String>)
+
+    @Query("DELETE FROM items WHERE id IN (:ids)") suspend fun deleteItemsByIds(ids: List<String>)
+
     @Query("DELETE FROM item_tags") suspend fun clearAllItemTags()
 
     @Query("DELETE FROM items") suspend fun clearAllItems()
@@ -147,20 +156,66 @@ interface RocheDao {
     @Query("DELETE FROM tags") suspend fun clearAllTags()
 
     @Transaction
+    suspend fun reconcileSnapshotDiff(
+        feeds: List<FeedEntity>,
+        tags: List<TagEntity>,
+        items: List<ItemEntity>,
+        itemTags: List<ItemTagEntity>,
+    ) {
+        val existingFeedsById = getAllFeeds().associateBy { it.id }
+        val existingTagsById = getAllTags().associateBy { it.id }
+        val existingItemsById = getAllItems().associateBy { it.id }
+        val existingItemTags = getAllItemTags().toSet()
+
+        val targetFeedsById = feeds.associateBy { it.id }
+        val targetTagsById = tags.associateBy { it.id }
+        val targetItemsById = items.map { truncateItemForStorage(it) }.associateBy { it.id }
+        val targetItemTags = itemTags.toSet()
+
+        (existingItemTags - targetItemTags).forEach { removed ->
+            deleteItemTag(itemId = removed.itemId, tagId = removed.tagId)
+        }
+        deleteRemovedIdsInChunks(existingItemsById.keys, targetItemsById.keys) { ids ->
+            deleteItemsByIds(ids)
+        }
+        deleteRemovedIdsInChunks(existingFeedsById.keys, targetFeedsById.keys) { ids ->
+            deleteFeedsByIds(ids)
+        }
+        deleteRemovedIdsInChunks(existingTagsById.keys, targetTagsById.keys) { ids ->
+            deleteTagsByIds(ids)
+        }
+
+        val changedFeeds = collectChangedEntities(existingFeedsById, targetFeedsById)
+        if (changedFeeds.isNotEmpty()) {
+            upsertFeeds(changedFeeds)
+        }
+        val changedTags = collectChangedEntities(existingTagsById, targetTagsById)
+        if (changedTags.isNotEmpty()) {
+            upsertTags(changedTags)
+        }
+        val changedItems = collectChangedEntities(existingItemsById, targetItemsById)
+        if (changedItems.isNotEmpty()) {
+            upsertItems(changedItems)
+        }
+        val addedItemTags = (targetItemTags - existingItemTags).toList()
+        if (addedItemTags.isNotEmpty()) {
+            insertItemTags(addedItemTags)
+        }
+    }
+
+    @Transaction
     suspend fun replaceSnapshotAtomically(
         feeds: List<FeedEntity>,
         tags: List<TagEntity>,
         items: List<ItemEntity>,
         itemTags: List<ItemTagEntity>,
     ) {
-        clearAllItemTags()
-        clearAllItems()
-        clearAllFeeds()
-        clearAllTags()
-        upsertFeeds(feeds)
-        upsertTags(tags)
-        upsertItems(items)
-        insertItemTags(itemTags)
+        reconcileSnapshotDiff(
+            feeds = feeds,
+            tags = tags,
+            items = items,
+            itemTags = itemTags,
+        )
     }
 
     @Query("SELECT * FROM tags WHERE LOWER(name) = LOWER(:name) LIMIT 1")
@@ -253,3 +308,39 @@ interface RocheDao {
             java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
     )
 }
+
+internal const val SQLITE_DELETE_CHUNK_SIZE = 500
+
+internal fun truncateItemForStorage(item: ItemEntity): ItemEntity {
+    val summaryLen = item.summary?.length ?: 0
+    val textLen = item.contentText?.length ?: 0
+    val htmlLen = item.contentHtml?.length ?: 0
+    val withinBounds =
+        summaryLen <= MAX_SQLITE_SUMMARY_CHARS &&
+            textLen <= MAX_SQLITE_TEXT_CHARS &&
+            htmlLen <= MAX_SQLITE_HTML_CHARS
+    return if (withinBounds) {
+        item
+    } else {
+        item.copy(
+            summary = item.summary?.take(MAX_SQLITE_SUMMARY_CHARS),
+            contentText = item.contentText?.take(MAX_SQLITE_TEXT_CHARS),
+            contentHtml = item.contentHtml?.take(MAX_SQLITE_HTML_CHARS),
+        )
+    }
+}
+
+internal suspend fun deleteRemovedIdsInChunks(
+    existingIds: Set<String>,
+    targetIds: Set<String>,
+    deleteChunk: suspend (List<String>) -> Unit,
+) {
+    val removedIds = existingIds - targetIds
+    if (removedIds.isEmpty()) return
+    removedIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteChunk(chunk) }
+}
+
+internal fun <T> collectChangedEntities(
+    existingById: Map<String, T>,
+    targetById: Map<String, T>,
+): List<T> = targetById.mapNotNull { (id, target) -> target.takeIf { existingById[id] != it } }

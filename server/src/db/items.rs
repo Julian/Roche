@@ -585,6 +585,12 @@ impl<'a> ItemRepo<'a> {
                 .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
                 .push_bind(pattern)
                 .push(" ESCAPE '\\'))");
+        } else if let [term] = search_terms {
+            qb.push(" AND (fts.fts_rowid IS NOT NULL OR COALESCE(f.title, '') LIKE ")
+                .push_bind(term.like_pattern.clone())
+                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                .push_bind(term.like_pattern.clone())
+                .push(" ESCAPE '\\'))");
         } else {
             qb.push(" AND (fts.fts_rowid IS NOT NULL OR (");
             for (idx, term) in search_terms.iter().enumerate() {

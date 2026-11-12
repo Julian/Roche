@@ -855,24 +855,26 @@ class PodcastPlayerController(
         }
     }
 
-    private fun advanceSingleTick(tickCount: Int): Boolean {
+    internal fun advanceSingleTick(tickCount: Int): Boolean {
         val s = _state.value
         var keepRunning = s.isPlaying
         if (keepRunning) {
             val nextPos = backend.currentPositionMs().coerceAtLeast(0L)
             val updatedDuration = maxOf(s.durationMs, nextPos)
             val nextSleep = s.sleepTimerRemainingSec?.let { (it - 1).coerceAtLeast(0) }
-            if (nextSleep != null && nextSleep == 0) {
+            if (nextSleep == 0) {
                 stopForSleepTimer(nextPos, updatedDuration)
                 keepRunning = false
             } else {
                 val positionChanged = nextPos != s.positionMs
-                _state.update {
-                    it.copy(
-                        positionMs = nextPos,
-                        durationMs = updatedDuration,
-                        sleepTimerRemainingSec = nextSleep,
-                    )
+                if (shouldEmitTickState(s, nextPos, updatedDuration, nextSleep)) {
+                    _state.update {
+                        it.copy(
+                            positionMs = nextPos,
+                            durationMs = updatedDuration,
+                            sleepTimerRemainingSec = nextSleep,
+                        )
+                    }
                 }
                 if (positionChanged && tickCount % 5 == 0) {
                     syncMediaSessionBridge()
@@ -882,6 +884,16 @@ class PodcastPlayerController(
         }
         return keepRunning
     }
+
+    private fun shouldEmitTickState(
+        current: PodcastPlayerState,
+        nextPos: Long,
+        updatedDuration: Long,
+        nextSleep: Int?,
+    ): Boolean =
+        nextPos / 1_000L != current.positionMs / 1_000L ||
+            updatedDuration != current.durationMs ||
+            nextSleep != current.sleepTimerRemainingSec
 
     private fun stopForSleepTimer(nextPos: Long, updatedDuration: Long) {
         resumeAfterTransientFocusLoss = false

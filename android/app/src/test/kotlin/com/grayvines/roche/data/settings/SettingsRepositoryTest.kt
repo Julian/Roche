@@ -1,9 +1,11 @@
 package com.grayvines.roche.data.settings
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.io.File
+import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -13,6 +15,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -141,4 +144,86 @@ class SettingsRepositoryTest {
         assertEquals(firstBootPeerId, secondBootPeerId)
         scope2.coroutineContext[Job]?.cancelAndJoin()
     }
+
+    @Test
+    fun `TokenCipher encrypts bearerToken at rest with distinct IVs and rejects tampering`() =
+        runTest {
+            val secretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val otherKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val cipher = AesGcmSecretKeyTokenCipher(secretKey)
+
+            val enc1 = cipher.encrypt("super-secret-bearer")
+            val enc2 = cipher.encrypt("super-secret-bearer")
+            assertTrue(enc1.startsWith("enc:v1:"))
+            assertTrue(enc2.startsWith("enc:v1:"))
+            assertFalse(enc1.contains("super-secret-bearer"))
+            assertNotEquals(enc1.split(':')[2], enc2.split(':')[2])
+            assertEquals("super-secret-bearer", cipher.decrypt(enc1))
+            assertEquals("super-secret-bearer", cipher.decrypt(enc2))
+
+            val flippedLast = enc1.dropLast(1) + if (enc1.last() == 'A') 'B' else 'A'
+            assertEquals("", cipher.decrypt(flippedLast))
+            assertEquals("", cipher.decrypt("enc:v1:bad-iv:bad-ct"))
+            assertEquals("", AesGcmSecretKeyTokenCipher(otherKey).decrypt(enc1))
+
+            val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val store =
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "encrypted_token.preferences_pb") },
+                    )
+                val repository = SettingsRepository(store, cipher)
+                repository.update { it.copy(bearerToken = "  live-bearer-42  ") }
+
+                val rawStored = store.data.first()[SettingsRepository.KEY_BEARER_TOKEN].orEmpty()
+                assertTrue(rawStored.startsWith("enc:v1:"))
+                assertFalse(rawStored.contains("live-bearer-42"))
+                assertEquals("live-bearer-42", repository.settings.first().bearerToken)
+
+                store.edit { it[SettingsRepository.KEY_BEARER_TOKEN] = flippedLast }
+                assertEquals("", repository.settings.first().bearerToken)
+
+                repository.update { it.copy(bearerToken = "   ") }
+                assertEquals("", store.data.first()[SettingsRepository.KEY_BEARER_TOKEN])
+            } finally {
+                dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `legacy plaintext bearerToken remains readable and migrates to AES-GCM on next update`() =
+        runTest {
+            val secretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val cipher = AesGcmSecretKeyTokenCipher(secretKey)
+            val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val store =
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "legacy_token.preferences_pb") },
+                    )
+                store.edit { prefs ->
+                    prefs[SettingsRepository.KEY_SERVER_URL] = "http://100.64.0.9:8080"
+                    prefs[SettingsRepository.KEY_BEARER_TOKEN] = "legacy-plaintext-tok"
+                    prefs[SettingsRepository.KEY_LAST_PEER_SYNC_CURSOR] = "2026-06-01T12:00:00Z"
+                }
+
+                val repository = SettingsRepository(store, cipher)
+                val initialRead = repository.settings.first()
+                assertEquals("legacy-plaintext-tok", initialRead.bearerToken)
+                assertEquals("2026-06-01T12:00:00Z", initialRead.lastPeerSyncCursor)
+
+                repository.update { it.copy(ultraDenseRows = true) }
+
+                val migratedRaw = store.data.first()[SettingsRepository.KEY_BEARER_TOKEN].orEmpty()
+                assertTrue(migratedRaw.startsWith("enc:v1:"))
+                assertFalse(migratedRaw.contains("legacy-plaintext-tok"))
+                val afterUpdate = repository.settings.first()
+                assertEquals("legacy-plaintext-tok", afterUpdate.bearerToken)
+                assertEquals("2026-06-01T12:00:00Z", afterUpdate.lastPeerSyncCursor)
+            } finally {
+                dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
 }

@@ -22,7 +22,11 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
-class SettingsRepository(private val dataStore: DataStore<Preferences>) {
+class SettingsRepository
+internal constructor(
+    private val dataStore: DataStore<Preferences>,
+    private val tokenCipher: TokenCipher,
+) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
 
     val settings: Flow<Settings> =
@@ -36,6 +40,10 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                 }
             }
             .map { prefs -> prefs.toSettings() }
+
+    constructor(
+        dataStore: DataStore<Preferences>
+    ) : this(dataStore = dataStore, tokenCipher = createDefaultTokenCipher())
 
     private suspend fun ensurePeerIdPersisted(prefs: Preferences) {
         if (!prefs[KEY_PEER_ID].isNullOrBlank()) return
@@ -65,7 +73,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                     transformed
                 }
             prefs[KEY_SERVER_URL] = updated.serverUrl
-            prefs[KEY_BEARER_TOKEN] = updated.bearerToken
+            prefs[KEY_BEARER_TOKEN] = encodeBearerToken(updated.bearerToken)
             prefs[KEY_PEER_ID] = updated.peerId
             prefs[KEY_DEVICE_NAME] = updated.deviceName
             prefs[KEY_SWIPE_TO_ARCHIVE] = updated.swipeToArchive
@@ -82,11 +90,25 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         }
     }
 
+    private fun encodeBearerToken(plaintext: String): String {
+        val trimmed = plaintext.trim()
+        return if (trimmed.isEmpty()) "" else tokenCipher.encrypt(trimmed)
+    }
+
+    private fun decodeBearerToken(stored: String?): String {
+        val trimmed = stored?.trim().orEmpty()
+        return when {
+            trimmed.isEmpty() -> ""
+            trimmed.startsWith(ENCRYPTED_TOKEN_PREFIX) -> tokenCipher.decrypt(trimmed)
+            else -> trimmed
+        }
+    }
+
     @Suppress("CyclomaticComplexMethod")
     private fun Preferences.toSettings(): Settings =
         Settings(
                 serverUrl = this[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
-                bearerToken = this[KEY_BEARER_TOKEN].orEmpty(),
+                bearerToken = decodeBearerToken(this[KEY_BEARER_TOKEN]),
                 peerId = this[KEY_PEER_ID]?.takeIf { it.isNotBlank() } ?: fallbackPeerId,
                 deviceName =
                     this[KEY_DEVICE_NAME]?.takeIf { it.isNotBlank() }
@@ -127,21 +149,21 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
 
     companion object {
         private const val STORE_NAME = "roche_settings"
-        private val KEY_SERVER_URL = stringPreferencesKey("server_url")
-        private val KEY_BEARER_TOKEN = stringPreferencesKey("bearer_token")
-        private val KEY_PEER_ID = stringPreferencesKey("peer_id")
-        private val KEY_DEVICE_NAME = stringPreferencesKey("device_name")
-        private val KEY_SWIPE_TO_ARCHIVE = booleanPreferencesKey("swipe_to_archive")
-        private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
-        private val KEY_HEADLINE_FONT = stringPreferencesKey("headline_font")
-        private val KEY_ULTRA_DENSE_ROWS = booleanPreferencesKey("ultra_dense_rows")
-        private val KEY_READER_FONT_SCALE = floatPreferencesKey("reader_font_scale")
-        private val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
-        private val KEY_LAST_PEER_SYNC_CURSOR = stringPreferencesKey("last_peer_sync_cursor")
-        private val KEY_QUEUE_ITEM_IDS = stringPreferencesKey("queue_item_ids")
-        private val KEY_DEFAULT_PLAYBACK_SPEED = floatPreferencesKey("default_playback_speed")
-        private val KEY_SKIP_SILENCE_ENABLED = booleanPreferencesKey("skip_silence_enabled")
-        private val KEY_SMART_REWIND_ENABLED = booleanPreferencesKey("smart_rewind_enabled")
+        internal val KEY_SERVER_URL = stringPreferencesKey("server_url")
+        internal val KEY_BEARER_TOKEN = stringPreferencesKey("bearer_token")
+        internal val KEY_PEER_ID = stringPreferencesKey("peer_id")
+        internal val KEY_DEVICE_NAME = stringPreferencesKey("device_name")
+        internal val KEY_SWIPE_TO_ARCHIVE = booleanPreferencesKey("swipe_to_archive")
+        internal val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
+        internal val KEY_HEADLINE_FONT = stringPreferencesKey("headline_font")
+        internal val KEY_ULTRA_DENSE_ROWS = booleanPreferencesKey("ultra_dense_rows")
+        internal val KEY_READER_FONT_SCALE = floatPreferencesKey("reader_font_scale")
+        internal val KEY_BOTTOM_NAV_TABS = stringPreferencesKey("bottom_nav_tabs")
+        internal val KEY_LAST_PEER_SYNC_CURSOR = stringPreferencesKey("last_peer_sync_cursor")
+        internal val KEY_QUEUE_ITEM_IDS = stringPreferencesKey("queue_item_ids")
+        internal val KEY_DEFAULT_PLAYBACK_SPEED = floatPreferencesKey("default_playback_speed")
+        internal val KEY_SKIP_SILENCE_ENABLED = booleanPreferencesKey("skip_silence_enabled")
+        internal val KEY_SMART_REWIND_ENABLED = booleanPreferencesKey("smart_rewind_enabled")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext
@@ -150,7 +172,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
                     corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
                     produceFile = { appContext.preferencesDataStoreFile(STORE_NAME) },
                 )
-            return SettingsRepository(store)
+            return SettingsRepository(dataStore = store, tokenCipher = createDefaultTokenCipher())
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
+    net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -28,38 +29,55 @@ const MAX_DEVICE_NAME_LEN: usize = 128;
 const MAX_SYNC_URL_LEN: usize = 2048;
 const PAIR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
+const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
+
+#[derive(Debug, Default)]
+struct PairingRateLimiterState {
+    active_hash: Option<String>,
+    by_ip: HashMap<IpAddr, Vec<Instant>>,
+}
 
 #[derive(Debug, Default)]
 struct PairingRateLimiter {
-    state: Mutex<(Option<String>, VecDeque<Instant>)>,
+    state: Mutex<PairingRateLimiterState>,
 }
 
 impl PairingRateLimiter {
-    fn check_and_record(&self, active_hash: &str) -> bool {
+    fn check_and_record(&self, active_hash: &str, client_ip: IpAddr) -> bool {
         let now = Instant::now();
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.0.as_deref() != Some(active_hash) {
-            guard.0 = Some(active_hash.to_owned());
-            guard.1.clear();
+        if guard.active_hash.as_deref() != Some(active_hash) {
+            guard.active_hash = Some(active_hash.to_owned());
+            guard.by_ip.clear();
         }
-        while let Some(&front) = guard.1.front() {
-            if now.duration_since(front) >= PAIR_RATE_LIMIT_WINDOW {
-                guard.1.pop_front();
-            } else {
-                break;
+        guard.by_ip.retain(|_, timestamps| {
+            timestamps.retain(|&ts| now.duration_since(ts) < PAIR_RATE_LIMIT_WINDOW);
+            !timestamps.is_empty()
+        });
+        if let Some(timestamps) = guard.by_ip.get_mut(&client_ip) {
+            if timestamps.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
+                return false;
             }
+            timestamps.push(now);
+            return true;
         }
-        if guard.1.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
-            return false;
+        if guard.by_ip.len() >= MAX_TRACKED_PAIRING_IPS
+            && let Some(oldest_ip) = guard
+                .by_ip
+                .iter()
+                .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
+                .map(|(&ip, _)| ip)
+        {
+            guard.by_ip.remove(&oldest_ip);
         }
-        guard.1.push_back(now);
+        guard.by_ip.insert(client_ip, vec![now]);
         true
     }
 
     fn reset(&self) {
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.0 = None;
-        guard.1.clear();
+        guard.active_hash = None;
+        guard.by_ip.clear();
     }
 }
 
@@ -186,6 +204,15 @@ impl<F: FeedFetcher> RocheService<F> {
     #[must_use]
     pub const fn auth(&self) -> AuthService<'_, F> {
         AuthService { service: self }
+    }
+
+    pub async fn pair_device(
+        &self,
+        device_name: &str,
+        pairing_code: &str,
+        client_ip: IpAddr,
+    ) -> Result<String, ApiError> {
+        self.auth().pair_device(device_name, pairing_code, client_ip).await
     }
 
     #[must_use]
@@ -392,6 +419,7 @@ impl<F: FeedFetcher> AuthService<'_, F> {
         &self,
         device_name: &str,
         pairing_code: &str,
+        client_ip: IpAddr,
     ) -> Result<String, ApiError> {
         let trimmed_name = device_name.trim();
         if trimmed_name.is_empty() {
@@ -407,7 +435,7 @@ impl<F: FeedFetcher> AuthService<'_, F> {
             return Err(ApiError::unauthorized("Invalid or expired pairing code"));
         };
 
-        if !self.service.pairing_limiter.check_and_record(&active_hash) {
+        if !self.service.pairing_limiter.check_and_record(&active_hash, client_ip) {
             return Err(ApiError::too_many_requests(
                 "Too many failed pairing attempts; please wait before retrying",
             ));
@@ -967,5 +995,29 @@ impl<F: FeedFetcher> MediaService<'_, F> {
         self.service.media_store.remove(&media.path).await?;
         repo.delete(id).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[test]
+    fn test_pairing_rate_limiter_bounds_tracked_ips_and_evicts_oldest() {
+        let limiter = PairingRateLimiter::default();
+        let active_hash = "hash-1";
+
+        for idx in 0..(MAX_TRACKED_PAIRING_IPS + 8) {
+            let hi = u8::try_from((idx >> 8) & 0xff).unwrap();
+            let lo = u8::try_from(idx & 0xff).unwrap();
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, hi, lo));
+            assert!(limiter.check_and_record(active_hash, ip));
+        }
+
+        let guard = limiter.state.lock().unwrap();
+        assert_eq!(guard.by_ip.len(), MAX_TRACKED_PAIRING_IPS);
     }
 }

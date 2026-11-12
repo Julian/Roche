@@ -85,7 +85,9 @@ impl RocheServer {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         tracing::info!(addr = %addr, "Roche server listening");
-        axum::serve(listener, app).with_graceful_shutdown(Self::shutdown_signal()).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(Self::shutdown_signal())
+            .await?;
 
         scheduler_handle.abort();
         worker_handle.abort();

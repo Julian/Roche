@@ -368,6 +368,7 @@ internal data class TransientUiState(
     val prefilledShareUrl: String = "",
     val prefilledShareTitle: String = "",
     val isSyncing: Boolean = false,
+    val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
@@ -381,7 +382,8 @@ class MainViewModel(
     private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
 ) : ViewModel() {
 
-    private val transientState = MutableStateFlow(TransientUiState())
+    private val transientState =
+        MutableStateFlow(TransientUiState(localNetworkTier = repository.currentNetworkTier()))
 
     internal val playerController =
         PodcastPlayerController(
@@ -430,7 +432,7 @@ class MainViewModel(
                         snapshot = snapshot,
                         settings = settings,
                         local = local,
-                        localNetworkTier = repository.currentNetworkTier(),
+                        localNetworkTier = local.localNetworkTier,
                         playerState =
                             playerState.copy(smartRewindEnabled = settings.smartRewindEnabled),
                     )
@@ -616,7 +618,13 @@ class MainViewModel(
         }
     }
 
+    internal fun refreshLocalNetworkTier() {
+        val tier = repository.currentNetworkTier()
+        transientState.update { it.copy(localNetworkTier = tier) }
+    }
+
     internal suspend fun performSyncWithServerConfig(action: MainAction.SyncWithServerConfig) {
+        refreshLocalNetworkTier()
         performUpdateServerConfig(
             MainAction.UpdateServerConfig(
                 serverUrl = action.serverUrl,
@@ -625,6 +633,7 @@ class MainViewModel(
             )
         )
         performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
+        refreshLocalNetworkTier()
     }
 
     private suspend fun applySettingsMutation(action: MainAction.Mutation) {
@@ -682,6 +691,7 @@ class MainViewModel(
             showStatusMessage("Enter a pairing code")
             return
         }
+        refreshLocalNetworkTier()
         repository
             .pairWithCode(
                 serverUrl = action.serverUrl,
@@ -690,10 +700,12 @@ class MainViewModel(
             )
             .onSuccess {
                 val syncCount = repository.syncWithServer().getOrNull()
+                refreshLocalNetworkTier()
                 val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
                 showStatusMessage("Paired with server$suffix")
             }
             .onFailure { error ->
+                refreshLocalNetworkTier()
                 showStatusMessage("Pairing failed (${error.message ?: "error"})")
             }
     }
@@ -1339,18 +1351,22 @@ class MainViewModel(
     }
 
     internal suspend fun performStartupSync() {
+        refreshLocalNetworkTier()
         val initialState = uiState.first { !it.isInitialLoading }
         val currentSettings = initialState.settings
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             performSync(errorPolicy = SyncErrorPolicy.SILENT)
         }
+        refreshLocalNetworkTier()
     }
 
     internal suspend fun performPollFeedsOnDevice() {
+        refreshLocalNetworkTier()
         if (!tryAcquireSyncLock()) return
         try {
-            repository
-                .pollDueFeedsOnDeviceNow()
+            val pollResult = repository.pollDueFeedsOnDeviceNow()
+            refreshLocalNetworkTier()
+            pollResult
                 .onSuccess { count ->
                     val msg =
                         if (count == 0) {
@@ -1365,15 +1381,18 @@ class MainViewModel(
                     showStatusMessage("On-device poll skipped (${error.message ?: "offline"})")
                 }
         } finally {
+            refreshLocalNetworkTier()
             transientState.update { it.copy(isSyncing = false) }
         }
     }
 
     private suspend fun performSync(errorPolicy: SyncErrorPolicy = SyncErrorPolicy.SHOW_BANNER) {
+        refreshLocalNetworkTier()
         if (!tryAcquireSyncLock()) return
         try {
-            repository
-                .syncWithServer()
+            val syncResult = repository.syncWithServer()
+            refreshLocalNetworkTier()
+            syncResult
                 .onSuccess { count ->
                     showStatusMessage("Synced $count entries from server")
                 }
@@ -1383,6 +1402,7 @@ class MainViewModel(
                     }
                 }
         } finally {
+            refreshLocalNetworkTier()
             transientState.update { it.copy(isSyncing = false) }
         }
     }
@@ -1574,7 +1594,7 @@ internal fun buildMainUiState(
     snapshot: RepositorySnapshot,
     settings: Settings,
     local: TransientUiState,
-    localNetworkTier: NetworkTier = NetworkTier.WIFI,
+    localNetworkTier: NetworkTier = local.localNetworkTier,
     playerState: PodcastPlayerState = PodcastPlayerState(),
 ): MainUiState {
     val filtered =

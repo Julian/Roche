@@ -24,6 +24,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
@@ -36,6 +39,7 @@ import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlin.math.roundToInt
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
@@ -462,11 +466,46 @@ internal fun extractPreCodeText(preElement: Element): String {
     return clone.wholeText().trim('\r', '\n')
 }
 
+internal class ScrollCoordinateHolder {
+    var coords: LayoutCoordinates? = null
+}
+
+internal fun computeRelativeYOffsetPx(
+    rootCoords: LayoutCoordinates?,
+    targetCoords: LayoutCoordinates,
+): Int? =
+    if (rootCoords != null && rootCoords.isAttached && targetCoords.isAttached) {
+        (targetCoords.positionInRoot().y - rootCoords.positionInRoot().y)
+            .roundToInt()
+            .coerceAtLeast(0)
+    } else {
+        null
+    }
+
+internal fun Modifier.trackHeadingPosition(
+    headingIndex: Int?,
+    scrollRootCoords: (() -> LayoutCoordinates?)?,
+    fallbackOrigin: ScrollCoordinateHolder,
+    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)?,
+): Modifier =
+    if (headingIndex == null || onHeadingMeasured == null) {
+        this
+    } else {
+        onGloballyPositioned { headingCoords ->
+            val rootCoords = scrollRootCoords?.invoke() ?: fallbackOrigin.coords
+            computeRelativeYOffsetPx(rootCoords, headingCoords)?.let { yOffsetPx ->
+                onHeadingMeasured(headingIndex, yOffsetPx)
+            }
+        }
+    }
+
 @Composable
 internal fun StructuredHtmlArticleContent(
     blocks: List<ArticleBlock>,
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
+    scrollRootCoords: (() -> LayoutCoordinates?)? = null,
+    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     val linkStyles =
@@ -479,14 +518,36 @@ internal fun StructuredHtmlArticleContent(
                     )
             )
         }
+    val localOrigin = remember { ScrollCoordinateHolder() }
+    val headingIndices =
+        remember(blocks, onHeadingMeasured != null) {
+            if (onHeadingMeasured != null) mapBlockHeadingIndices(blocks) else emptyMap()
+        }
+    val columnModifier =
+        if (onHeadingMeasured != null) {
+            Modifier.onGloballyPositioned { coords -> localOrigin.coords = coords }
+        } else {
+            Modifier
+        }
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        blocks.forEach { block ->
+    Column(
+        modifier = columnModifier,
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        blocks.forEachIndexed { blockIndex, block ->
+            val headingModifier =
+                Modifier.trackHeadingPosition(
+                    headingIndex = headingIndices[blockIndex],
+                    scrollRootCoords = scrollRootCoords,
+                    fallbackOrigin = localOrigin,
+                    onHeadingMeasured = onHeadingMeasured,
+                )
             RenderArticleBlock(
                 block = block,
                 linkStyles = linkStyles,
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
+                modifier = headingModifier,
             )
         }
     }
@@ -498,12 +559,14 @@ private fun RenderArticleBlock(
     linkStyles: TextLinkStyles,
     baseUrl: String?,
     onOpenUrl: ((String) -> Unit)?,
+    modifier: Modifier = Modifier,
 ) {
     when (block) {
         is ArticleBlock.Heading ->
             RenderHeadingBlock(
                 block = block,
                 linkStyles = linkStyles,
+                modifier = modifier,
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
             )
@@ -556,6 +619,7 @@ private fun RenderArticleBlock(
 internal fun RenderHeadingBlock(
     block: ArticleBlock.Heading,
     linkStyles: TextLinkStyles,
+    modifier: Modifier = Modifier,
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
 ) {
@@ -596,6 +660,7 @@ internal fun RenderHeadingBlock(
         fontSize = (baseFontSize * scale).sp,
         lineHeight = (baseLineHeight * scale).sp,
         fontWeight = FontWeight.SemiBold,
+        modifier = modifier,
     )
 }
 
@@ -909,6 +974,22 @@ internal fun extractPlainTextHeadings(blocks: List<ArticleBlock>): List<String> 
         .map { heading -> Jsoup.parseBodyFragment(heading.html).text().trim() }
         .filter { it.isNotEmpty() }
         .distinct()
+
+internal fun mapBlockHeadingIndices(blocks: List<ArticleBlock>): Map<Int, Int> {
+    val seenTexts = HashSet<String>()
+    val indices = HashMap<Int, Int>()
+    var nextHeadingIndex = 0
+    blocks.forEachIndexed { blockIndex, block ->
+        if (block is ArticleBlock.Heading) {
+            val plainText = Jsoup.parseBodyFragment(block.html).text().trim()
+            if (plainText.isNotEmpty() && seenTexts.add(plainText)) {
+                indices[blockIndex] = nextHeadingIndex
+                nextHeadingIndex++
+            }
+        }
+    }
+    return indices
+}
 
 private const val MIN_HEADING = 1
 private const val MAX_HEADING = 6

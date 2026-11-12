@@ -1,5 +1,8 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.SyncTombstoneDto
+import com.grayvines.roche.data.local.FeedEntity
+import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.model.ContentType
 import java.io.File
 import kotlinx.coroutines.test.runTest
@@ -550,4 +553,108 @@ class RocheApiClientTest {
             )
             assertFalse(failedFile.exists())
         }
+
+    @Test
+    internal fun `RocheJsonCodec handles unread tombstone blank IDs polymorphic tags and peer sync`() {
+        assertEquals(
+            """{"read_at":null}""",
+            buildUpdateItemPayload(
+                status = null,
+                isFavorite = null,
+                readProgress = null,
+                readAt = UNREAD_READ_AT_TOMBSTONE,
+            ),
+        )
+        assertEquals(
+            """{"status":"unread"}""",
+            buildUpdateItemPayload(
+                status = "unread",
+                isFavorite = null,
+                readProgress = null,
+                readAt = null,
+            ),
+        )
+
+        val feeds =
+            parseFeedsJsonArray(
+                """[{"id":"","title":"Skip"},{"id":"f-ok","title":"Keep","url":"https://a.com/rss"}]"""
+            )
+        assertEquals(listOf("f-ok"), feeds.map { it.id })
+
+        val objTagsItem =
+            parseItemJson(
+                """{"id":"i-1","title":"T","url":"https://a.com/1",""" +
+                    """"duration":"14:30","tags":[{"id":"t1","name":" Systems "},""]}"""
+            )
+        assertEquals(listOf("systems"), objTagsItem.tagNames)
+        assertEquals("14:30", objTagsItem.duration)
+
+        val strTagsItems =
+            parseItemsEnvelopeJson(
+                """{"items":[{"id":" ","title":"Skip"},""" +
+                    """{"id":"i-2","title":"T2","url":"https://a.com/2","tags":["Rust"," EBPF "]}]}"""
+            )
+        assertEquals(listOf("i-2"), strTagsItems.map { it.id })
+        assertEquals(listOf("rust", "ebpf"), strTagsItems.single().tagNames)
+
+        verifyPeerSyncWireRoundTrip()
+    }
+}
+
+internal fun verifyPeerSyncWireRoundTrip() {
+    val payload =
+        buildPeerSyncRequestPayload(
+            PeerSyncRequestDto(
+                peerId = "android-1",
+                deviceName = "Pixel",
+                feeds =
+                    listOf(
+                        FeedEntity(
+                            id = "f-pod",
+                            title = "Pod",
+                            url = "https://pod.example.com/rss",
+                            siteUrl = null,
+                            feedType = "podcast",
+                        )
+                    ),
+                items =
+                    listOf(
+                        PeerSyncItemPayload(
+                            id = "i-unread",
+                            feedId = "f-pod",
+                            feedUrl = "https://pod.example.com/rss",
+                            title = "Ep 1",
+                            url = "https://pod.example.com/1",
+                            author = null,
+                            publishedAt = null,
+                            createdAt = "2026-06-01T00:00:00Z",
+                            summary = null,
+                            contentHtml = null,
+                            thumbnailUrl = null,
+                            contentType = "podcast",
+                            status = "unread",
+                            isFavorite = false,
+                            readAt = null,
+                            readProgress = 0.0,
+                            interactionUpdatedAt = null,
+                            tagNames = listOf("audio"),
+                            duration = 125L,
+                        )
+                    ),
+                tags = listOf(TagEntity(id = "t-audio", name = "audio")),
+                tombstones = listOf(SyncTombstoneDto("tag", "old", "2026-06-01T00:00:00Z")),
+            )
+        )
+    assertTrue(payload.contains(""""feed_type":"rss""""))
+    assertTrue(payload.contains(""""read_at":null"""))
+    val resp =
+        parsePeerSyncResponseJson(
+            """{"server_peer_id":"server","sync_timestamp":"2026-06-01T00:00:00Z",""" +
+                """"active_peers":[{"peer_id":""},{"peer_id":"server","device_name":"Srv"}],""" +
+                """"feeds":[{"id":""},{"id":"f-pod","title":"Pod","url":"https://pod.example.com/rss"}],""" +
+                """"items":[],"tags":[{"id":""},{"id":"t-audio","name":"audio"}],"tombstones":[]}"""
+        )
+    assertEquals(listOf("server"), resp?.activePeers?.map { it.peerId })
+    assertEquals(listOf("f-pod"), resp?.feeds?.map { it.id })
+    assertEquals(listOf("t-audio"), resp?.tags?.map { it.id })
 }

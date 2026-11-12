@@ -1,6 +1,7 @@
 package com.grayvines.roche.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -37,6 +38,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -81,19 +84,8 @@ fun ReaderView(
     val scrollState = rememberScrollState()
     val coroutineScope = rememberCoroutineScope()
     var showTypographyDrawer by rememberSaveable { mutableStateOf(false) }
-    val scrollFraction by
-        remember(scrollState, entry.readProgress) {
-            derivedStateOf {
-                if (scrollState.maxValue > 0) {
-                    (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(
-                        MIN_PROGRESS,
-                        1f,
-                    )
-                } else {
-                    entry.readProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
-                }
-            }
-        }
+    val htmlBody = resolveReaderHtmlBody(entry)
+    val headingOffsetsPx = remember(entry.id, htmlBody) { mutableMapOf<Int, Int>() }
 
     ReaderScrollProgressEffect(entry = entry, scrollState = scrollState, onAction = onAction)
 
@@ -106,22 +98,22 @@ fun ReaderView(
             onAction = onAction,
             onShare = { onShareEntry(entry) },
         )
-
-        Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(colors.border)) {
-            Box(
-                modifier =
-                    Modifier.fillMaxWidth(scrollFraction).height(2.dp).background(colors.accentBlue)
-            )
-        }
+        ReaderScrollProgressBar(scrollState = scrollState, fallbackProgress = entry.readProgress)
 
         if (showTypographyDrawer) {
             ReaderTypographyDrawer(
                 entry = entry,
                 settings = settings,
                 onAction = onAction,
-                onJumpToFraction = { fraction ->
+                onJumpToSection = { headingIndex, totalHeadings ->
                     coroutineScope.launch {
-                        val target = (fraction * scrollState.maxValue).roundToInt()
+                        val target =
+                            resolveHeadingScrollPx(
+                                headingIndex = headingIndex,
+                                totalHeadings = totalHeadings,
+                                maxScrollPx = scrollState.maxValue,
+                                measuredOffsetsPx = headingOffsetsPx,
+                            )
                         scrollState.animateScrollTo(target)
                     }
                 },
@@ -133,6 +125,37 @@ fun ReaderView(
             scrollState = scrollState,
             onSelectTag = { onAction(MainAction.FilterByTag(it)) },
             onOpenExternalUrl = onOpenExternalUrl,
+            onHeadingMeasured = { headingIndex, yOffsetPx ->
+                headingOffsetsPx[headingIndex] = yOffsetPx
+            },
+        )
+    }
+}
+
+@Composable
+internal fun ReaderScrollProgressBar(
+    scrollState: ScrollState,
+    fallbackProgress: Double,
+) {
+    val colors = LocalRocheColors.current
+    val scrollFraction by
+        remember(scrollState, fallbackProgress) {
+            derivedStateOf {
+                if (scrollState.maxValue > 0) {
+                    (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(
+                        MIN_PROGRESS,
+                        1f,
+                    )
+                } else {
+                    fallbackProgress.toFloat().coerceIn(MIN_PROGRESS, 1f)
+                }
+            }
+        }
+
+    Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(colors.border)) {
+        Box(
+            modifier =
+                Modifier.fillMaxWidth(scrollFraction).height(2.dp).background(colors.accentBlue)
         )
     }
 }
@@ -140,7 +163,7 @@ fun ReaderView(
 @Composable
 internal fun ReaderScrollProgressEffect(
     entry: InboxEntry,
-    scrollState: androidx.compose.foundation.ScrollState,
+    scrollState: ScrollState,
     onAction: (MainAction) -> Unit,
 ) {
     val bodyLengthBucket = (entry.contentHtml?.length ?: 0) + (entry.contentText?.length ?: 0)
@@ -230,14 +253,17 @@ internal fun ReaderTypographyDrawer(
     entry: InboxEntry,
     settings: Settings,
     onAction: (MainAction) -> Unit,
-    onJumpToFraction: (Float) -> Unit,
+    onJumpToSection: (headingIndex: Int, totalHeadings: Int) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val scale = settings.readerFontScale
+    val htmlBody = resolveReaderHtmlBody(entry)
     val headings =
-        remember(entry.contentHtml, entry.summary, entry.url) {
-            val html = entry.contentHtml ?: entry.summary.orEmpty()
-            extractPlainTextHeadings(parseHtmlArticleBlocks(rawHtml = html, baseUrl = entry.url))
+        remember(htmlBody, entry.url) {
+            htmlBody
+                ?.let { parseHtmlArticleBlocks(rawHtml = it, baseUrl = entry.url) }
+                ?.let(::extractPlainTextHeadings)
+                .orEmpty()
         }
 
     Column(
@@ -258,7 +284,10 @@ internal fun ReaderTypographyDrawer(
         ReaderAppearanceQuickToggleRow(settings = settings, onAction = onAction)
 
         if (headings.isNotEmpty()) {
-            ReaderSectionsOutlineStrip(headings = headings, onJumpToFraction = onJumpToFraction)
+            ReaderSectionsOutlineStrip(
+                headings = headings,
+                onSelectHeading = { index -> onJumpToSection(index, headings.size) },
+            )
         }
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -348,7 +377,7 @@ internal fun ReaderFontScaleControlsRow(
 @Composable
 internal fun ReaderSectionsOutlineStrip(
     headings: List<String>,
-    onJumpToFraction: (Float) -> Unit,
+    onSelectHeading: (headingIndex: Int) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Text(
@@ -362,16 +391,10 @@ internal fun ReaderSectionsOutlineStrip(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         headings.forEachIndexed { index, heading ->
-            val fraction =
-                if (headings.size <= 1) {
-                    0f
-                } else {
-                    index.toFloat() / headings.size.toFloat()
-                }
             FilterChipPill(
                 label = "§ ${heading.take(MAX_SECTION_LABEL_CHARS)}",
                 selected = false,
-                onClick = { onJumpToFraction(fraction) },
+                onClick = { onSelectHeading(index) },
             )
         }
     }
@@ -414,15 +437,18 @@ private fun CompactStarAndArchiveButtons(
 @Composable
 internal fun ReaderArticleBody(
     entry: InboxEntry,
-    scrollState: androidx.compose.foundation.ScrollState,
+    scrollState: ScrollState,
     onSelectTag: (String) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
+    val scrollOrigin = remember(entry.id) { ScrollCoordinateHolder() }
     Column(
         modifier =
             Modifier.fillMaxSize()
                 .verticalScroll(scrollState)
+                .onGloballyPositioned { coords -> scrollOrigin.coords = coords }
                 .padding(horizontal = 20.dp, vertical = 18.dp)
     ) {
         ReaderArticleHeader(entry = entry)
@@ -447,7 +473,12 @@ internal fun ReaderArticleBody(
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         Spacer(modifier = Modifier.height(16.dp))
 
-        ReaderBodyContent(entry = entry, onOpenExternalUrl = onOpenExternalUrl)
+        ReaderBodyContent(
+            entry = entry,
+            onOpenExternalUrl = onOpenExternalUrl,
+            scrollRootCoords = { scrollOrigin.coords },
+            onHeadingMeasured = onHeadingMeasured,
+        )
         Spacer(modifier = Modifier.height(24.dp))
     }
 }
@@ -491,12 +522,13 @@ internal fun ReaderArticleHeader(entry: InboxEntry) {
 }
 
 @Composable
-internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: (String) -> Unit = {}) {
-    val colors = LocalRocheColors.current
-    val scale = LocalReaderFontScale.current
-    val htmlBody =
-        entry.contentHtml?.takeIf { it.isNotBlank() }
-            ?: entry.summary?.takeIf { "<" in it || "&" in it }
+internal fun ReaderBodyContent(
+    entry: InboxEntry,
+    onOpenExternalUrl: (String) -> Unit = {},
+    scrollRootCoords: (() -> LayoutCoordinates?)? = null,
+    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
+) {
+    val htmlBody = resolveReaderHtmlBody(entry)
     val htmlBlocks =
         remember(htmlBody, entry.url) {
             htmlBody?.let { parseHtmlArticleBlocks(rawHtml = it, baseUrl = entry.url) }.orEmpty()
@@ -508,32 +540,11 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: (String) ->
                     blocks = htmlBlocks,
                     baseUrl = entry.url,
                     onOpenUrl = onOpenExternalUrl,
+                    scrollRootCoords = scrollRootCoords,
+                    onHeadingMeasured = onHeadingMeasured,
                 )
             } else {
-                val bodyParagraphs =
-                    (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
-                        .split("\n\n")
-                        .filter { it.isNotBlank() }
-
-                if (bodyParagraphs.isEmpty()) {
-                    Text(
-                        text = "Full article text is not cached locally for this item.",
-                        color = colors.textMuted,
-                        fontSize = 14.sp,
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                } else {
-                    bodyParagraphs.forEach { paragraph ->
-                        Text(
-                            text = paragraph.trim(),
-                            color = colors.textPrimary,
-                            fontFamily = FontFamily.Serif,
-                            fontSize = (16f * scale).sp,
-                            lineHeight = (26f * scale).sp,
-                        )
-                        Spacer(modifier = Modifier.height(14.dp))
-                    }
-                }
+                ReaderPlainTextParagraphs(entry = entry)
             }
         }
     }
@@ -542,6 +553,57 @@ internal fun ReaderBodyContent(entry: InboxEntry, onOpenExternalUrl: (String) ->
         label = "Open Original Link ↗",
         onClick = { onOpenExternalUrl(entry.url) },
     )
+}
+
+@Composable
+internal fun ReaderPlainTextParagraphs(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    val scale = LocalReaderFontScale.current
+    val bodyParagraphs =
+        (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
+            .split("\n\n")
+            .filter { it.isNotBlank() }
+
+    if (bodyParagraphs.isEmpty()) {
+        Text(
+            text = "Full article text is not cached locally for this item.",
+            color = colors.textMuted,
+            fontSize = 14.sp,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+    } else {
+        bodyParagraphs.forEach { paragraph ->
+            Text(
+                text = paragraph.trim(),
+                color = colors.textPrimary,
+                fontFamily = FontFamily.Serif,
+                fontSize = (16f * scale).sp,
+                lineHeight = (26f * scale).sp,
+            )
+            Spacer(modifier = Modifier.height(14.dp))
+        }
+    }
+}
+
+internal fun resolveReaderHtmlBody(entry: InboxEntry): String? =
+    entry.contentHtml?.takeIf { it.isNotBlank() }
+        ?: entry.summary?.takeIf { "<" in it || "&" in it }
+
+internal fun resolveHeadingScrollPx(
+    headingIndex: Int,
+    totalHeadings: Int,
+    maxScrollPx: Int,
+    measuredOffsetsPx: Map<Int, Int>,
+): Int {
+    val safeMax = maxScrollPx.coerceAtLeast(0)
+    val measured = measuredOffsetsPx[headingIndex]
+    return if (measured != null) {
+        measured.coerceIn(0, safeMax)
+    } else {
+        val safeCount = totalHeadings.coerceAtLeast(1)
+        val fraction = if (totalHeadings <= 1) 0f else headingIndex.toFloat() / safeCount.toFloat()
+        (fraction * safeMax).roundToInt().coerceIn(0, safeMax)
+    }
 }
 
 private fun formatReaderByline(entry: InboxEntry): String = buildString {
