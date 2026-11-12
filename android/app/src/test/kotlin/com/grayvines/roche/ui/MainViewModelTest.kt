@@ -22,11 +22,15 @@ import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -49,6 +53,7 @@ import org.junit.jupiter.api.io.TempDir
 class MainViewModelTest {
     @TempDir lateinit var tempDir: File
 
+    private lateinit var dataStoreScope: CoroutineScope
     private lateinit var database: RocheDatabase
     private lateinit var settings: SettingsRepository
     private lateinit var repository: RocheRepository
@@ -60,9 +65,11 @@ class MainViewModelTest {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         database =
             Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
+        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val dataStore =
             PreferenceDataStoreFactory.create(
-                produceFile = { File(tempDir, "vm_test_settings.preferences_pb") }
+                scope = dataStoreScope,
+                produceFile = { File(tempDir, "vm_test_settings.preferences_pb") },
             )
         settings = SettingsRepository(dataStore)
         val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
@@ -73,13 +80,18 @@ class MainViewModelTest {
             MainViewModel(
                 repository = repository,
                 settingsRepository = settings,
+                playerBackend = DeterministicTestAudioBackend(),
                 mediaSessionBridge = mediaSessionBridge,
             )
     }
 
     @AfterEach
     fun tearDown() {
-        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        viewModel.playerController.releaseController()
+        runBlocking {
+            viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+        }
         database.close()
         Dispatchers.resetMain()
     }
@@ -668,6 +680,7 @@ class MainViewModelTest {
                 viewModel.uiState.first {
                     it.playerState.currentEntryId == "ep-2" &&
                         it.allEntries.first { e -> e.id == "ep-1" }.isArchived &&
+                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2") &&
                         it.listeningHistoryEntries.size == 2
                 }
             assertEquals(listOf("art-mid", "ep-2"), playingEp2.queueEntries.map { it.id })
@@ -741,9 +754,13 @@ class MainViewModelTest {
             viewModel.uiState.first {
                 it.playerState.currentEntryId == "ep-a" && it.playerState.hasNextQueuedAudio
             }
+            val epASnapshot =
+                mediaSessionBridge.snapshots.first {
+                    it?.entryId == "ep-a" && it.hasNextQueuedAudio
+                }
             assertTrue(mediaSessionBridge.focusRequestedCount > 0)
-            assertEquals("Episode A", mediaSessionBridge.latestSnapshot?.episodeTitle)
-            assertTrue(mediaSessionBridge.latestSnapshot?.hasNextQueuedAudio == true)
+            assertEquals("Episode A", epASnapshot?.episodeTitle)
+            assertTrue(epASnapshot?.hasNextQueuedAudio == true)
 
             // Seek, Fast-forward 30s & Rewind 15s via MediaSession commands
             mediaSessionBridge.callbacks?.onSeekToMs(60_000L)
@@ -778,8 +795,9 @@ class MainViewModelTest {
             )
             mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
             viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
-            assertEquals("Episode B", mediaSessionBridge.latestSnapshot?.episodeTitle)
-            assertFalse(mediaSessionBridge.latestSnapshot?.hasNextQueuedAudio == true)
+            val epBSnapshot = mediaSessionBridge.snapshots.first { it?.entryId == "ep-b" }
+            assertEquals("Episode B", epBSnapshot?.episodeTitle)
+            assertFalse(epBSnapshot?.hasNextQueuedAudio == true)
 
             // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
             viewModel.dispatch(MainAction.SetRememberPodcastSpeed("f-pod", true))
@@ -800,31 +818,85 @@ class MainViewModelTest {
             )
         }
 
+    private class DeterministicTestAudioBackend : AudioPlayerBackend {
+        private var positionMs: Long = 0L
+        private var durationMs: Long = 1_800_000L
+        private var playing: Boolean = false
+
+        override fun loadAndPlay(
+            source: String,
+            initialPositionMs: Long,
+            fallbackDurationMs: Long,
+            speed: Float,
+            playWhenReady: Boolean,
+            onPrepared: (durationMs: Long) -> Unit,
+            onCompletion: () -> Unit,
+            onError: () -> Unit,
+        ) {
+            if (source.isBlank()) {
+                playing = false
+                onError()
+                return
+            }
+            durationMs = fallbackDurationMs.takeIf { it > 0L } ?: 1_800_000L
+            positionMs = initialPositionMs.coerceIn(0L, durationMs)
+            playing = playWhenReady
+            onPrepared(durationMs)
+        }
+
+        override fun play() {
+            playing = true
+        }
+
+        override fun pause() {
+            playing = false
+        }
+
+        override fun seekTo(positionMs: Long) {
+            this.positionMs = positionMs.coerceIn(0L, durationMs)
+        }
+
+        override fun setSpeed(speed: Float) = Unit
+
+        override fun currentPositionMs(): Long = positionMs
+
+        override fun durationMs(): Long = durationMs
+
+        override fun isPlaying(): Boolean = playing
+
+        override fun release() {
+            playing = false
+        }
+    }
+
     private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
-        var callbacks: PodcastMediaSessionCallbacks? = null
-        var focusRequestedCount: Int = 0
-        var focusAbandonedCount: Int = 0
-        var latestSnapshot: MediaSessionMetadataSnapshot? = null
+        @Volatile var callbacks: PodcastMediaSessionCallbacks? = null
+        private val focusRequested = AtomicInteger(0)
+        private val focusAbandoned = AtomicInteger(0)
+        val snapshots = MutableStateFlow<MediaSessionMetadataSnapshot?>(null)
+
+        val focusRequestedCount: Int
+            get() = focusRequested.get()
 
         override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
             this.callbacks = callbacks
         }
 
         override fun requestAudioFocus(): Boolean {
-            focusRequestedCount++
+            focusRequested.incrementAndGet()
             return true
         }
 
         override fun abandonAudioFocus() {
-            focusAbandonedCount++
+            focusAbandoned.incrementAndGet()
         }
 
         override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
-            latestSnapshot = snapshot
+            snapshots.value = snapshot
         }
 
         override fun release() {
-            latestSnapshot = null
+            snapshots.value = null
         }
     }
 

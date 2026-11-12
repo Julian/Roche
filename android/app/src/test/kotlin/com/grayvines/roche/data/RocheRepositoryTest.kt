@@ -12,7 +12,13 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -25,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir
 class RocheRepositoryTest {
     @TempDir lateinit var tempDir: File
 
+    private lateinit var dataStoreScope: CoroutineScope
     private lateinit var database: RocheDatabase
     private lateinit var settings: SettingsRepository
     private lateinit var repository: RocheRepository
@@ -33,9 +40,11 @@ class RocheRepositoryTest {
     fun setUp() {
         database =
             Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
+        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val dataStore =
             PreferenceDataStoreFactory.create(
-                produceFile = { File(tempDir, "test_settings.preferences_pb") }
+                scope = dataStoreScope,
+                produceFile = { File(tempDir, "test_settings.preferences_pb") },
             )
         settings = SettingsRepository(dataStore)
         val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
@@ -45,6 +54,7 @@ class RocheRepositoryTest {
 
     @AfterEach
     fun tearDown() {
+        runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
         database.close()
     }
 

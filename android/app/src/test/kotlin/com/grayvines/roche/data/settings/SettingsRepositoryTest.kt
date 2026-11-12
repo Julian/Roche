@@ -4,6 +4,11 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -16,36 +21,42 @@ class SettingsRepositoryTest {
 
     @Test
     fun `settings normalize server URL and persist updates`() = runTest {
-        val store =
-            PreferenceDataStoreFactory.create(
-                produceFile = { File(tempDir, "settings_test.preferences_pb") }
-            )
-        val repository = SettingsRepository(store)
+        val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val store =
+                PreferenceDataStoreFactory.create(
+                    scope = dataStoreScope,
+                    produceFile = { File(tempDir, "settings_test.preferences_pb") },
+                )
+            val repository = SettingsRepository(store)
 
-        repository.update {
-            it.copy(
-                serverUrl = "100.64.0.9:8080/",
-                bearerToken = "  secret-token  ",
-                swipeToArchive = false,
-                themeMode = ThemeMode.LIGHT,
-                headlineFont = HeadlineFont.SANS,
-                ultraDenseRows = true,
-            )
+            repository.update {
+                it.copy(
+                    serverUrl = "100.64.0.9:8080/",
+                    bearerToken = "  secret-token  ",
+                    swipeToArchive = false,
+                    themeMode = ThemeMode.LIGHT,
+                    headlineFont = HeadlineFont.SANS,
+                    ultraDenseRows = true,
+                )
+            }
+
+            val current = repository.settings.first()
+            assertEquals("http://100.64.0.9:8080", current.serverUrl)
+            assertEquals("secret-token", current.bearerToken)
+            assertFalse(current.swipeToArchive)
+            assertEquals(ThemeMode.LIGHT, current.themeMode)
+            assertEquals(HeadlineFont.SANS, current.headlineFont)
+            assertEquals(true, current.ultraDenseRows)
+
+            repository.update { it.copy(lastPeerSyncCursor = "2026-06-01T12:01:00Z") }
+            assertEquals("2026-06-01T12:01:00Z", repository.settings.first().lastPeerSyncCursor)
+
+            repository.update { it.copy(bearerToken = "new-token") }
+            assertEquals("", repository.settings.first().lastPeerSyncCursor)
+        } finally {
+            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
         }
-
-        val current = repository.settings.first()
-        assertEquals("http://100.64.0.9:8080", current.serverUrl)
-        assertEquals("secret-token", current.bearerToken)
-        assertFalse(current.swipeToArchive)
-        assertEquals(ThemeMode.LIGHT, current.themeMode)
-        assertEquals(HeadlineFont.SANS, current.headlineFont)
-        assertEquals(true, current.ultraDenseRows)
-
-        repository.update { it.copy(lastPeerSyncCursor = "2026-06-01T12:01:00Z") }
-        assertEquals("2026-06-01T12:01:00Z", repository.settings.first().lastPeerSyncCursor)
-
-        repository.update { it.copy(bearerToken = "new-token") }
-        assertEquals("", repository.settings.first().lastPeerSyncCursor)
     }
 
     @Test
