@@ -20,7 +20,7 @@ class BaselineProfileGenerator {
             device.wait(Until.hasObject(By.pkg(PACKAGE)), TIMEOUT_MS)
             device.waitForIdle()
 
-            listOf("Feeds", "Queue", "Home", "Settings", "Inbox").forEach { tabLabel ->
+            listOf("Home", "Feeds", "Starred", "Settings", "Inbox").forEach { tabLabel ->
                 device.findObject(By.text(tabLabel))?.click()
                 device.waitForIdle()
             }

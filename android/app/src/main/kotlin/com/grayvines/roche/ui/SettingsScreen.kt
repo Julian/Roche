@@ -345,6 +345,8 @@ internal fun NavigationSummaryCardSection(
                 val unpinnedSubtitle =
                     when (unpinnedTab) {
                         AppTab.HOME -> "Quick access to your unpinned Home widgets"
+                        AppTab.QUEUE ->
+                            "Quick access to your unpinned tab (${state.queueEntries.size} queued)"
                         AppTab.OFFLINE ->
                             "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
                         AppTab.STARRED ->

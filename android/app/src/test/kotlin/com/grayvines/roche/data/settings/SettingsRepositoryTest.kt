@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -54,9 +55,15 @@ class SettingsRepositoryTest {
             assertEquals(ThemeMode.LIGHT, current.themeMode)
             assertEquals(HeadlineFont.SANS, current.headlineFont)
             assertEquals(true, current.ultraDenseRows)
+            assertEquals(
+                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                current.bottomNavTabs,
+            )
+            assertNull(store.data.first()[SettingsRepository.KEY_BOTTOM_NAV_TABS])
 
             repository.update { it.copy(lastPeerSyncCursor = "2026-06-01T12:01:00Z") }
             assertEquals("2026-06-01T12:01:00Z", repository.settings.first().lastPeerSyncCursor)
+            assertNull(store.data.first()[SettingsRepository.KEY_BOTTOM_NAV_TABS])
 
             repository.update { it.copy(bearerToken = "new-token") }
             assertEquals("", repository.settings.first().lastPeerSyncCursor)

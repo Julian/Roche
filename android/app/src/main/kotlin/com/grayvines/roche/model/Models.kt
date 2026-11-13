@@ -82,8 +82,8 @@ enum class AppTab(val label: String) {
 
     companion object {
         const val SIDE_TAB_COUNT = 4
-        val sideTabCandidates: List<AppTab> = listOf(HOME, FEEDS, QUEUE, STARRED, OFFLINE, SETTINGS)
-        val defaultSideTabs: List<AppTab> = listOf(FEEDS, QUEUE, HOME, SETTINGS)
+        val sideTabCandidates: List<AppTab> = listOf(HOME, FEEDS, STARRED, QUEUE, OFFLINE, SETTINGS)
+        val defaultSideTabs: List<AppTab> = listOf(HOME, FEEDS, STARRED, SETTINGS)
 
         fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {
             val distinctValid = tabs.filter { it != INBOX && it in sideTabCandidates }.distinct()

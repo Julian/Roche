@@ -151,6 +151,9 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("settings_server_row").assertExists()
         composeRule.onNodeWithTag("settings_nav_row").assertExists()
+        composeRule.onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings").assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_queue").assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_offline").assertExists()
         composeRule.onNodeWithTag("import_opml_btn").assertExists()
         composeRule.onNodeWithTag("export_opml_btn").assertExists()
 

@@ -331,18 +331,26 @@ class MainViewModelTest {
                 }
             assertNull(afterUnread.allEntries.first { it.id == "item-1" }.readAt)
 
+            assertEquals(
+                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                afterUnread.settings.bottomNavTabs,
+            )
+
             viewModel.dispatch(MainAction.SetBottomNavSlot(1, AppTab.OFFLINE))
             val afterNavUpdate =
                 viewModel.uiState.first { it.settings.bottomNavTabs[1] == AppTab.OFFLINE }
             assertEquals(
-                listOf(AppTab.FEEDS, AppTab.OFFLINE, AppTab.HOME, AppTab.SETTINGS),
+                listOf(AppTab.HOME, AppTab.OFFLINE, AppTab.STARRED, AppTab.SETTINGS),
                 afterNavUpdate.settings.bottomNavTabs,
             )
 
             viewModel.dispatch(MainAction.ResetBottomNavTabs)
             val afterNavReset =
                 viewModel.uiState.first { it.settings.bottomNavTabs == AppTab.defaultSideTabs }
-            assertEquals(AppTab.defaultSideTabs, afterNavReset.settings.bottomNavTabs)
+            assertEquals(
+                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                afterNavReset.settings.bottomNavTabs,
+            )
             collectJob.cancel()
         }
 
@@ -1281,6 +1289,8 @@ class MainViewModelTest {
                 )
             val store1 = ViewModelStore()
             val store2 = ViewModelStore()
+            var vm1: MainViewModel? = null
+            var vm2: MainViewModel? = null
             try {
                 val podcastFeed =
                     testFeed("f-shared-pod", "Durable Cast").copy(feedType = "podcast")
@@ -1310,15 +1320,16 @@ class MainViewModelTest {
                         mediaSessionBridge = sharedBridge,
                         sharedPlayerController = sharedController,
                     )
-                val vm1 = ViewModelProvider(store1, factory)[MainViewModel::class.java]
-                val collect1 = backgroundScope.launch { vm1.uiState.collect() }
-                vm1.uiState.first { it.allEntries.size == 2 }
+                val firstVm = ViewModelProvider(store1, factory)[MainViewModel::class.java]
+                vm1 = firstVm
+                val collect1 = backgroundScope.launch { firstVm.uiState.collect() }
+                firstVm.uiState.first { it.allEntries.size == 2 }
 
-                vm1.dispatch(MainAction.AddToQueue("ep-shared-1"))
-                vm1.dispatch(MainAction.AddToQueue("ep-shared-2"))
-                vm1.uiState.first { it.queueEntries.size == 2 }
-                vm1.dispatch(MainAction.PlayAudioEntry("ep-shared-1"))
-                vm1.uiState.first {
+                firstVm.dispatch(MainAction.AddToQueue("ep-shared-1"))
+                firstVm.dispatch(MainAction.AddToQueue("ep-shared-2"))
+                firstVm.uiState.first { it.queueEntries.size == 2 }
+                firstVm.dispatch(MainAction.PlayAudioEntry("ep-shared-1"))
+                firstVm.uiState.first {
                     it.playerState.currentEntryId == "ep-shared-1" &&
                         it.playerState.isPlaying &&
                         it.nextQueuedAudioEntryId == "ep-shared-2"
@@ -1328,7 +1339,7 @@ class MainViewModelTest {
                 // Finish Activity 1: cancels vm1.viewModelScope and invokes vm1.onCleared()
                 collect1.cancel()
                 store1.clear()
-                vm1.viewModelScope.coroutineContext[Job]?.join()
+                firstVm.viewModelScope.coroutineContext[Job]?.join()
 
                 assertTrue(sharedController.state.value.isPlaying)
                 assertTrue(sharedBackend.isPlaying())
@@ -1340,13 +1351,14 @@ class MainViewModelTest {
                 assertEquals(18_000L, sharedController.state.value.positionMs)
 
                 // Recreate MainViewModel: immediately observes live playing episode
-                val vm2 = ViewModelProvider(store2, factory)[MainViewModel::class.java]
-                assertEquals("ep-shared-1", vm2.uiState.value.playerState.currentEntryId)
-                assertTrue(vm2.uiState.value.playerState.isPlaying)
+                val secondVm = ViewModelProvider(store2, factory)[MainViewModel::class.java]
+                vm2 = secondVm
+                assertEquals("ep-shared-1", secondVm.uiState.value.playerState.currentEntryId)
+                assertTrue(secondVm.uiState.value.playerState.isPlaying)
 
-                val collect2 = backgroundScope.launch { vm2.uiState.collect() }
+                val collect2 = backgroundScope.launch { secondVm.uiState.collect() }
                 val liveState =
-                    vm2.uiState.first {
+                    secondVm.uiState.first {
                         !it.isInitialLoading && it.activePlayerEntry?.id == "ep-shared-1"
                     }
                 assertTrue(liveState.playerState.isPlaying)
@@ -1357,6 +1369,8 @@ class MainViewModelTest {
             } finally {
                 store1.clear()
                 store2.clear()
+                vm1?.viewModelScope?.coroutineContext?.get(Job)?.cancelAndJoin()
+                vm2?.viewModelScope?.coroutineContext?.get(Job)?.cancelAndJoin()
                 sharedController.releaseController()
                 appScope.coroutineContext[Job]?.cancelAndJoin()
             }

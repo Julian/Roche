@@ -88,7 +88,11 @@ internal constructor(
             prefs[KEY_HEADLINE_FONT] = updated.headlineFont.name
             prefs[KEY_ULTRA_DENSE_ROWS] = updated.ultraDenseRows
             prefs[KEY_READER_FONT_SCALE] = updated.readerFontScale
-            prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
+            if (updated.bottomNavTabs == AppTab.defaultSideTabs) {
+                prefs.remove(KEY_BOTTOM_NAV_TABS)
+            } else {
+                prefs[KEY_BOTTOM_NAV_TABS] = updated.bottomNavTabs.joinToString(",") { it.name }
+            }
             prefs[KEY_LAST_PEER_SYNC_CURSOR] = updated.lastPeerSyncCursor
             prefs[KEY_QUEUE_ITEM_IDS] = updated.queueItemIds.joinToString(",")
             prefs[KEY_DEFAULT_PLAYBACK_SPEED] = updated.defaultPlaybackSpeed
