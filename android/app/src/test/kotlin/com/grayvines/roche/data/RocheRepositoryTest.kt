@@ -8,6 +8,8 @@ import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.ItemTagEntity
+import com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS
+import com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
@@ -20,6 +22,8 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -926,6 +930,100 @@ class RocheRepositoryTest {
                 setOf("item-page-0", "item-page-1", "item-page-2", "item-page-3"),
                 paginatedRepo.snapshot.first().entries.map { it.id }.toSet(),
             )
+        }
+
+    @Test
+    internal fun `toggleStar with backgroundScope updates Room immediately while HTTP push blocks`() =
+        runTest {
+            seedTestDatabase()
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-bg")
+            }
+            val patchStarted = CountDownLatch(1)
+            val allowPatchFinish = CountDownLatch(1)
+            val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val slowApiClient = RocheApiClient { request ->
+                    if (request.method == "PATCH" && request.url.endsWith("/api/v1/items/item-2")) {
+                        patchStarted.countDown()
+                        allowPatchFinish.await(5, TimeUnit.SECONDS)
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"id":"item-2","title":"Async Star","url":"https://example.com/2","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-04-01T10:00:00Z"}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 200, body = "{}")
+                    }
+                }
+                val asyncRepo =
+                    RocheRepository(
+                        database = database,
+                        apiClient = slowApiClient,
+                        settings = settings,
+                        backgroundScope = bgScope,
+                    )
+
+                // item-2 starts unstarred; toggleStar returns immediately before PATCH completes
+                assertTrue(asyncRepo.toggleStar("item-2"))
+                assertEquals(true, database.dao().getItemStateById("item-2")?.isFavorite)
+                assertEquals(
+                    true,
+                    database.dao().getPendingMutation("item-2")?.dirtyFavorite,
+                )
+                assertTrue(patchStarted.await(2, TimeUnit.SECONDS))
+
+                // Release slow HTTP PATCH and verify pending_mutations clears once pushed
+                allowPatchFinish.countDown()
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                while (
+                    database.dao().getPendingMutation("item-2") != null &&
+                        System.nanoTime() < deadline
+                ) {
+                    kotlinx.coroutines.delay(15)
+                }
+                assertNull(database.dao().getPendingMutation("item-2"))
+            } finally {
+                bgScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    internal fun `item_contents split stores compact list rows and searchDeepEntries finds deep body text`() =
+        runTest {
+            val deepBody =
+                "Intro paragraph. " +
+                    "x".repeat(12_000) +
+                    " NeedleInHaystackToken99 appears deep in the article body."
+            val deepHtml = "<p>$deepBody</p>"
+            database
+                .dao()
+                .upsertItem(
+                    SeedData.items
+                        .first()
+                        .copy(
+                            id = "item-deep",
+                            title = "Compact Row Storage Test",
+                            summary = "Short summary",
+                            contentText = deepBody,
+                            contentHtml = deepHtml,
+                        )
+                )
+
+            val listSnapshot = repository.prewarm()
+            val listEntry = listSnapshot.entries.single { it.id == "item-deep" }
+            assertEquals(LIST_PREVIEW_TEXT_CHARS, listEntry.contentText?.length)
+            assertEquals(LIST_PREVIEW_HTML_CHARS, listEntry.contentHtml?.length)
+
+            val fullEntity = database.dao().getItemById("item-deep")
+            assertEquals(deepBody.length, fullEntity?.contentText?.length)
+            assertEquals(deepHtml.length, fullEntity?.contentHtml?.length)
+
+            val deepMatches = repository.searchDeepEntries("NeedleInHaystackToken99")
+            assertEquals(1, deepMatches.size)
+            assertEquals("item-deep", deepMatches.single().id)
+            val snippet = extractSearchMatchSnippet(deepMatches.single(), "NeedleInHaystackToken99")
+            assertTrue(snippet?.contains("NeedleInHaystackToken99") == true)
         }
 }
 

@@ -15,6 +15,7 @@ import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +24,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -47,6 +49,14 @@ class MainViewModel(
     private val transientState =
         MutableStateFlow(TransientUiState(localNetworkTier = repository.currentNetworkTier()))
 
+    private var deepSearchJob: Job? = null
+    private val inFlightStarCounts = mutableMapOf<String, Int>()
+
+    private val settingsForUi =
+        settingsRepository.settings
+            .onStart { emit(settingsRepository.latestSettings ?: Settings()) }
+            .distinctUntilChanged()
+
     private val uiErrorListener: (String) -> Unit = { message -> showStatusMessage(message) }
 
     internal val playerController: PodcastPlayerController =
@@ -62,7 +72,7 @@ class MainViewModel(
     private val baseUiStateFlow =
         combine(
             repository.snapshot,
-            settingsRepository.settings,
+            settingsForUi,
             transientState,
         ) { snapshot: RepositorySnapshot, settings: Settings, local: TransientUiState ->
             buildMainUiState(
@@ -84,11 +94,7 @@ class MainViewModel(
             .stateIn(
                 scope = viewModelScope,
                 started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
-                initialValue =
-                    MainUiState(
-                        isInitialLoading = true,
-                        playerState = playerController.state.value,
-                    ),
+                initialValue = buildInitialUiState(),
             )
 
     init {
@@ -96,7 +102,28 @@ class MainViewModel(
         observeActiveEpisodeNotes()
     }
 
+    private fun buildInitialUiState(): MainUiState {
+        val cachedSnapshot =
+            repository.latestSnapshot
+                ?: return MainUiState(
+                    isInitialLoading = true,
+                    playerState = playerController.state.value,
+                )
+        val cachedSettings = settingsRepository.latestSettings ?: Settings()
+        return buildMainUiState(
+            snapshot = cachedSnapshot,
+            settings = cachedSettings,
+            local = transientState.value,
+            localNetworkTier = transientState.value.localNetworkTier,
+            playerState =
+                playerController.state.value.copy(
+                    smartRewindEnabled = cachedSettings.smartRewindEnabled
+                ),
+        )
+    }
+
     override fun onCleared() {
+        deepSearchJob?.cancel()
         playerController.clearUiErrorListener(uiErrorListener)
         if (ownsPlayerController) {
             playerController.releaseController()
@@ -123,36 +150,106 @@ class MainViewModel(
 
     fun dispatch(action: MainAction) {
         when (action) {
-            is MainAction.Ui -> {
-                if (handlePlayerUiAction(action)) return
-                if (action is MainAction.OpenReader) {
-                    val existing = uiState.value.allEntries.firstOrNull { it.id == action.entryId }
-                    if (existing?.contentType == ContentType.AUDIO) {
-                        viewModelScope.launch {
-                            performPlayAudioEntry(
-                                entryId = action.entryId,
-                                openFullscreen = true,
-                            )
-                        }
-                        return
-                    }
+            is MainAction.Ui -> handleUiAction(action)
+            is MainAction.Mutation -> handleMutationAction(action)
+        }
+    }
+
+    private fun handleUiAction(action: MainAction.Ui) {
+        if (handlePlayerUiAction(action)) return
+        if (action is MainAction.OpenReader) {
+            val existing = uiState.value.allEntries.firstOrNull { it.id == action.entryId }
+            if (existing?.contentType == ContentType.AUDIO) {
+                viewModelScope.launch {
+                    performPlayAudioEntry(
+                        entryId = action.entryId,
+                        openFullscreen = true,
+                    )
                 }
-                transientState.update { reduceUiAction(it, action) }
-                if (action is MainAction.OpenReader) {
-                    viewModelScope.launch {
-                        val hydrated =
-                            repository.hydrateItemContentIfNeeded(action.entryId) { localContent ->
-                                applyReaderContentIfActive(action.entryId, localContent)
-                            }
-                        if (hydrated != null) {
-                            applyReaderContentIfActive(action.entryId, hydrated)
-                        }
-                    }
-                    viewModelScope.launch { repository.setReadState(action.entryId, true) }
-                }
+                return
             }
-            is MainAction.Mutation -> {
-                viewModelScope.launch { executeMutation(action) }
+        }
+        transientState.update { reduceUiAction(it, action) }
+        when (action) {
+            is MainAction.OpenReader -> launchReaderOpenSideEffects(action.entryId)
+            is MainAction.UpdateSearchQuery -> scheduleDeepSearch(action.query)
+            MainAction.CloseSearch -> cancelDeepSearch()
+            else -> Unit
+        }
+    }
+
+    private fun launchReaderOpenSideEffects(entryId: String) {
+        viewModelScope.launch {
+            val hydrated =
+                repository.hydrateItemContentIfNeeded(entryId) { localContent ->
+                    applyReaderContentIfActive(entryId, localContent)
+                }
+            if (hydrated != null) {
+                applyReaderContentIfActive(entryId, hydrated)
+            }
+        }
+        viewModelScope.launch { repository.setReadState(entryId, true) }
+    }
+
+    private fun cancelDeepSearch() {
+        deepSearchJob?.cancel()
+        deepSearchJob = null
+    }
+
+    private fun handleMutationAction(action: MainAction.Mutation) {
+        if (action is MainAction.ToggleStar) {
+            val currentFav = resolveCurrentFavoriteState(action.entryId)
+            if (currentFav != null) {
+                val targetFav = !currentFav
+                synchronized(inFlightStarCounts) {
+                    inFlightStarCounts[action.entryId] =
+                        (inFlightStarCounts[action.entryId] ?: 0) + 1
+                }
+                transientState.update { current ->
+                    current.copy(
+                        optimisticFavorites =
+                            current.optimisticFavorites + (action.entryId to targetFav),
+                        undoEvent = null,
+                        statusBanner = if (targetFav) "Starred" else "Removed star",
+                        messageSequence = current.messageSequence + 1,
+                    )
+                }
+                viewModelScope.launch {
+                    performToggleStar(
+                        entryId = action.entryId,
+                        targetFavorite = targetFav,
+                        bannerAlreadyShown = true,
+                    )
+                }
+                return
+            }
+        }
+        viewModelScope.launch { executeMutation(action) }
+    }
+
+    private fun resolveCurrentFavoriteState(entryId: String): Boolean? =
+        transientState.value.optimisticFavorites[entryId]
+            ?: uiState.value.allEntries.firstOrNull { it.id == entryId }?.isFavorite
+            ?: repository.latestSnapshot?.entries?.firstOrNull { it.id == entryId }?.isFavorite
+
+    private fun scheduleDeepSearch(rawQuery: String) {
+        deepSearchJob?.cancel()
+        val normalized = rawQuery.trim().lowercase()
+        if (normalized.isBlank()) {
+            deepSearchJob = null
+            return
+        }
+        deepSearchJob = viewModelScope.launch {
+            val deepMatches = repository.searchDeepEntries(rawQuery)
+            transientState.update { current ->
+                if (current.searchQuery.trim().lowercase() == normalized) {
+                    current.copy(
+                        deepSearchQuery = normalized,
+                        deepSearchResults = deepMatches,
+                    )
+                } else {
+                    current
+                }
             }
         }
     }
@@ -378,9 +475,47 @@ class MainViewModel(
             }
     }
 
-    internal suspend fun performToggleStar(entryId: String) {
-        val starred = repository.toggleStar(entryId)
-        showStatusMessage(if (starred) "Starred" else "Removed star")
+    internal suspend fun performToggleStar(
+        entryId: String,
+        targetFavorite: Boolean? = null,
+        bannerAlreadyShown: Boolean = false,
+    ) {
+        try {
+            val starred = repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
+            if (!bannerAlreadyShown) {
+                showStatusMessage(if (starred) "Starred" else "Removed star")
+            }
+        } finally {
+            if (bannerAlreadyShown) {
+                val remaining =
+                    synchronized(inFlightStarCounts) {
+                        val next = ((inFlightStarCounts[entryId] ?: 1) - 1).coerceAtLeast(0)
+                        if (next == 0) {
+                            inFlightStarCounts.remove(entryId)
+                        } else {
+                            inFlightStarCounts[entryId] = next
+                        }
+                        next
+                    }
+                if (remaining == 0) {
+                    val persistedFav =
+                        repository.latestSnapshot
+                            ?.entries
+                            ?.firstOrNull { it.id == entryId }
+                            ?.isFavorite
+                    if (
+                        persistedFav != null &&
+                            transientState.value.optimisticFavorites[entryId] == persistedFav
+                    ) {
+                        transientState.update { current ->
+                            current.copy(
+                                optimisticFavorites = current.optimisticFavorites - entryId
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     internal suspend fun performToggleReadState(entryId: String) {
@@ -715,6 +850,7 @@ class MainViewModel(
         transientState.update {
             it.copy(
                 isAddSheetOpen = false,
+                isSearchOpen = false,
                 prefilledShareUrl = "",
                 prefilledShareTitle = "",
                 selectedReaderEntryId = null,
@@ -907,8 +1043,8 @@ class MainViewModel(
 
     internal suspend fun performStartupSync() {
         refreshLocalNetworkTier()
-        val initialState = uiState.first { !it.isInitialLoading }
-        val currentSettings = initialState.settings
+        uiState.first { !it.isInitialLoading }
+        val currentSettings = settingsRepository.settings.first()
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             performSync(errorPolicy = SyncErrorPolicy.SILENT)
         }

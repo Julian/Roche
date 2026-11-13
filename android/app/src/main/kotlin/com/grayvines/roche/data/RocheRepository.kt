@@ -7,6 +7,7 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.buildSqlContainsPattern
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.Settings
@@ -21,12 +22,16 @@ import com.grayvines.roche.model.TagItem
 import java.io.File
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 enum class SavedResourceKind {
     ITEM,
@@ -67,10 +72,18 @@ class RocheRepository(
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
+    backgroundScope: CoroutineScope? = null,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
+    private val itemMutationMutex = Mutex()
+    private val mutationDispatcher = BackgroundMutationDispatcher(backgroundScope)
+    private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
+    @Volatile
+    internal var latestSnapshot: RepositorySnapshot? = null
+        private set
+
     private val offlineCacheManager =
         OfflineCacheManager(
             dao = dao,
@@ -81,19 +94,58 @@ class RocheRepository(
 
     val snapshot: Flow<RepositorySnapshot> =
         combine(
-            dao.observeItems(),
-            dao.observeFeeds(),
-            dao.observeTags(),
-            dao.observeItemTags(),
-            activePeersFlow,
-        ) { items, feeds, tags, itemTags, activePeers ->
-            buildSnapshot(
-                items = items,
-                feeds = feeds,
-                tags = tags,
-                itemTags = itemTags,
-                activePeers = activePeers,
-            )
+                dao.observeItems(),
+                dao.observeFeeds(),
+                dao.observeTags(),
+                dao.observeItemTags(),
+                activePeersFlow,
+            ) { items, feeds, tags, itemTags, activePeers ->
+                buildSnapshot(
+                        items = items,
+                        feeds = feeds,
+                        tags = tags,
+                        itemTags = itemTags,
+                        activePeers = activePeers,
+                        entryCache = entryCache,
+                    )
+                    .also { latestSnapshot = it }
+            }
+            .flowOn(Dispatchers.Default)
+
+    suspend fun prewarm(): RepositorySnapshot = snapshot.first()
+
+    internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =
+        withContext(Dispatchers.Default) {
+            val cleanQuery = rawQuery.trim().trimStart('#')
+            if (cleanQuery.isBlank()) {
+                emptyList()
+            } else {
+                val matchedItems = dao.searchFullItems(buildSqlContainsPattern(cleanQuery))
+                if (matchedItems.isEmpty()) {
+                    emptyList()
+                } else {
+                    val tagsById = dao.getAllTags().associateBy { it.id }
+                    val tagNamesByItemId =
+                        dao.getAllItemTags()
+                            .groupBy(
+                                keySelector = { it.itemId },
+                                valueTransform = { tagsById[it.tagId]?.name },
+                            )
+                            .mapValues { (_, names) ->
+                                names
+                                    .filterNotNull()
+                                    .sortedWith(
+                                        compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) {
+                                                it
+                                            }
+                                            .thenBy { it }
+                                    )
+                            }
+                    matchedItems.map { entity ->
+                        toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
+                    }
+                }
+            }
         }
 
     fun currentNetworkTier(): NetworkTier = networkTierProvider.currentNetworkTier()
@@ -105,7 +157,7 @@ class RocheRepository(
         itemId: String,
         archived: Boolean,
     ): ArchiveStateSnapshot? {
-        val current = dao.getItemById(itemId) ?: return null
+        val current = dao.getItemStateById(itemId) ?: return null
         val previous = ItemStatus.fromWireValue(current.status)
         val snapshot =
             ArchiveStateSnapshot(
@@ -137,6 +189,7 @@ class RocheRepository(
             settings = settings,
             itemId = itemId,
             status = newStatus.wireValue,
+            dispatcher = mutationDispatcher,
         )
         return snapshot
     }
@@ -146,7 +199,7 @@ class RocheRepository(
         status: ItemStatus,
         readAt: String? = null,
     ) {
-        val current = dao.getItemById(itemId) ?: return
+        val current = dao.getItemStateById(itemId) ?: return
         val targetReadAt =
             if (status == ItemStatus.ARCHIVED) {
                 readAt?.takeIf { it.isNotBlank() }
@@ -163,6 +216,7 @@ class RocheRepository(
             itemId = itemId,
             status = status.wireValue,
             explicitReadAt = targetReadAt?.takeIf { status == ItemStatus.UNREAD },
+            dispatcher = mutationDispatcher,
         )
     }
 
@@ -177,7 +231,7 @@ class RocheRepository(
     }
 
     suspend fun setReadState(itemId: String, isRead: Boolean) {
-        val current = dao.getItemById(itemId) ?: return
+        val current = dao.getItemStateById(itemId) ?: return
         val currentlyRead = !current.readAt.isNullOrBlank()
         if (currentlyRead == isRead) return
         val nextReadAt = if (isRead) Instant.now().toString() else null
@@ -188,11 +242,12 @@ class RocheRepository(
             settings = settings,
             itemId = itemId,
             readAt = nextReadAt,
+            dispatcher = mutationDispatcher,
         )
     }
 
     suspend fun toggleReadState(itemId: String): Boolean {
-        val current = dao.getItemById(itemId) ?: return false
+        val current = dao.getItemStateById(itemId) ?: return false
         val nextIsRead = current.readAt.isNullOrBlank()
         val nextReadAt = if (nextIsRead) Instant.now().toString() else null
         dao.updateItemReadAt(itemId, nextReadAt)
@@ -202,26 +257,35 @@ class RocheRepository(
             settings = settings,
             itemId = itemId,
             readAt = nextReadAt,
+            dispatcher = mutationDispatcher,
         )
         return nextIsRead
     }
 
-    suspend fun toggleStar(itemId: String): Boolean {
-        val current = dao.getItemById(itemId) ?: return false
-        val updated = !current.isFavorite
-        dao.updateItemFavorite(itemId, updated)
-        syncFavoriteMutation(
-            dao = dao,
-            apiClient = apiClient,
-            settings = settings,
-            itemId = itemId,
-            isFavorite = updated,
-        )
-        return updated
-    }
+    suspend fun toggleStar(itemId: String, targetFavorite: Boolean? = null): Boolean =
+        itemMutationMutex.withLock {
+            val current = dao.getItemStateById(itemId)
+            if (current == null) {
+                false
+            } else {
+                val updated = targetFavorite ?: !current.isFavorite
+                if (current.isFavorite != updated) {
+                    dao.updateItemFavorite(itemId, updated)
+                }
+                syncFavoriteMutation(
+                    dao = dao,
+                    apiClient = apiClient,
+                    settings = settings,
+                    itemId = itemId,
+                    isFavorite = updated,
+                    dispatcher = mutationDispatcher,
+                )
+                updated
+            }
+        }
 
     suspend fun toggleOfflineCache(itemId: String): Boolean {
-        val current = dao.getItemById(itemId) ?: return false
+        val current = dao.getItemStateById(itemId) ?: return false
         val updated = !current.isCachedOffline
         return offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = updated)
     }
@@ -269,13 +333,13 @@ class RocheRepository(
                 allUnread = allUnread,
             )
         for (snap in snapshots) {
-            val entity = dao.getItemById(snap.itemId) ?: continue
+            val state = dao.getItemStateById(snap.itemId) ?: continue
             if (
-                entity.isCachedOffline &&
-                    (entity.contentType.equals("audio", ignoreCase = true) ||
-                        !entity.audioUrl.isNullOrBlank())
+                state.isCachedOffline &&
+                    (state.contentType.equals("audio", ignoreCase = true) ||
+                        !state.audioUrl.isNullOrBlank())
             ) {
-                offlineCacheManager.setOfflineCacheState(itemId = entity.id, enabled = false)
+                offlineCacheManager.setOfflineCacheState(itemId = state.id, enabled = false)
             }
         }
         return snapshots
@@ -338,7 +402,7 @@ class RocheRepository(
         progress: Double,
         recordPlayedTimestamp: Boolean = false,
     ) {
-        if (!progress.isFinite() || dao.getItemById(itemId) == null) return
+        if (!progress.isFinite() || dao.getItemStateById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
         dao.updateReadProgress(itemId, clamped)
         if (recordPlayedTimestamp) {
@@ -350,6 +414,7 @@ class RocheRepository(
                 settings = settings,
                 itemId = itemId,
                 readAt = nowIso,
+                dispatcher = mutationDispatcher,
             )
         }
         syncReadProgressMutation(
@@ -358,11 +423,12 @@ class RocheRepository(
             settings = settings,
             itemId = itemId,
             progress = clamped,
+            dispatcher = mutationDispatcher,
         )
     }
 
     internal suspend fun recordEpisodePlaybackStarted(itemId: String) {
-        if (dao.getItemById(itemId) == null) return
+        if (dao.getItemStateById(itemId) == null) return
         val nowIso = Instant.now().toString()
         dao.updateItemReadAt(itemId, nowIso)
         syncReadAtMutation(
@@ -371,12 +437,13 @@ class RocheRepository(
             settings = settings,
             itemId = itemId,
             readAt = nowIso,
+            dispatcher = mutationDispatcher,
         )
     }
 
     internal suspend fun toggleTagOnItem(itemId: String, tagName: String) {
         val normalized = normalizeTagName(tagName)
-        if (normalized.isBlank() || dao.getItemById(itemId) == null) return
+        if (normalized.isBlank() || dao.getItemStateById(itemId) == null) return
         dao.updateItemInteractionTimestamp(itemId)
         val existingTag =
             dao.getTagByName(normalized)

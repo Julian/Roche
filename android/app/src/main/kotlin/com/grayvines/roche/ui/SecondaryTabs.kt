@@ -2,7 +2,9 @@
 
 package com.grayvines.roche.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -21,7 +23,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -30,6 +34,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,6 +44,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
@@ -67,13 +74,18 @@ import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
 @Composable
-fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun StarredTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
+) {
     val colors = LocalRocheColors.current
     var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
     val allStarred = state.starredEntries
@@ -149,6 +161,7 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             }
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize().testTag("starred_list"),
                 contentPadding = PaddingValues(bottom = 88.dp),
             ) {
@@ -173,8 +186,14 @@ fun StarredTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
 }
 
 @Composable
-fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun SearchOverlay(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
+) {
+    BackHandler { onAction(MainAction.CloseSearch) }
     val colors = LocalRocheColors.current
+    val focusRequester = remember { FocusRequester() }
     var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
     val visibleResults =
         remember(state.searchResults, scopeFilter) {
@@ -187,20 +206,57 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             "${visibleResults.size} matches"
         }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    LaunchedEffect(Unit) {
+        if (state.searchQuery.isBlank()) {
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().background(colors.background).testTag("search_overlay")
+    ) {
         RocheTopHeader(
             title = "Search",
             subtitle = subtitleText,
+            navigationAction = {
+                HeaderActionButton(
+                    label = "←",
+                    onClick = { onAction(MainAction.CloseSearch) },
+                    modifier = Modifier.testTag("close_search_btn"),
+                )
+            },
         )
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
             OutlinedTextField(
                 value = state.searchQuery,
                 onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
+                leadingIcon = { SearchIcon(tint = colors.textMuted, size = 18.dp) },
+                trailingIcon =
+                    if (state.searchQuery.isNotEmpty()) {
+                        {
+                            RocheIconActionButton(
+                                contentDescription = "Clear search",
+                                onClick = { onAction(MainAction.UpdateSearchQuery("")) },
+                                outlined = false,
+                                modifier = Modifier.testTag("clear_search_input_btn"),
+                            ) {
+                                Text(
+                                    text = "✕",
+                                    color = colors.textMuted,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 13.sp,
+                                )
+                            }
+                        }
+                    } else {
+                        null
+                    },
                 placeholder = {
                     Text("Search titles, full text, authors, feeds, #tags…", fontSize = 13.sp)
                 },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth().testTag("search_input"),
+                modifier =
+                    Modifier.fillMaxWidth().focusRequester(focusRequester).testTag("search_input"),
             )
             Spacer(modifier = Modifier.height(8.dp))
             SearchScopeFilterStrip(
@@ -224,6 +280,7 @@ fun SearchTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             playingEntryId = state.playerState.currentEntryId,
             nextQueuedAudioEntryId = state.nextQueuedAudioEntryId,
             onAction = onAction,
+            listState = listState,
         )
     }
 }
@@ -258,6 +315,7 @@ internal fun SearchResultsBody(
     playingEntryId: String? = null,
     nextQueuedAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
 ) {
     val colors = LocalRocheColors.current
     if (results.isEmpty()) {
@@ -280,6 +338,7 @@ internal fun SearchResultsBody(
         }
     } else {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize().testTag("search_results_list"),
             contentPadding = PaddingValues(bottom = 88.dp),
         ) {
@@ -399,7 +458,11 @@ private fun SearchQuickTagStrip(state: MainUiState, onAction: (MainAction) -> Un
 }
 
 @Composable
-fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun FeedsAndTagsTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    scrollState: ScrollState = rememberScrollState(),
+) {
     val colors = LocalRocheColors.current
     var showFilterDrawer by rememberSaveable { mutableStateOf(false) }
     var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
@@ -453,6 +516,7 @@ fun FeedsAndTagsTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 archivedFeeds = archivedFeeds,
                 hasFeedsAtAll = activeFeeds.isNotEmpty(),
                 onAction = onAction,
+                scrollState = scrollState,
             )
         }
     }
@@ -581,12 +645,13 @@ private fun SubscribedFeedsCardList(
     archivedFeeds: List<FeedItem>,
     hasFeedsAtAll: Boolean,
     onAction: (MainAction) -> Unit,
+    scrollState: ScrollState = rememberScrollState(),
 ) {
     val colors = LocalRocheColors.current
     Column(
         modifier =
             Modifier.fillMaxSize()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(horizontal = 14.dp, vertical = 14.dp)
     ) {
         if (feeds.isEmpty()) {
@@ -846,7 +911,11 @@ internal fun SubscribedFeedTrailingActions(
 }
 
 @Composable
-fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun OfflineTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
+) {
     val colors = LocalRocheColors.current
     val offlineEntries = state.offlineEntries
 
@@ -867,6 +936,7 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             }
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
             ) {
@@ -909,7 +979,12 @@ fun OfflineTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
 }
 
 @Composable
-fun QueueTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
+fun QueueTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    upNextListState: LazyListState = rememberLazyListState(),
+    historyListState: LazyListState = rememberLazyListState(),
+) {
     val colors = LocalRocheColors.current
     var showHistory by rememberSaveable { mutableStateOf(false) }
     val queueEntries = state.queueEntries
@@ -964,6 +1039,7 @@ fun QueueTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
                 historyEntries = historyEntries,
                 state = state,
                 onAction = onAction,
+                listState = historyListState,
             )
         } else if (queueEntries.isEmpty()) {
             Box(
@@ -979,6 +1055,7 @@ fun QueueTabContent(state: MainUiState, onAction: (MainAction) -> Unit) {
             }
         } else {
             LazyColumn(
+                state = upNextListState,
                 modifier = Modifier.fillMaxSize().testTag("queue_list"),
                 contentPadding = PaddingValues(bottom = 96.dp),
             ) {
@@ -1009,6 +1086,7 @@ private fun ListeningHistoryListContent(
     historyEntries: List<InboxEntry>,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily =
@@ -1031,6 +1109,7 @@ private fun ListeningHistoryListContent(
         }
     } else {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize().testTag("listening_history_list"),
             contentPadding = PaddingValues(bottom = 96.dp),
         ) {

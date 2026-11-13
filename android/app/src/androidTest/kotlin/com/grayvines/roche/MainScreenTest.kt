@@ -2,11 +2,16 @@
 
 package com.grayvines.roche
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToIndex
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -14,6 +19,7 @@ import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
+import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainUiState
 import com.grayvines.roche.ui.theme.RocheTheme
@@ -24,11 +30,10 @@ class MainScreenTest {
     @get:Rule val composeRule = createComposeRule()
 
     @Test
-    fun rendersInboxHeaderPrimaryRowActionsAndFab() {
+    fun rendersInboxHeaderPrimaryRowActionsAndFabs() {
         val sample = createSampleEntry()
         val tag = TagItem(id = "tag-1", name = "llm-inference", unreadCount = 1)
-        val unpinnedSettingsNav =
-            listOf(AppTab.FEEDS, AppTab.STARRED, AppTab.SEARCH, AppTab.OFFLINE)
+        val unpinnedSettingsNav = listOf(AppTab.FEEDS, AppTab.STARRED, AppTab.HOME, AppTab.OFFLINE)
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
@@ -50,10 +55,10 @@ class MainScreenTest {
         }
 
         composeRule.onNodeWithText("Roche").assertExists()
-        composeRule.onNodeWithText("Search").assertExists()
+        composeRule.onNodeWithText("Home").assertExists()
         composeRule.onNodeWithTag("bottom_nav_bar").assertExists()
         composeRule.onNodeWithTag("bottom_tab_inbox").assertExists()
-        composeRule.onNodeWithTag("bottom_tab_search").assertExists()
+        composeRule.onNodeWithTag("bottom_tab_home").assertExists()
         composeRule.onNodeWithTag("bottom_tab_feeds").assertExists()
         composeRule.onNodeWithTag("bottom_tab_starred").assertExists()
         composeRule.onNodeWithTag("bottom_tab_offline").assertExists()
@@ -61,6 +66,7 @@ class MainScreenTest {
         composeRule.onNodeWithText(sample.title).assertExists()
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
+        composeRule.onNodeWithTag("search_fab").assertExists()
         composeRule.onNodeWithTag("save_fab").assertExists()
 
         composeRule.onNodeWithTag("inbox_tag_filter_drawer").assertDoesNotExist()
@@ -91,7 +97,7 @@ class MainScreenTest {
                 isActive = false,
             )
         val tag = TagItem(id = "tag-1", name = "ml-systems", unreadCount = 2)
-        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val dispatched = mutableListOf<MainAction>()
 
         composeRule.setContent {
             RocheTheme {
@@ -121,9 +127,7 @@ class MainScreenTest {
         composeRule.onNodeWithText("legacy.example.com · 1 unread").assertExists()
         composeRule.onNodeWithTag("unarchive_feed_feed-archived-1").performClick()
         org.junit.Assert.assertTrue(
-            dispatched.contains(
-                com.grayvines.roche.ui.MainAction.ToggleFeedArchive("feed-archived-1")
-            )
+            dispatched.contains(MainAction.ToggleFeedArchive("feed-archived-1"))
         )
 
         composeRule.onNodeWithTag("feeds_filter_btn").performClick()
@@ -133,7 +137,7 @@ class MainScreenTest {
 
     @Test
     fun settingsTabNavigatesBetweenHubAndVisualDockAndServerSubpages() {
-        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val dispatched = mutableListOf<MainAction>()
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
@@ -156,13 +160,9 @@ class MainScreenTest {
         composeRule.onNodeWithTag("dock_candidate_offline").performClick()
         composeRule.onNodeWithTag("reset_bottom_nav_btn").performClick()
         org.junit.Assert.assertTrue(
-            dispatched.contains(
-                com.grayvines.roche.ui.MainAction.SetBottomNavSlot(1, AppTab.OFFLINE)
-            )
+            dispatched.contains(MainAction.SetBottomNavSlot(1, AppTab.OFFLINE))
         )
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.ResetBottomNavTabs)
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.ResetBottomNavTabs))
         composeRule.onNodeWithTag("settings_subpage_back_btn").performClick()
 
         composeRule.onNodeWithTag("settings_server_row").performClick()
@@ -174,7 +174,7 @@ class MainScreenTest {
 
     @Test
     fun readerTypographyDrawerAndSearchScopeFiltersRenderAndDispatch() {
-        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val dispatched = mutableListOf<MainAction>()
         val entry =
             createSampleEntry()
                 .copy(contentHtml = "<h2>Architecture</h2><p>Autoregressive decoding details.</p>")
@@ -183,7 +183,7 @@ class MainScreenTest {
                 MainScreen(
                     state =
                         MainUiState(
-                            activeTab = AppTab.SEARCH,
+                            isSearchOpen = true,
                             searchQuery = "Wait-free",
                             searchResults = listOf(entry),
                             allEntries = listOf(entry),
@@ -196,38 +196,134 @@ class MainScreenTest {
             }
         }
 
+        composeRule.onNodeWithText("← Search").assertExists()
         composeRule.onNodeWithTag("reader_typography_btn").performClick()
         composeRule.onNodeWithTag("reader_typography_drawer").assertExists()
         composeRule.onNodeWithText("§ Architecture").assertExists()
         composeRule.onNodeWithTag("reader_font_larger_btn").performScrollTo().performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.any { it is com.grayvines.roche.ui.MainAction.SetReaderFontScale }
-        )
+        org.junit.Assert.assertTrue(dispatched.any { it is MainAction.SetReaderFontScale })
     }
 
     @Test
-    fun searchScopeStripAndMatchSnippetRenderOnSearchTab() {
+    fun searchOverlayRendersScopeStripMatchSnippetAndCloseButton() {
+        val dispatched = mutableListOf<MainAction>()
         val entry = createSampleEntry()
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
                     state =
                         MainUiState(
-                            activeTab = AppTab.SEARCH,
+                            isSearchOpen = true,
                             searchQuery = "Wait-free",
                             searchResults = listOf(entry),
                         ),
-                    onAction = {},
+                    onAction = { dispatched.add(it) },
                     onShareEntry = {},
                     onOpenExternalUrl = {},
                 )
             }
         }
 
+        composeRule.onNodeWithTag("search_overlay").assertExists()
+        composeRule.onNodeWithTag("search_fab").assertDoesNotExist()
         composeRule.onNodeWithTag("search_scope_papers").assertExists()
         composeRule.onNodeWithTag("search_match_snippet_${entry.id}").assertExists()
         composeRule.onNodeWithTag("search_scope_videos").performScrollTo().performClick()
         composeRule.onNodeWithText("No results in Videos for \"Wait-free\".").assertExists()
+        composeRule.onNodeWithTag("close_search_btn").performClick()
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.CloseSearch))
+    }
+
+    @Test
+    fun homeTabRendersWidgetsAndFloatingMagnifyingGlassOpensSearch() {
+        val sample = createSampleEntry()
+        var uiState by
+            mutableStateOf(
+                MainUiState(
+                    activeTab = AppTab.HOME,
+                    visibleEntries = listOf(sample),
+                    allEntries = listOf(sample),
+                )
+            )
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state = uiState,
+                    onAction = { action ->
+                        when (action) {
+                            MainAction.OpenSearch -> uiState = uiState.copy(isSearchOpen = true)
+                            MainAction.CloseSearch -> uiState = uiState.copy(isSearchOpen = false)
+                            else -> Unit
+                        }
+                    },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("home_screen").assertExists()
+        composeRule.onNodeWithTag("home_widget_pulse").assertExists()
+        composeRule.onNodeWithTag("home_widget_up_next").assertExists()
+        composeRule.onNodeWithTag("home_widget_sources").assertExists()
+
+        composeRule.onNodeWithTag("search_fab").performClick()
+        composeRule.onNodeWithTag("search_overlay").assertExists()
+        composeRule.onNodeWithTag("close_search_btn").performClick()
+        composeRule.onNodeWithTag("home_screen").assertExists()
+    }
+
+    @Test
+    fun backFromReaderPreservesExactScrollPositionInInboxList() {
+        val entries =
+            (0 until 40).map { index ->
+                createSampleEntry()
+                    .copy(
+                        id = "entry-$index",
+                        title = "Scrollable Article Headline #$index",
+                        contentType = ContentType.ARTICLE,
+                        isFavorite = false,
+                        isCachedOffline = false,
+                    )
+            }
+        var uiState by
+            mutableStateOf(
+                MainUiState(
+                    activeTab = AppTab.INBOX,
+                    visibleEntries = entries,
+                    allEntries = entries,
+                )
+            )
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state = uiState,
+                    onAction = { action ->
+                        when (action) {
+                            is MainAction.OpenReader ->
+                                uiState = uiState.copy(selectedReaderEntryId = action.entryId)
+                            MainAction.CloseReader ->
+                                uiState = uiState.copy(selectedReaderEntryId = null)
+                            else -> Unit
+                        }
+                    },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("inbox_list").performScrollToIndex(30)
+        composeRule.onNodeWithText("Scrollable Article Headline #30").assertIsDisplayed()
+        composeRule.onNodeWithText("Scrollable Article Headline #0").assertDoesNotExist()
+
+        composeRule.onNodeWithText("Scrollable Article Headline #30").performClick()
+        composeRule.onNodeWithText("← Inbox").assertIsDisplayed()
+
+        composeRule.onNodeWithText("← Inbox").performClick()
+        composeRule.onNodeWithText("Scrollable Article Headline #30").assertIsDisplayed()
+        composeRule.onNodeWithText("Scrollable Article Headline #0").assertDoesNotExist()
     }
 
     @Test
@@ -285,7 +381,7 @@ class MainScreenTest {
 
     @Test
     fun queueTabMiniPlayerAndFullscreenPodcastPlayerRenderAndDispatchActions() {
-        val dispatched = mutableListOf<com.grayvines.roche.ui.MainAction>()
+        val dispatched = mutableListOf<MainAction>()
         val audioEntry =
             createSampleEntry()
                 .copy(
@@ -335,30 +431,18 @@ class MainScreenTest {
             }
         }
 
-        // Fullscreen player renders album art (tap to toggle play/pause), 5 transport buttons, and
-        // top bar
         composeRule.onNodeWithTag("fullscreen_podcast_player").assertExists()
         composeRule.onNodeWithTag("player_album_artwork").performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.TogglePlayPause)
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.TogglePlayPause))
         composeRule.onNodeWithTag("player_speed_btn").assertExists()
         composeRule.onNodeWithTag("player_rewind_btn").performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipPlayerBySeconds(-15))
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.SkipPlayerBySeconds(-15)))
         composeRule.onNodeWithTag("player_ff_btn").performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipPlayerBySeconds(30))
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.SkipPlayerBySeconds(30)))
         composeRule.onNodeWithTag("player_skip_next_btn").performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.SkipToNextQueuedAudio)
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.SkipToNextQueuedAudio))
         composeRule.onNodeWithTag("player_star_btn").performClick()
-        org.junit.Assert.assertTrue(
-            dispatched.contains(com.grayvines.roche.ui.MainAction.ToggleStar(audioEntry.id))
-        )
+        org.junit.Assert.assertTrue(dispatched.contains(MainAction.ToggleStar(audioEntry.id)))
     }
 
     @Test

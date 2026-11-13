@@ -1,6 +1,7 @@
 package com.grayvines.roche.data.local
 
 import androidx.room3.Entity
+import androidx.room3.ForeignKey
 import androidx.room3.Index
 import androidx.room3.PrimaryKey
 
@@ -31,6 +32,7 @@ data class FeedEntity(
             Index(value = ["status"]),
             Index(value = ["contentType"]),
             Index(value = ["isFavorite"]),
+            Index(value = ["publishedAt", "createdAt"]),
         ],
 )
 data class ItemEntity(
@@ -57,6 +59,36 @@ data class ItemEntity(
     val feedUrl: String? = null,
     val interactionUpdatedAt: String? = null,
     val audioUrl: String? = null,
+)
+
+@Entity(
+    tableName = "item_contents",
+    foreignKeys =
+        [
+            ForeignKey(
+                entity = ItemEntity::class,
+                parentColumns = ["id"],
+                childColumns = ["itemId"],
+                onDelete = ForeignKey.CASCADE,
+            )
+        ],
+)
+data class ItemContentEntity(
+    @PrimaryKey val itemId: String,
+    val summary: String? = null,
+    val contentText: String? = null,
+    val contentHtml: String? = null,
+)
+
+data class ItemStateRow(
+    val id: String,
+    val status: String,
+    val isFavorite: Boolean,
+    val isCachedOffline: Boolean,
+    val contentType: String,
+    val readAt: String?,
+    val readProgress: Double,
+    val audioUrl: String?,
 )
 
 @Entity(tableName = "tags", indices = [Index(value = ["name"], unique = true)])

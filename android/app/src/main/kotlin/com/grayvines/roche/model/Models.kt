@@ -72,19 +72,18 @@ enum class InboxFilter(val label: String) {
 }
 
 enum class AppTab(val label: String) {
+    HOME("Home"),
     FEEDS("Feeds"),
     QUEUE("Queue"),
     STARRED("Starred"),
     INBOX("Inbox"),
-    SEARCH("Search"),
     OFFLINE("Offline"),
     SETTINGS("Settings");
 
     companion object {
         const val SIDE_TAB_COUNT = 4
-        val sideTabCandidates: List<AppTab> =
-            listOf(FEEDS, QUEUE, STARRED, SEARCH, OFFLINE, SETTINGS)
-        val defaultSideTabs: List<AppTab> = listOf(FEEDS, QUEUE, SEARCH, SETTINGS)
+        val sideTabCandidates: List<AppTab> = listOf(HOME, FEEDS, QUEUE, STARRED, OFFLINE, SETTINGS)
+        val defaultSideTabs: List<AppTab> = listOf(FEEDS, QUEUE, HOME, SETTINGS)
 
         fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {
             val distinctValid = tabs.filter { it != INBOX && it in sideTabCandidates }.distinct()
@@ -236,7 +235,8 @@ data class InboxEntry(
                 ContentType.PDF -> duration ?: "PDF"
                 ContentType.AUDIO -> formatAudioDurationEstimate(duration) ?: "Audio"
                 ContentType.ARTICLE ->
-                    formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
+                    duration?.takeIf { it.isNotBlank() }
+                        ?: formatArticleMinutes(contentText ?: contentHtml ?: summary.orEmpty())
             }
         }
 }

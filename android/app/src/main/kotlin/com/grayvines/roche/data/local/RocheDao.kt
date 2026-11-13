@@ -8,6 +8,8 @@ import androidx.room3.Transaction
 import com.grayvines.roche.data.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
 import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
+import com.grayvines.roche.model.ContentType
+import com.grayvines.roche.model.formatArticleMinutes
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -15,15 +17,7 @@ interface RocheDao {
     @Query("SELECT * FROM feeds ORDER BY title COLLATE NOCASE ASC, title ASC")
     fun observeFeeds(): Flow<List<FeedEntity>>
 
-    @Query(
-        "SELECT id, feedId, feedTitle, title, url, author, " +
-            "SUBSTR(summary, 1, 16384) AS summary, " +
-            "SUBSTR(contentText, 1, 65536) AS contentText, " +
-            "SUBSTR(contentHtml, 1, 65536) AS contentHtml, " +
-            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
-            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt, audioUrl FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC"
-    )
+    @Query("SELECT * FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC")
     fun observeItems(): Flow<List<ItemEntity>>
 
     @Query("SELECT * FROM tags ORDER BY name COLLATE NOCASE ASC, name ASC")
@@ -107,32 +101,83 @@ interface RocheDao {
     suspend fun deletePendingMutation(entityId: String)
 
     @Query(
-        "SELECT * FROM items WHERE feedId = :feedId " +
-            "OR (feedUrl IS NOT NULL AND LOWER(feedUrl) = LOWER(:feedUrl))"
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
+            "WHERE items.feedId = :feedId " +
+            "OR (items.feedUrl IS NOT NULL AND LOWER(items.feedUrl) = LOWER(:feedUrl))"
     )
     suspend fun getItemsForFeed(feedId: String, feedUrl: String): List<ItemEntity>
 
     @Query(
-        "SELECT id, feedId, feedTitle, title, url, author, " +
-            "SUBSTR(summary, 1, 16384) AS summary, " +
-            "SUBSTR(contentText, 1, 262144) AS contentText, " +
-            "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
-            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
-            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt, audioUrl FROM items"
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId"
     )
     suspend fun getAllItems(): List<ItemEntity>
 
     @Query(
-        "SELECT id, feedId, feedTitle, title, url, author, " +
-            "SUBSTR(summary, 1, 16384) AS summary, " +
-            "SUBSTR(contentText, 1, 262144) AS contentText, " +
-            "SUBSTR(contentHtml, 1, 512000) AS contentHtml, " +
-            "contentType, status, isFavorite, isCachedOffline, publishedAt, createdAt, " +
-            "readProgress, thumbnailMediaId, duration, readAt, thumbnailUrl, feedUrl, " +
-            "interactionUpdatedAt, audioUrl FROM items WHERE id = :id LIMIT 1"
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
+            "WHERE items.id = :id LIMIT 1"
     )
     suspend fun getItemById(id: String): ItemEntity?
+
+    @Query(
+        "SELECT id, status, isFavorite, isCachedOffline, contentType, readAt, readProgress, audioUrl " +
+            "FROM items WHERE id = :id LIMIT 1"
+    )
+    suspend fun getItemStateById(id: String): ItemStateRow?
+
+    @Query(
+        "SELECT id, status, isFavorite, isCachedOffline, contentType, readAt, readProgress, audioUrl " +
+            "FROM items WHERE status != 'archived'"
+    )
+    suspend fun getUnarchivedItemStates(): List<ItemStateRow>
+
+    @Query(
+        """SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, """ +
+            """SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, """ +
+            """SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, """ +
+            """SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, """ +
+            """items.contentType, items.status, items.isFavorite, items.isCachedOffline, """ +
+            """items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, """ +
+            """items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, """ +
+            """items.interactionUpdatedAt, items.audioUrl """ +
+            """FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId """ +
+            """WHERE items.title LIKE :likePattern ESCAPE '\' """ +
+            """OR items.feedTitle LIKE :likePattern ESCAPE '\' """ +
+            """OR items.author LIKE :likePattern ESCAPE '\' """ +
+            """OR items.url LIKE :likePattern ESCAPE '\' """ +
+            """OR COALESCE(ic.summary, items.summary) LIKE :likePattern ESCAPE '\' """ +
+            """OR COALESCE(ic.contentText, items.contentText) LIKE :likePattern ESCAPE '\' """ +
+            """OR COALESCE(ic.contentHtml, items.contentHtml) LIKE :likePattern ESCAPE '\' """ +
+            """OR EXISTS (""" +
+            """SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId """ +
+            """WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\'""" +
+            """) """ +
+            """ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"""
+    )
+    suspend fun searchFullItems(likePattern: String): List<ItemEntity>
 
     @Query("DELETE FROM items WHERE id = :id") suspend fun deleteItemById(id: String)
 
@@ -227,9 +272,35 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertFeed(feed: FeedEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertItems(items: List<ItemEntity>)
+    suspend fun insertRawItems(items: List<ItemEntity>)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertItem(item: ItemEntity)
+    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertRawItem(item: ItemEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertItemContents(contents: List<ItemContentEntity>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertItemContent(content: ItemContentEntity)
+
+    @Transaction
+    suspend fun upsertItems(items: List<ItemEntity>) {
+        if (items.isEmpty()) return
+        val bounded = items.map(::truncateItemForStorage)
+        insertRawItems(bounded.map(::truncateItemForInlinePreview))
+        val extended = bounded.filter(::hasExtendedItemContent).map(::toItemContentEntity)
+        if (extended.isNotEmpty()) {
+            upsertItemContents(extended)
+        }
+    }
+
+    @Transaction
+    suspend fun upsertItem(item: ItemEntity) {
+        val bounded = truncateItemForStorage(item)
+        insertRawItem(truncateItemForInlinePreview(bounded))
+        if (hasExtendedItemContent(bounded)) {
+            upsertItemContent(toItemContentEntity(bounded))
+        }
+    }
 
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertTags(tags: List<TagEntity>)
 
@@ -310,24 +381,85 @@ interface RocheDao {
 }
 
 internal const val SQLITE_DELETE_CHUNK_SIZE = 500
+internal const val LIST_PREVIEW_SUMMARY_CHARS = 1_024
+internal const val LIST_PREVIEW_TEXT_CHARS = 2_048
+internal const val LIST_PREVIEW_HTML_CHARS = 2_048
 
 internal fun truncateItemForStorage(item: ItemEntity): ItemEntity {
-    val summaryLen = item.summary?.length ?: 0
-    val textLen = item.contentText?.length ?: 0
-    val htmlLen = item.contentHtml?.length ?: 0
-    val withinBounds =
-        summaryLen <= MAX_SQLITE_SUMMARY_CHARS &&
-            textLen <= MAX_SQLITE_TEXT_CHARS &&
-            htmlLen <= MAX_SQLITE_HTML_CHARS
-    return if (withinBounds) {
+    val boundedSummary = item.summary?.take(MAX_SQLITE_SUMMARY_CHARS)
+    val boundedText = item.contentText?.take(MAX_SQLITE_TEXT_CHARS)
+    val boundedHtml = item.contentHtml?.take(MAX_SQLITE_HTML_CHARS)
+    val resolvedDuration =
+        resolveStoredArticleDuration(item, boundedSummary, boundedText, boundedHtml)
+    val unchanged =
+        boundedSummary == item.summary &&
+            boundedText == item.contentText &&
+            boundedHtml == item.contentHtml &&
+            resolvedDuration == item.duration
+    return if (unchanged) {
         item
     } else {
         item.copy(
-            summary = item.summary?.take(MAX_SQLITE_SUMMARY_CHARS),
-            contentText = item.contentText?.take(MAX_SQLITE_TEXT_CHARS),
-            contentHtml = item.contentHtml?.take(MAX_SQLITE_HTML_CHARS),
+            summary = boundedSummary,
+            contentText = boundedText,
+            contentHtml = boundedHtml,
+            duration = resolvedDuration,
         )
     }
+}
+
+private fun resolveStoredArticleDuration(
+    item: ItemEntity,
+    boundedSummary: String?,
+    boundedText: String?,
+    boundedHtml: String?,
+): String? =
+    if (
+        ContentType.fromWireValue(item.contentType) == ContentType.ARTICLE &&
+            hasExtendedItemContent(item)
+    ) {
+        formatArticleMinutes(boundedText ?: boundedHtml ?: boundedSummary.orEmpty())
+    } else {
+        item.duration
+    }
+
+internal fun hasExtendedItemContent(item: ItemEntity): Boolean =
+    item.summary.orEmpty().length > LIST_PREVIEW_SUMMARY_CHARS ||
+        item.contentText.orEmpty().length > LIST_PREVIEW_TEXT_CHARS ||
+        item.contentHtml.orEmpty().length > LIST_PREVIEW_HTML_CHARS
+
+internal fun truncateItemForInlinePreview(item: ItemEntity): ItemEntity =
+    if (!hasExtendedItemContent(item)) {
+        item
+    } else {
+        item.copy(
+            summary = item.summary?.take(LIST_PREVIEW_SUMMARY_CHARS),
+            contentText = item.contentText?.take(LIST_PREVIEW_TEXT_CHARS),
+            contentHtml = item.contentHtml?.take(LIST_PREVIEW_HTML_CHARS),
+        )
+    }
+
+internal fun toItemContentEntity(item: ItemEntity): ItemContentEntity =
+    ItemContentEntity(
+        itemId = item.id,
+        summary = item.summary,
+        contentText = item.contentText,
+        contentHtml = item.contentHtml,
+    )
+
+internal fun buildSqlContainsPattern(rawQuery: String): String {
+    val escaped =
+        buildString(rawQuery.length + 2) {
+            append('%')
+            for (ch in rawQuery) {
+                if (ch == '\\' || ch == '%' || ch == '_') {
+                    append('\\')
+                }
+                append(ch)
+            }
+            append('%')
+        }
+    return escaped
 }
 
 internal suspend fun deleteRemovedIdsInChunks(

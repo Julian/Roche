@@ -1,3 +1,5 @@
+@file:Suppress("MatchingDeclarationName")
+
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.FeedEntity
@@ -14,6 +16,40 @@ import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.time.Instant
 
+internal class InboxEntryCache {
+    private data class CachedEntry(
+        val entity: ItemEntity,
+        val tags: List<String>,
+        val entry: InboxEntry,
+    )
+
+    private var byId: Map<String, CachedEntry> = emptyMap()
+
+    @Synchronized
+    fun mapEntries(
+        items: List<ItemEntity>,
+        tagNamesByItemId: Map<String, List<String>>,
+    ): List<InboxEntry> {
+        val previous = byId
+        val next = HashMap<String, CachedEntry>(items.size)
+        val result = ArrayList<InboxEntry>(items.size)
+        for (entity in items) {
+            val tags = tagNamesByItemId[entity.id].orEmpty()
+            val cached = previous[entity.id]
+            val resolved =
+                if (cached != null && cached.entity == entity && cached.tags == tags) {
+                    cached
+                } else {
+                    CachedEntry(entity = entity, tags = tags, entry = toInboxEntry(entity, tags))
+                }
+            next[entity.id] = resolved
+            result.add(resolved.entry)
+        }
+        byId = next
+        return result
+    }
+}
+
 @Suppress("LongMethod")
 internal fun buildSnapshot(
     items: List<ItemEntity>,
@@ -21,6 +57,7 @@ internal fun buildSnapshot(
     tags: List<TagEntity>,
     itemTags: List<ItemTagEntity>,
     activePeers: List<PeerNodeDto> = emptyList(),
+    entryCache: InboxEntryCache? = null,
 ): RepositorySnapshot {
     val tagsById = tags.associateBy { it.id }
     val tagNamesByItemId =
@@ -38,9 +75,12 @@ internal fun buildSnapshot(
                     )
             }
 
-    val domainEntries = items.map { entity ->
-        toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
-    }
+    val domainEntries =
+        if (entryCache != null) {
+            entryCache.mapEntries(items = items, tagNamesByItemId = tagNamesByItemId)
+        } else {
+            items.map { entity -> toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty()) }
+        }
 
     val unreadByFeedId =
         domainEntries

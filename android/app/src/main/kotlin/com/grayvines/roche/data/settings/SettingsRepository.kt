@@ -19,6 +19,7 @@ import java.io.IOException
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 
@@ -28,6 +29,10 @@ internal constructor(
     private val tokenCipher: TokenCipher,
 ) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
+    @Volatile private var cachedDecodedToken: Pair<String, String>? = null
+    @Volatile
+    internal var latestSettings: Settings? = null
+        private set
 
     val settings: Flow<Settings> =
         dataStore.data
@@ -39,11 +44,13 @@ internal constructor(
                     throw exception
                 }
             }
-            .map { prefs -> prefs.toSettings() }
+            .map { prefs -> prefs.toSettings().also { latestSettings = it } }
 
     constructor(
         dataStore: DataStore<Preferences>
     ) : this(dataStore = dataStore, tokenCipher = createDefaultTokenCipher())
+
+    suspend fun prewarm(): Settings = settings.first()
 
     private suspend fun ensurePeerIdPersisted(prefs: Preferences) {
         if (!prefs[KEY_PEER_ID].isNullOrBlank()) return
@@ -87,20 +94,49 @@ internal constructor(
             prefs[KEY_DEFAULT_PLAYBACK_SPEED] = updated.defaultPlaybackSpeed
             prefs[KEY_SKIP_SILENCE_ENABLED] = updated.skipSilenceEnabled
             prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
+            latestSettings = updated
         }
     }
 
     private fun encodeBearerToken(plaintext: String): String {
         val trimmed = plaintext.trim()
-        return if (trimmed.isEmpty()) "" else tokenCipher.encrypt(trimmed)
+        if (trimmed.isEmpty()) {
+            cachedDecodedToken = null
+            return ""
+        }
+        val existing = cachedDecodedToken
+        if (
+            existing != null &&
+                existing.second == trimmed &&
+                existing.first.startsWith(ENCRYPTED_TOKEN_PREFIX)
+        ) {
+            return existing.first
+        }
+        return tokenCipher.encrypt(trimmed).also { encrypted ->
+            if (encrypted.isNotEmpty()) {
+                cachedDecodedToken = encrypted to trimmed
+            }
+        }
     }
 
     private fun decodeBearerToken(stored: String?): String {
         val trimmed = stored?.trim().orEmpty()
         return when {
             trimmed.isEmpty() -> ""
-            trimmed.startsWith(ENCRYPTED_TOKEN_PREFIX) -> tokenCipher.decrypt(trimmed)
+            trimmed.startsWith(ENCRYPTED_TOKEN_PREFIX) -> decryptWithCache(trimmed)
             else -> trimmed
+        }
+    }
+
+    private fun decryptWithCache(encrypted: String): String {
+        val cached = cachedDecodedToken
+        if (cached != null && cached.first == encrypted) {
+            return cached.second
+        }
+        return tokenCipher.decrypt(encrypted).also { decrypted ->
+            if (decrypted.isNotEmpty()) {
+                cachedDecodedToken = encrypted to decrypted
+            }
         }
     }
 
@@ -127,9 +163,7 @@ internal constructor(
                 bottomNavTabs =
                     this[KEY_BOTTOM_NAV_TABS]?.let { raw ->
                         raw.split(',')
-                            .mapNotNull { token ->
-                                AppTab.entries.firstOrNull { it.name == token.trim() }
-                            }
+                            .mapNotNull { token -> parseSavedNavTab(token) }
                             .let { AppTab.normalizeSideTabs(it) }
                     } ?: AppTab.defaultSideTabs,
                 lastPeerSyncCursor = this[KEY_LAST_PEER_SYNC_CURSOR].orEmpty(),
@@ -174,5 +208,16 @@ internal constructor(
                 )
             return SettingsRepository(dataStore = store, tokenCipher = createDefaultTokenCipher())
         }
+    }
+}
+
+private const val LEGACY_SEARCH_TAB_NAME = "SEARCH"
+
+internal fun parseSavedNavTab(rawToken: String): AppTab? {
+    val trimmed = rawToken.trim()
+    return if (trimmed == LEGACY_SEARCH_TAB_NAME) {
+        AppTab.HOME
+    } else {
+        AppTab.entries.firstOrNull { it.name == trimmed }
     }
 }

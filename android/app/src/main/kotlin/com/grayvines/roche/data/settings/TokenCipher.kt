@@ -67,7 +67,15 @@ internal class AesGcmSecretKeyTokenCipher(private val keyProvider: () -> SecretK
 
 internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTORE_KEY_ALIAS) :
     TokenCipher {
-    private val delegate = AesGcmSecretKeyTokenCipher { getOrCreateKeystoreSecretKey(keyAlias) }
+    @Volatile private var cachedSecretKey: SecretKey? = null
+
+    private val delegate = AesGcmSecretKeyTokenCipher {
+        cachedSecretKey
+            ?: synchronized(keystoreLock) {
+                cachedSecretKey
+                    ?: getOrCreateKeystoreSecretKey(keyAlias).also { cachedSecretKey = it }
+            }
+    }
 
     override fun encrypt(plaintext: String): String = delegate.encrypt(plaintext)
 

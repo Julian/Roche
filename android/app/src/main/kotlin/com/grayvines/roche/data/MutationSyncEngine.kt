@@ -21,7 +21,28 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.ItemStatus
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+internal class BackgroundMutationDispatcher(private val scope: CoroutineScope? = null) {
+    private val itemMutexes = ConcurrentHashMap<String, Mutex>()
+
+    val isAsync: Boolean
+        get() = scope != null
+
+    suspend fun dispatchOrRun(itemId: String, block: suspend () -> Unit) {
+        val mutex = itemMutexes.computeIfAbsent(itemId) { Mutex() }
+        if (scope == null) {
+            mutex.withLock { block() }
+        } else {
+            scope.launch { mutex.withLock { block() } }
+        }
+    }
+}
 
 private const val HTTP_NOT_FOUND = 404
 private const val ARCHIVED_STATUS_WIRE = "archived"
@@ -271,8 +292,9 @@ internal suspend fun pushItemUpdateBestEffort(
 private suspend fun syncItemFieldMutation(
     dao: RocheDao,
     itemId: String,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
     applyDirty: (PendingMutationEntity) -> PendingMutationEntity,
-    clearDirty: (PendingMutationEntity) -> PendingMutationEntity,
+    clearDirtyIfMatches: (PendingMutationEntity) -> PendingMutationEntity,
     pushRemote: suspend () -> Boolean,
 ) {
     val existing = dao.getPendingMutation(itemId)
@@ -280,12 +302,27 @@ private suspend fun syncItemFieldMutation(
         dao.upsertPendingMutation(applyDirty(existing))
         return
     }
-    val pushed = pushRemote()
     val base = existing ?: PendingMutationEntity(entityId = itemId)
-    upsertOrCleanPendingMutation(
-        dao = dao,
-        mutation = if (pushed) clearDirty(base) else applyDirty(base),
-    )
+    val dirty = applyDirty(base)
+    if (!dispatcher.isAsync) {
+        val pushed = pushRemote()
+        if (!pushed) {
+            upsertOrCleanPendingMutation(dao = dao, mutation = dirty)
+        } else if (existing != null) {
+            upsertOrCleanPendingMutation(dao = dao, mutation = clearDirtyIfMatches(dirty))
+        }
+        return
+    }
+    upsertOrCleanPendingMutation(dao = dao, mutation = dirty)
+    dispatcher.dispatchOrRun(itemId) {
+        val pushed = pushRemote()
+        if (pushed) {
+            val latest = dao.getPendingMutation(itemId)
+            if (latest != null && latest.kind != PendingEntityKind.LOCAL_ITEM) {
+                upsertOrCleanPendingMutation(dao = dao, mutation = clearDirtyIfMatches(latest))
+            }
+        }
+    }
 }
 
 internal suspend fun syncStatusMutation(
@@ -295,12 +332,22 @@ internal suspend fun syncStatusMutation(
     itemId: String,
     status: String,
     explicitReadAt: String? = null,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
 ) {
     syncItemFieldMutation(
         dao = dao,
         itemId = itemId,
+        dispatcher = dispatcher,
         applyDirty = { it.copy(dirtyStatus = status, dirtyReadAt = explicitReadAt) },
-        clearDirty = { it.copy(dirtyStatus = null, dirtyReadAt = null) },
+        clearDirtyIfMatches = { current ->
+            if (current.dirtyStatus == status && current.dirtyReadAt == explicitReadAt) {
+                current.copy(dirtyStatus = null, dirtyReadAt = null)
+            } else if (current.dirtyStatus == status) {
+                current.copy(dirtyStatus = null)
+            } else {
+                current
+            }
+        },
         pushRemote = {
             pushItemUpdateBestEffort(
                 apiClient = apiClient,
@@ -319,12 +366,20 @@ internal suspend fun syncFavoriteMutation(
     settings: SettingsRepository,
     itemId: String,
     isFavorite: Boolean,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
 ) {
     syncItemFieldMutation(
         dao = dao,
         itemId = itemId,
+        dispatcher = dispatcher,
         applyDirty = { it.copy(dirtyFavorite = isFavorite) },
-        clearDirty = { it.copy(dirtyFavorite = null) },
+        clearDirtyIfMatches = { current ->
+            if (current.dirtyFavorite == isFavorite) {
+                current.copy(dirtyFavorite = null)
+            } else {
+                current
+            }
+        },
         pushRemote = {
             pushItemUpdateBestEffort(
                 apiClient = apiClient,
@@ -342,12 +397,20 @@ internal suspend fun syncReadProgressMutation(
     settings: SettingsRepository,
     itemId: String,
     progress: Double,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
 ) {
     syncItemFieldMutation(
         dao = dao,
         itemId = itemId,
+        dispatcher = dispatcher,
         applyDirty = { it.copy(dirtyReadProgress = progress) },
-        clearDirty = { it.copy(dirtyReadProgress = null) },
+        clearDirtyIfMatches = { current ->
+            if (current.dirtyReadProgress == progress) {
+                current.copy(dirtyReadProgress = null)
+            } else {
+                current
+            }
+        },
         pushRemote = {
             pushItemUpdateBestEffort(
                 apiClient = apiClient,
@@ -365,13 +428,21 @@ internal suspend fun syncReadAtMutation(
     settings: SettingsRepository,
     itemId: String,
     readAt: String?,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
 ) {
     val wireReadAt = readAt ?: UNREAD_READ_AT_TOMBSTONE
     syncItemFieldMutation(
         dao = dao,
         itemId = itemId,
+        dispatcher = dispatcher,
         applyDirty = { it.copy(dirtyReadAt = wireReadAt) },
-        clearDirty = { it.copy(dirtyReadAt = null) },
+        clearDirtyIfMatches = { current ->
+            if (current.dirtyReadAt == wireReadAt) {
+                current.copy(dirtyReadAt = null)
+            } else {
+                current
+            }
+        },
         pushRemote = {
             pushItemUpdateBestEffort(
                 apiClient = apiClient,
@@ -1402,8 +1473,7 @@ internal suspend fun syncArchiveBatchMutation(
     allUnread: Boolean = false,
 ): List<ArchiveStateSnapshot> {
     val targetIds = itemIds.toSet()
-    val unarchivedItems =
-        dao.getAllItems().filter { it.id in targetIds && it.status != ARCHIVED_STATUS_WIRE }
+    val unarchivedItems = dao.getUnarchivedItemStates().filter { it.id in targetIds }
     if (unarchivedItems.isEmpty()) return emptyList()
 
     val nowIso = Instant.now().toString()

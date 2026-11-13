@@ -20,7 +20,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -76,6 +78,7 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 fun InboxTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
 ) {
     val colors = LocalRocheColors.current
     var showTagFilterDrawer by rememberSaveable { mutableStateOf(false) }
@@ -105,7 +108,7 @@ fun InboxTabContent(
             onRefresh = { onAction(MainAction.SyncNow) },
             modifier = Modifier.fillMaxSize().testTag("inbox_pull_to_refresh"),
         ) {
-            InboxEntryListBody(state = state, onAction = onAction)
+            InboxEntryListBody(state = state, onAction = onAction, listState = listState)
         }
     }
 }
@@ -114,6 +117,7 @@ fun InboxTabContent(
 internal fun InboxEntryListBody(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
 ) {
     val colors = LocalRocheColors.current
     if (state.visibleEntries.isEmpty()) {
@@ -138,6 +142,7 @@ internal fun InboxEntryListBody(
         }
     } else {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize().testTag("inbox_list"),
             contentPadding = PaddingValues(bottom = 88.dp),
         ) {

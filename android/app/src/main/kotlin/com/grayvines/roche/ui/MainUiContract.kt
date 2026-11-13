@@ -35,6 +35,7 @@ data class UndoArchiveEvent(
 data class MainUiState(
     val activeTab: AppTab = AppTab.INBOX,
     val activeFilter: InboxFilter = InboxFilter.ALL,
+    val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
@@ -153,6 +154,10 @@ sealed interface MainAction {
     data class FilterByFeed(val feedId: String?) : Ui
 
     data object NavigateBackFromScope : Ui
+
+    data object OpenSearch : Ui
+
+    data object CloseSearch : Ui
 
     data class UpdateSearchQuery(val query: String) : Ui
 
@@ -319,7 +324,11 @@ sealed interface MainAction {
 internal data class TransientUiState(
     val activeTab: AppTab = AppTab.INBOX,
     val activeFilter: InboxFilter = InboxFilter.ALL,
+    val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
+    val deepSearchQuery: String = "",
+    val deepSearchResults: List<InboxEntry> = emptyList(),
+    val optimisticFavorites: Map<String, Boolean> = emptyMap(),
     val selectedTag: String? = null,
     val selectedFeedId: String? = null,
     val scopeOriginTab: AppTab? = null,
@@ -345,6 +354,7 @@ internal fun reduceUiAction(
         is MainAction.SelectTab ->
             state.copy(
                 activeTab = action.tab,
+                isSearchOpen = false,
                 selectedReaderEntryId = null,
                 readerContent = null,
                 selectedFeedId = null,
@@ -361,6 +371,7 @@ internal fun reduceUiAction(
         is MainAction.FilterByTag ->
             state.copy(
                 activeTab = AppTab.INBOX,
+                isSearchOpen = false,
                 selectedTag = action.tagName,
                 selectedFeedId = null,
                 scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
@@ -371,6 +382,7 @@ internal fun reduceUiAction(
         is MainAction.FilterByFeed ->
             state.copy(
                 activeTab = AppTab.INBOX,
+                isSearchOpen = false,
                 selectedFeedId = action.feedId,
                 selectedTag = null,
                 scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
@@ -390,7 +402,6 @@ internal fun reduceUiAction(
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
             )
-        is MainAction.UpdateSearchQuery -> state.copy(searchQuery = action.query)
         else -> reduceOverlayUiAction(state, action)
     }
 
@@ -417,6 +428,21 @@ private fun reduceOverlayUiAction(
     action: MainAction.Ui,
 ): TransientUiState =
     when (action) {
+        is MainAction.UpdateSearchQuery -> reduceUpdateSearchQuery(state, action.query)
+        MainAction.OpenSearch ->
+            state.copy(
+                isSearchOpen = true,
+                contextSheetEntryId = null,
+                feedContextSheetId = null,
+                isAddSheetOpen = false,
+            )
+        MainAction.CloseSearch ->
+            state.copy(
+                isSearchOpen = false,
+                searchQuery = "",
+                deepSearchQuery = "",
+                deepSearchResults = emptyList(),
+            )
         is MainAction.OpenReader ->
             state.copy(
                 selectedReaderEntryId = action.entryId,
@@ -446,6 +472,15 @@ private fun reduceOverlayUiAction(
         else -> state
     }
 
+private fun reduceUpdateSearchQuery(state: TransientUiState, query: String): TransientUiState {
+    val clean = query.trim()
+    return state.copy(
+        searchQuery = query,
+        deepSearchQuery = if (clean.isEmpty()) "" else state.deepSearchQuery,
+        deepSearchResults = if (clean.isEmpty()) emptyList() else state.deepSearchResults,
+    )
+}
+
 internal fun updateBottomNavSlot(
     current: List<AppTab>,
     slotIndex: Int,
@@ -472,11 +507,11 @@ internal fun buildMainUiState(
     localNetworkTier: NetworkTier = local.localNetworkTier,
     playerState: PodcastPlayerState = PodcastPlayerState(),
 ): MainUiState {
-    val entries = snapshot.entries
+    val effectiveEntries = applyOptimisticFavorites(snapshot.entries, local.optimisticFavorites)
     val feeds = snapshot.feeds
     val filtered =
         RocheRepository.filterEntries(
-            entries = entries,
+            entries = effectiveEntries,
             filter = local.activeFilter,
             searchQuery = "",
             selectedTag = local.selectedTag,
@@ -484,14 +519,16 @@ internal fun buildMainUiState(
         )
     val normalizedQuery = local.searchQuery.trim().lowercase()
     val searchResults =
-        if (normalizedQuery.isBlank()) {
-            entries
-        } else {
-            entries.filter { entry -> matchesSearchQuery(entry, normalizedQuery) }
-        }
+        resolveMergedSearchResults(
+            entries = effectiveEntries,
+            normalizedQuery = normalizedQuery,
+            deepSearchQuery = local.deepSearchQuery,
+            deepSearchResults = local.deepSearchResults,
+        )
     return MainUiState(
         activeTab = local.activeTab,
         activeFilter = local.activeFilter,
+        isSearchOpen = local.isSearchOpen,
         searchQuery = local.searchQuery,
         selectedTag = local.selectedTag,
         selectedFeedId = local.selectedFeedId,
@@ -507,23 +544,72 @@ internal fun buildMainUiState(
         isSyncing = local.isSyncing,
         visibleEntries = filtered,
         searchResults = searchResults,
-        allEntries = entries,
+        allEntries = effectiveEntries,
         feeds = feeds,
         tags = snapshot.tags,
         activePeers = snapshot.activePeers,
         localNetworkTier = localNetworkTier,
         settings = settings,
-        queueEntries = computeQueueEntries(entries, settings.queueItemIds),
-        listeningHistoryEntries = computeListeningHistory(entries),
+        queueEntries = computeQueueEntries(effectiveEntries, settings.queueItemIds),
+        listeningHistoryEntries = computeListeningHistory(effectiveEntries),
         activeFeeds = computeActiveFeeds(feeds),
         archivedFeeds = computeArchivedFeeds(feeds),
-        starredEntries = computeStarredEntries(entries),
-        offlineEntries = computeOfflineEntries(entries),
+        starredEntries = computeStarredEntries(effectiveEntries),
+        offlineEntries = computeOfflineEntries(effectiveEntries),
         playerState = playerState,
         undoEvent = local.undoEvent,
         statusBanner = local.statusBanner,
         messageSequence = local.messageSequence,
     )
+}
+
+private fun applyOptimisticFavorites(
+    entries: List<InboxEntry>,
+    optimisticFavorites: Map<String, Boolean>,
+): List<InboxEntry> {
+    if (optimisticFavorites.isEmpty()) return entries
+    var anyChanged = false
+    val mapped = entries.map { entry ->
+        val optimisticFav = optimisticFavorites[entry.id]
+        if (optimisticFav != null && optimisticFav != entry.isFavorite) {
+            anyChanged = true
+            entry.copy(isFavorite = optimisticFav)
+        } else {
+            entry
+        }
+    }
+    return if (anyChanged) mapped else entries
+}
+
+private fun resolveMergedSearchResults(
+    entries: List<InboxEntry>,
+    normalizedQuery: String,
+    deepSearchQuery: String,
+    deepSearchResults: List<InboxEntry>,
+): List<InboxEntry> {
+    if (normalizedQuery.isBlank()) return entries
+    val deepById =
+        if (deepSearchQuery == normalizedQuery && deepSearchResults.isNotEmpty()) {
+            deepSearchResults.associateBy { it.id }
+        } else {
+            emptyMap()
+        }
+    if (deepById.isEmpty()) {
+        return entries.filter { entry -> matchesSearchQuery(entry, normalizedQuery) }
+    }
+    return entries.mapNotNull { entry ->
+        val deepMatch = deepById[entry.id]
+        when {
+            deepMatch != null ->
+                deepMatch.copy(
+                    isFavorite = entry.isFavorite,
+                    status = entry.status,
+                    readAt = entry.readAt,
+                )
+            matchesSearchQuery(entry, normalizedQuery) -> entry
+            else -> null
+        }
+    }
 }
 
 internal fun computeQueueEntries(

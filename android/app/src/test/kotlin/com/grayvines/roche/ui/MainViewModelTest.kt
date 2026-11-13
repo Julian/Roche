@@ -66,7 +66,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
 @OptIn(ExperimentalCoroutinesApi::class)
-@Suppress("LargeClass")
+@Suppress("LargeClass", "TooManyFunctions")
 class MainViewModelTest {
     @TempDir lateinit var tempDir: File
 
@@ -337,7 +337,7 @@ class MainViewModelTest {
             val afterNavUpdate =
                 viewModel.uiState.first { it.settings.bottomNavTabs[1] == AppTab.OFFLINE }
             assertEquals(
-                listOf(AppTab.FEEDS, AppTab.OFFLINE, AppTab.SEARCH, AppTab.SETTINGS),
+                listOf(AppTab.FEEDS, AppTab.OFFLINE, AppTab.HOME, AppTab.SETTINGS),
                 afterNavUpdate.settings.bottomNavTabs,
             )
 
@@ -612,8 +612,14 @@ class MainViewModelTest {
             assertEquals(1, loadedState.visibleEntries.size)
             val listEntry = loadedState.visibleEntries.single()
             assertEquals("Persisted Oversized Entry", listEntry.title)
-            assertEquals(65_536, listEntry.contentHtml?.length)
-            assertEquals(65_536, listEntry.contentText?.length)
+            assertEquals(
+                com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS,
+                listEntry.contentHtml?.length,
+            )
+            assertEquals(
+                com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS,
+                listEntry.contentText?.length,
+            )
 
             viewModel.dispatch(MainAction.OpenReader("item-large"))
             val readerState =
@@ -1441,6 +1447,94 @@ class MainViewModelTest {
                 listOf("chunk-3", "chunk-4", "chunk-5"),
                 bytePruneDir.listFiles().orEmpty().map { it.name }.sorted(),
             )
+        }
+
+    @Test
+    internal fun `prewarmed repository initializes MainViewModel with instant non-loading inbox`() =
+        runTest {
+            database.dao().upsertFeeds(SeedData.feeds)
+            database.dao().upsertItems(SeedData.items)
+            settings.prewarm()
+            repository.prewarm()
+
+            val warmViewModel =
+                MainViewModel(
+                    repository = repository,
+                    settingsRepository = settings,
+                    playerBackend = playerBackend,
+                    mediaSessionBridge = mediaSessionBridge,
+                )
+            try {
+                // Before even starting a collector, initialValue already has cached entries
+                assertFalse(warmViewModel.uiState.value.isInitialLoading)
+                assertTrue(warmViewModel.uiState.value.visibleEntries.isNotEmpty())
+            } finally {
+                warmViewModel.playerController.releaseController()
+                warmViewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    internal fun `ToggleStar updates UI optimistically and SearchOverlay merges deep body matches`() =
+        runTest {
+            val deepText =
+                "Lead text. " + "z".repeat(8_000) + " DeepOverlayKeyword42 inside full text."
+            database
+                .dao()
+                .upsertItem(
+                    testItem(id = "item-fast-star", title = "Optimistic Star Target")
+                        .copy(contentText = deepText, contentHtml = "<p>$deepText</p>")
+                )
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.visibleEntries.any { e -> e.id == "item-fast-star" } }
+
+            // ToggleStar flips favorite immediately in uiState
+            viewModel.dispatch(MainAction.ToggleStar("item-fast-star"))
+            val starredState =
+                viewModel.uiState.first {
+                    it.visibleEntries.firstOrNull { e -> e.id == "item-fast-star" }?.isFavorite ==
+                        true
+                }
+            assertEquals("Starred", starredState.statusBanner)
+
+            viewModel.dispatch(MainAction.ToggleStar("item-fast-star"))
+            val unstarredState =
+                viewModel.uiState.first {
+                    it.visibleEntries.firstOrNull { e -> e.id == "item-fast-star" }?.isFavorite ==
+                        false
+                }
+            assertEquals("Removed star", unstarredState.statusBanner)
+
+            // OpenSearch -> UpdateSearchQuery finds deep text beyond 2KB list preview ->
+            // CloseSearch
+            viewModel.dispatch(MainAction.OpenSearch)
+            assertTrue(viewModel.uiState.first { it.isSearchOpen }.isSearchOpen)
+
+            viewModel.dispatch(MainAction.UpdateSearchQuery("DeepOverlayKeyword42"))
+            val searched =
+                viewModel.uiState.first { state ->
+                    state.searchResults.any { it.id == "item-fast-star" }
+                }
+            assertEquals("item-fast-star", searched.searchResults.single().id)
+
+            // Opening Reader from Search keeps isSearchOpen true so CloseReader returns to Search
+            viewModel.dispatch(MainAction.OpenReader("item-fast-star"))
+            assertEquals(
+                "item-fast-star",
+                viewModel.uiState
+                    .first { it.selectedReaderEntryId == "item-fast-star" }
+                    .selectedReaderEntryId,
+            )
+            viewModel.dispatch(MainAction.CloseReader)
+            val backInSearch = viewModel.uiState.first { it.selectedReaderEntryId == null }
+            assertTrue(backInSearch.isSearchOpen)
+            assertEquals("DeepOverlayKeyword42", backInSearch.searchQuery)
+
+            viewModel.dispatch(MainAction.CloseSearch)
+            val closedSearch = viewModel.uiState.first { !it.isSearchOpen }
+            assertEquals("", closedSearch.searchQuery)
+
+            collectJob.cancel()
         }
 
     private class FakeAudioPlayerBackend : AudioPlayerBackend {

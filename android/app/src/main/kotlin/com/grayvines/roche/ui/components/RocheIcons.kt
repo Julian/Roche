@@ -44,8 +44,7 @@ fun BottomTabIcon(
                     color = tint,
                     style = stroke,
                 )
-            AppTab.SEARCH ->
-                drawSearchTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+            AppTab.HOME -> drawHomeTabIcon(tint = tint, stroke = stroke)
             AppTab.FEEDS -> drawFeedsTabIcon(tint = tint, stroke = stroke)
             AppTab.OFFLINE ->
                 drawArrowTray(
@@ -123,6 +122,45 @@ private fun DrawScope.drawQueueTabIcon(tint: Color, stroke: Stroke, strokeWidth:
         }
     drawPath(path = playPath, color = tint, style = Fill)
     drawPath(path = playPath, color = tint, style = stroke)
+}
+
+private fun DrawScope.drawHomeTabIcon(tint: Color, stroke: Stroke) {
+    val w = size.width
+    val h = size.height
+    val housePath =
+        Path().apply {
+            moveTo(w * 0.14f, h * 0.48f)
+            lineTo(w * 0.50f, h * 0.16f)
+            lineTo(w * 0.86f, h * 0.48f)
+            lineTo(w * 0.78f, h * 0.48f)
+            lineTo(w * 0.78f, h * 0.84f)
+            lineTo(w * 0.22f, h * 0.84f)
+            lineTo(w * 0.22f, h * 0.48f)
+            close()
+        }
+    drawPath(path = housePath, color = tint, style = stroke)
+    val doorPath =
+        Path().apply {
+            moveTo(w * 0.41f, h * 0.84f)
+            lineTo(w * 0.41f, h * 0.58f)
+            lineTo(w * 0.59f, h * 0.58f)
+            lineTo(w * 0.59f, h * 0.84f)
+        }
+    drawPath(path = doorPath, color = tint, style = stroke)
+}
+
+/** Crisp magnifying glass icon for the floating Search overlay button and search bar. */
+@Composable
+fun SearchIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 20.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        drawSearchTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+    }
 }
 
 private fun DrawScope.drawSearchTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {

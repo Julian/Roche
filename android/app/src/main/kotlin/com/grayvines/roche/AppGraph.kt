@@ -18,6 +18,7 @@ import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class AppGraph(context: Context) {
     private val appContext = context.applicationContext
@@ -43,6 +44,7 @@ class AppGraph(context: Context) {
             settings = settings,
             cacheDir = offlineCacheDir,
             networkTierProvider = networkTierProvider,
+            backgroundScope = appScope,
         )
     }
 
@@ -69,5 +71,10 @@ class AppGraph(context: Context) {
             settingsRepository = settings,
             mediaSessionBridge = mediaSessionBridge,
         )
+    }
+
+    fun prewarm() {
+        appScope.launch { settings.prewarm() }
+        appScope.launch { repository.prewarm() }
     }
 }

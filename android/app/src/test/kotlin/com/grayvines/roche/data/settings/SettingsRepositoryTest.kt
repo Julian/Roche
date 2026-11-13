@@ -2,9 +2,11 @@ package com.grayvines.roche.data.settings
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
+import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -222,6 +224,55 @@ class SettingsRepositoryTest {
                 val afterUpdate = repository.settings.first()
                 assertEquals("legacy-plaintext-tok", afterUpdate.bearerToken)
                 assertEquals("2026-06-01T12:00:00Z", afterUpdate.lastPeerSyncCursor)
+            } finally {
+                dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `legacy SEARCH bottom nav slot migrates to HOME and token decryption caches plaintext`() =
+        runTest {
+            val secretKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val delegateCipher = AesGcmSecretKeyTokenCipher(secretKey)
+            val decryptCount = AtomicInteger(0)
+            val countingCipher =
+                object : TokenCipher {
+                    override fun encrypt(plaintext: String): String =
+                        delegateCipher.encrypt(plaintext)
+
+                    override fun decrypt(stored: String): String {
+                        decryptCount.incrementAndGet()
+                        return delegateCipher.decrypt(stored)
+                    }
+                }
+            val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val store =
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "migrated_nav.preferences_pb") },
+                    )
+                val encryptedToken = delegateCipher.encrypt("cached-token-99")
+                store.edit { prefs ->
+                    prefs[SettingsRepository.KEY_BOTTOM_NAV_TABS] = "FEEDS,QUEUE,SEARCH,SETTINGS"
+                    prefs[SettingsRepository.KEY_BEARER_TOKEN] = encryptedToken
+                }
+
+                val repository = SettingsRepository(store, countingCipher)
+                val prewarmed = repository.prewarm()
+                assertEquals(
+                    listOf(AppTab.FEEDS, AppTab.QUEUE, AppTab.HOME, AppTab.SETTINGS),
+                    prewarmed.bottomNavTabs,
+                )
+                assertEquals("cached-token-99", prewarmed.bearerToken)
+                assertEquals(prewarmed, repository.latestSettings)
+                val decryptsAfterPrewarm = decryptCount.get()
+                assertEquals(1, decryptsAfterPrewarm)
+
+                repository.update { it.copy(ultraDenseRows = true) }
+                val updated = repository.settings.first()
+                assertEquals("cached-token-99", updated.bearerToken)
+                assertEquals(decryptsAfterPrewarm, decryptCount.get())
             } finally {
                 dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
             }

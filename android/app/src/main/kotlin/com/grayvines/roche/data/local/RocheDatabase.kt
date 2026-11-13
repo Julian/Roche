@@ -14,12 +14,13 @@ import androidx.sqlite.execSQL
         [
             FeedEntity::class,
             ItemEntity::class,
+            ItemContentEntity::class,
             TagEntity::class,
             ItemTagEntity::class,
             PendingMutationEntity::class,
             TombstoneEntity::class,
         ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -97,10 +98,53 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_5_6 =
+            object : Migration(5, 6) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    connection.execSQL(
+                        "CREATE TABLE IF NOT EXISTS `item_contents` (" +
+                            "`itemId` TEXT NOT NULL, " +
+                            "`summary` TEXT, " +
+                            "`contentText` TEXT, " +
+                            "`contentHtml` TEXT, " +
+                            "PRIMARY KEY(`itemId`), " +
+                            "FOREIGN KEY(`itemId`) REFERENCES `items`(`id`) " +
+                            "ON UPDATE NO ACTION ON DELETE CASCADE)"
+                    )
+                    connection.execSQL(
+                        "INSERT OR REPLACE INTO `item_contents` " +
+                            "(`itemId`, `summary`, `contentText`, `contentHtml`) " +
+                            "SELECT `id`, `summary`, `contentText`, `contentHtml` FROM `items` " +
+                            "WHERE LENGTH(`summary`) > $LIST_PREVIEW_SUMMARY_CHARS " +
+                            "OR LENGTH(`contentText`) > $LIST_PREVIEW_TEXT_CHARS " +
+                            "OR LENGTH(`contentHtml`) > $LIST_PREVIEW_HTML_CHARS"
+                    )
+                    connection.execSQL(
+                        "UPDATE `items` SET " +
+                            "`summary` = SUBSTR(`summary`, 1, $LIST_PREVIEW_SUMMARY_CHARS), " +
+                            "`contentText` = SUBSTR(`contentText`, 1, $LIST_PREVIEW_TEXT_CHARS), " +
+                            "`contentHtml` = SUBSTR(`contentHtml`, 1, $LIST_PREVIEW_HTML_CHARS) " +
+                            "WHERE LENGTH(`summary`) > $LIST_PREVIEW_SUMMARY_CHARS " +
+                            "OR LENGTH(`contentText`) > $LIST_PREVIEW_TEXT_CHARS " +
+                            "OR LENGTH(`contentHtml`) > $LIST_PREVIEW_HTML_CHARS"
+                    )
+                    connection.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_items_publishedAt_createdAt` " +
+                            "ON `items` (`publishedAt`, `createdAt`)"
+                    )
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(
+                    MIGRATION_1_2,
+                    MIGRATION_2_3,
+                    MIGRATION_3_4,
+                    MIGRATION_4_5,
+                    MIGRATION_5_6,
+                )
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }
