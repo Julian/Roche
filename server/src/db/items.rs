@@ -481,8 +481,7 @@ impl<'a> ItemRepo<'a> {
 
     pub async fn list_filtered_page(&self, filter: &ItemFilter) -> Result<ItemPage> {
         let trimmed_search = filter.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let search_terms =
-            trimmed_search.map(ItemFilter::tokenize_search_terms).unwrap_or_default();
+        let search_terms = trimmed_search.map_or_default(ItemFilter::tokenize_search_terms);
         let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
 
         let base_select = if filter.include_content == Some(false) {

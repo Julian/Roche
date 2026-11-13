@@ -79,8 +79,8 @@ impl RssParser {
             });
 
         let parsed_feed = RssFeed {
-            title: feed.title.map(|t| t.content).unwrap_or_default(),
-            description: feed.description.map(|d| d.content).unwrap_or_default(),
+            title: feed.title.map_or_default(|t| t.content),
+            description: feed.description.map_or_default(|d| d.content),
             language: feed.language.unwrap_or_default(),
         };
 
@@ -116,7 +116,7 @@ impl RssParser {
                         })
                     })
                     .or_else(|| audio_url.is_some().then(|| feed_fallback_thumb.clone()).flatten());
-                let title = entry.title.map(|t| t.content).unwrap_or_default();
+                let title = entry.title.map_or_default(|t| t.content);
                 let body = entry.content.and_then(|c| c.body);
                 let summary = entry.summary.map(|s| s.content);
                 let description = summary.clone().or_else(|| body.clone()).unwrap_or_default();

@@ -745,8 +745,14 @@ internal suspend fun subscribeFeedBestEffort(
         )
     }
 
-    val remoteFeed =
-        tryCreateRemoteFeed(apiClient, currentSettings, canonicalUrl, url, cleanTitleOverride)
+    val spec =
+        FeedCreationSpec(
+            canonicalUrl = canonicalUrl,
+            rawUrl = url,
+            fallbackTitle = fallbackTitle,
+            cleanTitleOverride = cleanTitleOverride,
+        )
+    val remoteFeed = tryCreateRemoteFeed(apiClient, currentSettings, spec)
     val entity =
         if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
             toRemoteFeedEntity(
@@ -757,14 +763,7 @@ internal suspend fun subscribeFeedBestEffort(
                 existingLocal,
             )
         } else {
-            createPendingLocalFeed(
-                dao,
-                existingLocal,
-                canonicalUrl,
-                url,
-                fallbackTitle,
-                cleanTitleOverride,
-            )
+            createPendingLocalFeed(dao, existingLocal, spec)
         }
     dao.upsertFeed(entity)
     if (remoteFeed == null) {
@@ -778,23 +777,28 @@ internal suspend fun subscribeFeedBestEffort(
     return dao.getFeedById(entity.id)?.title ?: entity.title
 }
 
+private data class FeedCreationSpec(
+    val canonicalUrl: String,
+    val rawUrl: String,
+    val fallbackTitle: String,
+    val cleanTitleOverride: String?,
+)
+
 private suspend fun tryCreateRemoteFeed(
     apiClient: RocheApiClient,
     currentSettings: Settings,
-    canonicalUrl: String,
-    rawUrl: String,
-    cleanTitleOverride: String?,
+    spec: FeedCreationSpec,
 ): RemoteFeedDto? = runSuspendCatching {
     if (
-        isSyncablePublicUrl(canonicalUrl) &&
+        isSyncablePublicUrl(spec.canonicalUrl) &&
             currentSettings.serverUrl.isNotBlank() &&
             currentSettings.bearerToken.isNotBlank()
     ) {
         apiClient.createFeed(
             serverUrl = currentSettings.serverUrl,
             token = currentSettings.bearerToken,
-            url = rawUrl,
-            title = cleanTitleOverride,
+            url = spec.rawUrl,
+            title = spec.cleanTitleOverride,
         )
     } else {
         null
@@ -802,33 +806,29 @@ private suspend fun tryCreateRemoteFeed(
 }
     .getOrNull()
 
-@Suppress("LongParameterList")
 private suspend fun createPendingLocalFeed(
     dao: RocheDao,
     existingLocal: FeedEntity?,
-    canonicalUrl: String,
-    rawUrl: String,
-    fallbackTitle: String,
-    cleanTitleOverride: String?,
+    spec: FeedCreationSpec,
 ): FeedEntity {
     val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
     val localFeed =
         existingLocal?.copy(
-            title = cleanTitleOverride ?: existingLocal.title,
+            title = spec.cleanTitleOverride ?: existingLocal.title,
             isActive = true,
         )
             ?: FeedEntity(
-                id = deterministicFeedId(canonicalUrl),
-                title = fallbackTitle,
-                url = canonicalUrl,
+                id = deterministicFeedId(spec.canonicalUrl),
+                title = spec.fallbackTitle,
+                url = spec.canonicalUrl,
                 siteUrl = null,
-                feedType = inferFeedTypeWireValue(rawUrl),
+                feedType = inferFeedTypeWireValue(spec.rawUrl),
                 lastPolled = nowIso,
             )
     dao.upsertPendingMutation(
         PendingMutationEntity.localFeed(
             entityId = localFeed.id,
-            titleOverride = cleanTitleOverride,
+            titleOverride = spec.cleanTitleOverride,
         )
     )
     return localFeed

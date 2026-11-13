@@ -58,6 +58,10 @@ internal class AesGcmSecretKeyTokenCipher(private val keyProvider: () -> SecretK
         val decoder = Base64.getUrlDecoder()
         val iv = decoder.decode(parts[0])
         val ciphertext = decoder.decode(parts[1])
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        val isCanonicalBase64 =
+            encoder.encodeToString(iv) == parts[0] && encoder.encodeToString(ciphertext) == parts[1]
+        if (!isCanonicalBase64) return ""
         if (iv.size != GCM_IV_LENGTH_BYTES || ciphertext.size <= GCM_TAG_LENGTH_BYTES) return ""
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         cipher.init(Cipher.DECRYPT_MODE, keyProvider(), GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))

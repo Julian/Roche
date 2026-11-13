@@ -163,6 +163,17 @@ class SettingsRepositoryTest {
             assertEquals("super-secret-bearer", cipher.decrypt(enc1))
             assertEquals("super-secret-bearer", cipher.decrypt(enc2))
 
+            repeat(64) {
+                val sample = cipher.encrypt("super-secret-bearer")
+                val sampleParts = sample.split(':')
+                val ct = sampleParts[3]
+                val flippedFirstCt = (if (ct.first() == 'A') 'B' else 'A') + ct.drop(1)
+                val tamperedPayload =
+                    "${sampleParts[0]}:${sampleParts[1]}:${sampleParts[2]}:$flippedFirstCt"
+                val flippedLastSample = sample.dropLast(1) + if (sample.last() == 'A') 'B' else 'A'
+                assertEquals("", cipher.decrypt(tamperedPayload))
+                assertEquals("", cipher.decrypt(flippedLastSample))
+            }
             val flippedLast = enc1.dropLast(1) + if (enc1.last() == 'A') 'B' else 'A'
             assertEquals("", cipher.decrypt(flippedLast))
             assertEquals("", cipher.decrypt("enc:v1:bad-iv:bad-ct"))

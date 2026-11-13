@@ -678,16 +678,7 @@ class RocheRepository(
             }
             val peerSyncedCount =
                 if (currentSettings.bearerToken.isNotBlank()) {
-                    tryPeerSyncAndCooperativePoll(
-                        dao = dao,
-                        apiClient = apiClient,
-                        currentSettings = currentSettings,
-                        networkTier = currentTier,
-                        onPeersUpdated = { activePeersFlow.value = it },
-                        onSyncCursorUpdated = { cursor ->
-                            settings.update { it.copy(lastPeerSyncCursor = cursor) }
-                        },
-                    )
+                    peerSyncCoordinator(currentTier).syncAndCooperativePoll(currentSettings)
                 } else {
                     null
                 }
@@ -702,36 +693,28 @@ class RocheRepository(
             val currentTier = networkTierProvider.currentNetworkTier()
             check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
             val currentSettings = settings.settings.first()
-            var measuredWeight: Double? = null
-            val polledCount =
+            val pollOutcome =
                 pollCooperativeFeedsOnDevice(
                     dao = dao,
                     apiClient = apiClient,
                     localPeerId = currentSettings.peerId,
                     activePeers = activePeersFlow.value,
-                    onMeasuredWeight = { measuredWeight = it },
                 )
             if (
-                polledCount > 0 &&
+                pollOutcome.polledFeedsCount > 0 &&
                     currentSettings.serverUrl.isNotBlank() &&
                     currentSettings.bearerToken.isNotBlank()
             ) {
                 runSuspendCatching {
-                    tryPeerSyncAndCooperativePoll(
-                        dao = dao,
-                        apiClient = apiClient,
-                        currentSettings = currentSettings,
-                        networkTier = currentTier,
-                        onPeersUpdated = { activePeersFlow.value = it },
-                        onSyncCursorUpdated = { cursor ->
-                            settings.update { it.copy(lastPeerSyncCursor = cursor) }
-                        },
-                        initialWeightOverride = measuredWeight,
-                    )
+                    peerSyncCoordinator(currentTier)
+                        .syncAndCooperativePoll(
+                            currentSettings = currentSettings,
+                            initialWeightOverride = pollOutcome.measuredWeight,
+                        )
                 }
             }
             offlineCacheManager.autoDownloadNewEpisodes()
-            polledCount
+            pollOutcome.polledFeedsCount
         }
     }
 
@@ -746,14 +729,26 @@ class RocheRepository(
         return syncMutex.withLock {
             runSuspendCatching {
                 pollCooperativeFeedsOnDevice(
-                    dao = dao,
-                    apiClient = apiClient,
-                    localPeerId = currentSettings.peerId,
-                    activePeers = activePeersFlow.value,
-                )
+                        dao = dao,
+                        apiClient = apiClient,
+                        localPeerId = currentSettings.peerId,
+                        activePeers = activePeersFlow.value,
+                    )
+                    .polledFeedsCount
             }
         }
     }
+
+    private fun peerSyncCoordinator(networkTier: NetworkTier): PeerSyncCoordinator =
+        PeerSyncCoordinator(
+            dao = dao,
+            apiClient = apiClient,
+            networkTier = networkTier,
+            onPeersUpdated = { activePeersFlow.value = it },
+            onSyncCursorUpdated = { cursor ->
+                settings.update { it.copy(lastPeerSyncCursor = cursor) }
+            },
+        )
 
     private suspend fun syncLegacySnapshot(currentSettings: Settings): Int {
         val pushOutcome =
@@ -789,21 +784,24 @@ class RocheRepository(
 
         reconcileRemoteSnapshot(
             dao = dao,
-            remoteFeeds = mergedFeeds,
-            remoteItems = mergedItems,
-            remoteTags = remoteTags,
-            appliedMutations = pushOutcome.appliedMutations,
-            preFetchItemsById = preFetchItemsById,
-            preFetchFeedsById = preFetchFeedsById,
+            snapshot =
+                RemoteSnapshotData(
+                    feeds = mergedFeeds,
+                    items = mergedItems,
+                    tags = remoteTags,
+                ),
+            options =
+                ReconcileOptions(
+                    appliedMutations = pushOutcome.appliedMutations,
+                    preFetchItemsById = preFetchItemsById,
+                    preFetchFeedsById = preFetchFeedsById,
+                ),
         )
         bootstrapDeltaPeerSyncIfNeeded(
-            dao = dao,
-            apiClient = apiClient,
+            coordinator = peerSyncCoordinator(networkTierProvider.currentNetworkTier()),
             settings = settings,
             currentSettings = currentSettings,
-            networkTier = networkTierProvider.currentNetworkTier(),
             hasMergedData = mergedFeeds.isNotEmpty() || mergedItems.isNotEmpty(),
-            onPeersUpdated = { activePeersFlow.value = it },
         )
         return dao.countItems()
     }
@@ -850,15 +848,11 @@ private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
 private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L
 
-@Suppress("LongParameterList")
 internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
-    dao: RocheDao,
-    apiClient: RocheApiClient,
+    coordinator: PeerSyncCoordinator,
     settings: SettingsRepository,
     currentSettings: Settings,
-    networkTier: NetworkTier,
     hasMergedData: Boolean,
-    onPeersUpdated: (List<PeerNodeDto>) -> Unit,
 ) {
     val shouldBootstrap =
         currentSettings.bearerToken.isNotBlank() &&
@@ -872,15 +866,8 @@ internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
             .toString()
     settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
     runSuspendCatching {
-        tryPeerSyncAndCooperativePoll(
-            dao = dao,
-            apiClient = apiClient,
-            currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor),
-            networkTier = networkTier,
-            onPeersUpdated = onPeersUpdated,
-            onSyncCursorUpdated = { cursor ->
-                settings.update { it.copy(lastPeerSyncCursor = cursor) }
-            },
+        coordinator.syncAndCooperativePoll(
+            currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor)
         )
     }
 }

@@ -73,7 +73,7 @@ impl YouTubeParser {
     pub fn parse(content: &str) -> Result<YouTubeFeed> {
         let feed = feed_rs::parser::parse(content.as_bytes())?;
 
-        let channel_title = feed.title.map(|t| t.content).unwrap_or_default();
+        let channel_title = feed.title.map_or_default(|t| t.content);
         let fallback_descriptions = Self::extract_all_media_descriptions(content);
 
         let items = feed
@@ -91,7 +91,7 @@ impl YouTubeParser {
                     "https://www.youtube.com/watch?v={video_id}"
                 ))
                 .ok()?;
-                let title = entry.title.map(|t| t.content).unwrap_or_default();
+                let title = entry.title.map_or_default(|t| t.content);
 
                 let mut description = entry
                     .media

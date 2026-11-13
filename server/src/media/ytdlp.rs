@@ -168,11 +168,8 @@ impl YtDlpWorker {
                 continue;
             }
             let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
+            let ext =
+                path.extension().and_then(|e| e.to_str()).map_or_default(str::to_ascii_lowercase);
 
             match ext.as_str() {
                 "mp4" | "webm" | "mkv" | "m4v" if video_file.is_none() => {

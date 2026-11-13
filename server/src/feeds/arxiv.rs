@@ -31,7 +31,7 @@ impl ArxivParser {
     pub fn parse(content: &str) -> Result<ArxivFeed> {
         let feed = feed_rs::parser::parse(content.as_bytes())?;
 
-        let title = feed.title.map(|t| t.content).unwrap_or_default();
+        let title = feed.title.map_or_default(|t| t.content);
 
         let items = feed
             .entries
@@ -43,12 +43,12 @@ impl ArxivParser {
                         SafeHttpClient::parse_url(&format!("https://arxiv.org/abs/{id}")).ok()
                     })
                 });
-                let title = entry.title.map(|t| t.content).unwrap_or_default();
+                let title = entry.title.map_or_default(|t| t.content);
 
                 let authors: Vec<String> =
                     entry.authors.into_iter().filter_map(|a| a.name).collect();
 
-                let summary = entry.summary.map(|s| s.content).unwrap_or_default();
+                let summary = entry.summary.map_or_default(|s| s.content);
 
                 ArxivPaper { title, authors, abstract_url, published_at, summary }
             })
