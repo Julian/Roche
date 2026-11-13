@@ -51,6 +51,7 @@ class MainViewModel(
 
     private var deepSearchJob: Job? = null
     private val inFlightStarCounts = mutableMapOf<String, Int>()
+    private val uiStateMemoizer = MainUiStateMemoizer()
 
     private val settingsForUi =
         settingsRepository.settings
@@ -75,7 +76,7 @@ class MainViewModel(
             settingsForUi,
             transientState,
         ) { snapshot: RepositorySnapshot, settings: Settings, local: TransientUiState ->
-            buildMainUiState(
+            uiStateMemoizer.build(
                 snapshot = snapshot,
                 settings = settings,
                 local = local,
@@ -110,7 +111,7 @@ class MainViewModel(
                     playerState = playerController.state.value,
                 )
         val cachedSettings = settingsRepository.latestSettings ?: Settings()
-        return buildMainUiState(
+        return uiStateMemoizer.build(
             snapshot = cachedSnapshot,
             settings = cachedSettings,
             local = transientState.value,
@@ -120,6 +121,10 @@ class MainViewModel(
                     smartRewindEnabled = cachedSettings.smartRewindEnabled
                 ),
         )
+    }
+
+    internal suspend fun awaitBackgroundUiWorkForTest() {
+        deepSearchJob?.join()
     }
 
     override fun onCleared() {

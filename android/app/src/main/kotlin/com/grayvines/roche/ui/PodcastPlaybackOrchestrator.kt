@@ -36,13 +36,17 @@ internal class PodcastPlaybackOrchestrator(
         val feed = entry.feedId?.let { fid -> latestSnapshot.feeds.firstOrNull { it.id == fid } }
         val effectiveSpeed = feed?.customPlaybackSpeed ?: latestSettings.defaultPlaybackSpeed
         val source = repository.resolveAudioPlaybackSource(entry)
-        val updatedQueue =
-            if (entryId in latestSettings.queueItemIds) {
-                latestSettings.queueItemIds
-            } else {
-                listOf(entryId) + latestSettings.queueItemIds
-            }
-        settingsRepository.update { current -> current.copy(queueItemIds = updatedQueue) }
+        var updatedQueue: List<String> = latestSettings.queueItemIds
+        settingsRepository.update { current ->
+            val nextQueue =
+                if (entryId in current.queueItemIds) {
+                    current.queueItemIds
+                } else {
+                    listOf(entryId) + current.queueItemIds
+                }
+            updatedQueue = nextQueue
+            current.copy(queueItemIds = nextQueue)
+        }
         val entriesById = allEntries.associateBy { it.id }
         val hasNextAudio = updatedQueue.any { id ->
             id != entryId &&

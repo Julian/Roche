@@ -32,8 +32,6 @@ import com.grayvines.roche.ui.components.calculateInSampleSize
 import com.grayvines.roche.ui.components.pruneThumbnailDiskCache
 import java.io.File
 import java.lang.reflect.Proxy
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlinx.coroutines.CompletableDeferred
@@ -1031,9 +1029,13 @@ class MainViewModelTest {
             localVm.dispatch(MainAction.SelectTab(AppTab.FEEDS))
             localVm.uiState.first { it.activeTab == AppTab.FEEDS }
             localVm.dispatch(MainAction.UpdateSearchQuery("Episode"))
+            localVm.awaitBackgroundUiWorkForTest()
             localVm.uiState.first { it.searchQuery == "Episode" }
             localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
-            localVm.uiState.first { it.playerState.currentEntryId == "ep-tier-1" }
+            localVm.uiState.first {
+                it.playerState.currentEntryId == "ep-tier-1" && it.readerContent != null
+            }
+            localVm.playerController.cancelAutoTickerForTest()
             localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
             localVm.uiState.first { it.playerState.positionMs == 10_100L }
             assertEquals(1, tierQueryCount)
@@ -1165,20 +1167,34 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.AddToQueue("art-stage-2"))
             viewModel.dispatch(MainAction.UpdateSearchQuery("Systems"))
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-stage-1"))
+            viewModel.awaitBackgroundUiWorkForTest()
 
             val beforeState =
                 viewModel.uiState.first {
                     it.playerState.currentEntryId == "ep-stage-1" &&
+                        it.queueEntries.size == 2 &&
                         it.searchQuery == "Systems" &&
                         it.searchResults.size == 2 &&
-                        it.listeningHistoryEntries.size == 1
+                        it.listeningHistoryEntries.size == 1 &&
+                        it.readerContent != null
                 }
+            viewModel.playerController.cancelAutoTickerForTest()
             assertEquals(2, beforeState.visibleEntries.size)
             assertEquals(2, beforeState.searchResults.size)
             assertEquals(1, beforeState.activeFeeds.size)
             assertEquals(1, beforeState.archivedFeeds.size)
             assertEquals(1, beforeState.starredEntries.size)
             assertEquals(1, beforeState.offlineEntries.size)
+
+            // Non-list transient UI updates (e.g. context sheet / snackbar) also keep derived lists
+            // reference-identical via MainUiStateMemoizer
+            viewModel.dispatch(MainAction.OpenContextSheet("art-stage-2"))
+            val afterSheetOpen = viewModel.uiState.first { it.contextSheetEntryId == "art-stage-2" }
+            assertSame(beforeState.visibleEntries, afterSheetOpen.visibleEntries)
+            assertSame(beforeState.searchResults, afterSheetOpen.searchResults)
+            assertSame(beforeState.queueEntries, afterSheetOpen.queueEntries)
+            viewModel.dispatch(MainAction.CloseContextSheet)
+            viewModel.uiState.first { it.contextSheetEntryId == null }
 
             // 1-second playback tick updates playerState without recomputing list filters
             playerBackend.setSimulatedPositionMs(5_200L)
@@ -1222,6 +1238,7 @@ class MainViewModelTest {
                 )
             val seekCollectJob = backgroundScope.launch { seekVm.uiState.collect() }
             seekVm.dispatch(MainAction.UpdateSearchQuery("Systems"))
+            seekVm.awaitBackgroundUiWorkForTest()
             val initialSeekState =
                 seekVm.uiState.first { !it.isInitialLoading && it.searchQuery == "Systems" }
             seekController.playEntry(
@@ -1234,6 +1251,7 @@ class MainViewModelTest {
                 seekVm.uiState.first {
                     it.playerState.currentEntryId == "ep-stage-1" && it.readerContent != null
                 }
+            seekController.cancelAutoTickerForTest()
             seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
             val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }
             assertEquals(42_000L, afterSeek.playerState.positionMs)
@@ -1305,6 +1323,7 @@ class MainViewModelTest {
                         it.playerState.isPlaying &&
                         it.nextQueuedAudioEntryId == "ep-shared-2"
                 }
+                sharedController.cancelAutoTickerForTest()
 
                 // Finish Activity 1: cancels vm1.viewModelScope and invokes vm1.onCleared()
                 collect1.cancel()
@@ -1350,7 +1369,8 @@ class MainViewModelTest {
             val decodeCount = AtomicInteger(0)
             val enteredTransport = CompletableDeferred<Unit>()
             val releaseTransport = CompletableDeferred<Unit>()
-            val allCallersDispatched = CountDownLatch(8)
+            val readyCount = AtomicInteger(0)
+            val allCallersReady = CompletableDeferred<Unit>()
             val coalescingCacheDir = File(tempDir, "coalesce_cache")
 
             val coalescingClient = RocheApiClient { request ->
@@ -1381,8 +1401,10 @@ class MainViewModelTest {
             val jobs =
                 (1..8).map {
                     async(Dispatchers.Default) {
-                        allCallersDispatched.countDown()
-                        allCallersDispatched.await(5, TimeUnit.SECONDS)
+                        if (readyCount.incrementAndGet() == 8) {
+                            allCallersReady.complete(Unit)
+                        }
+                        allCallersReady.await()
                         loader.loadThumbnail("https://cdn.example.com/shared-cover.png")
                     }
                 }

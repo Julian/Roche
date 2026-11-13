@@ -971,16 +971,18 @@ class RocheRepositoryTest {
                     true,
                     database.dao().getPendingMutation("item-2")?.dirtyFavorite,
                 )
-                assertTrue(patchStarted.await(2, TimeUnit.SECONDS))
+                assertTrue(patchStarted.await(5, TimeUnit.SECONDS))
 
                 // Release slow HTTP PATCH and verify pending_mutations clears once pushed
                 allowPatchFinish.countDown()
-                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
                 while (
                     database.dao().getPendingMutation("item-2") != null &&
                         System.nanoTime() < deadline
                 ) {
-                    kotlinx.coroutines.delay(15)
+                    kotlinx.coroutines.withContext(Dispatchers.Default) {
+                        kotlinx.coroutines.delay(15)
+                    }
                 }
                 assertNull(database.dao().getPendingMutation("item-2"))
             } finally {

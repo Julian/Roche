@@ -739,6 +739,10 @@ class PodcastPlayerController(
         }
     }
 
+    internal fun cancelAutoTickerForTest() {
+        tickerJob?.cancel()
+    }
+
     fun stopAndClear() {
         tickerJob?.cancel()
         resumeAfterTransientFocusLoss = false
