@@ -336,6 +336,7 @@ internal data class PeerSyncWireRequest(
     @SerialName("network_tier") val networkTier: String,
     val weight: Double? = null,
     @SerialName("updated_after") val updatedAfter: String? = null,
+    @SerialName("after_item_id") val afterItemId: String? = null,
     val feeds: List<PeerSyncWireFeed>,
     val items: List<PeerSyncWireItem>,
     val tags: List<PeerSyncWireTag>,
@@ -378,6 +379,8 @@ internal data class WireTombstoneResponseDto(
 internal data class PeerSyncWireResponse(
     @SerialName("server_peer_id") val serverPeerId: String? = null,
     @SerialName("sync_timestamp") val syncTimestamp: String = "",
+    @SerialName("has_more") val hasMore: Boolean = false,
+    @SerialName("next_after_item_id") val nextAfterItemId: String? = null,
     @SerialName("active_peers") val activePeers: List<WirePeerNodeDto> = emptyList(),
     val feeds: List<WireFeedDto> = emptyList(),
     val items: List<WireItemDto> = emptyList(),
@@ -540,6 +543,7 @@ internal fun buildPeerSyncRequestPayload(request: PeerSyncRequestDto): String =
             networkTier = request.networkTier,
             weight = request.weight,
             updatedAfter = request.updatedAfter.nullIfBlank(),
+            afterItemId = request.afterItemId.nullIfBlank(),
             feeds = request.feeds.map { toPeerWireFeed(it) },
             items = request.items.map { toPeerWireItem(it) },
             tags = request.tags.map { toPeerWireTag(it) },
@@ -621,6 +625,8 @@ internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto? = runC
                 wire.tombstones
                     .map { it.toSyncTombstoneDto() }
                     .filter { it.entityType.isNotBlank() && it.naturalKey.isNotBlank() },
+            hasMore = wire.hasMore,
+            nextAfterItemId = wire.nextAfterItemId.nullIfBlank(),
         )
     }
 }

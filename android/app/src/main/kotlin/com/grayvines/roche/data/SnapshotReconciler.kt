@@ -1025,6 +1025,13 @@ private fun shouldClearPreSyncMutation(
     }
 }
 
+internal const val MAX_DELTA_CONTINUATION_PAGES = 20
+
+private data class SinglePeerSyncResult(
+    val response: PeerSyncResponseDto,
+    val cursorUsed: String?,
+)
+
 @Suppress("LongParameterList")
 internal suspend fun tryPeerSyncAndCooperativePoll(
     dao: RocheDao,
@@ -1035,7 +1042,7 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
     onSyncCursorUpdated: suspend (String) -> Unit = {},
     initialWeightOverride: Double? = null,
 ): Int? {
-    val response =
+    val initialRound =
         executeSinglePeerSyncRound(
             dao = dao,
             apiClient = apiClient,
@@ -1043,15 +1050,23 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
             networkTier = networkTier,
             weightOverride = initialWeightOverride,
         ) ?: return null
-    onPeersUpdated(response.activePeers)
-    val latestCursor = response.syncTimestamp.trim()
+    var latestPeers = initialRound.response.activePeers
+    onPeersUpdated(latestPeers)
     val updatedSettings =
-        if (latestCursor.isNotBlank()) {
-            onSyncCursorUpdated(latestCursor)
-            currentSettings.copy(lastPeerSyncCursor = latestCursor)
-        } else {
-            currentSettings
-        }
+        applyCursorAndContinueDelta(
+            dao = dao,
+            apiClient = apiClient,
+            baseSettings = currentSettings,
+            response = initialRound.response,
+            cursorUsed = initialRound.cursorUsed,
+            networkTier = networkTier,
+            weightOverride = initialWeightOverride,
+            onPeersUpdated = { peers ->
+                latestPeers = peers
+                onPeersUpdated(peers)
+            },
+            onSyncCursorUpdated = onSyncCursorUpdated,
+        )
     var measuredWeight: Double? = null
     var attemptedAnyFeed = false
     if (networkTier != NetworkTier.OFFLINE) {
@@ -1059,29 +1074,196 @@ internal suspend fun tryPeerSyncAndCooperativePoll(
             dao = dao,
             apiClient = apiClient,
             localPeerId = updatedSettings.peerId,
-            activePeers = response.activePeers,
+            activePeers = latestPeers,
             onMeasuredWeight = { measuredWeight = it },
             onAttemptedFeeds = { attemptedAnyFeed = it > 0 },
         )
     }
     if (attemptedAnyFeed) {
-        val followUpResp =
-            executeSinglePeerSyncRound(
+        runPostPollPeerSync(
+            dao = dao,
+            apiClient = apiClient,
+            currentSettings = updatedSettings,
+            networkTier = networkTier,
+            measuredWeight = measuredWeight,
+            onPeersUpdated = onPeersUpdated,
+            onSyncCursorUpdated = onSyncCursorUpdated,
+        )
+    }
+    return dao.countItems()
+}
+
+@Suppress("LongParameterList")
+private suspend fun runPostPollPeerSync(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    currentSettings: Settings,
+    networkTier: NetworkTier,
+    measuredWeight: Double?,
+    onPeersUpdated: (List<PeerNodeDto>) -> Unit,
+    onSyncCursorUpdated: suspend (String) -> Unit,
+) {
+    val followUpRound =
+        executeSinglePeerSyncRound(
+            dao = dao,
+            apiClient = apiClient,
+            currentSettings = currentSettings,
+            networkTier = networkTier,
+            weightOverride = measuredWeight,
+        ) ?: return
+    onPeersUpdated(followUpRound.response.activePeers)
+    applyCursorAndContinueDelta(
+        dao = dao,
+        apiClient = apiClient,
+        baseSettings = currentSettings,
+        response = followUpRound.response,
+        cursorUsed = followUpRound.cursorUsed,
+        networkTier = networkTier,
+        weightOverride = measuredWeight,
+        onPeersUpdated = onPeersUpdated,
+        onSyncCursorUpdated = onSyncCursorUpdated,
+    )
+}
+
+@Suppress("LongParameterList")
+private suspend fun applyCursorAndContinueDelta(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    baseSettings: Settings,
+    response: PeerSyncResponseDto,
+    cursorUsed: String?,
+    networkTier: NetworkTier,
+    weightOverride: Double?,
+    onPeersUpdated: (List<PeerNodeDto>) -> Unit,
+    onSyncCursorUpdated: suspend (String) -> Unit,
+): Settings {
+    var updatedSettings =
+        advancePersistedSyncCursor(
+            settings = baseSettings,
+            candidateCursor = response.syncTimestamp,
+            isIntermediatePage = response.hasMore,
+            onSyncCursorUpdated = onSyncCursorUpdated,
+        )
+    var pageCursor = response.syncTimestamp.trim()
+    var afterItemId = response.nextAfterItemId?.trim()?.takeIf { it.isNotBlank() }
+    val seenKeys = mutableSetOf<Pair<String, String?>>()
+    if (!cursorUsed.isNullOrBlank()) {
+        seenKeys.add(cursorUsed.trim() to null)
+    }
+    var hasMore =
+        response.hasMore && pageCursor.isNotBlank() && seenKeys.add(pageCursor to afterItemId)
+    var page = 0
+    while (hasMore && page < MAX_DELTA_CONTINUATION_PAGES) {
+        val pageResp =
+            executePullOnlyDeltaPage(
                 dao = dao,
                 apiClient = apiClient,
                 currentSettings = updatedSettings,
+                cursor = pageCursor,
+                afterItemId = afterItemId,
                 networkTier = networkTier,
-                weightOverride = measuredWeight,
+                weightOverride = weightOverride,
             )
-        if (followUpResp != null) {
-            onPeersUpdated(followUpResp.activePeers)
-            val followUpCursor = followUpResp.syncTimestamp.trim()
-            if (followUpCursor.isNotBlank()) {
-                onSyncCursorUpdated(followUpCursor)
-            }
+        val nextCursor = pageResp?.syncTimestamp?.trim().orEmpty()
+        if (pageResp != null && nextCursor.isNotBlank()) {
+            onPeersUpdated(pageResp.activePeers)
+            updatedSettings =
+                advancePersistedSyncCursor(
+                    settings = updatedSettings,
+                    candidateCursor = nextCursor,
+                    isIntermediatePage = pageResp.hasMore,
+                    onSyncCursorUpdated = onSyncCursorUpdated,
+                )
+            pageCursor = nextCursor
+            afterItemId = pageResp.nextAfterItemId?.trim()?.takeIf { it.isNotBlank() }
+            hasMore = pageResp.hasMore && seenKeys.add(pageCursor to afterItemId)
+        } else {
+            hasMore = false
         }
+        page++
     }
-    return dao.countItems()
+    return updatedSettings
+}
+
+private suspend fun advancePersistedSyncCursor(
+    settings: Settings,
+    candidateCursor: String,
+    isIntermediatePage: Boolean,
+    onSyncCursorUpdated: suspend (String) -> Unit,
+): Settings {
+    val cleanCandidate = candidateCursor.trim()
+    val shouldPersist =
+        cleanCandidate.isNotBlank() &&
+            (!isIntermediatePage ||
+                shouldAdvanceSyncCursor(settings.lastPeerSyncCursor, cleanCandidate))
+    return if (shouldPersist) {
+        onSyncCursorUpdated(cleanCandidate)
+        settings.copy(lastPeerSyncCursor = cleanCandidate)
+    } else {
+        settings
+    }
+}
+
+private fun shouldAdvanceSyncCursor(previousCursor: String?, candidateCursor: String): Boolean {
+    if (candidateCursor.isBlank()) return false
+    if (previousCursor.isNullOrBlank()) return true
+    val prevInstant =
+        runCatching { Instant.parse(previousCursor.trim()) }.getOrNull() ?: return true
+    val candInstant =
+        runCatching { Instant.parse(candidateCursor.trim()) }.getOrNull() ?: return false
+    return !candInstant.isBefore(prevInstant)
+}
+
+@Suppress("LongParameterList")
+private suspend fun executePullOnlyDeltaPage(
+    dao: RocheDao,
+    apiClient: RocheApiClient,
+    currentSettings: Settings,
+    cursor: String,
+    afterItemId: String?,
+    networkTier: NetworkTier,
+    weightOverride: Double?,
+): PeerSyncResponseDto? {
+    val preFetchItems = dao.getAllItems()
+    val preFetchFeeds = dao.getAllFeeds()
+    val effectiveWeight =
+        if (networkTier == NetworkTier.OFFLINE) {
+            0.0
+        } else {
+            weightOverride
+        }
+    val request =
+        PeerSyncRequestDto(
+            peerId = currentSettings.peerId,
+            deviceName = currentSettings.deviceName,
+            networkTier = networkTier.wireValue,
+            weight = effectiveWeight,
+            updatedAfter = cursor,
+            afterItemId = afterItemId,
+            feeds = emptyList(),
+            items = emptyList(),
+            tags = emptyList(),
+            tombstones = emptyList(),
+        )
+    val response =
+        apiClient.syncPeer(
+            serverUrl = currentSettings.serverUrl,
+            token = currentSettings.bearerToken,
+            request = request,
+        ) ?: return null
+    reconcilePeerSyncResponse(
+        dao = dao,
+        response = response,
+        preFetchItemsById = preFetchItems.associateBy { it.id },
+        preFetchFeedsById = preFetchFeeds.associateBy { it.id },
+        preSyncMutations = emptyList(),
+        isDeltaItems = true,
+        appliedMutations = emptyList(),
+        sentFeedIds = emptySet(),
+        sentItemIds = emptySet(),
+        overflowItemIds = emptySet(),
+    )
+    return response
 }
 
 private suspend fun executeSinglePeerSyncRound(
@@ -1090,7 +1272,7 @@ private suspend fun executeSinglePeerSyncRound(
     currentSettings: Settings,
     networkTier: NetworkTier,
     weightOverride: Double? = null,
-): PeerSyncResponseDto? {
+): SinglePeerSyncResult? {
     val appliedFeedMutations = pushPendingRemoteFeedMutations(dao, apiClient, currentSettings)
     val preFetchItems = dao.getAllItems()
     val preFetchFeeds = dao.getAllFeeds()
@@ -1131,7 +1313,10 @@ private suspend fun executeSinglePeerSyncRound(
         sentItemIds = tracked.sentItemIds,
         overflowItemIds = tracked.overflowItemIds,
     )
-    return response
+    return SinglePeerSyncResult(
+        response = response,
+        cursorUsed = tracked.request.updatedAfter,
+    )
 }
 
 private suspend fun pushPendingRemoteFeedMutations(

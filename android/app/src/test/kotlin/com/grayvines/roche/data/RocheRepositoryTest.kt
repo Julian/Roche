@@ -884,6 +884,127 @@ class RocheRepositoryTest {
 
             verifyDaoDiffSkipsZeroChangeAndChunksDeletes(database.dao())
         }
+
+    @Test
+    internal fun `syncWithServer follows has_more delta continuation pages and advances cursor`() =
+        runTest {
+            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
+            seedPaginatedDeltaInitialState(database.dao(), feedId)
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "tok-paginated",
+                    lastPeerSyncCursor = "2026-06-01T00:00:00Z",
+                )
+            }
+            val peerSyncBodies = mutableListOf<String>()
+            val paginatedRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = buildPaginatedDeltaSyncMockClient(feedId, peerSyncBodies),
+                    settings = settings,
+                )
+
+            val totalSynced = paginatedRepo.syncWithServer().getOrThrow()
+
+            assertEquals(EXPECTED_PAGINATED_ITEM_COUNT, totalSynced)
+            assertEquals(EXPECTED_CONTINUATION_REQUESTS, peerSyncBodies.size)
+            assertTrue(peerSyncBodies[0].contains(""""updated_after":"2026-06-01T00:00:00Z""""))
+            assertFalse(peerSyncBodies[0].contains("after_item_id"))
+            assertTrue(peerSyncBodies[1].contains(""""updated_after":"2026-06-01T01:00:00Z""""))
+            assertTrue(peerSyncBodies[1].contains(""""after_item_id":"item-page-1""""))
+            assertTrue(peerSyncBodies[1].contains(""""items":[]"""))
+            assertTrue(peerSyncBodies[1].contains(""""feeds":[]"""))
+            assertTrue(peerSyncBodies[2].contains(""""updated_after":"2026-06-01T01:00:00Z""""))
+            assertTrue(peerSyncBodies[2].contains(""""after_item_id":"item-page-2""""))
+            assertTrue(peerSyncBodies[2].contains(""""items":[]"""))
+            assertEquals(
+                "2026-06-01T03:00:00Z",
+                settings.settings.first().lastPeerSyncCursor,
+            )
+            assertEquals(
+                setOf("item-page-0", "item-page-1", "item-page-2", "item-page-3"),
+                paginatedRepo.snapshot.first().entries.map { it.id }.toSet(),
+            )
+        }
+}
+
+private const val EXPECTED_CONTINUATION_REQUESTS = 3
+private const val EXPECTED_PAGINATED_ITEM_COUNT = 4
+
+private suspend fun seedPaginatedDeltaInitialState(dao: RocheDao, feedId: String) {
+    dao.upsertFeed(
+        FeedEntity(
+            id = feedId,
+            title = "Systems Feed",
+            url = "https://blog.example.com/rss.xml",
+            siteUrl = "https://blog.example.com",
+            feedType = "rss",
+            lastPolled = "2099-01-01T00:00:00Z",
+        )
+    )
+    dao.upsertItem(
+        ItemEntity(
+            id = "item-page-0",
+            feedId = feedId,
+            feedUrl = "https://blog.example.com/rss.xml",
+            feedTitle = "Systems Feed",
+            title = "Existing Post 0",
+            url = "https://blog.example.com/post-0",
+            author = null,
+            summary = "Existing summary",
+            contentText = null,
+            contentHtml = null,
+            contentType = "article",
+            status = "unread",
+            isFavorite = false,
+            isCachedOffline = false,
+            publishedAt = "2026-05-31T12:00:00Z",
+            createdAt = "2026-05-31T12:00:00Z",
+            readProgress = 0.0,
+            thumbnailMediaId = null,
+            duration = null,
+        )
+    )
+}
+
+private data class DeltaPageFixture(
+    val itemId: String,
+    val nextCursor: String,
+    val hasMore: Boolean,
+    val nextAfterItemId: String?,
+)
+
+private fun buildPaginatedDeltaSyncMockClient(
+    feedId: String,
+    peerSyncBodies: MutableList<String>,
+): RocheApiClient = RocheApiClient { request ->
+    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+        val body = request.body.orEmpty()
+        peerSyncBodies.add(body)
+        val page =
+            when {
+                body.contains(""""updated_after":"2026-06-01T00:00:00Z"""") ->
+                    DeltaPageFixture("item-page-1", "2026-06-01T01:00:00Z", true, "item-page-1")
+                body.contains(""""after_item_id":"item-page-1"""") ->
+                    DeltaPageFixture("item-page-2", "2026-06-01T01:00:00Z", true, "item-page-2")
+                else -> DeltaPageFixture("item-page-3", "2026-06-01T03:00:00Z", false, null)
+            }
+        val nextAfterJson =
+            page.nextAfterItemId?.let { """"next_after_item_id":"$it",""" }.orEmpty()
+        HttpResponse(
+            statusCode = 200,
+            body =
+                """{"server_peer_id":"server","sync_timestamp":"${page.nextCursor}","has_more":${page.hasMore},""" +
+                    nextAfterJson +
+                    """"active_peers":[{"peer_id":"server","device_name":"Server","network_tier":"wired","weight":1.0,"last_seen_at":"${page.nextCursor}"}],""" +
+                    """"feeds":[{"id":"$feedId","title":"Systems Feed","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2099-01-01T00:00:00Z","is_active":true,"unread_count":4}],""" +
+                    """"items":[{"id":"${page.itemId}","feed_id":"$feedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Systems Feed","title":"Post ${page.itemId}","url":"https://blog.example.com/${page.itemId}","content_type":"article","status":"unread","is_favorite":false,"created_at":"${page.nextCursor}","tag_names":[]}],""" +
+                    """"tags":[],"tombstones":[]}""",
+        )
+    } else {
+        HttpResponse(statusCode = 404, body = "{}")
+    }
 }
 
 internal fun buildFeedAndItemManagementMockClient(requests: MutableList<String>): RocheApiClient =

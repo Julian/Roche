@@ -34,6 +34,7 @@ class MainActivity : ComponentActivity() {
             repository = graph.repository,
             settings = graph.settings,
             mediaSessionBridge = graph.mediaSessionBridge,
+            sharedPlayerController = graph.playerController,
         )
     }
 

@@ -64,6 +64,7 @@ impl Db {
 
         let db = Self { pool };
         db.run_startup_maintenance().await;
+        verify_and_heal_fts_index(&db.pool).await?;
 
         Ok(db)
     }
@@ -172,6 +173,30 @@ impl Db {
     }
 }
 
+/// Verifies `items_fts` integrity against the external-content `items` table and rebuilds the
+/// FTS5 index if implicit `rowid` compaction (e.g. from an external SQLite `VACUUM` or dump/restore)
+/// desynchronized it.
+///
+/// Note: For external-content FTS5 tables (`content='items'`), `rank = 1` is required so SQLite
+/// compares the inverted index against the external `items` table rather than only checking
+/// internal FTS5 b-tree structure (`rank = 0` default for external-content tables).
+pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
+    match sqlx::query("INSERT INTO items_fts(items_fts, rank) VALUES('integrity-check', 1)")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "items_fts external-content integrity check failed (likely after external VACUUM); rebuilding FTS5 index"
+            );
+            sqlx::query("INSERT INTO items_fts(items_fts) VALUES('rebuild')").execute(pool).await?;
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -271,6 +296,127 @@ mod tests {
 
         db3.pool().close().await;
         drop(db3);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_verify_and_heal_fts_index_recovers_after_external_vacuum() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-fts-vacuum-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let db_path = temp_dir.join("roche.db");
+
+        let db = Db::connect(&db_path).await.unwrap();
+        let items = db.items();
+
+        let url1 = Url::parse("https://example.com/vacuum-1").unwrap();
+        let item1 = items
+            .create(&NewItem {
+                feed_id: None,
+                title: "Alpha Ephemeral First Entry",
+                url: &url1,
+                author: Some("Author One"),
+                published_at: None,
+                summary: Some("First item to be deleted before vacuum"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        let url2 = Url::parse("https://example.com/vacuum-2").unwrap();
+        let item2 = items
+            .create(&NewItem {
+                feed_id: None,
+                title: "Bravo Distributed Consensus",
+                url: &url2,
+                author: Some("Author Two"),
+                published_at: None,
+                summary: Some("Second item surviving rowid compaction"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        let url3 = Url::parse("https://example.com/vacuum-3").unwrap();
+        let item3 = items
+            .create(&NewItem {
+                feed_id: None,
+                title: "Charlie Quantum Cryptography",
+                url: &url3,
+                author: Some("Author Three"),
+                published_at: None,
+                summary: Some("Third item surviving rowid compaction"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        assert!(items.delete(&item1.id).await.unwrap());
+        assert!(!verify_and_heal_fts_index(db.pool()).await.unwrap());
+
+        // Legacy external SQLite (< 3.32) `VACUUM` or dump/restore compacts implicit `rowid`s on
+        // `items` (`TEXT PRIMARY KEY`) from (2, 3) -> (1, 2) without firing `items_fts_au`
+        // (`AFTER UPDATE OF title, author, summary, content_html ON items`). Bundled modern SQLite
+        // preserves `rowid` during in-process `VACUUM`, so if `min(rowid)` is still > 1 after
+        // `VACUUM`, compact `rowid` directly to reproduce the exact trigger-bypassing desync.
+        sqlx::query("VACUUM").execute(db.pool()).await.unwrap();
+        let min_rowid: i64 =
+            sqlx::query_scalar("SELECT MIN(rowid) FROM items").fetch_one(db.pool()).await.unwrap();
+        if min_rowid > 1 {
+            sqlx::query("UPDATE items SET rowid = rowid - 1").execute(db.pool()).await.unwrap();
+        }
+
+        // Before self-healing, `items_fts` rowid=3 (`item3`) no longer matches any `items.rowid`.
+        let broken_charlie = items
+            .list_filtered_page(&ItemFilter {
+                search: Some("charlie quantum".to_string()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(broken_charlie.items.is_empty());
+
+        assert!(
+            verify_and_heal_fts_index(db.pool()).await.unwrap(),
+            "verify_and_heal_fts_index must detect rowid desync after VACUUM and rebuild items_fts"
+        );
+        assert!(
+            !verify_and_heal_fts_index(db.pool()).await.unwrap(),
+            "Rebuilt items_fts must pass integrity-check cleanly"
+        );
+
+        let bravo_page = items
+            .list_filtered_page(&ItemFilter {
+                search: Some("bravo consensus".to_string()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bravo_page.items.len(), 1);
+        assert_eq!(bravo_page.items[0].id, item2.id);
+
+        let charlie_page = items
+            .list_filtered_page(&ItemFilter {
+                search: Some("charlie quantum".to_string()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(charlie_page.items.len(), 1);
+        assert_eq!(charlie_page.items[0].id, item3.id);
+
+        let deleted_page = items
+            .list_filtered_page(&ItemFilter {
+                search: Some("ephemeral".to_string()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert!(deleted_page.items.is_empty());
+
+        db.pool().close().await;
+        drop(db);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

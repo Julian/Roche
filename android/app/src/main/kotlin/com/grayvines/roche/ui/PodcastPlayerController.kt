@@ -407,9 +407,25 @@ class PodcastPlayerController(
     private var pendingResumeProgress: Double? = null
     private var activeSourceUriOrPath: String = ""
     private var backendFailed: Boolean = false
+    @Volatile private var uiErrorListener: ((String) -> Unit)? = null
 
     init {
         mediaSessionBridge.bindCallbacks(this)
+    }
+
+    internal fun setUiErrorListener(listener: ((String) -> Unit)?) {
+        uiErrorListener = listener
+    }
+
+    internal fun clearUiErrorListener(listener: (String) -> Unit) {
+        if (uiErrorListener === listener) {
+            uiErrorListener = null
+        }
+    }
+
+    internal fun emitUiMessage(message: String) {
+        onPlaybackError(message)
+        uiErrorListener?.invoke(message)
     }
 
     fun playEntry(
@@ -441,6 +457,10 @@ class PodcastPlayerController(
                 0L
             }
         val parsedChapters = extractBestChaptersFromEntry(entry)
+        val resolvedArtworkUrl =
+            entry.thumbnailUrl?.takeIf { it.isNotBlank() }
+                ?: entry.effectiveThumbnailUrl
+                ?: entry.thumbnailMediaId?.takeIf { it.isNotBlank() }
         pausedAtEpochMs = null
         resumeAfterTransientFocusLoss = false
         activeSourceUriOrPath = sourceUriOrPath
@@ -450,7 +470,7 @@ class PodcastPlayerController(
                 currentEntryId = entry.id,
                 currentEpisodeTitle = entry.title,
                 currentPodcastTitle = entry.feedTitle,
-                currentArtworkUrl = entry.thumbnailUrl,
+                currentArtworkUrl = resolvedArtworkUrl,
                 hasNextQueuedAudio = hasNextQueuedAudio,
                 isPlaying = hasFocus,
                 isBuffering = true,
@@ -485,7 +505,7 @@ class PodcastPlayerController(
         mediaSessionBridge.abandonAudioFocus()
         _state.update { it.copy(isBuffering = false, isPlaying = false) }
         syncMediaSessionBridge()
-        onPlaybackError(DEFAULT_PLAYBACK_ERROR_MESSAGE)
+        emitUiMessage(DEFAULT_PLAYBACK_ERROR_MESSAGE)
     }
 
     private fun handleBackendPrepared(entryId: String, durationMs: Long) {

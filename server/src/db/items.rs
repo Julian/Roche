@@ -162,10 +162,14 @@ pub struct ItemFilter {
     pub search: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_rfc3339")]
     pub updated_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_after_item_id: Option<String>,
     pub sort: Option<ItemSortField>,
     pub order: Option<SortOrder>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
+    #[serde(default)]
+    pub sort_updated_asc: bool,
 }
 
 impl ItemFilter {
@@ -522,20 +526,16 @@ impl<'a> ItemRepo<'a> {
         if let Some(fav) = filter.is_favorite {
             qb.push(" AND i.is_favorite = ").push_bind(fav);
         }
-        if let Some(ts) = filter.updated_after {
-            qb.push(
-                " AND strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ",
-            )
-            .push_bind(ts)
-            .push(")");
-        }
+        Self::append_updated_after_where_clause(&mut qb, filter);
         if let Some(search) = trimmed_search {
             Self::append_search_where_clause(&mut qb, search, &search_terms);
         }
 
         let sort_by_relevance =
             fts_query.is_some() && matches!(filter.sort, None | Some(ItemSortField::Relevance));
-        if sort_by_relevance {
+        if filter.sort_updated_asc {
+            qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) ASC, i.id ASC");
+        } else if sort_by_relevance {
             let rank_dir = match filter.order.unwrap_or_default() {
                 // bm25() returns negative scores where more negative = higher relevance
                 SortOrder::Desc => "ASC",
@@ -563,6 +563,33 @@ impl<'a> ItemRepo<'a> {
         let has_more = items.len() > per_page;
         items.truncate(per_page);
         Ok(ItemPage { items, page, per_page, has_more })
+    }
+
+    fn append_updated_after_where_clause(qb: &mut QueryBuilder<sqlx::Sqlite>, filter: &ItemFilter) {
+        let Some(ts) = filter.updated_after else {
+            return;
+        };
+        if let Some(after_id) =
+            filter.updated_after_item_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            qb.push(
+                " AND (strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ",
+            )
+            .push_bind(ts)
+            .push(
+                ") OR (strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) = strftime('%Y-%m-%dT%H:%M:%fZ', ",
+            )
+            .push_bind(ts)
+            .push(") AND i.id > ")
+            .push_bind(after_id)
+            .push("))");
+        } else {
+            qb.push(
+                " AND strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ",
+            )
+            .push_bind(ts)
+            .push(")");
+        }
     }
 
     fn append_search_where_clause(

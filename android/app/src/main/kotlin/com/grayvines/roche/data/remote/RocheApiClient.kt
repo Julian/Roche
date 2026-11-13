@@ -300,6 +300,7 @@ data class PeerSyncRequestDto(
     val networkTier: String = NetworkTier.WIFI.wireValue,
     val weight: Double? = null,
     val updatedAfter: String? = null,
+    val afterItemId: String? = null,
     val feeds: List<FeedEntity> = emptyList(),
     val items: List<PeerSyncItemPayload> = emptyList(),
     val tags: List<TagEntity> = emptyList(),
@@ -314,6 +315,8 @@ data class PeerSyncResponseDto(
     val items: List<RemoteItemDto>,
     val tags: List<RemoteTagDto>,
     val tombstones: List<SyncTombstoneDto>,
+    val hasMore: Boolean = false,
+    val nextAfterItemId: String? = null,
 )
 
 data class RemoteMediaDto(

@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -19,6 +20,7 @@ import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -28,6 +30,12 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import com.grayvines.roche.MainActivity
 import com.grayvines.roche.RocheApp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 internal fun mapMediaKeyCodeToCommand(keyCode: Int): MediaSessionCommand? =
     when (keyCode) {
@@ -49,6 +57,7 @@ internal data class SessionMetadataKey(
     val podcastTitle: String,
     val artworkUrl: String?,
     val durationMs: Long,
+    val hasArtworkBitmap: Boolean = false,
 )
 
 internal data class NotificationContentKey(
@@ -58,18 +67,24 @@ internal data class NotificationContentKey(
     val playbackSpeed: Float,
     val isPlaying: Boolean,
     val hasNextQueuedAudio: Boolean,
+    val hasArtworkBitmap: Boolean = false,
 )
 
-internal fun MediaSessionMetadataSnapshot.toMetadataKey(): SessionMetadataKey =
+internal fun MediaSessionMetadataSnapshot.toMetadataKey(
+    hasArtworkBitmap: Boolean = false
+): SessionMetadataKey =
     SessionMetadataKey(
         entryId = entryId,
         episodeTitle = episodeTitle,
         podcastTitle = podcastTitle,
         artworkUrl = artworkUrl,
         durationMs = durationMs,
+        hasArtworkBitmap = hasArtworkBitmap,
     )
 
-internal fun MediaSessionMetadataSnapshot.toNotificationKey(): NotificationContentKey =
+internal fun MediaSessionMetadataSnapshot.toNotificationKey(
+    hasArtworkBitmap: Boolean = false
+): NotificationContentKey =
     NotificationContentKey(
         entryId = entryId,
         episodeTitle = episodeTitle,
@@ -77,9 +92,14 @@ internal fun MediaSessionMetadataSnapshot.toNotificationKey(): NotificationConte
         playbackSpeed = playbackSpeed,
         isPlaying = isPlaying,
         hasNextQueuedAudio = hasNextQueuedAudio,
+        hasArtworkBitmap = hasArtworkBitmap,
     )
 
-class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBridge {
+class AndroidPodcastMediaSessionBridge(
+    context: Context,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
+) : PodcastMediaSessionBridge {
     private val appContext: Context = context.applicationContext
     private val mainHandler: Handler = Handler(Looper.getMainLooper())
     private val audioManager: AudioManager? = appContext.getSystemService(AudioManager::class.java)
@@ -93,6 +113,10 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
     @Volatile private var serviceRunningInForeground: Boolean = false
     @Volatile private var pendingForegroundStart: Boolean = false
     @Volatile private var inServiceCommand: Boolean = false
+    @Volatile private var cachedArtworkUrl: String? = null
+    @Volatile private var cachedArtworkBitmap: Bitmap? = null
+    @Volatile private var loadingArtworkUrl: String? = null
+    private var artworkLoadJob: Job? = null
     private var mediaSession: MediaSession? = null
     private var audioFocusRequest: AudioFocusRequest? = null
     private var noisyReceiverRegistered: Boolean = false
@@ -177,6 +201,9 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
     override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
         latestSnapshot = snapshot
         if (snapshot == null) {
+            artworkLoadJob?.cancel()
+            artworkLoadJob = null
+            loadingArtworkUrl = null
             lastMetadataKey = null
             lastNotificationKey = null
             unregisterNoisyReceiver()
@@ -191,10 +218,14 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
         registerDismissReceiver()
         syncNoisyReceiver(snapshot.isPlaying)
         session.isActive = true
-        val metadataKey = snapshot.toMetadataKey()
+        val artworkBitmap = resolveCachedArtworkBitmap(snapshot.artworkUrl)
+        if (artworkBitmap == null) {
+            requestArtworkLoadIfNeeded(snapshot.artworkUrl)
+        }
+        val metadataKey = snapshot.toMetadataKey(hasArtworkBitmap = artworkBitmap != null)
         if (metadataKey != lastMetadataKey) {
             lastMetadataKey = metadataKey
-            session.setMetadata(buildMediaMetadata(snapshot))
+            session.setMetadata(buildMediaMetadata(snapshot, artworkBitmap))
         }
         session.setPlaybackState(buildPlaybackState(snapshot))
         if (!inServiceCommand) {
@@ -203,6 +234,11 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
     }
 
     override fun release() {
+        artworkLoadJob?.cancel()
+        artworkLoadJob = null
+        loadingArtworkUrl = null
+        cachedArtworkUrl = null
+        cachedArtworkBitmap = null
         unregisterNoisyReceiver()
         unregisterDismissReceiver()
         abandonAudioFocus()
@@ -215,6 +251,60 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
         }
         mediaSession = null
         stopPlaybackService()
+    }
+
+    internal fun resolveCachedArtworkBitmap(artworkUrl: String?): Bitmap? {
+        val cleanUrl = artworkUrl?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return if (cleanUrl == cachedArtworkUrl) cachedArtworkBitmap else null
+    }
+
+    private fun requestArtworkLoadIfNeeded(artworkUrl: String?) {
+        val loader = artworkBitmapLoader ?: return
+        val cleanUrl = artworkUrl?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanUrl == null) {
+            artworkLoadJob?.cancel()
+            artworkLoadJob = null
+            loadingArtworkUrl = null
+            return
+        }
+        if (loadingArtworkUrl == cleanUrl && artworkLoadJob?.isActive == true) return
+        artworkLoadJob?.cancel()
+        loadingArtworkUrl = cleanUrl
+        artworkLoadJob = scope.launch {
+            val bitmap = runCatching {
+                loader(cleanUrl)
+            }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+            if (bitmap != null) {
+                cachedArtworkUrl = cleanUrl
+                cachedArtworkBitmap = bitmap
+                val posted = runCatching {
+                    mainHandler.post { applyLoadedArtworkIfCurrent(cleanUrl) }
+                }
+                    .getOrDefault(false)
+                if (!posted) {
+                    applyLoadedArtworkIfCurrent(cleanUrl)
+                }
+            }
+            if (loadingArtworkUrl == cleanUrl) {
+                loadingArtworkUrl = null
+            }
+        }
+    }
+
+    internal fun applyLoadedArtworkIfCurrent(loadedUrl: String) {
+        val snapshot = latestSnapshot ?: return
+        if (snapshot.artworkUrl?.trim() != loadedUrl) return
+        val bitmap = resolveCachedArtworkBitmap(loadedUrl) ?: return
+        val session = mediaSession
+        if (session != null) {
+            lastMetadataKey = snapshot.toMetadataKey(hasArtworkBitmap = true)
+            runCatching { session.setMetadata(buildMediaMetadata(snapshot, bitmap)) }
+        }
+        if (!inServiceCommand) {
+            syncForegroundService(snapshot)
+        }
     }
 
     internal fun dispatchActionFromSession(action: String?) {
@@ -274,6 +364,9 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
                 .setOnlyAlertOnce(true)
                 .setOngoing(snapshot.isPlaying)
                 .setStyle(style)
+        resolveCachedArtworkBitmap(snapshot.artworkUrl)?.let { bitmap ->
+            builder.setLargeIcon(Icon.createWithBitmap(bitmap))
+        }
         attachTransportActions(builder, snapshot)
         return builder.build()
     }
@@ -441,7 +534,10 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
             }
         }
 
-    private fun buildMediaMetadata(snapshot: MediaSessionMetadataSnapshot): MediaMetadata {
+    private fun buildMediaMetadata(
+        snapshot: MediaSessionMetadataSnapshot,
+        artworkBitmap: Bitmap?,
+    ): MediaMetadata {
         val builder =
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_MEDIA_ID, snapshot.entryId)
@@ -457,6 +553,9 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
                 builder.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, artUri)
                 builder.putString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI, artUri)
             }
+        if (artworkBitmap != null) {
+            builder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, artworkBitmap)
+        }
         return builder.build()
     }
 
@@ -546,7 +645,8 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
 
     private fun syncForegroundService(snapshot: MediaSessionMetadataSnapshot) {
         runCatching {
-            val notifKey = snapshot.toNotificationKey()
+            val hasArtwork = resolveCachedArtworkBitmap(snapshot.artworkUrl) != null
+            val notifKey = snapshot.toNotificationKey(hasArtworkBitmap = hasArtwork)
             val notificationChanged = notifKey != lastNotificationKey
             lastNotificationKey = notifKey
             if (snapshot.isPlaying) {
@@ -668,6 +768,7 @@ class AndroidPodcastMediaSessionBridge(context: Context) : PodcastMediaSessionBr
 
 class PodcastPlaybackService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -747,21 +848,48 @@ class PodcastPlaybackService : Service() {
     }
 
     private fun acquireWakeLock() {
-        val current = wakeLock
-        if (current != null && current.isHeld) return
-        val pm = getSystemService(PowerManager::class.java) ?: return
-        wakeLock =
-            pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Roche:PodcastPlaybackWakeLock").apply {
-                setReferenceCounted(false)
-                runCatching { acquire(MAX_WAKE_LOCK_DURATION_MS) }
+        val currentWake = wakeLock
+        if (currentWake == null || !currentWake.isHeld) {
+            val pm = getSystemService(PowerManager::class.java)
+            if (pm != null) {
+                wakeLock =
+                    pm.newWakeLock(
+                            PowerManager.PARTIAL_WAKE_LOCK,
+                            "Roche:PodcastPlaybackWakeLock",
+                        )
+                        .apply {
+                            setReferenceCounted(false)
+                            runCatching { acquire(MAX_WAKE_LOCK_DURATION_MS) }
+                        }
             }
+        }
+        val currentWifi = wifiLock
+        if (currentWifi == null || !currentWifi.isHeld) {
+            val wm = applicationContext.getSystemService(WifiManager::class.java)
+            if (wm != null) {
+                wifiLock =
+                    wm.createWifiLock(
+                            WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                            "Roche:PodcastPlaybackWifiLock",
+                        )
+                        .apply {
+                            setReferenceCounted(false)
+                            runCatching { acquire() }
+                        }
+            }
+        }
     }
 
     private fun releaseWakeLock() {
-        val current = wakeLock ?: return
+        val currentWake = wakeLock
         wakeLock = null
-        if (current.isHeld) {
-            runCatching { current.release() }
+        if (currentWake != null && currentWake.isHeld) {
+            runCatching { currentWake.release() }
+        }
+        val currentWifi = wifiLock
+        wifiLock = null
+        if (currentWifi != null && currentWifi.isHeld) {
+            runCatching { currentWifi.release() }
         }
     }
 

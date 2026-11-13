@@ -17,9 +17,16 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 val LocalThumbnailLoader = staticCompositionLocalOf<ThumbnailLoader?> { null }
+
+internal class KeyMutex {
+    val mutex = Mutex()
+    var waiters: Int = 0
+}
 
 class ThumbnailLoader(
     private val apiClient: RocheApiClient,
@@ -40,6 +47,9 @@ class ThumbnailLoader(
         if (decoder === ::decodeBitmapBytes) ::decodeFaviconBitmapBytes else decoder
 
     private val failedKeys = ConcurrentHashMap<String, Long>()
+    private val keyLocksGuard = Any()
+    private val keyLocks = HashMap<String, KeyMutex>()
+    private val diskWriteLock = Any()
 
     fun getCached(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
@@ -112,7 +122,36 @@ class ThumbnailLoader(
         }
     }
 
+    private suspend fun <T> withKeyLock(cacheKey: String, block: suspend () -> T): T {
+        val entry =
+            synchronized(keyLocksGuard) {
+                val existing = keyLocks.getOrPut(cacheKey) { KeyMutex() }
+                existing.waiters++
+                existing
+            }
+        return try {
+            entry.mutex.withLock { block() }
+        } finally {
+            synchronized(keyLocksGuard) {
+                entry.waiters--
+                if (entry.waiters == 0) {
+                    keyLocks.remove(cacheKey, entry)
+                }
+            }
+        }
+    }
+
     private suspend fun loadOrFetchImage(
+        cleanId: String,
+        cacheKey: String,
+        targetCache: LruCache<String, ImageBitmap>,
+        decode: (ByteArray) -> ImageBitmap?,
+    ): ImageBitmap? =
+        withKeyLock(cacheKey) {
+            targetCache[cacheKey] ?: loadOrFetchLocked(cleanId, cacheKey, targetCache, decode)
+        }
+
+    private suspend fun loadOrFetchLocked(
         cleanId: String,
         cacheKey: String,
         targetCache: LruCache<String, ImageBitmap>,
@@ -203,19 +242,49 @@ class ThumbnailLoader(
     private fun writeDiskCachedBytes(mediaId: String, bytes: ByteArray) {
         val rootDir = cacheDir ?: return
         runCatching {
-            val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-            writeBytesAtomically(thumbsDir, diskCacheKey(mediaId), bytes)
+            synchronized(diskWriteLock) {
+                val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
+                val fileKey = diskCacheKey(mediaId)
+                writeBytesAtomically(thumbsDir, fileKey, bytes)
+                val targetFile = resolveSafeChildFile(thumbsDir, fileKey)
+                targetFile.setLastModified(clockMs())
+                pruneThumbnailDiskCache(thumbsDir)
+            }
         }
     }
 
     internal companion object {
         internal const val FAILED_RETRY_COOLDOWN_MS = 60_000L
+        internal const val MAX_DISK_CACHED_FILES = 512
+        internal const val MAX_DISK_CACHE_BYTES = 64L * 1024L * 1024L
         private const val THUMB_KEY_PREFIX = "thumb:"
         private const val INLINE_KEY_PREFIX = "inline:"
         private const val MAX_IMAGE_CACHE_KIB = 32 * 1024
         private const val MAX_FAVICON_CACHE_KIB = 4 * 1024
         private const val MAX_FAILED_THUMBNAILS = 256
         private const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
+    }
+}
+
+internal fun pruneThumbnailDiskCache(
+    thumbsDir: File,
+    maxFiles: Int = ThumbnailLoader.MAX_DISK_CACHED_FILES,
+    maxBytes: Long = ThumbnailLoader.MAX_DISK_CACHE_BYTES,
+) {
+    val files = thumbsDir.listFiles()?.filter { it.isFile && !it.name.endsWith(".tmp") } ?: return
+    var remainingCount = files.size
+    var totalBytes = files.sumOf { it.length() }
+    if (remainingCount <= maxFiles && totalBytes <= maxBytes) return
+
+    val sortedOldestFirst =
+        files.sortedWith(compareBy<File> { it.lastModified() }.thenBy { it.name })
+    for (file in sortedOldestFirst) {
+        if (remainingCount <= maxFiles && totalBytes <= maxBytes) break
+        val fileLen = file.length()
+        if (file.delete() || !file.exists()) {
+            remainingCount--
+            totalBytes = (totalBytes - fileLen).coerceAtLeast(0L)
+        }
     }
 }
 

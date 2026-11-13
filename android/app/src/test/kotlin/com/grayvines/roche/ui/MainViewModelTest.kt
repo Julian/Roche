@@ -4,6 +4,8 @@ package com.grayvines.roche.ui
 
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
@@ -27,15 +29,21 @@ import com.grayvines.roche.model.resolveOriginFaviconUrl
 import com.grayvines.roche.ui.components.MAX_BITMAP_DIMENSION_PX
 import com.grayvines.roche.ui.components.ThumbnailLoader
 import com.grayvines.roche.ui.components.calculateInSampleSize
+import com.grayvines.roche.ui.components.pruneThumbnailDiskCache
 import java.io.File
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
@@ -49,7 +57,9 @@ import kotlinx.coroutines.test.setMain
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -1121,6 +1131,317 @@ class MainViewModelTest {
             ),
         )
     }
+
+    @Test
+    internal fun `two-stage uiState keeps visibleEntries and searchResults reference-identical on player ticks`() =
+        runTest {
+            val activeFeed = testFeed("f-pod-stage", "Systems Podcast").copy(feedType = "podcast")
+            val archivedFeed = testFeed("f-arch-stage", "Archived Blog").copy(isActive = false)
+            val episode =
+                testItem("ep-stage-1", "Systems Kernel Episode", "f-pod-stage")
+                    .copy(
+                        contentType = "audio",
+                        audioUrl = "https://example.com/stage-1.mp3",
+                        duration = "30:00",
+                        isFavorite = true,
+                        isCachedOffline = true,
+                    )
+            val article =
+                testItem("art-stage-2", "Systems Storage Notes", "f-pod-stage")
+                    .copy(contentType = "article")
+            database.dao().upsertFeeds(listOf(activeFeed, archivedFeed))
+            database.dao().upsertItems(listOf(episode, article))
+
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 2 && it.feeds.size == 2 }
+
+            viewModel.dispatch(MainAction.AddToQueue("ep-stage-1"))
+            viewModel.dispatch(MainAction.AddToQueue("art-stage-2"))
+            viewModel.dispatch(MainAction.UpdateSearchQuery("Systems"))
+            viewModel.dispatch(MainAction.PlayAudioEntry("ep-stage-1"))
+
+            val beforeState =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == "ep-stage-1" &&
+                        it.searchQuery == "Systems" &&
+                        it.searchResults.size == 2 &&
+                        it.listeningHistoryEntries.size == 1
+                }
+            assertEquals(2, beforeState.visibleEntries.size)
+            assertEquals(2, beforeState.searchResults.size)
+            assertEquals(1, beforeState.activeFeeds.size)
+            assertEquals(1, beforeState.archivedFeeds.size)
+            assertEquals(1, beforeState.starredEntries.size)
+            assertEquals(1, beforeState.offlineEntries.size)
+
+            // 1-second playback tick updates playerState without recomputing list filters
+            playerBackend.setSimulatedPositionMs(5_200L)
+            assertTrue(viewModel.playerController.advanceSingleTick(tickCount = 1))
+            val afterTick = viewModel.uiState.first { it.playerState.positionMs == 5_200L }
+            assertEquals(5_200L, afterTick.playerState.positionMs)
+            assertSame(beforeState.visibleEntries, afterTick.visibleEntries)
+            assertSame(beforeState.searchResults, afterTick.searchResults)
+            assertSame(beforeState.queueEntries, afterTick.queueEntries)
+            assertSame(beforeState.listeningHistoryEntries, afterTick.listeningHistoryEntries)
+            assertSame(beforeState.activeFeeds, afterTick.activeFeeds)
+            assertSame(beforeState.archivedFeeds, afterTick.archivedFeeds)
+            assertSame(beforeState.starredEntries, afterTick.starredEntries)
+            assertSame(beforeState.offlineEntries, afterTick.offlineEntries)
+
+            // Seek updates playerState positionMs while keeping base lists reference-identical
+            // prior to DB progress snapshot emission; test sub-progress seek on in-memory state
+            viewModel.playerController.setSleepTimerMinutes(15)
+            val afterSleepUpdate =
+                viewModel.uiState.first { it.playerState.sleepTimerRemainingSec == 900 }
+            assertSame(beforeState.visibleEntries, afterSleepUpdate.visibleEntries)
+            assertSame(beforeState.searchResults, afterSleepUpdate.searchResults)
+
+            playerBackend.setSimulatedPositionMs(8_400L)
+            assertTrue(viewModel.playerController.advanceSingleTick(tickCount = 2))
+            val afterSecondTick = viewModel.uiState.first { it.playerState.positionMs == 8_400L }
+            assertEquals(899, afterSecondTick.playerState.sleepTimerRemainingSec)
+            assertSame(beforeState.visibleEntries, afterSecondTick.visibleEntries)
+            assertSame(beforeState.searchResults, afterSecondTick.searchResults)
+
+            // Seeking on a shared controller without DB mutation updates playerState.positionMs
+            // while keeping visibleEntries and searchResults reference-identical (assertSame)
+            val seekBackend = FakeAudioPlayerBackend()
+            val seekController =
+                PodcastPlayerController(scope = backgroundScope, backend = seekBackend)
+            val seekVm =
+                MainViewModel(
+                    repository = repository,
+                    settingsRepository = settings,
+                    sharedPlayerController = seekController,
+                )
+            val seekCollectJob = backgroundScope.launch { seekVm.uiState.collect() }
+            seekVm.dispatch(MainAction.UpdateSearchQuery("Systems"))
+            val initialSeekState =
+                seekVm.uiState.first { !it.isInitialLoading && it.searchQuery == "Systems" }
+            seekController.playEntry(
+                entry = initialSeekState.allEntries.first { it.id == "ep-stage-1" },
+                sourceUriOrPath = "https://example.com/stage-1.mp3",
+                speed = 1.0f,
+                skipSilenceEnabled = false,
+            )
+            val seekBefore =
+                seekVm.uiState.first {
+                    it.playerState.currentEntryId == "ep-stage-1" && it.readerContent != null
+                }
+            seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
+            val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }
+            assertEquals(42_000L, afterSeek.playerState.positionMs)
+            assertSame(seekBefore.visibleEntries, afterSeek.visibleEntries)
+            assertSame(seekBefore.searchResults, afterSeek.searchResults)
+
+            seekController.releaseController()
+            seekCollectJob.cancel()
+            seekVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            viewModel.playerController.stopAndClear()
+            collectJob.cancel()
+        }
+
+    @Test
+    internal fun `sharedPlayerController survives MainViewModel clear and attaches to recreated ViewModel`() =
+        runTest {
+            val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val sharedBackend = FakeAudioPlayerBackend()
+            val sharedBridge = RecordingMediaSessionBridge()
+            val sharedController =
+                createManagedPlayerController(
+                    scope = appScope,
+                    repository = repository,
+                    settingsRepository = settings,
+                    playerBackend = sharedBackend,
+                    mediaSessionBridge = sharedBridge,
+                )
+            val store1 = ViewModelStore()
+            val store2 = ViewModelStore()
+            try {
+                val podcastFeed =
+                    testFeed("f-shared-pod", "Durable Cast").copy(feedType = "podcast")
+                val ep1 =
+                    testItem("ep-shared-1", "Background Episode 1", "f-shared-pod")
+                        .copy(
+                            feedTitle = "Durable Cast",
+                            contentType = "audio",
+                            audioUrl = "https://example.com/shared-1.mp3",
+                            duration = "25:00",
+                        )
+                val ep2 =
+                    testItem("ep-shared-2", "Background Episode 2", "f-shared-pod")
+                        .copy(
+                            feedTitle = "Durable Cast",
+                            contentType = "audio",
+                            audioUrl = "https://example.com/shared-2.mp3",
+                            duration = "30:00",
+                        )
+                database.dao().upsertFeeds(listOf(podcastFeed))
+                database.dao().upsertItems(listOf(ep1, ep2))
+
+                val factory =
+                    MainViewModel.Factory(
+                        repository = repository,
+                        settings = settings,
+                        mediaSessionBridge = sharedBridge,
+                        sharedPlayerController = sharedController,
+                    )
+                val vm1 = ViewModelProvider(store1, factory)[MainViewModel::class.java]
+                val collect1 = backgroundScope.launch { vm1.uiState.collect() }
+                vm1.uiState.first { it.allEntries.size == 2 }
+
+                vm1.dispatch(MainAction.AddToQueue("ep-shared-1"))
+                vm1.dispatch(MainAction.AddToQueue("ep-shared-2"))
+                vm1.uiState.first { it.queueEntries.size == 2 }
+                vm1.dispatch(MainAction.PlayAudioEntry("ep-shared-1"))
+                vm1.uiState.first {
+                    it.playerState.currentEntryId == "ep-shared-1" &&
+                        it.playerState.isPlaying &&
+                        it.nextQueuedAudioEntryId == "ep-shared-2"
+                }
+
+                // Finish Activity 1: cancels vm1.viewModelScope and invokes vm1.onCleared()
+                collect1.cancel()
+                store1.clear()
+                vm1.viewModelScope.coroutineContext[Job]?.join()
+
+                assertTrue(sharedController.state.value.isPlaying)
+                assertTrue(sharedBackend.isPlaying())
+                assertEquals("ep-shared-1", sharedController.state.value.currentEntryId)
+
+                // Background playback continues advancing while no ViewModel is alive
+                sharedBackend.setSimulatedPositionMs(18_000L)
+                assertTrue(sharedController.advanceSingleTick(tickCount = 5))
+                assertEquals(18_000L, sharedController.state.value.positionMs)
+
+                // Recreate MainViewModel: immediately observes live playing episode
+                val vm2 = ViewModelProvider(store2, factory)[MainViewModel::class.java]
+                assertEquals("ep-shared-1", vm2.uiState.value.playerState.currentEntryId)
+                assertTrue(vm2.uiState.value.playerState.isPlaying)
+
+                val collect2 = backgroundScope.launch { vm2.uiState.collect() }
+                val liveState =
+                    vm2.uiState.first {
+                        !it.isInitialLoading && it.activePlayerEntry?.id == "ep-shared-1"
+                    }
+                assertTrue(liveState.playerState.isPlaying)
+                assertEquals(18_000L, liveState.playerState.positionMs)
+                assertEquals("ep-shared-2", liveState.nextQueuedAudioEntryId)
+
+                collect2.cancel()
+            } finally {
+                store1.clear()
+                store2.clear()
+                sharedController.releaseController()
+                appScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    internal fun `ThumbnailLoader coalesces concurrent requests and prunes disk cache over cap`() =
+        runTest {
+            val fetchCount = AtomicInteger(0)
+            val decodeCount = AtomicInteger(0)
+            val enteredTransport = CompletableDeferred<Unit>()
+            val releaseTransport = CompletableDeferred<Unit>()
+            val allCallersDispatched = CountDownLatch(8)
+            val coalescingCacheDir = File(tempDir, "coalesce_cache")
+
+            val coalescingClient = RocheApiClient { request ->
+                if (request.url == "https://cdn.example.com/shared-cover.png") {
+                    fetchCount.incrementAndGet()
+                    enteredTransport.complete(Unit)
+                    releaseTransport.await()
+                }
+                HttpResponse(
+                    statusCode = 200,
+                    body = "img",
+                    bodyBytes = byteArrayOf(10, 20, 30, 40),
+                )
+            }
+            var nowMs = 1_000_000L
+            val loader =
+                ThumbnailLoader(
+                    apiClient = coalescingClient,
+                    settings = settings,
+                    cacheDir = coalescingCacheDir,
+                    decoder = {
+                        decodeCount.incrementAndGet()
+                        fakeImageBitmap(width = 128, height = 128)
+                    },
+                    clockMs = { nowMs },
+                )
+
+            val jobs =
+                (1..8).map {
+                    async(Dispatchers.Default) {
+                        allCallersDispatched.countDown()
+                        allCallersDispatched.await(5, TimeUnit.SECONDS)
+                        loader.loadThumbnail("https://cdn.example.com/shared-cover.png")
+                    }
+                }
+            enteredTransport.await()
+            releaseTransport.complete(Unit)
+            val bitmaps = jobs.awaitAll()
+
+            assertEquals(1, fetchCount.get())
+            assertEquals(1, decodeCount.get())
+            val firstBitmap = bitmaps.first()
+            assertNotNull(firstBitmap)
+            bitmaps.forEach { bitmap -> assertSame(firstBitmap, bitmap) }
+
+            // Disk cache pruning: writing 516 thumbnails caps thumbnails/ at 512 and evicts 4
+            // oldest
+            val pruneCacheDir = File(tempDir, "prune_cache")
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "tok-thumbs",
+                )
+            }
+            val pruneLoader =
+                ThumbnailLoader(
+                    apiClient =
+                        RocheApiClient {
+                            HttpResponse(
+                                statusCode = 200,
+                                body = "img",
+                                bodyBytes = byteArrayOf(1, 2, 3, 4),
+                            )
+                        },
+                    settings = settings,
+                    cacheDir = pruneCacheDir,
+                    decoder = { fakeImageBitmap(width = 32, height = 32) },
+                    clockMs = { nowMs },
+                )
+            val totalWritten = ThumbnailLoader.MAX_DISK_CACHED_FILES + 4
+            for (idx in 1..totalWritten) {
+                nowMs = 2_000_000L + idx * 1_000L
+                assertNotNull(pruneLoader.loadThumbnail("media-id-$idx"))
+            }
+            val thumbsDir = File(pruneCacheDir, "thumbnails")
+            val cachedFiles = thumbsDir.listFiles().orEmpty().filter { it.isFile }
+            assertEquals(ThumbnailLoader.MAX_DISK_CACHED_FILES, cachedFiles.size)
+            for (evictedIdx in 1..4) {
+                assertFalse(File(thumbsDir, "media-id-$evictedIdx").exists())
+            }
+            assertTrue(File(thumbsDir, "media-id-5").exists())
+            assertTrue(File(thumbsDir, "media-id-$totalWritten").exists())
+
+            // Byte-cap pruning also evicts oldest files until total bytes <= maxBytes
+            val bytePruneDir = File(tempDir, "byte_prune_thumbs").apply { mkdirs() }
+            for (idx in 1..5) {
+                File(bytePruneDir, "chunk-$idx").apply {
+                    writeBytes(ByteArray(100) { idx.toByte() })
+                    setLastModified(3_000_000L + idx * 1_000L)
+                }
+            }
+            pruneThumbnailDiskCache(thumbsDir = bytePruneDir, maxFiles = 100, maxBytes = 300L)
+            assertEquals(
+                listOf("chunk-3", "chunk-4", "chunk-5"),
+                bytePruneDir.listFiles().orEmpty().map { it.name }.sorted(),
+            )
+        }
 
     private class FakeAudioPlayerBackend : AudioPlayerBackend {
         var failNextLoad: Boolean = false
