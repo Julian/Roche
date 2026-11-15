@@ -5,6 +5,7 @@ package com.grayvines.roche.ui.components
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -30,39 +31,65 @@ fun BottomTabIcon(
     modifier: Modifier = Modifier,
     size: Dp = 20.dp,
 ) {
+    val pathA = remember { Path() }
+    val pathB = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
         when (tab) {
-            AppTab.INBOX ->
-                drawInboxTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
-            AppTab.QUEUE ->
-                drawQueueTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
-            AppTab.STARRED ->
-                drawPath(
-                    path = buildStarPath(width = this.size.width, height = this.size.height),
-                    color = tint,
-                    style = stroke,
+            AppTab.INBOX -> {
+                drawInboxTabIcon(
+                    path = pathA,
+                    tint = tint,
+                    stroke = stroke,
+                    strokeWidth = strokeWidth,
                 )
-            AppTab.HOME -> drawHomeTabIcon(tint = tint, stroke = stroke)
-            AppTab.FEEDS -> drawFeedsTabIcon(tint = tint, stroke = stroke)
-            AppTab.LISTS ->
+            }
+            AppTab.QUEUE -> {
+                drawQueueTabIcon(
+                    path = pathA,
+                    tint = tint,
+                    stroke = stroke,
+                    strokeWidth = strokeWidth,
+                )
+            }
+            AppTab.STARRED -> {
+                populateStarPath(path = pathA, width = this.size.width, height = this.size.height)
+                drawPath(path = pathA, color = tint, style = stroke)
+            }
+            AppTab.HOME -> {
+                drawHomeTabIcon(housePath = pathA, doorPath = pathB, tint = tint, stroke = stroke)
+            }
+            AppTab.FEEDS -> {
+                drawFeedsTabIcon(tint = tint, stroke = stroke)
+            }
+            AppTab.LISTS -> {
                 drawListsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
-            AppTab.OFFLINE ->
+            }
+            AppTab.OFFLINE -> {
                 drawArrowTray(
+                    trayPath = pathA,
+                    chevronPath = pathB,
                     tint = tint,
                     stroke = stroke,
                     strokeWidth = strokeWidth,
                     arrowTipY = ARROW_BOTTOM_Y,
                     chevronWingY = OFFLINE_CHEVRON_WING_Y,
                 )
-            AppTab.SETTINGS ->
+            }
+            AppTab.SETTINGS -> {
                 drawSettingsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+            }
         }
     }
 }
 
-private fun DrawScope.drawInboxTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
+private fun DrawScope.drawInboxTabIcon(
+    path: Path,
+    tint: Color,
+    stroke: Stroke,
+    strokeWidth: Float,
+) {
     val w = size.width
     val h = size.height
     drawRoundRect(
@@ -72,16 +99,14 @@ private fun DrawScope.drawInboxTabIcon(tint: Color, stroke: Stroke, strokeWidth:
         cornerRadius = CornerRadius(w * CORNER_FRACTION, w * CORNER_FRACTION),
         style = stroke,
     )
-    val shelfPath =
-        Path().apply {
-            moveTo(w * INBOX_BOX_LEFT, h * INBOX_SHELF_Y)
-            lineTo(w * INBOX_NOTCH_LEFT, h * INBOX_SHELF_Y)
-            lineTo(w * INBOX_WELL_LEFT, h * INBOX_WELL_Y)
-            lineTo(w * INBOX_WELL_RIGHT, h * INBOX_WELL_Y)
-            lineTo(w * INBOX_NOTCH_RIGHT, h * INBOX_SHELF_Y)
-            lineTo(w * INBOX_BOX_RIGHT, h * INBOX_SHELF_Y)
-        }
-    drawPath(path = shelfPath, color = tint, style = stroke)
+    path.rewind()
+    path.moveTo(w * INBOX_BOX_LEFT, h * INBOX_SHELF_Y)
+    path.lineTo(w * INBOX_NOTCH_LEFT, h * INBOX_SHELF_Y)
+    path.lineTo(w * INBOX_WELL_LEFT, h * INBOX_WELL_Y)
+    path.lineTo(w * INBOX_WELL_RIGHT, h * INBOX_WELL_Y)
+    path.lineTo(w * INBOX_NOTCH_RIGHT, h * INBOX_SHELF_Y)
+    path.lineTo(w * INBOX_BOX_RIGHT, h * INBOX_SHELF_Y)
+    drawPath(path = path, color = tint, style = stroke)
     drawLine(
         color = tint,
         start = Offset(w * INBOX_LINE_LEFT, h * INBOX_TOP_LINE_Y),
@@ -91,7 +116,12 @@ private fun DrawScope.drawInboxTabIcon(tint: Color, stroke: Stroke, strokeWidth:
     )
 }
 
-private fun DrawScope.drawQueueTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
+private fun DrawScope.drawQueueTabIcon(
+    path: Path,
+    tint: Color,
+    stroke: Stroke,
+    strokeWidth: Float,
+) {
     val w = size.width
     val h = size.height
     drawLine(
@@ -115,39 +145,38 @@ private fun DrawScope.drawQueueTabIcon(tint: Color, stroke: Stroke, strokeWidth:
         strokeWidth = strokeWidth,
         cap = StrokeCap.Round,
     )
-    val playPath =
-        Path().apply {
-            moveTo(w * 0.66f, h * 0.46f)
-            lineTo(w * 0.88f, h * 0.63f)
-            lineTo(w * 0.66f, h * 0.80f)
-            close()
-        }
-    drawPath(path = playPath, color = tint, style = Fill)
-    drawPath(path = playPath, color = tint, style = stroke)
+    path.rewind()
+    path.moveTo(w * 0.66f, h * 0.46f)
+    path.lineTo(w * 0.88f, h * 0.63f)
+    path.lineTo(w * 0.66f, h * 0.80f)
+    path.close()
+    drawPath(path = path, color = tint, style = Fill)
+    drawPath(path = path, color = tint, style = stroke)
 }
 
-private fun DrawScope.drawHomeTabIcon(tint: Color, stroke: Stroke) {
+private fun DrawScope.drawHomeTabIcon(
+    housePath: Path,
+    doorPath: Path,
+    tint: Color,
+    stroke: Stroke,
+) {
     val w = size.width
     val h = size.height
-    val housePath =
-        Path().apply {
-            moveTo(w * 0.14f, h * 0.48f)
-            lineTo(w * 0.50f, h * 0.16f)
-            lineTo(w * 0.86f, h * 0.48f)
-            lineTo(w * 0.78f, h * 0.48f)
-            lineTo(w * 0.78f, h * 0.84f)
-            lineTo(w * 0.22f, h * 0.84f)
-            lineTo(w * 0.22f, h * 0.48f)
-            close()
-        }
+    housePath.rewind()
+    housePath.moveTo(w * 0.14f, h * 0.48f)
+    housePath.lineTo(w * 0.50f, h * 0.16f)
+    housePath.lineTo(w * 0.86f, h * 0.48f)
+    housePath.lineTo(w * 0.78f, h * 0.48f)
+    housePath.lineTo(w * 0.78f, h * 0.84f)
+    housePath.lineTo(w * 0.22f, h * 0.84f)
+    housePath.lineTo(w * 0.22f, h * 0.48f)
+    housePath.close()
     drawPath(path = housePath, color = tint, style = stroke)
-    val doorPath =
-        Path().apply {
-            moveTo(w * 0.41f, h * 0.84f)
-            lineTo(w * 0.41f, h * 0.58f)
-            lineTo(w * 0.59f, h * 0.58f)
-            lineTo(w * 0.59f, h * 0.84f)
-        }
+    doorPath.rewind()
+    doorPath.moveTo(w * 0.41f, h * 0.84f)
+    doorPath.lineTo(w * 0.41f, h * 0.58f)
+    doorPath.lineTo(w * 0.59f, h * 0.58f)
+    doorPath.lineTo(w * 0.59f, h * 0.84f)
     drawPath(path = doorPath, color = tint, style = stroke)
 }
 
@@ -275,10 +304,11 @@ fun StarIcon(
     isStarred: Boolean = false,
     size: Dp = 18.dp,
 ) {
+    val starPath = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        val starPath = buildStarPath(width = this.size.width, height = this.size.height)
+        populateStarPath(path = starPath, width = this.size.width, height = this.size.height)
         if (isStarred) {
             drawPath(path = starPath, color = tint, style = Fill)
         }
@@ -315,25 +345,24 @@ fun PlusIcon(
     }
 }
 
-private fun buildStarPath(width: Float, height: Float): Path {
+private fun populateStarPath(path: Path, width: Float, height: Float) {
     val cx = width * 0.5f
     val cy = height * STAR_CENTER_Y
     val outerRadius = width * STAR_OUTER_RADIUS
     val innerRadius = width * STAR_INNER_RADIUS
-    return Path().apply {
-        for (i in 0 until STAR_VERTEX_COUNT) {
-            val radius = if (i % 2 == 0) outerRadius else innerRadius
-            val angleRad = Math.toRadians(STAR_START_DEG + i * STAR_STEP_DEG)
-            val x = cx + (radius * cos(angleRad)).toFloat()
-            val y = cy + (radius * sin(angleRad)).toFloat()
-            if (i == 0) {
-                moveTo(x, y)
-            } else {
-                lineTo(x, y)
-            }
+    path.rewind()
+    for (i in 0 until STAR_VERTEX_COUNT) {
+        val radius = if (i % 2 == 0) outerRadius else innerRadius
+        val angleRad = Math.toRadians(STAR_START_DEG + i * STAR_STEP_DEG)
+        val x = cx + (radius * cos(angleRad)).toFloat()
+        val y = cy + (radius * sin(angleRad)).toFloat()
+        if (i == 0) {
+            path.moveTo(x, y)
+        } else {
+            path.lineTo(x, y)
         }
-        close()
     }
+    path.close()
 }
 
 /**
@@ -347,6 +376,8 @@ fun FilingCabinetIcon(
     isArchived: Boolean = false,
     size: Dp = 18.dp,
 ) {
+    val pathA = remember { Path() }
+    val pathB = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
@@ -355,6 +386,8 @@ fun FilingCabinetIcon(
             drawFilingCabinet(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
         } else {
             drawArrowTray(
+                trayPath = pathA,
+                chevronPath = pathB,
                 tint = tint,
                 stroke = stroke,
                 strokeWidth = strokeWidth,
@@ -406,7 +439,10 @@ private fun DrawScope.drawFilingCabinet(tint: Color, stroke: Stroke, strokeWidth
     )
 }
 
+@Suppress("LongParameterList")
 private fun DrawScope.drawArrowTray(
+    trayPath: Path,
+    chevronPath: Path,
     tint: Color,
     stroke: Stroke,
     strokeWidth: Float,
@@ -415,13 +451,11 @@ private fun DrawScope.drawArrowTray(
 ) {
     val width = size.width
     val height = size.height
-    val trayPath =
-        Path().apply {
-            moveTo(width * CABINET_LEFT, height * TRAY_TOP_Y)
-            lineTo(width * CABINET_LEFT, height * TRAY_BOTTOM_Y)
-            lineTo(width * CABINET_RIGHT, height * TRAY_BOTTOM_Y)
-            lineTo(width * CABINET_RIGHT, height * TRAY_TOP_Y)
-        }
+    trayPath.rewind()
+    trayPath.moveTo(width * CABINET_LEFT, height * TRAY_TOP_Y)
+    trayPath.lineTo(width * CABINET_LEFT, height * TRAY_BOTTOM_Y)
+    trayPath.lineTo(width * CABINET_RIGHT, height * TRAY_BOTTOM_Y)
+    trayPath.lineTo(width * CABINET_RIGHT, height * TRAY_TOP_Y)
     drawPath(path = trayPath, color = tint, style = stroke)
 
     val centerX = width * 0.5f
@@ -432,12 +466,10 @@ private fun DrawScope.drawArrowTray(
         strokeWidth = strokeWidth,
         cap = StrokeCap.Round,
     )
-    val chevronPath =
-        Path().apply {
-            moveTo(width * CHEVRON_LEFT_X, height * chevronWingY)
-            lineTo(centerX, height * arrowTipY)
-            lineTo(width * CHEVRON_RIGHT_X, height * chevronWingY)
-        }
+    chevronPath.rewind()
+    chevronPath.moveTo(width * CHEVRON_LEFT_X, height * chevronWingY)
+    chevronPath.lineTo(centerX, height * arrowTipY)
+    chevronPath.lineTo(width * CHEVRON_RIGHT_X, height * chevronWingY)
     drawPath(path = chevronPath, color = tint, style = stroke)
 }
 
@@ -448,21 +480,20 @@ internal fun FilterFunnelIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val funnelPath = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
         val w = this.size.width
         val h = this.size.height
-        val funnelPath =
-            Path().apply {
-                moveTo(w * 0.14f, h * 0.18f)
-                lineTo(w * 0.86f, h * 0.18f)
-                lineTo(w * 0.58f, h * 0.52f)
-                lineTo(w * 0.58f, h * 0.84f)
-                lineTo(w * 0.42f, h * 0.76f)
-                lineTo(w * 0.42f, h * 0.52f)
-                close()
-            }
+        funnelPath.rewind()
+        funnelPath.moveTo(w * 0.14f, h * 0.18f)
+        funnelPath.lineTo(w * 0.86f, h * 0.18f)
+        funnelPath.lineTo(w * 0.58f, h * 0.52f)
+        funnelPath.lineTo(w * 0.58f, h * 0.84f)
+        funnelPath.lineTo(w * 0.42f, h * 0.76f)
+        funnelPath.lineTo(w * 0.42f, h * 0.52f)
+        funnelPath.close()
         drawPath(path = funnelPath, color = tint, style = stroke)
     }
 }
@@ -506,27 +537,25 @@ internal fun DocumentOpmlIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val docPath = remember { Path() }
+    val foldPath = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
         val w = this.size.width
         val h = this.size.height
-        val docPath =
-            Path().apply {
-                moveTo(w * 0.22f, h * 0.12f)
-                lineTo(w * 0.58f, h * 0.12f)
-                lineTo(w * 0.78f, h * 0.32f)
-                lineTo(w * 0.78f, h * 0.88f)
-                lineTo(w * 0.22f, h * 0.88f)
-                close()
-            }
+        docPath.rewind()
+        docPath.moveTo(w * 0.22f, h * 0.12f)
+        docPath.lineTo(w * 0.58f, h * 0.12f)
+        docPath.lineTo(w * 0.78f, h * 0.32f)
+        docPath.lineTo(w * 0.78f, h * 0.88f)
+        docPath.lineTo(w * 0.22f, h * 0.88f)
+        docPath.close()
         drawPath(path = docPath, color = tint, style = stroke)
-        val foldPath =
-            Path().apply {
-                moveTo(w * 0.56f, h * 0.12f)
-                lineTo(w * 0.56f, h * 0.34f)
-                lineTo(w * 0.78f, h * 0.34f)
-            }
+        foldPath.rewind()
+        foldPath.moveTo(w * 0.56f, h * 0.12f)
+        foldPath.lineTo(w * 0.56f, h * 0.34f)
+        foldPath.lineTo(w * 0.78f, h * 0.34f)
         drawPath(path = foldPath, color = tint, style = stroke)
     }
 }
@@ -538,10 +567,14 @@ fun DownloadTrayIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val pathA = remember { Path() }
+    val pathB = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
         drawArrowTray(
+            trayPath = pathA,
+            chevronPath = pathB,
             tint = tint,
             stroke = stroke,
             strokeWidth = strokeWidth,
@@ -558,23 +591,21 @@ fun RewindIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val leftTri = remember { Path() }
+    val rightTri = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val w = this.size.width
         val h = this.size.height
-        val leftTri =
-            Path().apply {
-                moveTo(w * 0.10f, h * 0.50f)
-                lineTo(w * 0.48f, h * 0.22f)
-                lineTo(w * 0.48f, h * 0.78f)
-                close()
-            }
-        val rightTri =
-            Path().apply {
-                moveTo(w * 0.48f, h * 0.50f)
-                lineTo(w * 0.88f, h * 0.22f)
-                lineTo(w * 0.88f, h * 0.78f)
-                close()
-            }
+        leftTri.rewind()
+        leftTri.moveTo(w * 0.10f, h * 0.50f)
+        leftTri.lineTo(w * 0.48f, h * 0.22f)
+        leftTri.lineTo(w * 0.48f, h * 0.78f)
+        leftTri.close()
+        rightTri.rewind()
+        rightTri.moveTo(w * 0.48f, h * 0.50f)
+        rightTri.lineTo(w * 0.88f, h * 0.22f)
+        rightTri.lineTo(w * 0.88f, h * 0.78f)
+        rightTri.close()
         drawPath(path = leftTri, color = tint, style = Fill)
         drawPath(path = rightTri, color = tint, style = Fill)
     }
@@ -587,23 +618,21 @@ fun FastForwardIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val leftTri = remember { Path() }
+    val rightTri = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val w = this.size.width
         val h = this.size.height
-        val leftTri =
-            Path().apply {
-                moveTo(w * 0.52f, h * 0.50f)
-                lineTo(w * 0.12f, h * 0.22f)
-                lineTo(w * 0.12f, h * 0.78f)
-                close()
-            }
-        val rightTri =
-            Path().apply {
-                moveTo(w * 0.90f, h * 0.50f)
-                lineTo(w * 0.52f, h * 0.22f)
-                lineTo(w * 0.52f, h * 0.78f)
-                close()
-            }
+        leftTri.rewind()
+        leftTri.moveTo(w * 0.52f, h * 0.50f)
+        leftTri.lineTo(w * 0.12f, h * 0.22f)
+        leftTri.lineTo(w * 0.12f, h * 0.78f)
+        leftTri.close()
+        rightTri.rewind()
+        rightTri.moveTo(w * 0.90f, h * 0.50f)
+        rightTri.lineTo(w * 0.52f, h * 0.22f)
+        rightTri.lineTo(w * 0.52f, h * 0.78f)
+        rightTri.close()
         drawPath(path = leftTri, color = tint, style = Fill)
         drawPath(path = rightTri, color = tint, style = Fill)
     }
@@ -617,6 +646,7 @@ fun PlayPauseIcon(
     modifier: Modifier = Modifier,
     size: Dp = 20.dp,
 ) {
+    val playTri = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val w = this.size.width
         val h = this.size.height
@@ -636,13 +666,11 @@ fun PlayPauseIcon(
                 cornerRadius = corner,
             )
         } else {
-            val playTri =
-                Path().apply {
-                    moveTo(w * 0.24f, h * 0.16f)
-                    lineTo(w * 0.84f, h * 0.50f)
-                    lineTo(w * 0.24f, h * 0.84f)
-                    close()
-                }
+            playTri.rewind()
+            playTri.moveTo(w * 0.24f, h * 0.16f)
+            playTri.lineTo(w * 0.84f, h * 0.50f)
+            playTri.lineTo(w * 0.24f, h * 0.84f)
+            playTri.close()
             drawPath(path = playTri, color = tint, style = Fill)
         }
     }
@@ -655,16 +683,15 @@ fun SkipNextIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val tri = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val w = this.size.width
         val h = this.size.height
-        val tri =
-            Path().apply {
-                moveTo(w * 0.16f, h * 0.20f)
-                lineTo(w * 0.68f, h * 0.50f)
-                lineTo(w * 0.16f, h * 0.80f)
-                close()
-            }
+        tri.rewind()
+        tri.moveTo(w * 0.16f, h * 0.20f)
+        tri.lineTo(w * 0.68f, h * 0.50f)
+        tri.lineTo(w * 0.16f, h * 0.80f)
+        tri.close()
         drawPath(path = tri, color = tint, style = Fill)
         drawRoundRect(
             color = tint,

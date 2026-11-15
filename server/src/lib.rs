@@ -8,6 +8,7 @@ pub mod db;
 mod error;
 mod feeds;
 mod media;
+pub mod migrate_great;
 pub mod ranking;
 mod scheduler;
 mod service;
@@ -23,21 +24,7 @@ impl RocheServer {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
 
-        let advertised_ok = match Self::maybe_advertise_tailscale(&cfg).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
-                false
-            }
-        };
         let mut ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
-        if !advertised_ok && let Some(identity) = &mut ts_identity {
-            identity.service_name = None;
-        }
-        if let Some(identity) = &ts_identity {
-            let urls = identity.candidate_urls(cfg.server.port);
-            tracing::info!(tailscale_urls = ?urls, "Detected Tailscale node addresses");
-        }
 
         let listen_host = if cfg.server.host.trim().eq_ignore_ascii_case("tailscale") {
             let ts_ip = ts_identity
@@ -50,15 +37,59 @@ impl RocheServer {
         };
         let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
 
+        let advertised_ok = match Self::maybe_advertise_tailscale(&cfg, &listen_cfg.host).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
+                false
+            }
+        };
+        if !advertised_ok && let Some(identity) = &mut ts_identity {
+            identity.service_name = None;
+        }
+        if let Some(identity) = &ts_identity {
+            let urls = identity.candidate_urls(cfg.server.port);
+            tracing::info!(tailscale_urls = ?urls, "Detected Tailscale node addresses");
+        }
+
+        let startup_worker = workers::WorkerManager::new(
+            db.clone(),
+            cfg.sync.op_log_prune_after,
+            cfg.storage.media_dir.clone(),
+        )
+        .with_download_dir(cfg.media.download_dir.clone());
+        if let Err(e) = startup_worker.cleanup_startup_partials().await {
+            tracing::warn!(error = %e, "Startup partial media cleanup failed");
+        }
+        let ytdlp_probe = media::ytdlp::YtDlpWorker::new(
+            cfg.media.clone(),
+            media::MediaStore::new(&cfg.storage.media_dir),
+        );
+        match ytdlp_probe.check_version().await {
+            Ok(ver) => tracing::info!(ytdlp_version = %ver, "Detected yt-dlp binary"),
+            Err(e) => tracing::debug!(error = %e, "yt-dlp binary unavailable at startup"),
+        }
+
         let roche_service = service::RocheService::new(db.clone(), fetcher, cfg.clone())
             .with_node_identity(ts_identity);
 
+        if cfg.tailscale.enabled && !cfg.tailscale.auto_auth_users.is_empty() {
+            tracing::info!(
+                allowed_users = cfg.tailscale.auto_auth_users.len(),
+                "tailscale.auto_auth_users enabled; ensure this is a single-user host fronted exclusively by `tailscale serve`"
+            );
+        }
+
         if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
             match roche_service.auth().issue_pairing_code().await {
-                Ok(code) => tracing::info!(
-                    pairing_code = %code,
-                    "No paired devices found; generated bootstrap pairing code"
-                ),
+                Ok(code) => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                        eprintln!("Bootstrap pairing code (valid 5m): {code}");
+                    }
+                    tracing::info!(
+                        "No paired devices found; generated 5-minute bootstrap pairing code (run `roche pair` to mint a new code)"
+                    );
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to generate bootstrap device pairing code");
                 }
@@ -77,8 +108,10 @@ impl RocheServer {
         let worker_db = db.clone();
         let prune_after = cfg.sync.op_log_prune_after;
         let media_dir = cfg.storage.media_dir.clone();
+        let download_dir = cfg.media.download_dir.clone();
         let worker_handle = tokio::spawn(async move {
-            let worker_mgr = workers::WorkerManager::new(worker_db, prune_after, media_dir);
+            let worker_mgr = workers::WorkerManager::new(worker_db, prune_after, media_dir)
+                .with_download_dir(download_dir);
             if let Err(e) = worker_mgr.run_all().await {
                 tracing::error!(error = %e, "WorkerManager terminated with error");
             }
@@ -190,10 +223,17 @@ impl RocheServer {
         identity.canonical_url(cfg.server.port)
     }
 
-    async fn maybe_advertise_tailscale(cfg: &config::Config) -> anyhow::Result<()> {
-        if let Some(svc) = tailscale::advertise_service(&cfg.tailscale, cfg.server.port).await? {
+    async fn maybe_advertise_tailscale(
+        cfg: &config::Config,
+        listen_host: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(svc) =
+            tailscale::advertise_service_with_target(&cfg.tailscale, listen_host, cfg.server.port)
+                .await?
+        {
             tracing::info!(
                 service = %svc,
+                upstream = %tailscale::serve_upstream_host(listen_host),
                 port = cfg.server.port,
                 "Advertised Roche server on Tailnet via `tailscale serve`"
             );

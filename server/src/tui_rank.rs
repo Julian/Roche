@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Write},
     process::{Command, Stdio},
@@ -6,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::db::CatalogEntry;
+use crate::{db::CatalogEntry, ranking::RankBoard};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterRankOutcome {
@@ -22,7 +23,7 @@ pub enum RankKey {
     MoveDown,
     MoveUp,
     MoveTo(usize),
-    TieRest,
+    TieWithAbove,
     TieAll,
     Skip,
     OpenUrl,
@@ -32,43 +33,34 @@ pub enum RankKey {
 
 #[derive(Debug, Clone)]
 pub struct ClusterRankState {
-    entries: Vec<CatalogEntry>,
-    order: Vec<usize>,
-    /// `tied[pos]` is true when `pos > 0` and `pos` is tied with `pos - 1`.
-    tied: Vec<bool>,
-    cursor: usize,
+    entries_by_id: HashMap<String, CatalogEntry>,
+    board: RankBoard,
     status_note: Option<String>,
 }
 
 impl ClusterRankState {
     #[must_use]
     pub fn new(entries: Vec<CatalogEntry>) -> Self {
-        let n = entries.len();
-        Self {
-            entries,
-            order: (0..n).collect(),
-            tied: vec![false; n],
-            cursor: 0,
-            status_note: None,
-        }
+        let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let entries_by_id = entries.into_iter().map(|e| (e.id.clone(), e)).collect();
+        Self { entries_by_id, board: RankBoard::new(ids), status_note: None }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn display_ranks(&self) -> Vec<usize> {
-        let mut ranks = Vec::with_capacity(self.order.len());
-        let mut cur = 1usize;
-        for pos in 0..self.order.len() {
-            if pos > 0 && !self.tied[pos] {
-                cur = pos + 1;
-            }
-            ranks.push(cur);
-        }
-        ranks
+        self.board.flat_rows().into_iter().map(|r| r.display_rank).collect()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.board.selected_flat_index()
     }
 
     #[must_use]
     pub fn focused_entry(&self) -> Option<&CatalogEntry> {
-        self.order.get(self.cursor).and_then(|&idx| self.entries.get(idx))
+        self.entries_by_id.get(self.board.selected_id())
     }
 
     pub fn set_status_note(&mut self, msg: impl Into<String>) {
@@ -77,22 +69,11 @@ impl ClusterRankState {
 
     #[must_use]
     pub fn to_ordering(&self) -> Vec<Vec<String>> {
-        let mut groups: Vec<Vec<String>> = Vec::new();
-        for (pos, &idx) in self.order.iter().enumerate() {
-            let id = self.entries[idx].id.clone();
-            if pos > 0 && self.tied[pos] {
-                if let Some(last) = groups.last_mut() {
-                    last.push(id);
-                }
-            } else {
-                groups.push(vec![id]);
-            }
-        }
-        groups
+        self.board.to_ordering()
     }
 
     pub fn apply_key(&mut self, key: RankKey) -> Option<ClusterRankOutcome> {
-        let n = self.order.len();
+        let n = self.board.len();
         if n == 0 {
             return Some(ClusterRankOutcome::Quit);
         }
@@ -100,63 +81,45 @@ impl ClusterRankState {
 
         match key {
             RankKey::Down => {
-                if self.cursor + 1 < n {
-                    self.cursor += 1;
-                }
+                self.board.select_next();
                 None
             }
             RankKey::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.board.select_prev();
                 None
             }
             RankKey::MoveDown => {
-                if self.cursor + 1 < n {
-                    self.order.swap(self.cursor, self.cursor + 1);
-                    self.cursor += 1;
-                }
+                self.board.move_down();
                 None
             }
             RankKey::MoveUp => {
-                if self.cursor > 0 {
-                    self.order.swap(self.cursor - 1, self.cursor);
-                    self.cursor -= 1;
-                }
+                self.board.move_up();
                 None
             }
             RankKey::MoveTo(rank_one_based) => {
                 if rank_one_based >= 1 && rank_one_based <= n {
-                    let target = rank_one_based - 1;
-                    while self.cursor > target {
-                        self.order.swap(self.cursor - 1, self.cursor);
-                        self.cursor -= 1;
-                    }
-                    while self.cursor < target {
-                        self.order.swap(self.cursor, self.cursor + 1);
-                        self.cursor += 1;
-                    }
-                    if target + 1 < n {
-                        self.cursor = target + 1;
+                    self.board.move_to_rank_slot(rank_one_based - 1);
+                    let placed = self.board.selected_flat_index();
+                    if placed + 1 < n {
+                        self.board.select_flat_index(placed + 1);
                     }
                 }
                 None
             }
-            RankKey::TieRest => {
-                if self.cursor + 1 < n {
-                    let already_one_group =
-                        !self.tied[self.cursor] && (self.cursor + 1..n).all(|i| self.tied[i]);
-                    for i in (self.cursor + 1)..n {
-                        self.tied[i] = !already_one_group;
-                    }
-                    if !already_one_group {
-                        self.tied[self.cursor] = false;
-                    }
+            RankKey::TieWithAbove => {
+                if self.board.selected_flat_index() == 0 {
+                    self.status_note = Some(
+                        "Move to row 2+ and press '=' to tie with the item above (or 't' to tie all)."
+                            .to_owned(),
+                    );
+                } else {
+                    self.board.toggle_tie_with_above();
                 }
                 None
             }
             RankKey::TieAll => {
-                let all_ids: Vec<String> =
-                    self.order.iter().map(|&idx| self.entries[idx].id.clone()).collect();
-                Some(ClusterRankOutcome::Submitted(vec![all_ids]))
+                self.board.toggle_tie_all();
+                None
             }
             RankKey::Skip => Some(ClusterRankOutcome::Skip),
             RankKey::OpenUrl => None,
@@ -179,17 +142,19 @@ impl ClusterRankState {
             appended
         );
         buf.push_str(
-            "\x1b[2mOrder best → worst. j/k or ↑/↓ focus · J/K or Shift+↑/↓ move · 1-9 send to rank · = tie below · t tie all · s skip · o open · Enter submit · q quit\x1b[0m\r\n\r\n",
+            "\x1b[2mOrder best → worst. j/k or ↑/↓ focus · J/K or Shift+↑/↓ move · 1-9 send to rank · = tie above · t tie all · s skip · o open · Enter submit · q quit\x1b[0m\r\n\r\n",
         );
 
-        let ranks = self.display_ranks();
-        let has_ties = self.tied.iter().any(|&t| t);
-        for (pos, &idx) in self.order.iter().enumerate() {
-            if has_ties && pos > 0 && !self.tied[pos] {
+        let rows = self.board.flat_rows();
+        let has_ties = rows.iter().any(|r| r.is_tied_with_above);
+        for row in &rows {
+            if has_ties && row.flat_index > 0 && !row.is_tied_with_above {
                 buf.push_str("  \x1b[2m┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\x1b[0m\r\n");
             }
-            let entry = &self.entries[idx];
-            let focused = pos == self.cursor;
+            let Some(entry) = self.entries_by_id.get(&row.entry_id) else {
+                continue;
+            };
+            let focused = row.is_selected;
             let cursor_glyph = if focused { "\x1b[1;38;5;166m▸\x1b[0m" } else { " " };
             let byline = if entry.creators.is_empty() {
                 String::new()
@@ -203,11 +168,11 @@ impl ClusterRankState {
             } else {
                 sanitize_line(&entry.title)
             };
-            let tie_badge = if pos > 0 && self.tied[pos] { " \x1b[33m[=]\x1b[0m" } else { "" };
+            let tie_badge = if row.is_tied_with_above { " \x1b[33m[=]\x1b[0m" } else { "" };
             let _ = write!(
                 buf,
                 " {cursor_glyph} {:2}. {byline}{title_styled}{year_suffix}{tie_badge}\r\n",
-                ranks[pos]
+                row.display_rank
             );
         }
 
@@ -238,10 +203,14 @@ impl RawTtyGuard {
             anyhow::bail!("stty -g failed on /dev/tty");
         }
         let saved_stty = String::from_utf8_lossy(&stty_out.stdout).trim().to_owned();
+        // Construct guard immediately so any failure below restores terminal state via Drop.
+        let guard = Self { saved_stty };
 
         let tty_raw = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        // Include `-isig` so Ctrl+C delivers byte 0x03 (`RankKey::Cancel`) and unwinds cleanly
+        // through `RawTtyGuard::drop` instead of killing the process with an un-restored TTY.
         let status = Command::new("stty")
-            .args(["-icanon", "-echo", "min", "1", "time", "0"])
+            .args(["-icanon", "-echo", "-isig", "min", "1", "time", "0"])
             .stdin(Stdio::from(tty_raw))
             .status()
             .context("Failed to enable non-canonical mode via stty")?;
@@ -254,7 +223,7 @@ impl RawTtyGuard {
         writer.write_all(b"\x1b[?1049h\x1b[?25l")?;
         writer.flush()?;
 
-        Ok((Self { saved_stty }, reader, writer))
+        Ok((guard, reader, writer))
     }
 }
 
@@ -308,25 +277,29 @@ pub fn prompt_cluster_tty(
     }
 }
 
-fn read_next_key(reader: &mut File) -> Result<Option<RankKey>> {
-    let mut buf = [0u8; 8];
+fn read_next_key<R: Read>(reader: &mut R) -> Result<Option<RankKey>> {
+    let mut buf = [0u8; 64];
     let n = reader.read(&mut buf)?;
     if n == 0 {
         return Ok(Some(RankKey::Cancel));
     }
-    match &buf[..n] {
-        [b'j', ..] | b"\x1b[B" | b"\x1bOB" => Ok(Some(RankKey::Down)),
-        [b'k', ..] | b"\x1b[A" | b"\x1bOA" => Ok(Some(RankKey::Up)),
-        [b'J', ..] | b"\x1b[1;2B" => Ok(Some(RankKey::MoveDown)),
-        [b'K', ..] | b"\x1b[1;2A" => Ok(Some(RankKey::MoveUp)),
-        [d @ b'1'..=b'9', ..] => Ok(Some(RankKey::MoveTo(usize::from(d - b'0')))),
-        [b'=', ..] => Ok(Some(RankKey::TieRest)),
-        [b't', ..] => Ok(Some(RankKey::TieAll)),
-        [b's', ..] => Ok(Some(RankKey::Skip)),
-        [b'o', ..] => Ok(Some(RankKey::OpenUrl)),
-        [b'\r' | b'\n', ..] => Ok(Some(RankKey::Submit)),
-        [b'q' | 0x03 | 0x04, ..] | [0x1b] => Ok(Some(RankKey::Cancel)),
-        _ => Ok(None),
+    Ok(parse_rank_key(&buf[..n]))
+}
+
+fn parse_rank_key(bytes: &[u8]) -> Option<RankKey> {
+    match bytes {
+        [b'j', ..] | b"\x1b[B" | b"\x1bOB" => Some(RankKey::Down),
+        [b'k', ..] | b"\x1b[A" | b"\x1bOA" => Some(RankKey::Up),
+        [b'J', ..] | b"\x1b[1;2B" => Some(RankKey::MoveDown),
+        [b'K', ..] | b"\x1b[1;2A" => Some(RankKey::MoveUp),
+        [d @ b'1'..=b'9', ..] => Some(RankKey::MoveTo(usize::from(d - b'0'))),
+        [b'=', ..] => Some(RankKey::TieWithAbove),
+        [b't', ..] => Some(RankKey::TieAll),
+        [b's', ..] => Some(RankKey::Skip),
+        [b'o', ..] => Some(RankKey::OpenUrl),
+        [b'\r' | b'\n', ..] => Some(RankKey::Submit),
+        [b'q' | 0x03 | 0x04, ..] | [0x1b] => Some(RankKey::Cancel),
+        _ => None,
     }
 }
 
@@ -409,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_rank_state_reorder_move_to_and_tie_groups() {
+    fn test_cluster_rank_state_reorder_move_to_and_pairwise_tie_buckets() {
         let entries = vec![
             sample_entry("a", "Alpha"),
             sample_entry("b", "Bravo"),
@@ -432,27 +405,42 @@ mod tests {
                 vec!["d".to_owned()]
             ]
         );
-        assert_eq!(state.cursor, 1);
+        assert_eq!(state.cursor(), 1);
 
-        // Press `=` (`TieRest`) at cursor 1 -> ties `a`, `b`, `d` into one group `[1, 2, 2, 2]`
-        state.apply_key(RankKey::TieRest);
-        assert_eq!(state.display_ranks(), vec![1, 2, 2, 2]);
+        // Pairwise `=` (`TieWithAbove`) at cursor 1 ties `c` and `a` ONLY (`#1 c = #1 a`, `#3 b`, `#4 d`)!
+        state.apply_key(RankKey::TieWithAbove);
+        assert_eq!(state.display_ranks(), vec![1, 1, 3, 4]);
         assert_eq!(
             state.to_ordering(),
-            vec![vec!["c".to_owned()], vec!["a".to_owned(), "b".to_owned(), "d".to_owned()]]
+            vec![vec!["c".to_owned(), "a".to_owned()], vec!["b".to_owned()], vec!["d".to_owned()]]
         );
 
-        // Pressing `=` again at the same group start splits back into singletons
-        state.apply_key(RankKey::TieRest);
-        assert_eq!(state.display_ranks(), vec![1, 2, 3, 4]);
-
-        // `TieAll` submits single all-tied group
+        // Moving `b` (cursor 2) up jumps cleanly above tie group `["c", "a"]` without corrupting their tie!
+        state.apply_key(RankKey::Down);
+        assert_eq!(state.cursor(), 2);
+        state.apply_key(RankKey::MoveUp);
         assert_eq!(
-            state.apply_key(RankKey::TieAll),
+            state.to_ordering(),
+            vec![vec!["b".to_owned()], vec!["c".to_owned(), "a".to_owned()], vec!["d".to_owned()]]
+        );
+        assert_eq!(state.display_ranks(), vec![1, 2, 2, 4]);
+
+        // `TieAll` toggles all rows into a single tied bucket without exiting, and toggles back to singletons!
+        assert_eq!(state.apply_key(RankKey::TieAll), None);
+        assert_eq!(state.display_ranks(), vec![1, 1, 1, 1]);
+        assert_eq!(
+            state.to_ordering(),
+            vec![vec!["b".to_owned(), "c".to_owned(), "a".to_owned(), "d".to_owned()]]
+        );
+        assert_eq!(state.apply_key(RankKey::TieAll), None);
+        assert_eq!(state.display_ranks(), vec![1, 2, 3, 4]);
+        assert_eq!(state.apply_key(RankKey::TieAll), None);
+        assert_eq!(
+            state.apply_key(RankKey::Submit),
             Some(ClusterRankOutcome::Submitted(vec![vec![
+                "b".to_owned(),
                 "c".to_owned(),
                 "a".to_owned(),
-                "b".to_owned(),
                 "d".to_owned()
             ]]))
         );
@@ -466,5 +454,17 @@ mod tests {
         assert!(validate_browser_open_url("file:///etc/passwd").is_err());
         assert!(validate_browser_open_url("-aCalculator").is_err());
         assert!(validate_browser_open_url("https://example.com/\nfoo").is_err());
+    }
+
+    #[test]
+    fn test_read_next_key_consumes_long_escape_sequence_without_splitting_into_digits() {
+        use std::io::Cursor;
+
+        // xterm `modifyOtherKeys=2` Shift+Enter (`\x1b[27;2;13~`, 10 bytes) must be read in one shot
+        // and ignored (`None`), never leaving trailing `3~` bytes that trigger `MoveTo(3)`.
+        let mut cursor = Cursor::new(b"\x1b[27;2;13~".to_vec());
+        assert_eq!(read_next_key(&mut cursor).unwrap(), None);
+        assert_eq!(cursor.position(), 10);
+        assert_eq!(read_next_key(&mut cursor).unwrap(), Some(RankKey::Cancel));
     }
 }

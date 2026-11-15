@@ -1,4 +1,4 @@
-@file:Suppress("TooManyFunctions", "LongMethod", "MagicNumber")
+@file:Suppress("TooManyFunctions", "LongMethod", "MagicNumber", "LargeClass")
 
 package com.grayvines.roche.data
 
@@ -29,7 +29,6 @@ import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -141,6 +140,7 @@ class RocheCatalogAndSyncTest {
                         RocheDatabase.MIGRATION_4_5,
                         RocheDatabase.MIGRATION_5_6,
                         RocheDatabase.MIGRATION_6_7,
+                        RocheDatabase.MIGRATION_7_8,
                     )
                     .build()
             try {
@@ -526,8 +526,7 @@ class RocheCatalogAndSyncTest {
                         """"comparisons":[{"id":"c1","ts":"2026-06-01T11:00:00Z",""" +
                         """"ordering":[["$bookA"],["$bookB"]]}]}"""
                 val parsedResp = parsePeerSyncResponseJson(respRaw)
-                assertNotNull(parsedResp)
-                assertEquals(1, parsedResp!!.comparisons.size)
+                assertEquals(1, parsedResp.comparisons.size)
 
                 reconcilePeerSyncResponse(
                     dao = peerDb.dao(),
@@ -676,5 +675,344 @@ class RocheCatalogAndSyncTest {
             val rankedMovies =
                 snap.entriesByCollectionId[moviesSpec.collectionId].orEmpty().map { it.entry.id }
             assertEquals(listOf(canonId, otherId), rankedMovies)
+        }
+
+    @Test
+    fun `Room MIGRATION_7_8 normalizes v7 identifiers backfills article duration and triggers one-time catalog backfill`() =
+        runTest {
+            val dbFile = File(tempDir, "roche_v7_upgrade.db")
+            val driver = BundledSQLiteDriver()
+            driver.open(dbFile.absolutePath).use { conn ->
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `feeds` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `url` TEXT NOT NULL, `siteUrl` TEXT, `feedType` TEXT NOT NULL, `description` TEXT, `language` TEXT, `pollInterval` INTEGER NOT NULL, `lastPolled` TEXT, `lastPolledBy` TEXT, `lastError` TEXT, `lastErrorBy` TEXT, `isActive` INTEGER NOT NULL, `autoDownloadEpisodes` INTEGER NOT NULL, `customPlaybackSpeed` REAL, PRIMARY KEY(`id`))"
+                )
+                conn.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_feeds_url` ON `feeds` (`url`)"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `items` (`id` TEXT NOT NULL, `feedId` TEXT, `feedTitle` TEXT NOT NULL, `title` TEXT NOT NULL, `url` TEXT NOT NULL, `author` TEXT, `summary` TEXT, `contentText` TEXT, `contentHtml` TEXT, `contentType` TEXT NOT NULL, `status` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, `isCachedOffline` INTEGER NOT NULL, `publishedAt` TEXT, `createdAt` TEXT NOT NULL, `readProgress` REAL NOT NULL, `thumbnailMediaId` TEXT, `duration` TEXT, `readAt` TEXT, `thumbnailUrl` TEXT, `feedUrl` TEXT, `interactionUpdatedAt` TEXT, `audioUrl` TEXT, PRIMARY KEY(`id`))"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_items_feedId` ON `items` (`feedId`)"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_items_status` ON `items` (`status`)"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_items_contentType` ON `items` (`contentType`)"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_items_isFavorite` ON `items` (`isFavorite`)"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_items_publishedAt_createdAt` ON `items` (`publishedAt`, `createdAt`)"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `item_contents` (`itemId` TEXT NOT NULL, `summary` TEXT, `contentText` TEXT, `contentHtml` TEXT, PRIMARY KEY(`itemId`), FOREIGN KEY(`itemId`) REFERENCES `items`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tags` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `color` TEXT, PRIMARY KEY(`id`))"
+                )
+                conn.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_tags_name` ON `tags` (`name`)"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `item_tags` (`itemId` TEXT NOT NULL, `tagId` TEXT NOT NULL, PRIMARY KEY(`itemId`, `tagId`))"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_item_tags_itemId` ON `item_tags` (`itemId`)"
+                )
+                conn.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_item_tags_tagId` ON `item_tags` (`tagId`)"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `pending_mutations` (`entityId` TEXT NOT NULL, `isLocalFeed` INTEGER NOT NULL, `isLocalItem` INTEGER NOT NULL, `titleOverride` TEXT, `dirtyStatus` TEXT, `dirtyFavorite` INTEGER, `dirtyReadProgress` REAL, `dirtyReadAt` TEXT, `addedTagsCsv` TEXT NOT NULL, `removedTagsCsv` TEXT NOT NULL, PRIMARY KEY(`entityId`))"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `sync_tombstones` (`entityType` TEXT NOT NULL, `naturalKey` TEXT NOT NULL, `deletedAt` TEXT NOT NULL, PRIMARY KEY(`entityType`, `naturalKey`))"
+                )
+                conn.execSQL(
+                    "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)"
+                )
+                conn.execSQL(
+                    "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'd1c26f2f8fb02af999da276c321c99f0')"
+                )
+                com.grayvines.roche.data.local.migrateCatalogSchemaV7(conn)
+                conn.execSQL(
+                    "INSERT INTO `items` (`id`, `feedId`, `feedTitle`, `title`, `url`, `contentType`, `status`, `isFavorite`, `isCachedOffline`, `createdAt`, `readProgress`) VALUES ('art-v7', NULL, 'Saved', 'Long Essay', 'https://example.com/long', 'article', 'unread', 0, 0, '2026-05-01T00:00:00Z', 0.0)"
+                )
+                val body = "a".repeat(5_400)
+                conn.execSQL(
+                    "INSERT INTO `item_contents` (`itemId`, `contentText`) VALUES ('art-v7', '$body')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `catalog_entries` (`id`, `kind`, `title`, `creatorsJson`, `metadataJson`, `createdAt`, `updatedAt`, `isLocalDirty`) VALUES ('alb-v7', 'album', 'Dummy', '[]', '{}', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', 0)"
+                )
+                conn.execSQL(
+                    "INSERT INTO `entry_identifiers` (`scheme`, `value`, `entryId`) VALUES ('spotify', '4sW8Eql2e2kdRP1A1R1C9t', 'alb-v7')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `entry_identifiers` (`scheme`, `value`, `entryId`) VALUES ('1001albums', 'MixedCaseSlug', 'alb-v7')"
+                )
+                conn.execSQL("PRAGMA user_version = 7")
+            }
+
+            val migratedDb =
+                Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
+                    .setDriver(BundledSQLiteDriver())
+                    .addMigrations(RocheDatabase.MIGRATION_7_8)
+                    .build()
+            try {
+                val dao = migratedDb.dao()
+                assertEquals("5m", dao.getItemById("art-v7")?.duration)
+                val idents =
+                    dao.getIdentifiersForEntry("alb-v7").associate { it.scheme to it.value }
+                assertEquals("spotify:album:4sW8Eql2e2kdRP1A1R1C9t", idents["spotify"])
+                assertEquals("mixedcaseslug", idents["1001albums"])
+                assertEquals(
+                    "1",
+                    dao.getLocalSyncFlag(
+                        com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
+                    ),
+                )
+
+                // First syncWithServer after v7->v8 upgrade omits updated_after once to backfill
+                // catalog, then clears flag
+                settings.update {
+                    it.copy(
+                        serverUrl = "http://100.64.0.12:8080",
+                        bearerToken = "tok-v8",
+                        lastPeerSyncCursor = "2026-06-01T00:00:00Z",
+                    )
+                }
+                val syncBodies = mutableListOf<String>()
+                val upgradeClient = RocheApiClient { request ->
+                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                        syncBodies.add(request.body.orEmpty())
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_timestamp":"2026-06-02T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                }
+                val upgradedRepo =
+                    RocheRepository(
+                        database = migratedDb,
+                        apiClient = upgradeClient,
+                        settings = settings,
+                    )
+                upgradedRepo.syncWithServer().getOrThrow()
+                assertFalse(syncBodies.single().contains("updated_after"))
+                assertEquals(
+                    null,
+                    dao.getLocalSyncFlag(
+                        com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
+                    ),
+                )
+            } finally {
+                migratedDb.close()
+            }
+        }
+
+    @Test
+    fun `peer sync deduplicates incoming auto-completion logs preserves concurrent dirty edits and enforces LWW updatedAt`() =
+        runTest {
+            val dao = database.dao()
+            val entryId =
+                repository.catalog.logEntry(
+                    UpsertCatalogEntryInput(
+                        id = "11111111-1111-4111-8111-111111111111",
+                        kind = EntryKind.ARTICLE,
+                        title = "Fresh Local Title",
+                        url = "https://arxiv.org/pdf/2603.11842.pdf",
+                    ),
+                    ConsumptionStatus.CONSUMED,
+                    "Manual note",
+                )
+            // Verify arXiv identifier was extracted from URL
+            assertEquals(
+                "11111111-1111-4111-8111-111111111111",
+                dao.getEntryIdByIdentifier("arxiv", "2603.11842"),
+            )
+
+            val built =
+                buildTrackedPeerSyncRequest(
+                    dao = dao,
+                    config = PeerSyncRequestConfig(peerId = "peer-android", deviceName = "Pixel"),
+                )
+            // Simulate concurrent user edit while sync request is in flight (newer updatedAt)
+            dao.upsertCatalogEntry(
+                dao.getCatalogEntryById(entryId)!!.copy(
+                    title = "Concurrent Newer Title",
+                    updatedAt = "2099-01-01T00:00:00Z",
+                    isLocalDirty = true,
+                )
+            )
+
+            // Server responds with stale updatedAt on entry AND a deterministic auto-completion log
+            // for the same entry (which already has a manual consumed log!)
+            val autoLogId = deterministicAutoLogId(entryId)
+            val serverResp =
+                PeerSyncResponseDto(
+                    serverPeerId = "server-1",
+                    syncTimestamp = "2026-08-01T00:00:00Z",
+                    activePeers = emptyList(),
+                    feeds = emptyList(),
+                    items = emptyList(),
+                    tags = emptyList(),
+                    tombstones = emptyList(),
+                    catalogEntries =
+                        listOf(
+                            PeerCatalogEntryPayload(
+                                id = entryId,
+                                kind = "article",
+                                title = "Stale Server Title",
+                                updatedAt = "2020-01-01T00:00:00Z",
+                            )
+                        ),
+                    consumptionLog =
+                        listOf(
+                            PeerConsumptionLogPayload(
+                                id = autoLogId,
+                                entryId = entryId,
+                                ts = "2026-08-01T00:00:00Z",
+                                status = "consumed",
+                            )
+                        ),
+                )
+
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response = serverResp,
+                input =
+                    PeerSyncReconcileInput(
+                        preloaded = PeerSyncPreloadedState(emptyList(), emptyList()),
+                        sentCatalogBatch = built.sentCatalogBatch,
+                        catalogStore = repository.catalog,
+                    ),
+            )
+
+            val afterEntry = dao.getCatalogEntryById(entryId)!!
+            assertEquals("Concurrent Newer Title", afterEntry.title)
+            assertTrue(afterEntry.isLocalDirty)
+            val logs = dao.getConsumptionLogsForEntry(entryId)
+            assertEquals(1, logs.size)
+            assertEquals("Manual note", logs.single().notes)
+        }
+
+    @Test
+    fun `nested collections reject cycles slug collisions remap cleanly and LocalFeedPoller strips non-http schemes`() =
+        runTest {
+            val dao = database.dao()
+            val colA = repository.catalog.createCustomList("Parent List")
+            val colB = repository.catalog.createCustomList("Child List")
+            repository.catalog.addCollectionEntry(colA, colB)
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { repository.catalog.addCollectionEntry(colB, colA) }
+            }
+
+            // Slug collision from peer remaps incoming memberships & comparisons to colA
+            val itemId =
+                repository.catalog.upsertEntry(
+                    UpsertCatalogEntryInput(kind = EntryKind.BOOK, title = "Dune")
+                )
+            val item2Id =
+                repository.catalog.upsertEntry(
+                    UpsertCatalogEntryInput(kind = EntryKind.BOOK, title = "Hyperion")
+                )
+            val remoteCollidingId = "remote-parent-list-uuid"
+            val tsIso = "2026-08-05T10:00:00Z"
+            val resp =
+                PeerSyncResponseDto(
+                    serverPeerId = "server-1",
+                    syncTimestamp = tsIso,
+                    activePeers = emptyList(),
+                    feeds = emptyList(),
+                    items = emptyList(),
+                    tags = emptyList(),
+                    tombstones = emptyList(),
+                    collections =
+                        listOf(
+                            PeerCollectionSpecPayload(
+                                collectionId = remoteCollidingId,
+                                title = "Parent List",
+                                slug = "parent_list",
+                                mode = "manual",
+                                role = "list",
+                                updatedAt = tsIso,
+                            )
+                        ),
+                    collectionEntries =
+                        listOf(
+                            PeerCollectionEntryPayload(
+                                collectionId = remoteCollidingId,
+                                entryId = itemId,
+                                addedAt = tsIso,
+                            )
+                        ),
+                    comparisons =
+                        listOf(
+                            PeerComparisonPayload(
+                                id = "stale-comp-id",
+                                ts = tsIso,
+                                scopeCollectionId = remoteCollidingId,
+                                ordering = listOf(listOf(itemId), listOf(item2Id)),
+                            )
+                        ),
+                )
+            reconcileIncomingCatalogSync(
+                dao = dao,
+                catalogStore = repository.catalog,
+                response = resp,
+                sentBatch = OutgoingCatalogSyncBatch(),
+            )
+            assertTrue(dao.getCollectionMemberships(colA).any { it.entryId == itemId })
+            val savedComp = dao.getAllComparisons().single()
+            assertEquals(colA, savedComp.scopeCollectionId)
+            assertEquals(
+                deterministicComparisonId(
+                    colA,
+                    java.time.Instant.parse(tsIso).toEpochMilli(),
+                    listOf(listOf(itemId), listOf(item2Id)),
+                ),
+                savedComp.id,
+            )
+
+            // LocalFeedPoller sanitizes upstream HTTP error detail and drops non-HTTP enclosure
+            // URLs
+            val errFeed =
+                FeedEntity(
+                    id = "f-err",
+                    title = "Err Feed",
+                    url = "https://feeds.example.com/rss.xml",
+                    siteUrl = null,
+                    feedType = "podcast",
+                )
+            dao.upsertFeed(errFeed)
+            val failingClient = RocheApiClient {
+                HttpResponse(
+                    statusCode = 502,
+                    body = """{"title":"Bad Gateway","detail":"INTERNAL_SECRET_TOKEN_LEAK"}""",
+                )
+            }
+            LocalFeedPoller.pollFeed(dao, failingClient, errFeed, "peer-1")
+            assertEquals("HTTP 502", dao.getFeedById("f-err")?.lastError)
+
+            val schemeXml =
+                """<rss version="2.0"><channel><title>Pod</title>""" +
+                    """<item><title>BadLinkOnly</title><link>javascript:alert(1)</link>""" +
+                    """<enclosure url="file:///data/data/com.grayvines.roche/secret" type="audio/mpeg"/></item>""" +
+                    """<item><title>ValidLinkBadAudio</title><link>https://feeds.example.com/ep1</link>""" +
+                    """<enclosure url="file:///data/data/com.grayvines.roche/secret" type="audio/mpeg"/></item>""" +
+                    """</channel></rss>"""
+            val schemeClient = RocheApiClient { HttpResponse(statusCode = 200, body = schemeXml) }
+            LocalFeedPoller.pollFeed(dao, schemeClient, errFeed, "peer-1")
+            val parsedItem = dao.getAllItems().single { it.feedId == "f-err" }
+            assertEquals("ValidLinkBadAudio", parsedItem.title)
+            assertEquals(null, parsedItem.audioUrl)
+            assertEquals("https://feeds.example.com/ep1", parsedItem.url)
         }
 }

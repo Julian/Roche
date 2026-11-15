@@ -1,5 +1,6 @@
 package com.grayvines.roche.data
 
+import com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
 import com.grayvines.roche.data.local.ItemTagEntity
 import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
@@ -8,6 +9,7 @@ import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.remote.PublicUrlValidator
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.Settings
@@ -23,6 +25,7 @@ import java.io.File
 import java.io.InputStream
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -31,6 +34,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -75,16 +79,24 @@ class RocheRepository(
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
-    backgroundScope: CoroutineScope? = null,
+    private val backgroundScope: CoroutineScope? = null,
     poolStreamProvider: (() -> InputStream?)? = null,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
     private val itemMutationMutex = Mutex()
-    private val mutationDispatcher = BackgroundMutationDispatcher(backgroundScope)
+    private val mutationDispatcher =
+        BackgroundMutationDispatcher(scope = backgroundScope, syncMutex = syncMutex)
+    private val catalogSyncRunning = AtomicBoolean(false)
+    private val catalogSyncPending = AtomicBoolean(false)
     private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
-    val catalog: CatalogStore = CatalogStore(dao = dao, poolStreamProvider = poolStreamProvider)
+    val catalog: CatalogStore =
+        CatalogStore(
+            dao = dao,
+            poolStreamProvider = poolStreamProvider,
+            onLocalMutation = ::triggerBackgroundCatalogSync,
+        )
     @Volatile
     internal var latestSnapshot: RepositorySnapshot? = null
         private set
@@ -416,29 +428,26 @@ class RocheRepository(
         itemId: String,
         progress: Double,
         recordPlayedTimestamp: Boolean = false,
+        syncRemote: Boolean = true,
     ) {
         if (!progress.isFinite() || dao.getItemStateById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
         dao.updateReadProgress(itemId, clamped)
+        val explicitReadAt =
+            if (recordPlayedTimestamp) {
+                Instant.now().toString().also { dao.updateItemReadAt(itemId, it) }
+            } else {
+                null
+            }
         maybeAutoLogFeedItemCompletion(itemId)
-        if (recordPlayedTimestamp) {
-            val nowIso = Instant.now().toString()
-            dao.updateItemReadAt(itemId, nowIso)
-            syncReadAtMutation(
-                dao = dao,
-                apiClient = apiClient,
-                settings = settings,
-                itemId = itemId,
-                readAt = nowIso,
-                dispatcher = mutationDispatcher,
-            )
-        }
         syncReadProgressMutation(
             dao = dao,
             apiClient = apiClient,
             settings = settings,
             itemId = itemId,
             progress = clamped,
+            explicitReadAt = explicitReadAt,
+            pushImmediately = syncRemote,
             dispatcher = mutationDispatcher,
         )
     }
@@ -474,6 +483,7 @@ class RocheRepository(
                 itemId = itemId,
                 existingTag = existingTag,
                 normalizedName = normalized,
+                dispatcher = mutationDispatcher,
             )
         } else {
             dao.insertItemTag(ItemTagEntity(itemId = itemId, tagId = existingTag.id))
@@ -484,6 +494,7 @@ class RocheRepository(
                 itemId = itemId,
                 existingTag = existingTag,
                 normalizedName = normalized,
+                dispatcher = mutationDispatcher,
             )
         }
     }
@@ -514,6 +525,7 @@ class RocheRepository(
             settings = settings,
             feedId = feedId,
             tagName = tagName,
+            dispatcher = mutationDispatcher,
         )
 
     suspend fun refreshFeed(feedId: String): Result<String> = runSuspendCatching {
@@ -738,7 +750,11 @@ class RocheRepository(
         val currentTier = networkTierProvider.currentNetworkTier()
         if (currentTier == NetworkTier.OFFLINE) return Result.success(0)
         val currentSettings = settings.settings.first()
-        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+        if (
+            currentSettings.serverUrl.isNotBlank() &&
+                currentSettings.bearerToken.isNotBlank() &&
+                isServerSyncAllowedByTransport(currentSettings.serverUrl)
+        ) {
             val syncResult = syncWithServer()
             if (syncResult.isSuccess) return syncResult
         }
@@ -754,6 +770,42 @@ class RocheRepository(
             }
         }
     }
+
+    private fun triggerBackgroundCatalogSync() {
+        val scope = backgroundScope ?: return
+        catalogSyncPending.set(true)
+        if (!catalogSyncRunning.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                while (catalogSyncPending.compareAndSet(true, false)) {
+                    if (canRunBackgroundCatalogSync()) {
+                        syncWithServer()
+                    } else {
+                        catalogSyncPending.set(false)
+                    }
+                }
+            } finally {
+                catalogSyncRunning.set(false)
+                if (catalogSyncPending.get()) {
+                    triggerBackgroundCatalogSync()
+                }
+            }
+        }
+    }
+
+    private suspend fun canRunBackgroundCatalogSync(): Boolean {
+        if (currentNetworkTier() == NetworkTier.OFFLINE) return false
+        val current = settings.settings.first()
+        return current.serverUrl.isNotBlank() &&
+            current.bearerToken.isNotBlank() &&
+            isServerSyncAllowedByTransport(current.serverUrl)
+    }
+
+    private fun isServerSyncAllowedByTransport(serverUrl: String): Boolean =
+        PublicUrlValidator.isServerEndpointAllowed(
+            rawServerUrl = serverUrl,
+            isVpnActive = networkTierProvider::isVpnTransportActive,
+        )
 
     private fun peerSyncCoordinator(networkTier: NetworkTier): PeerSyncCoordinator =
         PeerSyncCoordinator(
@@ -814,11 +866,12 @@ class RocheRepository(
                     preFetchFeedsById = preFetchFeedsById,
                 ),
         )
+        val needsCatalogBackfill = dao.getLocalSyncFlag(FLAG_CATALOG_BACKFILL_NEEDED) != null
         bootstrapDeltaPeerSyncIfNeeded(
             coordinator = peerSyncCoordinator(networkTierProvider.currentNetworkTier()),
-            settings = settings,
             currentSettings = currentSettings,
             hasMergedData = mergedFeeds.isNotEmpty() || mergedItems.isNotEmpty(),
+            needsCatalogBackfill = needsCatalogBackfill,
         )
         return dao.countItems()
     }
@@ -884,6 +937,8 @@ class RocheRepository(
                 isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
             }
         if (!shouldLog) return
+        val resolvedTarget = catalog.followMergedId(itemId) ?: itemId
+        if (dao.countTerminalLogsForEntry(resolvedTarget) > 0) return
         val item = dao.getItemById(itemId) ?: return
         val feed = item.feedId?.let { dao.getFeedById(it) }
         catalog.materializeFeedItemInCatalog(item = item, feed = feed, logConsumed = true)
@@ -916,24 +971,24 @@ private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L
 
 internal suspend fun bootstrapDeltaPeerSyncIfNeeded(
     coordinator: PeerSyncCoordinator,
-    settings: SettingsRepository,
     currentSettings: Settings,
     hasMergedData: Boolean,
+    needsCatalogBackfill: Boolean = false,
 ) {
     val shouldBootstrap =
         currentSettings.bearerToken.isNotBlank() &&
-            currentSettings.lastPeerSyncCursor.isBlank() &&
-            hasMergedData
+            (currentSettings.lastPeerSyncCursor.isBlank() || needsCatalogBackfill) &&
+            (hasMergedData || needsCatalogBackfill)
     if (!shouldBootstrap) return
     val bootstrapCursor =
         Instant.now()
             .minusSeconds(BOOTSTRAP_DELTA_LOOKBACK_SEC)
             .truncatedTo(ChronoUnit.SECONDS)
             .toString()
-    settings.update { it.copy(lastPeerSyncCursor = bootstrapCursor) }
     runSuspendCatching {
         coordinator.syncAndCooperativePoll(
-            currentSettings = currentSettings.copy(lastPeerSyncCursor = bootstrapCursor)
+            currentSettings = currentSettings,
+            requestCursorOverride = bootstrapCursor,
         )
     }
 }
@@ -981,12 +1036,14 @@ internal suspend fun toggleFeedArchiveInDbAndRemote(
     return existing.title.ifBlank { feedId } to !nextIsActive
 }
 
+@Suppress("LongParameterList")
 internal suspend fun applyTagToUnarchivedFeedItems(
     dao: RocheDao,
     apiClient: RocheApiClient,
     settings: SettingsRepository,
     feedId: String,
     tagName: String,
+    dispatcher: BackgroundMutationDispatcher = BackgroundMutationDispatcher(),
 ): Int {
     val normalized = normalizeTagName(tagName)
     if (normalized.isBlank()) return 0
@@ -1007,6 +1064,7 @@ internal suspend fun applyTagToUnarchivedFeedItems(
                 itemId = itemId,
                 existingTag = existingTag,
                 normalizedName = normalized,
+                dispatcher = dispatcher,
             )
             taggedCount++
         }

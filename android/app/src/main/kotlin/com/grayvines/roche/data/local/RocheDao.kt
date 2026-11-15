@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.data.local
 
 import androidx.room3.Dao
@@ -54,6 +56,19 @@ interface RocheDao {
 
     @Query("SELECT id FROM items WHERE feedId = :feedId AND status != 'archived'")
     suspend fun getUnarchivedItemIdsForFeed(feedId: String): List<String>
+
+    @Query("SELECT id FROM items WHERE feedId = :feedId")
+    suspend fun getItemIdsForFeed(feedId: String): List<String>
+
+    @Query(
+        "SELECT id FROM items WHERE feedId IN (:feedIds) AND status != 'archived' " +
+            "AND (readAt IS NULL OR readAt = '') AND isCachedOffline = 0 " +
+            "AND (LOWER(contentType) = 'audio' OR (audioUrl IS NOT NULL AND audioUrl != ''))"
+    )
+    suspend fun getUncachedUnreadAudioItemIds(feedIds: List<String>): List<String>
+
+    @Query("SELECT * FROM items WHERE id IN (:ids)")
+    suspend fun getPreviewItemsByIds(ids: List<String>): List<ItemEntity>
 
     @Query("SELECT * FROM sync_tombstones") suspend fun getAllTombstones(): List<TombstoneEntity>
 
@@ -282,14 +297,33 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertItemContent(content: ItemContentEntity)
 
+    @Query("DELETE FROM item_contents WHERE itemId IN (:itemIds)")
+    suspend fun deleteItemContentsByIds(itemIds: List<String>)
+
+    @Query("DELETE FROM item_contents WHERE itemId = :itemId")
+    suspend fun deleteItemContentById(itemId: String)
+
+    @Transaction
+    suspend fun executeInTransaction(block: suspend () -> Unit) {
+        block()
+    }
+
     @Transaction
     suspend fun upsertItems(items: List<ItemEntity>) {
         if (items.isEmpty()) return
         val bounded = items.map(::truncateItemForStorage)
         insertRawItems(bounded.map(::truncateItemForInlinePreview))
-        val extended = bounded.filter(::hasExtendedItemContent).map(::toItemContentEntity)
+        val (extended, inlineOnly) = bounded.partition(::hasExtendedItemContent)
         if (extended.isNotEmpty()) {
-            upsertItemContents(extended)
+            upsertItemContents(extended.map(::toItemContentEntity))
+        }
+        if (inlineOnly.isNotEmpty()) {
+            inlineOnly
+                .map { it.id }
+                .chunked(SQLITE_DELETE_CHUNK_SIZE)
+                .forEach { chunk ->
+                    deleteItemContentsByIds(chunk)
+                }
         }
     }
 
@@ -299,6 +333,8 @@ interface RocheDao {
         insertRawItem(truncateItemForInlinePreview(bounded))
         if (hasExtendedItemContent(bounded)) {
             upsertItemContent(toItemContentEntity(bounded))
+        } else {
+            deleteItemContentById(bounded.id)
         }
     }
 
@@ -379,6 +415,9 @@ interface RocheDao {
             java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
     )
 
+    @Query("UPDATE items SET interactionUpdatedAt = :updatedAt WHERE id IN (:itemIds)")
+    suspend fun updateItemsInteractionAt(itemIds: List<String>, updatedAt: String)
+
     @Query("SELECT * FROM catalog_entries")
     fun observeCatalogEntries(): Flow<List<CatalogEntryEntity>>
 
@@ -414,6 +453,14 @@ interface RocheDao {
 
     @Query("UPDATE catalog_entries SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearCatalogEntriesDirty(ids: List<String>)
+
+    @Query("UPDATE catalog_entries SET isLocalDirty = 1 WHERE id IN (:ids)")
+    suspend fun markCatalogEntriesDirty(ids: List<String>)
+
+    @Query(
+        "UPDATE catalog_entries SET isLocalDirty = 0 WHERE id = :id AND updatedAt = :expectedUpdatedAt"
+    )
+    suspend fun clearEntryDirtyIfSameTs(id: String, expectedUpdatedAt: String)
 
     @Query("SELECT * FROM entry_identifiers")
     suspend fun getAllEntryIdentifiers(): List<EntryIdentifierEntity>
@@ -456,6 +503,15 @@ interface RocheDao {
     @Query("UPDATE collection_specs SET isLocalDirty = 0 WHERE collectionId IN (:ids)")
     suspend fun clearCollectionSpecsDirty(ids: List<String>)
 
+    @Query("UPDATE collection_specs SET isLocalDirty = 1 WHERE collectionId IN (:ids)")
+    suspend fun markCollectionSpecsDirty(ids: List<String>)
+
+    @Query(
+        "UPDATE collection_specs SET isLocalDirty = 0 " +
+            "WHERE collectionId = :id AND updatedAt = :expectedUpdatedAt"
+    )
+    suspend fun clearSpecDirtyIfSameTs(id: String, expectedUpdatedAt: String)
+
     @Query("SELECT * FROM collection_entries")
     suspend fun getAllCollectionEntries(): List<CollectionEntryEntity>
 
@@ -489,6 +545,23 @@ interface RocheDao {
     )
     suspend fun clearCollectionEntryDirty(collectionId: String, entryId: String)
 
+    @Query(
+        "UPDATE collection_entries SET isLocalDirty = 1 " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId"
+    )
+    suspend fun markCollectionEntryDirty(collectionId: String, entryId: String)
+
+    @Query(
+        "UPDATE collection_entries SET isLocalDirty = 0 " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId " +
+            "AND addedAt = :expectedAddedAt"
+    )
+    suspend fun clearMemberDirtyIfSameTs(
+        collectionId: String,
+        entryId: String,
+        expectedAddedAt: String,
+    )
+
     @Query("SELECT * FROM collection_generators")
     suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
 
@@ -500,6 +573,15 @@ interface RocheDao {
 
     @Query("UPDATE collection_generators SET isLocalDirty = 0 WHERE collectionId = :collectionId")
     suspend fun clearCollectionGeneratorDirty(collectionId: String)
+
+    @Query(
+        "UPDATE collection_generators SET isLocalDirty = 0 " +
+            "WHERE collectionId = :collectionId AND updatedAt = :expectedUpdatedAt"
+    )
+    suspend fun clearGeneratorDirtyIfSameTs(
+        collectionId: String,
+        expectedUpdatedAt: String,
+    )
 
     @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
     suspend fun getAllConsumptionLogs(): List<ConsumptionLogEntity>
@@ -525,6 +607,12 @@ interface RocheDao {
     @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearConsumptionLogsDirty(ids: List<String>)
 
+    @Query("UPDATE consumption_log SET isLocalDirty = 1 WHERE id IN (:ids)")
+    suspend fun markConsumptionLogsDirty(ids: List<String>)
+
+    @Query("DELETE FROM consumption_log WHERE id = :id")
+    suspend fun deleteConsumptionLogById(id: String)
+
     @Query("UPDATE consumption_log SET entryId = :canonicalId WHERE entryId = :dupId")
     suspend fun repointConsumptionLogsToEntry(dupId: String, canonicalId: String)
 
@@ -543,6 +631,9 @@ interface RocheDao {
     @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearComparisonsDirty(ids: List<String>)
 
+    @Query("UPDATE comparisons SET isLocalDirty = 1 WHERE id IN (:ids)")
+    suspend fun markComparisonsDirty(ids: List<String>)
+
     @Query(
         "UPDATE comparisons SET scopeCollectionId = :canonicalId WHERE scopeCollectionId = :dupId"
     )
@@ -552,6 +643,15 @@ interface RocheDao {
     suspend fun updateComparisonOrdering(id: String, orderingJson: String)
 
     @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
+
+    @Query("SELECT flagValue FROM local_sync_flags WHERE flagKey = :key LIMIT 1")
+    suspend fun getLocalSyncFlag(key: String): String?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertLocalSyncFlag(flag: LocalSyncFlagEntity)
+
+    @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
+    suspend fun deleteLocalSyncFlag(key: String)
 }
 
 internal const val SQLITE_DELETE_CHUNK_SIZE = 500
@@ -582,20 +682,29 @@ internal fun truncateItemForStorage(item: ItemEntity): ItemEntity {
     }
 }
 
+private val SYNTHETIC_ARTICLE_DURATION_REGEX = Regex("""^\d+m$""")
+
 private fun resolveStoredArticleDuration(
     item: ItemEntity,
     boundedSummary: String?,
     boundedText: String?,
     boundedHtml: String?,
-): String? =
-    if (
-        ContentType.fromWireValue(item.contentType) == ContentType.ARTICLE &&
-            hasExtendedItemContent(item)
-    ) {
-        formatArticleMinutes(boundedText ?: boundedHtml ?: boundedSummary.orEmpty())
-    } else {
-        item.duration
+): String? {
+    if (ContentType.fromWireValue(item.contentType) != ContentType.ARTICLE) {
+        return item.duration
     }
+    val existing = item.duration?.trim()?.takeIf { it.isNotEmpty() }
+    val hasExplicitUpstreamDuration =
+        existing != null && !SYNTHETIC_ARTICLE_DURATION_REGEX.matches(existing)
+    if (hasExplicitUpstreamDuration) {
+        return item.duration
+    }
+    if (!hasExtendedItemContent(item)) {
+        return null
+    }
+    val textSource = boundedText ?: boundedHtml ?: boundedSummary.orEmpty()
+    return if (textSource.isNotBlank()) formatArticleMinutes(textSource) else null
+}
 
 internal fun hasExtendedItemContent(item: ItemEntity): Boolean =
     item.summary.orEmpty().length > LIST_PREVIEW_SUMMARY_CHARS ||

@@ -288,6 +288,7 @@ year = 1999
             # Idempotency check: running a second time inserts 0 duplicates
             stats2 = migrate_great_repo(great_dir, db_path)
             self.assertEqual(stats2.seeded_1001_albums, 0)
+            self.assertEqual(stats2.consumption_logs_added, 0)
             self.assertEqual(stats2.comparisons_added, 0)
 
             conn = sqlite3.connect(str(db_path))
@@ -369,10 +370,9 @@ year = 1999
                     (elvis_artist_row[0],),
                 ).fetchall()
                 linked_ids = {r[0] for r in elvis_linked_works}
-                self.assertIn(elvis_id, linked_ids)
-                self.assertIn(song_row[0], linked_ids)
+                self.assertEqual(linked_ids, {elvis_id, song_row[0]})
 
-                # AntennaPod episode + parent podcast both marked consumed
+                # AntennaPod episode + parent podcast both marked consumed as distinct entries
                 pod_consumed = conn.execute(
                     """
                     SELECT COUNT(*)
@@ -382,6 +382,27 @@ year = 1999
                     """
                 ).fetchone()[0]
                 self.assertEqual(pod_consumed, 1)
+                ep_consumed = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM entries e
+                    JOIN consumption_log cl ON cl.entry_id = e.id
+                    WHERE e.kind = 'podcast_episode'
+                      AND e.title = 'The Bronze Age Collapse'
+                      AND cl.status = 'consumed'
+                    """
+                ).fetchone()[0]
+                self.assertEqual(ep_consumed, 1)
+
+                # Unengaged 1001-pool artists (including unrevealed Duke Ellington) are NOT synthesized;
+                # only Frank Sinatra (revealed 1001 album) and Elvis Presley (played Spotify track) exist!
+                synthesized_artists = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT title FROM entries WHERE kind = 'artist'"
+                    ).fetchall()
+                }
+                self.assertEqual(synthesized_artists, {"Elvis Presley", "Frank Sinatra"})
 
                 # Want queue: Alien & Blade Runner present; The Matrix skipped because already consumed!
                 want_movies_id = deterministic_system_collection_id("want:movies")

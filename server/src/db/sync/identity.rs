@@ -96,6 +96,13 @@ pub fn deterministic_consumption_log_id(entry_id: &str, ts_millis: i64, status: 
     deterministic_entity_uuid("consumption_log", &key)
 }
 
+/// Deterministic consumption-log UUID for automatic feed/parent completion so online peers
+/// independently auto-logging the same finished item converge on a single Diary row.
+#[must_use]
+pub fn deterministic_auto_consumption_log_id(entry_id: &str) -> String {
+    deterministic_entity_uuid("auto_consumption_log", entry_id.trim())
+}
+
 #[must_use]
 pub fn canonical_ordering_json(ordering: &[Vec<String>]) -> String {
     let normalized: Vec<Vec<String>> = ordering

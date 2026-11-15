@@ -2,6 +2,9 @@
 // intentionally so EP inference matches Python (`choix`) and Kotlin (`EpRankingEngine`) to 1e-12.
 #![allow(clippy::similar_names, clippy::suboptimal_flops, clippy::suspicious_operation_groupings)]
 
+pub mod board;
+pub use board::{RankBoard, RankBoardRow};
+
 use std::{
     collections::{HashMap, HashSet},
     hash::BuildHasher,
@@ -20,7 +23,7 @@ pub const N_QUANTILES: usize = 5;
 pub const TIER_LETTERS: [char; N_QUANTILES] = ['D', 'C', 'B', 'A', 'S'];
 
 const THRESHOLD: f64 = 1e-6;
-const MEAN_TIE_EPSILON: f64 = 1e-5;
+pub const MEAN_TIE_EPSILON: f64 = 1e-5;
 const SQRT2: f64 = std::f64::consts::SQRT_2;
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 const SQRT_2PI: f64 = 2.506_628_274_631_000_2;

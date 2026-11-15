@@ -10,6 +10,7 @@ import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.model.ContentType
 import java.time.Instant
@@ -27,7 +28,11 @@ internal suspend fun materializeFeedsForIds(
     if (missingIds.isEmpty()) return
 
     val feedsById = dao.getAllFeeds().associateBy { it.id }
-    val itemsById = dao.getAllItems().associateBy { it.id }
+    val itemsById =
+        missingIds
+            .chunked(SQLITE_DELETE_CHUNK_SIZE)
+            .flatMap { chunk -> dao.getPreviewItemsByIds(chunk) }
+            .associateBy { it.id }
     for (missingId in missingIds) {
         val item = itemsById[missingId]
         if (item != null) {
@@ -148,6 +153,7 @@ private suspend fun ensureConsumedOnceInDao(dao: RocheDao, entryId: String, nowI
             tsIso = nowIso,
             nowIso = nowIso,
             markDirty = true,
+            explicitLogId = deterministicAutoLogId(entryId),
         )
     }
 }
@@ -194,7 +200,8 @@ private suspend fun resolveEntryIdInDao(
 ): String {
     val explicitMerged =
         input.id?.trim()?.takeIf { it.isNotEmpty() }?.let { followMergedIdInDao(dao, it) }
-    val identifierMatch = explicitMerged ?: findEntryIdByIdentifiers(dao, cleanIdentifiers)
+    val identifierMatch =
+        explicitMerged ?: findEntryIdByIdentifiers(dao, input.kind, cleanIdentifiers)
     val matchedId =
         identifierMatch
             ?: if (input.kind == EntryKind.ALBUM) {
@@ -202,17 +209,36 @@ private suspend fun resolveEntryIdInDao(
             } else {
                 null
             }
-    return matchedId ?: computeFallbackEntryId(input, normalizedTitle, cleanIdentifiers)
+    if (matchedId != null) return matchedId
+    val fallbackId =
+        chooseDeterministicEntryId(
+            explicitId = input.id,
+            kind = input.kind,
+            title = normalizedTitle,
+            creators = input.creators,
+            identifiers = cleanIdentifiers,
+        )
+    return followMergedIdInDao(dao, fallbackId) ?: fallbackId
 }
 
 private suspend fun findEntryIdByIdentifiers(
     dao: RocheDao,
+    expectedKind: EntryKind,
     identifiers: List<EntryIdentifierDto>,
 ): String? {
     for (ident in identifiers) {
-        val found = dao.getEntryIdByIdentifier(ident.scheme, ident.value)
-        if (found != null) {
-            return followMergedIdInDao(dao, found) ?: found
+        val found = dao.getEntryIdByIdentifier(ident.scheme, ident.value) ?: continue
+        val resolved = followMergedIdInDao(dao, found) ?: found
+        val isCompatible =
+            if (ident.scheme == "url" || ident.scheme == "feed_url") {
+                dao.getCatalogEntryById(resolved)?.let {
+                    EntryKind.fromWireValue(it.kind) == expectedKind
+                } != false
+            } else {
+                true
+            }
+        if (isCompatible) {
+            return resolved
         }
     }
     return null
@@ -233,20 +259,7 @@ private suspend fun synthesizeArtistsInDao(
         val clean = rawArtist.trim()
         if (clean.isEmpty()) continue
         val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
-        val artistId =
-            existing?.id
-                ?: deterministicTitleEntryId("artist", clean.lowercase()).also { id ->
-                    dao.upsertCatalogEntry(
-                        CatalogEntryEntity(
-                            id = id,
-                            kind = EntryKind.ARTIST.wireValue,
-                            title = clean,
-                            createdAt = nowIso,
-                            updatedAt = nowIso,
-                            isLocalDirty = markDirty,
-                        )
-                    )
-                }
+        val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty)
         dao.upsertCollectionEntry(
             CollectionEntryEntity(
                 collectionId = artistId,
@@ -259,21 +272,44 @@ private suspend fun synthesizeArtistsInDao(
     }
 }
 
+private suspend fun ensureSynthesizedArtist(
+    dao: RocheDao,
+    cleanArtistName: String,
+    nowIso: String,
+    markDirty: Boolean,
+): String {
+    val detId = deterministicTitleEntryId("artist", cleanArtistName.lowercase())
+    val mergedTarget = followMergedIdInDao(dao, detId)
+    if (mergedTarget != null) {
+        return mergedTarget
+    }
+    dao.upsertCatalogEntry(
+        CatalogEntryEntity(
+            id = detId,
+            kind = EntryKind.ARTIST.wireValue,
+            title = cleanArtistName,
+            createdAt = nowIso,
+            updatedAt = nowIso,
+            isLocalDirty = markDirty,
+        )
+    )
+    return detId
+}
+
 private suspend fun findAlbumByTitleArtist(
     dao: RocheDao,
     normalizedTitle: String,
     creators: List<String>,
 ): String? {
-    val primaryCreator = creators.firstOrNull()?.trim()?.lowercase().orEmpty()
+    val primaryCreator = creators.map { it.trim() }.firstOrNull { it.isNotEmpty() } ?: return null
     return dao.getAllCatalogEntries()
         .firstOrNull { cand ->
             cand.mergedIntoId.isNullOrBlank() &&
                 EntryKind.fromWireValue(cand.kind) == EntryKind.ALBUM &&
                 stripAlbumEditionSuffix(cand.title).equals(normalizedTitle, ignoreCase = true) &&
-                (primaryCreator.isEmpty() ||
-                    decodeCreatorsJson(cand.creatorsJson).any {
-                        it.equals(primaryCreator, ignoreCase = true)
-                    })
+                decodeCreatorsJson(cand.creatorsJson).any {
+                    it.equals(primaryCreator, ignoreCase = true)
+                }
         }
         ?.id
 }
@@ -287,12 +323,15 @@ internal suspend fun appendConsumptionInDao(
     tsIso: String,
     nowIso: String,
     markDirty: Boolean,
+    explicitLogId: String? = null,
 ): String {
     val tsMillis = runCatching {
         Instant.parse(tsIso).toEpochMilli()
     }
         .getOrElse { System.currentTimeMillis() }
-    val logId = deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+    val logId =
+        explicitLogId?.trim()?.takeIf { it.isNotEmpty() }
+            ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
             id = logId,
@@ -306,17 +345,15 @@ internal suspend fun appendConsumptionInDao(
     )
     if (status == ConsumptionStatus.CONSUMED) {
         removeFromWantQueuesInDao(dao, entryId, nowIso)
-        engageParentArtistsInDao(dao, entryId, tsIso, tsMillis, nowIso, markDirty)
+        engageParentArtistsInDao(dao, entryId, tsIso, nowIso, markDirty)
     }
     return logId
 }
 
-@Suppress("LongParameterList")
 private suspend fun engageParentArtistsInDao(
     dao: RocheDao,
     entryId: String,
     tsIso: String,
-    tsMillis: Long,
     nowIso: String,
     markDirty: Boolean,
 ) {
@@ -334,17 +371,15 @@ private suspend fun engageParentArtistsInDao(
             parent.mergedIntoId.isNullOrBlank() &&
                 EntryKind.fromWireValue(parent.kind) == EntryKind.ARTIST
         if (isActiveArtist) {
-            engageSingleArtistInDao(dao, pid, tsIso, tsMillis, nowIso, markDirty)
+            engageSingleArtistInDao(dao, pid, tsIso, nowIso, markDirty)
         }
     }
 }
 
-@Suppress("LongParameterList")
 private suspend fun engageSingleArtistInDao(
     dao: RocheDao,
     artistId: String,
     tsIso: String,
-    tsMillis: Long,
     nowIso: String,
     markDirty: Boolean,
 ) {
@@ -353,12 +388,7 @@ private suspend fun engageSingleArtistInDao(
             ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED
         }
     if (alreadyLogged) return
-    val logId =
-        deterministicConsumptionLogId(
-            artistId,
-            tsMillis,
-            ConsumptionStatus.CONSUMED.wireValue,
-        )
+    val logId = deterministicAutoLogId(artistId)
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
             id = logId,
@@ -430,7 +460,12 @@ internal suspend fun ensureWantCollectionInDao(
     val existing =
         explicit?.let { dao.getCollectionSpecById(it) ?: dao.getCollectionSpecBySlug(it) }
             ?: dao.getCollectionSpecBySlug(wantSlug)
-    if (existing != null) return existing
+    if (existing != null) {
+        if (dao.getCatalogEntryById(existing.collectionId) == null) {
+            dao.upsertCatalogEntry(buildCollectionCatalogEntry(existing))
+        }
+        return existing
+    }
 
     val id = systemCollectionUuid(wantSlug)
     val spec =
@@ -446,9 +481,21 @@ internal suspend fun ensureWantCollectionInDao(
             isLocalDirty = true,
         )
     dao.upsertCollectionSpec(spec)
+    dao.upsertCatalogEntry(buildCollectionCatalogEntry(spec))
     dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", wantSlug, id))
     return spec
 }
+
+internal fun buildCollectionCatalogEntry(spec: CollectionSpecEntity): CatalogEntryEntity =
+    CatalogEntryEntity(
+        id = spec.collectionId,
+        kind = EntryKind.COLLECTION.wireValue,
+        title = spec.title,
+        summary = spec.summary,
+        createdAt = spec.createdAt,
+        updatedAt = spec.updatedAt,
+        isLocalDirty = false,
+    )
 
 @Suppress("LongParameterList")
 internal suspend fun addCollectionMemberInDao(
@@ -464,6 +511,11 @@ internal suspend fun addCollectionMemberInDao(
         "Cannot manually modify entries of ${mode.wireValue} collection '${spec.title}'"
     }
     require(spec.collectionId != entryId) { "A collection cannot contain itself" }
+    val childrenByParent =
+        dao.getAllCollectionEntries().groupBy({ it.collectionId }, { it.entryId })
+    require(!wouldIntroduceCycleInGraph(childrenByParent, spec.collectionId, entryId)) {
+        "Adding '$entryId' to '${spec.title}' would create a collection cycle"
+    }
     dao.deleteTombstone(
         COLLECTION_ENTRY_ENTITY,
         collectionEntryNaturalKey(spec.collectionId, entryId),
@@ -479,6 +531,32 @@ internal suspend fun addCollectionMemberInDao(
     )
 }
 
+internal fun wouldIntroduceCycleInGraph(
+    childrenByParent: Map<String, Collection<String>>,
+    parentCollectionId: String,
+    childEntryId: String,
+): Boolean {
+    if (parentCollectionId == childEntryId) return true
+    val queue = ArrayDeque<String>()
+    val visited = HashSet<String>()
+    queue.add(childEntryId)
+    visited.add(childEntryId)
+    var hasCycle = false
+    while (queue.isNotEmpty() && !hasCycle) {
+        val current = queue.removeFirst()
+        for (next in childrenByParent[current].orEmpty()) {
+            if (next == parentCollectionId) {
+                hasCycle = true
+                break
+            }
+            if (visited.add(next)) {
+                queue.add(next)
+            }
+        }
+    }
+    return hasCycle
+}
+
 private fun buildFeedItemUpsertInput(
     item: ItemEntity,
     contentType: ContentType,
@@ -491,7 +569,7 @@ private fun buildFeedItemUpsertInput(
             contentType == ContentType.VIDEO -> EntryKind.VIDEO
             else -> EntryKind.ARTICLE
         }
-    val creators = item.author?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }.orEmpty()
+    val creators = item.author?.trim()?.takeIf { it.isNotEmpty() }?.let(::listOf).orEmpty()
     val canonicalUrl = item.url.trim().takeIf { it.isNotEmpty() }?.let(::canonicalizeSyncUrl)
     val identifiers = buildList {
         if (!canonicalUrl.isNullOrBlank()) {
@@ -513,51 +591,36 @@ private fun buildFeedItemUpsertInput(
 }
 
 private fun normalizeEntryIdentifiers(input: UpsertCatalogEntryInput): List<EntryIdentifierDto> {
-    val explicit = input.identifiers.mapNotNull(::cleanSingleIdentifier)
+    val explicit = input.identifiers.mapNotNull { cleanSingleIdentifier(input.kind, it) }
+    val trimmedUrl = input.url?.trim()?.takeIf { it.isNotEmpty() }
     val urlIdent =
-        input.url
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() && input.kind != EntryKind.ALBUM }
+        trimmedUrl
             ?.let(::canonicalizeSyncUrl)
             ?.takeIf { it.isNotEmpty() }
             ?.let { EntryIdentifierDto("url", it) }
-    return (explicit + listOfNotNull(urlIdent)).distinct()
+    val arxivIdent =
+        trimmedUrl
+            ?.takeIf {
+                it.startsWith("http://", ignoreCase = true) ||
+                    it.startsWith("https://", ignoreCase = true)
+            }
+            ?.let(::extractArxivIdentifier)
+            ?.let { EntryIdentifierDto("arxiv", it) }
+    return (explicit + listOfNotNull(arxivIdent, urlIdent)).distinct()
 }
 
-private fun cleanSingleIdentifier(ident: EntryIdentifierDto): EntryIdentifierDto? {
-    val scheme = ident.scheme.trim().lowercase()
-    val value =
-        if (scheme == "url" || scheme == "feed_url") {
-            canonicalizeSyncUrl(ident.value)
-        } else {
-            ident.value.trim()
-        }
+private fun cleanSingleIdentifier(
+    kind: EntryKind,
+    ident: EntryIdentifierDto,
+): EntryIdentifierDto? {
+    val scheme = normalizeIdentifierScheme(ident.scheme)
+    val value = normalizeIdentifierValue(kind, scheme, ident.value)
     return if (scheme.isNotEmpty() && value.isNotEmpty()) {
         EntryIdentifierDto(scheme, value)
     } else {
         null
     }
 }
-
-private fun computeFallbackEntryId(
-    input: UpsertCatalogEntryInput,
-    normalizedTitle: String,
-    cleanIdentifiers: List<EntryIdentifierDto>,
-): String =
-    input.id?.trim()?.takeIf { it.isNotEmpty() }
-        ?: cleanIdentifiers.firstOrNull()?.let {
-            deterministicCatalogEntryId(input.kind.wireValue, it.scheme, it.value)
-        }
-        ?: run {
-            val primaryCreator = input.creators.firstOrNull()?.trim()?.lowercase().orEmpty()
-            val titleKey =
-                if (primaryCreator.isEmpty()) {
-                    normalizedTitle.lowercase()
-                } else {
-                    "$primaryCreator\u0000${normalizedTitle.lowercase()}"
-                }
-            deterministicTitleEntryId(input.kind.wireValue, titleKey)
-        }
 
 @Suppress("LongParameterList")
 private fun mergeCatalogEntryEntity(
@@ -583,7 +646,7 @@ private fun mergeCatalogEntryEntity(
     return CatalogEntryEntity(
         id = resolvedId,
         kind = existing?.kind ?: input.kind.wireValue,
-        title = nonBlankOrKeep(existing?.title, normalizedTitle) ?: normalizedTitle,
+        title = nonBlankOrKeep(normalizedTitle, existing?.title) ?: normalizedTitle,
         creatorsJson = mergedCreators,
         url = nonBlankOrKeep(input.url, existing?.url),
         publishedAt = nonBlankOrKeep(input.publishedAt, existing?.publishedAt),

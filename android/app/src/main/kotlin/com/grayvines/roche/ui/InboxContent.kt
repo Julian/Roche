@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -82,6 +83,10 @@ fun InboxTabContent(
 ) {
     val colors = LocalRocheColors.current
     var showTagFilterDrawer by rememberSaveable { mutableStateOf(false) }
+
+    BackHandler(enabled = showTagFilterDrawer && state.tags.isNotEmpty()) {
+        showTagFilterDrawer = false
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         InboxHeaderSection(

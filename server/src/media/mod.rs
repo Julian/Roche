@@ -102,6 +102,93 @@ impl MediaStore {
             .map_err(|e| anyhow::anyhow!("Media path validation task failed: {e}"))?
     }
 
+    /// Creates `dir` recursively with `0700` permissions on Unix and tightens existing dedicated
+    /// directories to `0700` (skipping shared system/home/temp/cwd roots).
+    pub async fn ensure_private_dir(dir: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir).await?;
+            if Self::is_safe_to_chmod_dir(dir) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        Ok(())
+    }
+
+    /// Creates `file` if missing with `0600` permissions on Unix and tightens existing file mode to `0600`.
+    pub async fn precreate_or_tighten_private_file(file: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(false).mode(0o600);
+            let handle = opts.open(file).await?;
+            drop(handle);
+            let _ = tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
+        }
+        #[cfg(not(unix))]
+        {
+            let handle = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(file)
+                .await?;
+            drop(handle);
+        }
+        Ok(())
+    }
+
+    /// Tightens `file` permissions to `0600` on Unix if the file exists.
+    pub async fn tighten_private_file_if_exists(file: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if tokio::fs::try_exists(file).await.unwrap_or(false) {
+                let _ =
+                    tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_safe_to_chmod_dir(dir: &Path) -> bool {
+        let abs = Self::normalize_lexical(dir);
+        if abs == Path::new("/")
+            || abs == Path::new("/tmp")
+            || abs == Path::new("/private/tmp")
+            || abs == Path::new("/var/tmp")
+        {
+            return false;
+        }
+        if std::env::current_dir().is_ok_and(|cwd| Self::normalize_lexical(&cwd) == abs) {
+            return false;
+        }
+        let temp_norm = Self::normalize_lexical(&std::env::temp_dir());
+        if abs == temp_norm {
+            return false;
+        }
+        if std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .is_some_and(|home| Self::normalize_lexical(&home) == abs)
+        {
+            return false;
+        }
+        true
+    }
+
     pub async fn open_file(&self, stored_path: &str) -> Result<tokio::fs::File> {
         let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
         Ok(tokio::fs::File::open(&safe_path).await?)
@@ -109,8 +196,9 @@ impl MediaStore {
 
     pub async fn write_bytes(&self, stored_path: &str, bytes: &[u8]) -> Result<i64> {
         let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
+        Self::ensure_private_dir(&self.base_dir).await?;
         if let Some(parent) = safe_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            Self::ensure_private_dir(parent).await?;
         }
         // Re-validate after creating parent directories to guard against TOCTOU symlink swaps
         let verified_path = self.validate_path_async(&safe_path).await?;
@@ -118,7 +206,18 @@ impl MediaStore {
         let temp_name = format!(".tmp-{}-{file_name}", uuid::Uuid::new_v4());
         let temp_path = verified_path.with_file_name(temp_name);
 
-        if let Err(e) = tokio::fs::write(&temp_path, bytes).await {
+        let write_res: std::io::Result<()> = async {
+            use tokio::io::AsyncWriteExt;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts.open(&temp_path).await?;
+            f.write_all(bytes).await?;
+            f.flush().await
+        }
+        .await;
+        if let Err(e) = write_res {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(e.into());
         }
@@ -160,6 +259,60 @@ impl MediaStore {
                 if is_stale && tokio::fs::remove_file(entry.path()).await.is_ok() {
                     removed += 1;
                 }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Removes leftover `downloads/<item_id>` subdirectories that have no registered `entry_media`
+    /// row (e.g. partial `.part` / `.ytdl` directories left behind after an unclean process exit).
+    pub async fn cleanup_unregistered_download_dirs(
+        &self,
+        download_dir: &Path,
+        registered_item_ids: &std::collections::HashSet<String>,
+        min_age: std::time::Duration,
+    ) -> Result<usize> {
+        let normalized_dl = Self::normalize_lexical(download_dir);
+        let base_downloads = if normalized_dl.starts_with(&self.base_dir) {
+            normalized_dl
+        } else {
+            self.base_dir.join("downloads")
+        };
+        let Ok(safe_downloads) = self.validate_path_async(&base_downloads).await else {
+            return Ok(0);
+        };
+        let Ok(mut entries) = tokio::fs::read_dir(&safe_downloads).await else {
+            return Ok(0);
+        };
+        let mut removed = 0usize;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            if registered_item_ids.contains(&dir_name) {
+                continue;
+            }
+            if !min_age.is_zero() {
+                let is_old_enough = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age >= min_age);
+                if !is_old_enough {
+                    continue;
+                }
+            }
+            let dir_path = entry.path();
+            if let Ok(verified) = self.validate_path_async(&dir_path).await
+                && tokio::fs::remove_dir_all(&verified).await.is_ok()
+            {
+                removed += 1;
             }
         }
         Ok(removed)
@@ -240,6 +393,25 @@ mod tests {
 
         let written = tokio::fs::read(temp_dir.join("pdfs/paper-1.pdf")).await.unwrap();
         assert_eq!(written, payload);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let base_mode =
+                tokio::fs::metadata(&temp_dir).await.unwrap().permissions().mode() & 0o777;
+            let sub_mode =
+                tokio::fs::metadata(temp_dir.join("pdfs")).await.unwrap().permissions().mode()
+                    & 0o777;
+            let file_mode = tokio::fs::metadata(temp_dir.join("pdfs/paper-1.pdf"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(base_mode, 0o700);
+            assert_eq!(sub_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
 
         // Verify no temporary .tmp-* sibling files remain in pdfs/
         let mut entries = tokio::fs::read_dir(temp_dir.join("pdfs")).await.unwrap();

@@ -31,6 +31,7 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
 
     let public_login = Router::new()
         .route("/login", get(auth::login_get::<F>).post(auth::login_post::<F>))
+        .route("/login/tailscale", post(auth::login_tailscale_post::<F>))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(RequestBodyLimitLayer::new(16 * 1024));
 
@@ -133,11 +134,24 @@ async fn serve_js() -> Response {
         .into_response()
 }
 
+const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'sameorigin'";
+
 async fn attach_web_security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    if !headers.contains_key(header::REFERRER_POLICY) {
+        headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    }
+    if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(WEB_CONTENT_SECURITY_POLICY),
+        );
+    }
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
     resp
 }

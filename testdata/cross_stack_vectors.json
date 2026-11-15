@@ -27,6 +27,10 @@
     {
       "input": "https://arxiv.org/abs/2301.07041",
       "expected": "https://arxiv.org/abs/2301.07041"
+    },
+    {
+      "input": "https://bücher.example/feeds/../rss/my feed.xml",
+      "expected": "https://xn--bcher-kva.example/rss/my%20feed.xml"
     }
   ],
   "entity_ids": [
@@ -127,6 +131,305 @@
         }
       ],
       "expected_winner": "android-pixel"
+    }
+  ],
+  "preferred_identifier_schemes": [
+    "spotify",
+    "1001albums",
+    "musicbrainz_release",
+    "musicbrainz_recording",
+    "musicbrainz_artist",
+    "imdb",
+    "tmdb_movie",
+    "tmdb_tv",
+    "isbn",
+    "openlibrary",
+    "igdb",
+    "arxiv",
+    "wikipedia",
+    "feed_url",
+    "url"
+  ],
+  "identifier_normalizations": [
+    {
+      "kind": "album",
+      "scheme": "Spotify",
+      "raw_value": "4LH4d3cOWNNsVw41Gqt2kv",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "kind": "album",
+      "scheme": "spotify",
+      "raw_value": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv?si=abc123",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "kind": "song",
+      "scheme": "spotify",
+      "raw_value": "https://open.spotify.com/intl-de/track/6rqhFgbbKwnb9MLmUQDhG6?utm_source=copy-link",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:track:6rqhFgbbKwnb9MLmUQDhG6"
+    },
+    {
+      "kind": "collection",
+      "scheme": "spotify",
+      "raw_value": "spotify:user:spotifycharts:playlist:37i9dQZEVXbMDoHDwVN2tF",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:playlist:37i9dQZEVXbMDoHDwVN2tF"
+    },
+    {
+      "kind": "podcast",
+      "scheme": "spotify",
+      "raw_value": "2MAi0BvDc6GTFvKFPXnkCL",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:show:2MAi0BvDc6GTFvKFPXnkCL"
+    },
+    {
+      "kind": "podcast_episode",
+      "scheme": "spotify",
+      "raw_value": "512ojhOuo1ktJprKbVcKyQ",
+      "expected_scheme": "spotify",
+      "expected_value": "spotify:episode:512ojhOuo1ktJprKbVcKyQ"
+    },
+    {
+      "kind": "album",
+      "scheme": "1001albums",
+      "raw_value": "  Pink-Floyd-The-Dark-Side-Of-The-Moon  ",
+      "expected_scheme": "1001albums",
+      "expected_value": "pink-floyd-the-dark-side-of-the-moon"
+    },
+    {
+      "kind": "collection",
+      "scheme": "SLUG",
+      "raw_value": "  Sci-Fi_Classics  ",
+      "expected_scheme": "slug",
+      "expected_value": "sci-fi_classics"
+    },
+    {
+      "kind": "movie",
+      "scheme": "IMDb",
+      "raw_value": "https://www.imdb.com/title/TT0079944/?ref_=nv_sr_srsg_0",
+      "expected_scheme": "imdb",
+      "expected_value": "tt0079944"
+    },
+    {
+      "kind": "movie",
+      "scheme": "wikipedia",
+      "raw_value": "https://en.wikipedia.org/wiki/Stalker (1979 film)/",
+      "expected_scheme": "wikipedia",
+      "expected_value": "Stalker_(1979_film)"
+    },
+    {
+      "kind": "artist",
+      "scheme": "wikipedia",
+      "raw_value": "https://en.wikipedia.org/wiki/Björk",
+      "expected_scheme": "wikipedia",
+      "expected_value": "Björk"
+    },
+    {
+      "kind": "artist",
+      "scheme": "wikipedia",
+      "raw_value": "https://en.wikipedia.org/wiki/Bj%C3%B6rk",
+      "expected_scheme": "wikipedia",
+      "expected_value": "Björk"
+    },
+    {
+      "kind": "paper",
+      "scheme": "arxiv",
+      "raw_value": "HTTPS://example.com/abs/2301.07041",
+      "expected_scheme": "arxiv",
+      "expected_value": "HTTPS://example.com/abs/2301.07041"
+    },
+    {
+      "kind": "paper",
+      "scheme": "arxiv",
+      "raw_value": "HTTPS://arxiv.org/abs/2301.07041v2",
+      "expected_scheme": "arxiv",
+      "expected_value": "2301.07041v2"
+    },
+    {
+      "kind": "paper",
+      "scheme": "arxiv",
+      "raw_value": "https://arxiv.org/pdf/2301.07041v2.pdf",
+      "expected_scheme": "arxiv",
+      "expected_value": "2301.07041v2"
+    },
+    {
+      "kind": "article",
+      "scheme": "URL",
+      "raw_value": "HTTPS://Example.COM:443/Essays/One",
+      "expected_scheme": "url",
+      "expected_value": "https://example.com/Essays/One"
+    },
+    {
+      "kind": "podcast",
+      "scheme": "feed-url",
+      "raw_value": "HTTP://Feeds.Example.ORG:80/podcast.xml",
+      "expected_scheme": "feed_url",
+      "expected_value": "http://feeds.example.org/podcast.xml"
+    }
+  ],
+  "album_edition_stripping": [
+    {
+      "input": "OK Computer (Deluxe Edition)",
+      "expected": "OK Computer"
+    },
+    {
+      "input": "Abbey Road [2019 Remaster]",
+      "expected": "Abbey Road"
+    },
+    {
+      "input": "In Rainbows (Expanded Edition) [Remastered]",
+      "expected": "In Rainbows"
+    },
+    {
+      "input": "Spring (Cleaning)",
+      "expected": "Spring (Cleaning)"
+    },
+    {
+      "input": "Expedition (Subversion)",
+      "expected": "Expedition (Subversion)"
+    },
+    {
+      "input": "Stop Making Sense (Live)",
+      "expected": "Stop Making Sense (Live)"
+    },
+    {
+      "input": "Blade Runner - Original Motion Picture Soundtrack",
+      "expected": "Blade Runner - Original Motion Picture Soundtrack"
+    },
+    {
+      "input": "(Deluxe)",
+      "expected": "(Deluxe)"
+    }
+  ],
+  "catalog_entry_ids": [
+    {
+      "kind": "album",
+      "title": "The Dark Side of the Moon (2011 Remastered Version)",
+      "creators": ["Pink Floyd"],
+      "identifiers": [
+        { "scheme": "url", "value": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv" },
+        { "scheme": "1001albums", "value": "pink-floyd-the-dark-side-of-the-moon" },
+        { "scheme": "spotify", "value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv" }
+      ],
+      "expected_id": "3c5218f9-675c-55e6-819b-2673630566a4"
+    },
+    {
+      "kind": "album",
+      "title": "The Dark Side of the Moon",
+      "creators": ["Pink Floyd"],
+      "identifiers": [
+        { "scheme": "1001albums", "value": "pink-floyd-the-dark-side-of-the-moon" },
+        { "scheme": "url", "value": "https://example.com/dsotm" }
+      ],
+      "expected_id": "abbc7eb9-c23a-5e03-b689-7394389394dc"
+    },
+    {
+      "kind": "movie",
+      "title": "Stalker",
+      "creators": ["Andrei Tarkovsky"],
+      "identifiers": [
+        { "scheme": "wikipedia", "value": "Stalker_(1979_film)" },
+        { "scheme": "imdb", "value": "tt0079944" }
+      ],
+      "expected_id": "397f3c1d-69b3-50a1-a003-2dce793de263"
+    },
+    {
+      "kind": "album",
+      "title": "OK Computer (Deluxe Edition)",
+      "creators": ["  Radiohead  "],
+      "identifiers": [],
+      "expected_id": "ac172f8d-60f5-590a-be4b-4234e4a41668"
+    },
+    {
+      "kind": "movie",
+      "title": "  Stalker  ",
+      "creators": [],
+      "identifiers": [],
+      "expected_id": "e0cc62ae-c820-5c6a-8ac2-62879cd4f734"
+    }
+  ],
+  "auto_consumption_log_ids": [
+    {
+      "entry_id": "af903f9e-774e-5f56-8729-5a0c74c0d020",
+      "expected_log_id": "c26a2cda-b3aa-5e1b-984e-b4f18d54759b"
+    },
+    {
+      "entry_id": "  f2883154-ec66-5c3c-882a-4ca16280f4f0  ",
+      "expected_log_id": "c3fe866c-7ea9-5d73-a828-7300ce82f1d5"
+    }
+  ],
+  "dynamic_collection_rules": [
+    {
+      "rule_json": "{\"kinds\":[\"movie\",\"tv\"],\"consumed\":true,\"release_year\":1979}",
+      "entry": {
+        "kind": "movie",
+        "creators": ["Andrei Tarkovsky"],
+        "release_year": 1979,
+        "statuses": ["consumed"]
+      },
+      "expected_match": true
+    },
+    {
+      "rule_json": "{\"kinds\":[\"movie\",\"tv\"],\"consumed\":true,\"release_year\":1979}",
+      "entry": {
+        "kind": "movie",
+        "creators": ["Andrei Tarkovsky"],
+        "release_year": 1972,
+        "statuses": ["consumed"]
+      },
+      "expected_match": false
+    },
+    {
+      "rule_json": "{\"kind\":\"album\",\"status\":\"abandoned\",\"creator_contains\":\"björk\"}",
+      "entry": {
+        "kind": "album",
+        "creators": ["Björk Guðmundsdóttir"],
+        "release_year": 1997,
+        "statuses": ["abandoned"]
+      },
+      "expected_match": true
+    },
+    {
+      "rule_json": "{\"kind\":\"album\",\"consumed\":false}",
+      "entry": {
+        "kind": "album",
+        "creators": ["Radiohead"],
+        "release_year": 1997,
+        "statuses": ["abandoned"]
+      },
+      "expected_match": true
+    }
+  ],
+  "ranked_collection_parity": [
+    {
+      "name": "cold_start_no_comparisons_has_null_tiers_and_title_order",
+      "is_priority_scope": false,
+      "entries": [
+        { "id": "id-z", "title": "Solaris" },
+        { "id": "id-b", "title": "alpha" },
+        { "id": "id-a", "title": "Alpha" }
+      ],
+      "orderings": [],
+      "expected_ids": ["id-a", "id-b", "id-z"],
+      "expected_tiers": [null, null, null]
+    },
+    {
+      "name": "explicit_tie_breaks_by_lowercase_title_then_id_with_quantiles",
+      "is_priority_scope": false,
+      "entries": [
+        { "id": "id-9", "title": "Zodiac" },
+        { "id": "id-2", "title": "Arrival" },
+        { "id": "id-5", "title": "Metropolis" }
+      ],
+      "orderings": [
+        [["id-9", "id-2"], ["id-5"]]
+      ],
+      "expected_ids": ["id-2", "id-9", "id-5"],
+      "expected_tiers": ["A", "A", "D"]
     }
   ]
 }

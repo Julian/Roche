@@ -307,26 +307,58 @@ private fun resolveRemoteFeedTitle(
 private fun String?.nonBlankOr(fallback: String?): String? =
     this?.takeIf { it.isNotBlank() } ?: fallback
 
+internal fun mergeRemoteItemIntoLocal(
+    local: ItemEntity,
+    remote: RemoteItemDto,
+    adoptRemoteIdentity: Boolean,
+): ItemEntity =
+    local.copy(
+        id = if (adoptRemoteIdentity) remote.id else local.id,
+        title = remote.title.ifBlank { local.title },
+        author = remote.author.nonBlankOr(local.author),
+        summary =
+            (if (adoptRemoteIdentity) {
+                    remote.summary ?: local.summary
+                } else {
+                    remote.summary.nonBlankOr(local.summary)
+                })
+                ?.take(MAX_SQLITE_SUMMARY_CHARS),
+        contentText =
+            (if (adoptRemoteIdentity) {
+                    remote.contentText ?: local.contentText
+                } else {
+                    remote.contentText.nonBlankOr(
+                        local.contentText?.takeIf { it.isNotBlank() && it != local.summary }
+                    )
+                })
+                ?.take(MAX_SQLITE_TEXT_CHARS),
+        contentHtml = remote.contentHtml.nonBlankOr(local.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
+        contentType =
+            if (adoptRemoteIdentity) {
+                remote.contentType.ifBlank { local.contentType }
+            } else {
+                local.contentType
+            },
+        createdAt =
+            if (adoptRemoteIdentity) {
+                remote.createdAt.ifBlank { local.createdAt }
+            } else {
+                local.createdAt
+            },
+        thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(local.thumbnailMediaId),
+        duration = remote.duration.nonBlankOr(local.duration),
+        thumbnailUrl = remote.thumbnailUrl.nonBlankOr(local.thumbnailUrl),
+        audioUrl = remote.audioUrl.nonBlankOr(local.audioUrl),
+    )
+
 internal fun reconcileSavedItemEntity(
     localEntity: ItemEntity,
     remoteSaved: RemoteItemDto,
 ): ItemEntity =
-    localEntity.copy(
-        id = remoteSaved.id,
-        title = remoteSaved.title.ifBlank { localEntity.title },
-        summary = (remoteSaved.summary ?: localEntity.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
-        contentText =
-            (remoteSaved.contentText ?: localEntity.contentText)?.take(MAX_SQLITE_TEXT_CHARS),
-        contentHtml =
-            (remoteSaved.contentHtml?.takeIf { it.isNotBlank() } ?: localEntity.contentHtml)?.take(
-                MAX_SQLITE_HTML_CHARS
-            ),
-        contentType = remoteSaved.contentType.ifBlank { localEntity.contentType },
-        createdAt = remoteSaved.createdAt.ifBlank { localEntity.createdAt },
-        thumbnailMediaId = remoteSaved.thumbnailMediaId ?: localEntity.thumbnailMediaId,
-        duration = remoteSaved.duration ?: localEntity.duration,
-        thumbnailUrl = remoteSaved.thumbnailUrl ?: localEntity.thumbnailUrl,
-        audioUrl = remoteSaved.audioUrl ?: localEntity.audioUrl,
+    mergeRemoteItemIntoLocal(
+        local = localEntity,
+        remote = remoteSaved,
+        adoptRemoteIdentity = true,
     )
 
 internal fun createSavedItemEntity(

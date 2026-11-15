@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use figment::{
@@ -13,6 +13,7 @@ use crate::{
         Generator1001State, UpsertEntryInput,
     },
     ranking::RANDOM_SEED_EVERY,
+    service::CatalogService,
     tui_rank::{ClusterRankOutcome, open_system_browser, prompt_cluster_tty},
 };
 
@@ -96,6 +97,27 @@ impl Cli {
 
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> anyhow::Result<()> {
+        if let Some(Command::MigrateGreat {
+            ref great_dir,
+            db_path: Some(ref explicit_db),
+            ref pool_json,
+            dry_run,
+            json,
+        }) = self.command
+        {
+            if self.config.is_some() {
+                let _ = self.load_config()?;
+            }
+            return run_migrate_great_cmd(
+                explicit_db,
+                great_dir,
+                pool_json.as_deref(),
+                dry_run,
+                json,
+            )
+            .await;
+        }
+
         let cfg = self.load_config()?;
         match self.command {
             Some(Command::Serve) | None => crate::RocheServer::run(cfg).await,
@@ -192,8 +214,16 @@ impl Cli {
             }
             Some(Command::Want { args, queue }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
+                let catalog = CatalogService::new(&db);
                 let input = args.to_upsert_input()?;
-                let (want_col, entry) = db.catalog().want_entry(&input, queue.as_deref()).await?;
+                let (want_col, entry) = catalog
+                    .want_resolved_or_upsert(
+                        &input,
+                        args.has_explicit_metadata(),
+                        args.notes.as_deref(),
+                        queue.as_deref(),
+                    )
+                    .await?;
                 println!(
                     "Added '{}' ({}) to {}",
                     sanitize_terminal_text(&entry.title),
@@ -221,8 +251,41 @@ impl Cli {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
                 run_album_cmd(&db, action.unwrap_or(AlbumCommand::Status)).await
             }
+            Some(Command::MigrateGreat { great_dir, db_path, pool_json, dry_run, json }) => {
+                let target_db = db_path.as_deref().unwrap_or(&cfg.storage.database_path);
+                run_migrate_great_cmd(target_db, &great_dir, pool_json.as_deref(), dry_run, json)
+                    .await
+            }
         }
     }
+}
+
+async fn run_migrate_great_cmd(
+    target_db: &Path,
+    great_dir: &Path,
+    pool_json: Option<&Path>,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let stats =
+        crate::migrate_great::migrate_great_database(target_db, great_dir, pool_json, dry_run)
+            .await?;
+    if json {
+        println!("{}", serde_json::to_string(&stats)?);
+    } else {
+        let mode_suffix = if dry_run { " (dry run — rolled back)" } else { "" };
+        println!("Migrated Great -> Roche successfully{mode_suffix}:");
+        println!("  1001 Albums seeded:     {}", stats.seeded_1001_albums);
+        println!("  Catalog entries added:  {}", stats.entries_upserted);
+        println!("  Want queue memberships: {}", stats.want_entries_added);
+        println!("  Consumption log rows:   {}", stats.consumption_logs_added);
+        println!("  Comparisons imported:   {}", stats.comparisons_added);
+        println!(
+            "  Active 1001 Album ID:   {}",
+            stats.active_1001_album_id.as_deref().unwrap_or("(none)")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -321,6 +384,23 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<AlbumCommand>,
     },
+    /// Migrate a Great data repository into Roche's unified SQLite database
+    MigrateGreat {
+        /// Path to the Great repository directory (containing `great.toml`)
+        great_dir: PathBuf,
+        /// Optional SQLite database path override (defaults to `storage.database_path`)
+        #[arg(long, visible_alias = "roche-db", value_name = "FILE")]
+        db_path: Option<PathBuf>,
+        /// Optional override path to `albums_1001_pool.json`
+        #[arg(long, value_name = "FILE")]
+        pool_json: Option<PathBuf>,
+        /// Validate and simulate migration in a rolled-back transaction without modifying disk
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON stats to stdout
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -358,17 +438,19 @@ pub struct MediaEntryArgs {
 }
 
 impl MediaEntryArgs {
+    #[must_use]
+    const fn has_explicit_metadata(&self) -> bool {
+        !self.creators.is_empty()
+            || self.year.is_some()
+            || self.url.is_some()
+            || !self.identifiers.is_empty()
+    }
+
     fn to_upsert_input(&self) -> anyhow::Result<UpsertEntryInput> {
         let parsed_kind = EntryKind::parse_flexible(&self.kind)?;
         let mut idents = Vec::with_capacity(self.identifiers.len());
         for raw in &self.identifiers {
-            let (scheme, val) = raw.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("Identifier '{raw}' must use `scheme=value` format")
-            })?;
-            idents.push(EntryIdentifier {
-                scheme: scheme.trim().to_owned(),
-                value: val.trim().to_owned(),
-            });
+            idents.push(CatalogService::parse_cli_identifier(raw)?);
         }
         Ok(UpsertEntryInput {
             id: None,
@@ -544,11 +626,8 @@ async fn run_log_entry_cmd(
     rank_after: bool,
 ) -> anyhow::Result<()> {
     let parsed_kind = EntryKind::parse_flexible(&args.kind)?;
-    let catalog = db.catalog();
-    let entry = if args.creators.is_empty()
-        && args.year.is_none()
-        && args.url.is_none()
-        && args.identifiers.is_empty()
+    let catalog = CatalogService::new(db);
+    let entry = if !args.has_explicit_metadata()
         && let Ok(existing) = catalog.resolve_entry(&args.title, Some(parsed_kind), None).await
     {
         existing
@@ -565,27 +644,31 @@ async fn run_log_entry_cmd(
         logged.entry.kind.as_str()
     );
 
-    if rank_after
-        && status == ConsumptionStatus::Consumed
-        && let Some(list_slug) = logged.entry.kind.default_list_slug()
-    {
-        let focus_args = RankArgs {
-            target: list_slug.to_owned(),
-            want: false,
-            max_k: 5,
-            max_iters: 25,
-            focus: Some(logged.entry.id.clone()),
-            recent: None,
-            by: None,
-            from: None,
-        };
-        run_rank_cmd(db, &focus_args).await?;
+    if rank_after && status == ConsumptionStatus::Consumed {
+        if let Some(list_slug) = catalog.rank_target_after_consumption(&logged.entry).await? {
+            let focus_args = RankArgs {
+                target: list_slug,
+                want: false,
+                max_k: 5,
+                max_iters: 25,
+                focus: Some(logged.entry.id.clone()),
+                recent: None,
+                by: None,
+                from: None,
+            };
+            run_rank_cmd(db, &focus_args).await?;
+        } else if logged.entry.kind.default_list_slug().is_some() {
+            println!(
+                "Ranked #1 in {} (log at least 2 items to compare).",
+                logged.entry.kind.display_label()
+            );
+        }
     }
     Ok(())
 }
 
 async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
-    let catalog = db.catalog();
+    let catalog = CatalogService::new(db);
     let focus_ids = if let Some(ref f) = args.focus {
         let entry = catalog.resolve_entry(f, None, None).await?;
         vec![entry.id]
@@ -604,6 +687,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
     let mut judged_clusters: Vec<std::collections::HashSet<String>> = Vec::new();
     let max_k = args.max_k.clamp(2, 9);
 
+    let mut effective_want = args.want;
     for iteration in 0..args.max_iters {
         let eff_iter = if force_random_next { RANDOM_SEED_EVERY } else { iteration };
         force_random_next = false;
@@ -615,31 +699,14 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
             by_creator: args.by.clone(),
             from_parent_id: parent_id.clone(),
         };
-        let (summary, mut cluster, _) =
-            catalog.select_next_cluster(&args.target, args.want, &filter).await?;
-        let is_covered = |cand: &[CatalogEntry], prev: &[std::collections::HashSet<String>]| {
-            !cand.is_empty() && prev.iter().any(|s| cand.iter().all(|c| s.contains(&c.id)))
-        };
-        if is_covered(&cluster, &judged_clusters) {
-            if focus_ids.is_empty() {
-                let fallback_filter = ClusterSelectFilter {
-                    max_k,
-                    iteration: RANDOM_SEED_EVERY,
-                    focus_ids: Vec::new(),
-                    recent_limit: args.recent,
-                    by_creator: args.by.clone(),
-                    from_parent_id: parent_id.clone(),
-                };
-                let (_, alt_cluster, _) =
-                    catalog.select_next_cluster(&args.target, args.want, &fallback_filter).await?;
-                if is_covered(&alt_cluster, &judged_clusters) {
-                    cluster.clear();
-                } else {
-                    cluster = alt_cluster;
-                }
-            } else {
-                cluster.clear();
-            }
+        let (summary, cluster, _) = catalog
+            .select_next_uncovered_cluster(&args.target, effective_want, &filter, |cand| {
+                !cand.is_empty()
+                    && judged_clusters.iter().any(|s| cand.iter().all(|c| s.contains(&c.id)))
+            })
+            .await?;
+        if summary.role == crate::db::CollectionRole::Want {
+            effective_want = true;
         }
         if cluster.len() < 2 {
             if iteration == 0 && summary.member_count < 2 {
@@ -656,7 +723,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
             cluster.iter().map(|c| c.id.clone()).collect();
         match prompt_cluster_tty(&summary.title, cluster, iteration, appended)? {
             ClusterRankOutcome::Submitted(ordering) => {
-                let scope_id = args.want.then_some(summary.id.as_str());
+                let scope_id = effective_want.then_some(summary.id.as_str());
                 catalog.append_comparison(scope_id, &ordering, None).await?;
                 judged_clusters.push(cluster_ids);
                 appended += 1;
@@ -670,7 +737,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
 
     println!("Saved {appended} comparison(s).");
     if let Some(fid) = focus_ids.first() {
-        let view = catalog.get_ranked_collection(&args.target, args.want).await?;
+        let view = catalog.get_ranked_collection(&args.target, effective_want).await?;
         if let Some(row) = view.rows.iter().find(|r| &r.entry.id == fid) {
             let tier_badge = row.tier.map_or_else(String::new, |t| format!(" [{t} tier]"));
             println!(
@@ -686,7 +753,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
 }
 
 async fn run_album_cmd(db: &Db, action: AlbumCommand) -> anyhow::Result<()> {
-    let catalog = db.catalog();
+    let catalog = CatalogService::new(db);
     match action {
         AlbumCommand::Status => {
             let state = catalog.get_1001_generator_state().await?;
@@ -719,10 +786,9 @@ async fn run_album_cmd(db: &Db, action: AlbumCommand) -> anyhow::Result<()> {
                 sanitize_terminal_text(&finished.creators.join(", "))
             );
             if !no_rank {
-                let albums_view = catalog.get_ranked_collection("albums", false).await?;
-                if albums_view.rows.len() >= 2 {
+                if let Some(list_slug) = catalog.rank_target_after_consumption(&finished).await? {
                     let rank_args = RankArgs {
-                        target: "albums".to_owned(),
+                        target: list_slug,
                         want: false,
                         max_k: 5,
                         max_iters: 20,
@@ -734,6 +800,8 @@ async fn run_album_cmd(db: &Db, action: AlbumCommand) -> anyhow::Result<()> {
                     if let Err(err) = run_rank_cmd(db, &rank_args).await {
                         eprintln!("Skipped interactive ranking ({err})");
                     }
+                } else {
+                    println!("Ranked #1 in Albums (finish at least 2 albums to compare).");
                 }
             }
             println!();
@@ -886,5 +954,45 @@ mod tests {
                 }),
             })
         );
+
+        let migrate_cmd = Cli::try_parse_from([
+            "roche",
+            "migrate-great",
+            "/tmp/great",
+            "--roche-db",
+            "/tmp/roche.db",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(
+            migrate_cmd.command,
+            Some(Command::MigrateGreat {
+                great_dir: PathBuf::from("/tmp/great"),
+                db_path: Some(PathBuf::from("/tmp/roche.db")),
+                pool_json: None,
+                dry_run: true,
+                json: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_consumed_rank_on_first_item_does_not_bail() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let args = MediaEntryArgs {
+            kind: "movie".to_owned(),
+            title: "Stalker".to_owned(),
+            year: Some(1979),
+            creators: vec!["Andrei Tarkovsky".to_owned()],
+            url: None,
+            identifiers: vec!["imdb:tt0079944".to_owned()],
+            notes: Some("First logged film".to_owned()),
+        };
+        // Previously bailed with "Need at least 2 items in 'Movies' to rank (found 1)."
+        run_log_entry_cmd(&db, &args, ConsumptionStatus::Consumed, true).await.unwrap();
+        let diary = db.catalog().list_diary(None, None, 10).await.unwrap();
+        assert_eq!(diary.len(), 1);
+        assert_eq!(diary[0].entry.title, "Stalker");
     }
 }

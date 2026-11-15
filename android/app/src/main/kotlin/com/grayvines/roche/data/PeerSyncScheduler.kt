@@ -8,7 +8,11 @@ import android.content.ComponentName
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.PersistableBundle
 import com.grayvines.roche.RocheApp
+import java.net.URI
+import java.util.Locale
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -31,6 +35,22 @@ class AndroidNetworkTierProvider(context: Context) : NetworkTierProvider {
         )
     }
         .getOrDefault(NetworkTier.WIFI)
+
+    override fun isVpnTransportActive(): Boolean = runCatching {
+        val cm = appContext.getSystemService(ConnectivityManager::class.java) ?: return false
+        val activeHasVpn =
+            cm.activeNetwork?.let { active ->
+                cm.getNetworkCapabilities(active)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            } == true
+        if (activeHasVpn) return true
+        @Suppress("DEPRECATION")
+        cm.allNetworks.any { network ->
+            cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ==
+                true
+        }
+    }
+        .getOrDefault(false)
 }
 
 class PeerSyncJobService : JobService() {
@@ -65,20 +85,50 @@ class PeerSyncJobService : JobService() {
 object PeerSyncScheduler {
     internal const val PEER_SYNC_JOB_ID = 4107
     internal const val PERIODIC_SYNC_INTERVAL_MS = 30L * 60L * 1000L
+    private const val EXTRA_REQUIRES_VPN = "requires_vpn"
 
-    fun schedulePeriodicSync(context: Context) {
+    internal fun requiresVpnForServerUrl(serverUrl: String): Boolean {
+        val trimmed = serverUrl.trim()
+        if (trimmed.isEmpty()) return false
+        val host = runCatching {
+            URI(trimmed.replace(" ", "%20")).host?.trim()?.lowercase(Locale.ROOT)
+        }
+            .getOrNull()
+            .orEmpty()
+        return host.isNotEmpty() && !isLoopbackHost(host) && isTailnetOnlyHost(host)
+    }
+
+    fun schedulePeriodicSync(context: Context, serverUrl: String = "") {
         runCatching {
             val appContext = context.applicationContext
             val scheduler = appContext.getSystemService(JobScheduler::class.java) ?: return
-            if (scheduler.getPendingJob(PEER_SYNC_JOB_ID) != null) return
+            val requiresVpn = requiresVpnForServerUrl(serverUrl)
+            val pending = scheduler.getPendingJob(PEER_SYNC_JOB_ID)
+            if (
+                pending != null &&
+                    pending.extras.getBoolean(EXTRA_REQUIRES_VPN, false) == requiresVpn
+            ) {
+                return
+            }
             val serviceComponent = ComponentName(appContext, PeerSyncJobService::class.java)
-            val jobInfo =
+            val extras = PersistableBundle().apply { putBoolean(EXTRA_REQUIRES_VPN, requiresVpn) }
+            val builder =
                 JobInfo.Builder(PEER_SYNC_JOB_ID, serviceComponent)
                     .setPeriodic(PERIODIC_SYNC_INTERVAL_MS)
-                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setRequiresBatteryNotLow(true)
-                    .build()
-            scheduler.schedule(jobInfo)
+                    .setExtras(extras)
+            if (requiresVpn) {
+                val vpnRequest =
+                    NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                        .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build()
+                builder.setRequiredNetwork(vpnRequest)
+            } else {
+                builder.setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+            }
+            scheduler.schedule(builder.build())
         }
     }
 }

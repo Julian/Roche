@@ -1,0 +1,600 @@
+@file:Suppress("TooManyFunctions")
+
+package com.grayvines.roche.ui
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedSortOrder
+import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.components.FilterChipPill
+import com.grayvines.roche.ui.components.FilterFunnelIcon
+import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RefreshIcon
+import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheSurfaceCard
+import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SiteFaviconBadge
+import com.grayvines.roche.ui.theme.LocalRocheColors
+
+@Composable
+fun FeedsAndTagsTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    scrollState: ScrollState = rememberScrollState(),
+) {
+    val colors = LocalRocheColors.current
+    var showFilterDrawer by rememberSaveable { mutableStateOf(false) }
+    var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
+    var unreadOnly by rememberSaveable { mutableStateOf(false) }
+
+    BackHandler(enabled = showFilterDrawer) { showFilterDrawer = false }
+
+    val activeFeeds = state.activeFeeds
+    val archivedFeeds = state.archivedFeeds
+    val totalUnread = remember(activeFeeds) { activeFeeds.sumOf { it.unreadCount } }
+    val subtitle =
+        if (totalUnread > 0) {
+            "${activeFeeds.size} feeds · $totalUnread unread"
+        } else {
+            "${activeFeeds.size} feeds"
+        }
+    val visibleFeeds =
+        remember(activeFeeds, sortOrder, unreadOnly) {
+            sortAndFilterFeeds(activeFeeds, sortOrder, unreadOnly)
+        }
+    val hasActiveFilter = showFilterDrawer || unreadOnly || sortOrder != FeedSortOrder.ALPHABETICAL
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        FeedsTopHeaderBar(
+            subtitle = subtitle,
+            hasActiveFilter = hasActiveFilter,
+            onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
+            onSync = { onAction(MainAction.SyncNow) },
+        )
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (showFilterDrawer) {
+            FeedsFilterDrawer(
+                state = state,
+                sortOrder = sortOrder,
+                unreadOnly = unreadOnly,
+                onSelectSortOrder = { sortOrder = it },
+                onToggleUnreadOnly = { unreadOnly = !unreadOnly },
+                onSelectTag = { tagName ->
+                    showFilterDrawer = false
+                    onAction(MainAction.FilterByTag(tagName))
+                },
+            )
+        }
+
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("feeds_pull_to_refresh"),
+        ) {
+            SubscribedFeedsCardList(
+                feeds = visibleFeeds,
+                archivedFeeds = archivedFeeds,
+                hasFeedsAtAll = activeFeeds.isNotEmpty(),
+                onAction = onAction,
+                scrollState = scrollState,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun FeedsTopHeaderBar(
+    subtitle: String,
+    hasActiveFilter: Boolean,
+    onToggleFilterDrawer: () -> Unit,
+    onSync: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheTopHeader(
+        title = "Feeds",
+        subtitle = subtitle,
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Filter Feeds & Tags",
+            onClick = onToggleFilterDrawer,
+            modifier = Modifier.testTag("feeds_filter_btn"),
+        ) {
+            FilterFunnelIcon(
+                tint = if (hasActiveFilter) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+            )
+        }
+        RocheIconActionButton(
+            contentDescription = "Sync Feeds",
+            onClick = onSync,
+            modifier = Modifier.testTag("feeds_sync_btn"),
+        ) {
+            RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+        }
+    }
+}
+
+internal fun sortAndFilterFeeds(
+    feeds: List<FeedItem>,
+    sortOrder: FeedSortOrder,
+    unreadOnly: Boolean,
+): List<FeedItem> {
+    val base = if (unreadOnly) feeds.filter { it.unreadCount > 0 } else feeds
+    val alphaComparator =
+        compareBy<FeedItem, String>(String.CASE_INSENSITIVE_ORDER) { it.title }.thenBy { it.title }
+    return when (sortOrder) {
+        FeedSortOrder.ALPHABETICAL -> base.sortedWith(alphaComparator)
+        FeedSortOrder.UNREAD_FIRST ->
+            base.sortedWith(compareByDescending<FeedItem> { it.unreadCount }.then(alphaComparator))
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FeedsFilterDrawer(
+    state: MainUiState,
+    sortOrder: FeedSortOrder,
+    unreadOnly: Boolean,
+    onSelectSortOrder: (FeedSortOrder) -> Unit,
+    onToggleUnreadOnly: () -> Unit,
+    onSelectTag: (String?) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.surface)
+                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .testTag("feeds_filter_drawer"),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "VIEW & SORT",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+        )
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            FeedSortOrder.entries.forEach { order ->
+                FilterChipPill(
+                    label = order.label,
+                    selected = sortOrder == order,
+                    onClick = { onSelectSortOrder(order) },
+                )
+            }
+            FilterChipPill(
+                label = "Unread Feeds Only",
+                selected = unreadOnly,
+                onClick = onToggleUnreadOnly,
+            )
+        }
+        if (state.tags.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "FILTER INBOX BY TAG",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.5.sp,
+            )
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                state.tags.forEach { tag ->
+                    val isSelected = state.selectedTag == tag.name
+                    FilterChipPill(
+                        label = "#${tag.name} (${tag.unreadCount})",
+                        selected = isSelected,
+                        onClick = { onSelectTag(if (isSelected) null else tag.name) },
+                    )
+                }
+            }
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+@Composable
+private fun SubscribedFeedsCardList(
+    feeds: List<FeedItem>,
+    archivedFeeds: List<FeedItem>,
+    hasFeedsAtAll: Boolean,
+    onAction: (MainAction) -> Unit,
+    scrollState: ScrollState = rememberScrollState(),
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier =
+            Modifier.fillMaxSize()
+                .verticalScroll(scrollState)
+                .padding(horizontal = 14.dp, vertical = 14.dp)
+    ) {
+        if (feeds.isEmpty()) {
+            val emptyMessage =
+                when {
+                    hasFeedsAtAll -> "No feeds with unread items."
+                    archivedFeeds.isNotEmpty() ->
+                        "No active feeds. Expand Archived Feeds below to unarchive."
+                    else -> "No subscribed feeds yet. Tap + to subscribe to RSS, arXiv, or YouTube."
+                }
+            Box(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp, horizontal = 16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text = emptyMessage, color = colors.textMuted, fontSize = 13.sp)
+            }
+        } else {
+            RocheSurfaceCard {
+                feeds.forEachIndexed { index, feed ->
+                    if (index > 0) {
+                        HorizontalDivider(
+                            color = colors.border,
+                            thickness = 1.dp,
+                            modifier = Modifier.padding(start = 52.dp),
+                        )
+                    }
+                    SubscribedFeedRow(
+                        feed = feed,
+                        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                        onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                        onRefresh = { onAction(MainAction.RefreshFeed(feed.id)) },
+                    )
+                }
+            }
+        }
+        if (archivedFeeds.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(16.dp))
+            ArchivedFeedsBinSection(
+                archivedFeeds = archivedFeeds,
+                onAction = onAction,
+            )
+        }
+        Spacer(modifier = Modifier.height(72.dp))
+    }
+}
+
+@Composable
+private fun ArchivedFeedsBinSection(
+    archivedFeeds: List<FeedItem>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val chevron = if (expanded) "▾" else "▸"
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable { expanded = !expanded }
+                    .semantics { role = Role.Button }
+                    .padding(vertical = 8.dp, horizontal = 4.dp)
+                    .testTag("archived_feeds_header"),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "$chevron Archived Feeds (${archivedFeeds.size})",
+                color = colors.textSecondary,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "Paused polling",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.5.sp,
+            )
+        }
+        if (expanded) {
+            RocheSurfaceCard {
+                archivedFeeds.forEachIndexed { index, feed ->
+                    if (index > 0) {
+                        HorizontalDivider(
+                            color = colors.border,
+                            thickness = 1.dp,
+                            modifier = Modifier.padding(start = 52.dp),
+                        )
+                    }
+                    ArchivedFeedRow(
+                        feed = feed,
+                        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+                        onLongPress = { onAction(MainAction.OpenFeedContextSheet(feed.id)) },
+                        onUnarchive = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ArchivedFeedRow(
+    feed: FeedItem,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+    onUnarchive: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .semantics { role = Role.Button }
+                .padding(vertical = 11.dp, horizontal = 12.dp)
+                .testTag("archived_feed_row_${feed.id}"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SiteFaviconBadge(
+                primaryFaviconUrl = feed.faviconUrl,
+                fallbackFaviconUrl = feed.fallbackFaviconUrl,
+                domain = feed.displayDomain,
+                title = feed.title,
+                feedType = feed.feedType,
+                size = 28.dp,
+            )
+            Spacer(modifier = Modifier.width(11.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = feed.title,
+                    color = colors.textSecondary,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val subtitle =
+                    if (feed.unreadCount > 0) {
+                        "${feed.displayDomain} · ${feed.unreadCount} unread"
+                    } else {
+                        feed.displayDomain
+                    }
+                Text(
+                    text = subtitle,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HeaderActionButton(
+            label = "Unarchive",
+            onClick = onUnarchive,
+            modifier = Modifier.testTag("unarchive_feed_${feed.id}"),
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SubscribedFeedRow(
+    feed: FeedItem,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .combinedClickable(onClick = onClick, onLongClick = onLongPress)
+                .semantics { role = Role.Button }
+                .padding(vertical = 11.dp, horizontal = 12.dp)
+                .testTag("feed_row_${feed.id}"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            modifier = Modifier.weight(1f).padding(end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SiteFaviconBadge(
+                primaryFaviconUrl = feed.faviconUrl,
+                fallbackFaviconUrl = feed.fallbackFaviconUrl,
+                domain = feed.displayDomain,
+                title = feed.title,
+                feedType = feed.feedType,
+                size = 28.dp,
+            )
+            Spacer(modifier = Modifier.width(11.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = feed.title,
+                    color = colors.textPrimary,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = feed.displayDomain,
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        SubscribedFeedTrailingActions(feed = feed, onRefresh = onRefresh)
+    }
+}
+
+@Composable
+internal fun SubscribedFeedTrailingActions(
+    feed: FeedItem,
+    onRefresh: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (feed.unreadCount > 0) {
+            Box(
+                modifier =
+                    Modifier.clip(RoundedCornerShape(99.dp))
+                        .background(colors.accentBlue.copy(alpha = 0.16f))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = feed.unreadCount.toString(),
+                    color = colors.accentBlue,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+        RocheIconActionButton(
+            contentDescription = "Refresh ${feed.title}",
+            onClick = onRefresh,
+            outlined = false,
+            modifier = Modifier.testTag("refresh_feed_${feed.id}"),
+        ) {
+            RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+        }
+    }
+}
+
+@Composable
+fun OfflineTabContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
+) {
+    val colors = LocalRocheColors.current
+    val offlineEntries = state.offlineEntries
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        RocheTopHeader(title = "Offline Vault", subtitle = "${offlineEntries.size} cached")
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+
+        if (offlineEntries.isEmpty()) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "No offline entries cached on this device.",
+                    color = colors.textMuted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
+            ) {
+                items(items = offlineEntries, key = { it.id }) { entry ->
+                    OfflineVaultEntryRow(
+                        entry = entry,
+                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                        onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+                    )
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfflineVaultEntryRow(
+    entry: InboxEntry,
+    onOpen: () -> Unit,
+    onEvict: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .semantics { role = Role.Button }
+                .padding(vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(
+                text = entry.title,
+                color = colors.textPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text =
+                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
+        HeaderActionButton(label = "Evict", onClick = onEvict)
+    }
+}

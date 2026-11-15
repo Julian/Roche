@@ -19,8 +19,8 @@ object EpRankingEngine {
     const val RANDOM_SEED_EVERY: Int = 5
     const val N_QUANTILES: Int = 5
     val TIER_LETTERS: CharArray = charArrayOf('D', 'C', 'B', 'A', 'S')
+    const val MEAN_TIE_EPSILON: Double = 1e-5
 
-    private const val MEAN_TIE_EPSILON: Double = 1e-5
     private const val ZERO_MEAN_SNAP: Double = 1e-12
     private const val DEFAULT_MAX_ITER: Int = 100
 

@@ -267,6 +267,26 @@ pub async fn inspect_local_node(cfg: &TailscaleConfig) -> Option<NodeIdentity> {
 
 /// Advertises the local Roche server as a Tailscale Service (`svc:<name>`) via `tailscale serve`.
 pub async fn advertise_service(cfg: &TailscaleConfig, port: u16) -> Result<Option<String>> {
+    advertise_service_with_target(cfg, "127.0.0.1", port).await
+}
+
+/// Resolves the local TCP upstream host that `tailscale serve` should proxy to for a given
+/// `listen_host` (mapping wildcard/loopback binds to `127.0.0.1`, and preserving explicit interface IPs).
+#[must_use]
+pub fn serve_upstream_host(listen_host: &str) -> &str {
+    let trimmed = listen_host.trim();
+    match trimmed {
+        "" | "0.0.0.0" | "::" | "[::]" | "127.0.0.1" | "localhost" | "::1" | "[::1]" => "127.0.0.1",
+        other => other,
+    }
+}
+
+/// Advertises the local Roche server at `upstream_host:port` via `tailscale serve`.
+pub async fn advertise_service_with_target(
+    cfg: &TailscaleConfig,
+    upstream_host: &str,
+    port: u16,
+) -> Result<Option<String>> {
     if !cfg.enabled {
         return Ok(None);
     }
@@ -278,8 +298,13 @@ pub async fn advertise_service(cfg: &TailscaleConfig, port: u16) -> Result<Optio
         anyhow::bail!("Invalid Tailscale service name: {svc}");
     }
 
+    let host = serve_upstream_host(upstream_host);
+    let target_arg = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let service_arg = format!("--service={svc}");
-    let target_arg = format!("127.0.0.1:{port}");
     let output = run_tailscale_cmd(
         &cfg.tailscale_bin,
         &["serve", "--bg", &service_arg, "--https=443", &target_arg],

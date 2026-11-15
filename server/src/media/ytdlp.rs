@@ -17,6 +17,9 @@ use crate::{
 };
 
 const YTDLP_TIMEOUT: Duration = Duration::from_secs(600);
+const YTDLP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub const DEFAULT_MAX_VIDEO_SIZE_MB: u64 = 500;
 
 #[derive(Debug, Default, Deserialize)]
 struct YtDlpInfoJson {
@@ -46,7 +49,18 @@ impl YtDlpWorker {
     }
 
     /// Builds the argument vector passed to `yt-dlp` without shell interpolation.
+    #[cfg(test)]
     pub fn build_args(item_id: &str, url: &Url, output_dir: &Path) -> Result<Vec<String>> {
+        Self::build_args_with_limit(item_id, url, output_dir, DEFAULT_MAX_VIDEO_SIZE_MB)
+    }
+
+    /// Builds the argument vector passed to `yt-dlp` with an explicit `--max-filesize` cap in MiB.
+    pub fn build_args_with_limit(
+        item_id: &str,
+        url: &Url,
+        output_dir: &Path,
+        max_video_size_mb: u64,
+    ) -> Result<Vec<String>> {
         Self::validate_item_id(item_id)?;
         let canonical_url = YouTubeParser::canonical_watch_url(url)
             .ok_or_else(|| anyhow::anyhow!("URL is not a valid YouTube watch URL: {url}"))?;
@@ -54,6 +68,7 @@ impl YtDlpWorker {
         let template_str = output_template
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Output directory path is not valid UTF-8"))?;
+        let max_mb = max_video_size_mb.max(1);
 
         Ok(vec![
             "--ignore-config".to_string(),
@@ -62,6 +77,8 @@ impl YtDlpWorker {
             "--no-exec".to_string(),
             "--socket-timeout".to_string(),
             "30".to_string(),
+            "--max-filesize".to_string(),
+            format!("{max_mb}M"),
             "--format".to_string(),
             "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best".to_string(),
             "--merge-output-format".to_string(),
@@ -75,6 +92,29 @@ impl YtDlpWorker {
         ])
     }
 
+    /// Checks `yt-dlp --version` asynchronously without blocking Tokio runtime threads.
+    pub async fn check_version(&self) -> Result<String> {
+        let mut cmd = Command::new(&self.config.ytdlp_path);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(YTDLP_VERSION_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("yt-dlp --version timed out"))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to spawn yt-dlp at '{}': {e}",
+                    self.config.ytdlp_path.display()
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!("yt-dlp --version exited with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     pub async fn download_for_item(
         &self,
         media_repo: &MediaRepo<'_>,
@@ -83,9 +123,11 @@ impl YtDlpWorker {
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         Self::validate_item_id(item_id)?;
         let item_dir = self.item_download_dir(item_id)?;
-        let args = Self::build_args(item_id, url, &item_dir)?;
+        let args =
+            Self::build_args_with_limit(item_id, url, &item_dir, self.config.max_video_size_mb)?;
 
-        tokio::fs::create_dir_all(&item_dir).await?;
+        MediaStore::ensure_private_dir(self.media_store.base_dir()).await?;
+        MediaStore::ensure_private_dir(&item_dir).await?;
         let verified_dir = match self.media_store.validate_path(&item_dir) {
             Ok(dir) => dir,
             Err(e) => {
@@ -188,19 +230,41 @@ impl YtDlpWorker {
             anyhow::bail!("yt-dlp completed without producing a video file");
         };
 
-        let mut registered = Vec::new();
-        let video_rel = self.media_store.relative_path(&video_path)?;
-        let video_media = media_repo
-            .create(item_id, MediaType::Video, &video_rel, Some(video_size), duration)
-            .await?;
-        registered.push(video_media);
-
-        if let Some((thumb_path, size)) = thumbnail_file {
-            let rel = self.media_store.relative_path(&thumb_path)?;
-            let media =
-                media_repo.create(item_id, MediaType::Thumbnail, &rel, Some(size), None).await?;
-            registered.push(media);
+        let max_bytes =
+            i64::try_from(self.config.max_video_size_mb.max(1).saturating_mul(1024 * 1024))
+                .unwrap_or(i64::MAX);
+        if video_size > max_bytes {
+            anyhow::bail!(
+                "Downloaded video exceeds max_video_size_mb limit ({video_size} bytes > {max_bytes} bytes)"
+            );
         }
+
+        MediaStore::tighten_private_file_if_exists(&video_path).await;
+        if let Some((ref thumb_path, _)) = thumbnail_file {
+            MediaStore::tighten_private_file_if_exists(thumb_path).await;
+        }
+
+        let video_rel = self.media_store.relative_path(&video_path)?;
+        let thumb_rel_and_size = match thumbnail_file {
+            Some((thumb_path, size)) => Some((self.media_store.relative_path(&thumb_path)?, size)),
+            None => None,
+        };
+
+        let mut specs = vec![crate::db::NewMediaSpec {
+            media_type: MediaType::Video,
+            path: &video_rel,
+            file_size: Some(video_size),
+            duration,
+        }];
+        if let Some((ref thumb_rel, size)) = thumb_rel_and_size {
+            specs.push(crate::db::NewMediaSpec {
+                media_type: MediaType::Thumbnail,
+                path: thumb_rel,
+                file_size: Some(size),
+                duration: None,
+            });
+        }
+        let registered = media_repo.create_batch(item_id, &specs).await?;
 
         Ok((registered, metadata))
     }
@@ -277,6 +341,7 @@ mod tests {
             ytdlp_path: PathBuf::from("/usr/local/bin/yt-dlp"),
             download_dir: temp_base.join("downloads"),
             max_concurrent_downloads: 2,
+            max_video_size_mb: 500,
         };
         let worker = YtDlpWorker::new(cfg, store);
 

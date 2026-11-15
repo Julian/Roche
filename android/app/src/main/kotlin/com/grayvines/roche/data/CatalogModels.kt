@@ -68,18 +68,39 @@ enum class EntryKind(
                 PUBLICATION,
             )
 
-        fun fromWireValue(raw: String?): EntryKind =
-            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: ARTICLE
+        fun fromWireValue(raw: String?): EntryKind = fromWireValueOrNull(raw) ?: ARTICLE
+
+        fun fromWireValueOrNull(raw: String?): EntryKind? {
+            val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return entries.firstOrNull { it.wireValue.equals(trimmed, ignoreCase = true) }
+        }
 
         fun fromFlexibleAlias(raw: String?): EntryKind? {
             val norm =
                 raw?.trim()?.lowercase()?.replace('-', '_')?.takeIf { it.isNotEmpty() }
                     ?: return null
-            return entries.firstOrNull {
+            val direct = entries.firstOrNull {
                 it.wireValue == norm ||
                     it.systemListSlug == norm ||
                     it.displayLabel.lowercase().replace(' ', '_') == norm
             }
+            return direct
+                ?: when (norm) {
+                    "film",
+                    "films" -> MOVIE
+                    "show",
+                    "shows",
+                    "series" -> TV
+                    "track",
+                    "tracks" -> SONG
+                    "episode",
+                    "episodes" -> PODCAST_EPISODE
+                    "blog",
+                    "blogs" -> PUBLICATION
+                    "list",
+                    "lists" -> COLLECTION
+                    else -> null
+                }
         }
     }
 }
@@ -114,8 +135,12 @@ enum class ConsumptionStatus(val wireValue: String, val displayLabel: String) {
     ABANDONED("abandoned", "Abandoned");
 
     companion object {
-        fun fromWireValue(raw: String?): ConsumptionStatus =
-            entries.firstOrNull { it.wireValue.equals(raw?.trim(), ignoreCase = true) } ?: CONSUMED
+        fun fromWireValue(raw: String?): ConsumptionStatus = fromWireValueOrNull(raw) ?: CONSUMED
+
+        fun fromWireValueOrNull(raw: String?): ConsumptionStatus? {
+            val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return entries.firstOrNull { it.wireValue.equals(trimmed, ignoreCase = true) }
+        }
     }
 }
 
@@ -128,8 +153,12 @@ data class EntryIdentifierDto(
 @Serializable
 internal data class DynamicCollectionRuleDto(
     val kind: String? = null,
+    val kinds: List<String> = emptyList(),
+    val status: String? = null,
     val consumed: Boolean? = null,
+    @SerialName("release_year") val releaseYear: Int? = null,
     val creator: String? = null,
+    @SerialName("creator_contains") val creatorContains: String? = null,
 )
 
 @Serializable

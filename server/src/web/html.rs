@@ -184,8 +184,12 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
     Html(out)
 }
 
-pub(super) fn render_login_page(error_msg: Option<&str>, tailscale_enabled: bool) -> Html<String> {
-    let mut out = String::with_capacity(2_048);
+pub(super) fn render_login_page(
+    error_msg: Option<&str>,
+    tailscale_enabled: bool,
+    tailscale_user: Option<&str>,
+) -> Html<String> {
+    let mut out = String::with_capacity(2_560);
     out.push_str(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -207,6 +211,16 @@ pub(super) fn render_login_page(error_msg: Option<&str>, tailscale_enabled: bool
 
     if let Some(err) = error_msg.map(str::trim).filter(|s| !s.is_empty()) {
         let _ = writeln!(out, "<div class=\"notice notice-error\">{}</div>", esc(err));
+    }
+
+    if let Some(ts_login) = tailscale_user.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = writeln!(
+            out,
+            "<form method=\"post\" action=\"/login/tailscale\" style=\"margin-bottom:1.1rem\">\n\
+               <button type=\"submit\" class=\"btn btn-primary\" style=\"width:100%\">Sign in as {}</button>\n\
+             </form>\n",
+            esc(ts_login)
+        );
     }
 
     out.push_str(

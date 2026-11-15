@@ -171,4 +171,30 @@ impl<'a> AuthRepo<'a> {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+
+    /// Prunes older Tailscale web session tokens for `device_name` beyond `keep_most_recent`
+    /// so `device_tokens` stays bounded even across repeated server restarts.
+    pub async fn prune_excess_named_tokens(
+        &self,
+        device_name: &str,
+        keep_most_recent: i64,
+    ) -> Result<u64> {
+        let keep = keep_most_recent.max(1);
+        let res = sqlx::query(
+            "DELETE FROM device_tokens
+             WHERE device_name = ?
+               AND id NOT IN (
+                   SELECT id FROM device_tokens
+                   WHERE device_name = ?
+                   ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC
+                   LIMIT ?
+               )",
+        )
+        .bind(device_name)
+        .bind(device_name)
+        .bind(keep)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }

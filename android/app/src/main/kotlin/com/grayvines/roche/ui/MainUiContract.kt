@@ -71,6 +71,7 @@ data class MainUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val readerContent: ReaderItemContent? = null,
+    val hydratingEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -171,6 +172,9 @@ data class MainUiState(
 
     val selectedFeedTitle: String?
         get() = feeds.firstOrNull { it.id == selectedFeedId }?.title
+
+    val isReaderHydrating: Boolean
+        get() = selectedReaderEntryId != null && selectedReaderEntryId in hydratingEntryIds
 }
 
 fun MainUiState.isEntryInQueue(entryId: String): Boolean = entryId in settings.queueItemIds
@@ -291,7 +295,10 @@ sealed interface MainAction {
 
     data class MoveQueueItemToTop(val entryId: String) : Mutation
 
-    data class ToggleArchive(val entry: InboxEntry) : Mutation
+    data class ToggleArchive(
+        val entry: InboxEntry,
+        val liveReadProgress: Double? = null,
+    ) : Mutation
 
     data object UndoLastArchive : Mutation
 
@@ -445,6 +452,7 @@ internal data class TransientUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val readerContent: ReaderItemContent? = null,
+    val hydratingEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
     val isAddSheetOpen: Boolean = false,
@@ -466,21 +474,30 @@ internal data class TransientUiState(
     val messageSequence: Long = 0L,
 )
 
+internal fun TransientUiState.clearSearch(): TransientUiState =
+    copy(
+        isSearchOpen = false,
+        searchQuery = "",
+        deepSearchQuery = "",
+        deepSearchResults = emptyList(),
+    )
+
 internal fun reduceUiAction(
     state: TransientUiState,
     action: MainAction.Ui,
 ): TransientUiState =
     when (action) {
         is MainAction.SelectTab ->
-            state.copy(
-                activeTab = action.tab,
-                isSearchOpen = false,
-                selectedReaderEntryId = null,
-                readerContent = null,
-                selectedFeedId = null,
-                selectedTag = null,
-                scopeOriginTab = null,
-            )
+            state
+                .clearSearch()
+                .copy(
+                    activeTab = action.tab,
+                    selectedReaderEntryId = null,
+                    readerContent = null,
+                    selectedFeedId = null,
+                    selectedTag = null,
+                    scopeOriginTab = null,
+                )
         is MainAction.SelectFilter ->
             state.copy(
                 activeFilter = action.filter,
@@ -489,28 +506,30 @@ internal fun reduceUiAction(
                 scopeOriginTab = null,
             )
         is MainAction.FilterByTag ->
-            state.copy(
-                activeTab = AppTab.INBOX,
-                isSearchOpen = false,
-                selectedTag = action.tagName,
-                selectedFeedId = null,
-                scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
-                selectedReaderEntryId = null,
-                readerContent = null,
-                contextSheetEntryId = null,
-            )
+            state
+                .clearSearch()
+                .copy(
+                    activeTab = AppTab.INBOX,
+                    selectedTag = action.tagName,
+                    selectedFeedId = null,
+                    scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
+                    selectedReaderEntryId = null,
+                    readerContent = null,
+                    contextSheetEntryId = null,
+                )
         is MainAction.FilterByFeed ->
-            state.copy(
-                activeTab = AppTab.INBOX,
-                isSearchOpen = false,
-                selectedFeedId = action.feedId,
-                selectedTag = null,
-                scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
-                selectedReaderEntryId = null,
-                readerContent = null,
-                contextSheetEntryId = null,
-                feedContextSheetId = null,
-            )
+            state
+                .clearSearch()
+                .copy(
+                    activeTab = AppTab.INBOX,
+                    selectedFeedId = action.feedId,
+                    selectedTag = null,
+                    scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
+                    selectedReaderEntryId = null,
+                    readerContent = null,
+                    contextSheetEntryId = null,
+                    feedContextSheetId = null,
+                )
         MainAction.NavigateBackFromScope ->
             state.copy(
                 activeTab = state.scopeOriginTab ?: AppTab.INBOX,
@@ -556,17 +575,12 @@ private fun reduceOverlayUiAction(
                 feedContextSheetId = null,
                 isAddSheetOpen = false,
             )
-        MainAction.CloseSearch ->
-            state.copy(
-                isSearchOpen = false,
-                searchQuery = "",
-                deepSearchQuery = "",
-                deepSearchResults = emptyList(),
-            )
+        MainAction.CloseSearch -> state.clearSearch()
         is MainAction.OpenReader ->
             state.copy(
                 selectedReaderEntryId = action.entryId,
                 readerContent = null,
+                hydratingEntryIds = state.hydratingEntryIds + action.entryId,
                 contextSheetEntryId = null,
             )
         MainAction.CloseReader -> state.copy(selectedReaderEntryId = null, readerContent = null)
@@ -598,13 +612,14 @@ private fun reduceCatalogUiAction(
 ): TransientUiState =
     when (action) {
         is MainAction.OpenCompanionSection ->
-            state.copy(
-                activeTab = AppTab.LISTS,
-                companionSubTab = action.subTab,
-                isSearchOpen = false,
-                selectedReaderEntryId = null,
-                readerContent = null,
-            )
+            state
+                .clearSearch()
+                .copy(
+                    activeTab = AppTab.LISTS,
+                    companionSubTab = action.subTab,
+                    selectedReaderEntryId = null,
+                    readerContent = null,
+                )
         is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
         is MainAction.SelectCatalogCollection ->
             state.copy(selectedCatalogCollectionId = action.collectionId)
@@ -762,6 +777,7 @@ internal class MainUiStateMemoizer {
             scopeOriginTab = local.scopeOriginTab,
             selectedReaderEntryId = local.selectedReaderEntryId,
             readerContent = local.readerContent,
+            hydratingEntryIds = local.hydratingEntryIds,
             contextSheetEntryId = local.contextSheetEntryId,
             feedContextSheetId = local.feedContextSheetId,
             isAddSheetOpen = local.isAddSheetOpen,
@@ -938,10 +954,9 @@ internal fun resolveMergedSearchResults(
         val deepMatch = deepById[entry.id]
         when {
             deepMatch != null ->
-                deepMatch.copy(
-                    isFavorite = entry.isFavorite,
-                    status = entry.status,
-                    readAt = entry.readAt,
+                entry.copy(
+                    contentText = deepMatch.contentText ?: entry.contentText,
+                    contentHtml = deepMatch.contentHtml ?: entry.contentHtml,
                 )
             matchesSearchQuery(entry, normalizedQuery) -> entry
             else -> null

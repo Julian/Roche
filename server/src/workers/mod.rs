@@ -8,6 +8,7 @@ pub struct WorkerManager {
     db: Db,
     op_log_prune_after_days: i64,
     media_store: MediaStore,
+    download_dir: std::path::PathBuf,
 }
 
 impl WorkerManager {
@@ -17,7 +18,27 @@ impl WorkerManager {
         op_log_prune_after_days: i64,
         media_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
-        Self { db, op_log_prune_after_days, media_store: MediaStore::new(media_dir) }
+        let store = MediaStore::new(media_dir);
+        let download_dir = store.base_dir().join("downloads");
+        Self { db, op_log_prune_after_days, media_store: store, download_dir }
+    }
+
+    #[must_use]
+    pub fn with_download_dir(mut self, download_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.download_dir = download_dir.into();
+        self
+    }
+
+    /// Cleans leftover partial `downloads/<item_id>` directories and stale `.tmp-*` files on startup
+    /// before any background download workers begin.
+    pub async fn cleanup_startup_partials(&self) -> Result<()> {
+        let _ = self.media_store.cleanup_stale_temp_files(Duration::ZERO).await;
+        let registered = self.db.media().list_registered_item_ids().await?;
+        let _ = self
+            .media_store
+            .cleanup_unregistered_download_dirs(&self.download_dir, &registered, Duration::ZERO)
+            .await;
+        Ok(())
     }
 
     pub async fn run_all(&self) -> Result<()> {
@@ -44,7 +65,18 @@ impl WorkerManager {
         let _ = self.media_store.cleanup_stale_temp_files(Duration::from_secs(600)).await;
         let media_repo = self.db.media();
         let orphans = media_repo.find_orphaned().await?;
-        media_repo.delete_with_files(&self.media_store, orphans).await
+        media_repo.delete_with_files(&self.media_store, orphans).await?;
+        if let Ok(registered) = media_repo.list_registered_item_ids().await {
+            let _ = self
+                .media_store
+                .cleanup_unregistered_download_dirs(
+                    &self.download_dir,
+                    &registered,
+                    Duration::from_mins(11),
+                )
+                .await;
+        }
+        Ok(())
     }
 }
 

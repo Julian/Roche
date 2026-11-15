@@ -5,8 +5,8 @@ use sqlx::{SqliteConnection, SqlitePool};
 use url::Url;
 
 use super::{
-    ActivityAction, ActivityEntityType, ContentType, EntryKind, FeedType, ItemRepo, MediaRepo,
-    SyncRepo,
+    ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
+    ItemRepo, MediaRepo, SyncRepo,
     sync::{
         SERVER_PEER_ID, STARRED_COLLECTION_ID, canonicalize_sync_url, deterministic_feed_id,
         deterministic_item_id, feed_natural_key, item_natural_key,
@@ -18,7 +18,7 @@ macro_rules! feed_select_sql {
     ($suffix:literal) => {
         concat!(
             "SELECT fs.collection_id AS id,
-       CASE fs.source_type WHEN 'podcast' THEN 'rss' ELSE fs.source_type END AS feed_type,
+       fs.source_type AS feed_type,
        fs.feed_url AS url,
        fs.feed_title AS title,
        e.summary AS description,
@@ -36,8 +36,7 @@ macro_rules! feed_select_sql {
         JOIN entries ie ON ie.id = ce.entry_id
         WHERE ce.collection_id = fs.collection_id
           AND ie.merged_into_id IS NULL
-          AND es.inbox_state = 'unread'
-          AND es.read_at IS NULL) AS unread_count
+          AND es.inbox_state = 'unread') AS unread_count
 FROM feed_sources fs
 JOIN entries e ON e.id = fs.collection_id ",
             $suffix
@@ -92,9 +91,27 @@ pub struct PollBatch {
 pub(super) const fn entry_kind_for_feed_type(feed_type: FeedType) -> EntryKind {
     match feed_type {
         FeedType::Rss => EntryKind::Publication,
+        FeedType::Podcast => EntryKind::Podcast,
         FeedType::Youtube => EntryKind::Channel,
         FeedType::Arxiv => EntryKind::Collection,
     }
+}
+
+pub(super) struct NewFeedRow<'a> {
+    pub id: &'a str,
+    pub feed_url: &'a str,
+    pub feed_type: FeedType,
+    pub title: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub poll_interval: i64,
+    pub is_active: bool,
+    pub last_polled: Option<DateTime<Utc>>,
+    pub last_polled_by: Option<&'a str>,
+    pub last_error: Option<&'a str>,
+    pub last_error_by: Option<&'a str>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub(super) async fn resolve_dedup_entry_id(
@@ -103,13 +120,8 @@ pub(super) async fn resolve_dedup_entry_id(
     canon_url: &str,
     arxiv_id: Option<&str>,
 ) -> std::result::Result<Option<String>, sqlx::Error> {
-    let direct: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT id, merged_into_id FROM entries WHERE id = ? LIMIT 1")
-            .bind(det_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    if let Some((id, merged)) = direct {
-        return Ok(Some(merged.unwrap_or(id)));
+    if let Some(found) = CatalogRepo::follow_merged_id_in_tx(&mut *conn, det_id).await? {
+        return Ok(Some(found));
     }
 
     let by_ident: Option<String> = if let Some(aid) = arxiv_id {
@@ -138,7 +150,10 @@ pub(super) async fn resolve_dedup_entry_id(
         .await?
     };
 
-    Ok(by_ident)
+    if let Some(found) = by_ident {
+        return CatalogRepo::follow_merged_id_in_tx(&mut *conn, &found).await;
+    }
+    Ok(None)
 }
 
 pub struct FeedRepo<'a> {
@@ -230,9 +245,6 @@ impl<'a> FeedRepo<'a> {
                 .ok_or_else(|| anyhow::anyhow!("Feed disappeared after unarchive"));
         }
 
-        let entry_kind = entry_kind_for_feed_type(feed_type);
-        let entry_title = title.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(url.as_str());
-
         let active_feed_exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM feed_sources WHERE collection_id = ? OR feed_url = ? LIMIT 1",
         )
@@ -241,65 +253,30 @@ impl<'a> FeedRepo<'a> {
         .fetch_optional(&mut *tx)
         .await?;
 
-        if active_feed_exists.is_none() {
-            sqlx::query(
-                "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     title = excluded.title,
-                     summary = COALESCE(excluded.summary, entries.summary),
-                     created_at = excluded.created_at,
-                     updated_at = excluded.updated_at",
-            )
-            .bind(&id)
-            .bind(entry_kind)
-            .bind(entry_title)
-            .bind(description)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO collection_specs (collection_id, mode, collection_role, show_in_lists)
-                 VALUES (?, 'feed', 'feed', 0)
-                 ON CONFLICT(collection_id) DO UPDATE SET
-                     mode = 'feed',
-                     collection_role = 'feed'",
-            )
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
+        if active_feed_exists.is_some() {
+            return Err(
+                super::ConflictError(format!("Feed '{}' already exists", url.as_str())).into()
+            );
         }
 
-        sqlx::query(
-            "INSERT INTO feed_sources
-             (collection_id, feed_url, source_type, feed_title, poll_interval, is_active)
-             VALUES (?, ?, ?, ?, ?, 1)",
-        )
-        .bind(&id)
-        .bind(url.as_str())
-        .bind(feed_type)
-        .bind(title)
-        .bind(poll_interval)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('feed_url', ?, ?)",
-        )
-        .bind(&nat_key)
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-
-        SyncRepo::record_activity(
+        Self::insert_feed_in_tx(
             &mut tx,
-            ActivityEntityType::Feed,
-            &id,
-            ActivityAction::Create,
-            now,
+            &NewFeedRow {
+                id: &id,
+                feed_url: url.as_str(),
+                feed_type,
+                title,
+                description,
+                language: None,
+                poll_interval,
+                is_active: true,
+                last_polled: None,
+                last_polled_by: None,
+                last_error: None,
+                last_error_by: None,
+                created_at: now,
+                updated_at: now,
+            },
         )
         .await?;
 
@@ -321,6 +298,84 @@ impl<'a> FeedRepo<'a> {
             created_at: now,
             unread_count: 0,
         })
+    }
+
+    pub(super) async fn insert_feed_in_tx(
+        conn: &mut SqliteConnection,
+        row: &NewFeedRow<'_>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let entry_kind = entry_kind_for_feed_type(row.feed_type);
+        let entry_title =
+            row.title.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(row.feed_url);
+        let nat_key = feed_natural_key(row.feed_url);
+
+        sqlx::query(
+            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 kind = excluded.kind,
+                 title = excluded.title,
+                 summary = COALESCE(excluded.summary, entries.summary),
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(row.id)
+        .bind(entry_kind)
+        .bind(entry_title)
+        .bind(row.description)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO collection_specs (collection_id, mode, collection_role, show_in_lists)
+             VALUES (?, 'feed', 'feed', 0)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                 mode = 'feed',
+                 collection_role = 'feed'",
+        )
+        .bind(row.id)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO feed_sources
+             (collection_id, feed_url, source_type, feed_title, language, poll_interval,
+              is_active, last_polled_at, last_polled_by, last_error, last_error_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(row.id)
+        .bind(row.feed_url)
+        .bind(row.feed_type)
+        .bind(row.title)
+        .bind(row.language)
+        .bind(row.poll_interval)
+        .bind(row.is_active)
+        .bind(row.last_polled)
+        .bind(row.last_polled_by)
+        .bind(row.last_error)
+        .bind(row.last_error_by)
+        .execute(&mut *conn)
+        .await?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+             VALUES ('feed_url', ?, ?)",
+        )
+        .bind(&nat_key)
+        .bind(row.id)
+        .execute(&mut *conn)
+        .await?;
+
+        SyncRepo::record_activity(
+            &mut *conn,
+            ActivityEntityType::Feed,
+            row.id,
+            ActivityAction::Create,
+            row.updated_at,
+        )
+        .await
     }
 
     pub async fn import_outlines(
@@ -416,64 +471,24 @@ impl<'a> FeedRepo<'a> {
             return Ok(None);
         }
 
-        let entry_kind = entry_kind_for_feed_type(outline.feed_type);
-        let entry_title = clean_title.unwrap_or(outline.xml_url.as_str());
-
-        sqlx::query(
-            "INSERT INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                 title = excluded.title,
-                 created_at = excluded.created_at,
-                 updated_at = excluded.updated_at",
-        )
-        .bind(&id)
-        .bind(entry_kind)
-        .bind(entry_title)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO collection_specs (collection_id, mode, collection_role, show_in_lists)
-             VALUES (?, 'feed', 'feed', 0)
-             ON CONFLICT(collection_id) DO UPDATE SET
-                 mode = 'feed',
-                 collection_role = 'feed'",
-        )
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO feed_sources
-             (collection_id, feed_url, source_type, feed_title, poll_interval, is_active)
-             VALUES (?, ?, ?, ?, ?, 1)",
-        )
-        .bind(&id)
-        .bind(outline.xml_url.as_str())
-        .bind(outline.feed_type)
-        .bind(clean_title)
-        .bind(default_interval)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('feed_url', ?, ?)",
-        )
-        .bind(&nat_key)
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-
-        SyncRepo::record_activity(
+        Self::insert_feed_in_tx(
             &mut *tx,
-            ActivityEntityType::Feed,
-            &id,
-            ActivityAction::Create,
-            now,
+            &NewFeedRow {
+                id: &id,
+                feed_url: outline.xml_url.as_str(),
+                feed_type: outline.feed_type,
+                title: clean_title,
+                description: None,
+                language: None,
+                poll_interval: default_interval,
+                is_active: true,
+                last_polled: None,
+                last_polled_by: None,
+                last_error: None,
+                last_error_by: None,
+                created_at: now,
+                updated_at: now,
+            },
         )
         .await?;
 
@@ -644,14 +659,10 @@ impl<'a> FeedRepo<'a> {
         if has_preserved_children.is_some()
             || ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, feed_id).await?
         {
-            sqlx::query(
-                "UPDATE collection_specs
-                 SET mode = 'manual', collection_role = 'list', show_in_lists = 0
-                 WHERE collection_id = ?",
-            )
-            .bind(feed_id)
-            .execute(&mut *conn)
-            .await?;
+            sqlx::query("DELETE FROM collection_specs WHERE collection_id = ?")
+                .bind(feed_id)
+                .execute(&mut *conn)
+                .await?;
             sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(feed_id)
@@ -830,6 +841,13 @@ impl<'a> FeedRepo<'a> {
             if let Some(existing_id) =
                 resolve_dedup_entry_id(&mut tx, &det_id, &canon_url, arxiv_id.as_deref()).await?
             {
+                let existing_state: Option<InboxState> = sqlx::query_scalar(
+                    "SELECT inbox_state FROM entry_state WHERE entry_id = ? LIMIT 1",
+                )
+                .bind(&existing_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
                 sqlx::query(
                     "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
                      VALUES (?, ?, ?)",
@@ -840,14 +858,106 @@ impl<'a> FeedRepo<'a> {
                 .execute(&mut *tx)
                 .await?;
 
-                Self::backfill_existing_poll_item_in_tx(
-                    &mut tx,
-                    &existing_id,
-                    item,
-                    clean_duration,
-                    now,
-                )
-                .await?;
+                if existing_state.is_none() {
+                    let clean_summary =
+                        Some(item.summary.as_str()).filter(|s| !s.trim().is_empty());
+                    sqlx::query(
+                        "UPDATE entries
+                         SET url = COALESCE(url, ?),
+                             published_at = COALESCE(published_at, ?),
+                             summary = COALESCE(summary, ?),
+                             thumbnail_url = COALESCE(thumbnail_url, ?),
+                             updated_at = ?
+                         WHERE id = ?",
+                    )
+                    .bind(item.url.as_str())
+                    .bind(item.published_at)
+                    .bind(clean_summary)
+                    .bind(item.thumbnail_url.as_deref())
+                    .bind(now)
+                    .bind(&existing_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO entry_content (entry_id, content_html, content_type)
+                         VALUES (?, ?, ?)
+                         ON CONFLICT(entry_id) DO UPDATE SET
+                             content_html = COALESCE(entry_content.content_html, excluded.content_html),
+                             content_type = excluded.content_type",
+                    )
+                    .bind(&existing_id)
+                    .bind(item.content_html.as_deref())
+                    .bind(item.content_type)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
+                         VALUES (?, 'unread', 0.0, ?)",
+                    )
+                    .bind(&existing_id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                         VALUES ('url', ?, ?)",
+                    )
+                    .bind(&canon_url)
+                    .bind(&existing_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    if let Some(ref aid) = arxiv_id {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                             VALUES ('arxiv', ?, ?)",
+                        )
+                        .bind(aid)
+                        .bind(&existing_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+
+                    MediaRepo::upsert_audio_enclosure_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        item.audio_url.as_deref(),
+                        clean_duration,
+                        now,
+                    )
+                    .await?;
+
+                    Self::backfill_existing_poll_item_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        item,
+                        clean_duration,
+                        now,
+                    )
+                    .await?;
+
+                    SyncRepo::record_activity(
+                        &mut tx,
+                        ActivityEntityType::Item,
+                        &existing_id,
+                        ActivityAction::Create,
+                        now,
+                    )
+                    .await?;
+                    inserted.push((existing_id, item.clone()));
+                } else {
+                    Self::backfill_existing_poll_item_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        item,
+                        clean_duration,
+                        now,
+                    )
+                    .await?;
+                }
             } else {
                 let entry_kind = EntryKind::from_content_type(item.content_type);
                 let creators_json = item

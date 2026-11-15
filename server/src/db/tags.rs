@@ -18,8 +18,7 @@ macro_rules! tag_select_sql {
         JOIN entries ie ON ie.id = ce.entry_id
         WHERE ce.collection_id = e.id
           AND ie.merged_into_id IS NULL
-          AND es.inbox_state = 'unread'
-          AND es.read_at IS NULL) AS unread_count
+          AND es.inbox_state = 'unread') AS unread_count
 FROM entries e
 JOIN collection_specs cs ON cs.collection_id = e.id
 WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL ",
@@ -56,7 +55,6 @@ impl<'a> TagRepo<'a> {
     pub async fn create(&self, name: &str, color: Option<&HexColor>) -> Result<Tag> {
         let id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
-        let slug = format!("tag:{nat_key}");
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
@@ -74,47 +72,10 @@ impl<'a> TagRepo<'a> {
         .fetch_optional(&mut *tx)
         .await?;
         if existing.is_some() {
-            anyhow::bail!("UNIQUE constraint failed: tags.name");
+            return Err(super::ConflictError(format!("Tag '{name}' already exists")).into());
         }
 
-        sqlx::query(
-            "INSERT INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(name)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
-             VALUES (?, ?, 'manual', 'tag', 0, ?)",
-        )
-        .bind(&id)
-        .bind(&slug)
-        .bind(color)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT OR REPLACE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('tag', ?, ?)",
-        )
-        .bind(&nat_key)
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-
-        SyncRepo::record_activity(
-            &mut tx,
-            ActivityEntityType::Tag,
-            &id,
-            ActivityAction::Create,
-            now,
-        )
-        .await?;
+        let id = Self::get_or_create_in_tx(&mut tx, name, color, now, now).await?;
 
         tx.commit().await?;
 
@@ -166,6 +127,23 @@ impl<'a> TagRepo<'a> {
         if let Some(n) = name {
             let nat_key = tag_natural_key(n);
             let slug = format!("tag:{nat_key}");
+            let duplicate: Option<String> = sqlx::query_scalar(
+                "SELECT e.id
+                 FROM entries e
+                 JOIN collection_specs cs ON cs.collection_id = e.id
+                 WHERE cs.collection_role = 'tag'
+                   AND e.id != ?
+                   AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))
+                 LIMIT 1",
+            )
+            .bind(id)
+            .bind(&slug)
+            .bind(n)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if duplicate.is_some() {
+                return Err(super::ConflictError(format!("Tag '{n}' already exists")).into());
+            }
             sqlx::query("UPDATE entries SET title = ?, updated_at = ? WHERE id = ?")
                 .bind(n)
                 .bind(now)
@@ -274,82 +252,96 @@ impl<'a> TagRepo<'a> {
         Ok(true)
     }
 
-    pub async fn get_or_create_and_attach_in_tx(
+    pub async fn get_or_create_in_tx(
         conn: &mut SqliteConnection,
-        item_id: &str,
         name: &str,
+        color: Option<&HexColor>,
+        created_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> std::result::Result<Tag, sqlx::Error> {
+    ) -> std::result::Result<String, sqlx::Error> {
         let new_tag_id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
+        let slug = format!("tag:{nat_key}");
         SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::Tag, &nat_key).await?;
 
         let existing_id: Option<String> = sqlx::query_scalar(
             "SELECT e.id
              FROM entries e
              JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE cs.collection_role = 'tag' AND (e.id = ? OR LOWER(e.title) = LOWER(?))
+             WHERE cs.collection_role = 'tag'
+               AND (e.id = ? OR cs.slug = ? OR LOWER(e.title) = LOWER(?))
              LIMIT 1",
         )
         .bind(&new_tag_id)
+        .bind(&slug)
         .bind(name)
         .fetch_optional(&mut *conn)
         .await?;
 
-        let tag_id = if let Some(id) = existing_id {
-            id
-        } else {
-            let slug = format!("tag:{nat_key}");
-            let tag_insert = sqlx::query(
-                "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-                 VALUES (?, 'collection', ?, ?, ?)",
+        if let Some(id) = existing_id {
+            return Ok(id);
+        }
+
+        let tag_insert = sqlx::query(
+            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
+             VALUES (?, 'collection', ?, ?, ?)",
+        )
+        .bind(&new_tag_id)
+        .bind(name)
+        .bind(created_at)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+
+        if tag_insert.rows_affected() > 0 {
+            sqlx::query(
+                "INSERT OR IGNORE INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
+                 VALUES (?, ?, 'manual', 'tag', 0, ?)",
             )
             .bind(&new_tag_id)
-            .bind(name)
-            .bind(now)
-            .bind(now)
+            .bind(&slug)
+            .bind(color)
             .execute(&mut *conn)
             .await?;
-
-            if tag_insert.rows_affected() > 0 {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
-                     VALUES (?, ?, 'manual', 'tag', 0, NULL)",
-                )
-                .bind(&new_tag_id)
-                .bind(&slug)
-                .execute(&mut *conn)
-                .await?;
-                sqlx::query(
-                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('tag', ?, ?)",
-                )
-                .bind(&nat_key)
-                .bind(&new_tag_id)
-                .execute(&mut *conn)
-                .await?;
-                SyncRepo::record_activity(
-                    &mut *conn,
-                    ActivityEntityType::Tag,
-                    &new_tag_id,
-                    ActivityAction::Create,
-                    now,
-                )
-                .await?;
-            }
-            sqlx::query_scalar(
-                "SELECT e.id
-                 FROM entries e
-                 JOIN collection_specs cs ON cs.collection_id = e.id
-                 WHERE cs.collection_role = 'tag' AND (e.id = ? OR LOWER(e.title) = LOWER(?))
-                 LIMIT 1",
+            sqlx::query(
+                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                 VALUES ('tag', ?, ?)",
             )
+            .bind(&nat_key)
             .bind(&new_tag_id)
-            .bind(name)
-            .fetch_one(&mut *conn)
-            .await?
-        };
+            .execute(&mut *conn)
+            .await?;
+            SyncRepo::record_activity(
+                &mut *conn,
+                ActivityEntityType::Tag,
+                &new_tag_id,
+                ActivityAction::Create,
+                now,
+            )
+            .await?;
+        }
+        sqlx::query_scalar(
+            "SELECT e.id
+             FROM entries e
+             JOIN collection_specs cs ON cs.collection_id = e.id
+             WHERE cs.collection_role = 'tag'
+               AND (e.id = ? OR cs.slug = ? OR LOWER(e.title) = LOWER(?))
+             LIMIT 1",
+        )
+        .bind(&new_tag_id)
+        .bind(&slug)
+        .bind(name)
+        .fetch_one(&mut *conn)
+        .await
+    }
 
+    pub async fn get_or_create_and_attach_in_tx(
+        conn: &mut SqliteConnection,
+        item_id: &str,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<Tag, sqlx::Error> {
+        let tag_id = Self::get_or_create_in_tx(&mut *conn, name, None, now, now).await?;
         Self::attach_in_tx(&mut *conn, item_id, &tag_id, now).await?;
 
         let tag: Tag = sqlx::query_as(tag_select_sql!("AND e.id = ?"))
@@ -367,11 +359,13 @@ impl<'a> TagRepo<'a> {
     ) -> std::result::Result<(), sqlx::Error> {
         let res = sqlx::query(
             "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-             VALUES (?, ?, ?)",
+             SELECT cs.collection_id, ?, ?
+             FROM collection_specs cs
+             WHERE cs.collection_id = ? AND cs.collection_role = 'tag'",
         )
-        .bind(tag_id)
         .bind(item_id)
         .bind(now)
+        .bind(tag_id)
         .execute(&mut *conn)
         .await?;
         if res.rows_affected() > 0 {
@@ -419,12 +413,20 @@ impl<'a> TagRepo<'a> {
     pub async fn remove_from_item(&self, item_id: &str, tag_id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res =
-            sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
-                .bind(tag_id)
-                .bind(item_id)
-                .execute(&mut *tx)
-                .await?;
+        let res = sqlx::query(
+            "DELETE FROM collection_entries
+             WHERE collection_id = ?
+               AND entry_id = ?
+               AND EXISTS (
+                   SELECT 1 FROM collection_specs cs
+                   WHERE cs.collection_id = collection_entries.collection_id
+                     AND cs.collection_role = 'tag'
+               )",
+        )
+        .bind(tag_id)
+        .bind(item_id)
+        .execute(&mut *tx)
+        .await?;
         if res.rows_affected() == 0 {
             return Ok(false);
         }

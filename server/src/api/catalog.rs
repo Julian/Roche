@@ -271,7 +271,15 @@ pub(super) async fn catalog_want_add<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     ProblemJson(req): ProblemJson<WantEntryRequest>,
 ) -> Result<(StatusCode, Json<WantEntryResponse>), ApiError> {
-    let (queue, entry) = service.catalog().want_entry(&req.entry, req.queue.as_deref()).await?;
+    let has_explicit_metadata = req.entry.id.is_some()
+        || req.entry.url.is_some()
+        || !req.entry.identifiers.is_empty()
+        || !req.entry.creators.is_empty()
+        || req.entry.release_year.is_some();
+    let (queue, entry) = service
+        .catalog()
+        .want_resolved_or_upsert(&req.entry, has_explicit_metadata, None, req.queue.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(WantEntryResponse { queue, entry })))
 }
 
@@ -288,13 +296,9 @@ pub(super) async fn catalog_rank_cluster<F: FeedFetcher>(
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemQuery(q): ProblemQuery<ClusterQuery>,
 ) -> Result<Json<ClusterResponse>, ApiError> {
-    let focus_ids: Vec<String> = q
-        .focus
-        .as_deref()
-        .map(|raw| {
-            raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
-        })
-        .unwrap_or_default();
+    let focus_ids: Vec<String> = q.focus.as_deref().map_or_default(|raw| {
+        raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
+    });
     let filter = ClusterSelectFilter {
         max_k: q.max_k.unwrap_or(5),
         iteration: q.iteration.unwrap_or(0),

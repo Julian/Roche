@@ -616,7 +616,7 @@ private fun WantQueuesPane(
     val entries =
         activeQueue?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
 
-    if (queues.isEmpty() || entries.isEmpty()) {
+    if (queues.isEmpty()) {
         CompanionEmptyCard(
             title = "Your Want Queue is clear",
             body =
@@ -642,12 +642,22 @@ private fun WantQueuesPane(
                 },
             )
         }
-        WantQueueEntriesList(
-            entries = entries,
-            activeQueueId = activeQueue?.collectionId,
-            listState = listState,
-            onAction = onAction,
-        )
+        if (entries.isEmpty()) {
+            CompanionEmptyCard(
+                title = "No entries in ${activeQueue?.title ?: "Want Queue"} yet",
+                body =
+                    "Save movies, books, albums, or games you want to experience next and prioritize them locally.",
+                ctaLabel = "+ Add to Want Queue",
+                onCta = { onAction(MainAction.OpenQuickLogSheet(true)) },
+            )
+        } else {
+            WantQueueEntriesList(
+                entries = entries,
+                activeQueueId = activeQueue?.collectionId,
+                listState = listState,
+                onAction = onAction,
+            )
+        }
     }
 }
 

@@ -1,10 +1,12 @@
 package com.grayvines.roche.data
 
+import com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.PendingEntityKind
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.PeerSyncItemPayload
@@ -24,6 +26,7 @@ internal data class BuiltPeerSyncRequest(
     val sentFeedIds: Set<String>,
     val sentItemIds: Set<String>,
     val overflowItemIds: Set<String>,
+    val sentTombstoneKeys: Set<Pair<String, String>> = emptySet(),
     val sentCatalogBatch: OutgoingCatalogSyncBatch = OutgoingCatalogSyncBatch(),
 )
 
@@ -47,6 +50,7 @@ internal data class PeerSyncReconcileInput(
     val appliedMutations: List<PendingMutationEntity> = emptyList(),
     val sentFeedIds: Set<String>? = null,
     val sentItemIds: Set<String>? = null,
+    val sentTombstoneKeys: Set<Pair<String, String>>? = null,
     val overflowItemIds: Set<String> = emptySet(),
     val sentCatalogBatch: OutgoingCatalogSyncBatch = OutgoingCatalogSyncBatch(),
     val catalogStore: CatalogStore? = null,
@@ -95,14 +99,13 @@ internal suspend fun buildTrackedPeerSyncRequest(
             inclusiveSinceInstant = inclusiveSinceInstant,
         )
     val sentFeedIdSet = syncableFeeds.map { it.id }.toSet()
-    val nonOverflowSyncableItemIds =
-        syncablePeerItems.map { it.id }.filterNot { it in overflowItemIds }.toSet()
+    val sentItemIdSet = sentItems.map { it.id }.toSet()
     val catalogBatch =
         buildOutgoingCatalogSyncBatch(
             dao = dao,
             inclusiveSinceInstant = inclusiveSinceInstant,
             syncedFeedIds = sentFeedIdSet,
-            syncedItemIds = nonOverflowSyncableItemIds,
+            syncedItemIds = sentItemIdSet,
         )
     val itemPayloads =
         mapPeerSyncItemPayloads(sentItems, mutationsById, itemTagsByItemId, feedUrlsById, nowIso)
@@ -120,8 +123,9 @@ internal suspend fun buildTrackedPeerSyncRequest(
     return BuiltPeerSyncRequest(
         request = requestDto,
         sentFeedIds = sentFeedIdSet,
-        sentItemIds = sentItems.map { it.id }.toSet(),
+        sentItemIds = sentItemIdSet,
         overflowItemIds = overflowItemIds,
+        sentTombstoneKeys = tombstones.map { it.entityType.lowercase() to it.naturalKey }.toSet(),
         sentCatalogBatch = catalogBatch,
     )
 }
@@ -368,6 +372,12 @@ internal class PeerResponseReconciler(
                     overflowItemIds = input.overflowItemIds,
                 ),
         )
+        val cleanSyncTimestamp = response.syncTimestamp.trim()
+        if (input.overflowItemIds.isNotEmpty() && cleanSyncTimestamp.isNotBlank()) {
+            input.overflowItemIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk ->
+                dao.updateItemsInteractionAt(chunk, cleanSyncTimestamp)
+            }
+        }
         val store = input.catalogStore
         if (store != null) {
             store.withMutationLock {
@@ -392,43 +402,77 @@ internal class PeerResponseReconciler(
         val remoteTombstoneKeys =
             response.tombstones.map { it.entityType.lowercase() to it.naturalKey }.toSet()
         val liveFeedUrlsById = response.feeds.associate { it.id to it.url }
-        val liveFeedKeys = response.feeds.map { feedNaturalKey(it.url) }.toSet()
-        val liveItemKeys =
-            response.items
-                .map { item ->
-                    val fUrl = item.feedUrl ?: item.feedId?.let { liveFeedUrlsById[it] }
-                    itemNaturalKey(fUrl, item.url)
-                }
-                .toSet()
+        val liveFeedTsByKey = response.feeds.associate { feedNaturalKey(it.url) to it.lastPolled }
+        val liveItemTsByKey =
+            response.items.associate { item ->
+                val fUrl = item.feedUrl ?: item.feedId?.let { liveFeedUrlsById[it] }
+                itemNaturalKey(fUrl, item.url) to (item.interactionUpdatedAt ?: item.createdAt)
+            }
         val liveTagKeys = response.tags.map { tagNaturalKey(it.name) }.toSet()
 
         for (localTomb in dao.getAllTombstones()) {
-            val typeLower = localTomb.entityType.lowercase()
-            val keyPair = typeLower to localTomb.naturalKey
-            val isResurrectedOnPeer =
-                keyPair !in remoteTombstoneKeys &&
-                    when (typeLower) {
-                        "feed" -> localTomb.naturalKey in liveFeedKeys
-                        "item" -> localTomb.naturalKey in liveItemKeys
-                        "tag" -> localTomb.naturalKey in liveTagKeys
-                        else -> false
-                    }
-            if (isResurrectedOnPeer) {
+            val isResurrected =
+                isTombstoneResurrectedOnPeer(
+                    localTomb = localTomb,
+                    remoteTombstoneKeys = remoteTombstoneKeys,
+                    liveFeedTsByKey = liveFeedTsByKey,
+                    liveItemTsByKey = liveItemTsByKey,
+                    liveTagKeys = liveTagKeys,
+                )
+            if (isResurrected) {
                 dao.deleteTombstone(localTomb.entityType, localTomb.naturalKey)
             }
         }
 
         if (response.tombstones.isNotEmpty()) {
+            val existingByKey =
+                dao.getAllTombstones().associateBy { it.entityType.lowercase() to it.naturalKey }
             dao.upsertTombstones(
-                response.tombstones.map {
+                response.tombstones.map { incoming ->
+                    val current =
+                        existingByKey[incoming.entityType.lowercase() to incoming.naturalKey]
                     TombstoneEntity(
-                        entityType = it.entityType,
-                        naturalKey = it.naturalKey,
-                        deletedAt = it.deletedAt,
+                        entityType = incoming.entityType,
+                        naturalKey = incoming.naturalKey,
+                        deletedAt = selectNewerTombstoneTs(incoming.deletedAt, current?.deletedAt),
                     )
                 }
             )
         }
+    }
+
+    private fun isTombstoneResurrectedOnPeer(
+        localTomb: TombstoneEntity,
+        remoteTombstoneKeys: Set<Pair<String, String>>,
+        liveFeedTsByKey: Map<String, String?>,
+        liveItemTsByKey: Map<String, String?>,
+        liveTagKeys: Set<String>,
+    ): Boolean {
+        val typeLower = localTomb.entityType.lowercase()
+        val keyPair = typeLower to localTomb.naturalKey
+        if (keyPair in remoteTombstoneKeys) return false
+        val wasSent = input.sentTombstoneKeys == null || keyPair in input.sentTombstoneKeys
+        return when (typeLower) {
+            "feed" -> isFeedTombstoneResurrected(localTomb, liveFeedTsByKey, wasSent)
+            "item" ->
+                localTomb.naturalKey in liveItemTsByKey &&
+                    isPeerTsStrictlyAfter(
+                        liveItemTsByKey[localTomb.naturalKey],
+                        localTomb.deletedAt,
+                    )
+            "tag" -> wasSent && localTomb.naturalKey in liveTagKeys
+            else -> false
+        }
+    }
+
+    private fun isFeedTombstoneResurrected(
+        localTomb: TombstoneEntity,
+        liveFeedTsByKey: Map<String, String?>,
+        wasSent: Boolean,
+    ): Boolean {
+        if (localTomb.naturalKey !in liveFeedTsByKey) return false
+        val feedTs = liveFeedTsByKey[localTomb.naturalKey]
+        return if (feedTs != null) isPeerTsStrictlyAfter(feedTs, localTomb.deletedAt) else wasSent
     }
 
     private suspend fun clearSyncedMutations(
@@ -508,11 +552,15 @@ internal class PeerSyncCoordinator(
     internal suspend fun syncAndCooperativePoll(
         currentSettings: Settings,
         initialWeightOverride: Double? = null,
+        requestCursorOverride: String? = null,
     ): Int? {
+        val needsCatalogBackfill = dao.getLocalSyncFlag(FLAG_CATALOG_BACKFILL_NEEDED) != null
         val initialRound =
             executeSinglePeerSyncRound(
                 currentSettings = currentSettings,
                 weightOverride = initialWeightOverride,
+                ignoreSyncCursor = needsCatalogBackfill,
+                requestCursorOverride = requestCursorOverride,
             ) ?: return null
         var latestPeers = initialRound.response.activePeers
         onPeersUpdated(latestPeers)
@@ -526,6 +574,9 @@ internal class PeerSyncCoordinator(
                     onPeersUpdated(peers)
                 },
             )
+        if (needsCatalogBackfill) {
+            dao.deleteLocalSyncFlag(FLAG_CATALOG_BACKFILL_NEEDED)
+        }
         val pollOutcome =
             if (networkTier != NetworkTier.OFFLINE) {
                 pollCooperativeFeedsOnDevice(
@@ -617,9 +668,9 @@ internal class PeerSyncCoordinator(
     ): Settings {
         val cleanCandidate = candidateCursor.trim()
         val shouldPersist =
-            cleanCandidate.isNotBlank() &&
-                (!isIntermediatePage ||
-                    shouldAdvanceSyncCursor(settings.lastPeerSyncCursor, cleanCandidate))
+            !isIntermediatePage &&
+                cleanCandidate.isNotBlank() &&
+                shouldAdvanceSyncCursor(settings.lastPeerSyncCursor, cleanCandidate)
         return if (shouldPersist) {
             onSyncCursorUpdated(cleanCandidate)
             settings.copy(lastPeerSyncCursor = cleanCandidate)
@@ -680,6 +731,7 @@ internal class PeerSyncCoordinator(
                     isDeltaItems = true,
                     sentFeedIds = emptySet(),
                     sentItemIds = emptySet(),
+                    sentTombstoneKeys = emptySet(),
                     catalogStore = catalogStore,
                 ),
         )
@@ -689,6 +741,8 @@ internal class PeerSyncCoordinator(
     private suspend fun executeSinglePeerSyncRound(
         currentSettings: Settings,
         weightOverride: Double? = null,
+        ignoreSyncCursor: Boolean = false,
+        requestCursorOverride: String? = null,
     ): SinglePeerSyncResult? {
         val appliedFeedMutations = pushRemoteFeedMutations(currentSettings)
         val preloaded =
@@ -697,6 +751,13 @@ internal class PeerSyncCoordinator(
                 items = dao.getAllItems(),
                 mutations = dao.getAllPendingMutations(),
             )
+        val effectiveCursor =
+            requestCursorOverride
+                ?: if (ignoreSyncCursor) {
+                    null
+                } else {
+                    currentSettings.lastPeerSyncCursor
+                }
         val tracked =
             buildTrackedPeerSyncRequest(
                 dao = dao,
@@ -705,23 +766,12 @@ internal class PeerSyncCoordinator(
                         peerId = currentSettings.peerId,
                         deviceName = currentSettings.deviceName,
                         networkTier = networkTier,
-                        updatedAfter = currentSettings.lastPeerSyncCursor,
+                        updatedAfter = effectiveCursor,
                         weightOverride = weightOverride,
                     ),
                 preloaded = preloaded,
             )
-        val syncResponse = runSuspendCatching {
-            apiClient.syncPeer(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                request = tracked.request,
-            )
-        }
-            .onFailure { error ->
-                if (tracked.request.updatedAfter != null || error !is IOException) throw error
-            }
-            .getOrNull()
-        val response = syncResponse ?: return null
+        val response = callSyncPeerRound(currentSettings, tracked.request) ?: return null
         reconcilePeerSyncResponse(
             dao = dao,
             response = response,
@@ -732,6 +782,7 @@ internal class PeerSyncCoordinator(
                     appliedMutations = appliedFeedMutations,
                     sentFeedIds = tracked.sentFeedIds,
                     sentItemIds = tracked.sentItemIds,
+                    sentTombstoneKeys = tracked.sentTombstoneKeys,
                     overflowItemIds = tracked.overflowItemIds,
                     sentCatalogBatch = tracked.sentCatalogBatch,
                     catalogStore = catalogStore,
@@ -742,6 +793,23 @@ internal class PeerSyncCoordinator(
             cursorUsed = tracked.request.updatedAfter,
         )
     }
+
+    private suspend fun callSyncPeerRound(
+        currentSettings: Settings,
+        request: PeerSyncRequestDto,
+    ): PeerSyncResponseDto? = runSuspendCatching {
+        apiClient.syncPeer(
+            serverUrl = currentSettings.serverUrl,
+            token = currentSettings.bearerToken,
+            request = request,
+        )
+    }
+        .onFailure { error ->
+            val allowBootstrapFallback =
+                request.updatedAfter == null && isOversizedResponseError(error)
+            if (!allowBootstrapFallback) throw error
+        }
+        .getOrNull()
 
     private suspend fun pushRemoteFeedMutations(
         currentSettings: Settings
@@ -839,4 +907,21 @@ internal suspend fun pollCooperativeSlice(
         }
         .awaitAll()
         .mapNotNull { it.getOrNull() }
+}
+
+internal fun isOversizedResponseError(error: Throwable): Boolean =
+    error is IOException &&
+        error.message?.contains("exceeds maximum allowed size", ignoreCase = true) == true
+
+internal fun isPeerTsStrictlyAfter(peerIso: String?, tombDeletedAtIso: String): Boolean {
+    val peerInst = peerIso?.trim()?.let { runCatching { Instant.parse(it) }.getOrNull() }
+    val tombInst = runCatching { Instant.parse(tombDeletedAtIso.trim()) }.getOrNull()
+    return peerInst != null && tombInst != null && peerInst.isAfter(tombInst)
+}
+
+internal fun selectNewerTombstoneTs(incomingIso: String, localIso: String?): String {
+    if (localIso.isNullOrBlank()) return incomingIso
+    val incInst = runCatching { Instant.parse(incomingIso.trim()) }.getOrNull() ?: return localIso
+    val locInst = runCatching { Instant.parse(localIso.trim()) }.getOrNull() ?: return incomingIso
+    return if (locInst.isAfter(incInst)) localIso else incomingIso
 }

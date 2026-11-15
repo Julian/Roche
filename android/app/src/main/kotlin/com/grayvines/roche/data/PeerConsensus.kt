@@ -3,6 +3,7 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.FeedEntity
+import java.net.IDN
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.URI
@@ -11,6 +12,7 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
+import java.util.Locale
 import java.util.UUID
 import kotlin.math.ln
 
@@ -31,6 +33,8 @@ enum class NetworkTier(val wireValue: String, val defaultWeight: Double, val dis
 
 fun interface NetworkTierProvider {
     fun currentNetworkTier(): NetworkTier
+
+    fun isVpnTransportActive(): Boolean = true
 }
 
 @Suppress("LongParameterList")
@@ -92,43 +96,218 @@ internal fun deterministicEntityUuid(kind: String, naturalKey: String): String {
 }
 
 internal fun canonicalizeSyncUrl(raw: String): String {
-    val trimmed = raw.trim()
+    val trimmed = raw.trim().filterNot { it == '\t' || it == '\r' || it == '\n' }
     if (trimmed.isEmpty()) return ""
-    val canonical = runCatching {
-        val uri = URI(trimmed)
-        val scheme = uri.scheme?.lowercase()
-        val host = uri.host?.lowercase()
-        if (scheme.isNullOrBlank() || host.isNullOrBlank()) {
-            null
-        } else {
-            buildCanonicalHttpUriString(uri = uri, scheme = scheme, host = host)
-        }
-    }
-        .getOrNull()
-    return canonical ?: trimmed.lowercase()
+    return canonicalizeHierarchicalUrl(trimmed) ?: trimmed.lowercase(Locale.ROOT)
 }
 
-private fun buildCanonicalHttpUriString(uri: URI, scheme: String, host: String): String {
-    val isHttpOrHttps = scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS
+private data class SplitHierarchicalUrl(
+    val scheme: String,
+    val userInfo: String?,
+    val host: String,
+    val port: Int,
+    val rawPath: String,
+    val rawQuery: String?,
+    val rawFragment: String?,
+)
+
+private fun canonicalizeHierarchicalUrl(trimmed: String): String? {
+    val split = splitHierarchicalUrl(trimmed) ?: return null
+    val isWebScheme =
+        split.scheme == SCHEME_HTTP ||
+            split.scheme == SCHEME_HTTPS ||
+            split.scheme == "ws" ||
+            split.scheme == "wss"
     val defaultPort =
-        when (scheme) {
-            SCHEME_HTTP -> DEFAULT_HTTP_PORT
-            SCHEME_HTTPS -> DEFAULT_HTTPS_PORT
+        when (split.scheme) {
+            SCHEME_HTTP,
+            "ws" -> DEFAULT_HTTP_PORT
+            SCHEME_HTTPS,
+            "wss" -> DEFAULT_HTTPS_PORT
             else -> -1
         }
-    val portPart =
-        if (uri.port != -1 && uri.port != defaultPort) {
-            ":${uri.port}"
-        } else {
-            ""
-        }
-    val userInfoPart = uri.rawUserInfo?.let { "$it@" }.orEmpty()
-    val rawPath = uri.rawPath.orEmpty()
-    val normalizedPath = if (isHttpOrHttps && rawPath.isEmpty()) "/" else rawPath
-    val queryPart = uri.rawQuery?.let { "?$it" }.orEmpty()
-    val fragmentPart = uri.rawFragment?.let { "#$it" }.orEmpty()
-    return "$scheme://$userInfoPart$host$portPart$normalizedPath$queryPart$fragmentPart"
+    val portPart = if (split.port != -1 && split.port != defaultPort) ":${split.port}" else ""
+    val userInfoPart =
+        split.userInfo?.let { "${percentEncodeUrlText(it, URL_USERINFO_SAFE)}@" }.orEmpty()
+    val normalizedPath = normalizeUrlPath(split.rawPath, defaultSlashIfEmpty = isWebScheme)
+    val queryPart =
+        split.rawQuery?.let { "?${percentEncodeUrlText(it, URL_QUERY_FRAGMENT_SAFE)}" }.orEmpty()
+    val fragmentPart =
+        split.rawFragment?.let { "#${percentEncodeUrlText(it, URL_QUERY_FRAGMENT_SAFE)}" }.orEmpty()
+    return "${split.scheme}://$userInfoPart${split.host}$portPart$normalizedPath$queryPart$fragmentPart"
 }
+
+private fun splitHierarchicalUrl(trimmed: String): SplitHierarchicalUrl? {
+    val sepIdx = trimmed.indexOf("://")
+    if (sepIdx <= 0) return null
+    val scheme = trimmed.substring(0, sepIdx).lowercase(Locale.ROOT)
+    val validScheme =
+        scheme[0] in 'a'..'z' &&
+            scheme.all { it in 'a'..'z' || it in '0'..'9' || it == '+' || it == '-' || it == '.' }
+    if (!validScheme) return null
+
+    val afterScheme = trimmed.substring(sepIdx + URL_SCHEME_SEP_LEN)
+    val withoutFrag = afterScheme.substringBefore('#')
+    val rawFragment =
+        afterScheme.substringAfter('#', missingDelimiterValue = MISSING_DELIM).takeIf {
+            it != MISSING_DELIM
+        }
+    val withoutQuery = withoutFrag.substringBefore('?')
+    val rawQuery =
+        withoutFrag.substringAfter('?', missingDelimiterValue = MISSING_DELIM).takeIf {
+            it != MISSING_DELIM
+        }
+    val slashIdx = withoutQuery.indexOf('/')
+    val authority = if (slashIdx == -1) withoutQuery else withoutQuery.substring(0, slashIdx)
+    val rawPath = if (slashIdx == -1) "" else withoutQuery.substring(slashIdx)
+    val (userInfo, host, port) = parseUrlAuthority(authority) ?: return null
+    return SplitHierarchicalUrl(scheme, userInfo, host, port, rawPath, rawQuery, rawFragment)
+}
+
+private fun parseUrlAuthority(authority: String): Triple<String?, String, Int>? {
+    if (authority.isEmpty()) return null
+    val atIdx = authority.lastIndexOf('@')
+    val userInfo = if (atIdx != -1) authority.substring(0, atIdx) else null
+    val hostPort = if (atIdx != -1) authority.substring(atIdx + 1) else authority
+    val (rawHost, portStr) = splitHostAndPort(hostPort) ?: return null
+    val port =
+        if (portStr == null) {
+            -1
+        } else {
+            portStr.toIntOrNull()?.takeIf { it in 1..MAX_URL_PORT } ?: return null
+        }
+    val asciiHost = canonicalizeAuthorityHost(rawHost) ?: return null
+    return Triple(userInfo, asciiHost, port)
+}
+
+private fun splitHostAndPort(hostPort: String): Pair<String, String?>? {
+    if (hostPort.isEmpty()) return null
+    return if (hostPort.startsWith("[")) {
+        val closeIdx = hostPort.indexOf(']')
+        val rest = if (closeIdx > 1) hostPort.substring(closeIdx + 1) else null
+        when {
+            rest == null -> null
+            rest.isEmpty() -> hostPort.substring(0, closeIdx + 1) to null
+            rest.startsWith(":") && rest.length > 1 ->
+                hostPort.substring(0, closeIdx + 1) to rest.substring(1)
+            else -> null
+        }
+    } else {
+        val colonIdx = hostPort.lastIndexOf(':')
+        if (colonIdx == -1) {
+            hostPort to null
+        } else {
+            hostPort.substring(0, colonIdx) to hostPort.substring(colonIdx + 1)
+        }
+    }
+}
+
+private fun canonicalizeAuthorityHost(rawHost: String): String? {
+    if (rawHost.isEmpty()) return null
+    if (rawHost.startsWith("[") && rawHost.endsWith("]")) {
+        val lower = rawHost.lowercase(Locale.ROOT)
+        return runCatching { URI("http://$lower").host?.lowercase(Locale.ROOT) }.getOrNull()
+    }
+    val ascii = runCatching {
+        IDN.toASCII(rawHost, IDN.ALLOW_UNASSIGNED).lowercase(Locale.ROOT)
+    }
+        .getOrNull()
+        ?.takeIf { it.isNotEmpty() && it.none { ch -> ch <= ' ' || ch in "/?#@\\[]" } }
+    return ascii
+}
+
+private fun normalizeUrlPath(rawPath: String, defaultSlashIfEmpty: Boolean): String {
+    if (rawPath.isEmpty()) return if (defaultSlashIfEmpty) "/" else ""
+    val out = ArrayList<String>()
+    val rawSegments = rawPath.removePrefix("/").split('/')
+    var trailingSlash = rawPath.endsWith("/")
+    for ((idx, seg) in rawSegments.withIndex()) {
+        trailingSlash = applyUrlPathSegment(out, seg, idx == rawSegments.lastIndex, trailingSlash)
+    }
+    return formatNormalizedPath(out, trailingSlash)
+}
+
+private fun applyUrlPathSegment(
+    out: MutableList<String>,
+    seg: String,
+    isLast: Boolean,
+    currentTrailingSlash: Boolean,
+): Boolean =
+    when {
+        seg.isEmpty() -> {
+            currentTrailingSlash
+        }
+        isSingleDotSegment(seg) -> {
+            currentTrailingSlash || isLast
+        }
+        isDoubleDotSegment(seg) -> {
+            if (out.isNotEmpty()) out.removeAt(out.lastIndex)
+            currentTrailingSlash || isLast
+        }
+        else -> {
+            out.add(percentEncodeUrlText(seg, URL_PATH_SAFE))
+            currentTrailingSlash
+        }
+    }
+
+private fun formatNormalizedPath(segments: List<String>, trailingSlash: Boolean): String =
+    if (segments.isEmpty()) {
+        "/"
+    } else {
+        buildString {
+            append('/')
+            append(segments.joinToString("/"))
+            if (trailingSlash) append('/')
+        }
+    }
+
+private fun isSingleDotSegment(seg: String): Boolean =
+    seg == "." || seg.equals("%2e", ignoreCase = true)
+
+private fun isDoubleDotSegment(seg: String): Boolean =
+    seg == ".." ||
+        seg.equals(".%2e", ignoreCase = true) ||
+        seg.equals("%2e.", ignoreCase = true) ||
+        seg.equals("%2e%2e", ignoreCase = true)
+
+private fun percentEncodeUrlText(input: String, safeAsciiChars: String): String = buildString {
+    var i = 0
+    while (i < input.length) {
+        if (isPercentTripletAt(input, i)) {
+            append(input, i, i + PERCENT_TRIPLET_LEN)
+            i += PERCENT_TRIPLET_LEN
+        } else {
+            val cp = input.codePointAt(i)
+            appendEncodedCodePoint(cp, safeAsciiChars)
+            i += Character.charCount(cp)
+        }
+    }
+}
+
+private fun StringBuilder.appendEncodedCodePoint(cp: Int, safeAsciiChars: String) {
+    val ch = cp.toChar()
+    if (
+        cp in ASCII_PRINTABLE_MIN..ASCII_PRINTABLE_MAX &&
+            (ch.isLetterOrDigit() || ch in safeAsciiChars)
+    ) {
+        append(ch)
+        return
+    }
+    for (b in String(Character.toChars(cp)).toByteArray(StandardCharsets.UTF_8)) {
+        val unsigned = b.toInt() and IPV4_OCTET_MAX
+        append('%')
+        append(HEX_UPPER[unsigned ushr HEX_NIBBLE_SHIFT])
+        append(HEX_UPPER[unsigned and HEX_LOW_NIBBLE_MASK])
+    }
+}
+
+private fun isPercentTripletAt(text: String, idx: Int): Boolean =
+    text[idx] == '%' &&
+        idx + 2 < text.length &&
+        isAsciiHexDigit(text[idx + 1]) &&
+        isAsciiHexDigit(text[idx + 2])
+
+private fun isAsciiHexDigit(ch: Char): Boolean = ch in '0'..'9' || ch in 'a'..'f' || ch in 'A'..'F'
 
 internal fun feedNaturalKey(url: String): String = canonicalizeSyncUrl(url)
 
@@ -182,6 +361,9 @@ internal fun deterministicConsumptionLogId(
         "${entryId.trim()}\u0000$tsMillis\u0000${status.trim().lowercase()}",
     )
 
+internal fun deterministicAutoLogId(entryId: String): String =
+    deterministicEntityUuid("auto_consumption_log", entryId.trim())
+
 internal fun canonicalOrderingJson(ordering: List<List<String>>): String =
     ordering.joinToString(prefix = "[", postfix = "]", separator = ",") { group ->
         group
@@ -224,9 +406,9 @@ internal fun rendezvousUniformUnit(peerId: String, feedUrl: String, epoch: Long)
         MessageDigest.getInstance("SHA-256").run {
             update("roche:hrw:v1:".toByteArray(StandardCharsets.UTF_8))
             update(peerId.toByteArray(StandardCharsets.UTF_8))
-            update("\u0000".toByteArray(StandardCharsets.UTF_8))
+            update(byteArrayOf(0))
             update(feedUrl.toByteArray(StandardCharsets.UTF_8))
-            update("\u0000".toByteArray(StandardCharsets.UTF_8))
+            update(byteArrayOf(0))
             update(epoch.toString().toByteArray(StandardCharsets.UTF_8))
             digest()
         }
@@ -382,39 +564,92 @@ internal fun shouldPeerPollFeed(
 }
 
 internal fun isSyncablePublicUrl(rawUrl: String): Boolean {
-    val uri = runCatching { URI(rawUrl.trim()) }.getOrNull() ?: return false
-    val scheme = uri.scheme?.lowercase()
-    val rawHost = uri.host?.lowercase()
-    val allowedScheme = scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS
+    val split = splitHierarchicalUrl(rawUrl.trim()) ?: return false
+    val allowedScheme = split.scheme == SCHEME_HTTP || split.scheme == SCHEME_HTTPS
     val allowedPort =
-        uri.port == -1 || uri.port == DEFAULT_HTTP_PORT || uri.port == DEFAULT_HTTPS_PORT
+        split.port == -1 || split.port == DEFAULT_HTTP_PORT || split.port == DEFAULT_HTTPS_PORT
     return allowedScheme &&
-        uri.rawUserInfo == null &&
+        split.userInfo == null &&
         allowedPort &&
-        !rawHost.isNullOrBlank() &&
-        isPublicHost(rawHost)
+        split.host.isNotBlank() &&
+        isPublicHost(split.host)
 }
 
 internal fun isSyncableItemUrl(rawUrl: String): Boolean {
-    val uri = runCatching { URI(rawUrl.trim()) }.getOrNull() ?: return false
-    val scheme = uri.scheme?.lowercase()
-    val host = uri.host?.trim('[', ']')
-    return (scheme == SCHEME_HTTP || scheme == SCHEME_HTTPS) &&
-        uri.rawUserInfo == null &&
-        !host.isNullOrBlank()
+    val split = splitHierarchicalUrl(rawUrl.trim()) ?: return false
+    val host = split.host.trim('[', ']')
+    return (split.scheme == SCHEME_HTTP || split.scheme == SCHEME_HTTPS) &&
+        split.userInfo == null &&
+        host.isNotBlank()
 }
 
-private fun isPublicHost(rawHost: String): Boolean {
-    if (rawHost.startsWith("[") && rawHost.endsWith("]")) {
-        return isPublicIpv6Literal(rawHost)
+internal fun isPublicHost(rawHost: String): Boolean {
+    val lower = rawHost.trim().lowercase(Locale.ROOT)
+    if (lower.startsWith("[") && lower.endsWith("]")) {
+        return isPublicIpv6Literal(lower)
     }
-    val normalized = rawHost.trimEnd('.')
+    val normalized = lower.trimEnd('.')
     val labels = normalized.split('.')
     return when {
         normalized.isEmpty() || '.' !in normalized || labels.any { it.isEmpty() } -> false
         normalized.all { it.isDigit() || it == '.' } -> isPublicIpv4Literal(normalized)
         labels.last().all { it.isDigit() } -> false
         else -> DISALLOWED_DOMAIN_SUFFIXES.none { normalized.endsWith(it) }
+    }
+}
+
+internal fun isPublicInetAddress(addr: InetAddress): Boolean =
+    if (addr is Inet4Address) {
+        isPublicIpv4Bytes(addr.address)
+    } else {
+        isPublicIpv6Address(addr)
+    }
+
+internal fun isLoopbackHost(rawHost: String): Boolean {
+    val lower = rawHost.trim().lowercase(Locale.ROOT).trimEnd('.')
+    return lower == "localhost" ||
+        lower == "10.0.2.2" ||
+        lower == "[::1]" ||
+        lower == "::1" ||
+        lower.startsWith("127.") &&
+            lower.split('.').let { parts ->
+                parts.size == IPV4_OCTET_COUNT &&
+                    parts.all { it.toIntOrNull() in 0..IPV4_OCTET_MAX }
+            }
+}
+
+internal fun isTailnetOnlyHost(rawHost: String): Boolean {
+    val lower = rawHost.trim().lowercase(Locale.ROOT).trimEnd('.')
+    return lower == "roche" || isTailscaleHostOrIp(lower)
+}
+
+internal fun isTailscaleHostOrIp(rawHost: String): Boolean {
+    val lower = rawHost.trim().lowercase(Locale.ROOT).trimEnd('.')
+    if (lower.endsWith(TS_NET_SUFFIX) && lower.length > TS_NET_SUFFIX.length) return true
+    if (lower.startsWith("[") && lower.endsWith("]")) {
+        return runCatching { isTailscaleInetAddress(InetAddress.getByName(lower)) }
+            .getOrDefault(false)
+    }
+    val octets =
+        lower.split('.').mapNotNull { part ->
+            part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
+        }
+    return octets.size == IPV4_OCTET_COUNT &&
+        octets[0] == IPV4_CGNAT_100 &&
+        octets[1] in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
+}
+
+internal fun isTailscaleInetAddress(addr: InetAddress): Boolean {
+    val bytes = addr.address
+    return if (addr is Inet4Address) {
+        bytes.size == IPV4_OCTET_COUNT &&
+            bytes[0].toInt() and IPV4_OCTET_MAX == IPV4_CGNAT_100 &&
+            bytes[1].toInt() and IPV4_OCTET_MAX in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
+    } else {
+        bytes.size == IPV6_BYTE_COUNT &&
+            TAILSCALE_ULA_PREFIX.indices.all { idx ->
+                bytes[idx].toInt() and IPV4_OCTET_MAX == TAILSCALE_ULA_PREFIX[idx]
+            }
     }
 }
 
@@ -448,12 +683,7 @@ private fun isPublicIpv4Octets(first: Int, second: Int): Boolean {
 }
 
 private fun isPublicIpv6Literal(bracketedHost: String): Boolean = runCatching {
-    val addr = InetAddress.getByName(bracketedHost)
-    if (addr is Inet4Address) {
-        isPublicIpv4Bytes(addr.address)
-    } else {
-        isPublicIpv6Address(addr)
-    }
+    isPublicInetAddress(InetAddress.getByName(bracketedHost))
 }
     .getOrDefault(false)
 
@@ -473,8 +703,20 @@ private const val SCHEME_HTTP = "http"
 private const val SCHEME_HTTPS = "https"
 private const val DEFAULT_HTTP_PORT = 80
 private const val DEFAULT_HTTPS_PORT = 443
+private const val MAX_URL_PORT = 65_535
+private const val HEX_UPPER = "0123456789ABCDEF"
+private const val URL_USERINFO_SAFE = "-._~!$&'()*+,;=:"
+private const val URL_PATH_SAFE = "-._~!$&'()*+,;=:@"
+private const val URL_QUERY_FRAGMENT_SAFE = "-._~!$&'()*+,;=:@/?%"
 private const val IPV4_OCTET_COUNT = 4
+private const val IPV6_BYTE_COUNT = 16
 private const val IPV4_OCTET_MAX = 255
+private const val TAILSCALE_ULA_B0 = 0xfd
+private const val TAILSCALE_ULA_B1 = 0x7a
+private const val TAILSCALE_ULA_B2 = 0x11
+private const val TAILSCALE_ULA_B3 = 0x5c
+private const val TAILSCALE_ULA_B4 = 0xa1
+private const val TAILSCALE_ULA_B5 = 0xe0
 private const val IPV4_PRIVATE_10 = 10
 private const val IPV4_PRIVATE_172 = 172
 private const val IPV4_PRIVATE_172_MIN = 16
@@ -490,8 +732,25 @@ private const val IPV4_CGNAT_MAX = 127
 private const val IPV4_MULTICAST_START = 224
 private const val IPV6_ULA_MASK = 0xfe
 private const val IPV6_ULA_PREFIX = 0xfc
+private const val TS_NET_SUFFIX = ".ts.net"
+private const val MISSING_DELIM = "\u0000"
+private const val URL_SCHEME_SEP_LEN = 3
+private const val PERCENT_TRIPLET_LEN = 3
+private const val ASCII_PRINTABLE_MIN = 0x21
+private const val ASCII_PRINTABLE_MAX = 0x7E
+private const val HEX_NIBBLE_SHIFT = 4
+private const val HEX_LOW_NIBBLE_MASK = 0x0F
+private val TAILSCALE_ULA_PREFIX =
+    intArrayOf(
+        TAILSCALE_ULA_B0,
+        TAILSCALE_ULA_B1,
+        TAILSCALE_ULA_B2,
+        TAILSCALE_ULA_B3,
+        TAILSCALE_ULA_B4,
+        TAILSCALE_ULA_B5,
+    )
 private val DISALLOWED_DOMAIN_SUFFIXES =
-    listOf(".local", ".lan", ".internal", ".home.arpa", ".ts.net", ".localhost", ".home")
+    listOf(".local", ".lan", ".internal", ".home.arpa", TS_NET_SUFFIX, ".localhost", ".home")
 internal const val DEFAULT_ONLINE_PEER_WEIGHT = 1.0
 private const val WIRED_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT
 private const val WIFI_DEFAULT_WEIGHT = DEFAULT_ONLINE_PEER_WEIGHT

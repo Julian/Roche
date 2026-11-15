@@ -22,6 +22,18 @@ pub(super) enum ByteRangeParse {
     Unsatisfiable,
 }
 
+const MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
+const PDF_MEDIA_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; object-src 'self' blob:; frame-src 'self' blob:; img-src 'self' data: blob:; style-src 'unsafe-inline'; frame-ancestors 'sameorigin'; base-uri 'none'; form-action 'none'";
+
+#[must_use]
+const fn media_csp_for_content_type(content_type: &str) -> &'static str {
+    if content_type.eq_ignore_ascii_case("application/pdf") {
+        PDF_MEDIA_CONTENT_SECURITY_POLICY
+    } else {
+        MEDIA_CONTENT_SECURITY_POLICY
+    }
+}
+
 pub(super) async fn media_get<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     ProblemPath(id): ProblemPath<String>,
@@ -77,6 +89,11 @@ pub async fn serve_media_stream<F: FeedFetcher>(
                         (header::CONTENT_DISPOSITION, disposition),
                         (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
                         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                        (header::REFERRER_POLICY, "no-referrer".to_string()),
+                        (
+                            header::CONTENT_SECURITY_POLICY,
+                            media_csp_for_content_type(stream.content_type).to_string(),
+                        ),
                     ],
                     body,
                 )
@@ -85,6 +102,7 @@ pub async fn serve_media_stream<F: FeedFetcher>(
         }
     }
 
+    let csp = media_csp_for_content_type(stream.content_type).to_string();
     let body = Body::from_stream(ReaderStream::new(stream.file));
     Ok((
         StatusCode::OK,
@@ -95,6 +113,8 @@ pub async fn serve_media_stream<F: FeedFetcher>(
             (header::CONTENT_DISPOSITION, disposition),
             (header::CACHE_CONTROL, "private, max-age=86400".to_string()),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::REFERRER_POLICY, "no-referrer".to_string()),
+            (header::CONTENT_SECURITY_POLICY, csp),
         ],
         body,
     )

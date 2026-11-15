@@ -1,0 +1,148 @@
+mod diary_queue;
+mod entry;
+mod lists;
+
+use std::{collections::HashMap, fmt::Write as _};
+
+use serde::Deserialize;
+
+use super::html::esc;
+use crate::{
+    db::{ConsumptionStatus, EntryKind},
+    scheduler::FeedFetcher,
+    service::RocheService,
+};
+
+pub(super) use diary_queue::{
+    diary_get, post_quick_log, post_want_complete, post_want_remove, queue_get,
+};
+pub(super) use entry::{entry_detail_get, post_entry_list_add, post_entry_log, post_entry_merge};
+pub(super) use lists::{
+    list_detail_get, lists_get, post_list_add_entry, post_list_create, post_list_remove_entry,
+};
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ListPageQuery {
+    pub page: Option<usize>,
+    pub notice: Option<String>,
+    pub err: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DiaryFilterQuery {
+    pub year: Option<i32>,
+    pub status: Option<String>,
+    pub notice: Option<String>,
+    pub err: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct CreateListForm {
+    pub title: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AddListEntryForm {
+    pub title_or_id: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub creators: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct EntryLogForm {
+    pub status: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub rank_after: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct EntryAddToListForm {
+    pub list_slug_or_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct EntryMergeForm {
+    pub canonical_query: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct QuickLogForm {
+    pub title: String,
+    pub kind: String,
+    #[serde(default)]
+    pub creators: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+    pub action: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub rank_after: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WantCompleteForm {
+    #[serde(default)]
+    pub rank_after: Option<String>,
+}
+
+pub(super) async fn load_artist_id_by_lower_name<F: FeedFetcher>(
+    service: &RocheService<F>,
+    creator_names: &[String],
+) -> HashMap<String, String> {
+    service.catalog().find_artist_ids_by_names(creator_names).await.unwrap_or_default()
+}
+
+pub(super) fn render_kind_options(selected: EntryKind) -> String {
+    const LOGGABLE: [EntryKind; 10] = [
+        EntryKind::Movie,
+        EntryKind::Album,
+        EntryKind::Book,
+        EntryKind::Tv,
+        EntryKind::Game,
+        EntryKind::Song,
+        EntryKind::Article,
+        EntryKind::Paper,
+        EntryKind::Video,
+        EntryKind::PodcastEpisode,
+    ];
+    let mut out = String::with_capacity(512);
+    for k in LOGGABLE {
+        let sel = if k == selected { " selected" } else { "" };
+        let _ = write!(
+            out,
+            "<option value=\"{}\"{sel}>{}</option>",
+            k.as_str(),
+            esc(k.display_label())
+        );
+    }
+    out
+}
+
+pub(super) fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
+    raw.map_or_default(|s| {
+        s.split(',').map(str::trim).filter(|c| !c.is_empty()).map(ToOwned::to_owned).collect()
+    })
+}
+
+pub(super) fn parse_optional_year(raw: Option<&str>) -> Option<i32> {
+    raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok())
+}
+
+pub(super) fn parse_consumption_status(raw: &str) -> ConsumptionStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "started" => ConsumptionStatus::Started,
+        "abandoned" => ConsumptionStatus::Abandoned,
+        _ => ConsumptionStatus::Consumed,
+    }
+}

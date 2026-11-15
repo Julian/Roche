@@ -17,6 +17,7 @@ import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
 import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
@@ -29,6 +30,7 @@ internal constructor(
     private val tokenCipher: TokenCipher,
 ) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
+    private val peerIdPersistAttempted = AtomicBoolean(false)
     @Volatile private var cachedDecodedToken: Pair<String, String>? = null
     @Volatile
     internal var latestSettings: Settings? = null
@@ -36,7 +38,7 @@ internal constructor(
 
     val settings: Flow<Settings> =
         dataStore.data
-            .onEach { prefs -> ensurePeerIdPersisted(prefs) }
+            .onEach { prefs -> ensurePeerIdPersistedOnce(prefs) }
             .catch { exception ->
                 if (exception is IOException) {
                     emit(emptyPreferences())
@@ -52,8 +54,12 @@ internal constructor(
 
     suspend fun prewarm(): Settings = settings.first()
 
-    private suspend fun ensurePeerIdPersisted(prefs: Preferences) {
-        if (!prefs[KEY_PEER_ID].isNullOrBlank()) return
+    private suspend fun ensurePeerIdPersistedOnce(prefs: Preferences) {
+        if (!prefs[KEY_PEER_ID].isNullOrBlank()) {
+            peerIdPersistAttempted.set(true)
+            return
+        }
+        if (!peerIdPersistAttempted.compareAndSet(false, true)) return
         runSuspendCatching {
             dataStore.edit { mutablePrefs ->
                 if (mutablePrefs[KEY_PEER_ID].isNullOrBlank()) {
@@ -61,27 +67,43 @@ internal constructor(
                 }
             }
         }
+            .onFailure { peerIdPersistAttempted.set(false) }
     }
 
     suspend fun update(transform: (Settings) -> Settings) {
         dataStore.edit { prefs ->
+            val rawStoredToken = prefs[KEY_BEARER_TOKEN]
             val current = prefs.toSettings()
-            val transformed = transform(current).clamped()
+            val rawTransformed = transform(current)
+            val transformed = rawTransformed.clamped()
+            val preserveUndecryptableToken =
+                !rawStoredToken.isNullOrBlank() &&
+                    current.bearerToken.isEmpty() &&
+                    transformed.bearerToken.isEmpty() &&
+                    transform(current.copy(bearerToken = TOKEN_PRESERVE_PROBE)).bearerToken ==
+                        TOKEN_PRESERVE_PROBE
             val credentialsChanged =
                 transformed.serverUrl != current.serverUrl ||
-                    transformed.bearerToken != current.bearerToken
+                    transformed.bearerToken != current.bearerToken ||
+                    !rawStoredToken.isNullOrBlank() &&
+                        current.bearerToken.isEmpty() &&
+                        !preserveUndecryptableToken
             val updated =
-                if (
-                    credentialsChanged &&
-                        transformed.lastPeerSyncCursor == current.lastPeerSyncCursor
-                ) {
-                    transformed.copy(lastPeerSyncCursor = "")
-                } else {
-                    transformed
-                }
+                (if (
+                        credentialsChanged &&
+                            transformed.lastPeerSyncCursor == current.lastPeerSyncCursor
+                    ) {
+                        transformed.copy(lastPeerSyncCursor = "")
+                    } else {
+                        transformed
+                    })
+                    .copy(hasUndecryptableToken = preserveUndecryptableToken)
             prefs[KEY_SERVER_URL] = updated.serverUrl
-            prefs[KEY_BEARER_TOKEN] = encodeBearerToken(updated.bearerToken)
+            if (!preserveUndecryptableToken) {
+                prefs[KEY_BEARER_TOKEN] = encodeBearerToken(updated.bearerToken)
+            }
             prefs[KEY_PEER_ID] = updated.peerId
+            peerIdPersistAttempted.set(true)
             prefs[KEY_DEVICE_NAME] = updated.deviceName
             prefs[KEY_SWIPE_TO_ARCHIVE] = updated.swipeToArchive
             prefs[KEY_THEME_MODE] = updated.themeMode.name
@@ -145,10 +167,12 @@ internal constructor(
     }
 
     @Suppress("CyclomaticComplexMethod")
-    private fun Preferences.toSettings(): Settings =
-        Settings(
+    private fun Preferences.toSettings(): Settings {
+        val rawStoredToken = this[KEY_BEARER_TOKEN]?.trim().orEmpty()
+        val decodedToken = decodeBearerToken(rawStoredToken)
+        return Settings(
                 serverUrl = this[KEY_SERVER_URL] ?: Settings.DEFAULT_SERVER_URL,
-                bearerToken = decodeBearerToken(this[KEY_BEARER_TOKEN]),
+                bearerToken = decodedToken,
                 peerId = this[KEY_PEER_ID]?.takeIf { it.isNotBlank() } ?: fallbackPeerId,
                 deviceName =
                     this[KEY_DEVICE_NAME]?.takeIf { it.isNotBlank() }
@@ -182,8 +206,10 @@ internal constructor(
                     this[KEY_DEFAULT_PLAYBACK_SPEED] ?: Settings.DEFAULT_PLAYBACK_SPEED,
                 skipSilenceEnabled = this[KEY_SKIP_SILENCE_ENABLED] ?: false,
                 smartRewindEnabled = this[KEY_SMART_REWIND_ENABLED] ?: true,
+                hasUndecryptableToken = rawStoredToken.isNotEmpty() && decodedToken.isEmpty(),
             )
             .clamped()
+    }
 
     companion object {
         private const val STORE_NAME = "roche_settings"
@@ -210,12 +236,13 @@ internal constructor(
                     corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
                     produceFile = { appContext.preferencesDataStoreFile(STORE_NAME) },
                 )
-            return SettingsRepository(dataStore = store, tokenCipher = createDefaultTokenCipher())
+            return SettingsRepository(dataStore = store, tokenCipher = AndroidKeystoreTokenCipher())
         }
     }
 }
 
 private const val LEGACY_SEARCH_TAB_NAME = "SEARCH"
+private const val TOKEN_PRESERVE_PROBE = "\u0000__preserve_token_probe__"
 
 internal fun parseSavedNavTab(rawToken: String): AppTab? {
     val trimmed = rawToken.trim()

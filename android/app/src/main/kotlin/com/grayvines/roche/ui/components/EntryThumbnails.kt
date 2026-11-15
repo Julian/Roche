@@ -15,6 +15,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -311,6 +312,7 @@ internal fun DrawScope.drawPodcastArtworkCanvas(colors: RocheColors) {
 private fun ArticleImageThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
+    val landscapePath = remember { Path() }
     val bitmap =
         rememberEntryThumbnailBitmap(
             primaryKey = entry.thumbnailMediaId,
@@ -332,12 +334,17 @@ private fun ArticleImageThumbnail(entry: InboxEntry, modifier: Modifier = Modifi
                 modifier = Modifier.fillMaxSize(),
             )
         } else {
-            Canvas(modifier = Modifier.matchParentSize()) { drawArticleImagePlaceholder(colors) }
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawArticleImagePlaceholder(colors = colors, landscape = landscapePath)
+            }
         }
     }
 }
 
-internal fun DrawScope.drawArticleImagePlaceholder(colors: RocheColors) {
+internal fun DrawScope.drawArticleImagePlaceholder(
+    colors: RocheColors,
+    landscape: Path,
+) {
     val w = size.width
     val h = size.height
     drawCircle(
@@ -345,15 +352,13 @@ internal fun DrawScope.drawArticleImagePlaceholder(colors: RocheColors) {
         radius = w * ARTICLE_SUN_RADIUS,
         center = Offset(w * ARTICLE_SUN_CX, h * ARTICLE_SUN_CY),
     )
-    val landscape =
-        Path().apply {
-            moveTo(w * ARTICLE_MNT_X0, h * ARTICLE_MNT_BASE_Y)
-            lineTo(w * ARTICLE_MNT_X1, h * ARTICLE_MNT_PEAK1_Y)
-            lineTo(w * ARTICLE_MNT_X2, h * ARTICLE_MNT_VALLEY_Y)
-            lineTo(w * ARTICLE_MNT_X3, h * ARTICLE_MNT_PEAK2_Y)
-            lineTo(w * ARTICLE_MNT_X4, h * ARTICLE_MNT_BASE_Y)
-            close()
-        }
+    landscape.rewind()
+    landscape.moveTo(w * ARTICLE_MNT_X0, h * ARTICLE_MNT_BASE_Y)
+    landscape.lineTo(w * ARTICLE_MNT_X1, h * ARTICLE_MNT_PEAK1_Y)
+    landscape.lineTo(w * ARTICLE_MNT_X2, h * ARTICLE_MNT_VALLEY_Y)
+    landscape.lineTo(w * ARTICLE_MNT_X3, h * ARTICLE_MNT_PEAK2_Y)
+    landscape.lineTo(w * ARTICLE_MNT_X4, h * ARTICLE_MNT_BASE_Y)
+    landscape.close()
     drawPath(
         path = landscape,
         color = colors.textMuted.copy(alpha = ARTICLE_MNT_ALPHA),
@@ -365,6 +370,7 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(5.dp)
     val isAlternateChart = entry.id.hashCode() % 2 == 0
+    val curvePath = remember { Path() }
     val bitmap =
         rememberEntryThumbnailBitmap(
             primaryKey = entry.thumbnailMediaId,
@@ -387,13 +393,21 @@ private fun PaperFirstPageThumbnail(entry: InboxEntry, modifier: Modifier = Modi
             )
         } else {
             Canvas(modifier = Modifier.matchParentSize()) {
-                drawPaperPage(colors = colors, isAlternateChart = isAlternateChart)
+                drawPaperPage(
+                    colors = colors,
+                    isAlternateChart = isAlternateChart,
+                    curvePath = curvePath,
+                )
             }
         }
     }
 }
 
-private fun DrawScope.drawPaperPage(colors: RocheColors, isAlternateChart: Boolean) {
+private fun DrawScope.drawPaperPage(
+    colors: RocheColors,
+    isAlternateChart: Boolean,
+    curvePath: Path,
+) {
     val w = size.width
     val h = size.height
     val inkDark = Color(0xFF2C2A27)
@@ -427,6 +441,7 @@ private fun DrawScope.drawPaperPage(colors: RocheColors, isAlternateChart: Boole
         isAlternateChart = isAlternateChart,
         figTop = figTop,
         figHeight = figHeight,
+        curvePath = curvePath,
     )
 
     PAPER_BODY_ROWS.forEach { rowFrac ->
@@ -448,19 +463,18 @@ private fun DrawScope.drawPaperFigure(
     isAlternateChart: Boolean,
     figTop: Float,
     figHeight: Float,
+    curvePath: Path,
 ) {
     val w = size.width
     if (isAlternateChart) {
-        val curve =
-            Path().apply {
-                moveTo(w * CURVE_X0, figTop + figHeight * CURVE_Y0)
-                lineTo(w * CURVE_X1, figTop + figHeight * CURVE_Y1)
-                lineTo(w * CURVE_X2, figTop + figHeight * CURVE_Y2)
-                lineTo(w * CURVE_X3, figTop + figHeight * CURVE_Y3)
-                lineTo(w * CURVE_X4, figTop + figHeight * CURVE_Y4)
-            }
+        curvePath.rewind()
+        curvePath.moveTo(w * CURVE_X0, figTop + figHeight * CURVE_Y0)
+        curvePath.lineTo(w * CURVE_X1, figTop + figHeight * CURVE_Y1)
+        curvePath.lineTo(w * CURVE_X2, figTop + figHeight * CURVE_Y2)
+        curvePath.lineTo(w * CURVE_X3, figTop + figHeight * CURVE_Y3)
+        curvePath.lineTo(w * CURVE_X4, figTop + figHeight * CURVE_Y4)
         drawPath(
-            path = curve,
+            path = curvePath,
             color = colors.accentBlue,
             style = Stroke(width = CURVE_STROKE_W, cap = StrokeCap.Round),
         )
@@ -487,6 +501,8 @@ private fun DrawScope.drawPaperFigure(
 private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
+    val wavePath = remember { Path() }
+    val playTrianglePath = remember { Path() }
     val bitmap =
         rememberEntryThumbnailBitmap(
             primaryKey = entry.thumbnailMediaId,
@@ -508,7 +524,13 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
                 modifier = Modifier.fillMaxSize(),
             )
         } else {
-            Canvas(modifier = Modifier.matchParentSize()) { drawVideoCanvas(colors) }
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawVideoCanvas(
+                    colors = colors,
+                    wave = wavePath,
+                    playTriangle = playTrianglePath,
+                )
+            }
         }
 
         Text(
@@ -531,39 +553,44 @@ private fun VideoFrameThumbnail(entry: InboxEntry, modifier: Modifier = Modifier
 internal fun rememberFaviconBitmap(
     primaryKey: String?,
     fallbackKey: String? = null,
-): ImageBitmap? {
-    val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
-    val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
-    val effectivePrimary = cleanPrimary ?: cleanFallback ?: return null
-    val loader = LocalThumbnailLoader.current ?: return null
-    val initialCached =
-        loader.getCachedFavicon(effectivePrimary)
-            ?: cleanFallback?.let { loader.getCachedFavicon(it) }
-    val bitmap by
-        produceState<ImageBitmap?>(
-            initialValue = initialCached,
-            key1 = effectivePrimary,
-            key2 = cleanFallback,
-            key3 = loader,
-        ) {
-            if (value == null) {
-                val loadedPrimary = loader.loadFavicon(effectivePrimary)
-                value =
-                    loadedPrimary
-                        ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
-                            loader.loadFavicon(cleanFallback)
-                        } else {
-                            null
-                        }
-            }
-        }
-    return bitmap
-}
+): ImageBitmap? =
+    rememberCachedOrLoadedBitmap(
+        primaryKey = primaryKey,
+        fallbackKey = fallbackKey,
+        getCached = ThumbnailLoader::getCachedFavicon,
+        loadRemote = { key -> loadFavicon(key) },
+    )
 
 @Composable
 internal fun rememberEntryThumbnailBitmap(
     primaryKey: String?,
     fallbackKey: String? = null,
+): ImageBitmap? =
+    rememberCachedOrLoadedBitmap(
+        primaryKey = primaryKey,
+        fallbackKey = fallbackKey,
+        getCached = ThumbnailLoader::getCached,
+        loadRemote = { key -> loadThumbnail(key) },
+    )
+
+@Composable
+internal fun rememberHighResImageBitmap(
+    primaryKey: String?,
+    fallbackKey: String? = null,
+): ImageBitmap? =
+    rememberCachedOrLoadedBitmap(
+        primaryKey = primaryKey,
+        fallbackKey = fallbackKey,
+        getCached = ThumbnailLoader::getCachedInlineImage,
+        loadRemote = { key -> loadInlineImage(key) },
+    )
+
+@Composable
+private fun rememberCachedOrLoadedBitmap(
+    primaryKey: String?,
+    fallbackKey: String?,
+    getCached: ThumbnailLoader.(String) -> ImageBitmap?,
+    loadRemote: suspend ThumbnailLoader.(String) -> ImageBitmap?,
 ): ImageBitmap? {
     val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
     val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
@@ -578,12 +605,13 @@ internal fun rememberEntryThumbnailBitmap(
             key2 = cleanFallback,
             key3 = loader,
         ) {
+            value = initialCached
             if (value == null) {
-                val loadedPrimary = loader.loadThumbnail(effectivePrimary)
+                val loadedPrimary = loader.loadRemote(effectivePrimary)
                 value =
                     loadedPrimary
                         ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
-                            loader.loadThumbnail(cleanFallback)
+                            loader.loadRemote(cleanFallback)
                         } else {
                             null
                         }
@@ -592,51 +620,20 @@ internal fun rememberEntryThumbnailBitmap(
     return bitmap
 }
 
-@Composable
-internal fun rememberHighResImageBitmap(
-    primaryKey: String?,
-    fallbackKey: String? = null,
-): ImageBitmap? {
-    val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
-    val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
-    val effectivePrimary = cleanPrimary ?: cleanFallback ?: return null
-    val loader = LocalThumbnailLoader.current ?: return null
-    val initialCached =
-        loader.getCachedInlineImage(effectivePrimary)
-            ?: cleanFallback?.let { loader.getCachedInlineImage(it) }
-    val bitmap by
-        produceState<ImageBitmap?>(
-            initialValue = initialCached,
-            key1 = effectivePrimary,
-            key2 = cleanFallback,
-            key3 = loader,
-        ) {
-            if (value == null) {
-                val loadedPrimary = loader.loadInlineImage(effectivePrimary)
-                value =
-                    loadedPrimary
-                        ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
-                            loader.loadInlineImage(cleanFallback)
-                        } else {
-                            null
-                        }
-            }
-        }
-    return bitmap
-}
-
-private fun DrawScope.drawVideoCanvas(colors: RocheColors) {
+private fun DrawScope.drawVideoCanvas(
+    colors: RocheColors,
+    wave: Path,
+    playTriangle: Path,
+) {
     val w = size.width
     val h = size.height
-    val wave =
-        Path().apply {
-            moveTo(0f, h * WAVE_Y0)
-            lineTo(w * WAVE_X1, h * WAVE_Y1)
-            lineTo(w * WAVE_X2, h * WAVE_Y2)
-            lineTo(w * WAVE_X3, h * WAVE_Y3)
-            lineTo(w * WAVE_X4, h * WAVE_Y4)
-            lineTo(w, h * WAVE_Y5)
-        }
+    wave.rewind()
+    wave.moveTo(0f, h * WAVE_Y0)
+    wave.lineTo(w * WAVE_X1, h * WAVE_Y1)
+    wave.lineTo(w * WAVE_X2, h * WAVE_Y2)
+    wave.lineTo(w * WAVE_X3, h * WAVE_Y3)
+    wave.lineTo(w * WAVE_X4, h * WAVE_Y4)
+    wave.lineTo(w, h * WAVE_Y5)
     drawPath(
         path = wave,
         color = colors.accentVerdigris.copy(alpha = WAVE_ALPHA),
@@ -653,13 +650,11 @@ private fun DrawScope.drawVideoCanvas(colors: RocheColors) {
         style = Stroke(width = PLAY_RING_W),
     )
 
-    val playTriangle =
-        Path().apply {
-            moveTo(center.x - radius * PLAY_LEFT_OFFSET, center.y - radius * PLAY_HALF_H)
-            lineTo(center.x - radius * PLAY_LEFT_OFFSET, center.y + radius * PLAY_HALF_H)
-            lineTo(center.x + radius * PLAY_RIGHT_OFFSET, center.y)
-            close()
-        }
+    playTriangle.rewind()
+    playTriangle.moveTo(center.x - radius * PLAY_LEFT_OFFSET, center.y - radius * PLAY_HALF_H)
+    playTriangle.lineTo(center.x - radius * PLAY_LEFT_OFFSET, center.y + radius * PLAY_HALF_H)
+    playTriangle.lineTo(center.x + radius * PLAY_RIGHT_OFFSET, center.y)
+    playTriangle.close()
     drawPath(path = playTriangle, color = PLAY_TRIANGLE_FG)
 }
 

@@ -24,7 +24,8 @@ pub use hrw::{
 pub use identity::{
     ALBUMS_1001_COLLECTION_ID, STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID,
     canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
-    deterministic_catalog_entry_id, deterministic_comparison_id, deterministic_consumption_log_id,
+    deterministic_auto_consumption_log_id, deterministic_catalog_entry_id,
+    deterministic_comparison_id, deterministic_consumption_log_id,
     deterministic_enclosure_media_id, deterministic_entity_uuid, deterministic_feed_id,
     deterministic_item_id, deterministic_system_collection_id, deterministic_tag_id,
     deterministic_title_entry_id, feed_natural_key, item_natural_key, tag_natural_key,

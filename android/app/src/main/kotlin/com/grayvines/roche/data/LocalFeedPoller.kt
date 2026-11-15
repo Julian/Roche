@@ -5,6 +5,7 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.model.ItemStatus
 import java.io.StringReader
@@ -69,7 +70,7 @@ internal object LocalFeedPoller {
             dao.upsertFeed(
                 feed.copy(
                     lastPolled = nowIso,
-                    lastError = error.message ?: "Feed fetch failed",
+                    lastError = sanitizeFeedFetchError(error),
                     lastErrorBy = localPeerId,
                 )
             )
@@ -82,7 +83,7 @@ internal object LocalFeedPoller {
                 dao.upsertFeed(
                     feed.copy(
                         lastPolled = nowIso,
-                        lastError = error.message ?: "Feed XML parse failed",
+                        lastError = "Feed XML parse failed",
                         lastErrorBy = localPeerId,
                     )
                 )
@@ -100,6 +101,18 @@ internal object LocalFeedPoller {
                 nowIso = nowIso,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
+    }
+
+    private fun sanitizeFeedFetchError(error: Throwable): String {
+        if (error is ProblemDetailsException) return "HTTP ${error.statusCode}"
+        val clean =
+            error.message
+                ?.lineSequence()
+                ?.firstOrNull()
+                ?.trim()
+                ?.take(MAX_FEED_ERROR_CHARS)
+                ?.takeIf { it.isNotEmpty() }
+        return clean ?: "Feed fetch failed"
     }
 
     private fun buildUpdatedPolledFeed(
@@ -329,14 +342,13 @@ internal object LocalFeedPoller {
             extractItunesImageHref(entry, resolvedUrl)
                 ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, resolvedUrl)
         val duration = extractPodcastDurationLabel(entry)
+        val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
-            if (audioUrl != null) {
+            if (effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
             }
-        val effectiveAudioUrl =
-            audioUrl ?: resolvedUrl.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
 
         return ParsedFeedCandidateItem(
             title = rawTitle.ifBlank { resolvedUrl },
@@ -398,8 +410,8 @@ internal object LocalFeedPoller {
     ): ParsedFeedCandidateItem? {
         val audioUrl = extractAudioEnclosureUrl(item, feedUrl)
         val linkText = extractRssItemUrl(item, feedUrl) ?: audioUrl ?: return null
-        val resolvedUrl =
-            canonicalizeEntryUrl(resolveRelativeUrl(feedUrl, linkText) ?: linkText, feedType)
+        val httpItemUrl = resolveRelativeUrl(feedUrl, linkText) ?: audioUrl ?: return null
+        val resolvedUrl = canonicalizeEntryUrl(httpItemUrl, feedType)
         val rawTitle =
             item.firstDirectChildText(XML_TAG_TITLE)?.let(::decodeHtmlText)?.trim().orEmpty()
         val author = extractRssAuthor(item) ?: channelAuthor?.takeIf { audioUrl != null }
@@ -412,20 +424,21 @@ internal object LocalFeedPoller {
         val summarySource = description?.takeIf { it.isNotBlank() } ?: encodedContent
         val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
         val duration = extractPodcastDurationLabel(item)
+        val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
-            if (audioUrl != null) {
+            if (effectiveAudioUrl != null) {
                 CONTENT_TYPE_AUDIO
             } else {
                 resolveCandidateContentType(feedType, resolvedUrl)
             }
-        val effectiveAudioUrl =
-            audioUrl ?: resolvedUrl.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
         val thumbnailUrl =
-            extractItunesImageHref(item, resolvedUrl)
-                ?: extractMediaThumbnail(item, resolvedUrl)
-                ?: extractEnclosureImage(item, resolvedUrl)
-                ?: sanitizedHtml?.let { extractFirstImgUrl(it, resolvedUrl) }
-                ?: channelArtworkUrl?.takeIf { effectiveType == CONTENT_TYPE_AUDIO }
+            extractRssThumbnailUrl(
+                item = item,
+                resolvedUrl = resolvedUrl,
+                sanitizedHtml = sanitizedHtml,
+                channelArtworkUrl = channelArtworkUrl,
+                isAudio = effectiveType == CONTENT_TYPE_AUDIO,
+            )
 
         return ParsedFeedCandidateItem(
             title = rawTitle.ifBlank { resolvedUrl },
@@ -440,6 +453,19 @@ internal object LocalFeedPoller {
             duration = duration,
         )
     }
+
+    private fun extractRssThumbnailUrl(
+        item: Element,
+        resolvedUrl: String,
+        sanitizedHtml: String?,
+        channelArtworkUrl: String?,
+        isAudio: Boolean,
+    ): String? =
+        extractItunesImageHref(item, resolvedUrl)
+            ?: extractMediaThumbnail(item, resolvedUrl)
+            ?: extractEnclosureImage(item, resolvedUrl)
+            ?: sanitizedHtml?.let { extractFirstImgUrl(it, resolvedUrl) }
+            ?: channelArtworkUrl?.takeIf { isAudio }
 }
 
 internal fun extractAtomEntryUrl(entry: Element, feedUrl: String): String? =
@@ -513,7 +539,7 @@ internal fun extractAudioEnclosureUrl(item: Element, baseUrl: String): String? {
         findEnclosureTagAudioUrl(item)
             ?: findMediaContentAudioUrl(item)
             ?: findAtomLinkEnclosureAudioUrl(item)
-    return rawCandidate?.let { raw -> resolveRelativeUrl(baseUrl, raw) ?: raw }
+    return rawCandidate?.let { raw -> resolveRelativeUrl(baseUrl, raw) }
 }
 
 private fun findEnclosureTagAudioUrl(item: Element): String? =
@@ -623,7 +649,7 @@ internal fun extractAtomLink(
             links.firstOrNull { it.getAttribute("href").isNotBlank() }
         }
     val href = chosen?.getAttribute("href")?.trim()?.takeIf { it.isNotBlank() } ?: return null
-    return resolveRelativeUrl(baseUrl, href) ?: href
+    return resolveRelativeUrl(baseUrl, href)
 }
 
 internal fun extractAtomAuthor(entry: Element): String? {
@@ -678,7 +704,7 @@ internal fun sanitizeFeedHtml(rawHtml: String, baseUrl: String): String {
     return IMG_SRC_ATTR_REGEX.replace(withoutDangerousBlocks) { match ->
             val quote = match.groupValues[1]
             val rawSrc = match.groupValues[2].trim()
-            val resolved = resolveRelativeUrl(baseUrl, rawSrc) ?: rawSrc
+            val resolved = resolveRelativeUrl(baseUrl, rawSrc).orEmpty()
             """src=$quote$resolved$quote"""
         }
         .trim()
@@ -796,6 +822,7 @@ internal fun Element.firstDirectChildText(localTarget: String): String? =
     firstDirectChildElement(localTarget)?.textContent?.trim()?.takeIf { it.isNotEmpty() }
 
 private const val MAX_SUMMARY_EXCERPT_CHARS = 500
+private const val MAX_FEED_ERROR_CHARS = 120
 private const val MIN_PRINTABLE_CODEPOINT = 32
 private const val MAX_UNICODE_CODEPOINT = 0x10FFFF
 private const val HEX_RADIX = 16

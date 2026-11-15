@@ -3,23 +3,13 @@ package com.grayvines.roche.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.SavedResourceKind
-import com.grayvines.roche.data.UpsertCatalogEntryInput
-import com.grayvines.roche.data.normalizeTagName
-import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
-import com.grayvines.roche.data.settings.clampPlaybackSpeed
-import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.model.InboxFilter
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -33,33 +23,33 @@ import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
-@Suppress("TooManyFunctions", "LargeClass")
+@Suppress("TooManyFunctions")
 class MainViewModel(
-    private val repository: RocheRepository,
-    private val settingsRepository: SettingsRepository,
-    playerBackend: AudioPlayerBackend = ResilientMediaPlayerBackend(),
+    internal val repository: RocheRepository,
+    internal val settingsRepository: SettingsRepository,
+    playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
     private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     sharedPlayerController: PodcastPlayerController? = null,
 ) : ViewModel() {
 
     private val ownsPlayerController: Boolean = sharedPlayerController == null
-    private val catalogActionMutex = Mutex()
 
-    private val playbackOrchestrator =
+    internal val playbackOrchestrator =
         PodcastPlaybackOrchestrator(
             repository = repository,
             settingsRepository = settingsRepository,
         )
 
-    private val transientState =
+    internal val transientState =
         MutableStateFlow(TransientUiState(localNetworkTier = repository.currentNetworkTier()))
 
     private var deepSearchJob: Job? = null
-    private val inFlightStarCounts = mutableMapOf<String, Int>()
     private val uiStateMemoizer = MainUiStateMemoizer()
+
+    private val inboxReaderDelegate = MainInboxReaderDelegate(this)
+    private val syncFeedDelegate = MainSyncFeedDelegate(this)
+    private val catalogActionsDelegate = MainCatalogActionsDelegate(this)
 
     private val settingsForUi =
         settingsRepository.settings
@@ -171,10 +161,10 @@ class MainViewModel(
     private fun handleUiAction(action: MainAction.Ui) {
         if (handlePlayerUiAction(action)) return
         if (action is MainAction.OpenReader) {
-            val existing = uiState.value.allEntries.firstOrNull { it.id == action.entryId }
+            val existing = peekLatestEntries().firstOrNull { it.id == action.entryId }
             if (existing?.contentType == ContentType.AUDIO) {
                 viewModelScope.launch {
-                    performPlayAudioEntry(
+                    inboxReaderDelegate.performPlayAudioEntry(
                         entryId = action.entryId,
                         openFullscreen = true,
                     )
@@ -186,25 +176,39 @@ class MainViewModel(
         when (action) {
             is MainAction.OpenReader -> launchReaderOpenSideEffects(action.entryId)
             is MainAction.UpdateSearchQuery -> scheduleDeepSearch(action.query)
-            MainAction.CloseSearch -> cancelDeepSearch()
+            MainAction.CloseSearch,
+            is MainAction.SelectTab,
+            is MainAction.FilterByTag,
+            is MainAction.FilterByFeed,
+            is MainAction.OpenCompanionSection -> cancelDeepSearch()
             else -> Unit
         }
     }
 
     private fun launchReaderOpenSideEffects(entryId: String) {
         viewModelScope.launch {
-            val hydrated =
-                repository.hydrateItemContentIfNeeded(entryId) { localContent ->
-                    applyReaderContentIfActive(entryId, localContent)
+            try {
+                val hydrated =
+                    repository.hydrateItemContentIfNeeded(entryId) { localContent ->
+                        applyReaderContentIfActive(entryId, localContent)
+                    }
+                if (hydrated != null) {
+                    applyReaderContentIfActive(entryId, hydrated)
                 }
-            if (hydrated != null) {
-                applyReaderContentIfActive(entryId, hydrated)
+            } finally {
+                transientState.update { current ->
+                    if (entryId in current.hydratingEntryIds) {
+                        current.copy(hydratingEntryIds = current.hydratingEntryIds - entryId)
+                    } else {
+                        current
+                    }
+                }
             }
         }
         viewModelScope.launch { repository.setReadState(entryId, true) }
     }
 
-    private fun cancelDeepSearch() {
+    internal fun cancelDeepSearch() {
         deepSearchJob?.cancel()
         deepSearchJob = null
     }
@@ -214,9 +218,9 @@ class MainViewModel(
             val currentFav = resolveCurrentFavoriteState(action.entryId)
             if (currentFav != null) {
                 val targetFav = !currentFav
-                synchronized(inFlightStarCounts) {
-                    inFlightStarCounts[action.entryId] =
-                        (inFlightStarCounts[action.entryId] ?: 0) + 1
+                val inFlight = inboxReaderDelegate.inFlightStarCounts
+                synchronized(inFlight) {
+                    inFlight[action.entryId] = (inFlight[action.entryId] ?: 0) + 1
                 }
                 transientState.update { current ->
                     current.copy(
@@ -228,7 +232,7 @@ class MainViewModel(
                     )
                 }
                 viewModelScope.launch {
-                    performToggleStar(
+                    inboxReaderDelegate.performToggleStar(
                         entryId = action.entryId,
                         targetFavorite = targetFav,
                         bannerAlreadyShown = true,
@@ -240,10 +244,15 @@ class MainViewModel(
         viewModelScope.launch { executeMutation(action) }
     }
 
+    private suspend fun executeMutation(action: MainAction.Mutation) {
+        if (inboxReaderDelegate.tryExecute(action)) return
+        if (syncFeedDelegate.tryExecute(action)) return
+        catalogActionsDelegate.execute(action)
+    }
+
     private fun resolveCurrentFavoriteState(entryId: String): Boolean? =
         transientState.value.optimisticFavorites[entryId]
-            ?: uiState.value.allEntries.firstOrNull { it.id == entryId }?.isFavorite
-            ?: repository.latestSnapshot?.entries?.firstOrNull { it.id == entryId }?.isFavorite
+            ?: peekLatestEntries().firstOrNull { it.id == entryId }?.isFavorite
 
     private fun scheduleDeepSearch(rawQuery: String) {
         deepSearchJob?.cancel()
@@ -294,7 +303,50 @@ class MainViewModel(
             }
         }
 
+    internal suspend fun latestEntries(): List<InboxEntry> =
+        repository.latestSnapshot?.entries ?: repository.snapshot.first().entries
+
+    internal fun peekLatestEntries(): List<InboxEntry> =
+        repository.latestSnapshot?.entries ?: uiState.value.allEntries
+
+    internal suspend fun cleanupRemovedEntries(removedIds: Set<String>) {
+        if (removedIds.isEmpty()) return
+        val currentQueue =
+            (settingsRepository.latestSettings ?: settingsRepository.settings.first()).queueItemIds
+        if (currentQueue.any { it in removedIds }) {
+            settingsRepository.update { current ->
+                current.copy(queueItemIds = current.queueItemIds.filterNot { it in removedIds })
+            }
+            playbackOrchestrator.syncActivePlayerQueueState(playerController)
+        }
+        if (playerController.state.value.currentEntryId in removedIds) {
+            playerController.stopAndClear()
+        }
+        clearRemovedTransientSelection(removedIds)
+    }
+
+    private fun clearRemovedTransientSelection(removedIds: Set<String>) {
+        transientState.update { current ->
+            val nextReaderId = current.selectedReaderEntryId?.takeUnless { it in removedIds }
+            val nextContent = nextReaderId?.let { current.readerContent }
+            val nextSheetId = current.contextSheetEntryId?.takeUnless { it in removedIds }
+            current.copy(
+                selectedReaderEntryId = nextReaderId,
+                readerContent = nextContent,
+                contextSheetEntryId = nextSheetId,
+            )
+        }
+    }
+
+    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
+        playbackOrchestrator.handleAudioEpisodeCompleted(playerController, completedEntryId)
+    }
+
     internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
+
+    internal suspend fun performImportOpml(opmlXml: String) {
+        syncFeedDelegate.performImportOpml(opmlXml)
+    }
 
     internal fun showStatusMessage(message: String) {
         transientState.update {
@@ -310,1186 +362,12 @@ class MainViewModel(
         dispatch(MainAction.StartupSyncIfConfigured)
     }
 
-    private suspend fun executeMutation(action: MainAction.Mutation) {
-        when (action) {
-            is MainAction.ToggleArchive -> performToggleArchive(action.entry)
-            MainAction.UndoLastArchive -> performUndoArchive()
-            MainAction.ArchiveVisibleEntries -> performArchiveVisibleEntries()
-            is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
-            is MainAction.ToggleStar -> performToggleStar(action.entryId)
-            is MainAction.ToggleReadState -> performToggleReadState(action.entryId)
-            is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
-            is MainAction.ToggleTagOnEntry ->
-                repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
-            is MainAction.UpdateReadProgress ->
-                repository.updateReadProgress(itemId = action.entryId, progress = action.progress)
-            is MainAction.SaveUrlOrFeed ->
-                performSaveUrl(action.url, action.titleOverride, action.tagCsv)
-            else -> executePlayerMutation(action)
-        }
-    }
-
-    internal suspend fun executePlayerMutation(action: MainAction.Mutation) {
-        when (action) {
-            is MainAction.PlayAudioEntry ->
-                performPlayAudioEntry(action.entryId, action.openFullscreen)
-            MainAction.TogglePlayPause ->
-                playerController.togglePlayPause(
-                    smartRewindEnabled = settingsRepository.settings.first().smartRewindEnabled
-                )
-            is MainAction.SeekPlayerToFraction -> playerController.seekToFraction(action.fraction)
-            is MainAction.SeekPlayerToMs -> playerController.seekToMs(action.positionMs)
-            is MainAction.SkipPlayerBySeconds -> playerController.skipBySeconds(action.deltaSeconds)
-            MainAction.SkipToNextQueuedAudio -> performSkipToNextQueuedAudio()
-            is MainAction.SetPlaybackSpeed ->
-                performSetPlaybackSpeed(action.speed, action.applyToCurrentPodcast)
-            is MainAction.SetRememberPodcastSpeed ->
-                performSetRememberPodcastSpeed(action.feedId, action.enabled)
-            is MainAction.SetSkipSilence -> performSetSkipSilence(action.enabled)
-            is MainAction.SetSmartRewind -> performSetSmartRewind(action.enabled)
-            is MainAction.SetSleepTimerMinutes -> performSetSleepTimerMinutes(action.minutes)
-            else -> executeQueueOrSyncMutation(action)
-        }
-    }
-
-    internal suspend fun executeQueueOrSyncMutation(action: MainAction.Mutation) {
-        when (action) {
-            is MainAction.SetFeedAutoDownload ->
-                performSetFeedAutoDownload(action.feedId, action.enabled)
-            is MainAction.SetFeedPlaybackSpeed ->
-                performSetFeedPlaybackSpeed(action.feedId, action.speed)
-            is MainAction.ToggleQueueMembership -> performToggleQueueMembership(action.entryId)
-            is MainAction.AddToQueue -> performAddToQueue(action.entryId, action.playNext)
-            is MainAction.RemoveFromQueue ->
-                performRemoveFromQueue(action.entryId, showBanner = true)
-            is MainAction.MoveQueueItemUp -> performMoveQueueItemUp(action.entryId)
-            is MainAction.MoveQueueItemToTop -> performMoveQueueItemToTop(action.entryId)
-            else -> executeSyncOrSettingsMutation(action)
-        }
-    }
-
-    internal fun performSetSleepTimerMinutes(minutes: Int?) {
-        playerController.setSleepTimerMinutes(minutes)
-        val msg =
-            if (minutes == null) {
-                "Sleep timer off"
-            } else {
-                "Sleep timer set for ${minutes}m"
-            }
-        showStatusMessage(msg)
-    }
-
-    internal suspend fun executeSyncOrSettingsMutation(action: MainAction.Mutation) {
-        when (action) {
-            is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
-            is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
-            is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
-            is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
-            is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
-            is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
-            is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
-            MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
-            MainAction.PollFeedsOnDeviceNow -> performPollFeedsOnDevice()
-            is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
-            MainAction.StartupSyncIfConfigured -> performStartupSync()
-            else -> applySettingsMutation(action)
-        }
-    }
-
     internal fun refreshLocalNetworkTier() {
         val tier = repository.currentNetworkTier()
         transientState.update { it.copy(localNetworkTier = tier) }
     }
 
-    internal suspend fun performSyncWithServerConfig(action: MainAction.SyncWithServerConfig) {
-        refreshLocalNetworkTier()
-        performUpdateServerConfig(
-            MainAction.UpdateServerConfig(
-                serverUrl = action.serverUrl,
-                bearerToken = action.bearerToken,
-                feedback = ConfigSaveFeedback.SILENT,
-            )
-        )
-        performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
-        refreshLocalNetworkTier()
-    }
-
-    private suspend fun applySettingsMutation(action: MainAction.Mutation) {
-        when (action) {
-            is MainAction.SetThemeMode ->
-                settingsRepository.update { it.copy(themeMode = action.mode) }
-            is MainAction.SetHeadlineFont ->
-                settingsRepository.update { it.copy(headlineFont = action.font) }
-            is MainAction.SetUltraDenseRows ->
-                settingsRepository.update { it.copy(ultraDenseRows = action.enabled) }
-            is MainAction.SetReaderFontScale ->
-                settingsRepository.update { it.copy(readerFontScale = action.scale) }
-            is MainAction.SetSwipeToArchive ->
-                settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
-            is MainAction.SetBottomNavSlot ->
-                settingsRepository.update { current ->
-                    val updatedTabs =
-                        updateBottomNavSlot(current.bottomNavTabs, action.slotIndex, action.tab)
-                    current.copy(bottomNavTabs = updatedTabs)
-                }
-            MainAction.ResetBottomNavTabs ->
-                settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
-            is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
-            is MainAction.PairWithServer -> performPairWithServer(action)
-            MainAction.DiscoverServer -> performDiscoverServer()
-            else -> executeCatalogMutation(action)
-        }
-    }
-
-    internal suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
-        settingsRepository.update {
-            it.copy(
-                serverUrl = action.serverUrl,
-                bearerToken = action.bearerToken,
-            )
-        }
-        if (action.feedback == ConfigSaveFeedback.SHOW_BANNER) {
-            showStatusMessage("Saved server settings")
-        }
-    }
-
-    internal suspend fun performDiscoverServer() {
-        val message =
-            repository
-                .discoverServer()
-                .fold(
-                    onSuccess = { url -> "Discovered Roche server at $url" },
-                    onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
-                )
-        showStatusMessage(message)
-    }
-
-    internal suspend fun performPairWithServer(action: MainAction.PairWithServer) {
-        if (action.pairingCode.isBlank()) {
-            showStatusMessage("Enter a pairing code")
-            return
-        }
-        refreshLocalNetworkTier()
-        repository
-            .pairWithCode(
-                serverUrl = action.serverUrl,
-                pairingCode = action.pairingCode,
-                deviceName = action.deviceName,
-            )
-            .onSuccess {
-                val syncCount = repository.syncWithServer().getOrNull()
-                refreshLocalNetworkTier()
-                val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
-                showStatusMessage("Paired with server$suffix")
-            }
-            .onFailure { error ->
-                refreshLocalNetworkTier()
-                showStatusMessage("Pairing failed (${error.message ?: "error"})")
-            }
-    }
-
-    internal suspend fun performToggleStar(
-        entryId: String,
-        targetFavorite: Boolean? = null,
-        bannerAlreadyShown: Boolean = false,
-    ) {
-        try {
-            val starred = repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
-            if (!bannerAlreadyShown) {
-                showStatusMessage(if (starred) "Starred" else "Removed star")
-            }
-        } finally {
-            if (bannerAlreadyShown) {
-                val remaining =
-                    synchronized(inFlightStarCounts) {
-                        val next = ((inFlightStarCounts[entryId] ?: 1) - 1).coerceAtLeast(0)
-                        if (next == 0) {
-                            inFlightStarCounts.remove(entryId)
-                        } else {
-                            inFlightStarCounts[entryId] = next
-                        }
-                        next
-                    }
-                if (remaining == 0) {
-                    val persistedFav =
-                        repository.latestSnapshot
-                            ?.entries
-                            ?.firstOrNull { it.id == entryId }
-                            ?.isFavorite
-                    if (
-                        persistedFav != null &&
-                            transientState.value.optimisticFavorites[entryId] == persistedFav
-                    ) {
-                        transientState.update { current ->
-                            current.copy(
-                                optimisticFavorites = current.optimisticFavorites - entryId
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    internal suspend fun performToggleReadState(entryId: String) {
-        val isRead = repository.toggleReadState(entryId)
-        transientState.update {
-            it.copy(
-                contextSheetEntryId = null,
-                undoEvent = null,
-                statusBanner = if (isRead) "Marked as read" else "Marked as unread",
-                messageSequence = it.messageSequence + 1,
-            )
-        }
-    }
-
-    internal suspend fun performToggleOffline(entryId: String) {
-        val prevEntry = uiState.value.allEntries.firstOrNull { it.id == entryId }
-        val wasCached = prevEntry?.isCachedOffline == true
-        val cached = repository.toggleOfflineCache(entryId)
-        if (cached && transientState.value.selectedReaderEntryId == entryId) {
-            repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
-                applyReaderContentIfActive(entryId, content)
-            }
-        }
-        val entry = uiState.value.allEntries.firstOrNull { it.id == entryId } ?: prevEntry
-        val isAudio = entry?.contentType == ContentType.AUDIO
-        val msg =
-            when {
-                cached && isAudio -> "Downloaded episode for offline playback"
-                cached -> "Cached local copy"
-                !wasCached && isAudio -> "Failed to download episode for offline playback"
-                !wasCached -> "Failed to cache offline copy"
-                isAudio -> "Deleted local episode download"
-                else -> "Removed local offline copy"
-            }
-        showStatusMessage(msg)
-    }
-
-    internal suspend fun performPlayAudioEntry(
-        entryId: String,
-        openFullscreen: Boolean = true,
-    ) {
-        val played =
-            playbackOrchestrator.playAudioEntry(
-                playerController = playerController,
-                entryId = entryId,
-                openFullscreen = openFullscreen,
-            )
-        if (played) {
-            transientState.update { it.copy(contextSheetEntryId = null) }
-        }
-    }
-
-    private suspend fun syncActivePlayerQueueState() {
-        playbackOrchestrator.syncActivePlayerQueueState(playerController)
-    }
-
-    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
-        playbackOrchestrator.handleAudioEpisodeCompleted(playerController, completedEntryId)
-    }
-
-    internal suspend fun performSkipToNextQueuedAudio() {
-        playbackOrchestrator.performSkipToNextQueuedAudio(playerController)
-    }
-
-    internal suspend fun performSetPlaybackSpeed(
-        speed: Float,
-        applyToCurrentPodcast: Boolean?,
-    ) {
-        playbackOrchestrator.performSetPlaybackSpeed(
-            playerController = playerController,
-            speed = speed,
-            applyToCurrentPodcast = applyToCurrentPodcast,
-        )
-    }
-
-    internal suspend fun performSetRememberPodcastSpeed(
-        feedId: String,
-        enabled: Boolean,
-    ) {
-        val currentSpeed = playerController.state.value.playbackSpeed
-        if (enabled) {
-            repository.setFeedPlaybackSpeed(feedId = feedId, speed = currentSpeed)
-        } else {
-            repository.setFeedPlaybackSpeed(feedId = feedId, speed = null)
-        }
-    }
-
-    internal suspend fun performSetSkipSilence(enabled: Boolean) {
-        playerController.setSkipSilence(enabled)
-        settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
-    }
-
-    internal suspend fun performSetSmartRewind(enabled: Boolean) {
-        settingsRepository.update { it.copy(smartRewindEnabled = enabled) }
-        playerController.updateSmartRewindEnabled(enabled)
-    }
-
-    internal suspend fun performSetFeedAutoDownload(
-        feedId: String,
-        enabled: Boolean,
-    ) {
-        repository.setFeedAutoDownload(feedId = feedId, enabled = enabled)
-        val msg =
-            if (enabled) {
-                "Auto-downloading new episodes for this podcast"
-            } else {
-                "Disabled auto-download for this podcast"
-            }
-        showStatusMessage(msg)
-    }
-
-    internal suspend fun performSetFeedPlaybackSpeed(
-        feedId: String,
-        speed: Float?,
-    ) {
-        val clamped = speed?.let(::clampPlaybackSpeed)
-        repository.setFeedPlaybackSpeed(feedId = feedId, speed = clamped)
-        val currentEntryId = playerController.state.value.currentEntryId
-        val activeEntry = currentEntryId?.let { id ->
-            repository.snapshot.first().entries.firstOrNull { it.id == id }
-        }
-        if (activeEntry?.feedId == feedId && clamped != null) {
-            playerController.setPlaybackSpeed(clamped)
-        }
-    }
-
-    internal suspend fun performToggleQueueMembership(entryId: String) {
-        val inQueue = entryId in settingsRepository.settings.first().queueItemIds
-        if (inQueue) {
-            performRemoveFromQueue(entryId, showBanner = true)
-        } else {
-            performAddToQueue(entryId, playNext = false)
-        }
-    }
-
-    internal suspend fun performAddToQueue(
-        entryId: String,
-        playNext: Boolean = false,
-    ) {
-        val activeAudioId = playerController.state.value.currentEntryId
-        settingsRepository.update { current ->
-            val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
-            if (playNext) {
-                val insertIndex =
-                    if (activeAudioId != null && withoutTarget.firstOrNull() == activeAudioId) {
-                        1
-                    } else {
-                        0
-                    }
-                withoutTarget.add(insertIndex.coerceAtMost(withoutTarget.size), entryId)
-            } else {
-                withoutTarget.add(entryId)
-            }
-            current.copy(queueItemIds = withoutTarget)
-        }
-        syncActivePlayerQueueState()
-        transientState.update { it.copy(contextSheetEntryId = null) }
-        showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
-    }
-
-    internal suspend fun performRemoveFromQueue(
-        entryId: String,
-        showBanner: Boolean = true,
-    ) {
-        settingsRepository.update { current ->
-            current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
-        }
-        syncActivePlayerQueueState()
-        transientState.update { it.copy(contextSheetEntryId = null) }
-        if (showBanner) {
-            showStatusMessage("Removed from Queue")
-        }
-    }
-
-    internal suspend fun performMoveQueueItemUp(entryId: String) {
-        settingsRepository.update { current ->
-            val list = current.queueItemIds.toMutableList()
-            val idx = list.indexOf(entryId)
-            if (idx > 0) {
-                val prev = list[idx - 1]
-                list[idx - 1] = entryId
-                list[idx] = prev
-            }
-            current.copy(queueItemIds = list)
-        }
-        syncActivePlayerQueueState()
-    }
-
-    internal suspend fun performMoveQueueItemToTop(entryId: String) {
-        val activeAudioId = playerController.state.value.currentEntryId
-        settingsRepository.update { current ->
-            val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
-            val targetIdx =
-                if (activeAudioId != null && withoutTarget.firstOrNull() == activeAudioId) {
-                    1
-                } else {
-                    0
-                }
-            withoutTarget.add(targetIdx.coerceAtMost(withoutTarget.size), entryId)
-            current.copy(queueItemIds = withoutTarget)
-        }
-        syncActivePlayerQueueState()
-        showStatusMessage("Moved to top of Queue")
-    }
-
-    internal suspend fun performToggleArchive(entry: InboxEntry) {
-        val targetArchived = !entry.isArchived
-        val snapshot =
-            repository.setArchiveStateWithSnapshot(itemId = entry.id, archived = targetArchived)
-        if (targetArchived) {
-            settingsRepository.update { current ->
-                current.copy(queueItemIds = current.queueItemIds.filterNot { it == entry.id })
-            }
-            if (playerController.state.value.currentEntryId == entry.id) {
-                playerController.stopAndClear()
-            }
-        }
-        val previousStatus = snapshot?.previousStatus ?: entry.status
-        val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
-        val label = if (targetArchived) "Archived" else "Restored to Unread"
-        transientState.update { current ->
-            val nextReaderId =
-                if (current.selectedReaderEntryId == entry.id) {
-                    null
-                } else {
-                    current.selectedReaderEntryId
-                }
-            current.copy(
-                selectedReaderEntryId = nextReaderId,
-                readerContent = nextReaderId?.let { current.readerContent },
-                contextSheetEntryId = null,
-                statusBanner = null,
-                messageSequence = current.messageSequence + 1,
-                undoEvent =
-                    UndoArchiveEvent(
-                        itemId = entry.id,
-                        previousStatus = previousStatus,
-                        previousReadAt = previousReadAt,
-                        batchSnapshots = listOfNotNull(snapshot),
-                        message = "$label · ${entry.title.take(SNACKBAR_TITLE_LIMIT)}",
-                    ),
-            )
-        }
-    }
-
-    internal suspend fun performUndoArchive() {
-        val pending = transientState.value.undoEvent ?: return
-        if (pending.batchSnapshots.size > 1) {
-            repository.restoreArchiveSnapshots(pending.batchSnapshots)
-            showStatusMessage("Restored ${pending.batchSnapshots.size} entries")
-        } else {
-            repository.restoreStatus(
-                itemId = pending.itemId,
-                status = pending.previousStatus,
-                readAt = pending.previousReadAt,
-            )
-            showStatusMessage("Restored entry")
-        }
-    }
-
-    internal suspend fun performArchiveVisibleEntries() {
-        val currentUi = uiState.value
-        val unarchivedIds = currentUi.visibleEntries.filter { !it.isArchived }.map { it.id }
-        if (unarchivedIds.isEmpty()) return
-        val snapshots =
-            repository.archiveBatchWithSnapshots(
-                entryIds = unarchivedIds,
-                feedId = currentUi.selectedFeedId,
-                allUnread =
-                    currentUi.selectedFeedId == null &&
-                        currentUi.selectedTag == null &&
-                        currentUi.activeFilter == InboxFilter.UNREAD,
-            )
-        if (snapshots.isNotEmpty()) {
-            val archivedIds = snapshots.map { it.itemId }.toSet()
-            settingsRepository.update { current ->
-                current.copy(queueItemIds = current.queueItemIds.filterNot { it in archivedIds })
-            }
-            if (playerController.state.value.currentEntryId in archivedIds) {
-                playerController.stopAndClear()
-            }
-            val archivedCount = snapshots.size
-            val noun = entryCountNoun(archivedCount)
-            val first = snapshots.first()
-            transientState.update {
-                it.copy(
-                    statusBanner = null,
-                    messageSequence = it.messageSequence + 1,
-                    undoEvent =
-                        UndoArchiveEvent(
-                            itemId = first.itemId,
-                            previousStatus = first.previousStatus,
-                            previousReadAt = first.previousReadAt,
-                            batchSnapshots = snapshots,
-                            message = "Archived $archivedCount $noun",
-                        ),
-                )
-            }
-        }
-    }
-
-    internal suspend fun performImportOpml(opmlXml: String) {
-        if (!tryAcquireSyncLock()) return
-        try {
-            repository
-                .importOpml(opmlXml)
-                .onSuccess { importedCount ->
-                    val noun = if (importedCount == 1) "feed" else "feeds"
-                    showStatusMessage("Imported $importedCount $noun from OPML")
-                }
-                .onFailure { error ->
-                    showStatusMessage("OPML import failed (${error.message ?: "error"})")
-                }
-        } finally {
-            transientState.update { it.copy(isSyncing = false) }
-        }
-    }
-
-    internal suspend fun performSaveUrl(url: String, titleOverride: String?, tagCsv: String) {
-        if (url.isBlank()) return
-        val created =
-            repository.saveUrlOrFeed(
-                inputUrl = url,
-                titleOverride = titleOverride,
-                tagCsv = tagCsv,
-            )
-        val (verb, nextTab) =
-            when (created.kind) {
-                SavedResourceKind.FEED -> "Subscribed" to AppTab.FEEDS
-                SavedResourceKind.ITEM -> "Saved" to AppTab.INBOX
-            }
-        transientState.update {
-            it.copy(
-                isAddSheetOpen = false,
-                isSearchOpen = false,
-                prefilledShareUrl = "",
-                prefilledShareTitle = "",
-                selectedReaderEntryId = null,
-                readerContent = null,
-                activeTab = nextTab,
-                activeFilter = InboxFilter.ALL,
-                undoEvent = null,
-                statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                messageSequence = it.messageSequence + 1,
-            )
-        }
-    }
-
-    internal suspend fun performRefreshFeed(feedId: String) {
-        if (!tryAcquireSyncLock()) return
-        try {
-            repository
-                .refreshFeed(feedId)
-                .onSuccess { title ->
-                    showStatusMessage("Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
-                }
-                .onFailure { error ->
-                    showStatusMessage("Refresh failed (${error.message ?: "unreachable"})")
-                }
-        } finally {
-            transientState.update { it.copy(isSyncing = false) }
-        }
-    }
-
-    internal suspend fun performRenameFeed(feedId: String, newTitle: String) {
-        val updatedTitle = repository.renameFeed(feedId = feedId, newTitle = newTitle)
-        if (updatedTitle != null) {
-            showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
-        }
-    }
-
-    internal suspend fun performApplyTagToFeed(feedId: String, tagName: String) {
-        val count = repository.applyTagToFeedItems(feedId = feedId, tagName = tagName)
-        val cleanTag = normalizeTagName(tagName)
-        if (cleanTag.isNotBlank()) {
-            val msg =
-                if (count > 0) {
-                    "Tagged $count ${entryCountNoun(count)} with #$cleanTag"
-                } else {
-                    "All active feed entries already have #$cleanTag"
-                }
-            showStatusMessage(msg)
-        }
-    }
-
-    internal suspend fun performArchiveFeedUnread(feedId: String) {
-        val unreadIds =
-            uiState.value.allEntries.filter { it.feedId == feedId && !it.isArchived }.map { it.id }
-        if (unreadIds.isEmpty()) return
-        val snapshots =
-            repository.archiveBatchWithSnapshots(
-                entryIds = unreadIds,
-                feedId = feedId,
-                allUnread = false,
-            )
-        if (snapshots.isNotEmpty()) {
-            val archivedIds = snapshots.map { it.itemId }.toSet()
-            settingsRepository.update { current ->
-                current.copy(queueItemIds = current.queueItemIds.filterNot { it in archivedIds })
-            }
-            if (playerController.state.value.currentEntryId in archivedIds) {
-                playerController.stopAndClear()
-            }
-            val count = snapshots.size
-            val noun = entryCountNoun(count)
-            val first = snapshots.first()
-            transientState.update {
-                it.copy(
-                    feedContextSheetId = null,
-                    statusBanner = null,
-                    messageSequence = it.messageSequence + 1,
-                    undoEvent =
-                        UndoArchiveEvent(
-                            itemId = first.itemId,
-                            previousStatus = first.previousStatus,
-                            previousReadAt = first.previousReadAt,
-                            batchSnapshots = snapshots,
-                            message = "Archived $count $noun in feed",
-                        ),
-                )
-            }
-        }
-    }
-
-    internal suspend fun performToggleFeedArchive(feedId: String) {
-        repository
-            .toggleFeedArchive(feedId)
-            .onSuccess { (title, isArchived) ->
-                val verb = if (isArchived) "Archived feed" else "Unarchived feed"
-                transientState.update { current ->
-                    current.copy(
-                        feedContextSheetId =
-                            if (current.feedContextSheetId == feedId) {
-                                null
-                            } else {
-                                current.feedContextSheetId
-                            },
-                        undoEvent = null,
-                        statusBanner = "$verb \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                        messageSequence = current.messageSequence + 1,
-                    )
-                }
-            }
-            .onFailure { error ->
-                showStatusMessage("Feed update failed (${error.message ?: "error"})")
-            }
-    }
-
-    internal suspend fun performDeleteFeed(feedId: String) {
-        val feedEntryIds =
-            uiState.value.allEntries.filter { it.feedId == feedId }.map { it.id }.toSet()
-        repository
-            .deleteFeed(feedId)
-            .onSuccess { title ->
-                if (feedEntryIds.isNotEmpty()) {
-                    settingsRepository.update { current ->
-                        current.copy(
-                            queueItemIds = current.queueItemIds.filterNot { it in feedEntryIds }
-                        )
-                    }
-                    if (playerController.state.value.currentEntryId in feedEntryIds) {
-                        playerController.stopAndClear()
-                    }
-                }
-                transientState.update { current ->
-                    val nextFeedId =
-                        if (current.selectedFeedId == feedId) null else current.selectedFeedId
-                    val nextFeedSheetId =
-                        if (current.feedContextSheetId == feedId) {
-                            null
-                        } else {
-                            current.feedContextSheetId
-                        }
-                    current.copy(
-                        selectedFeedId = nextFeedId,
-                        feedContextSheetId = nextFeedSheetId,
-                        undoEvent = null,
-                        statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                        messageSequence = current.messageSequence + 1,
-                    )
-                }
-            }
-            .onFailure { error ->
-                showStatusMessage("Unsubscribe failed (${error.message ?: "error"})")
-            }
-    }
-
-    internal suspend fun performDeleteEntry(entryId: String) {
-        repository
-            .deleteItem(entryId)
-            .onSuccess { title ->
-                settingsRepository.update { current ->
-                    current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
-                }
-                if (playerController.state.value.currentEntryId == entryId) {
-                    playerController.stopAndClear()
-                }
-                transientState.update { current ->
-                    val nextReaderId =
-                        if (current.selectedReaderEntryId == entryId) {
-                            null
-                        } else {
-                            current.selectedReaderEntryId
-                        }
-                    val nextSheetId =
-                        if (current.contextSheetEntryId == entryId) {
-                            null
-                        } else {
-                            current.contextSheetEntryId
-                        }
-                    current.copy(
-                        selectedReaderEntryId = nextReaderId,
-                        readerContent = nextReaderId?.let { current.readerContent },
-                        contextSheetEntryId = nextSheetId,
-                        undoEvent = null,
-                        statusBanner = "Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                        messageSequence = current.messageSequence + 1,
-                    )
-                }
-            }
-            .onFailure { error ->
-                showStatusMessage("Delete failed (${error.message ?: "error"})")
-            }
-    }
-
-    internal suspend fun performStartupSync() {
-        refreshLocalNetworkTier()
-        uiState.first { !it.isInitialLoading }
-        val currentSettings = settingsRepository.settings.first()
-        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-            performSync(errorPolicy = SyncErrorPolicy.SILENT)
-        }
-        refreshLocalNetworkTier()
-    }
-
-    internal suspend fun performPollFeedsOnDevice() {
-        refreshLocalNetworkTier()
-        if (!tryAcquireSyncLock()) return
-        try {
-            val pollResult = repository.pollDueFeedsOnDeviceNow()
-            refreshLocalNetworkTier()
-            pollResult
-                .onSuccess { count ->
-                    val msg =
-                        if (count == 0) {
-                            "All cooperative feeds are up to date"
-                        } else {
-                            val noun = if (count == 1) "feed" else "feeds"
-                            "Polled $count due $noun on-device"
-                        }
-                    showStatusMessage(msg)
-                }
-                .onFailure { error ->
-                    showStatusMessage("On-device poll skipped (${error.message ?: "offline"})")
-                }
-        } finally {
-            refreshLocalNetworkTier()
-            transientState.update { it.copy(isSyncing = false) }
-        }
-    }
-
-    private suspend fun executeCatalogMutation(action: MainAction.Mutation) =
-        catalogActionMutex.withLock {
-            when (action) {
-                is MainAction.SetAlbumGeneratorEnabled ->
-                    performToggleAlbumGenerator(action.enabled)
-                is MainAction.ConfirmFinish1001Album -> performFinish1001Album(action.notes)
-                is MainAction.ConfirmAbandon1001Album -> performAbandon1001Album(action.notes)
-                is MainAction.StartRankingSession ->
-                    performStartRankingSession(action.collectionIdOrSlug, action.focusEntryId)
-                is MainAction.SubmitRankCluster -> performSubmitRankCluster(action.ordering)
-                MainAction.SkipRankCluster -> performSkipRankCluster()
-                is MainAction.MarkFeedEntryFinished ->
-                    performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
-                is MainAction.SubmitQuickLog -> performSubmitQuickLog(action)
-                is MainAction.CreateCustomCatalogList -> performCreateCustomList(action.title)
-                is MainAction.CompleteWantEntry ->
-                    performCompleteWantEntry(action.entryId, action.rankImmediately)
-                is MainAction.RemoveWantEntry ->
-                    performRemoveWantEntry(action.collectionId, action.entryId)
-                else -> Unit
-            }
-        }
-
-    private suspend fun performToggleAlbumGenerator(enabled: Boolean) {
-        runSuspendCatching { repository.catalog.setAlbumGeneratorEnabled(enabled) }
-            .onSuccess { drawn ->
-                val message =
-                    when {
-                        !enabled -> "Disabled 1001 Albums Generator"
-                        drawn != null -> "1001 Albums active · ${drawn.name}"
-                        else -> "1001 Albums completed"
-                    }
-                showStatusMessage(message)
-            }
-            .onFailure { err ->
-                showStatusMessage("Album generator error (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performFinish1001Album(notes: String) {
-        transientState.update { it.copy(albumNoteDialogMode = null) }
-        runSuspendCatching { repository.catalog.finishCurrent1001Album(notes) }
-            .onSuccess { (finishedId, nextAlbum) ->
-                val openedRank =
-                    openRankSessionForCollection(
-                        collectionIdOrSlug = EntryKind.ALBUM.systemListSlug,
-                        focusEntryId = finishedId,
-                    )
-                if (!openedRank) {
-                    val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
-                    showStatusMessage("Logged #1 album to Diary$nextPart")
-                }
-            }
-            .onFailure { err ->
-                showStatusMessage("Could not finish album (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performAbandon1001Album(notes: String) {
-        transientState.update { it.copy(albumNoteDialogMode = null) }
-        runSuspendCatching { repository.catalog.abandonCurrent1001Album(notes) }
-            .onSuccess { (_, nextAlbum) ->
-                val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
-                showStatusMessage("Abandoned album$nextPart")
-            }
-            .onFailure { err ->
-                showStatusMessage("Could not abandon album (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performStartRankingSession(
-        collectionIdOrSlug: String,
-        focusEntryId: String?,
-    ) {
-        val opened =
-            openRankSessionForCollection(
-                collectionIdOrSlug = collectionIdOrSlug,
-                focusEntryId = focusEntryId,
-            )
-        if (!opened) {
-            showStatusMessage("Need at least 2 entries in this list to compare")
-        }
-    }
-
-    private suspend fun openRankSessionForCollection(
-        collectionIdOrSlug: String,
-        focusEntryId: String?,
-    ): Boolean {
-        val rankMeta = repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
-        val title = rankMeta?.title ?: "Rankings"
-        val scopeId = rankMeta?.scopeCollectionId
-        val cluster =
-            repository.catalog.selectNextRankCluster(
-                collectionIdOrSlug = collectionIdOrSlug,
-                focusEntryId = focusEntryId,
-                roundIndex = 0,
-            )
-        val nextSession =
-            if (cluster.isNotEmpty()) {
-                ActiveRankSessionUiState(
-                    collectionIdOrSlug = collectionIdOrSlug,
-                    collectionTitle = title,
-                    scopeCollectionId = scopeId,
-                    focusEntryId = focusEntryId,
-                    roundIndex = 0,
-                    cluster = cluster,
-                    settlement = null,
-                )
-            } else {
-                val settlement =
-                    focusEntryId
-                        ?.let { repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug) }
-                        ?.takeIf { it.totalCount >= 1 }
-                settlement?.let {
-                    ActiveRankSessionUiState(
-                        collectionIdOrSlug = collectionIdOrSlug,
-                        collectionTitle = title,
-                        scopeCollectionId = scopeId,
-                        focusEntryId = focusEntryId,
-                        roundIndex = 0,
-                        cluster = emptyList(),
-                        settlement = it,
-                    )
-                }
-            }
-        if (nextSession != null) {
-            transientState.update { it.copy(rankSession = nextSession) }
-        }
-        return nextSession != null
-    }
-
-    private suspend fun performSubmitRankCluster(ordering: List<List<String>>) {
-        val session = transientState.value.rankSession ?: return
-        runSuspendCatching {
-            repository.catalog.recordComparison(
-                ordering = ordering,
-                scopeCollectionId = session.scopeCollectionId,
-            )
-        }
-            .onFailure { err ->
-                showStatusMessage("Invalid ordering (${err.message ?: "error"})")
-                return
-            }
-        val judgedSet = session.cluster.map { it.entryId }.toSet()
-        advanceRankSession(
-            session = session.copy(judgedClusters = session.judgedClusters + listOf(judgedSet)),
-            forceRandomNext = false,
-        )
-    }
-
-    private suspend fun performSkipRankCluster() {
-        val session = transientState.value.rankSession ?: return
-        advanceRankSession(session = session, forceRandomNext = true)
-    }
-
-    private suspend fun advanceRankSession(
-        session: ActiveRankSessionUiState,
-        forceRandomNext: Boolean,
-    ) {
-        val nextRound = session.roundIndex + 1
-        val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
-        if (nextCluster.isNotEmpty()) {
-            transientState.update {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = nextCluster,
-                            settlement = null,
-                        )
-                )
-            }
-            return
-        }
-        val settlement =
-            session.focusEntryId?.let {
-                repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
-            }
-        if (settlement != null) {
-            transientState.update {
-                it.copy(
-                    rankSession =
-                        session.copy(
-                            roundIndex = nextRound,
-                            cluster = emptyList(),
-                            settlement = settlement,
-                        )
-                )
-            }
-        } else {
-            transientState.update { it.copy(rankSession = null) }
-            showStatusMessage("Rankings settled for ${session.collectionTitle}")
-        }
-    }
-
-    private suspend fun selectDeduplicatedNextCluster(
-        session: ActiveRankSessionUiState,
-        nextRound: Int,
-        forceRandomNext: Boolean,
-    ): List<RankClusterCandidate> {
-        if (session.focusEntryId != null && nextRound >= MAX_FOCUSED_RANK_ROUNDS) {
-            return emptyList()
-        }
-        val candidate =
-            repository.catalog.selectNextRankCluster(
-                collectionIdOrSlug = session.collectionIdOrSlug,
-                focusEntryId = session.focusEntryId,
-                roundIndex = nextRound,
-                forceRandomNext = forceRandomNext,
-            )
-        if (candidate.isEmpty() || !isAlreadyCoveredCluster(candidate, session.judgedClusters)) {
-            return candidate
-        }
-        return if (session.focusEntryId == null) {
-            repository.catalog
-                .selectNextRankCluster(
-                    collectionIdOrSlug = session.collectionIdOrSlug,
-                    focusEntryId = null,
-                    roundIndex = nextRound,
-                    forceRandomNext = true,
-                )
-                .takeUnless { isAlreadyCoveredCluster(it, session.judgedClusters) }
-                .orEmpty()
-        } else {
-            emptyList()
-        }
-    }
-
-    private fun isAlreadyCoveredCluster(
-        cluster: List<RankClusterCandidate>,
-        judgedClusters: List<Set<String>>,
-    ): Boolean {
-        val ids = cluster.map { it.entryId }
-        return ids.isNotEmpty() && judgedClusters.any { prev -> prev.containsAll(ids) }
-    }
-
-    private suspend fun performMarkFeedEntryFinished(
-        entryId: String,
-        rankImmediately: Boolean,
-    ) {
-        val resolvedId = repository.markFeedItemFinished(entryId)
-        settingsRepository.update { current ->
-            current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
-        }
-        val wasActiveAudio = playerController.state.value.currentEntryId == entryId
-        if (wasActiveAudio) {
-            playerController.stopAndClear()
-        }
-        transientState.update { it.copy(contextSheetEntryId = null) }
-        if (resolvedId == null) {
-            showStatusMessage("Entry not found")
-            return
-        }
-        if (rankImmediately) {
-            val pair = repository.prepareFeedItemForRank(entryId)
-            val slug = (pair?.second ?: EntryKind.ARTICLE).systemListSlug
-            val opened = openRankSessionForCollection(slug, resolvedId)
-            if (!opened) {
-                showStatusMessage("Logged to Diary")
-            }
-        } else {
-            showStatusMessage("Marked finished & logged to Diary")
-        }
-    }
-
-    private suspend fun performSubmitQuickLog(action: MainAction.SubmitQuickLog) {
-        val cleanTitle = action.title.trim()
-        if (cleanTitle.isEmpty()) {
-            showStatusMessage("Enter a title")
-            return
-        }
-        val targetListId = action.targetCollectionId?.trim()?.takeIf { it.isNotEmpty() }
-        runSuspendCatching { saveQuickLogEntry(action, cleanTitle, targetListId) }
-            .onSuccess { entryId ->
-                handleQuickLogSaved(action, cleanTitle, targetListId, entryId)
-            }
-            .onFailure { err ->
-                showStatusMessage("Could not save (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun saveQuickLogEntry(
-        action: MainAction.SubmitQuickLog,
-        cleanTitle: String,
-        targetListId: String?,
-    ): String {
-        val creators = action.creatorsCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
-        val input =
-            UpsertCatalogEntryInput(
-                kind = action.kind,
-                title = cleanTitle,
-                creators = creators,
-                releaseYear = action.releaseYear,
-            )
-        return if (action.addToWant) {
-            repository.catalog.wantEntry(input)
-        } else {
-            val loggedId = repository.catalog.logEntry(input, action.status, action.notes)
-            if (targetListId != null) {
-                repository.catalog.addCollectionEntry(targetListId, loggedId)
-            }
-            loggedId
-        }
-    }
-
-    private suspend fun handleQuickLogSaved(
-        action: MainAction.SubmitQuickLog,
-        cleanTitle: String,
-        targetListId: String?,
-        entryId: String,
-    ) {
-        transientState.update {
-            it.copy(
-                isQuickLogSheetOpen = false,
-                quickLogTargetCollectionId = null,
-                quickLogTargetCollectionTitle = null,
-            )
-        }
-        if (!action.addToWant && action.rankAfterLog) {
-            val rankTarget = targetListId ?: action.kind.systemListSlug
-            if (!openRankSessionForCollection(rankTarget, entryId)) {
-                showStatusMessage("Logged \"$cleanTitle\" to Diary")
-            }
-        } else {
-            val verb = if (action.addToWant) "Added to Want Queue" else "Logged to Diary"
-            showStatusMessage("$verb · $cleanTitle")
-        }
-    }
-
-    private suspend fun performCreateCustomList(rawTitle: String) {
-        runSuspendCatching { repository.catalog.createCustomList(rawTitle) }
-            .onSuccess { specId ->
-                transientState.update {
-                    it.copy(
-                        companionSubTab = CompanionSubTab.LISTS,
-                        selectedCatalogCollectionId = specId,
-                    )
-                }
-                showStatusMessage("Created list \"${rawTitle.trim()}\"")
-            }
-            .onFailure { err ->
-                showStatusMessage("Could not create list (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performCompleteWantEntry(entryId: String, rankImmediately: Boolean) {
-        runSuspendCatching {
-            repository.catalog.logExistingEntry(entryId, ConsumptionStatus.CONSUMED, null)
-        }
-            .onSuccess { resolvedId ->
-                val targetId = resolvedId ?: entryId
-                val listSlug = repository.catalog.resolveEntrySystemListSlug(targetId)
-                if (rankImmediately && listSlug != null) {
-                    val opened = openRankSessionForCollection(listSlug, targetId)
-                    if (!opened) {
-                        showStatusMessage("Completed & logged to Diary")
-                    }
-                } else {
-                    showStatusMessage("Completed & logged to Diary")
-                }
-            }
-            .onFailure { err ->
-                showStatusMessage("Could not complete item (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performRemoveWantEntry(collectionId: String, entryId: String) {
-        val meta = repository.catalog.resolveCollectionRankMeta(collectionId)
-        val label = if (meta?.scopeCollectionId != null) "Want Queue" else meta?.title ?: "list"
-        runSuspendCatching {
-            repository.catalog.removeCollectionEntry(collectionId, entryId)
-        }
-            .onSuccess { showStatusMessage("Removed from $label") }
-            .onFailure { err ->
-                showStatusMessage("Could not remove (${err.message ?: "error"})")
-            }
-    }
-
-    private suspend fun performSync(errorPolicy: SyncErrorPolicy = SyncErrorPolicy.SHOW_BANNER) {
-        refreshLocalNetworkTier()
-        if (!tryAcquireSyncLock()) return
-        try {
-            val syncResult = repository.syncWithServer()
-            refreshLocalNetworkTier()
-            syncResult
-                .onSuccess { count ->
-                    showStatusMessage("Synced $count entries from server")
-                }
-                .onFailure { error ->
-                    if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
-                        showStatusMessage("Sync offline (${error.message ?: "unreachable"})")
-                    }
-                }
-        } finally {
-            refreshLocalNetworkTier()
-            transientState.update { it.copy(isSyncing = false) }
-        }
-    }
-
-    private fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
+    internal fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
         val activePlayerId = playerController.state.value.currentEntryId
         transientState.update { current ->
             if (current.selectedReaderEntryId == entryId || activePlayerId == entryId) {
@@ -1499,7 +377,7 @@ class MainViewModel(
             }
         }
         if (activePlayerId == entryId) {
-            val base = uiState.value.allEntries.firstOrNull { it.id == entryId }
+            val base = peekLatestEntries().firstOrNull { it.id == entryId }
             playerController.refreshChaptersFromNotes(
                 entryId = entryId,
                 pickLongerReaderText(content.contentHtml, base?.contentHtml),
@@ -1542,6 +420,5 @@ class MainViewModel(
 
     private companion object {
         private const val STOP_TIMEOUT_MS = 5_000L
-        private const val MAX_FOCUSED_RANK_ROUNDS = 8
     }
 }

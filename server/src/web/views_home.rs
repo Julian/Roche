@@ -398,11 +398,8 @@ pub(super) async fn post_1001_finish<F: FeedFetcher>(
 ) -> Response {
     match service.catalog().finish_active_1001_album(form.notes.as_deref()).await {
         Ok((completed, next_state)) => {
-            let can_rank = service
-                .catalog()
-                .get_ranked_collection("albums", false)
-                .await
-                .is_ok_and(|v| v.rows.len() >= 2);
+            let can_rank =
+                service.catalog().can_rank_collection("albums", false).await.unwrap_or(false);
             if can_rank {
                 let notice =
                     format!("Finished '{}' — rank it against your albums", completed.title);

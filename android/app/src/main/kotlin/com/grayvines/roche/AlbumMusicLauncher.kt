@@ -63,12 +63,7 @@ internal fun selectMusicUrlResolution(
         if (
             existing == null || !existing.isUserSelectedForHost && candidate.isUserSelectedForHost
         ) {
-            uniqueByPackage[pkg] =
-                if (existing != null) {
-                    existing.copy(isUserSelectedForHost = true)
-                } else {
-                    candidate
-                }
+            uniqueByPackage[pkg] = candidate
         }
     }
     val deduped = uniqueByPackage.values.toList()

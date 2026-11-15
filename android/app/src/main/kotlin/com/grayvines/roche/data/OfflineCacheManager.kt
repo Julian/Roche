@@ -121,22 +121,14 @@ internal class OfflineCacheManager(
 
     internal suspend fun autoDownloadNewEpisodes() {
         val autoDownloadFeedIds =
-            dao.getAllFeeds()
-                .filter { it.isActive && it.autoDownloadEpisodes }
-                .map { it.id }
-                .toSet()
+            dao.getAllFeeds().filter { it.isActive && it.autoDownloadEpisodes }.map { it.id }
         if (autoDownloadFeedIds.isEmpty()) return
-        val candidates =
-            dao.getAllItems().filter { item ->
-                item.feedId in autoDownloadFeedIds &&
-                    item.status != "archived" &&
-                    item.readAt.isNullOrBlank() &&
-                    !item.isCachedOffline &&
-                    (item.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
-                        !item.audioUrl.isNullOrBlank())
+        val candidateIds =
+            autoDownloadFeedIds.chunked(AUTO_DOWNLOAD_FEED_CHUNK_SIZE).flatMap { chunk ->
+                dao.getUncachedUnreadAudioItemIds(chunk)
             }
-        for (item in candidates) {
-            setOfflineCacheState(itemId = item.id, enabled = true)
+        for (itemId in candidateIds) {
+            setOfflineCacheState(itemId = itemId, enabled = true)
         }
     }
 
@@ -399,30 +391,10 @@ internal suspend fun copyCachedThumbnailBestEffort(
 }
 
 internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): ItemEntity =
-    local.copy(
-        title = detail.title.takeIf { it.isNotBlank() } ?: local.title,
-        author = detail.author?.takeIf { it.isNotBlank() } ?: local.author,
-        summary =
-            (detail.summary?.takeIf { it.isNotBlank() } ?: local.summary)?.take(
-                MAX_SQLITE_SUMMARY_CHARS
-            ),
-        contentText =
-            (detail.contentText?.takeIf { it.isNotBlank() }
-                    ?: local.contentText?.takeIf { it.isNotBlank() && it != local.summary })
-                ?.take(MAX_SQLITE_TEXT_CHARS),
-        contentHtml =
-            (detail.contentHtml?.takeIf { it.isNotBlank() } ?: local.contentHtml)?.take(
-                MAX_SQLITE_HTML_CHARS
-            ),
-        thumbnailMediaId =
-            detail.thumbnailMediaId?.takeIf { it.isNotBlank() } ?: local.thumbnailMediaId,
-        thumbnailUrl = detail.thumbnailUrl?.takeIf { it.isNotBlank() } ?: local.thumbnailUrl,
-        duration = detail.duration?.takeIf { it.isNotBlank() } ?: local.duration,
-        audioUrl = detail.audioUrl?.takeIf { it.isNotBlank() } ?: local.audioUrl,
-        status = local.status,
-        isFavorite = local.isFavorite,
-        readProgress = local.readProgress,
-        isCachedOffline = local.isCachedOffline,
+    mergeRemoteItemIntoLocal(
+        local = local,
+        remote = detail,
+        adoptRemoteIdentity = false,
     )
 
 internal fun collectEligibleMediaIds(
@@ -506,6 +478,7 @@ internal const val ITEMS_SUBDIR = "items"
 internal const val THUMBNAILS_SUBDIR = "thumbnails"
 internal const val AUDIO_ENCLOSURE_FILE_NAME = "audio_enclosure"
 private const val CONTENT_TYPE_AUDIO = "audio"
+private const val AUTO_DOWNLOAD_FEED_CHUNK_SIZE = 500
 private const val MAX_OFFLINE_MEDIA_BYTES = 50L * 1024L * 1024L
 private const val MAX_OFFLINE_THUMBNAIL_BYTES = 10L * 1024L * 1024L
 private const val MAX_OFFLINE_EXTERNAL_IMAGES = 16

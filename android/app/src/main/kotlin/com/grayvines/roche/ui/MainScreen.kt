@@ -53,7 +53,6 @@ fun MainScreen(
     modifier: Modifier = Modifier,
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
-    onMoveTaskToBack: () -> Unit = {},
     onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = { album ->
         onOpenExternalUrl(album.youtubeMusicUrl)
     },
@@ -71,9 +70,7 @@ fun MainScreen(
     MainBackNavigationHandler(
         state = state,
         showChrome = showChrome,
-        hasActivePlayer = activePlayerEntry != null,
         onAction = onAction,
-        onMoveTaskToBack = onMoveTaskToBack,
     )
 
     Scaffold(
@@ -137,18 +134,15 @@ fun MainScreen(
 private fun MainBackNavigationHandler(
     state: MainUiState,
     showChrome: Boolean,
-    hasActivePlayer: Boolean,
     onAction: (MainAction) -> Unit,
-    onMoveTaskToBack: () -> Unit,
 ) {
     val hasScopeFilter = state.selectedFeedId != null || state.selectedTag != null
     val hasInnerBack = state.isSearchOpen || hasScopeFilter || state.activeTab != AppTab.INBOX
-    BackHandler(enabled = showChrome && (hasInnerBack || hasActivePlayer)) {
+    BackHandler(enabled = showChrome && hasInnerBack) {
         when {
             state.isSearchOpen -> onAction(MainAction.CloseSearch)
             hasScopeFilter -> onAction(MainAction.NavigateBackFromScope)
             state.activeTab != AppTab.INBOX -> onAction(MainAction.SelectTab(AppTab.INBOX))
-            else -> onMoveTaskToBack()
         }
     }
 }
@@ -351,6 +345,7 @@ private fun MainBodyContent(
             ReaderView(
                 entry = readerEntry,
                 settings = state.settings,
+                isHydrating = state.isReaderHydrating,
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
@@ -415,7 +410,7 @@ private fun MainBodyContent(
                 MediaCompanionScreen(
                     state = state,
                     onAction = onAction,
-                    listState = scrollStates.lazyListState("lists:${state.companionSubTab.name}"),
+                    listState = scrollStates.lazyListState(companionScrollKey(state)),
                 )
             AppTab.SETTINGS ->
                 SettingsTabContent(
@@ -433,6 +428,35 @@ private fun inboxScrollKey(state: MainUiState): String =
         state.selectedFeedId != null -> "inbox:feed:${state.selectedFeedId}"
         state.selectedTag != null -> "inbox:tag:${state.selectedTag}"
         else -> "inbox:filter:${state.activeFilter.name}"
+    }
+
+private fun companionScrollKey(state: MainUiState): String =
+    when (state.companionSubTab) {
+        CompanionSubTab.LISTS -> {
+            val lists = state.catalog.lists
+            val activeId =
+                lists
+                    .firstOrNull { it.collectionId == state.selectedCatalogCollectionId }
+                    ?.collectionId
+                    ?: lists.firstOrNull { it.entryCount > 0 }?.collectionId
+                    ?: lists.firstOrNull()?.collectionId
+                    ?: "default"
+            "lists:LISTS:$activeId"
+        }
+        CompanionSubTab.WANT -> {
+            val queues = state.catalog.wantQueues
+            val activeId =
+                queues
+                    .firstOrNull { it.collectionId == state.selectedWantCollectionId }
+                    ?.collectionId
+                    ?: queues.firstOrNull { it.entryCount > 0 }?.collectionId
+                    ?: queues.firstOrNull()?.collectionId
+                    ?: "default"
+            "lists:WANT:$activeId"
+        }
+        CompanionSubTab.DIARY -> {
+            "lists:DIARY"
+        }
     }
 
 private fun readerBackLabel(state: MainUiState): String =

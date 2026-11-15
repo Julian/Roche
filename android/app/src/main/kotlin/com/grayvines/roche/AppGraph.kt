@@ -4,12 +4,15 @@ import android.content.Context
 import androidx.compose.ui.graphics.asAndroidBitmap
 import com.grayvines.roche.data.AndroidNetworkTierProvider
 import com.grayvines.roche.data.NetworkTierProvider
+import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpUrlConnectionTransport
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.VpnTransportCheck
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.ui.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.ui.ExoPlayerAudioBackend
 import com.grayvines.roche.ui.PodcastMediaSessionBridge
 import com.grayvines.roche.ui.PodcastPlayerController
 import com.grayvines.roche.ui.components.ThumbnailLoader
@@ -18,6 +21,7 @@ import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class AppGraph(context: Context) {
@@ -29,10 +33,16 @@ class AppGraph(context: Context) {
 
     val settings: SettingsRepository by lazy { SettingsRepository.create(appContext) }
 
-    val apiClient: RocheApiClient by lazy { RocheApiClient(HttpUrlConnectionTransport()) }
-
     val networkTierProvider: NetworkTierProvider by lazy {
         AndroidNetworkTierProvider(appContext)
+    }
+
+    val apiClient: RocheApiClient by lazy {
+        val vpnCheck = VpnTransportCheck(networkTierProvider::isVpnTransportActive)
+        RocheApiClient(
+            vpnCheck = vpnCheck,
+            transport = HttpUrlConnectionTransport(vpnCheck = vpnCheck),
+        )
     }
 
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
@@ -59,9 +69,17 @@ class AppGraph(context: Context) {
         )
     }
 
+    val audioPlayerBackend: ExoPlayerAudioBackend by lazy {
+        ExoPlayerAudioBackend(
+            context = appContext,
+            allowedLocalDirs = listOf(offlineCacheDir, appContext.cacheDir),
+        )
+    }
+
     val mediaSessionBridge: PodcastMediaSessionBridge by lazy {
         AndroidPodcastMediaSessionBridge(
             context = appContext,
+            backend = audioPlayerBackend,
             scope = appScope,
             artworkBitmapLoader = { url -> thumbnailLoader.loadThumbnail(url)?.asAndroidBitmap() },
         )
@@ -72,12 +90,17 @@ class AppGraph(context: Context) {
             scope = appScope,
             repository = repository,
             settingsRepository = settings,
+            playerBackend = audioPlayerBackend,
             mediaSessionBridge = mediaSessionBridge,
         )
     }
 
     fun prewarm() {
-        appScope.launch { settings.prewarm() }
+        appScope.launch {
+            settings.prewarm()
+            val current = settings.settings.first()
+            PeerSyncScheduler.schedulePeriodicSync(appContext, current.serverUrl)
+        }
         appScope.launch { repository.prewarm() }
     }
 }

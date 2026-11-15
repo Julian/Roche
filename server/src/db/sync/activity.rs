@@ -22,6 +22,15 @@ pub struct ActivityEntry {
     pub timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(in crate::db::sync) enum OutgoingSince {
+    All,
+    Inclusive(DateTime<Utc>),
+    StrictlyAfter(DateTime<Utc>),
+}
+
+pub(in crate::db::sync) const OUTGOING_SYNC_ROW_CAP: usize = 100_000;
+
 impl SyncRepo<'_> {
     pub async fn record_activity(
         conn: &mut SqliteConnection,
@@ -84,27 +93,63 @@ impl SyncRepo<'_> {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<SyncTombstone>> {
-        if let Some(ts) = since {
-            Ok(sqlx::query_as::<_, SyncTombstone>(
-                "SELECT entity_type, natural_key, deleted_at
-                 FROM sync_tombstones
-                 WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
-                 ORDER BY deleted_at DESC
-                 LIMIT 5000",
-            )
-            .bind(ts)
-            .fetch_all(self.pool)
-            .await?)
+        let mode = since.map_or(OutgoingSince::All, OutgoingSince::Inclusive);
+        let (rows, _) = self.list_tombstones_bounded(mode).await?;
+        Ok(rows)
+    }
+
+    pub(in crate::db::sync) async fn list_tombstones_bounded(
+        &self,
+        since: OutgoingSince,
+    ) -> Result<(Vec<SyncTombstone>, Option<DateTime<Utc>>)> {
+        let fetch_limit =
+            i64::try_from(OUTGOING_SYNC_ROW_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows: Vec<SyncTombstone> = match since {
+            OutgoingSince::All => {
+                sqlx::query_as::<_, SyncTombstone>(
+                    "SELECT entity_type, natural_key, deleted_at
+                     FROM sync_tombstones
+                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
+                     LIMIT ?",
+                )
+                .bind(fetch_limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            OutgoingSince::Inclusive(ts) => {
+                sqlx::query_as::<_, SyncTombstone>(
+                    "SELECT entity_type, natural_key, deleted_at
+                     FROM sync_tombstones
+                     WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
+                     LIMIT ?",
+                )
+                .bind(ts)
+                .bind(fetch_limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            OutgoingSince::StrictlyAfter(ts) => {
+                sqlx::query_as::<_, SyncTombstone>(
+                    "SELECT entity_type, natural_key, deleted_at
+                     FROM sync_tombstones
+                     WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
+                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
+                     LIMIT ?",
+                )
+                .bind(ts)
+                .bind(fetch_limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+        let trunc_ts = if rows.len() > OUTGOING_SYNC_ROW_CAP {
+            rows.truncate(OUTGOING_SYNC_ROW_CAP);
+            rows.last().map(|r| r.deleted_at)
         } else {
-            Ok(sqlx::query_as::<_, SyncTombstone>(
-                "SELECT entity_type, natural_key, deleted_at
-                 FROM sync_tombstones
-                 ORDER BY deleted_at DESC
-                 LIMIT 5000",
-            )
-            .fetch_all(self.pool)
-            .await?)
-        }
+            None
+        };
+        Ok((rows, trunc_ts))
     }
 
     pub async fn list_activity(&self) -> Result<Vec<ActivityEntry>> {

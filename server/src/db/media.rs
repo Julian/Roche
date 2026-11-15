@@ -35,10 +35,68 @@ pub struct MediaRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
 }
 
+pub struct NewMediaSpec<'a> {
+    pub media_type: MediaType,
+    pub path: &'a str,
+    pub file_size: Option<i64>,
+    pub duration: Option<i64>,
+}
+
 impl<'a> MediaRepo<'a> {
     #[must_use]
     pub const fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub async fn create_batch(
+        &self,
+        item_id: &str,
+        specs: &[NewMediaSpec<'_>],
+    ) -> Result<Vec<Media>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+        let mut out = Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            let id = Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+                 VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(item_id)
+            .bind(spec.media_type)
+            .bind(spec.path)
+            .bind(spec.file_size)
+            .bind(spec.duration)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Media,
+                &id,
+                ActivityAction::Create,
+                now,
+            )
+            .await?;
+
+            out.push(Media {
+                id,
+                item_id: item_id.to_owned(),
+                media_type: spec.media_type,
+                path: spec.path.to_owned(),
+                file_size: spec.file_size,
+                duration: spec.duration,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(out)
     }
 
     pub(crate) async fn upsert_audio_enclosure_in_tx(
@@ -144,6 +202,34 @@ impl<'a> MediaRepo<'a> {
         .await?)
     }
 
+    /// Lists downloaded media files belonging to items in `feed_id` that will NOT remain in Inbox
+    /// after deleting `feed_id` (i.e. items that are neither starred nor cross-posted in another feed).
+    pub async fn list_exclusively_owned_by_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
+        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
+            "AND EXISTS (
+                SELECT 1 FROM collection_entries ce
+                WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM collection_entries ce2
+                WHERE ce2.entry_id = m.entry_id
+                  AND ce2.collection_id != ?
+                  AND (
+                      ce2.collection_id = ?
+                      OR EXISTS (
+                          SELECT 1 FROM feed_sources fs2
+                          WHERE fs2.collection_id = ce2.collection_id
+                      )
+                  )
+            )"
+        ))
+        .bind(feed_id)
+        .bind(feed_id)
+        .bind(super::STARRED_COLLECTION_ID)
+        .fetch_all(self.pool)
+        .await?)
+    }
+
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
@@ -181,9 +267,24 @@ impl<'a> MediaRepo<'a> {
 
     pub async fn find_orphaned(&self) -> Result<Vec<Media>> {
         Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
-            "AND m.entry_id NOT IN (SELECT id FROM entries)"
+            "AND (
+                m.entry_id NOT IN (SELECT id FROM entries WHERE merged_into_id IS NULL)
+                OR EXISTS (
+                    SELECT 1 FROM entry_state es
+                    WHERE es.entry_id = m.entry_id AND es.inbox_state = 'none'
+                )
+            )"
         ))
         .fetch_all(self.pool)
         .await?)
+    }
+
+    pub async fn list_registered_item_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT entry_id FROM entry_media WHERE local_path IS NOT NULL",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 }

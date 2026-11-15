@@ -28,8 +28,9 @@ import androidx.sqlite.execSQL
             CollectionGeneratorEntity::class,
             ConsumptionLogEntity::class,
             ComparisonEntity::class,
+            LocalSyncFlagEntity::class,
         ],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -151,6 +152,13 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_7_8 =
+            object : Migration(7, 8) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateCatalogAndSyncSchemaV8(connection)
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
@@ -161,6 +169,7 @@ abstract class RocheDatabase : RoomDatabase() {
                     MIGRATION_4_5,
                     MIGRATION_5_6,
                     MIGRATION_6_7,
+                    MIGRATION_7_8,
                 )
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
@@ -298,4 +307,84 @@ private fun migrateCatalogActivityV7(connection: SQLiteConnection) {
             "ON `comparisons` (`scopeCollectionId`)"
     )
     connection.execSQL("CREATE INDEX IF NOT EXISTS `index_comparisons_ts` ON `comparisons` (`ts`)")
+}
+
+internal const val FLAG_CATALOG_BACKFILL_NEEDED = "catalog_backfill_needed"
+private const val APPROX_ARTICLE_CHARS_PER_MINUTE = 1_080
+
+internal fun migrateCatalogAndSyncSchemaV8(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `local_sync_flags` (" +
+            "`flagKey` TEXT NOT NULL, " +
+            "`flagValue` TEXT NOT NULL, " +
+            "PRIMARY KEY(`flagKey`))"
+    )
+    connection.execSQL(
+        "INSERT OR REPLACE INTO `local_sync_flags` (`flagKey`, `flagValue`) " +
+            "VALUES ('$FLAG_CATALOG_BACKFILL_NEEDED', '1')"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_items_interactionUpdatedAt` " +
+            "ON `items` (`interactionUpdatedAt`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_items_createdAt` ON `items` (`createdAt`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_collection_entries_addedAt` " +
+            "ON `collection_entries` (`addedAt`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_consumption_log_createdAt` " +
+            "ON `consumption_log` (`createdAt`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_comparisons_createdAt` ON `comparisons` (`createdAt`)"
+    )
+    connection.execSQL(
+        "UPDATE `items` SET `duration` = (" +
+            "SELECT CAST(MAX(1, LENGTH(COALESCE(ic.`contentText`, ic.`contentHtml`, ic.`summary`, '')) / " +
+            "$APPROX_ARTICLE_CHARS_PER_MINUTE) AS TEXT) || 'm' " +
+            "FROM `item_contents` ic WHERE ic.`itemId` = `items`.`id`" +
+            ") WHERE LOWER(`contentType`) = 'article' AND (`duration` IS NULL OR `duration` = '') " +
+            "AND EXISTS (SELECT 1 FROM `item_contents` ic WHERE ic.`itemId` = `items`.`id` " +
+            "AND LENGTH(TRIM(COALESCE(ic.`contentText`, ic.`contentHtml`, ic.`summary`, ''))) > 0)"
+    )
+    normalizeV7EntryIdentifiers(connection)
+}
+
+private fun normalizeV7EntryIdentifiers(connection: SQLiteConnection) {
+    connection.execSQL(
+        "INSERT OR IGNORE INTO `entry_identifiers` (`scheme`, `value`, `entryId`) " +
+            "SELECT `scheme`, LOWER(TRIM(`value`)), `entryId` FROM `entry_identifiers` " +
+            "WHERE `scheme` IN ('slug', 'tag', '1001albums') AND `value` != LOWER(TRIM(`value`))"
+    )
+    connection.execSQL(
+        "DELETE FROM `entry_identifiers` " +
+            "WHERE `scheme` IN ('slug', 'tag', '1001albums') AND `value` != LOWER(TRIM(`value`))"
+    )
+    connection.execSQL(
+        "INSERT OR IGNORE INTO `entry_identifiers` (`scheme`, `value`, `entryId`) " +
+            "SELECT 'spotify', " +
+            "CASE (SELECT `kind` FROM `catalog_entries` ce WHERE ce.`id` = ei.`entryId`) " +
+            "WHEN 'song' THEN 'spotify:track:' " +
+            "WHEN 'artist' THEN 'spotify:artist:' " +
+            "WHEN 'podcast' THEN 'spotify:show:' " +
+            "WHEN 'podcast_episode' THEN 'spotify:episode:' " +
+            "ELSE 'spotify:album:' END || TRIM(ei.`value`), " +
+            "ei.`entryId` " +
+            "FROM `entry_identifiers` ei " +
+            "WHERE ei.`scheme` = 'spotify' AND INSTR(ei.`value`, ':') = 0 " +
+            "AND INSTR(ei.`value`, '/') = 0 AND LENGTH(TRIM(ei.`value`)) = 22 " +
+            "AND EXISTS (SELECT 1 FROM `catalog_entries` ce WHERE ce.`id` = ei.`entryId` " +
+            "AND ce.`kind` IN ('album', 'song', 'artist', 'podcast', 'podcast_episode'))"
+    )
+    connection.execSQL(
+        "DELETE FROM `entry_identifiers` " +
+            "WHERE `scheme` = 'spotify' AND INSTR(`value`, ':') = 0 " +
+            "AND INSTR(`value`, '/') = 0 AND LENGTH(TRIM(`value`)) = 22 " +
+            "AND EXISTS (SELECT 1 FROM `catalog_entries` ce " +
+            "WHERE ce.`id` = `entry_identifiers`.`entryId` " +
+            "AND ce.`kind` IN ('album', 'song', 'artist', 'podcast', 'podcast_episode'))"
+    )
 }

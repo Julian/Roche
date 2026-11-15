@@ -1,371 +1,63 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerCatalogEntryPayload
-import com.grayvines.roche.data.PeerCollectionEntryPayload
-import com.grayvines.roche.data.PeerCollectionGeneratorPayload
-import com.grayvines.roche.data.PeerCollectionSpecPayload
-import com.grayvines.roche.data.PeerComparisonPayload
-import com.grayvines.roche.data.PeerConsumptionLogPayload
-import com.grayvines.roche.data.PeerNodeDto
-import com.grayvines.roche.data.SyncTombstoneDto
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
-import java.io.BufferedReader
-import java.io.ByteArrayOutputStream
-import java.io.IOException
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URI
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.util.zip.GZIPInputStream
+import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
 
-data class HttpRequest(
-    val method: String,
-    val url: String,
-    val headers: Map<String, String> = emptyMap(),
-    val body: String? = null,
-    val expectBinary: Boolean = false,
-)
-
-@Suppress("ArrayInDataClass")
-data class HttpResponse(
-    val statusCode: Int,
-    val body: String,
-    val headers: Map<String, String> = emptyMap(),
-    val bodyBytes: ByteArray? = null,
-)
-
-fun interface HttpTransport {
-    suspend fun execute(request: HttpRequest): HttpResponse
-}
-
-class HttpUrlConnectionTransport : HttpTransport {
-    override suspend fun execute(request: HttpRequest): HttpResponse =
-        withContext(Dispatchers.IO) { executeFollowingRedirects(request) }
-
-    private fun executeFollowingRedirects(initialRequest: HttpRequest): HttpResponse {
-        var currentRequest = initialRequest
-        repeat(MAX_REDIRECTS + 1) {
-            val (response, redirectLocation) = executeSingleRequest(currentRequest)
-            val nextUrl = redirectLocation?.let { resolveRedirectUrl(currentRequest.url, it) }
-            if (nextUrl == null) {
-                return response
-            }
-            currentRequest = buildRedirectedRequest(currentRequest, response.statusCode, nextUrl)
-        }
-        return executeSingleRequest(currentRequest).first
-    }
-
-    private fun executeSingleRequest(request: HttpRequest): Pair<HttpResponse, String?> {
-        val connection = openConfiguredConnection(request)
-        try {
-            val status = connection.responseCode
-            if (status in REDIRECT_STATUS_CODES) {
-                val location =
-                    connection.getHeaderField("Location")?.trim()?.takeIf { it.isNotBlank() }
-                if (location != null) {
-                    return HttpResponse(statusCode = status, body = "") to location
-                }
-            }
-            val isSuccess = status in HTTP_OK_START..HTTP_OK_END
-            val stream = openResponseStream(connection, isSuccess)
-            val maxBytes =
-                if (request.expectBinary && isSuccess) MAX_MEDIA_BYTES else MAX_RESPONSE_CHARS
-            val bytes = stream?.let { input -> readBoundedBytes(input, maxBytes) } ?: ByteArray(0)
-            val text =
-                if (request.expectBinary && isSuccess) {
-                    ""
-                } else {
-                    bytes.toString(Charsets.UTF_8)
-                }
-            return HttpResponse(statusCode = status, body = text, bodyBytes = bytes) to null
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private fun openConfiguredConnection(request: HttpRequest): HttpURLConnection {
-        val sanitizedUrl = request.url.trim().replace(" ", "%20")
-        return (URI.create(sanitizedUrl).toURL().openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = false
-            requestMethod = request.method
-            connectTimeout = CONNECT_TIMEOUT_MS
-            readTimeout = READ_TIMEOUT_MS
-            if (request.headers.keys.none { it.equals("Accept-Encoding", ignoreCase = true) }) {
-                setRequestProperty("Accept-Encoding", "gzip")
-            }
-            request.headers.forEach { (key, value) -> setRequestProperty(key, value) }
-            if (request.body != null) {
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                outputStream.use { out ->
-                    out.write(request.body.toByteArray(Charsets.UTF_8))
-                }
-            }
-        }
-    }
-
-    private fun openResponseStream(
-        connection: HttpURLConnection,
-        isSuccess: Boolean,
-    ): java.io.InputStream? {
-        val rawStream = if (isSuccess) connection.inputStream else connection.errorStream
-        val isGzip = connection.contentEncoding?.equals("gzip", ignoreCase = true) == true
-        return if (rawStream != null && isGzip) GZIPInputStream(rawStream) else rawStream
-    }
-
-    private companion object {
-        private const val CONNECT_TIMEOUT_MS = 10_000
-        private const val READ_TIMEOUT_MS = 15_000
-        private const val MAX_REDIRECTS = 5
-        private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
-    }
-}
-
-private val REDIRECT_SWITCH_TO_GET_CODES = setOf(301, 302, 303)
-
-internal fun buildRedirectedRequest(
-    currentRequest: HttpRequest,
-    statusCode: Int,
-    nextUrl: String,
-): HttpRequest {
-    val switchToGet =
-        statusCode in REDIRECT_SWITCH_TO_GET_CODES &&
-            currentRequest.method != "GET" &&
-            currentRequest.method != "HEAD"
-    val nextHeaders =
-        if (isSameOriginHost(currentRequest.url, nextUrl)) {
-            currentRequest.headers
-        } else {
-            currentRequest.headers.filterKeys {
-                !it.equals(HEADER_AUTHORIZATION, ignoreCase = true)
-            }
-        }
-    return currentRequest.copy(
-        method = if (switchToGet) "GET" else currentRequest.method,
-        url = nextUrl,
-        headers = nextHeaders,
-        body = if (switchToGet) null else currentRequest.body,
-    )
-}
-
-internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = runCatching {
-    val resolved =
-        URI.create(baseUrl.trim().replace(" ", "%20"))
-            .resolve(location.trim().replace(" ", "%20"))
-            .toString()
-    resolved.takeIf {
-        it.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
-            it.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-    }
-}
-    .getOrNull()
-
-private const val HTTP_SCHEME_HTTPS = "https://"
-private const val HTTP_SCHEME_HTTP = "http://"
-
-internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
-    val origin = URI.create(firstUrl.trim()).toURL()
-    val target = URI.create(secondUrl.trim()).toURL()
-    val originHost = origin.host
-    val targetHost = target.host
-    val sameProtocol = origin.protocol.equals(target.protocol, ignoreCase = true)
-    val originPort = origin.port.takeIf { it != -1 } ?: origin.defaultPort
-    val targetPort = target.port.takeIf { it != -1 } ?: target.defaultPort
-    originHost.isNotBlank() &&
-        originHost.equals(targetHost, ignoreCase = true) &&
-        sameProtocol &&
-        originPort != -1 &&
-        originPort == targetPort
-}
-    .getOrDefault(false)
-
-internal fun readBoundedBytes(
-    input: java.io.InputStream,
-    maxBytes: Int = MAX_MEDIA_BYTES,
-): ByteArray = input.use { stream ->
-    val out = ByteArrayOutputStream()
-    val buffer = ByteArray(READ_BUFFER_CHARS)
-    var total = 0
-    while (true) {
-        val remainingAllowed = maxBytes - total + 1
-        val read = stream.read(buffer, 0, minOf(buffer.size, remainingAllowed))
-        if (read == -1) break
-        total += read
-        if (total > maxBytes) {
-            throw IOException("Response exceeds maximum allowed size of $maxBytes bytes")
-        }
-        out.write(buffer, 0, read)
-    }
-    out.toByteArray()
-}
-
-internal fun readBoundedText(input: java.io.InputStream): String =
-    BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
-        val builder = StringBuilder()
-        val buffer = CharArray(READ_BUFFER_CHARS)
-        var total = 0
-        while (total < MAX_RESPONSE_CHARS) {
-            val read = reader.read(buffer, 0, minOf(buffer.size, MAX_RESPONSE_CHARS - total))
-            if (read == -1) break
-            builder.append(buffer, 0, read)
-            total += read
-        }
-        builder.toString()
-    }
-
-private const val READ_BUFFER_CHARS = 8_192
-private const val MAX_RESPONSE_CHARS = 64 * 1024 * 1024
-private const val MAX_MEDIA_BYTES = 50 * 1024 * 1024
-
-class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
-    Exception("$title ($statusCode): $detail")
-
-data class RemoteFeedDto(
-    val id: String,
-    val title: String,
-    val url: String,
-    val siteUrl: String?,
-    val feedType: String,
-    val unreadCount: Int,
-    val description: String? = null,
-    val language: String? = null,
-    val pollInterval: Int = 30,
-    val lastPolled: String? = null,
-    val lastPolledBy: String? = null,
-    val lastError: String? = null,
-    val lastErrorBy: String? = null,
-    val isActive: Boolean = true,
-)
-
-data class RemoteItemDto(
-    val id: String,
-    val feedId: String?,
-    val feedTitle: String?,
-    val title: String,
-    val url: String,
-    val author: String?,
-    val summary: String?,
-    val contentText: String?,
-    val contentHtml: String?,
-    val contentType: String,
-    val status: String,
-    val isFavorite: Boolean,
-    val publishedAt: String?,
-    val createdAt: String,
-    val readProgress: Double,
-    val thumbnailMediaId: String?,
-    val duration: String?,
-    val tagNames: List<String> = emptyList(),
-    val readAt: String? = null,
-    val thumbnailUrl: String? = null,
-    val feedUrl: String? = null,
-    val interactionUpdatedAt: String? = null,
-    val audioUrl: String? = null,
-)
-
-data class RemoteTagDto(
-    val id: String,
-    val name: String,
-    val unreadCount: Int,
-    val color: String? = null,
-)
-
-data class PeerSyncItemPayload(
-    val id: String,
-    val feedId: String?,
-    val feedUrl: String?,
-    val title: String,
-    val url: String,
-    val author: String?,
-    val publishedAt: String?,
-    val createdAt: String?,
-    val summary: String?,
-    val contentHtml: String?,
-    val thumbnailUrl: String?,
-    val contentType: String,
-    val status: String,
-    val isFavorite: Boolean,
-    val readAt: String?,
-    val readProgress: Double,
-    val interactionUpdatedAt: String?,
-    val tagNames: List<String>,
-    val audioUrl: String? = null,
-    val duration: Long? = null,
-)
-
-data class PeerSyncRequestDto(
-    val peerId: String,
-    val deviceName: String? = null,
-    val networkTier: String = NetworkTier.WIFI.wireValue,
-    val weight: Double? = null,
-    val updatedAfter: String? = null,
-    val afterItemId: String? = null,
-    val feeds: List<FeedEntity> = emptyList(),
-    val items: List<PeerSyncItemPayload> = emptyList(),
-    val tags: List<TagEntity> = emptyList(),
-    val tombstones: List<SyncTombstoneDto> = emptyList(),
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
-)
-
-data class PeerSyncResponseDto(
-    val serverPeerId: String,
-    val syncTimestamp: String,
-    val activePeers: List<PeerNodeDto>,
-    val feeds: List<RemoteFeedDto>,
-    val items: List<RemoteItemDto>,
-    val tags: List<RemoteTagDto>,
-    val tombstones: List<SyncTombstoneDto>,
-    val hasMore: Boolean = false,
-    val nextAfterItemId: String? = null,
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
-)
-
-data class RemoteMediaDto(
-    val id: String,
-    val itemId: String,
-    val mediaType: String,
-    val fileSize: Long? = null,
-    val mimeType: String? = null,
-)
-
-data class DiscoveredServerDto(
-    val probedUrl: String,
-    val canonicalUrl: String? = null,
-    val version: String? = null,
+@Suppress("TooManyFunctions")
+class RocheApiClient(
+    private val vpnCheck: VpnTransportCheck,
+    private val transport: HttpTransport,
 ) {
-    val preferredUrl: String
-        get() = canonicalUrl?.takeIf { it.isNotBlank() } ?: probedUrl
-}
+    constructor(
+        transport: HttpTransport = HttpUrlConnectionTransport()
+    ) : this(
+        vpnCheck = VpnTransportCheck { true },
+        transport = transport,
+    )
 
-class RocheApiClient(private val transport: HttpTransport) {
+    private suspend fun executeServerRequest(
+        serverUrl: String,
+        request: HttpRequest,
+    ): HttpResponse {
+        PublicUrlValidator.ensureSafeServerEndpoint(serverUrl, vpnCheck::isActive)
+        return transport.execute(request)
+    }
+
+    private suspend fun serverJson(
+        serverUrl: String,
+        method: String,
+        path: String,
+        token: String,
+        body: String? = null,
+    ): String {
+        val base = serverUrl.trimEnd('/')
+        val response =
+            executeServerRequest(
+                serverUrl = base,
+                request =
+                    HttpRequest(
+                        method = method,
+                        url = "$base$path",
+                        headers = authHeaders(token),
+                        body = body,
+                    ),
+            )
+        ensureSuccess(response)
+        return response.body
+    }
 
     internal suspend fun probeServerHealth(candidateUrl: String): DiscoveredServerDto? =
         runSuspendCatching {
             val base = candidateUrl.trim().trimEnd('/')
             if (base.isBlank()) return null
             val response =
-                transport.execute(
-                    HttpRequest(
-                        method = METHOD_GET,
-                        url = "$base/health",
-                    )
+                executeServerRequest(
+                    serverUrl = base,
+                    request = HttpRequest(method = METHOD_GET, url = "$base/health"),
                 )
             if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
             parseHealthDiscoveryJson(raw = response.body, probedBaseUrl = base)
@@ -389,83 +81,57 @@ class RocheApiClient(private val transport: HttpTransport) {
     }
 
     suspend fun pairDevice(serverUrl: String, code: String, deviceName: String): String {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/auth/pair",
-                    body = buildPairDevicePayload(code = code, deviceName = deviceName),
-                )
+        val body =
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "/auth/pair",
+                token = "",
+                body = buildPairDevicePayload(code = code, deviceName = deviceName),
             )
-        ensureSuccess(response)
-        return extractTokenFromPairResponse(response.body)
+        return extractTokenFromPairResponse(body)
     }
 
-    suspend fun fetchFeeds(serverUrl: String, token: String): List<RemoteFeedDto> {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds",
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
-        return parseFeedsJsonArray(response.body)
-    }
+    suspend fun fetchFeeds(serverUrl: String, token: String): List<RemoteFeedDto> =
+        parseFeedsJsonArray(serverJson(serverUrl, METHOD_GET, FEEDS_PATH, token))
 
     internal suspend fun createFeed(
         serverUrl: String,
         token: String,
         url: String,
         title: String? = null,
-    ): RemoteFeedDto {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds",
-                    headers = authHeaders(token),
-                    body = buildCreateFeedPayload(url = url, title = title),
-                )
+    ): RemoteFeedDto =
+        parseFeedJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = FEEDS_PATH,
+                token = token,
+                body = buildCreateFeedPayload(url = url, title = title),
             )
-        ensureSuccess(response)
-        return parseFeedJson(response.body)
-    }
+        )
 
     suspend fun refreshFeed(
         serverUrl: String,
         token: String,
         feedId: String,
-    ): RemoteFeedDto {
-        val encodedId = encodePathSegment(feedId)
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId/refresh",
-                    headers = authHeaders(token),
-                )
+    ): RemoteFeedDto =
+        parseFeedJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "${feedPath(feedId)}/refresh",
+                token = token,
             )
-        ensureSuccess(response)
-        return parseFeedJson(response.body)
-    }
+        )
 
-    suspend fun deleteFeed(
-        serverUrl: String,
-        token: String,
-        feedId: String,
-    ) {
-        val encodedId = encodePathSegment(feedId)
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_DELETE,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId",
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
+    suspend fun deleteFeed(serverUrl: String, token: String, feedId: String) {
+        serverJson(
+            serverUrl = serverUrl,
+            method = METHOD_DELETE,
+            path = feedPath(feedId),
+            token = token,
+        )
     }
 
     internal suspend fun updateFeedTitle(
@@ -474,12 +140,7 @@ class RocheApiClient(private val transport: HttpTransport) {
         feedId: String,
         title: String,
     ): RemoteFeedDto =
-        updateFeed(
-            serverUrl = serverUrl,
-            token = bearerToken,
-            feedId = feedId,
-            title = title,
-        )
+        updateFeed(serverUrl = serverUrl, token = bearerToken, feedId = feedId, title = title)
 
     internal suspend fun updateFeed(
         serverUrl: String,
@@ -488,47 +149,34 @@ class RocheApiClient(private val transport: HttpTransport) {
         title: String? = null,
         pollInterval: Int? = null,
         isActive: Boolean? = null,
-    ): RemoteFeedDto {
-        val encodedId = encodePathSegment(feedId)
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = "PATCH",
-                    url = "${serverUrl.trimEnd('/')}/api/v1/feeds/$encodedId",
-                    headers = authHeaders(token),
-                    body =
-                        buildUpdateFeedPayload(
-                            title = title,
-                            pollInterval = pollInterval,
-                            isActive = isActive,
-                        ),
-                )
+    ): RemoteFeedDto =
+        parseFeedJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_PATCH,
+                path = feedPath(feedId),
+                token = token,
+                body =
+                    buildUpdateFeedPayload(
+                        title = title,
+                        pollInterval = pollInterval,
+                        isActive = isActive,
+                    ),
             )
-        ensureSuccess(response)
-        return parseFeedJson(response.body)
-    }
+        )
 
     suspend fun fetchItems(serverUrl: String, token: String): List<RemoteItemDto> {
         val baseUrl = serverUrl.trimEnd('/')
-        val headers = authHeaders(token)
+        PublicUrlValidator.ensureSafeServerEndpoint(baseUrl, vpnCheck::isActive)
         val collected = LinkedHashMap<String, RemoteItemDto>()
         for (page in 1..MAX_SYNC_PAGES) {
-            val url =
+            val path =
                 if (page == 1) {
-                    "$baseUrl/api/v1/items?per_page=$ITEMS_PER_PAGE"
+                    "/api/v1/items?per_page=$ITEMS_PER_PAGE"
                 } else {
-                    "$baseUrl/api/v1/items?per_page=$ITEMS_PER_PAGE&page=$page"
+                    "/api/v1/items?per_page=$ITEMS_PER_PAGE&page=$page"
                 }
-            val response =
-                transport.execute(
-                    HttpRequest(
-                        method = METHOD_GET,
-                        url = url,
-                        headers = headers,
-                    )
-                )
-            ensureSuccess(response)
-            val pageItems = parseItemsEnvelopeJson(response.body)
+            val pageItems = parseItemsEnvelopeJson(serverJson(baseUrl, METHOD_GET, path, token))
             val beforeSize = collected.size
             pageItems.forEach { item ->
                 if (item.id.isNotBlank() && item.id !in collected) {
@@ -544,35 +192,21 @@ class RocheApiClient(private val transport: HttpTransport) {
         serverUrl: String,
         token: String,
         itemId: String,
-    ): RemoteItemDto {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = itemEndpointUrl(serverUrl, itemId),
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
-        return parseItemJson(response.body)
-    }
+    ): RemoteItemDto = parseItemJson(serverJson(serverUrl, METHOD_GET, itemPath(itemId), token))
 
     internal suspend fun fetchItemMedia(
         serverUrl: String,
         token: String,
         itemId: String,
-    ): List<RemoteMediaDto> {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${itemEndpointUrl(serverUrl, itemId)}/media",
-                    headers = authHeaders(token),
-                )
+    ): List<RemoteMediaDto> =
+        parseMediaJsonArray(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_GET,
+                path = "${itemPath(itemId)}/media",
+                token = token,
             )
-        ensureSuccess(response)
-        return parseMediaJsonArray(response.body)
-    }
+        )
 
     internal suspend fun fetchMediaBytes(
         serverUrl: String,
@@ -581,13 +215,15 @@ class RocheApiClient(private val transport: HttpTransport) {
     ): ByteArray? = runSuspendCatching {
         val encodedId = encodePathSegment(mediaId)
         val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/media/$encodedId",
-                    headers = authHeaders(token),
-                    expectBinary = true,
-                )
+            executeServerRequest(
+                serverUrl = serverUrl,
+                request =
+                    HttpRequest(
+                        method = METHOD_GET,
+                        url = "${serverUrl.trimEnd('/')}/api/v1/media/$encodedId",
+                        headers = authHeaders(token),
+                        expectBinary = true,
+                    ),
             )
         if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
         val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
@@ -599,11 +235,11 @@ class RocheApiClient(private val transport: HttpTransport) {
         serverUrl: String,
         token: String,
         mediaId: String,
-        targetFile: java.io.File,
+        targetFile: File,
         maxBytes: Long = MAX_MEDIA_BYTES.toLong(),
     ): Boolean = runSuspendCatching {
-        val encodedId = encodePathSegment(mediaId)
-        val mediaUrl = "${serverUrl.trimEnd('/')}/api/v1/media/$encodedId"
+        PublicUrlValidator.ensureSafeServerEndpoint(serverUrl, vpnCheck::isActive)
+        val mediaUrl = "${serverUrl.trimEnd('/')}/api/v1/media/${encodePathSegment(mediaId)}"
         val validScheme =
             mediaUrl.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
                 mediaUrl.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
@@ -611,7 +247,7 @@ class RocheApiClient(private val transport: HttpTransport) {
         when {
             !validScheme -> false
             transport !is HttpUrlConnectionTransport ->
-                streamFakeTransportToFile(mediaUrl, targetFile, maxBytes, headers)
+                streamTransportResponseToFile(transport, mediaUrl, targetFile, maxBytes, headers)
             else ->
                 withContext(Dispatchers.IO) {
                     streamUrlConnectionToFile(
@@ -619,6 +255,9 @@ class RocheApiClient(private val transport: HttpTransport) {
                         targetFile = targetFile,
                         maxBytes = maxBytes,
                         initialHeaders = headers,
+                        requirePublicIp = false,
+                        vpnCheck = vpnCheck,
+                        job = coroutineContext[Job],
                     )
                 }
         }
@@ -628,12 +267,7 @@ class RocheApiClient(private val transport: HttpTransport) {
     internal suspend fun fetchExternalImageBytes(imageUrl: String): ByteArray? =
         runSuspendCatching {
             val trimmed = imageUrl.trim()
-            if (
-                !trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) &&
-                    !trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-            ) {
-                return null
-            }
+            PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
             val response =
                 transport.execute(
                     HttpRequest(
@@ -645,6 +279,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                                 HEADER_ACCEPT to EXTERNAL_IMAGE_ACCEPT,
                             ),
                         expectBinary = true,
+                        requirePublicIp = true,
                     )
                 )
             if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) return null
@@ -655,68 +290,39 @@ class RocheApiClient(private val transport: HttpTransport) {
 
     internal suspend fun streamExternalBinaryToFile(
         fileUrl: String,
-        targetFile: java.io.File,
+        targetFile: File,
         maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
     ): Boolean = runSuspendCatching {
         val trimmed = fileUrl.trim()
-        val validScheme =
-            trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
-                trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-        when {
-            !validScheme -> false
-            transport !is HttpUrlConnectionTransport ->
-                streamFakeTransportToFile(
-                    trimmedUrl = trimmed,
+        PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
+        if (transport !is HttpUrlConnectionTransport) {
+            streamTransportResponseToFile(
+                transport = transport,
+                trimmedUrl = trimmed,
+                targetFile = targetFile,
+                maxBytes = maxBytes,
+                headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                requirePublicIp = true,
+            )
+        } else {
+            withContext(Dispatchers.IO) {
+                streamUrlConnectionToFile(
+                    initialUrl = trimmed,
                     targetFile = targetFile,
                     maxBytes = maxBytes,
-                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                    initialHeaders = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                    requirePublicIp = true,
+                    job = coroutineContext[Job],
                 )
-            else ->
-                withContext(Dispatchers.IO) {
-                    streamUrlConnectionToFile(trimmed, targetFile, maxBytes)
-                }
+            }
         }
     }
         .getOrDefault(false)
 
-    private suspend fun streamFakeTransportToFile(
-        trimmedUrl: String,
-        targetFile: java.io.File,
-        maxBytes: Long,
-        headers: Map<String, String>,
-    ): Boolean {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = trimmedUrl,
-                    headers = headers,
-                    expectBinary = true,
-                )
-            )
-        val bytes = response.bodyBytes ?: response.body.toByteArray(Charsets.UTF_8)
-        val valid =
-            response.statusCode in HTTP_OK_START..HTTP_OK_END &&
-                bytes.isNotEmpty() &&
-                bytes.size <= maxBytes
-        return if (!valid) {
-            false
-        } else {
-            withContext(Dispatchers.IO) {
-                writeBytesAtomicallyToFile(bytes, targetFile)
-            }
-        }
-    }
-
     internal suspend fun fetchExternalFeedXml(feedUrl: String): Result<String> =
         runSuspendCatching {
             val trimmed = feedUrl.trim()
-            require(
-                trimmed.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
-                    trimmed.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-            ) {
-                "Feed URL must use http:// or https://"
-            }
+            PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
             val response =
                 transport.execute(
                     HttpRequest(
@@ -727,6 +333,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                                 HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
                                 HEADER_ACCEPT to EXTERNAL_FEED_ACCEPT,
                             ),
+                        requirePublicIp = true,
                     )
                 )
             ensureSuccess(response)
@@ -739,13 +346,15 @@ class RocheApiClient(private val transport: HttpTransport) {
         request: PeerSyncRequestDto,
     ): PeerSyncResponseDto? {
         val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/sync/peer",
-                    headers = authHeaders(token),
-                    body = buildPeerSyncRequestPayload(request),
-                )
+            executeServerRequest(
+                serverUrl = serverUrl,
+                request =
+                    HttpRequest(
+                        method = METHOD_POST,
+                        url = "${serverUrl.trimEnd('/')}/api/v1/sync/peer",
+                        headers = authHeaders(token),
+                        body = buildPeerSyncRequestPayload(request),
+                    ),
             )
         if (
             response.statusCode == HTTP_NOT_FOUND_CODE ||
@@ -763,34 +372,24 @@ class RocheApiClient(private val transport: HttpTransport) {
         url: String,
         title: String?,
         tags: List<String>,
-    ): RemoteItemDto {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/save",
-                    headers = authHeaders(token),
-                    body = buildSaveItemPayload(url = url, title = title, tags = tags),
-                )
+    ): RemoteItemDto =
+        parseItemJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "/api/v1/items/save",
+                token = token,
+                body = buildSaveItemPayload(url = url, title = title, tags = tags),
             )
-        ensureSuccess(response)
-        return parseItemJson(response.body)
-    }
+        )
 
-    suspend fun deleteItem(
-        serverUrl: String,
-        token: String,
-        itemId: String,
-    ) {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_DELETE,
-                    url = itemEndpointUrl(serverUrl, itemId),
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
+    suspend fun deleteItem(serverUrl: String, token: String, itemId: String) {
+        serverJson(
+            serverUrl = serverUrl,
+            method = METHOD_DELETE,
+            path = itemPath(itemId),
+            token = token,
+        )
     }
 
     internal suspend fun updateItem(
@@ -801,57 +400,41 @@ class RocheApiClient(private val transport: HttpTransport) {
         isFavorite: Boolean? = null,
         readProgress: Double? = null,
         readAt: String? = null,
-    ): RemoteItemDto {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = "PATCH",
-                    url = itemEndpointUrl(serverUrl, itemId),
-                    headers = authHeaders(token),
-                    body =
-                        buildUpdateItemPayload(
-                            status = status,
-                            isFavorite = isFavorite,
-                            readProgress = readProgress,
-                            readAt = readAt,
-                        ),
-                )
+    ): RemoteItemDto =
+        parseItemJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_PATCH,
+                path = itemPath(itemId),
+                token = token,
+                body =
+                    buildUpdateItemPayload(
+                        status = status,
+                        isFavorite = isFavorite,
+                        readProgress = readProgress,
+                        readAt = readAt,
+                    ),
             )
-        ensureSuccess(response)
-        return parseItemJson(response.body)
-    }
+        )
 
-    suspend fun fetchTags(serverUrl: String, token: String): List<RemoteTagDto> {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/tags",
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
-        return parseTagsJsonArray(response.body)
-    }
+    suspend fun fetchTags(serverUrl: String, token: String): List<RemoteTagDto> =
+        parseTagsJsonArray(serverJson(serverUrl, METHOD_GET, "/api/v1/tags", token))
 
     internal suspend fun addTagToItem(
         serverUrl: String,
         token: String,
         itemId: String,
         tagName: String,
-    ): List<RemoteTagDto> {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${itemEndpointUrl(serverUrl, itemId)}/tags",
-                    headers = authHeaders(token),
-                    body = buildAddItemTagPayload(tagName),
-                )
+    ): List<RemoteTagDto> =
+        parseTagsJsonArray(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "${itemPath(itemId)}/tags",
+                token = token,
+                body = buildAddItemTagPayload(tagName),
             )
-        ensureSuccess(response)
-        return parseTagsJsonArray(response.body)
-    }
+        )
 
     internal suspend fun removeTagFromItem(
         serverUrl: String,
@@ -859,16 +442,12 @@ class RocheApiClient(private val transport: HttpTransport) {
         itemId: String,
         tagId: String,
     ) {
-        val encodedTagId = encodePathSegment(tagId)
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_DELETE,
-                    url = "${itemEndpointUrl(serverUrl, itemId)}/tags/$encodedTagId",
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
+        serverJson(
+            serverUrl = serverUrl,
+            method = METHOD_DELETE,
+            path = "${itemPath(itemId)}/tags/${encodePathSegment(tagId)}",
+            token = token,
+        )
     }
 
     internal suspend fun archiveBatch(
@@ -877,62 +456,50 @@ class RocheApiClient(private val transport: HttpTransport) {
         itemIds: List<String> = emptyList(),
         feedId: String? = null,
         allUnread: Boolean = false,
-    ): Int {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/items/archive-batch",
-                    headers = authHeaders(token),
-                    body =
-                        buildArchiveBatchPayload(
-                            itemIds = itemIds,
-                            feedId = feedId,
-                            allUnread = allUnread,
-                        ),
-                )
+    ): Int =
+        parseArchivedCountJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "/api/v1/items/archive-batch",
+                token = token,
+                body =
+                    buildArchiveBatchPayload(
+                        itemIds = itemIds,
+                        feedId = feedId,
+                        allUnread = allUnread,
+                    ),
             )
-        ensureSuccess(response)
-        return parseArchivedCountJson(response.body)
-    }
+        )
 
     internal suspend fun importOpml(
         serverUrl: String,
         token: String,
         opmlXml: String,
-    ): Int {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_POST,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/import/opml",
-                    headers = authHeaders(token),
-                    body = buildImportOpmlPayload(opmlXml),
-                )
+    ): Int =
+        parseImportedCountJson(
+            serverJson(
+                serverUrl = serverUrl,
+                method = METHOD_POST,
+                path = "/api/v1/import/opml",
+                token = token,
+                body = buildImportOpmlPayload(opmlXml),
             )
-        ensureSuccess(response)
-        return parseImportedCountJson(response.body)
-    }
+        )
 
-    internal suspend fun exportOpml(
-        serverUrl: String,
-        token: String,
-    ): String {
-        val response =
-            transport.execute(
-                HttpRequest(
-                    method = METHOD_GET,
-                    url = "${serverUrl.trimEnd('/')}/api/v1/export/feeds",
-                    headers = authHeaders(token),
-                )
-            )
-        ensureSuccess(response)
-        return response.body
-    }
+    internal suspend fun exportOpml(serverUrl: String, token: String): String =
+        serverJson(serverUrl, METHOD_GET, "/api/v1/export/feeds", token)
+
+    private fun feedPath(feedId: String): String = "$FEEDS_PATH/${encodePathSegment(feedId)}"
+
+    private fun itemPath(itemId: String): String = "$ITEMS_PATH/${encodePathSegment(itemId)}"
 
     private companion object {
+        private const val FEEDS_PATH = "/api/v1/feeds"
+        private const val ITEMS_PATH = "/api/v1/items"
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
+        private const val METHOD_PATCH = "PATCH"
         private const val METHOD_DELETE = "DELETE"
         private const val ITEMS_PER_PAGE = 200
         private const val MAX_SYNC_PAGES = 25
@@ -946,192 +513,4 @@ class RocheApiClient(private val transport: HttpTransport) {
         private const val HTTP_NOT_FOUND_CODE = 404
         private const val HTTP_METHOD_NOT_ALLOWED_CODE = 405
     }
-}
-
-private const val HEADER_USER_AGENT = "User-Agent"
-private const val HEADER_ACCEPT = "Accept"
-private const val HTTP_OK_START = 200
-private const val HTTP_OK_END = 299
-internal const val MAX_AUDIO_ENCLOSURE_BYTES = 500L * 1024L * 1024L
-private const val AUDIO_CONNECT_TIMEOUT_MS = 15_000
-private const val AUDIO_READ_TIMEOUT_MS = 60_000
-private const val AUDIO_MAX_REDIRECTS = 5
-private val AUDIO_REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
-
-internal fun writeBytesAtomicallyToFile(bytes: ByteArray, targetFile: java.io.File): Boolean {
-    targetFile.parentFile?.mkdirs()
-    val temp = java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
-    return try {
-        temp.writeBytes(bytes)
-        if (!temp.renameTo(targetFile)) {
-            temp.copyTo(targetFile, overwrite = true)
-        }
-        true
-    } finally {
-        if (temp.exists()) temp.delete()
-    }
-}
-
-internal fun streamUrlConnectionToFile(
-    initialUrl: String,
-    targetFile: java.io.File,
-    maxBytes: Long = MAX_AUDIO_ENCLOSURE_BYTES,
-    initialHeaders: Map<String, String> = emptyMap(),
-): Boolean {
-    var currentUrl: String? = initialUrl.trim()
-    var currentHeaders = initialHeaders
-    var step = 0
-    var success = false
-    while (currentUrl != null && step <= AUDIO_MAX_REDIRECTS && !success) {
-        val activeUrl = currentUrl
-        val nextOrDone =
-            executeAudioStreamAttempt(
-                url = activeUrl,
-                targetFile = targetFile,
-                maxBytes = maxBytes,
-                headers = currentHeaders,
-            )
-        when (nextOrDone) {
-            is AudioStreamStepResult.Redirect -> {
-                if (!isSameOriginHost(activeUrl, nextOrDone.nextUrl)) {
-                    currentHeaders = currentHeaders.filterKeys {
-                        !it.equals(HEADER_AUTHORIZATION, ignoreCase = true)
-                    }
-                }
-                currentUrl = nextOrDone.nextUrl
-            }
-            AudioStreamStepResult.Success -> {
-                success = true
-            }
-            AudioStreamStepResult.Failed -> {
-                currentUrl = null
-            }
-        }
-        step++
-    }
-    return success
-}
-
-private sealed interface AudioStreamStepResult {
-    data class Redirect(val nextUrl: String) : AudioStreamStepResult
-
-    data object Success : AudioStreamStepResult
-
-    data object Failed : AudioStreamStepResult
-}
-
-private fun executeAudioStreamAttempt(
-    url: String,
-    targetFile: java.io.File,
-    maxBytes: Long,
-    headers: Map<String, String>,
-): AudioStreamStepResult {
-    val connection =
-        (URI.create(url.replace(" ", "%20")).toURL().openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = false
-            requestMethod = "GET"
-            connectTimeout = AUDIO_CONNECT_TIMEOUT_MS
-            readTimeout = AUDIO_READ_TIMEOUT_MS
-            setRequestProperty(HEADER_USER_AGENT, "Roche-Android/1.0")
-            headers.forEach { (key, value) -> setRequestProperty(key, value) }
-        }
-    return try {
-        val status = connection.responseCode
-        when {
-            status in AUDIO_REDIRECT_CODES -> {
-                val loc = connection.getHeaderField("Location")?.trim()?.takeIf { it.isNotBlank() }
-                val next = loc?.let { resolveRedirectUrl(url, it) }
-                if (next != null) {
-                    AudioStreamStepResult.Redirect(next)
-                } else {
-                    AudioStreamStepResult.Failed
-                }
-            }
-            status in HTTP_OK_START..HTTP_OK_END && connection.contentLengthLong <= maxBytes -> {
-                if (copyStreamAtomicallyToFile(connection, targetFile, maxBytes)) {
-                    AudioStreamStepResult.Success
-                } else {
-                    AudioStreamStepResult.Failed
-                }
-            }
-            else -> {
-                AudioStreamStepResult.Failed
-            }
-        }
-    } finally {
-        connection.disconnect()
-    }
-}
-
-private fun copyStreamAtomicallyToFile(
-    connection: HttpURLConnection,
-    targetFile: java.io.File,
-    maxBytes: Long,
-): Boolean {
-    targetFile.parentFile?.mkdirs()
-    val tempFile =
-        java.io.File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
-    return try {
-        val rawStream = connection.inputStream
-        val stream =
-            if (connection.contentEncoding?.equals("gzip", ignoreCase = true) == true) {
-                GZIPInputStream(rawStream)
-            } else {
-                rawStream
-            }
-        val total = stream.use { input ->
-            tempFile.outputStream().use { out ->
-                copyBoundStreamBytes(input, out, maxBytes)
-            }
-        }
-        val wroteBytes = total > 0L
-        if (wroteBytes && !tempFile.renameTo(targetFile)) {
-            tempFile.copyTo(targetFile, overwrite = true)
-        }
-        wroteBytes
-    } finally {
-        if (tempFile.exists()) {
-            tempFile.delete()
-        }
-    }
-}
-
-private fun copyBoundStreamBytes(
-    input: java.io.InputStream,
-    out: java.io.OutputStream,
-    maxBytes: Long,
-): Long {
-    var total = 0L
-    val buffer = ByteArray(READ_BUFFER_CHARS)
-    var read = input.read(buffer)
-    while (read != -1) {
-        total += read
-        if (total > maxBytes) {
-            throw IOException("Audio stream exceeds maximum allowed size")
-        }
-        out.write(buffer, 0, read)
-        read = input.read(buffer)
-    }
-    return total
-}
-
-internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
-    "${serverUrl.trimEnd('/')}/api/v1/items/${encodePathSegment(itemId)}"
-
-internal fun encodePathSegment(raw: String): String =
-    URLEncoder.encode(raw, StandardCharsets.UTF_8.name()).replace("+", "%20")
-
-private const val HEADER_AUTHORIZATION = "Authorization"
-
-internal fun authHeaders(token: String): Map<String, String> =
-    if (token.isBlank()) {
-        emptyMap()
-    } else {
-        mapOf(HEADER_AUTHORIZATION to "Bearer $token")
-    }
-
-internal fun ensureSuccess(response: HttpResponse) {
-    if (response.statusCode in HTTP_OK_START..HTTP_OK_END) return
-    val (title, detail) = parseProblemDetails(response.body, response.statusCode)
-    throw ProblemDetailsException(statusCode = response.statusCode, title = title, detail = detail)
 }

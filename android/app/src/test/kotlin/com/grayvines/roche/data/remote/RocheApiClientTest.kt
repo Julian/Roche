@@ -154,11 +154,11 @@ class RocheApiClientTest {
     fun `discoverServer probes Tailscale candidates and adopts canonical_url from health endpoint`() =
         runTest {
             val client = RocheApiClient { request ->
-                if (request.url == "http://roche:8080/health") {
+                if (request.url == "https://roche/health") {
                     HttpResponse(
                         statusCode = 200,
                         body =
-                            """{"status":"ok","service":"roche","version":"0.1.0","canonical_url":"http://mac-mini.tail9876.ts.net:8080"}""",
+                            """{"status":"ok","service":"roche","version":"0.1.0","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
                     )
                 } else {
                     HttpResponse(statusCode = 404, body = "{}")
@@ -166,13 +166,13 @@ class RocheApiClientTest {
             }
 
             val discovered = client.discoverServer()
-            assertEquals("http://roche:8080", discovered?.probedUrl)
-            assertEquals("http://mac-mini.tail9876.ts.net:8080", discovered?.preferredUrl)
+            assertEquals("https://roche", discovered?.probedUrl)
+            assertEquals("https://mac-mini.tail9876.ts.net", discovered?.preferredUrl)
             assertEquals("0.1.0", discovered?.version)
         }
 
     @Test
-    fun `discoverServer ignores non-roche services and rejects untrusted canonical_url redirects`() =
+    fun `discoverServer ignores non-roche services and rejects untrusted or cleartext canonical_url redirects`() =
         runTest {
             val client = RocheApiClient { request ->
                 when (request.url) {
@@ -180,23 +180,59 @@ class RocheApiClientTest {
                         // Non-Roche service returning generic {"status":"ok"} without
                         // "service":"roche"
                         HttpResponse(statusCode = 200, body = """{"status":"ok"}""")
-                    "http://roche.tail9876.ts.net:8080/health" ->
-                        // Compromised/misconfigured response trying to redirect to external
-                        // attacker domain
+                    "https://roche/health" ->
+                        // Compromised/misconfigured response trying to downgrade to cleartext http
                         HttpResponse(
                             statusCode = 200,
                             body =
-                                """{"status":"ok","service":"roche","canonical_url":"https://attacker.example.com/steal"}""",
+                                """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
                         )
                     else -> HttpResponse(statusCode = 404, body = "{}")
                 }
             }
 
             val discovered = client.discoverServer(tailnetDomains = listOf("tail9876.ts.net"))
-            assertEquals("http://roche.tail9876.ts.net:8080", discovered?.probedUrl)
-            // Untrusted canonical_url was rejected, so preferredUrl falls back to probedUrl
-            assertEquals("http://roche.tail9876.ts.net:8080", discovered?.preferredUrl)
+            assertEquals("https://roche", discovered?.probedUrl)
+            assertEquals("https://roche", discovered?.preferredUrl)
             assertEquals(null, discovered?.canonicalUrl)
+        }
+
+    @Test
+    fun `RocheApiClient rejects cleartext non-Tailscale server URLs VPN-off cleartext and SSRF targets`() =
+        runTest {
+            val vpnOffClient =
+                RocheApiClient(
+                    vpnCheck = VpnTransportCheck { false },
+                    transport = { HttpResponse(statusCode = 200, body = """{"feeds":[]}""") },
+                )
+            val tailscaleVpnOffErr = runCatching {
+                vpnOffClient.fetchFeeds(
+                    serverUrl = "http://100.64.0.9:8080",
+                    token = "secret",
+                )
+            }
+                .exceptionOrNull()
+            assertEquals(true, tailscaleVpnOffErr is java.io.IOException)
+
+            val lanCleartextErr = runCatching {
+                vpnOffClient.fetchFeeds(
+                    serverUrl = "http://192.168.1.50:8080",
+                    token = "secret",
+                )
+            }
+                .exceptionOrNull()
+            assertEquals(true, lanCleartextErr is java.io.IOException)
+
+            val loopbackFeedErr = runCatching {
+                vpnOffClient.fetchExternalFeedXml("http://127.0.0.1:8080/feed.xml").getOrThrow()
+            }
+                .exceptionOrNull()
+            assertEquals(true, loopbackFeedErr is java.io.IOException)
+
+            assertEquals(
+                null,
+                vpnOffClient.fetchExternalImageBytes("http://100.64.0.9:8080/private.png"),
+            )
         }
 
     @Test
@@ -645,7 +681,7 @@ internal fun verifyPeerSyncWireRoundTrip() {
                 tombstones = listOf(SyncTombstoneDto("tag", "old", "2026-06-01T00:00:00Z")),
             )
         )
-    assertTrue(payload.contains(""""feed_type":"rss""""))
+    assertTrue(payload.contains(""""feed_type":"podcast""""))
     assertTrue(payload.contains(""""read_at":null"""))
     val resp =
         parsePeerSyncResponseJson(
@@ -654,7 +690,7 @@ internal fun verifyPeerSyncWireRoundTrip() {
                 """"feeds":[{"id":""},{"id":"f-pod","title":"Pod","url":"https://pod.example.com/rss"}],""" +
                 """"items":[],"tags":[{"id":""},{"id":"t-audio","name":"audio"}],"tombstones":[]}"""
         )
-    assertEquals(listOf("server"), resp?.activePeers?.map { it.peerId })
-    assertEquals(listOf("f-pod"), resp?.feeds?.map { it.id })
-    assertEquals(listOf("t-audio"), resp?.tags?.map { it.id })
+    assertEquals(listOf("server"), resp.activePeers.map { it.peerId })
+    assertEquals(listOf("f-pod"), resp.feeds.map { it.id })
+    assertEquals(listOf("t-audio"), resp.tags.map { it.id })
 }

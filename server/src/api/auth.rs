@@ -1,12 +1,9 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json,
     extract::{ConnectInfo, State, rejection::ExtensionRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
 
@@ -25,11 +22,13 @@ pub(super) struct PairRequest {
 pub(super) async fn auth_pair<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
+    headers: HeaderMap,
     ProblemJson(req): ProblemJson<PairRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let client_ip =
-        connect_info.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ConnectInfo(addr)| addr.ip());
-    let token = service.pair_device(&req.device_name, &req.pairing_code, client_ip).await?;
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    let token = service
+        .pair_device_for_request(&req.device_name, &req.pairing_code, peer_addr, &headers)
+        .await?;
     Ok(Json(serde_json::json!({
         "token": token,
         "expires_at": null,

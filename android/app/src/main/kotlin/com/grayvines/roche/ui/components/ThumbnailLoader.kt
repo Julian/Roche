@@ -11,14 +11,17 @@ import com.grayvines.roche.data.isHttpThumbnailUrl
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.resolveSafeChildFile
 import com.grayvines.roche.data.settings.SettingsRepository
-import com.grayvines.roche.data.writeBytesAtomically
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 val LocalThumbnailLoader = staticCompositionLocalOf<ThumbnailLoader?> { null }
@@ -50,6 +53,7 @@ class ThumbnailLoader(
     private val keyLocksGuard = Any()
     private val keyLocks = HashMap<String, KeyMutex>()
     private val diskWriteLock = Any()
+    private val loadPermits = Semaphore(MAX_CONCURRENT_LOADS)
 
     fun getCached(mediaId: String): ImageBitmap? {
         val cleanId = mediaId.trim()
@@ -156,23 +160,26 @@ class ThumbnailLoader(
         cacheKey: String,
         targetCache: LruCache<String, ImageBitmap>,
         decode: (ByteArray) -> ImageBitmap?,
-    ): ImageBitmap? {
+    ): ImageBitmap? = loadPermits.withPermit {
         val diskBytes = readDiskCachedBytes(cleanId)
-        if (diskBytes == null && isRecentlyFailed(cleanId)) return null
-        val (bytes, attemptedNetwork) =
-            if (diskBytes != null) {
-                diskBytes to false
-            } else {
-                fetchAndCacheRemoteBytes(cleanId)
+        if (diskBytes == null && isRecentlyFailed(cleanId)) {
+            null
+        } else {
+            val (bytes, attemptedNetwork) =
+                if (diskBytes != null) {
+                    diskBytes to false
+                } else {
+                    fetchAndCacheRemoteBytes(cleanId)
+                }
+            val bitmap = bytes?.let { runCatching { decode(it) }.getOrNull() }
+            if (bitmap != null) {
+                targetCache.put(cacheKey, bitmap)
+                failedKeys.remove(cleanId)
+            } else if (attemptedNetwork || diskBytes != null) {
+                recordFailedKey(cleanId)
             }
-        val bitmap = bytes?.let { runCatching { decode(it) }.getOrNull() }
-        if (bitmap != null) {
-            targetCache.put(cacheKey, bitmap)
-            failedKeys.remove(cleanId)
-        } else if (attemptedNetwork || diskBytes != null) {
-            recordFailedKey(cleanId)
+            bitmap
         }
-        return bitmap
     }
 
     internal fun isRecentlyFailed(key: String): Boolean {
@@ -211,6 +218,10 @@ class ThumbnailLoader(
         .getOrNull()
 
     private suspend fun fetchAndCacheRemoteBytes(mediaId: String): Pair<ByteArray?, Boolean> {
+        val rootDir = cacheDir
+        if (rootDir != null) {
+            return streamRemoteBytesToDiskCache(rootDir, mediaId)
+        }
         var attempted = false
         val bytes = runCatching {
             val rawBytes =
@@ -228,32 +239,91 @@ class ThumbnailLoader(
                         null
                     }
                 }
-            val validBytes = rawBytes?.takeIf { it.size in 1..MAX_THUMBNAIL_BYTES }
-            if (validBytes != null) {
-                writeDiskCachedBytes(mediaId, validBytes)
-            }
-            validBytes
+            rawBytes?.takeIf { it.size in 1..MAX_THUMBNAIL_BYTES }
         }
             .onFailure { if (it is CancellationException) throw it }
             .getOrNull()
         return bytes to attempted
     }
 
-    private fun writeDiskCachedBytes(mediaId: String, bytes: ByteArray) {
-        val rootDir = cacheDir ?: return
-        runCatching {
-            synchronized(diskWriteLock) {
-                val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-                val fileKey = diskCacheKey(mediaId)
-                writeBytesAtomically(thumbsDir, fileKey, bytes)
-                val targetFile = resolveSafeChildFile(thumbsDir, fileKey)
-                targetFile.setLastModified(clockMs())
-                pruneThumbnailDiskCache(thumbsDir)
+    private suspend fun streamRemoteBytesToDiskCache(
+        rootDir: File,
+        mediaId: String,
+    ): Pair<ByteArray?, Boolean> {
+        var attempted = false
+        val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR).apply { mkdirs() }
+        val fileKey = diskCacheKey(mediaId)
+        val tmpFile = resolveSafeChildFile(thumbsDir, "$fileKey.${System.nanoTime()}.tmp")
+        val bytes = runCatching {
+            val streamed =
+                if (isHttpThumbnailUrl(mediaId)) {
+                    attempted = true
+                    apiClient.streamExternalBinaryToFile(mediaId, tmpFile, MAX_THUMBNAIL_BYTES)
+                } else {
+                    val currentSettings = settings.settings.first()
+                    val serverUrl = currentSettings.serverUrl
+                    val token = currentSettings.bearerToken
+                    if (serverUrl.isNotBlank() && token.isNotBlank()) {
+                        attempted = true
+                        apiClient.streamMediaToFile(
+                            serverUrl = serverUrl,
+                            token = token,
+                            mediaId = mediaId,
+                            targetFile = tmpFile,
+                            maxBytes = MAX_THUMBNAIL_BYTES,
+                        )
+                    } else {
+                        false
+                    }
+                }
+            if (streamed && tmpFile.isFile && tmpFile.length() in 1..MAX_THUMBNAIL_BYTES) {
+                commitStreamedCacheFile(thumbsDir, fileKey, tmpFile)
+            } else {
+                tmpFile.delete()
+                null
             }
         }
+            .onFailure {
+                tmpFile.delete()
+                if (it is CancellationException) throw it
+            }
+            .getOrNull()
+        return bytes to attempted
     }
 
+    private fun commitStreamedCacheFile(
+        thumbsDir: File,
+        fileKey: String,
+        tmpFile: File,
+    ): ByteArray? =
+        synchronized(diskWriteLock) {
+            val targetFile = resolveSafeChildFile(thumbsDir, fileKey)
+            runCatching {
+                Files.move(
+                    tmpFile.toPath(),
+                    targetFile.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+                .onFailure {
+                    if (!tmpFile.renameTo(targetFile)) {
+                        tmpFile.copyTo(targetFile, overwrite = true)
+                        tmpFile.delete()
+                    }
+                }
+            targetFile.setLastModified(clockMs())
+            val bytes =
+                if (targetFile.isFile && targetFile.length() in 1..MAX_THUMBNAIL_BYTES) {
+                    targetFile.readBytes()
+                } else {
+                    null
+                }
+            pruneThumbnailDiskCache(thumbsDir)
+            bytes
+        }
+
     internal companion object {
+        internal const val MAX_CONCURRENT_LOADS = 4
         internal const val FAILED_RETRY_COOLDOWN_MS = 60_000L
         internal const val MAX_DISK_CACHED_FILES = 512
         internal const val MAX_DISK_CACHE_BYTES = 64L * 1024L * 1024L

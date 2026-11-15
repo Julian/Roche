@@ -8,7 +8,8 @@ use url::Url;
 
 use super::*;
 use crate::db::{
-    ContentType, Db, Feed, FeedType, ItemFilter, ItemStatus, PollBatch, PollItemCandidate,
+    ActivityEntityType, ConsumptionStatus, ContentType, Db, EntryKind, Feed, FeedType, ItemFilter,
+    ItemStatus, ManualItemInput, NewItem, PollBatch, PollItemCandidate,
 };
 
 #[test]
@@ -851,10 +852,78 @@ fn test_cross_stack_golden_vectors() {
     }
 
     #[derive(Deserialize)]
+    struct IdentifierNormVector {
+        kind: crate::db::EntryKind,
+        scheme: String,
+        raw_value: String,
+        expected_scheme: String,
+        expected_value: String,
+    }
+
+    #[derive(Deserialize)]
+    struct EditionStripVector {
+        input: String,
+        expected: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CatalogEntryIdVector {
+        kind: crate::db::EntryKind,
+        title: String,
+        creators: Vec<String>,
+        identifiers: Vec<crate::db::EntryIdentifier>,
+        expected_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct AutoLogIdVector {
+        entry_id: String,
+        expected_log_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct DynamicRuleEntryInput {
+        kind: crate::db::EntryKind,
+        creators: Vec<String>,
+        release_year: Option<i32>,
+        statuses: Vec<crate::db::ConsumptionStatus>,
+    }
+
+    #[derive(Deserialize)]
+    struct DynamicRuleVector {
+        rule_json: String,
+        entry: DynamicRuleEntryInput,
+        expected_match: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct RankedEntryInput {
+        id: String,
+        title: String,
+    }
+
+    #[derive(Deserialize)]
+    struct RankedParityVector {
+        name: String,
+        is_priority_scope: bool,
+        entries: Vec<RankedEntryInput>,
+        orderings: Vec<Vec<Vec<String>>>,
+        expected_ids: Vec<String>,
+        expected_tiers: Vec<Option<char>>,
+    }
+
+    #[derive(Deserialize)]
     struct GoldenVectors {
         canonical_urls: Vec<CanonicalUrlVector>,
         entity_ids: Vec<EntityIdVector>,
         hrw_elections: Vec<HrwElectionVector>,
+        preferred_identifier_schemes: Vec<String>,
+        identifier_normalizations: Vec<IdentifierNormVector>,
+        album_edition_stripping: Vec<EditionStripVector>,
+        catalog_entry_ids: Vec<CatalogEntryIdVector>,
+        auto_consumption_log_ids: Vec<AutoLogIdVector>,
+        dynamic_collection_rules: Vec<DynamicRuleVector>,
+        ranked_collection_parity: Vec<RankedParityVector>,
     }
 
     let vectors_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -916,6 +985,132 @@ fn test_cross_stack_golden_vectors() {
             Some(case.expected_winner.as_str()),
             "hrw_elections mismatch for '{}'",
             case.feed_url
+        );
+    }
+
+    assert_eq!(
+        vectors.preferred_identifier_schemes,
+        crate::db::PREFERRED_IDENTIFIER_SCHEMES.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+    );
+
+    for case in &vectors.identifier_normalizations {
+        assert_eq!(
+            crate::db::normalize_identifier_scheme(&case.scheme),
+            case.expected_scheme,
+            "scheme norm mismatch for '{}'",
+            case.scheme
+        );
+        assert_eq!(
+            crate::db::normalize_identifier_value(case.kind, &case.scheme, &case.raw_value),
+            case.expected_value,
+            "value norm mismatch for ({:?}, '{}', '{}')",
+            case.kind,
+            case.scheme,
+            case.raw_value
+        );
+    }
+
+    for case in &vectors.album_edition_stripping {
+        assert_eq!(
+            crate::db::strip_album_edition_suffix(&case.input),
+            case.expected,
+            "edition strip mismatch for '{}'",
+            case.input
+        );
+    }
+
+    for case in &vectors.catalog_entry_ids {
+        assert_eq!(
+            crate::db::choose_deterministic_entry_id(
+                None,
+                case.kind,
+                &case.title,
+                &case.creators,
+                &case.identifiers,
+            ),
+            case.expected_id,
+            "catalog_entry_id mismatch for '{}'",
+            case.title
+        );
+    }
+
+    for case in &vectors.auto_consumption_log_ids {
+        assert_eq!(
+            deterministic_auto_consumption_log_id(&case.entry_id),
+            case.expected_log_id,
+            "auto_consumption_log_id mismatch for '{}'",
+            case.entry_id
+        );
+    }
+
+    for case in &vectors.dynamic_collection_rules {
+        let rule = crate::db::parse_dynamic_collection_rule(Some(&case.rule_json)).unwrap();
+        assert_eq!(
+            crate::db::matches_dynamic_collection_rule(
+                &rule,
+                case.entry.kind,
+                &case.entry.creators,
+                case.entry.release_year,
+                &case.entry.statuses,
+            ),
+            case.expected_match,
+            "dynamic rule mismatch for '{}'",
+            case.rule_json
+        );
+    }
+
+    for case in &vectors.ranked_collection_parity {
+        let ids: Vec<String> = case.entries.iter().map(|e| e.id.clone()).collect();
+        let scores = crate::ranking::infer_scores(&ids, &case.orderings);
+        let tiers = if !case.is_priority_scope && !case.orderings.is_empty() {
+            crate::ranking::rescale_to_quantiles(&scores, crate::ranking::N_QUANTILES)
+                .into_iter()
+                .map(|(id, q)| (id, crate::ranking::tier_label(q)))
+                .collect::<std::collections::HashMap<_, _>>()
+        } else {
+            std::collections::HashMap::new()
+        };
+        let mut sorted: Vec<&RankedEntryInput> = case.entries.iter().collect();
+        sorted.sort_by(|a, b| {
+            let sa = scores.get(&a.id).copied().unwrap_or_default().mean;
+            let sb = scores.get(&b.id).copied().unwrap_or_default().mean;
+            sb.total_cmp(&sa)
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut i = 0usize;
+        while i < sorted.len() {
+            let base = scores.get(&sorted[i].id).copied().unwrap_or_default().mean;
+            let mut j = i + 1;
+            while j < sorted.len() {
+                let cur = scores.get(&sorted[j].id).copied().unwrap_or_default().mean;
+                if (cur - base).abs() <= crate::ranking::MEAN_TIE_EPSILON {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j - i > 1 {
+                sorted[i..j].sort_by(|a, b| {
+                    a.title
+                        .to_lowercase()
+                        .cmp(&b.title.to_lowercase())
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+            }
+            i = j;
+        }
+        assert_eq!(
+            sorted.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            case.expected_ids,
+            "ranked_collection_parity IDs mismatch for '{}'",
+            case.name
+        );
+        assert_eq!(
+            sorted.iter().map(|e| tiers.get(&e.id).copied()).collect::<Vec<_>>(),
+            case.expected_tiers,
+            "ranked_collection_parity tiers mismatch for '{}'",
+            case.name
         );
     }
 }
@@ -1285,4 +1480,580 @@ async fn test_peer_sync_preserves_single_consumption_log_and_never_auto_logs_bul
 
     // Bulk-archived article without an explicit consumption_log row MUST NOT be auto-logged!
     assert!(!resp.consumption_log.iter().any(|l| l.entry_id == bulk_art.id));
+}
+
+#[tokio::test]
+async fn test_peer_sync_initial_pagination_referenced_entries_slug_collision_and_tag_tie_stability()
+{
+    use crate::db::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, NewItem};
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://example.com/paged-feed.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Podcast, &feed_url, Some("Paged Podcast"), None).await.unwrap();
+    assert_eq!(feed.feed_type, FeedType::Podcast);
+
+    let mut created_ids = Vec::new();
+    let base_ts =
+        DateTime::parse_from_rfc3339("2026-07-01T12:00:00.000Z").unwrap().with_timezone(&Utc);
+    for idx in 0..4 {
+        let ep_url = Url::parse(&format!("https://example.com/ep-{idx}")).unwrap();
+        let ep = db
+            .items()
+            .create(&NewItem {
+                feed_id: Some(&feed.id),
+                title: &format!("Episode {idx}"),
+                url: &ep_url,
+                author: Some("Host"),
+                published_at: Some(base_ts),
+                summary: Some("Episode summary"),
+                content_type: ContentType::Audio,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+            .bind(base_ts + chrono::Duration::seconds(idx * 10))
+            .bind(&ep.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        created_ids.push(ep.id);
+    }
+
+    // Log consumption on the LAST item (`created_ids[3]`, which will be on page 2 of initial sync!)
+    // AND delete `created_ids[2]` after logging consumption so it's no longer in `items` at all!
+    db.catalog()
+        .log_consumption(&created_ids[3], ConsumptionStatus::Consumed, None, Some(base_ts))
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&created_ids[2], ConsumptionStatus::Consumed, None, Some(base_ts))
+        .await
+        .unwrap();
+    assert!(db.items().delete(&created_ids[2]).await.unwrap());
+
+    // Remaining inbox items are `[0, 1, 3]`. Initial sync (`updated_after: None`) with cap = 2:
+    let (page1, _) = db
+        .sync()
+        .merge_peer_state_with_limit(
+            &PeerSyncRequest {
+                peer_id: "peer-init".to_owned(),
+                device_name: Some("Tablet".to_owned()),
+                network_tier: NetworkTier::Wifi,
+                updated_after: None,
+                ..PeerSyncRequest::default()
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(page1.has_more, "Initial sync exceeding cap must set has_more = true");
+    assert_eq!(page1.items.len(), 2);
+    assert!(page1.next_after_item_id.is_some());
+    assert!(
+        page1.catalog_entries.iter().any(|e| e.id == created_ids[3]),
+        "Page 1 catalog_entries must materialize entry referenced by consumption_log even when its inbox item is on page 2"
+    );
+    assert!(
+        page1.catalog_entries.iter().any(|e| e.id == created_ids[2]),
+        "Page 1 catalog_entries must materialize entry referenced by consumption_log even when deleted from Inbox"
+    );
+
+    // Continuation page (`after_item_id` set) delivers the remaining item while skipping duplicate
+    // catalog/tombstone serialization and retaining feeds/tags.
+    let (page2, _) = db
+        .sync()
+        .merge_peer_state_with_limit(
+            &PeerSyncRequest {
+                peer_id: "peer-init".to_owned(),
+                device_name: Some("Tablet".to_owned()),
+                network_tier: NetworkTier::Wifi,
+                updated_after: Some(page1.sync_timestamp),
+                after_item_id: page1.next_after_item_id.clone(),
+                ..PeerSyncRequest::default()
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(!page2.has_more);
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items[0].id, created_ids[3]);
+    assert_eq!(page2.feeds.len(), 1);
+    assert!(page2.collections.is_empty(), "Continuation page must not re-emit page-1 collections");
+    assert!(page2.tombstones.is_empty(), "Continuation page must not re-emit page-1 tombstones");
+
+    // Manual collection slug collision: Peer A and Peer B create `"weekend-movies"` offline with
+    // distinct UUIDs; both collection_entries must merge into the surviving collection without UNIQUE errors!
+    let movie_a = "11111111-aaaa-4444-8888-111111111111".to_owned();
+    let movie_b = "22222222-bbbb-4444-8888-222222222222".to_owned();
+    let col_a = "aaaaaaaa-0000-4000-8000-aaaaaaaaaaaa".to_owned();
+    let col_b = "bbbbbbbb-0000-4000-8000-bbbbbbbbbbbb".to_owned();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            collections: vec![PeerCollectionSpecRecord {
+                collection_id: col_a.clone(),
+                title: "Weekend Movies".to_owned(),
+                summary: None,
+                slug: Some("weekend-movies".to_owned()),
+                mode: CollectionMode::Manual,
+                role: CollectionRole::List,
+                rule_json: None,
+                show_in_lists: true,
+                color: None,
+                created_at: Some(base_ts),
+                updated_at: Some(base_ts),
+            }],
+            catalog_entries: vec![PeerCatalogEntryRecord {
+                id: movie_a.clone(),
+                kind: EntryKind::Movie,
+                title: "Heat".to_owned(),
+                creators: vec!["Michael Mann".to_owned()],
+                url: None,
+                published_at: None,
+                release_year: Some(1995),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(base_ts),
+                updated_at: Some(base_ts),
+            }],
+            collection_entries: vec![PeerCollectionEntryRecord {
+                collection_id: col_a.clone(),
+                entry_id: movie_a.clone(),
+                position: Some(1.0),
+                added_at: base_ts,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let (slug_merged_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            collections: vec![PeerCollectionSpecRecord {
+                collection_id: col_b,
+                title: "Weekend Movies".to_owned(),
+                summary: Some("From Peer B".to_owned()),
+                slug: Some("  WEEKEND-MOVIES  ".to_owned()),
+                mode: CollectionMode::Manual,
+                role: CollectionRole::List,
+                rule_json: None,
+                show_in_lists: true,
+                color: None,
+                created_at: Some(base_ts),
+                updated_at: Some(base_ts + chrono::Duration::seconds(5)),
+            }],
+            catalog_entries: vec![PeerCatalogEntryRecord {
+                id: movie_b.clone(),
+                kind: EntryKind::Movie,
+                title: "Collateral".to_owned(),
+                creators: vec!["Michael Mann".to_owned()],
+                url: None,
+                published_at: None,
+                release_year: Some(2004),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(base_ts),
+                updated_at: Some(base_ts),
+            }],
+            collection_entries: vec![PeerCollectionEntryRecord {
+                collection_id: "bbbbbbbb-0000-4000-8000-bbbbbbbbbbbb".to_owned(),
+                entry_id: movie_b.clone(),
+                position: Some(2.0),
+                added_at: base_ts,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        slug_merged_resp
+            .collection_entries
+            .iter()
+            .any(|ce| ce.collection_id == col_a && ce.entry_id == movie_b),
+        "Colliding manual collection slug must remap collection_entries onto existing collection_id"
+    );
+
+    // Tag-tie stability: syncing an item with the same `interaction_updated_at` and same `tag_names`
+    // must NOT bump `entries.updated_at` on tie!
+    let tie_ts = base_ts + chrono::Duration::minutes(10);
+    let ep0_url = Url::parse("https://example.com/ep-0").unwrap();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            items: vec![PeerItemRecord {
+                id: created_ids[0].clone(),
+                feed_id: Some(feed.id.clone()),
+                feed_url: Some(feed_url.clone()),
+                title: "Episode 0".to_owned(),
+                url: ep0_url.clone(),
+                author: Some("Host".to_owned()),
+                published_at: Some(base_ts),
+                created_at: Some(base_ts),
+                summary: Some("Episode summary".to_owned()),
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Audio,
+                status: ItemStatus::Unread,
+                is_favorite: false,
+                read_at: None,
+                read_progress: 0.25,
+                interaction_updated_at: Some(tie_ts),
+                tag_names: vec!["queue".to_owned()],
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let updated_before_tie: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
+            .bind(&created_ids[0])
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            items: vec![PeerItemRecord {
+                id: created_ids[0].clone(),
+                feed_id: Some(feed.id.clone()),
+                feed_url: Some(feed_url),
+                title: "Episode 0".to_owned(),
+                url: ep0_url,
+                author: Some("Host".to_owned()),
+                published_at: Some(base_ts),
+                created_at: Some(base_ts),
+                summary: Some("Episode summary".to_owned()),
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Audio,
+                status: ItemStatus::Unread,
+                is_favorite: false,
+                read_at: None,
+                read_progress: 0.25,
+                interaction_updated_at: Some(tie_ts),
+                tag_names: vec!["QUEUE".to_owned()],
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let updated_after_tie: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
+            .bind(&created_ids[0])
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        updated_after_tie, updated_before_tie,
+        "Unchanged tag-tie sync must not bump entries.updated_at and cause delta ping-pong"
+    );
+}
+
+#[tokio::test]
+async fn test_deleted_feed_with_history_hides_from_lists_and_inbox_sync_materializes_catalog_only_entry()
+ {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://podcast.example.com/feed.xml").unwrap();
+    let feed = db
+        .feeds()
+        .create(FeedType::Podcast, &feed_url, None, Some("Deep Tech Podcast"))
+        .await
+        .unwrap();
+    let ep_url = Url::parse("https://podcast.example.com/ep-1").unwrap();
+    let ep = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Episode 1",
+            url: &ep_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?, ?)")
+        .bind(&feed.id)
+        .bind(&ep.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&ep.id, ConsumptionStatus::Consumed, Some("Great episode"), None)
+        .await
+        .unwrap();
+
+    // Deleting the feed while episode has consumption history preserves parent entry as `podcast`
+    // WITHOUT leaking it into `list_collections(false, false)` or coercing kind to `collection` in peer sync!
+    assert!(db.feeds().delete(&feed.id).await.unwrap());
+    let visible_lists = db.catalog().list_collections(false, false).await.unwrap();
+    assert!(
+        visible_lists.iter().all(|c| c.id != feed.id),
+        "Deleted feed with preserved history must not appear in user lists"
+    );
+    let (sync_resp, _) = db.sync().merge_peer_state(&PeerSyncRequest::default()).await.unwrap();
+    assert!(sync_resp.collections.iter().all(|c| c.collection_id != feed.id));
+    let synced_podcast =
+        sync_resp.catalog_entries.iter().find(|e| e.id == feed.id).expect("podcast entry synced");
+    assert_eq!(synced_podcast.kind, EntryKind::Podcast);
+
+    // Pre-existing catalog-only article entry (no `entry_content` / `entry_state` row) must be
+    // materialized into the Inbox when an incoming `PeerItemRecord` arrives via peer sync!
+    let pre_url = Url::parse("https://blog.example.com/preexisting-essay").unwrap();
+    let pre_entry = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Preexisting Essay".to_owned(),
+            url: Some(pre_url.to_string()),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&pre_entry.id).await.unwrap().is_none());
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-mobile".to_owned(),
+            items: vec![PeerItemRecord {
+                id: String::new(),
+                feed_id: None,
+                feed_url: None,
+                title: "Preexisting Essay".to_owned(),
+                url: pre_url,
+                author: None,
+                published_at: None,
+                created_at: None,
+                summary: None,
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                status: ItemStatus::Unread,
+                is_favorite: false,
+                read_at: None,
+                read_progress: 0.0,
+                interaction_updated_at: None,
+                tag_names: Vec::new(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let materialized = db
+        .items()
+        .get(&pre_entry.id)
+        .await
+        .unwrap()
+        .expect("Catalog-only entry must be materialized as an Inbox item on peer sync");
+    assert_eq!(materialized.status, ItemStatus::Unread);
+}
+
+#[tokio::test]
+async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+
+    // 1. Create ASCII tag, rename to non-ASCII uppercase (`"Äpfel"`), then attach `"äpfel"` via sync:
+    //    must reuse existing tag without 500 `RowNotFound`, converge idempotently without bumping
+    //    `updated_at` on repeat sync, and delete cleanly on incoming tombstone!
+    let tag = db.tags().create("apfel", None).await.unwrap();
+    assert!(db.tags().update(&tag.id, Some("Äpfel"), None).await.unwrap());
+
+    let item_url = Url::parse("https://example.com/unicode-tag").unwrap();
+    let initial_tags = vec!["Äpfel".to_owned()];
+    let (item, _) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &item_url,
+            title: "Unicode Tag Test",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &initial_tags,
+        })
+        .await
+        .unwrap();
+
+    let inter_ts = Utc::now();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-u".to_owned(),
+            items: vec![PeerItemRecord {
+                id: item.id.clone(),
+                feed_id: None,
+                feed_url: None,
+                title: "Unicode Tag Test".to_owned(),
+                url: Url::parse("https://example.com/unicode-tag").unwrap(),
+                author: None,
+                published_at: None,
+                created_at: None,
+                summary: None,
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                status: ItemStatus::Unread,
+                is_favorite: false,
+                read_at: None,
+                read_progress: 0.0,
+                interaction_updated_at: Some(inter_ts),
+                tag_names: vec!["äpfel".to_owned()],
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let updated_before: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
+            .bind(&item.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Second identical sync must be a complete no-op on `entries.updated_at`!
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-u".to_owned(),
+            items: vec![PeerItemRecord {
+                id: item.id.clone(),
+                feed_id: None,
+                feed_url: None,
+                title: "Unicode Tag Test".to_owned(),
+                url: Url::parse("https://example.com/unicode-tag").unwrap(),
+                author: None,
+                published_at: None,
+                created_at: None,
+                summary: None,
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                status: ItemStatus::Unread,
+                is_favorite: false,
+                read_at: None,
+                read_progress: 0.0,
+                interaction_updated_at: Some(inter_ts),
+                tag_names: vec!["Äpfel".to_owned()],
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let updated_after: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
+            .bind(&item.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(updated_after, updated_before, "Non-ASCII tag sync must not write-amplify");
+
+    // Incoming tombstone for `"ÄPFEL"` deletes `"Äpfel"`:
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-u".to_owned(),
+            tombstones: vec![crate::db::sync::SyncTombstone {
+                entity_type: ActivityEntityType::Tag,
+                natural_key: "ÄPFEL".to_owned(),
+                deleted_at: Utc::now() + chrono::Duration::seconds(5),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.tags().list().await.unwrap().len(), 0);
+
+    // 2. Multi-page sync: catalog entry written between page 1 and page 2 is delivered on final page!
+    for idx in 0..2 {
+        let mp_url = Url::parse(&format!("https://example.com/mp-{idx}")).unwrap();
+        let mp_title = format!("MP {idx}");
+        db.items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &mp_url,
+                title: &mp_title,
+                summary: None,
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                tags: &[],
+            })
+            .await
+            .unwrap();
+    }
+    let (p1, _) = db
+        .sync()
+        .merge_peer_state_with_limit(
+            &PeerSyncRequest {
+                peer_id: "peer-mp".to_owned(),
+                device_name: Some("Phone".to_owned()),
+                network_tier: NetworkTier::Wifi,
+                ..PeerSyncRequest::default()
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert!(p1.has_more);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let mid_entry = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Concurrent Mid-Pagination Book".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let (p2, _) = db
+        .sync()
+        .merge_peer_state_with_limit(
+            &PeerSyncRequest {
+                peer_id: "peer-mp".to_owned(),
+                device_name: Some("Phone".to_owned()),
+                network_tier: NetworkTier::Wifi,
+                updated_after: Some(p1.sync_timestamp),
+                after_item_id: p1.next_after_item_id.clone(),
+                ..PeerSyncRequest::default()
+            },
+            5,
+        )
+        .await
+        .unwrap();
+    assert!(!p2.has_more);
+    assert!(
+        p2.catalog_entries.iter().any(|e| e.id == mid_entry.id),
+        "Catalog mutation committed between page 1 and final page must be delivered on final page"
+    );
 }

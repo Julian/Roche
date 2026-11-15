@@ -159,9 +159,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
             .await;
         let active_peers = self.db.sync().list_active_peers(now).await.unwrap_or_default();
         let feeds = self.db.feeds().get_active_for_cooperative_polling(SERVER_PEER_ID).await?;
-        let batch_started_at = Instant::now();
-        let batch_progress = Arc::new(Mutex::new((0usize, 0usize)));
-
+        let mut due_feeds = Vec::new();
         for feed in feeds {
             if !should_peer_poll_feed(SERVER_PEER_ID, &active_peers, &feed, now) {
                 continue;
@@ -169,7 +167,18 @@ impl<F: FeedFetcher> PollScheduler<F> {
             if !self.in_flight.lock().is_ok_and(|mut set| set.insert(feed.id.clone())) {
                 continue;
             }
-            self.spawn_feed_poll_task(feed, batch_started_at, &batch_progress);
+            due_feeds.push(feed);
+        }
+
+        let batch_total = due_feeds.len();
+        if batch_total == 0 {
+            return Ok(());
+        }
+
+        let batch_started_at = Instant::now();
+        let batch_progress = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        for feed in due_feeds {
+            self.spawn_feed_poll_task(feed, batch_total, batch_started_at, &batch_progress);
         }
 
         Ok(())
@@ -178,8 +187,9 @@ impl<F: FeedFetcher> PollScheduler<F> {
     fn spawn_feed_poll_task(
         &self,
         feed: Feed,
+        batch_total: usize,
         batch_started_at: Instant,
-        batch_progress: &Arc<Mutex<(usize, usize)>>,
+        batch_progress: &Arc<Mutex<(usize, usize, usize)>>,
     ) {
         let db = self.db.clone();
         let fetcher = Arc::clone(&self.fetcher);
@@ -197,71 +207,59 @@ impl<F: FeedFetcher> PollScheduler<F> {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return;
                 };
-                let feed_repo = db.feeds();
-                FeedIngester::poll_returning_inserted(&feed_repo, &feed, fetcher.as_ref()).await
+                FeedIngester::poll_xml_and_record_outcome(
+                    &db,
+                    fetcher.as_ref(),
+                    &feed,
+                    "scheduled",
+                    false,
+                )
+                .await
             };
-            match poll_res {
-                Ok(outcome) => {
-                    let elapsed_secs = batch_started_at.elapsed().as_secs_f64();
-                    let (batch_feeds, batch_items) =
-                        batch_progress.lock().map_or((1, outcome.parsed_entries), |mut prog| {
-                            prog.0 += 1;
-                            prog.1 += outcome.parsed_entries;
-                            *prog
-                        });
-                    let sample_weight =
-                        compute_throughput_weight(batch_feeds, batch_items, elapsed_secs);
-                    let updated_weight = measured_weight.lock().map_or(sample_weight, |mut w| {
-                        *w = sample_weight.mul_add(0.6, *w * 0.4).clamp(0.2, 10.0);
-                        *w
-                    });
-                    let _ = db
-                        .sync()
-                        .upsert_peer_node(
-                            SERVER_PEER_ID,
-                            "Roche Headless Peer",
-                            NetworkTier::Wifi,
-                            updated_weight,
-                            SyncRepo::now_utc(),
-                        )
-                        .await;
-                    let feed_title = outcome
-                        .feed_title
-                        .as_deref()
-                        .or(feed.title.as_deref())
-                        .unwrap_or("<untitled>");
-                    tracing::info!(
-                        feed_title = %feed_title,
-                        feed_url = %feed.url,
-                        feed_id = %feed.id,
-                        new_items = outcome.inserted.len(),
-                        feed_entries = outcome.parsed_entries,
-                        "Feed polled successfully"
-                    );
-                    if let Some(ref store) = media_store {
-                        let ctx = MediaIngestContext {
-                            db: &db,
-                            media_store: store,
-                            ytdlp_worker: ytdlp_worker.as_ref(),
-                            download_semaphore: Some(&download_semaphore),
-                            fetcher: fetcher.as_ref(),
-                        };
-                        FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
-                    }
+
+            let maybe_batch_summary = batch_progress.lock().ok().and_then(|mut prog| {
+                prog.0 += 1;
+                if let Ok(ref outcome) = poll_res {
+                    prog.1 += 1;
+                    prog.2 += outcome.parsed_entries;
                 }
-                Err(e) => {
-                    let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
-                    tracing::error!(
-                        feed_title = %feed_title,
-                        feed_url = %feed.url,
-                        feed_id = %feed.id,
-                        error = %e,
-                        "Feed poll failed"
-                    );
-                    if matches!(e, PollError::Upstream(_)) {
-                        let _ = db.feeds().mark_error(&feed.id, &e.to_string()).await;
-                    }
+                (prog.0 == batch_total && prog.1 > 0).then_some((prog.1, prog.2))
+            });
+
+            if let Some((succeeded_feeds, batch_items)) = maybe_batch_summary {
+                let elapsed_secs = batch_started_at.elapsed().as_secs_f64();
+                let mut sample_weight =
+                    compute_throughput_weight(succeeded_feeds, batch_items, elapsed_secs);
+                if succeeded_feeds < 2 {
+                    sample_weight = sample_weight.max(DEFAULT_ONLINE_PEER_WEIGHT);
                 }
+                let updated_weight = measured_weight.lock().map_or(sample_weight, |mut w| {
+                    *w = sample_weight.mul_add(0.6, *w * 0.4).clamp(0.2, 10.0);
+                    *w
+                });
+                let _ = db
+                    .sync()
+                    .upsert_peer_node(
+                        SERVER_PEER_ID,
+                        "Roche Headless Peer",
+                        NetworkTier::Wifi,
+                        updated_weight,
+                        SyncRepo::now_utc(),
+                    )
+                    .await;
+            }
+
+            if let Ok(outcome) = poll_res
+                && let Some(ref store) = media_store
+            {
+                let ctx = MediaIngestContext {
+                    db: &db,
+                    media_store: store,
+                    ytdlp_worker: ytdlp_worker.as_ref(),
+                    download_semaphore: Some(&download_semaphore),
+                    fetcher: fetcher.as_ref(),
+                };
+                FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
             }
         });
     }
@@ -294,24 +292,57 @@ impl FeedIngester {
         Ok(())
     }
 
-    pub async fn poll_with_media<F: FeedFetcher>(
+    pub async fn poll_xml_and_record_outcome<F: FeedFetcher>(
+        db: &Db,
+        fetcher: &F,
+        feed: &Feed,
+        context_label: &str,
+        record_db_errors: bool,
+    ) -> std::result::Result<PollOutcome, PollError> {
+        let feed_repo = db.feeds();
+        match Self::poll_returning_inserted(&feed_repo, feed, fetcher).await {
+            Ok(outcome) => {
+                let feed_title =
+                    outcome.feed_title.as_deref().or(feed.title.as_deref()).unwrap_or("<untitled>");
+                tracing::info!(
+                    feed_title = %feed_title,
+                    feed_url = %feed.url,
+                    feed_id = %feed.id,
+                    context = context_label,
+                    new_items = outcome.inserted.len(),
+                    feed_entries = outcome.parsed_entries,
+                    "Feed polled successfully"
+                );
+                Ok(outcome)
+            }
+            Err(err) => {
+                let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
+                tracing::error!(
+                    feed_title = %feed_title,
+                    feed_url = %feed.url,
+                    feed_id = %feed.id,
+                    context = context_label,
+                    error = %err,
+                    "Feed poll failed"
+                );
+                if record_db_errors || matches!(err, PollError::Upstream(_)) {
+                    let _ = feed_repo.mark_error(&feed.id, &err.to_string()).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn poll_and_record<F: FeedFetcher>(
         ctx: &MediaIngestContext<'_, F>,
         feed: &Feed,
-    ) -> std::result::Result<(), PollError> {
-        let feed_repo = ctx.db.feeds();
-        let outcome = Self::poll_returning_inserted(&feed_repo, feed, ctx.fetcher).await?;
-        let feed_title =
-            outcome.feed_title.as_deref().or(feed.title.as_deref()).unwrap_or("<untitled>");
-        tracing::info!(
-            feed_title = %feed_title,
-            feed_url = %feed.url,
-            feed_id = %feed.id,
-            new_items = outcome.inserted.len(),
-            feed_entries = outcome.parsed_entries,
-            "Feed polled successfully"
-        );
+        context_label: &str,
+    ) -> std::result::Result<PollOutcome, PollError> {
+        let outcome =
+            Self::poll_xml_and_record_outcome(ctx.db, ctx.fetcher, feed, context_label, true)
+                .await?;
         Self::ingest_items_concurrently(ctx, &outcome.inserted).await;
-        Ok(())
+        Ok(outcome)
     }
 
     pub async fn ingest_items_concurrently<F: FeedFetcher>(
@@ -322,7 +353,7 @@ impl FeedIngester {
             return;
         }
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let worker = || async {
+        let worker = async || {
             loop {
                 let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some((item_id, candidate)) = inserted.get(idx) else {
@@ -478,7 +509,7 @@ impl FeedIngester {
     #[allow(clippy::too_many_lines)]
     fn parse_feed_content(feed_type: FeedType, content: &str) -> Result<PollBatch> {
         match feed_type {
-            FeedType::Rss => {
+            FeedType::Rss | FeedType::Podcast => {
                 let (rss_feed, items) = RssParser::parse(content)?;
                 let parsed_items = items
                     .into_iter()
@@ -753,7 +784,7 @@ mod tests {
             fetcher: &PdfCapableFetcher,
         };
 
-        FeedIngester::poll_with_media(&ctx, &feed).await.unwrap();
+        FeedIngester::poll_and_record(&ctx, &feed, "test").await.unwrap();
 
         let items = db.items().list(None, Some(&feed.id), None).await.unwrap();
         assert_eq!(items.len(), 4);

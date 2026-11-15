@@ -212,13 +212,13 @@ class RocheRepositoryTest {
     fun `pairWithCode auto-discovers Roche server on Tailnet when serverUrl is blank`() = runTest {
         val autoDiscoverClient = RocheApiClient { request ->
             when (request.url) {
-                "http://roche:8080/health" ->
+                "https://roche/health" ->
                     HttpResponse(
                         statusCode = 200,
                         body =
-                            """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
+                            """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
                     )
-                "http://roche.tail9876.ts.net:8080/auth/pair" ->
+                "https://roche.tail9876.ts.net/auth/pair" ->
                     HttpResponse(statusCode = 200, body = """{"token":"auto-paired-tok"}""")
                 else -> HttpResponse(statusCode = 404, body = "{}")
             }
@@ -240,7 +240,7 @@ class RocheRepositoryTest {
         assertEquals("auto-paired-tok", result.getOrNull())
 
         val currentSettings = settings.settings.first()
-        assertEquals("http://roche.tail9876.ts.net:8080", currentSettings.serverUrl)
+        assertEquals("https://roche.tail9876.ts.net", currentSettings.serverUrl)
         assertEquals("auto-paired-tok", currentSettings.bearerToken)
     }
 
@@ -254,11 +254,11 @@ class RocheRepositoryTest {
                 )
             }
             val discoverClient = RocheApiClient { request ->
-                if (request.url == "http://roche:8080/health") {
+                if (request.url == "https://roche/health") {
                     HttpResponse(
                         statusCode = 200,
                         body =
-                            """{"status":"ok","service":"roche","canonical_url":"http://roche.tail9876.ts.net:8080"}""",
+                            """{"status":"ok","service":"roche","canonical_url":"https://roche.tail9876.ts.net"}""",
                     )
                 } else {
                     HttpResponse(statusCode = 404, body = "{}")
@@ -272,10 +272,10 @@ class RocheRepositoryTest {
                 )
 
             val discoveredUrl = repo.discoverServer().getOrThrow()
-            assertEquals("http://roche.tail9876.ts.net:8080", discoveredUrl)
+            assertEquals("https://roche.tail9876.ts.net", discoveredUrl)
 
             val updated = settings.settings.first()
-            assertEquals("http://roche.tail9876.ts.net:8080", updated.serverUrl)
+            assertEquals("https://roche.tail9876.ts.net", updated.serverUrl)
             assertEquals("", updated.bearerToken)
         }
 
@@ -1026,6 +1026,123 @@ class RocheRepositoryTest {
             assertEquals("item-deep", deepMatches.single().id)
             val snippet = extractSearchMatchSnippet(deepMatches.single(), "NeedleInHaystackToken99")
             assertTrue(snippet?.contains("NeedleInHaystackToken99") == true)
+        }
+
+    @Test
+    internal fun `shrinking item content cleans item_contents row and recalculates article duration`() =
+        runTest {
+            val dao = database.dao()
+            val longText = List(1_500) { "word$it" }.joinToString(" ")
+            dao.upsertItem(
+                SeedData.items
+                    .first()
+                    .copy(
+                        id = "item-shrink",
+                        contentType = "article",
+                        summary = "Summary",
+                        contentText = longText,
+                        contentHtml = "<p>$longText</p>",
+                        duration = null,
+                    )
+            )
+            val storedLong = dao.getItemById("item-shrink")!!
+            assertTrue(storedLong.duration?.endsWith("m") == true)
+            val storedLongLength = storedLong.contentText?.length ?: 0
+            assertTrue(storedLongLength > LIST_PREVIEW_TEXT_CHARS)
+            val longEntry = repository.prewarm().entries.single { it.id == "item-shrink" }
+            assertEquals("8m", longEntry.readEstimateLabel)
+
+            // Shrink to short inline content: stale item_contents row and synthetic duration clear
+            dao.upsertItem(
+                storedLong.copy(
+                    summary = "Short summary",
+                    contentText = "Short body",
+                    contentHtml = "<p>Short body</p>",
+                )
+            )
+            val storedShort = dao.getItemById("item-shrink")!!
+            assertEquals("Short body", storedShort.contentText)
+            assertNull(storedShort.duration)
+            val entry = repository.prewarm().entries.single { it.id == "item-shrink" }
+            assertEquals("1m", entry.readEstimateLabel)
+        }
+
+    @Test
+    internal fun `syncWithServer rejects backwards syncTimestamp cursor regression on clock skew`() =
+        runTest {
+            settings.update {
+                it.copy(
+                    serverUrl = "http://100.64.0.12:8080",
+                    bearerToken = "tok-skew",
+                    lastPeerSyncCursor = "2026-06-10T12:00:00Z",
+                )
+            }
+            val skewedClient = RocheApiClient { request ->
+                if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"server_peer_id":"server","sync_timestamp":"2026-06-09T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+            val skewedRepo =
+                RocheRepository(database = database, apiClient = skewedClient, settings = settings)
+            skewedRepo.syncWithServer().getOrThrow()
+
+            assertEquals("2026-06-10T12:00:00Z", settings.settings.first().lastPeerSyncCursor)
+        }
+
+    @Test
+    internal fun `catalog mutation with backgroundScope triggers coalesced syncWithServer and bounds mutex cache`() =
+        runTest {
+            settings.update {
+                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-cat-bg")
+            }
+            val syncedLatch = CountDownLatch(1)
+            val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val catSyncClient = RocheApiClient { request ->
+                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                        if (request.body.orEmpty().contains("Neuromancer")) {
+                            syncedLatch.countDown()
+                        }
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_timestamp":"2026-07-01T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
+                        )
+                    } else {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                }
+                val bgRepo =
+                    RocheRepository(
+                        database = database,
+                        apiClient = catSyncClient,
+                        settings = settings,
+                        backgroundScope = bgScope,
+                    )
+                bgRepo.catalog.logEntry(
+                    UpsertCatalogEntryInput(
+                        kind = EntryKind.BOOK,
+                        title = "Neuromancer",
+                        creators = listOf("William Gibson"),
+                        releaseYear = 1984,
+                    ),
+                    ConsumptionStatus.CONSUMED,
+                    null,
+                )
+                assertTrue(syncedLatch.await(5, TimeUnit.SECONDS))
+
+                val dispatcher = BackgroundMutationDispatcher()
+                repeat(300) { idx -> dispatcher.dispatchOrRun("item-$idx") {} }
+                assertTrue(dispatcher.cachedMutexCountForTest() <= 256)
+            } finally {
+                bgScope.coroutineContext[Job]?.cancelAndJoin()
+            }
         }
 }
 

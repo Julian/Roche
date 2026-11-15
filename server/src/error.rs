@@ -100,6 +100,10 @@ impl ApiError {
         Self::MethodNotAllowed(message.into())
     }
 
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::PayloadTooLarge(message.into())
+    }
+
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self::TooManyRequests(message.into())
     }
@@ -109,6 +113,7 @@ impl ApiError {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_problem_details(&self) -> (StatusCode, ProblemDetails) {
         match self {
             Self::BadRequest(detail) => (
@@ -194,6 +199,20 @@ impl ApiError {
             ),
             Self::Database(sqlx_err) => Self::classify_sqlx_error(sqlx_err),
             Self::Internal(err) => {
+                if let Some(conflict) = err.downcast_ref::<crate::db::ConflictError>() {
+                    return (
+                        StatusCode::CONFLICT,
+                        ProblemDetails::new(
+                            StatusCode::CONFLICT,
+                            "urn:roche:problem:conflict",
+                            "Conflict",
+                            conflict.0.clone(),
+                        ),
+                    );
+                }
+                if let Some(cat_err) = err.downcast_ref::<crate::db::CatalogError>() {
+                    return Self::classify_catalog_error(cat_err);
+                }
                 if let Some(sqlx_err) = err.downcast_ref::<sqlx::Error>() {
                     return Self::classify_sqlx_error(sqlx_err);
                 }
@@ -208,6 +227,49 @@ impl ApiError {
                     ),
                 )
             }
+        }
+    }
+
+    fn classify_catalog_error(err: &crate::db::CatalogError) -> (StatusCode, ProblemDetails) {
+        match err {
+            crate::db::CatalogError::Db(db_err) => Self::classify_sqlx_error(db_err),
+            crate::db::CatalogError::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                ProblemDetails::new(
+                    StatusCode::NOT_FOUND,
+                    "urn:roche:problem:not-found",
+                    "Not Found",
+                    msg.clone(),
+                ),
+            ),
+            crate::db::CatalogError::Conflict(msg) => (
+                StatusCode::CONFLICT,
+                ProblemDetails::new(
+                    StatusCode::CONFLICT,
+                    "urn:roche:problem:conflict",
+                    "Conflict",
+                    msg.clone(),
+                ),
+            ),
+            crate::db::CatalogError::AmbiguousLookup { .. } => (
+                StatusCode::CONFLICT,
+                ProblemDetails::new(
+                    StatusCode::CONFLICT,
+                    "urn:roche:problem:conflict",
+                    "Conflict",
+                    err.to_string(),
+                ),
+            ),
+            crate::db::CatalogError::ImmutableCollection { .. }
+            | crate::db::CatalogError::InvalidInput(_) => (
+                StatusCode::BAD_REQUEST,
+                ProblemDetails::new(
+                    StatusCode::BAD_REQUEST,
+                    "urn:roche:problem:bad-request",
+                    "Bad Request",
+                    err.to_string(),
+                ),
+            ),
         }
     }
 

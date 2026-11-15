@@ -17,6 +17,7 @@ import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.abs
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -44,9 +45,16 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
         toDomainCatalogEntry(raw, identsByEntryId[raw.id].orEmpty())
     }
     val logsByEntryId = tables.logs.groupBy { it.entryId }
+    val statusesByEntryId = logsByEntryId.mapValues { (_, list) ->
+        list.map { ConsumptionStatus.fromWireValue(it.status) }.toHashSet()
+    }
     val consumedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.CONSUMED)
     val abandonedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.ABANDONED)
-    val globalScores = computeGlobalScores(domainEntries.keys, tables.comparisons)
+    val globalOrderings =
+        tables.comparisons
+            .filter { it.scopeCollectionId.isNullOrBlank() }
+            .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
+    val globalScores = EpRankingEngine.inferScores(domainEntries.keys.toList(), globalOrderings)
     val membershipsByCollection = groupSortedMemberships(tables.memberships)
     val generatorCollectionIds = tables.generators.map { it.collectionId }.toHashSet()
 
@@ -57,11 +65,14 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
             generatorCollectionIds = generatorCollectionIds,
             domainEntries = domainEntries,
             consumedIds = consumedIds,
+            statusesByEntryId = statusesByEntryId,
             logsByEntryId = logsByEntryId,
+            globalOrderings = globalOrderings,
             globalScores = globalScores,
             allComparisons = tables.comparisons,
         )
-    val globalTiers = computePerKindGlobalTiers(domainEntries, consumedIds, globalScores)
+    val globalTiers =
+        computePerKindGlobalTiers(domainEntries, consumedIds, globalScores, globalOrderings)
     val diaryItems = buildDiaryItems(tables.logs, domainEntries, globalTiers)
     val albumGen =
         buildAlbumGeneratorState(
@@ -92,17 +103,6 @@ private fun extractEntryIdsWithStatus(
         .map { it.entryId }
         .toHashSet()
 
-private fun computeGlobalScores(
-    entryIds: Set<String>,
-    comparisons: List<ComparisonEntity>,
-): Map<String, EpRankingEngine.Score> {
-    val globalOrderings =
-        comparisons
-            .filter { it.scopeCollectionId.isNullOrBlank() }
-            .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
-    return EpRankingEngine.inferScores(entryIds.toList(), globalOrderings)
-}
-
 private fun groupSortedMemberships(
     memberships: List<CollectionEntryEntity>
 ): Map<String, List<CollectionEntryEntity>> =
@@ -126,7 +126,9 @@ private fun buildRankedCollections(
     generatorCollectionIds: Set<String>,
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
+    statusesByEntryId: Map<String, Set<ConsumptionStatus>>,
     logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
+    globalOrderings: List<List<List<String>>>,
     globalScores: Map<String, EpRankingEngine.Score>,
     allComparisons: List<ComparisonEntity>,
 ): RankedCollectionsBundle {
@@ -149,17 +151,18 @@ private fun buildRankedCollections(
                 hasGenerator = hasGenerator,
                 domainEntries = domainEntries,
                 consumedIds = consumedIds,
+                statusesByEntryId = statusesByEntryId,
                 memberships = membershipsByCollection[spec.collectionId].orEmpty(),
             )
         val ranked =
-            rankCollectionMembers(
-                collectionId = spec.collectionId,
-                isPriorityScoped = isWant,
-                memberIds = memberIds,
-                domainEntries = domainEntries,
-                logsByEntryId = logsByEntryId,
-                globalScores = globalScores,
+            rankSpecEntries(
+                specId = spec.collectionId,
+                isWant = isWant,
+                memberEntries = memberIds.mapNotNull { domainEntries[it] },
                 allComparisons = allComparisons,
+                globalOrderings = globalOrderings,
+                globalScores = globalScores,
+                logsByEntryId = logsByEntryId,
             )
         entriesByCollectionId[spec.collectionId] = ranked
         val summary =
@@ -186,6 +189,33 @@ private fun buildRankedCollections(
         entriesByCollectionId = entriesByCollectionId,
         sortedLists = sortListSummaries(listSummaries),
         sortedWants = sortWantSummaries(wantSummaries),
+    )
+}
+
+@Suppress("LongParameterList")
+private fun rankSpecEntries(
+    specId: String,
+    isWant: Boolean,
+    memberEntries: List<CatalogEntryItem>,
+    allComparisons: List<ComparisonEntity>,
+    globalOrderings: List<List<List<String>>>,
+    globalScores: Map<String, EpRankingEngine.Score>,
+    logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
+): List<RankedCatalogEntry> {
+    val orderings =
+        if (isWant) {
+            allComparisons
+                .filter { it.scopeCollectionId == specId }
+                .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
+        } else {
+            globalOrderings
+        }
+    return rankEntriesByOrderings(
+        entries = memberEntries,
+        isPriorityScoped = isWant,
+        orderings = orderings,
+        precomputedGlobalScores = if (isWant) null else globalScores,
+        logsByEntryId = logsByEntryId,
     )
 }
 
@@ -228,25 +258,29 @@ internal fun resolveCollectionMemberIds(
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
     memberships: List<CollectionEntryEntity>,
+    statusesByEntryId: Map<String, Set<ConsumptionStatus>> = emptyMap(),
 ): List<String> =
     when (mode) {
         CollectionMode.DYNAMIC -> {
-            val rule =
-                spec.ruleJson
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { raw ->
-                        runCatching {
-                            rocheJson.decodeFromString(
-                                DynamicCollectionRuleDto.serializer(),
-                                raw,
-                            )
-                        }
-                            .getOrNull()
-                    }
+            val rule = parseDynamicCollectionRule(spec.ruleJson)
             domainEntries.values
                 .filter { entry ->
-                    matchesDynamicRule(entry, rule, consumedIds)
+                    val statuses =
+                        statusesByEntryId[entry.id]
+                            ?: if (entry.id in consumedIds) {
+                                setOf(ConsumptionStatus.CONSUMED)
+                            } else {
+                                emptySet()
+                            }
+                    matchesDynamicCollectionRule(
+                        rule = rule,
+                        kind = entry.kind,
+                        creators = entry.creators,
+                        releaseYear = entry.releaseYear,
+                        statuses = statuses,
+                    )
                 }
+                .sortedWith(compareBy<CatalogEntryItem> { it.title.lowercase() }.thenBy { it.id })
                 .map { it.id }
         }
         CollectionMode.MANUAL,
@@ -256,77 +290,144 @@ internal fun resolveCollectionMemberIds(
         }
     }
 
-private fun matchesDynamicRule(
-    entry: CatalogEntryItem,
+internal fun parseDynamicCollectionRule(rawJson: String?): DynamicCollectionRuleDto? =
+    rawJson
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { raw ->
+            runCatching { rocheJson.decodeFromString(DynamicCollectionRuleDto.serializer(), raw) }
+                .getOrNull()
+        }
+
+internal fun matchesDynamicCollectionRule(
     rule: DynamicCollectionRuleDto?,
-    consumedIds: Set<String>,
+    kind: EntryKind,
+    creators: List<String>,
+    releaseYear: Int?,
+    statuses: Set<ConsumptionStatus>,
 ): Boolean {
     if (rule == null) return false
-    val kindMatches =
-        rule.kind.isNullOrBlank() || entry.kind.wireValue.equals(rule.kind, ignoreCase = true)
-    val consumedMatches =
-        when (rule.consumed) {
-            null -> true
-            true -> entry.id in consumedIds
-            false -> entry.id !in consumedIds
-        }
+    val allowedKinds = parseRuleTargetKinds(rule) ?: return false
+    val requiredStatus = parseRuleTargetStatus(rule) ?: return false
+    val kindMatches = allowedKinds.isEmpty() || kind in allowedKinds
+    val isConsumed = ConsumptionStatus.CONSUMED in statuses
+    val consumedMatches = rule.consumed == null || isConsumed == rule.consumed
+    val statusMatches = requiredStatus.isEmpty() || requiredStatus.all { it in statuses }
+    val yearMatches = rule.releaseYear == null || releaseYear == rule.releaseYear
+    val creatorNeedle = (rule.creator ?: rule.creatorContains)?.trim()?.takeIf { it.isNotEmpty() }
     val creatorMatches =
-        rule.creator.isNullOrBlank() ||
-            entry.creators.any { it.contains(rule.creator, ignoreCase = true) }
-    return kindMatches && consumedMatches && creatorMatches
+        creatorNeedle == null || creators.any { it.contains(creatorNeedle, ignoreCase = true) }
+    return kindMatches && consumedMatches && statusMatches && yearMatches && creatorMatches
+}
+
+private fun parseRuleTargetKinds(rule: DynamicCollectionRuleDto): Set<EntryKind>? {
+    val result = LinkedHashSet<EntryKind>()
+    if (!rule.kind.isNullOrBlank()) {
+        val parsed = EntryKind.fromWireValueOrNull(rule.kind) ?: return null
+        result.add(parsed)
+    }
+    for (rawKind in rule.kinds) {
+        if (rawKind.isBlank()) continue
+        val parsed = EntryKind.fromWireValueOrNull(rawKind) ?: return null
+        result.add(parsed)
+    }
+    return result
+}
+
+private fun parseRuleTargetStatus(rule: DynamicCollectionRuleDto): Set<ConsumptionStatus>? {
+    val rawStatus = rule.status?.trim()?.takeIf { it.isNotEmpty() } ?: return emptySet()
+    val parsed = ConsumptionStatus.fromWireValueOrNull(rawStatus) ?: return null
+    return setOf(parsed)
 }
 
 @Suppress("LongParameterList")
-private fun rankCollectionMembers(
-    collectionId: String,
+internal fun rankEntriesByOrderings(
+    entries: List<CatalogEntryItem>,
     isPriorityScoped: Boolean,
-    memberIds: List<String>,
-    domainEntries: Map<String, CatalogEntryItem>,
-    logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
-    globalScores: Map<String, EpRankingEngine.Score>,
-    allComparisons: List<ComparisonEntity>,
+    orderings: List<List<List<String>>>,
+    precomputedGlobalScores: Map<String, EpRankingEngine.Score>? = null,
+    logsByEntryId: Map<String, List<ConsumptionLogEntity>> = emptyMap(),
 ): List<RankedCatalogEntry> {
-    if (memberIds.isEmpty()) return emptyList()
+    if (entries.isEmpty()) return emptyList()
+    val memberIds = entries.map { it.id }
+    val memberSet = memberIds.toHashSet()
+    val relevantComparisonCount = orderings.count { ord ->
+        ord.any { group -> group.any { it in memberSet } }
+    }
     val localScores =
-        if (isPriorityScoped) {
-            val scopedOrderings =
-                allComparisons
-                    .filter { it.scopeCollectionId == collectionId }
-                    .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
-            EpRankingEngine.inferScores(memberIds, scopedOrderings)
+        if (isPriorityScoped || precomputedGlobalScores == null) {
+            EpRankingEngine.inferScores(memberIds, orderings)
         } else {
-            memberIds.associateWith { globalScores[it] ?: EpRankingEngine.Score() }
+            memberIds.associateWith { precomputedGlobalScores[it] ?: EpRankingEngine.Score() }
         }
-    val orderedIds = EpRankingEngine.rankIdsByScore(memberIds, localScores)
+    val sortedEntries = sortEntriesByScoreAndTitle(entries, localScores)
     val quantiles =
-        if (isPriorityScoped) {
-            emptyMap()
-        } else {
+        if (!isPriorityScoped && relevantComparisonCount > 0) {
             EpRankingEngine.rescaleToQuantiles(localScores)
+        } else {
+            emptyMap()
         }
     val minMean = localScores.values.minOfOrNull { it.mean } ?: 0.0
     val maxMean = localScores.values.maxOfOrNull { it.mean } ?: 0.0
-    return orderedIds.mapIndexedNotNull { idx, id ->
-        domainEntries[id]?.let { domain ->
-            val score = localScores[id] ?: EpRankingEngine.Score()
-            val latestLog = logsByEntryId[id]?.firstOrNull()
-            val tier =
-                if (isPriorityScoped) {
-                    null
-                } else {
-                    quantiles[id]?.let(EpRankingEngine::tierLabel)
-                }
-            RankedCatalogEntry(
-                entry = domain,
-                rank = idx + 1,
-                mean = score.mean,
-                variance = score.variance,
-                scoreOutOfTen = EpRankingEngine.displayScoreOutOfTen(score.mean, minMean, maxMean),
-                tier = tier,
-                latestStatus = latestLog?.let { ConsumptionStatus.fromWireValue(it.status) },
-                latestNotes = latestLog?.notes?.takeIf { it.isNotBlank() },
-            )
+    return sortedEntries.mapIndexed { idx, domain ->
+        val score = localScores[domain.id] ?: EpRankingEngine.Score()
+        val latestLog = logsByEntryId[domain.id]?.firstOrNull()
+        RankedCatalogEntry(
+            entry = domain,
+            rank = idx + 1,
+            mean = score.mean,
+            variance = score.variance,
+            scoreOutOfTen = EpRankingEngine.displayScoreOutOfTen(score.mean, minMean, maxMean),
+            tier = quantiles[domain.id]?.let(EpRankingEngine::tierLabel),
+            latestStatus = latestLog?.let { ConsumptionStatus.fromWireValue(it.status) },
+            latestNotes = latestLog?.notes?.takeIf { it.isNotBlank() },
+        )
+    }
+}
+
+internal fun sortEntriesByScoreAndTitle(
+    entries: List<CatalogEntryItem>,
+    scores: Map<String, EpRankingEngine.Score>,
+): List<CatalogEntryItem> {
+    val sorted = entries.sortedWith(scoreAndTitleComparator(scores)).toMutableList()
+    normalizeTieGroupsInPlace(sorted, scores)
+    return sorted
+}
+
+private fun scoreAndTitleComparator(
+    scores: Map<String, EpRankingEngine.Score>
+): Comparator<CatalogEntryItem> = Comparator { a, b ->
+    val ma = (scores[a.id] ?: EpRankingEngine.Score()).mean
+    val mb = (scores[b.id] ?: EpRankingEngine.Score()).mean
+    val meanCmp = mb.compareTo(ma)
+    if (meanCmp != 0) {
+        meanCmp
+    } else {
+        val titleCmp = a.title.lowercase().compareTo(b.title.lowercase())
+        if (titleCmp != 0) titleCmp else a.id.compareTo(b.id)
+    }
+}
+
+private fun normalizeTieGroupsInPlace(
+    sorted: MutableList<CatalogEntryItem>,
+    scores: Map<String, EpRankingEngine.Score>,
+) {
+    val tieComparator = compareBy<CatalogEntryItem> { it.title.lowercase() }.thenBy { it.id }
+    var tieStart = 0
+    while (tieStart < sorted.size) {
+        val baseMean = (scores[sorted[tieStart].id] ?: EpRankingEngine.Score()).mean
+        var tieEnd = tieStart + 1
+        while (
+            tieEnd < sorted.size &&
+                abs((scores[sorted[tieEnd].id] ?: EpRankingEngine.Score()).mean - baseMean) <=
+                    EpRankingEngine.MEAN_TIE_EPSILON
+        ) {
+            tieEnd += 1
         }
+        if (tieEnd - tieStart > 1) {
+            sorted.subList(tieStart, tieEnd).sortWith(tieComparator)
+        }
+        tieStart = tieEnd
     }
 }
 
@@ -334,10 +435,16 @@ private fun computePerKindGlobalTiers(
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
     globalScores: Map<String, EpRankingEngine.Score>,
+    globalOrderings: List<List<List<String>>>,
 ): Map<String, Char> {
     val tiers = HashMap<String, Char>()
     val byKind = consumedIds.mapNotNull { domainEntries[it] }.groupBy { it.kind }
     for ((_, entries) in byKind) {
+        val idSet = entries.map { it.id }.toHashSet()
+        val hasComparisons = globalOrderings.any { ord ->
+            ord.any { group -> group.any { it in idSet } }
+        }
+        if (!hasComparisons) continue
         val kindScores = entries.associate { entry ->
             entry.id to (globalScores[entry.id] ?: EpRankingEngine.Score())
         }
@@ -447,7 +554,10 @@ internal fun toDailyAlbumSnapshot(
         qobuzId = identsByScheme["qobuz"],
         deezerId = identsByScheme["deezer"],
         amazonMusicId = identsByScheme["amazon_music"],
-        wikipediaUrl = sanitizeHttpUrl(identsByScheme["wikipedia"]),
+        wikipediaUrl =
+            identsByScheme["wikipedia"]
+                ?.let { externalIdentifierUrl("wikipedia", it) }
+                ?.let(::sanitizeHttpUrl),
     )
 }
 
@@ -504,38 +614,6 @@ internal fun decodeComparisonOrdering(rawJson: String): List<List<String>>? = ru
     .getOrNull()
     ?.takeIf { EpRankingEngine.validateOrdering(it).isSuccess }
 
-internal fun stripAlbumEditionSuffix(rawTitle: String): String {
-    var current = rawTitle.trim()
-    while (true) {
-        val next = stripBracketEditionOnce(current) ?: stripDashEditionOnce(current) ?: break
-        current = next
-    }
-    return current.ifEmpty { rawTitle.trim() }
-}
-
-private fun stripBracketEditionOnce(current: String): String? {
-    for ((openCh, closeCh) in EDITION_BRACKET_PAIRS) {
-        if (!current.endsWith(closeCh)) continue
-        val idx = current.lastIndexOf(openCh)
-        if (idx > 0 && hasEditionKeyword(current.substring(idx + 1, current.length - 1))) {
-            return current.substring(0, idx).trim()
-        }
-    }
-    return null
-}
-
-private fun stripDashEditionOnce(current: String): String? {
-    val dashIdx = current.lastIndexOf(" - ")
-    if (dashIdx <= 0) return null
-    val suffix = current.substring(dashIdx + 3)
-    return if (hasEditionKeyword(suffix)) current.substring(0, dashIdx).trim() else null
-}
-
-private fun hasEditionKeyword(fragment: String): Boolean {
-    val lower = fragment.lowercase()
-    return EDITION_KEYWORDS.any { lower.contains(it) }
-}
-
 internal fun loadBundled1001Albums(
     poolStreamProvider: (() -> InputStream?)? = null
 ): List<BundledAlbumPoolItem> {
@@ -580,22 +658,3 @@ private const val MONTH_PREFIX_LEN = 7
 private const val DATE_PREFIX_LEN = 10
 private val DIARY_MONTH_FMT = DateTimeFormatter.ofPattern("yyyy-MM", Locale.US)
 private val DIARY_DAY_FMT = DateTimeFormatter.ofPattern("MMM d", Locale.US)
-private val EDITION_BRACKET_PAIRS = listOf('(' to ')', '[' to ']')
-private val EDITION_KEYWORDS =
-    listOf(
-        "deluxe",
-        "standard",
-        "remaster",
-        "remastered",
-        "expanded",
-        "special",
-        "limited",
-        "anniversary",
-        "bonus",
-        "edition",
-        "version",
-        "reissue",
-        "explicit",
-        "clean",
-        "remasters",
-    )

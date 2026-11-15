@@ -33,6 +33,8 @@ data class FeedEntity(
             Index(value = ["contentType"]),
             Index(value = ["isFavorite"]),
             Index(value = ["publishedAt", "createdAt"]),
+            Index(value = ["interactionUpdatedAt"]),
+            Index(value = ["createdAt"]),
         ],
 )
 data class ItemEntity(
@@ -218,7 +220,7 @@ data class CollectionSpecEntity(
 @Entity(
     tableName = "collection_entries",
     primaryKeys = ["collectionId", "entryId"],
-    indices = [Index(value = ["entryId"])],
+    indices = [Index(value = ["entryId"]), Index(value = ["addedAt"])],
 )
 data class CollectionEntryEntity(
     val collectionId: String,
@@ -244,6 +246,7 @@ data class CollectionGeneratorEntity(
         [
             Index(value = ["entryId"]),
             Index(value = ["ts"]),
+            Index(value = ["createdAt"]),
         ],
 )
 data class ConsumptionLogEntity(
@@ -262,6 +265,7 @@ data class ConsumptionLogEntity(
         [
             Index(value = ["scopeCollectionId"]),
             Index(value = ["ts"]),
+            Index(value = ["createdAt"]),
         ],
 )
 data class ComparisonEntity(
@@ -271,4 +275,10 @@ data class ComparisonEntity(
     val orderingJson: String,
     val createdAt: String,
     val isLocalDirty: Boolean = false,
+)
+
+@Entity(tableName = "local_sync_flags")
+data class LocalSyncFlagEntity(
+    @PrimaryKey val flagKey: String,
+    val flagValue: String,
 )

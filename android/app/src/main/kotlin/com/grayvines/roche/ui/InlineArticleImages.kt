@@ -19,10 +19,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextLinkStyles
@@ -361,6 +363,7 @@ private fun RenderLoadingInlineImage(
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
+    val landscapePath = remember { Path() }
     val placeholderRatio = resolvePlaceholderAspectRatio(block.width, block.height)
     Column(
         modifier = Modifier.fillMaxWidth().testTag(READER_INLINE_IMAGE_TAG),
@@ -374,7 +377,9 @@ private fun RenderLoadingInlineImage(
                     .background(colors.surfaceElevated)
                     .border(width = 1.dp, color = colors.border, shape = shape)
         ) {
-            Canvas(modifier = Modifier.matchParentSize()) { drawArticleImagePlaceholder(colors) }
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawArticleImagePlaceholder(colors = colors, landscape = landscapePath)
+            }
         }
         if (!block.captionHtml.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
@@ -481,6 +486,7 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
             key1 = cleanUrl,
             key2 = loader,
         ) {
+            value = initialState
             if (value !is InlineImageLoadState.Success) {
                 val loaded = loader.loadInlineImage(cleanUrl)
                 value =

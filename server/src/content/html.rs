@@ -27,6 +27,9 @@ impl HtmlSanitizer {
     pub fn clean_with_base(html: &str, base_url: Option<&Url>) -> String {
         let mut builder = ammonia::Builder::default();
         builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
+        builder.set_tag_attribute_value("img", "referrerpolicy", "no-referrer");
+        builder.set_tag_attribute_value("img", "loading", "lazy");
+        builder.set_tag_attribute_value("img", "decoding", "async");
         if let Some(base) = base_url {
             builder.url_relative(ammonia::UrlRelative::RewriteWithBase(base.clone()));
         }

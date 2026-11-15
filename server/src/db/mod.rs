@@ -16,19 +16,26 @@ mod types;
 
 pub use auth::{AuthRepo, DeviceToken};
 pub use catalog::{
-    CatalogEntry, CatalogError, CatalogRepo, ClusterSelectFilter, CollectionSummary,
-    ComparisonRecord, ConsumptionLogView, EntryDetailView, EntryIdentifier, Generator1001State,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    CatalogEntry, CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionSummary,
+    ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule,
+    EntryDetailView, EntryIdentifier, Generator1001State, PREFERRED_IDENTIFIER_SCHEMES,
+    RankedCollectionView, RankedEntryRow, UpsertEntryInput, choose_deterministic_entry_id,
+    external_identifier_label, external_identifier_url, matches_dynamic_collection_rule,
+    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
+    strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
 pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
-pub use media::{Media, MediaRepo};
+pub use media::{Media, MediaRepo, NewMediaSpec};
 pub use sync::{
     ALBUMS_1001_COLLECTION_ID, ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier,
     PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID, SyncRepo,
-    UP_NEXT_COLLECTION_ID, compute_throughput_weight, should_peer_poll_feed,
+    UP_NEXT_COLLECTION_ID, canonical_ordering_json, canonicalize_sync_url,
+    collection_entry_natural_key, compute_throughput_weight, deterministic_comparison_id,
+    deterministic_consumption_log_id, deterministic_system_collection_id,
+    deterministic_title_entry_id, should_peer_poll_feed,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
@@ -36,6 +43,11 @@ pub use types::{
     ConsumptionStatus, ContentType, EntryKind, FeedType, HexColor, InboxState, ItemSortField,
     ItemStatus, ItemStatusFilter, MediaType, ReadAtPatch, SortOrder,
 };
+
+/// Domain conflict error mapped to `409 Conflict` by `ApiError`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ConflictError(pub String);
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -46,13 +58,21 @@ impl Db {
     /// Connects to the SQLite database at `database_path` and runs all embedded migrations.
     pub async fn connect(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
+        let file_path_for_perms = match path.to_str() {
+            Some(":memory:") => None,
+            Some(s) if s.starts_with("sqlite:") => None,
+            _ => Some(path),
+        };
         let base_options = match path.to_str() {
             Some(s) if s.starts_with("sqlite:") => SqliteConnectOptions::from_str(s)?,
             _ => {
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    tokio::fs::create_dir_all(parent).await?;
+                if let Some(file_path) = file_path_for_perms {
+                    if let Some(parent) = file_path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        crate::media::MediaStore::ensure_private_dir(parent).await?;
+                    }
+                    crate::media::MediaStore::precreate_or_tighten_private_file(file_path).await?;
                 }
                 SqliteConnectOptions::new().filename(path)
             }
@@ -68,7 +88,11 @@ impl Db {
         let pool =
             SqlitePoolOptions::new().max_connections(5).connect_with(connect_options).await?;
 
+        prepare_pre_v010_schema_if_needed(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        if let Some(file_path) = file_path_for_perms {
+            tighten_sqlite_sidecar_permissions(file_path).await;
+        }
 
         let db = Self { pool };
         db.run_startup_maintenance().await;
@@ -80,6 +104,7 @@ impl Db {
     async fn run_startup_maintenance(&self) {
         const NORMALIZE_SUMMARIES_TASK: &str = "normalize_legacy_html_summaries";
         const BACKFILL_THUMBNAILS_TASK: &str = "backfill_missing_thumbnails";
+        const CANONICALIZE_URL_IDENTIFIERS_TASK: &str = "canonicalize_entry_url_identifiers";
 
         self.run_maintenance_task_once(NORMALIZE_SUMMARIES_TASK, async {
             self.items().normalize_legacy_html_summaries().await.map(|_| ())
@@ -89,6 +114,81 @@ impl Db {
             self.items().backfill_missing_thumbnails().await.map(|_| ())
         })
         .await;
+        self.run_maintenance_task_once(CANONICALIZE_URL_IDENTIFIERS_TASK, async {
+            self.canonicalize_entry_url_identifiers().await
+        })
+        .await;
+    }
+
+    async fn canonicalize_entry_url_identifiers(&self) -> Result<()> {
+        let entry_urls: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, url FROM entries
+             WHERE url IS NOT NULL AND TRIM(url) != '' AND merged_into_id IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let feed_urls: Vec<(String, String)> = sqlx::query_as(
+            "SELECT collection_id, feed_url FROM feed_sources WHERE TRIM(feed_url) != ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tx = self.pool.begin().await?;
+        for (entry_id, raw_url) in entry_urls {
+            let canon = sync::canonicalize_sync_url(&raw_url);
+            if canon.is_empty() {
+                continue;
+            }
+            let legacy_lower = raw_url.trim().to_lowercase();
+            if legacy_lower != canon {
+                sqlx::query(
+                    "DELETE FROM entry_identifiers
+                     WHERE entry_id = ? AND scheme = 'url' AND value = ?",
+                )
+                .bind(&entry_id)
+                .bind(&legacy_lower)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                 VALUES ('url', ?, ?)",
+            )
+            .bind(&canon)
+            .bind(&entry_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (collection_id, raw_feed_url) in feed_urls {
+            let canon = sync::canonicalize_sync_url(&raw_feed_url);
+            if canon.is_empty() {
+                continue;
+            }
+            let legacy_lower = raw_feed_url.trim().to_lowercase();
+            if legacy_lower != canon {
+                sqlx::query(
+                    "DELETE FROM entry_identifiers
+                     WHERE entry_id = ? AND scheme = 'feed_url' AND value = ?",
+                )
+                .bind(&collection_id)
+                .bind(&legacy_lower)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                 VALUES ('feed_url', ?, ?)",
+            )
+            .bind(&canon)
+            .bind(&collection_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn run_maintenance_task_once<Fut>(&self, task_name: &str, task: Fut)
@@ -186,6 +286,67 @@ impl Db {
     }
 }
 
+/// Deduplicates case-variant legacy `tags` (e.g. `"Systems"` + `"systems"`) on pre-v010 databases
+/// before `010_unified_entries_model.sql` migrates `tags` into `collection_specs(slug = 'tag:' || LOWER(TRIM(name)))`,
+/// preserving the committed `010` migration checksum while preventing `UNIQUE` slug crashes.
+pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Result<()> {
+    let has_legacy_tags: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if has_legacy_tags.is_none() {
+        return Ok(());
+    }
+
+    let raw_tags: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM tags ORDER BY created_at ASC, id ASC")
+            .fetch_all(pool)
+            .await?;
+    if raw_tags.len() < 2 {
+        return Ok(());
+    }
+
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    for (id, name) in raw_tags {
+        let key = name.trim().to_lowercase();
+        groups.entry(key).or_default().push((id, name));
+    }
+
+    let has_duplicates = groups.values().any(|g| g.len() > 1);
+    if !has_duplicates {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for (_, mut group) in groups {
+        if group.len() < 2 {
+            continue;
+        }
+        // Prefer deterministic tag ID if one of the rows already uses it; otherwise keep earliest.
+        group.sort_by_key(|(id, name)| usize::from(id != &sync::deterministic_tag_id(name)));
+        let survivor_id = &group[0].0;
+        for (dup_id, _) in &group[1..] {
+            sqlx::query(
+                "INSERT OR IGNORE INTO item_tags (item_id, tag_id)
+                 SELECT item_id, ? FROM item_tags WHERE tag_id = ?",
+            )
+            .bind(survivor_id)
+            .bind(dup_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM item_tags WHERE tag_id = ?")
+                .bind(dup_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tags WHERE id = ?").bind(dup_id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Verifies `entries_fts` integrity against `entries` + `entry_content` and rebuilds the FTS5 index when needed.
 ///
 /// Rebuilds automatically if implicit `rowid` compaction (e.g. from an external SQLite `VACUUM`
@@ -236,6 +397,15 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) async fn tighten_sqlite_sidecar_permissions(db_path: &Path) {
+    crate::media::MediaStore::tighten_private_file_if_exists(db_path).await;
+    for suffix in ["-wal", "-shm"] {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        crate::media::MediaStore::tighten_private_file_if_exists(Path::new(&os)).await;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -250,13 +420,13 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         let db_path = temp_dir.join("roche.db");
 
-        // 1. Initial connect creates maintenance_runs records for both startup tasks
+        // 1. Initial connect creates maintenance_runs records for all startup tasks
         let db1 = Db::connect(&db_path).await.unwrap();
         let recorded_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM maintenance_runs")
             .fetch_one(db1.pool())
             .await
             .unwrap();
-        assert_eq!(recorded_count, 2);
+        assert_eq!(recorded_count, 3);
 
         // Simulate a pre-009 database with unnormalized HTML summary and missing thumbnail
         let url1 = Url::parse("https://example.com/legacy-post").unwrap();
@@ -279,7 +449,7 @@ mod tests {
         db1.pool().close().await;
         drop(db1);
 
-        // 2. Reconnecting runs both tasks once and records completion timestamps
+        // 2. Reconnecting runs all tasks once and records completion timestamps
         let db2 = Db::connect(&db_path).await.unwrap();
         let normalized_item = db2.items().get(&item1.id).await.unwrap().unwrap();
         assert_eq!(normalized_item.summary.as_deref(), Some("Legacy & HTML summary"));
@@ -291,7 +461,7 @@ mod tests {
         .fetch_all(db2.pool())
         .await
         .unwrap();
-        assert_eq!(first_runs.len(), 2);
+        assert_eq!(first_runs.len(), 3);
 
         // Inject raw unnormalized state while maintenance_runs already marks both tasks completed
         let url2 = Url::parse("https://example.com/post-after-maint").unwrap();
@@ -501,21 +671,22 @@ mod tests {
 
         let rss_feed_id = crate::db::sync::deterministic_feed_id("https://blog.example.com/rss");
         let pod_feed_id =
-            crate::db::sync::deterministic_feed_id("https://pod.example.com/feed.xml");
+            crate::db::sync::deterministic_feed_id("https://pod.example.com/FeedCase.xml");
         let art_item_id = crate::db::sync::deterministic_item_id(
             Some("https://blog.example.com/rss"),
-            "https://blog.example.com/post-1",
+            "https://YouTube.com/watch?v=dQw4w9WgXcQ",
         );
         let pod_item_id = crate::db::sync::deterministic_item_id(
-            Some("https://pod.example.com/feed.xml"),
+            Some("https://pod.example.com/FeedCase.xml"),
             "https://pod.example.com/ep-1",
         );
         let tag_id = crate::db::sync::deterministic_tag_id("systems");
+        let dup_case_tag_id = "legacy-dup-tag-systems-upper";
 
         sqlx::query(
             "INSERT INTO feeds (id, url, title, feed_type, is_active)
              VALUES (?, 'https://blog.example.com/rss', 'Systems Blog', 'rss', 1),
-                    (?, 'https://pod.example.com/feed.xml', 'Systems Pod', 'rss', 1)",
+                    (?, 'https://pod.example.com/FeedCase.xml', 'Systems Pod', 'rss', 1)",
         )
         .bind(&rss_feed_id)
         .bind(&pod_feed_id)
@@ -528,7 +699,7 @@ mod tests {
                 (id, feed_id, title, url, author, summary, content_html, content_type,
                  status, is_favorite, read_progress, audio_url, duration)
              VALUES
-                (?, ?, 'Zero-Copy Parsing', 'https://blog.example.com/post-1', 'Alice',
+                (?, ?, 'Zero-Copy Parsing', 'https://YouTube.com/watch?v=dQw4w9WgXcQ', 'Alice',
                  'Fast parser design', '<p>Zero-copy body</p>', 'article',
                  'unread', 1, 0.75, NULL, NULL),
                 (?, ?, 'Episode 1: Consensus', 'https://pod.example.com/ep-1', 'Bob',
@@ -543,14 +714,21 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::query("INSERT INTO tags (id, name, color) VALUES (?, 'systems', '#336699')")
-            .bind(&tag_id)
-            .execute(&pre_pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO item_tags (item_id, tag_id) VALUES (?, ?)")
+        sqlx::query(
+            "INSERT INTO tags (id, name, color) VALUES
+                (?, 'systems', '#336699'),
+                (?, 'Systems', '#663399')",
+        )
+        .bind(&tag_id)
+        .bind(dup_case_tag_id)
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO item_tags (item_id, tag_id) VALUES (?, ?), (?, ?)")
             .bind(&art_item_id)
             .bind(&tag_id)
+            .bind(&pod_item_id)
+            .bind(dup_case_tag_id)
             .execute(&pre_pool)
             .await
             .unwrap();
@@ -563,7 +741,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Mark startup maintenance done so summary/thumbnail stays exact
+        // Mark legacy HTML/thumbnail maintenance done while allowing URL canonicalization to run
         sqlx::query(
             "INSERT INTO maintenance_runs (task_name, completed_at) VALUES
                 ('normalize_legacy_html_summaries', '2026-01-01T00:00:00Z'),
@@ -575,25 +753,41 @@ mod tests {
         pre_pool.close().await;
         drop(pre_pool);
 
-        // Now run full Db::connect which applies 010_unified_entries_model.sql!
+        // Now run full Db::connect which deduplicates case-variant tags, applies 010 + 011,
+        // and canonicalizes entry_identifiers URLs without lowercasing case-sensitive paths/queries!
         let db = Db::connect(&db_path).await.unwrap();
 
         let feeds = db.feeds().list().await.unwrap();
         assert_eq!(feeds.len(), 2);
 
-        // Verify podcast feed upgraded its entry kind to `podcast` and source_type to `podcast`
+        // Verify podcast feed upgraded its entry kind to `podcast` and preserved feed_url case in identifiers
         let pod_entry = db.catalog().get_entry(&pod_feed_id).await.unwrap().unwrap();
         assert_eq!(pod_entry.kind, EntryKind::Podcast);
+        assert!(pod_entry.identifiers.iter().any(|id| {
+            id.scheme == "feed_url" && id.value == "https://pod.example.com/FeedCase.xml"
+        }));
 
-        // Verify article item preserved favorite (Starred collection), progress, tag, and FTS
+        // Verify article item preserved favorite (Starred collection), progress, tag, FTS, and case-sensitive URL identifier
         let art = db.items().get(&art_item_id).await.unwrap().unwrap();
         assert!(art.is_favorite);
         assert_eq!(art.status, ItemStatus::Unread);
         assert!((art.read_progress - 0.75).abs() < 1e-6);
+        let art_entry = db.catalog().get_entry(&art_item_id).await.unwrap().unwrap();
+        assert!(art_entry.identifiers.iter().any(|id| {
+            id.scheme == "url" && id.value == "https://youtube.com/watch?v=dQw4w9WgXcQ"
+        }));
+        assert!(!art_entry.identifiers.iter().any(|id| {
+            id.scheme == "url" && id.value == "https://youtube.com/watch?v=dqw4w9wgxcq"
+        }));
 
         let item_tags = db.tags().list_for_item(&art_item_id).await.unwrap();
         assert_eq!(item_tags.len(), 1);
         assert_eq!(item_tags[0].name, "systems");
+
+        // Verify the item tagged with case-variant "Systems" was remapped to surviving "systems" tag
+        let pod_tags = db.tags().list_for_item(&pod_item_id).await.unwrap();
+        assert_eq!(pod_tags.len(), 1);
+        assert_eq!(pod_tags[0].id, tag_id);
 
         // Verify podcast episode preserved enclosure audio_url + duration + local cached media
         let ep = db.items().get(&pod_item_id).await.unwrap().unwrap();
@@ -615,6 +809,39 @@ mod tests {
             .unwrap();
         assert_eq!(search_res.items.len(), 1);
         assert_eq!(search_res.items[0].id, art_item_id);
+
+        db.pool().close().await;
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_db_connect_enforces_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-db-perms-test-{}", uuid::Uuid::new_v4()));
+        let data_dir = temp_dir.join("data");
+        tokio::fs::create_dir_all(&data_dir).await.unwrap();
+        tokio::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let db_path = data_dir.join("roche.db");
+        tokio::fs::write(&db_path, b"").await.unwrap();
+        tokio::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).await.unwrap();
+
+        let db = Db::connect(&db_path).await.unwrap();
+        let dir_mode = tokio::fs::metadata(&data_dir).await.unwrap().permissions().mode() & 0o777;
+        let db_mode = tokio::fs::metadata(&db_path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
+        let wal_path = data_dir.join("roche.db-wal");
+        if tokio::fs::try_exists(&wal_path).await.unwrap_or(false) {
+            let wal_mode =
+                tokio::fs::metadata(&wal_path).await.unwrap().permissions().mode() & 0o777;
+            assert_eq!(wal_mode, 0o600);
+        }
 
         db.pool().close().await;
         drop(db);

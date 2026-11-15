@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -22,6 +23,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -54,6 +56,7 @@ fun RefreshIcon(
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
 ) {
+    val arrowHead = remember { Path() }
     Canvas(modifier = modifier.size(size)) {
         val strokeWidth = this.size.minDimension * REFRESH_STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
@@ -70,13 +73,11 @@ fun RefreshIcon(
             size = Size(arcDiameter, arcDiameter),
             style = stroke,
         )
-        val arrowHead =
-            Path().apply {
-                moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
-                lineTo(w * REFRESH_ARROW_LEFT_X, h * REFRESH_ARROW_TIP_Y)
-                moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
-                lineTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TOP_Y)
-            }
+        arrowHead.rewind()
+        arrowHead.moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
+        arrowHead.lineTo(w * REFRESH_ARROW_LEFT_X, h * REFRESH_ARROW_TIP_Y)
+        arrowHead.moveTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TIP_Y)
+        arrowHead.lineTo(w * REFRESH_ARROW_TIP_X, h * REFRESH_ARROW_TOP_Y)
         drawPath(path = arrowHead, color = tint, style = stroke)
     }
 }
@@ -340,6 +341,7 @@ fun HeaderActionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     style: RocheButtonStyle = RocheButtonStyle.SECONDARY,
+    horizontalPadding: Dp = 14.dp,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
@@ -369,7 +371,7 @@ fun HeaderActionButton(
                 .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
                 .semantics { role = Role.Button }
-                .padding(horizontal = 14.dp),
+                .padding(horizontal = horizontalPadding),
     ) {
         Text(
             text = label,
@@ -377,6 +379,7 @@ fun HeaderActionButton(
             fontSize = 12.5.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -391,26 +394,29 @@ fun RocheIconActionButton(
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
-    val baseModifier =
+    val visualModifier =
         if (outlined) {
-            modifier
-                .size(36.dp)
+            Modifier.size(36.dp)
                 .clip(shape)
                 .background(colors.surfaceElevated)
                 .border(1.dp, colors.border, shape)
         } else {
-            modifier.size(36.dp).clip(shape)
+            Modifier.size(36.dp).clip(shape)
         }
 
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            baseModifier.clickable(onClick = onClick).semantics {
-                role = Role.Button
-                this.contentDescription = contentDescription
-            },
+            modifier
+                .defaultMinSize(minWidth = 40.dp, minHeight = 48.dp)
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    this.contentDescription = contentDescription
+                },
     ) {
-        content()
+        Box(contentAlignment = Alignment.Center, modifier = visualModifier) { content() }
     }
 }
 

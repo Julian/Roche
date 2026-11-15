@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum FeedType {
     #[default]
-    #[serde(alias = "podcast")]
     Rss,
+    Podcast,
     Youtube,
     Arxiv,
 }
@@ -49,8 +49,8 @@ impl From<Option<Option<DateTime<Utc>>>> for ReadAtPatch {
 pub enum ArchiveBatchScope {
     /// Archive specific non-archived item IDs, optionally restricted to a specific feed.
     Items { item_ids: Vec<String>, feed_id: Option<String> },
-    /// Archive all non-archived items (or only unread items with `read_at IS NULL`) in a specific feed.
-    Feed { feed_id: String, unread_only: bool },
+    /// Archive all non-archived items (`inbox_state = 'unread'`) in a specific feed.
+    Feed { feed_id: String },
     /// Archive all unread items (`status = 'unread' AND read_at IS NULL`) across all feeds.
     AllUnread,
 }
@@ -72,7 +72,7 @@ impl ArchiveBatchScope {
         if !valid_ids.is_empty() {
             Some(Self::Items { item_ids: valid_ids, feed_id: clean_feed_id })
         } else if let Some(fid) = clean_feed_id {
-            Some(Self::Feed { feed_id: fid, unread_only: all_unread })
+            Some(Self::Feed { feed_id: fid })
         } else if all_unread {
             Some(Self::AllUnread)
         } else {
@@ -476,10 +476,7 @@ mod tests {
         assert_eq!(all_unread.as_ref().and_then(ArchiveBatchScope::feed_id), None);
 
         let feed_unread = ArchiveBatchScope::from_request(&[], Some(" feed-1 "), true);
-        assert_eq!(
-            feed_unread,
-            Some(ArchiveBatchScope::Feed { feed_id: "feed-1".to_string(), unread_only: true })
-        );
+        assert_eq!(feed_unread, Some(ArchiveBatchScope::Feed { feed_id: "feed-1".to_string() }));
         assert_eq!(feed_unread.as_ref().and_then(ArchiveBatchScope::feed_id), Some("feed-1"));
 
         let items = ArchiveBatchScope::from_request(

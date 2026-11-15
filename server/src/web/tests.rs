@@ -120,13 +120,15 @@ async fn login_browser(db: &Db, app: &Router) -> (String, String) {
         .append_pair("pairing_code", &code)
         .append_pair("device_name", "Test Browser")
         .finish();
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
         .uri("/login")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("x-forwarded-proto", "https")
         .body(Body::from(body))
         .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)));
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
@@ -691,4 +693,163 @@ async fn test_web_filtered_inbox_batch_archive_unconsumed_focus_and_restart_csrf
     )
     .await;
     assert_eq!(post_after_restart.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn test_web_cache_control_tailscale_session_reuse_and_explicit_logout() {
+    let mut cfg = Config::default();
+    cfg.tailscale.enabled = true;
+    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_string()];
+    let (db, app) = setup_web_app(cfg).await;
+
+    // Static assets keep public caching, while HTML pages enforce `private, no-store`
+    let js_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/static/roche.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(js_resp.headers().get(header::CACHE_CONTROL).unwrap(), "public, max-age=3600");
+
+    let ts_get = |cookie_hdr: Option<String>| {
+        let mut builder =
+            Request::builder().uri("/").header("Tailscale-User-Login", "reader@example.ts.net");
+        if let Some(c) = cookie_hdr {
+            builder = builder.header(header::COOKIE, c);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51900)));
+        req
+    };
+
+    let r1 = app.clone().oneshot(ts_get(None)).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(r1.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+    let cookie1 =
+        extract_cookie_header(r1.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap());
+    let html1 =
+        String::from_utf8(to_bytes(r1.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    let csrf = extract_csrf_token(&html1);
+
+    // Second unauthenticated Tailscale GET reuses the cached session token instead of minting duplicates
+    let r2 = app.clone().oneshot(ts_get(None)).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let cookie2 =
+        extract_cookie_header(r2.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap());
+    assert_eq!(cookie1, cookie2);
+    assert_eq!(db.auth().list_devices().await.unwrap().len(), 1);
+
+    // Explicit POST /logout revokes the session AND sets `roche_logged_out=1`
+    let logout_resp = post_form(&app, "/logout", &cookie1, &[("_csrf", &csrf)]).await;
+    assert_eq!(logout_resp.status(), StatusCode::SEE_OTHER);
+    let set_cookies: Vec<String> = logout_resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| extract_cookie_header(v.to_str().unwrap()))
+        .collect();
+    assert!(set_cookies.iter().any(|c| c == "roche_logged_out=1"));
+
+    // With `roche_logged_out=1`, Tailscale auto-auth does NOT silently re-login on `GET /`
+    let after_logout =
+        app.clone().oneshot(ts_get(Some("roche_logged_out=1".to_string()))).await.unwrap();
+    assert_eq!(after_logout.status(), StatusCode::SEE_OTHER);
+    assert_eq!(after_logout.headers().get(header::LOCATION).unwrap(), "/login");
+
+    // Explicit `POST /login/tailscale` clears `roche_logged_out` and issues a fresh session
+    let mut ts_relogin = Request::builder()
+        .method("POST")
+        .uri("/login/tailscale")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("sec-fetch-site", "same-origin")
+        .header(header::COOKIE, "roche_logged_out=1")
+        .body(Body::empty())
+        .unwrap();
+    ts_relogin
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51901)));
+    let relogin_resp = app.clone().oneshot(ts_relogin).await.unwrap();
+    assert_eq!(relogin_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(relogin_resp.headers().get(header::LOCATION).unwrap(), "/");
+}
+
+#[tokio::test]
+async fn test_entry_detail_excludes_tag_and_feed_collections_from_rankings() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let feed_url = Url::parse("https://essays.example/rss").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("UniqueFeedTitle"), None).await.unwrap();
+    let art_url = Url::parse("https://essays.example/post-1").unwrap();
+    let art = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Tagged Essay",
+            url: &art_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    let tag = db.tags().create("UniqueTagBadge", None).await.unwrap();
+    db.tags().add_to_item(&art.id, &tag.id).await.unwrap();
+    db.catalog().log_consumption(&art.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+
+    let detail_resp = get_authed(&app, &format!("/entries/{}", art.id), &cookie).await;
+    assert_eq!(detail_resp.status(), StatusCode::OK);
+    let html =
+        String::from_utf8(to_bytes(detail_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    // Appears in system `Articles` ranking, never in `tag:` or `feed` collections!
+    assert!(html.contains(">Articles</a>"));
+    assert!(!html.contains(">UniqueTagBadge</a>"));
+}
+
+#[tokio::test]
+async fn test_web_csp_and_sanitized_reader_image_privacy_attributes() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let art_url = Url::parse("https://essays.example/with-image").unwrap();
+    let art = db
+        .items()
+        .create(&NewItem {
+            feed_id: None,
+            title: "Illustrated Essay",
+            url: &art_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT OR REPLACE INTO entry_content (entry_id, content_html) VALUES (?, ?)")
+        .bind(&art.id)
+        .bind("<p>Body with <img src=\"/fig1.png\" referrerpolicy=\"unsafe-url\"></p>")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let resp = get_authed(&app, &format!("/reader/{}", art.id), &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let csp = resp
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(csp.contains("default-src 'self'"));
+    assert!(csp.contains("script-src 'self'"));
+    assert!(csp.contains("frame-ancestors 'sameorigin'"));
+
+    let html =
+        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("src=\"https://essays.example/fig1.png\""));
+    assert!(html.contains("referrerpolicy=\"no-referrer\""));
+    assert!(html.contains("loading=\"lazy\""));
+    assert!(!html.contains("unsafe-url"));
 }

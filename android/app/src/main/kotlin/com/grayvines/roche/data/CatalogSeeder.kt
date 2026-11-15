@@ -43,29 +43,39 @@ internal class CatalogSeeder(
 
     private suspend fun seedSystemSpecs() {
         val existingSpecs = dao.getAllCollectionSpecs().associateBy { it.collectionId }
+        val existingEntryIds = dao.getAllCatalogEntries().map { it.id }.toHashSet()
         val specsToInsert = ArrayList<CollectionSpecEntity>()
         val identsToInsert = ArrayList<EntryIdentifierEntity>()
 
         collectManualSystemSpecs(existingSpecs, specsToInsert, identsToInsert)
         collectDynamicSystemSpecs(existingSpecs, specsToInsert, identsToInsert)
+        val missingCollectionEntries =
+            (existingSpecs.values + specsToInsert)
+                .filter { it.collectionId !in existingEntryIds }
+                .map(::buildCollectionCatalogEntry)
 
-        if (specsToInsert.isNotEmpty()) {
-            dao.upsertCollectionSpecs(specsToInsert)
-        }
-        if (identsToInsert.isNotEmpty()) {
-            dao.insertEntryIdentifiersIgnore(identsToInsert)
-        }
-        if (dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID) == null) {
-            dao.upsertCollectionGenerator(
-                CollectionGeneratorEntity(
-                    collectionId = ALBUMS_1001_COLLECTION_ID,
-                    enabled = false,
-                    currentEntryId = null,
-                    drawnAt = null,
-                    updatedAt = SEED_EPOCH_ISO,
-                    isLocalDirty = false,
+        dao.executeInTransaction {
+            if (specsToInsert.isNotEmpty()) {
+                dao.upsertCollectionSpecs(specsToInsert)
+            }
+            if (missingCollectionEntries.isNotEmpty()) {
+                dao.upsertCatalogEntries(missingCollectionEntries)
+            }
+            if (identsToInsert.isNotEmpty()) {
+                dao.insertEntryIdentifiersIgnore(identsToInsert)
+            }
+            if (dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID) == null) {
+                dao.upsertCollectionGenerator(
+                    CollectionGeneratorEntity(
+                        collectionId = ALBUMS_1001_COLLECTION_ID,
+                        enabled = false,
+                        currentEntryId = null,
+                        drawnAt = null,
+                        updatedAt = SEED_EPOCH_ISO,
+                        isLocalDirty = false,
+                    )
                 )
-            )
+            }
         }
     }
 
@@ -126,11 +136,15 @@ internal class CatalogSeeder(
     }
 
     private suspend fun seedBundled1001Pool(): Boolean {
-        if (dao.countCollectionEntries(ALBUMS_1001_COLLECTION_ID) >= MIN_SEEDED_1001_COUNT) {
+        val existingCount = dao.countCollectionEntries(ALBUMS_1001_COLLECTION_ID)
+        if (existingCount >= MIN_SEEDED_1001_COUNT) {
             return true
         }
         val bundled = loadBundled1001Albums(poolStreamProvider)
         if (bundled.isEmpty()) return false
+        if (existingCount >= bundled.size) {
+            return true
+        }
 
         val existingById = dao.getAllCatalogEntries().associateBy { it.id }
         val entries = ArrayList<CatalogEntryEntity>(bundled.size)
@@ -153,9 +167,11 @@ internal class CatalogSeeder(
             )
         }
 
-        entries.chunked(BATCH_CHUNK).forEach { dao.upsertCatalogEntries(it) }
-        idents.chunked(BATCH_CHUNK).forEach { dao.insertEntryIdentifiersIgnore(it) }
-        memberships.chunked(BATCH_CHUNK).forEach { dao.upsertCollectionEntries(it) }
+        dao.executeInTransaction {
+            entries.chunked(BATCH_CHUNK).forEach { dao.upsertCatalogEntries(it) }
+            idents.chunked(BATCH_CHUNK).forEach { dao.insertEntryIdentifiersIgnore(it) }
+            memberships.chunked(BATCH_CHUNK).forEach { dao.upsertCollectionEntries(it) }
+        }
         return true
     }
 
@@ -187,15 +203,17 @@ internal class CatalogSeeder(
         album: BundledAlbumPoolItem,
         idents: MutableList<EntryIdentifierEntity>,
     ) {
-        if (album.slug.isNotBlank()) {
-            idents.add(EntryIdentifierEntity("1001albums", album.slug.trim(), album.id))
+        val normSlug = normalizeIdentifierValue(EntryKind.ALBUM, "1001albums", album.slug)
+        if (normSlug.isNotEmpty()) {
+            idents.add(EntryIdentifierEntity("1001albums", normSlug, album.id))
         }
-        if (album.spotifyId.isNotBlank()) {
-            idents.add(EntryIdentifierEntity("spotify", album.spotifyId.trim(), album.id))
+        val normSpotify = normalizeIdentifierValue(EntryKind.ALBUM, "spotify", album.spotifyId)
+        if (normSpotify.isNotEmpty()) {
+            idents.add(EntryIdentifierEntity("spotify", normSpotify, album.id))
         }
     }
 }
 
 private const val SEED_EPOCH_ISO = "1970-01-01T00:00:00Z"
-private const val MIN_SEEDED_1001_COUNT = 1_000
+private const val MIN_SEEDED_1001_COUNT = 1_101
 private const val BATCH_CHUNK = 400

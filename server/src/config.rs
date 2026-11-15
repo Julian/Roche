@@ -83,6 +83,7 @@ pub struct MediaConfig {
     pub ytdlp_path: PathBuf,
     pub download_dir: PathBuf,
     pub max_concurrent_downloads: usize,
+    pub max_video_size_mb: u64,
 }
 
 impl Default for MediaConfig {
@@ -91,6 +92,7 @@ impl Default for MediaConfig {
             ytdlp_path: PathBuf::from("/usr/local/bin/yt-dlp"),
             download_dir: PathBuf::from("./data/media/downloads"),
             max_concurrent_downloads: 2,
+            max_video_size_mb: 500,
         }
     }
 }
@@ -126,7 +128,54 @@ pub struct TailscaleConfig {
     pub enabled: bool,
     pub tailscale_bin: PathBuf,
     pub advertise_service: Option<String>,
+    /// Allowlisted Tailscale login emails/handles permitted to sign into the Web UI automatically
+    /// via the `Tailscale-User-Login` header on loopback (`127.0.0.1` / `::1`) connections.
+    ///
+    /// Security boundary: keep empty (`[]`, the default) on multi-user hosts or behind any
+    /// reverse proxy other than `tailscale serve` that does not strip `Tailscale-User-Login`,
+    /// because any local process able to connect to loopback could otherwise forge that header.
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub auto_auth_users: Vec<String>,
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrVecVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a list of user logins or a comma-separated string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let trimmed = value.trim().trim_start_matches('[').trim_end_matches(']');
+            Ok(trimmed
+                .split(',')
+                .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_owned())
+                .filter(|s| !s.is_empty())
+                .collect())
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut items = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                items.push(elem);
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVecVisitor)
 }
 
 impl Default for TailscaleConfig {
@@ -189,6 +238,7 @@ impl Config {
                 "max_concurrent_downloads" | "media_max_concurrent_downloads" => {
                     "media.max_concurrent_downloads".into()
                 }
+                "max_video_size_mb" | "media_max_video_size_mb" => "media.max_video_size_mb".into(),
                 "op_log_prune_after" | "sync_op_log_prune_after" => {
                     "sync.op_log_prune_after".into()
                 }
@@ -269,6 +319,9 @@ impl Config {
         }
         if self.media.max_concurrent_downloads == 0 {
             anyhow::bail!("media.max_concurrent_downloads must be greater than 0");
+        }
+        if self.media.max_video_size_mb == 0 {
+            anyhow::bail!("media.max_video_size_mb must be greater than 0");
         }
         let norm_media = crate::media::MediaStore::normalize_lexical(&self.storage.media_dir);
         let norm_downloads = crate::media::MediaStore::normalize_lexical(&self.media.download_dir);
@@ -452,6 +505,16 @@ auto_auth_users = [" Alice@Example.com ", "", "bob@github", "alice@example.com"]
         let cfg = Config::from_toml_str(toml_str).unwrap();
         assert_eq!(
             cfg.tailscale.auto_auth_users,
+            vec!["alice@example.com".to_string(), "bob@github".to_string()]
+        );
+
+        let csv_env = Figment::new().merge((
+            "tailscale.auto_auth_users",
+            " Alice@Example.com , bob@github , alice@example.com ",
+        ));
+        let cfg_csv = Config::from_figment(&csv_env).unwrap();
+        assert_eq!(
+            cfg_csv.tailscale.auto_auth_users,
             vec!["alice@example.com".to_string(), "bob@github".to_string()]
         );
     }

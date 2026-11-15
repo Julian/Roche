@@ -584,12 +584,7 @@ internal fun buildPeerSyncRequestPayload(request: PeerSyncRequestDto): String =
 internal fun toPeerWireFeed(feed: FeedEntity): PeerSyncWireFeed =
     PeerSyncWireFeed(
         id = feed.id,
-        feedType =
-            if (feed.feedType.equals("podcast", ignoreCase = true)) {
-                DEFAULT_FEED_TYPE
-            } else {
-                feed.feedType
-            },
+        feedType = feed.feedType.trim().lowercase().ifBlank { DEFAULT_FEED_TYPE },
         url = feed.url,
         title = feed.title.nullIfBlank(),
         description = feed.description.nullIfBlank(),
@@ -640,33 +635,45 @@ internal fun toPeerWireTombstone(tomb: SyncTombstoneDto): PeerSyncWireTombstone 
         deletedAt = tomb.deletedAt,
     )
 
-internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto? = runCatching {
-    val wire = rocheJson.decodeFromString(PeerSyncWireResponse.serializer(), raw)
-    wire.serverPeerId.nullIfBlank()?.let { serverPeerId ->
-        PeerSyncResponseDto(
-            serverPeerId = serverPeerId,
-            syncTimestamp = wire.syncTimestamp.nullIfBlank().orEmpty(),
-            activePeers =
-                wire.activePeers.map { it.toPeerNodeDto() }.filter { it.peerId.isNotBlank() },
-            feeds = wire.feeds.map { it.toRemoteFeedDto() }.filter { it.id.isNotBlank() },
-            items = wire.items.map { it.toRemoteItemDto() }.filter { it.id.isNotBlank() },
-            tags = wire.tags.map { it.toRemoteTagDto() }.filter { it.id.isNotBlank() },
-            tombstones =
-                wire.tombstones
-                    .map { it.toSyncTombstoneDto() }
-                    .filter { it.entityType.isNotBlank() && it.naturalKey.isNotBlank() },
-            hasMore = wire.hasMore,
-            nextAfterItemId = wire.nextAfterItemId.nullIfBlank(),
-            collections = wire.collections,
-            catalogEntries = wire.catalogEntries,
-            collectionEntries = wire.collectionEntries,
-            collectionGenerators = wire.collectionGenerators,
-            consumptionLog = wire.consumptionLog,
-            comparisons = wire.comparisons,
-        )
+internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto {
+    val wire = runCatching {
+        rocheJson.decodeFromString(PeerSyncWireResponse.serializer(), raw)
     }
+        .getOrElse { err ->
+            throw ProblemDetailsException(
+                statusCode = 200,
+                title = "Invalid Peer Sync Payload",
+                detail = err.message ?: "Malformed JSON in /api/v1/sync/peer response",
+            )
+        }
+    val serverPeerId =
+        wire.serverPeerId.nullIfBlank()
+            ?: throw ProblemDetailsException(
+                statusCode = 200,
+                title = "Invalid Peer Sync Payload",
+                detail = "Missing server_peer_id in /api/v1/sync/peer response",
+            )
+    return PeerSyncResponseDto(
+        serverPeerId = serverPeerId,
+        syncTimestamp = wire.syncTimestamp.nullIfBlank().orEmpty(),
+        activePeers = wire.activePeers.map { it.toPeerNodeDto() }.filter { it.peerId.isNotBlank() },
+        feeds = wire.feeds.map { it.toRemoteFeedDto() }.filter { it.id.isNotBlank() },
+        items = wire.items.map { it.toRemoteItemDto() }.filter { it.id.isNotBlank() },
+        tags = wire.tags.map { it.toRemoteTagDto() }.filter { it.id.isNotBlank() },
+        tombstones =
+            wire.tombstones
+                .map { it.toSyncTombstoneDto() }
+                .filter { it.entityType.isNotBlank() && it.naturalKey.isNotBlank() },
+        hasMore = wire.hasMore,
+        nextAfterItemId = wire.nextAfterItemId.nullIfBlank(),
+        collections = wire.collections,
+        catalogEntries = wire.catalogEntries,
+        collectionEntries = wire.collectionEntries,
+        collectionGenerators = wire.collectionGenerators,
+        consumptionLog = wire.consumptionLog,
+        comparisons = wire.comparisons,
+    )
 }
-    .getOrNull()
 
 internal fun parseMediaJsonArray(raw: String): List<RemoteMediaDto> {
     val trimmed = raw.trimStart()

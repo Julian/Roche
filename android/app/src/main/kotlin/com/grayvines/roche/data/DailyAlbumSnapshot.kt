@@ -47,8 +47,13 @@ internal fun DailyAlbumSnapshot.candidateStreamingUrls(): List<String> = buildLi
     if (!youtubeMusicId.isNullOrBlank()) {
         add(youtubeMusicUrl)
     }
-    spotifyId?.trim()?.takeIf(String::isNotEmpty)?.let { id ->
-        add("https://open.spotify.com/album/${encodeQueryValue(id)}")
+    spotifyId?.trim()?.takeIf(String::isNotEmpty)?.let { raw ->
+        val parsed = extractSpotifyEntityAndId(raw)
+        if (parsed != null) {
+            add("https://open.spotify.com/${parsed.first}/${encodeQueryValue(parsed.second)}")
+        } else {
+            add("https://open.spotify.com/album/${encodeQueryValue(raw)}")
+        }
     }
     appleMusicId?.trim()?.takeIf(String::isNotEmpty)?.let { id ->
         add("https://music.apple.com/album/${encodeQueryValue(id)}")

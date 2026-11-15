@@ -152,8 +152,7 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
         focus_clean.into_iter().map(ToOwned::to_owned).collect()
     };
 
-    let mut cluster = if focus_missing_from_list || (focus_is_member && round >= MAX_FOCUSED_ROUNDS)
-    {
+    let cluster = if focus_missing_from_list || (focus_is_member && round >= MAX_FOCUSED_ROUNDS) {
         Vec::new()
     } else {
         let iter_idx = if q.random == Some(1) { 5 } else { round };
@@ -163,7 +162,13 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
             focus_ids,
             ..ClusterSelectFilter::default()
         };
-        match service.catalog().select_next_cluster(&slug, q.want, &filter).await {
+        match service
+            .catalog()
+            .select_next_uncovered_cluster(&slug, q.want, &filter, |cand| {
+                is_cluster_covered(cand, &covered_sets)
+            })
+            .await
+        {
             Ok((_, c, _)) => c,
             Err(err) => {
                 return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
@@ -171,35 +176,23 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
         }
     };
 
-    if !cluster.is_empty() && is_cluster_covered(&cluster, &covered_sets) {
-        if focus_clean.is_none() {
-            let retry_filter = ClusterSelectFilter {
-                max_k: 5,
-                iteration: 5, // triggers random seed fallback
-                ..ClusterSelectFilter::default()
-            };
-            if let Ok((_, alt, _)) =
-                service.catalog().select_next_cluster(&slug, q.want, &retry_filter).await
-                && !is_cluster_covered(&alt, &covered_sets)
-            {
-                cluster = alt;
-            } else {
-                cluster.clear();
-            }
-        } else {
-            cluster.clear();
-        }
-    }
-
+    let effective_want = q.want || ranked_view.is_priority_scope;
     let mut body = String::with_capacity(8_192);
     if cluster.len() < 2 {
-        render_settled_rank_view(&mut body, &slug, q.want, focus_clean, round, &ranked_view);
+        render_settled_rank_view(
+            &mut body,
+            &slug,
+            effective_want,
+            focus_clean,
+            round,
+            &ranked_view,
+        );
     } else {
         render_active_cluster_view(
             &mut body,
             &slug,
             &q,
-            round,
+            effective_want,
             &ranked_view.collection,
             &cluster,
             &session.csrf_token,
@@ -288,12 +281,13 @@ fn render_active_cluster_view(
     out: &mut String,
     slug: &str,
     q: &RankSessionQuery,
-    round: usize,
+    is_want: bool,
     collection: &CollectionSummary,
     cluster: &[CatalogEntry],
     csrf: &str,
 ) {
-    let mode_label = if q.want { "Local Queue Priority" } else { "Global Quality" };
+    let round = q.round.unwrap_or(0);
+    let mode_label = if is_want { "Local Queue Priority" } else { "Global Quality" };
     let _ = writeln!(
         out,
         "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
@@ -324,7 +318,7 @@ fn render_active_cluster_view(
            <ul class=\"rank-board js-rank-list\">\n",
         slug_enc = esc(&urlencode(slug)),
         csrf = esc(csrf),
-        want = if q.want { "true" } else { "false" },
+        want = if is_want { "true" } else { "false" },
         focus = esc(q.focus.as_deref().unwrap_or("")),
         covered = esc(&next_covered),
         ord_json = esc(&default_json),
@@ -356,7 +350,7 @@ fn render_active_cluster_view(
          </form>\n\
          <p class=\"rank-shortcuts\">Shortcuts: j/k select &middot; J/K move &middot; 1&ndash;{k} jump &middot; = tie &middot; t tie all &middot; s skip &middot; o open link &middot; Enter submit</p>\n",
         slug_enc = esc(&urlencode(slug)),
-        want = if q.want { "true" } else { "false" },
+        want = if is_want { "true" } else { "false" },
         focus = esc(q.focus.as_deref().unwrap_or("")),
         next_round = round + 1,
         covered = esc(&next_covered),
@@ -443,15 +437,21 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
         ));
     };
 
-    let scope_col_id = if want {
+    let (effective_want, scope_col_id) = if want {
         match service.catalog().get_or_create_want_collection(&slug).await {
-            Ok(col) => Some(col.id),
+            Ok(col) => (true, Some(col.id)),
             Err(err) => {
                 return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
             }
         }
     } else {
-        None
+        match service.catalog().get_ranked_collection(&slug, false).await {
+            Ok(view) if view.is_priority_scope => (true, Some(view.collection.id)),
+            Ok(_) => (false, None),
+            Err(err) => {
+                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
+            }
+        }
     };
 
     if let Err(err) =
@@ -461,7 +461,7 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
     }
 
     let mut query_parts = vec![format!("round={}", round + 1)];
-    if want {
+    if effective_want {
         query_parts.push("want=true".to_owned());
     }
     if let Some(fid) = focus {
@@ -511,30 +511,30 @@ fn parse_submitted_ordering(pairs: &[(String, String)]) -> Option<Vec<Vec<String
     None
 }
 
+fn short_cluster_token(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 fn cluster_signature(cluster: &[CatalogEntry]) -> String {
-    let mut ids: Vec<&str> = cluster.iter().map(|c| c.id.as_str()).collect();
-    ids.sort_unstable();
-    ids.iter().map(|id| &id[..id.len().min(8)]).collect::<Vec<_>>().join(".")
+    let mut tokens: Vec<String> = cluster.iter().map(|c| short_cluster_token(&c.id)).collect();
+    tokens.sort_unstable();
+    tokens.join(".")
 }
 
 fn parse_covered_signatures(raw: Option<&str>) -> Vec<HashSet<String>> {
-    raw.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.split('|')
-                .filter(|part| !part.is_empty())
-                .map(|part| part.split('.').map(ToOwned::to_owned).collect::<HashSet<_>>())
-                .collect()
-        })
-        .unwrap_or_default()
+    raw.map(str::trim).filter(|s| !s.is_empty()).map_or_default(|s| {
+        s.split('|')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.split('.').map(ToOwned::to_owned).collect::<HashSet<_>>())
+            .collect()
+    })
 }
 
 fn append_covered_signature(existing: Option<&str>, sig: &str) -> String {
     let mut list: Vec<&str> = existing
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.split('|').filter(|p| !p.is_empty()).collect())
-        .unwrap_or_default();
+        .map_or_default(|s| s.split('|').filter(|p| !p.is_empty()).collect());
     if !list.contains(&sig) {
         list.push(sig);
     }
@@ -548,6 +548,6 @@ fn is_cluster_covered(cluster: &[CatalogEntry], covered: &[HashSet<String>]) -> 
     if cluster.is_empty() || covered.is_empty() {
         return false;
     }
-    let prefixes: Vec<&str> = cluster.iter().map(|c| &c.id[..c.id.len().min(8)]).collect();
-    covered.iter().any(|prev| prefixes.iter().all(|p| prev.contains(*p)))
+    let prefixes: Vec<String> = cluster.iter().map(|c| short_cluster_token(&c.id)).collect();
+    covered.iter().any(|prev| prefixes.iter().all(|p| prev.contains(p)))
 }

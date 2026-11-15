@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -15,8 +15,8 @@ use super::{
 };
 use crate::{
     db::{
-        ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole, ConsumptionStatus,
-        EntryIdentifier, EntryKind, UpsertEntryInput,
+        ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
+        ConsumptionStatus, EntryIdentifier, EntryKind, UpsertEntryInput,
     },
     ranking::validate_ordering,
 };
@@ -125,6 +125,22 @@ pub struct PeerComparisonRecord {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+type OutgoingRawEntryRow = (
+    String,
+    EntryKind,
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<i32>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    DateTime<Utc>,
+    DateTime<Utc>,
+);
+
 impl SyncRepo<'_> {
     pub(super) const fn has_incoming_catalog_payload(
         collections: &[PeerCollectionSpecRecord],
@@ -153,7 +169,9 @@ impl SyncRepo<'_> {
         comparisons: &[PeerComparisonRecord],
         now: DateTime<Utc>,
     ) -> Result<()> {
-        // 1. Collections (`list` / `want` manual collections)
+        let mut collection_id_remap: HashMap<String, String> = HashMap::new();
+
+        // 1. Collections (`list` / `want` manual collections, guarding slug collisions)
         for col in collections {
             let title = col.title.trim();
             if title.is_empty() || matches!(col.role, CollectionRole::Feed | CollectionRole::Tag) {
@@ -164,7 +182,7 @@ impl SyncRepo<'_> {
             }
             let slug_opt =
                 col.slug.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
-            let col_id = if !col.collection_id.trim().is_empty() {
+            let requested_col_id = if !col.collection_id.trim().is_empty() {
                 col.collection_id.trim().to_owned()
             } else if let Some(ref s) = slug_opt {
                 if s.starts_with("want:") {
@@ -176,23 +194,35 @@ impl SyncRepo<'_> {
                 continue;
             };
 
-            // Skip if an existing non-manual or feed/tag collection owns this ID or slug
-            let existing_role: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
-                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ? OR (slug IS NOT NULL AND slug = ?) LIMIT 1",
+            let existing_spec: Option<(String, CollectionMode, CollectionRole)> = sqlx::query_as(
+                "SELECT collection_id, mode, collection_role
+                 FROM collection_specs
+                 WHERE collection_id = ? OR (slug IS NOT NULL AND LOWER(slug) = LOWER(?))
+                 ORDER BY CASE WHEN collection_id = ? THEN 0 ELSE 1 END ASC
+                 LIMIT 1",
             )
-            .bind(&col_id)
+            .bind(&requested_col_id)
             .bind(&slug_opt)
+            .bind(&requested_col_id)
             .fetch_optional(&mut *tx)
             .await?;
-            if let Some((ex_mode, ex_role)) = existing_role
-                && (ex_mode != CollectionMode::Manual
+
+            let target_col_id = if let Some((existing_col_id, ex_mode, ex_role)) = existing_spec {
+                if ex_mode != CollectionMode::Manual
                     || matches!(
                         ex_role,
                         CollectionRole::Feed | CollectionRole::Tag | CollectionRole::System
-                    ))
-            {
-                continue;
-            }
+                    )
+                {
+                    continue;
+                }
+                if existing_col_id != requested_col_id {
+                    collection_id_remap.insert(requested_col_id.clone(), existing_col_id.clone());
+                }
+                existing_col_id
+            } else {
+                requested_col_id
+            };
 
             let created = col.created_at.unwrap_or(now);
             let incoming_updated = col.updated_at.unwrap_or(now);
@@ -213,7 +243,7 @@ impl SyncRepo<'_> {
                         ELSE entries.updated_at
                     END",
             )
-            .bind(&col_id)
+            .bind(&target_col_id)
             .bind(title)
             .bind(col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()))
             .bind(created)
@@ -231,7 +261,7 @@ impl SyncRepo<'_> {
                     show_in_lists = excluded.show_in_lists,
                     color = COALESCE(excluded.color, collection_specs.color)",
             )
-            .bind(&col_id)
+            .bind(&target_col_id)
             .bind(&slug_opt)
             .bind(col.role)
             .bind(col.show_in_lists)
@@ -245,13 +275,13 @@ impl SyncRepo<'_> {
                      VALUES ('slug', ?, ?)",
                 )
                 .bind(s)
-                .bind(&col_id)
+                .bind(&target_col_id)
                 .execute(&mut *tx)
                 .await?;
             }
         }
 
-        // 2. Active catalog entries (non-merged first, then merge redirects)
+        // 2. Active catalog entries (non-merged first, then validated merge redirects)
         let mut pending_merges: Vec<(&PeerCatalogEntryRecord, String)> = Vec::new();
         for entry in catalog_entries {
             let title = entry.title.trim();
@@ -309,7 +339,6 @@ impl SyncRepo<'_> {
                     .await?;
             match existing_dup {
                 None => {
-                    // Insert lightweight tombstone redirect row
                     sqlx::query(
                         "INSERT INTO entries (id, kind, title, merged_into_id, created_at, updated_at)
                          VALUES (?, ?, ?, ?, ?, ?)",
@@ -324,16 +353,24 @@ impl SyncRepo<'_> {
                     .await?;
                 }
                 Some(None) => {
-                    CatalogRepo::fold_live_duplicate_in_tx(tx, dup_id, &canon_resolved, now)
-                        .await?;
+                    if CatalogRepo::validate_mergeable_specs_in_tx(tx, dup_id, &canon_resolved)
+                        .await
+                        .is_ok()
+                    {
+                        CatalogRepo::fold_live_duplicate_in_tx(tx, dup_id, &canon_resolved, now)
+                            .await?;
+                    }
                 }
                 Some(Some(_)) => {}
             }
         }
 
-        // 3. Collection memberships (`collection_entries`, respecting tombstones & mode)
+        // 3. Collection memberships (`collection_entries`, respecting tombstones, mode & cycle guard)
         for ce in collection_entries {
-            let Some(col_id) = CatalogRepo::follow_merged_id_in_tx(tx, &ce.collection_id).await?
+            let mapped_col_raw = collection_id_remap
+                .get(ce.collection_id.trim())
+                .map_or(ce.collection_id.as_str(), String::as_str);
+            let Some(col_id) = CatalogRepo::follow_merged_id_in_tx(tx, mapped_col_raw).await?
             else {
                 continue;
             };
@@ -354,6 +391,9 @@ impl SyncRepo<'_> {
                 && (mode != CollectionMode::Manual
                     || matches!(role, CollectionRole::Feed | CollectionRole::Tag))
             {
+                continue;
+            }
+            if CatalogRepo::would_introduce_collection_cycle_in_tx(tx, &col_id, &entry_id).await? {
                 continue;
             }
 
@@ -379,7 +419,8 @@ impl SyncRepo<'_> {
                  ON CONFLICT(collection_id, entry_id) DO UPDATE SET
                     position = COALESCE(excluded.position, collection_entries.position),
                     added_at = CASE
-                        WHEN excluded.position IS NOT NULL AND excluded.position IS NOT collection_entries.position
+                        WHEN strftime('%Y-%m-%dT%H:%M:%fZ', ?) > strftime('%Y-%m-%dT%H:%M:%fZ', collection_entries.added_at)
+                          OR (excluded.position IS NOT NULL AND excluded.position IS NOT collection_entries.position)
                         THEN excluded.added_at
                         ELSE collection_entries.added_at
                     END",
@@ -388,19 +429,20 @@ impl SyncRepo<'_> {
             .bind(&entry_id)
             .bind(ce.position)
             .bind(ingested_added_at)
+            .bind(ce.added_at)
             .execute(&mut *tx)
             .await?;
         }
 
-        // 4. Consumption Log (append-only + want-queue promotion + parent engagement)
+        // 4. Consumption Log (preserving custom/timestamped IDs & deduplicating auto-completion IDs)
         for log in consumption_log {
-            let Some(canon_entry) = CatalogRepo::follow_merged_id_in_tx(tx, &log.entry_id).await?
-            else {
+            if CatalogRepo::follow_merged_id_in_tx(tx, &log.entry_id).await?.is_none() {
                 continue;
-            };
-            let _ = CatalogRepo::log_consumption_in_tx(
+            }
+            let _ = CatalogRepo::log_consumption_with_id_in_tx(
                 tx,
-                &canon_entry,
+                &log.id,
+                &log.entry_id,
                 log.status,
                 log.notes.as_deref(),
                 log.ts,
@@ -409,16 +451,15 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        // 5. Comparisons (append-only, canonicalized through `merged_into_id`)
+        // 5. Comparisons (append-only, canonicalized through `merged_into_id` & `collection_id_remap`)
         for comp in comparisons {
-            let scope_id = match comp
-                .scope_collection_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
+            let raw_scope_opt =
+                comp.scope_collection_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let scope_id = match raw_scope_opt {
                 Some(raw_scope) => {
-                    let Some(resolved) = CatalogRepo::follow_merged_id_in_tx(tx, raw_scope).await?
+                    let remapped =
+                        collection_id_remap.get(raw_scope).map_or(raw_scope, String::as_str);
+                    let Some(resolved) = CatalogRepo::follow_merged_id_in_tx(tx, remapped).await?
                     else {
                         continue;
                     };
@@ -452,7 +493,9 @@ impl SyncRepo<'_> {
                 continue;
             }
             let ord_json = canonical_ordering_json(&resolved_groups);
-            let comp_id = if comp.id.trim().is_empty() {
+            let was_rewritten =
+                resolved_groups != comp.ordering || scope_id.as_deref() != raw_scope_opt;
+            let comp_id = if comp.id.trim().is_empty() || was_rewritten {
                 deterministic_comparison_id(
                     scope_id.as_deref(),
                     comp.ts.timestamp_millis(),
@@ -461,7 +504,7 @@ impl SyncRepo<'_> {
             } else {
                 comp.id.trim().to_owned()
             };
-            sqlx::query(
+            let res = sqlx::query(
                 "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
                  VALUES (?, ?, ?, ?, ?)",
             )
@@ -472,6 +515,16 @@ impl SyncRepo<'_> {
             .bind(now)
             .execute(&mut *tx)
             .await?;
+            if res.rows_affected() > 0 {
+                Self::record_activity(
+                    tx,
+                    ActivityEntityType::Comparison,
+                    &comp_id,
+                    ActivityAction::Create,
+                    now,
+                )
+                .await?;
+            }
         }
 
         // 6. Collection Generators (`1001_albums` LWW + never-revive-consumed-album invariant)
@@ -599,15 +652,20 @@ impl SyncRepo<'_> {
     #[allow(clippy::too_many_lines)]
     pub(super) async fn collect_outgoing_catalog(
         &self,
-        inclusive_since: Option<DateTime<Utc>>,
+        since_mode: super::activity::OutgoingSince,
     ) -> Result<(
-        Vec<PeerCollectionSpecRecord>,
-        Vec<PeerCatalogEntryRecord>,
-        Vec<PeerCollectionEntryRecord>,
-        Vec<PeerCollectionGeneratorRecord>,
-        Vec<PeerConsumptionLogRecord>,
-        Vec<PeerComparisonRecord>,
+        (
+            Vec<PeerCollectionSpecRecord>,
+            Vec<PeerCatalogEntryRecord>,
+            Vec<PeerCollectionEntryRecord>,
+            Vec<PeerCollectionGeneratorRecord>,
+            Vec<PeerConsumptionLogRecord>,
+            Vec<PeerComparisonRecord>,
+        ),
+        Option<DateTime<Utc>>,
     )> {
+        use super::activity::{OUTGOING_SYNC_ROW_CAP, OutgoingSince};
+
         type OutgoingCollectionRow = (
             String,
             String,
@@ -623,6 +681,37 @@ impl SyncRepo<'_> {
         );
         type OutgoingComparisonRow = (String, DateTime<Utc>, Option<String>, String, DateTime<Utc>);
 
+        let fetch_limit =
+            i64::try_from(OUTGOING_SYNC_ROW_CAP.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut min_trunc_ts: Option<DateTime<Utc>> = None;
+        let mut record_trunc = |ts: Option<DateTime<Utc>>| {
+            if let Some(t) = ts {
+                min_trunc_ts = Some(min_trunc_ts.map_or(t, |cur| cur.min(t)));
+            }
+        };
+        let push_since = |qb: &mut QueryBuilder<Sqlite>, col: &str, prefix_and: bool| {
+            let conj = if prefix_and { " AND " } else { " WHERE " };
+            match since_mode {
+                OutgoingSince::All => {}
+                OutgoingSince::Inclusive(ts) => {
+                    qb.push(conj)
+                        .push("strftime('%Y-%m-%dT%H:%M:%fZ', ")
+                        .push(col)
+                        .push(") >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
+                        .push_bind(ts)
+                        .push(")");
+                }
+                OutgoingSince::StrictlyAfter(ts) => {
+                    qb.push(conj)
+                        .push("strftime('%Y-%m-%dT%H:%M:%fZ', ")
+                        .push(col)
+                        .push(") > strftime('%Y-%m-%dT%H:%M:%fZ', ")
+                        .push_bind(ts)
+                        .push(")");
+                }
+            }
+        };
+
         // 1. User-created & want manual collections
         let mut collections_qb = QueryBuilder::<Sqlite>::new(
             "SELECT cs.collection_id, e.title, e.summary, cs.slug, cs.mode, cs.collection_role,
@@ -631,15 +720,15 @@ impl SyncRepo<'_> {
              JOIN entries e ON e.id = cs.collection_id
              WHERE e.merged_into_id IS NULL
                AND cs.mode = 'manual'
-               AND cs.collection_role IN ('list', 'want')",
+               AND (
+                   cs.collection_role = 'want'
+                   OR (cs.collection_role = 'list' AND cs.show_in_lists = 1)
+               )",
         );
-        if let Some(since) = inclusive_since {
-            collections_qb
-                .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', e.updated_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        }
-        collections_qb.push(" ORDER BY e.created_at ASC, cs.collection_id ASC");
+        push_since(&mut collections_qb, "e.updated_at", true);
+        collections_qb.push(
+            " ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) ASC, cs.collection_id ASC",
+        );
         let raw_cols: Vec<OutgoingCollectionRow> =
             collections_qb.build_query_as().fetch_all(self.pool).await?;
         let collections: Vec<PeerCollectionSpecRecord> = raw_cols
@@ -659,7 +748,84 @@ impl SyncRepo<'_> {
             })
             .collect();
 
-        // 2. Non-inbox, non-collection_specs catalog entries
+        // 2. Collection entries (excluding `1001_albums`, `starred`, `feed`, and `tag`)
+        let mut memberships_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at
+             FROM collection_entries ce
+             LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+             WHERE ce.collection_id != ",
+        );
+        memberships_qb
+            .push_bind(ALBUMS_1001_COLLECTION_ID)
+            .push(" AND ce.collection_id != ")
+            .push_bind(STARRED_COLLECTION_ID)
+            .push(" AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('feed', 'tag'))");
+        push_since(&mut memberships_qb, "ce.added_at", true);
+        memberships_qb
+            .push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ce.added_at) ASC, ce.collection_id ASC, ce.entry_id ASC LIMIT ")
+            .push_bind(fetch_limit);
+        let mut collection_entries: Vec<PeerCollectionEntryRecord> =
+            memberships_qb.build_query_as().fetch_all(self.pool).await?;
+        if collection_entries.len() > OUTGOING_SYNC_ROW_CAP {
+            collection_entries.truncate(OUTGOING_SYNC_ROW_CAP);
+            record_trunc(collection_entries.last().map(|r| r.added_at));
+        }
+
+        // 3. Collection generators (`1001_albums`)
+        let mut generators_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT collection_id, enabled, current_entry_id, drawn_at, updated_at
+             FROM collection_generators",
+        );
+        push_since(&mut generators_qb, "updated_at", false);
+        let collection_generators: Vec<PeerCollectionGeneratorRecord> =
+            generators_qb.build_query_as().fetch_all(self.pool).await?;
+
+        // 4. Consumption log
+        let mut logs_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT id, entry_id, ts, status, notes, created_at FROM consumption_log",
+        );
+        push_since(&mut logs_qb, "created_at", false);
+        logs_qb
+            .push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', created_at) ASC, id ASC LIMIT ")
+            .push_bind(fetch_limit);
+        let mut consumption_log: Vec<PeerConsumptionLogRecord> =
+            logs_qb.build_query_as().fetch_all(self.pool).await?;
+        if consumption_log.len() > OUTGOING_SYNC_ROW_CAP {
+            consumption_log.truncate(OUTGOING_SYNC_ROW_CAP);
+            record_trunc(consumption_log.last().and_then(|r| r.created_at));
+        }
+
+        // 5. Comparisons
+        let mut comparisons_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT id, ts, scope_collection_id, ordering_json, created_at FROM comparisons",
+        );
+        push_since(&mut comparisons_qb, "created_at", false);
+        comparisons_qb
+            .push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', created_at) ASC, id ASC LIMIT ")
+            .push_bind(fetch_limit);
+        let mut raw_cmps: Vec<OutgoingComparisonRow> =
+            comparisons_qb.build_query_as().fetch_all(self.pool).await?;
+        if raw_cmps.len() > OUTGOING_SYNC_ROW_CAP {
+            raw_cmps.truncate(OUTGOING_SYNC_ROW_CAP);
+            record_trunc(raw_cmps.last().map(|r| r.4));
+        }
+        let comparisons: Vec<PeerComparisonRecord> = raw_cmps
+            .into_iter()
+            .filter_map(|(id, ts, scope, ord_json, created)| {
+                let ordering: Vec<Vec<String>> = serde_json::from_str(&ord_json).ok()?;
+                Some(PeerComparisonRecord {
+                    id,
+                    ts,
+                    scope_collection_id: scope,
+                    ordering,
+                    created_at: Some(created),
+                })
+            })
+            .collect();
+
+        // 6. Non-collection_specs catalog entries + any entries referenced by outgoing
+        //    `collection_entries`, `collection_generators`, `consumption_log`, or `comparisons`
+        //    (even if they also have an inbox_state or older `updated_at`, preventing dangling FK/IDs!)
         let mut ent_qb = QueryBuilder::<Sqlite>::new(
             "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year,
                     e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, e.updated_at
@@ -672,51 +838,117 @@ impl SyncRepo<'_> {
                  SELECT 1 FROM collection_specs cs WHERE cs.collection_id = e.id
              )",
         );
-        if let Some(since) = inclusive_since {
-            ent_qb
-                .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', e.updated_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        } else {
-            // Omit untouched static 1001-album pool rows on initial sync unless active/logged/ranked/merged
-            ent_qb.push(
-                " AND (
-                    e.merged_into_id IS NOT NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM collection_entries ce_pool
-                        WHERE ce_pool.collection_id = ",
-            )
-            .push_bind(ALBUMS_1001_COLLECTION_ID)
-            .push(
-                " AND ce_pool.entry_id = e.id
+        match since_mode {
+            OutgoingSince::Inclusive(_) | OutgoingSince::StrictlyAfter(_) => {
+                push_since(&mut ent_qb, "e.updated_at", true);
+            }
+            OutgoingSince::All => {
+                // Omit untouched static 1001-album pool rows on initial sync unless active/logged/ranked/merged
+                ent_qb
+                    .push(
+                        " AND (
+                        e.merged_into_id IS NOT NULL
+                        OR NOT EXISTS (
+                            SELECT 1 FROM collection_entries ce_pool
+                            WHERE ce_pool.collection_id = ",
                     )
-                    OR EXISTS (SELECT 1 FROM consumption_log cl WHERE cl.entry_id = e.id)
-                    OR EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.current_entry_id = e.id)
-                    OR EXISTS (
-                        SELECT 1 FROM collection_entries ce_other
-                        WHERE ce_other.entry_id = e.id AND ce_other.collection_id != ",
-            )
-            .push_bind(ALBUMS_1001_COLLECTION_ID)
-            .push("))");
+                    .push_bind(ALBUMS_1001_COLLECTION_ID)
+                    .push(
+                        " AND ce_pool.entry_id = e.id
+                        )
+                        OR EXISTS (SELECT 1 FROM consumption_log cl WHERE cl.entry_id = e.id)
+                        OR EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.current_entry_id = e.id)
+                        OR EXISTS (
+                            SELECT 1 FROM collection_entries ce_other
+                            WHERE ce_other.entry_id = e.id AND ce_other.collection_id != ",
+                    )
+                    .push_bind(ALBUMS_1001_COLLECTION_ID)
+                    .push("))");
+            }
         }
-        ent_qb.push(" ORDER BY e.updated_at ASC, e.id ASC LIMIT 5000");
+        ent_qb
+            .push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', e.updated_at) ASC, e.id ASC LIMIT ")
+            .push_bind(fetch_limit);
 
-        #[allow(clippy::type_complexity)]
-        let raw_entries: Vec<(
-            String,
-            EntryKind,
-            String,
-            String,
-            Option<String>,
-            Option<DateTime<Utc>>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            String,
-            Option<String>,
-            DateTime<Utc>,
-            DateTime<Utc>,
-        )> = ent_qb.build_query_as().fetch_all(self.pool).await?;
+        let mut raw_entries: Vec<OutgoingRawEntryRow> =
+            ent_qb.build_query_as().fetch_all(self.pool).await?;
+        if raw_entries.len() > OUTGOING_SYNC_ROW_CAP {
+            raw_entries.truncate(OUTGOING_SYNC_ROW_CAP);
+            record_trunc(raw_entries.last().map(|r| r.12));
+        }
+
+        let mut present_ids: HashSet<String> = raw_entries.iter().map(|r| r.0.clone()).collect();
+        let mut referenced_ids: Vec<String> = Vec::new();
+        let mut seen_ref: HashSet<String> = HashSet::new();
+        let mut record_ref = |id: &str| {
+            if !id.is_empty() && !present_ids.contains(id) && seen_ref.insert(id.to_owned()) {
+                referenced_ids.push(id.to_owned());
+            }
+        };
+        for ce in &collection_entries {
+            record_ref(&ce.collection_id);
+            record_ref(&ce.entry_id);
+        }
+        for cg in &collection_generators {
+            if let Some(ref cur_id) = cg.current_entry_id {
+                record_ref(cur_id);
+            }
+        }
+        for log in &consumption_log {
+            record_ref(&log.entry_id);
+        }
+        for cmp in &comparisons {
+            if let Some(ref sc) = cmp.scope_collection_id {
+                record_ref(sc);
+            }
+            for grp in &cmp.ordering {
+                for id in grp {
+                    record_ref(id);
+                }
+            }
+        }
+        for row in &raw_entries {
+            if let Some(ref mid) = row.10 {
+                record_ref(mid);
+            }
+        }
+
+        let mut pending_refs = referenced_ids;
+        for _ in 0..4 {
+            if pending_refs.is_empty() {
+                break;
+            }
+            let mut next_hop_refs: Vec<String> = Vec::new();
+            for chunk in pending_refs.chunks(400) {
+                let mut rqb = QueryBuilder::<Sqlite>::new(
+                    "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year,
+                            e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, e.updated_at
+                     FROM entries e
+                     WHERE NOT EXISTS (SELECT 1 FROM collection_specs cs WHERE cs.collection_id = e.id)
+                       AND e.id IN (",
+                );
+                let mut sep = rqb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id.as_str());
+                }
+                sep.push_unseparated(")");
+                let extra_rows: Vec<OutgoingRawEntryRow> =
+                    rqb.build_query_as().fetch_all(self.pool).await?;
+                for row in extra_rows {
+                    if let Some(ref mid) = row.10
+                        && !mid.is_empty()
+                        && !present_ids.contains(mid)
+                        && seen_ref.insert(mid.clone())
+                    {
+                        next_hop_refs.push(mid.clone());
+                    }
+                    if present_ids.insert(row.0.clone()) {
+                        raw_entries.push(row);
+                    }
+                }
+            }
+            pending_refs = next_hop_refs;
+        }
 
         let entry_ids: Vec<&str> = raw_entries.iter().map(|r| r.0.as_str()).collect();
         let mut ident_map: BTreeMap<String, Vec<EntryIdentifier>> = BTreeMap::new();
@@ -764,91 +996,16 @@ impl SyncRepo<'_> {
             })
             .collect();
 
-        // 3. Collection entries (excluding `1001_albums`, `starred`, `feed`, and `tag`)
-        let mut memberships_qb = QueryBuilder::<Sqlite>::new(
-            "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at
-             FROM collection_entries ce
-             LEFT JOIN collection_specs cs ON cs.collection_id = ce.collection_id
-             WHERE ce.collection_id != ",
-        );
-        memberships_qb
-            .push_bind(ALBUMS_1001_COLLECTION_ID)
-            .push(" AND ce.collection_id != ")
-            .push_bind(STARRED_COLLECTION_ID)
-            .push(" AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('feed', 'tag'))");
-        if let Some(since) = inclusive_since {
-            memberships_qb
-                .push(" AND strftime('%Y-%m-%dT%H:%M:%fZ', ce.added_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        }
-        memberships_qb
-            .push(" ORDER BY ce.added_at ASC, ce.collection_id ASC, ce.entry_id ASC LIMIT 10000");
-        let collection_entries: Vec<PeerCollectionEntryRecord> =
-            memberships_qb.build_query_as().fetch_all(self.pool).await?;
-
-        // 4. Collection generators (`1001_albums`)
-        let mut generators_qb = QueryBuilder::<Sqlite>::new(
-            "SELECT collection_id, enabled, current_entry_id, drawn_at, updated_at
-             FROM collection_generators",
-        );
-        if let Some(since) = inclusive_since {
-            generators_qb
-                .push(" WHERE strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        }
-        let collection_generators: Vec<PeerCollectionGeneratorRecord> =
-            generators_qb.build_query_as().fetch_all(self.pool).await?;
-
-        // 5. Consumption log
-        let mut logs_qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, entry_id, ts, status, notes, created_at FROM consumption_log",
-        );
-        if let Some(since) = inclusive_since {
-            logs_qb
-                .push(" WHERE strftime('%Y-%m-%dT%H:%M:%fZ', created_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        }
-        logs_qb.push(" ORDER BY ts ASC, id ASC LIMIT 10000");
-        let consumption_log: Vec<PeerConsumptionLogRecord> =
-            logs_qb.build_query_as().fetch_all(self.pool).await?;
-
-        // 6. Comparisons
-        let mut comparisons_qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, ts, scope_collection_id, ordering_json, created_at FROM comparisons",
-        );
-        if let Some(since) = inclusive_since {
-            comparisons_qb
-                .push(" WHERE strftime('%Y-%m-%dT%H:%M:%fZ', created_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ")
-                .push_bind(since)
-                .push(")");
-        }
-        comparisons_qb.push(" ORDER BY ts ASC, id ASC LIMIT 10000");
-        let raw_cmps: Vec<OutgoingComparisonRow> =
-            comparisons_qb.build_query_as().fetch_all(self.pool).await?;
-        let comparisons: Vec<PeerComparisonRecord> = raw_cmps
-            .into_iter()
-            .filter_map(|(id, ts, scope, ord_json, created)| {
-                let ordering: Vec<Vec<String>> = serde_json::from_str(&ord_json).ok()?;
-                Some(PeerComparisonRecord {
-                    id,
-                    ts,
-                    scope_collection_id: scope,
-                    ordering,
-                    created_at: Some(created),
-                })
-            })
-            .collect();
-
         Ok((
-            collections,
-            catalog_entries,
-            collection_entries,
-            collection_generators,
-            consumption_log,
-            comparisons,
+            (
+                collections,
+                catalog_entries,
+                collection_entries,
+                collection_generators,
+                consumption_log,
+                comparisons,
+            ),
+            min_trunc_ts,
         ))
     }
 }

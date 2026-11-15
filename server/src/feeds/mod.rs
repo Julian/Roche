@@ -43,7 +43,7 @@ impl FeedSource {
                 FeedType::Youtube | FeedType::Rss => {
                     Ok((FeedType::Youtube, YouTubeParser::feed_url_for_channel_id(&channel_id)?))
                 }
-                FeedType::Arxiv => anyhow::bail!(
+                FeedType::Arxiv | FeedType::Podcast => anyhow::bail!(
                     "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
                 ),
             },
@@ -69,7 +69,7 @@ impl FeedSource {
                     Self::validate_arxiv_feed_url(&url)?;
                     Ok((FeedType::Arxiv, url))
                 }
-                FeedType::Rss => {
+                FeedType::Rss | FeedType::Podcast => {
                     if !url.as_str().contains("/feeds/videos.xml")
                         && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
                     {
@@ -85,7 +85,7 @@ impl FeedSource {
                         Self::validate_arxiv_feed_url(&url)?;
                         return Ok((FeedType::Arxiv, url));
                     }
-                    Ok((FeedType::Rss, url))
+                    Ok((requested_type, url))
                 }
             },
         }

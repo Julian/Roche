@@ -1785,6 +1785,7 @@ class MainViewModelTest {
 
     private class FakeAudioPlayerBackend : AudioPlayerBackend {
         var failNextLoad: Boolean = false
+        var lastSkipSilence: Boolean = false
         private var positionMs: Long = 0L
         private var durationMs: Long = 1_800_000L
         private var playing: Boolean = false
@@ -1799,6 +1800,7 @@ class MainViewModelTest {
             initialPositionMs: Long,
             fallbackDurationMs: Long,
             speed: Float,
+            skipSilenceEnabled: Boolean,
             playWhenReady: Boolean,
             onPrepared: (durationMs: Long) -> Unit,
             onCompletion: () -> Unit,
@@ -1812,6 +1814,7 @@ class MainViewModelTest {
             durationMs = fallbackDurationMs.takeIf { it > 0L } ?: 1_800_000L
             positionMs = initialPositionMs.coerceIn(0L, durationMs)
             this.speed = speed
+            this.lastSkipSilence = skipSilenceEnabled
             playing = playWhenReady
             onPrepared(durationMs)
         }
@@ -1830,6 +1833,10 @@ class MainViewModelTest {
 
         override fun setSpeed(speed: Float) {
             this.speed = speed
+        }
+
+        override fun setSkipSilence(enabled: Boolean) {
+            lastSkipSilence = enabled
         }
 
         override fun currentPositionMs(): Long = positionMs

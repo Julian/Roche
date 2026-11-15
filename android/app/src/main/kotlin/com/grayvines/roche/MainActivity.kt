@@ -9,6 +9,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -56,7 +57,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        PeerSyncScheduler.schedulePeriodicSync(this)
         if (savedInstanceState == null) {
             handleIncomingShareIntent(intent)
             viewModel.triggerStartupSyncIfConfigured()
@@ -65,6 +65,14 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
+            LaunchedEffect(state.isInitialLoading, state.settings.serverUrl) {
+                if (!state.isInitialLoading) {
+                    PeerSyncScheduler.schedulePeriodicSync(
+                        context = this@MainActivity,
+                        serverUrl = state.settings.serverUrl,
+                    )
+                }
+            }
             CompositionLocalProvider(LocalThumbnailLoader provides thumbnailLoader) {
                 RocheTheme(
                     themeMode = state.settings.themeMode,
@@ -78,7 +86,6 @@ class MainActivity : ComponentActivity() {
                         onOpenExternalUrl = ::openUrlInBrowser,
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
-                        onMoveTaskToBack = { moveTaskToBack(true) },
                         onOpenDailyAlbumInMusicApp = { album ->
                             openAlbumInMusicApp(this, album, ::openUrlInBrowser)
                         },

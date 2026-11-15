@@ -85,7 +85,12 @@ internal class PodcastPlaybackOrchestrator(
         completedEntryId: String,
     ) {
         val wasFullscreen = playerController.state.value.isFullscreenOpen
-        repository.updateReadProgress(itemId = completedEntryId, progress = 1.0)
+        repository.updateReadProgress(
+            itemId = completedEntryId,
+            progress = 1.0,
+            recordPlayedTimestamp = true,
+            syncRemote = true,
+        )
         repository.setArchiveStateWithSnapshot(itemId = completedEntryId, archived = true)
         settingsRepository.update { current ->
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == completedEntryId })
@@ -174,8 +179,9 @@ internal fun createManagedPlayerController(
     scope: CoroutineScope,
     repository: RocheRepository,
     settingsRepository: SettingsRepository,
-    playerBackend: AudioPlayerBackend = ResilientMediaPlayerBackend(),
+    playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
     mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
+    clockMs: () -> Long = System::currentTimeMillis,
 ): PodcastPlayerController {
     val orchestrator =
         PodcastPlaybackOrchestrator(
@@ -188,15 +194,7 @@ internal fun createManagedPlayerController(
             scope = scope,
             backend = playerBackend,
             mediaSessionBridge = mediaSessionBridge,
-            onProgressChanged = { entryId, progress ->
-                scope.launch {
-                    repository.updateReadProgress(
-                        itemId = entryId,
-                        progress = progress,
-                        recordPlayedTimestamp = true,
-                    )
-                }
-            },
+            onProgressSaved = buildProgressSaveHandler(scope, repository, clockMs),
             onEpisodeCompleted = { completedEntryId ->
                 controllerRef?.let { active ->
                     scope.launch {
@@ -226,3 +224,36 @@ internal fun createManagedPlayerController(
     controllerRef = controller
     return controller
 }
+
+private fun buildProgressSaveHandler(
+    scope: CoroutineScope,
+    repository: RocheRepository,
+    clockMs: () -> Long,
+): (String, Double, ProgressSaveReason) -> Unit {
+    var lastRemoteSyncEntryId: String? = null
+    var lastRemoteSyncEpochMs = 0L
+    return { entryId, progress, reason ->
+        val nowMs = clockMs()
+        val isPeriodic = reason == ProgressSaveReason.PERIODIC_TICK
+        val shouldSyncRemote =
+            !isPeriodic ||
+                lastRemoteSyncEntryId != entryId ||
+                nowMs - lastRemoteSyncEpochMs >= REMOTE_PROGRESS_SYNC_INTERVAL_MS
+        if (shouldSyncRemote) {
+            lastRemoteSyncEntryId = entryId
+            lastRemoteSyncEpochMs = nowMs
+        }
+        val shouldRecordPlayedAt =
+            reason == ProgressSaveReason.PAUSE || reason == ProgressSaveReason.FINISH
+        scope.launch {
+            repository.updateReadProgress(
+                itemId = entryId,
+                progress = progress,
+                recordPlayedTimestamp = shouldRecordPlayedAt,
+                syncRemote = shouldSyncRemote,
+            )
+        }
+    }
+}
+
+private const val REMOTE_PROGRESS_SYNC_INTERVAL_MS = 30_000L

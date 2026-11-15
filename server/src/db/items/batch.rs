@@ -1,0 +1,319 @@
+use std::collections::HashSet;
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use sqlx::QueryBuilder;
+use url::Url;
+
+use super::{ItemRepo, mutations::maybe_auto_log_feed_completion_in_tx};
+use crate::db::{
+    ActivityAction, ActivityEntityType, ArchiveBatchScope, EntryKind, InboxState, SyncRepo,
+};
+
+impl ItemRepo<'_> {
+    #[allow(clippy::too_many_lines)]
+    pub async fn archive_batch(&self, scope: &ArchiveBatchScope) -> Result<u64> {
+        const MAX_BATCH_IDS: usize = 5_000;
+        const CHUNK_SIZE: usize = 400;
+
+        let candidate_ids: Vec<String> = match scope {
+            ArchiveBatchScope::Items { item_ids, feed_id } => {
+                let mut unique_ids = Vec::new();
+                let mut seen = HashSet::new();
+                for raw_id in item_ids {
+                    let trimmed = raw_id.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed) {
+                        unique_ids.push(trimmed);
+                        if unique_ids.len() >= MAX_BATCH_IDS {
+                            break;
+                        }
+                    }
+                }
+                if unique_ids.is_empty() {
+                    return Ok(0);
+                }
+                let mut matched = Vec::new();
+                for chunk in unique_ids.chunks(CHUNK_SIZE) {
+                    let mut qb = QueryBuilder::new(
+                        "SELECT es.entry_id FROM entry_state es
+                         JOIN entries e ON e.id = es.entry_id
+                         WHERE e.merged_into_id IS NULL
+                           AND es.inbox_state = 'unread'
+                           AND es.entry_id IN (",
+                    );
+                    let mut sep = qb.separated(", ");
+                    for id in chunk {
+                        sep.push_bind(*id);
+                    }
+                    sep.push_unseparated(")");
+                    if let Some(fid) = feed_id.as_deref() {
+                        qb.push(
+                            " AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ",
+                        )
+                        .push_bind(fid)
+                        .push(")");
+                    }
+                    let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
+                    matched.extend(rows);
+                }
+                matched
+            }
+            ArchiveBatchScope::Feed { feed_id } => {
+                sqlx::query_scalar(
+                    "SELECT es.entry_id FROM entry_state es
+                     JOIN entries e ON e.id = es.entry_id
+                     WHERE e.merged_into_id IS NULL
+                       AND es.inbox_state = 'unread'
+                       AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ?)
+                     LIMIT ?",
+                )
+                .bind(feed_id.as_str())
+                .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+                .fetch_all(self.pool)
+                .await?
+            }
+            ArchiveBatchScope::AllUnread => {
+                sqlx::query_scalar(
+                    "SELECT es.entry_id FROM entry_state es
+                     JOIN entries e ON e.id = es.entry_id
+                     WHERE e.merged_into_id IS NULL
+                       AND es.inbox_state = 'unread'
+                     LIMIT ?",
+                )
+                .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
+                .fetch_all(self.pool)
+                .await?
+            }
+        };
+
+        if candidate_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+        let mut archived_ids = Vec::with_capacity(candidate_ids.len());
+
+        for chunk in candidate_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new(
+                "UPDATE entry_state SET inbox_state = 'dismissed', read_at = COALESCE(read_at, ",
+            );
+            qb.push_bind(now)
+                .push("), interaction_updated_at = ")
+                .push_bind(now)
+                .push(", updated_at = ")
+                .push_bind(now)
+                .push(" WHERE inbox_state = 'unread' AND entry_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.as_str());
+            }
+            sep.push_unseparated(") RETURNING entry_id");
+            let updated: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+            archived_ids.extend(updated);
+        }
+
+        for chunk in archived_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new("UPDATE entries SET updated_at = ");
+            qb.push_bind(now).push(" WHERE id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.as_str());
+            }
+            sep.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // Batch-archived items whose progress had already reached >= 0.9 are auto-logged,
+        // while unopened / skimmed bulk-archived items (progress < 0.9) never touch consumption_log.
+        for id in &archived_ids {
+            let row: Option<(EntryKind, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT e.kind, es.progress, es.read_at
+                 FROM entries e
+                 JOIN entry_state es ON es.entry_id = e.id
+                 WHERE e.id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((kind, prog, r_at)) = row
+                && prog >= 0.9
+            {
+                maybe_auto_log_feed_completion_in_tx(
+                    &mut tx,
+                    id,
+                    kind,
+                    InboxState::Dismissed,
+                    prog,
+                    r_at.unwrap_or(now),
+                )
+                .await?;
+            }
+        }
+
+        for chunk in archived_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new(
+                "INSERT INTO activity_log (entity_type, entity_id, action, timestamp) ",
+            );
+            qb.push_values(chunk, |mut b, id| {
+                b.push_bind(ActivityEntityType::Item)
+                    .push_bind(id.as_str())
+                    .push_bind(ActivityAction::Archive)
+                    .push_bind(now);
+            });
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(u64::try_from(archived_ids.len()).unwrap_or(u64::MAX))
+    }
+
+    pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
+        use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
+
+        let candidates: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT e.id, COALESCE(e.url, ''), e.summary
+             FROM entries e
+             LEFT JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.summary IS NOT NULL
+               AND (
+                 length(e.summary) > 320
+                 OR (
+                   (ec.content_html IS NULL OR ec.content_html = '' OR e.summary = ec.content_html)
+                   AND (e.summary LIKE '%<%' OR e.summary LIKE '%&%;%')
+                 )
+               )",
+        )
+        .fetch_all(self.pool)
+        .await?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let normalized: Vec<(String, String, Option<String>)> =
+            tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .filter_map(|(id, url_str, raw_summary)| {
+                        let excerpt =
+                            HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
+                        if excerpt == raw_summary {
+                            None
+                        } else {
+                            let base_url = Url::parse(&url_str).ok();
+                            let thumb = HtmlSanitizer::extract_first_image_url_with_base(
+                                &raw_summary,
+                                base_url.as_ref(),
+                            );
+                            Some((id, excerpt, thumb))
+                        }
+                    })
+                    .collect()
+            })
+            .await?;
+
+        if normalized.is_empty() {
+            return Ok(0);
+        }
+
+        let count = u64::try_from(normalized.len()).unwrap_or(0);
+        let mut tx = self.pool.begin().await?;
+        for (id, excerpt, thumb) in normalized {
+            sqlx::query(
+                "INSERT INTO entry_content (entry_id, content_html, content_type)
+                 SELECT id, summary, 'article' FROM entries WHERE id = ?
+                 ON CONFLICT(entry_id) DO UPDATE SET
+                     content_html = COALESCE(NULLIF(entry_content.content_html, ''), (SELECT summary FROM entries WHERE id = ?))",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE entries
+                 SET thumbnail_url = COALESCE(thumbnail_url, ?),
+                     summary = ?
+                 WHERE id = ?",
+            )
+            .bind(thumb)
+            .bind(&excerpt)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
+        use crate::{content::fetcher::HtmlSanitizer, feeds::youtube::YouTubeParser};
+
+        let candidates: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, COALESCE(e.url, ''), ec.content_html, e.thumbnail_url
+             FROM entries e
+             LEFT JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE (
+                 e.thumbnail_url IS NULL
+                 AND (
+                   (ec.content_html IS NOT NULL AND (ec.content_html LIKE '%<img%' OR ec.content_html LIKE '%<IMG%'))
+                   OR e.url LIKE '%youtube.com/%'
+                   OR e.url LIKE '%youtu.be/%'
+                 )
+               )
+               OR e.thumbnail_url LIKE '%.svg'
+               OR e.thumbnail_url LIKE '%.svg?%'
+               OR e.thumbnail_url LIKE '%/images/core/emoji/%'
+               OR e.thumbnail_url LIKE '%/wpcom-smileys/%'
+               OR e.thumbnail_url LIKE '%/twemoji/%'",
+        )
+        .fetch_all(self.pool)
+        .await?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let updates: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter_map(|(id, url_str, html_opt, old_thumb)| {
+                    let base_url = Url::parse(&url_str).ok();
+                    let new_thumb = html_opt
+                        .as_deref()
+                        .and_then(|html| {
+                            HtmlSanitizer::extract_first_image_url_with_base(
+                                html,
+                                base_url.as_ref(),
+                            )
+                        })
+                        .or_else(|| {
+                            base_url
+                                .as_ref()
+                                .and_then(YouTubeParser::extract_video_id)
+                                .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"))
+                        });
+                    (new_thumb != old_thumb).then_some((id, new_thumb))
+                })
+                .collect()
+        })
+        .await?;
+
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let count = u64::try_from(updates.len()).unwrap_or(0);
+        let mut tx = self.pool.begin().await?;
+        for (id, thumb) in updates {
+            sqlx::query("UPDATE entries SET thumbnail_url = ? WHERE id = ?")
+                .bind(thumb)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(count)
+    }
+}

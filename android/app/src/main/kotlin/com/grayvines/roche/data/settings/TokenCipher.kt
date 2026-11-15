@@ -81,9 +81,38 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
             }
     }
 
-    override fun encrypt(plaintext: String): String = delegate.encrypt(plaintext)
+    private fun invalidateCachedKey() {
+        synchronized(keystoreLock) { cachedSecretKey = null }
+    }
 
-    override fun decrypt(stored: String): String = delegate.decrypt(stored)
+    private fun resetCorruptedKeystoreKey() {
+        synchronized(keystoreLock) {
+            cachedSecretKey = null
+            runCatching {
+                val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE_PROVIDER).apply { load(null) }
+                if (keyStore.containsAlias(keyAlias)) {
+                    keyStore.deleteEntry(keyAlias)
+                }
+            }
+        }
+    }
+
+    override fun encrypt(plaintext: String): String = runCatching {
+        delegate.encrypt(plaintext)
+    }
+        .getOrElse {
+            resetCorruptedKeystoreKey()
+            delegate.encrypt(plaintext)
+        }
+
+    override fun decrypt(stored: String): String {
+        val firstAttempt = delegate.decrypt(stored)
+        if (firstAttempt.isNotEmpty() || !stored.startsWith(ENCRYPTED_TOKEN_PREFIX)) {
+            return firstAttempt
+        }
+        invalidateCachedKey()
+        return delegate.decrypt(stored)
+    }
 }
 
 internal fun createDefaultTokenCipher(): TokenCipher =

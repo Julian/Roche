@@ -2,8 +2,6 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.CatalogEntryEntity
-import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
@@ -18,9 +16,13 @@ import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -28,10 +30,12 @@ class CatalogStore(
     private val dao: RocheDao,
     poolStreamProvider: (() -> InputStream?)? = null,
     private val random: Random = Random.Default,
+    private val onLocalMutation: () -> Unit = {},
 ) {
     private val seeder = CatalogSeeder(dao = dao, poolStreamProvider = poolStreamProvider)
     private val mutationMutex = Mutex()
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     val snapshot: Flow<CatalogSnapshot> =
         combine(
                 combine(
@@ -39,60 +43,60 @@ class CatalogStore(
                     dao.observeEntryIdentifiers(),
                     dao.observeCollectionSpecs(),
                     dao.observeCollectionEntries(),
-                ) { entries, identifiers, specs, memberships ->
-                    PartialCatalogTables(entries, identifiers, specs, memberships)
+                ) { _, _, _, _ ->
+                    Unit
                 },
                 dao.observeCollectionGenerators(),
                 dao.observeConsumptionLogs(),
                 dao.observeComparisons(),
-            ) { partial, generators, logs, comparisons ->
-                buildCatalogSnapshot(
-                    RawCatalogTables(
-                        entries = partial.entries,
-                        identifiers = partial.identifiers,
-                        specs = partial.specs,
-                        memberships = partial.memberships,
-                        generators = generators,
-                        logs = logs,
-                        comparisons = comparisons,
-                    )
-                )
+            ) { _, _, _, _ ->
+                Unit
             }
+            .mapLatest { loadConsistentRawTables() }
+            .distinctUntilChanged()
+            .map(::buildCatalogSnapshot)
             .flowOn(Dispatchers.Default)
 
     suspend fun ensureSystemSeeded() = seeder.ensureSystemSeeded()
 
     suspend fun ensure1001PoolSeeded() = seeder.ensure1001PoolSeeded()
 
-    suspend fun setAlbumGeneratorEnabled(enabled: Boolean): DailyAlbumSnapshot? =
-        mutationMutex.withLock {
+    suspend fun setAlbumGeneratorEnabled(enabled: Boolean): DailyAlbumSnapshot? {
+        val result = mutationMutex.withLock {
             ensure1001PoolSeeded()
             val nowIso = nowUtcIso()
-            val current = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
-            var activeId =
-                current?.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
-            if (activeId != null && dao.countTerminalLogsForEntry(activeId) > 0) {
-                activeId = null
-            }
-            val drawnAt =
-                if (enabled && activeId == null) {
-                    activeId = drawRandomRemaining1001Id()
-                    activeId?.let { nowIso }
-                } else {
-                    current?.drawnAt
+            var drawnActiveId: String? = null
+            dao.executeInTransaction {
+                val current = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
+                var activeId =
+                    current?.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
+                if (activeId != null && dao.countTerminalLogsForEntry(activeId) > 0) {
+                    activeId = null
                 }
-            dao.upsertCollectionGenerator(
-                CollectionGeneratorEntity(
-                    collectionId = ALBUMS_1001_COLLECTION_ID,
-                    enabled = enabled,
-                    currentEntryId = activeId,
-                    drawnAt = drawnAt,
-                    updatedAt = nowIso,
-                    isLocalDirty = true,
+                val drawnAt =
+                    if (enabled && activeId == null) {
+                        activeId = drawRandomRemaining1001Id()
+                        activeId?.let { nowIso }
+                    } else {
+                        current?.drawnAt
+                    }
+                drawnActiveId = activeId
+                dao.upsertCollectionGenerator(
+                    CollectionGeneratorEntity(
+                        collectionId = ALBUMS_1001_COLLECTION_ID,
+                        enabled = enabled,
+                        currentEntryId = activeId,
+                        drawnAt = drawnAt,
+                        updatedAt = nowIso,
+                        isLocalDirty = true,
+                    )
                 )
-            )
-            activeId?.takeIf { enabled }?.let { resolveAlbumSnapshotById(it) }
+            }
+            drawnActiveId?.takeIf { enabled }?.let { resolveAlbumSnapshotById(it) }
         }
+        onLocalMutation()
+        return result
+    }
 
     suspend fun finishCurrent1001Album(notes: String? = null): Album1001StepResult =
         completeActive1001Album(status = ConsumptionStatus.CONSUMED, notes = notes)
@@ -103,219 +107,316 @@ class CatalogStore(
     private suspend fun completeActive1001Album(
         status: ConsumptionStatus,
         notes: String?,
-    ): Album1001StepResult = mutationMutex.withLock {
-        ensure1001PoolSeeded()
-        val gen =
-            dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
-                ?: error("1001 Albums generator not initialized")
-        val verb = if (status == ConsumptionStatus.CONSUMED) "finish" else "abandon"
-        val currentId =
-            gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
-                ?: error("No active 1001 album to $verb")
-        val nowIso = nowUtcIso()
-        appendConsumptionInDao(
-            dao = dao,
-            entryId = currentId,
-            status = status,
-            notes = notes,
-            tsIso = nowIso,
-            nowIso = nowIso,
-            markDirty = true,
-        )
-        val nextId =
-            advance1001GeneratorLocked(enabled = gen.enabled, nowIso = nowIso, markDirty = true)
-        Album1001StepResult(
-            entryId = currentId,
-            nextAlbum = nextId?.let { resolveAlbumSnapshotById(it) },
-        )
+    ): Album1001StepResult {
+        val result = mutationMutex.withLock {
+            ensure1001PoolSeeded()
+            val gen =
+                dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
+                    ?: error("1001 Albums generator not initialized")
+            val verb = if (status == ConsumptionStatus.CONSUMED) "finish" else "abandon"
+            val currentId =
+                gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
+                    ?: error("No active 1001 album to $verb")
+            val nowIso = nowUtcIso()
+            var nextId: String? = null
+            dao.executeInTransaction {
+                appendConsumptionInDao(
+                    dao = dao,
+                    entryId = currentId,
+                    status = status,
+                    notes = notes,
+                    tsIso = nowIso,
+                    nowIso = nowIso,
+                    markDirty = true,
+                )
+                nextId =
+                    advance1001GeneratorLocked(
+                        enabled = gen.enabled,
+                        nowIso = nowIso,
+                        markDirty = true,
+                    )
+            }
+            Album1001StepResult(
+                entryId = currentId,
+                nextAlbum = nextId?.let { resolveAlbumSnapshotById(it) },
+            )
+        }
+        onLocalMutation()
+        return result
     }
 
     suspend fun upsertEntry(
         input: UpsertCatalogEntryInput,
         markDirty: Boolean = true,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        upsertEntryInDao(dao = dao, input = input, nowIso = nowUtcIso(), markDirty = markDirty)
+    ): String {
+        val entryId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            var resolved = ""
+            dao.executeInTransaction {
+                resolved =
+                    upsertEntryInDao(
+                        dao = dao,
+                        input = input,
+                        nowIso = nowUtcIso(),
+                        markDirty = markDirty,
+                    )
+            }
+            resolved
+        }
+        if (markDirty) {
+            onLocalMutation()
+        }
+        return entryId
     }
 
     suspend fun logEntry(
         input: UpsertCatalogEntryInput,
         status: ConsumptionStatus,
         notes: String? = null,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        val nowIso = nowUtcIso()
-        val entryId = upsertEntryInDao(dao = dao, input = input, nowIso = nowIso, markDirty = true)
-        appendConsumptionInDao(
-            dao = dao,
-            entryId = entryId,
-            status = status,
-            notes = notes,
-            tsIso = nowIso,
-            nowIso = nowIso,
-            markDirty = true,
-        )
-        advance1001IfActiveLocked(entryId, status, nowIso)
-        entryId
+    ): String {
+        val entryId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val nowIso = nowUtcIso()
+            var resolved = ""
+            dao.executeInTransaction {
+                resolved =
+                    upsertEntryInDao(
+                        dao = dao,
+                        input = input,
+                        nowIso = nowIso,
+                        markDirty = true,
+                    )
+                appendConsumptionInDao(
+                    dao = dao,
+                    entryId = resolved,
+                    status = status,
+                    notes = notes,
+                    tsIso = nowIso,
+                    nowIso = nowIso,
+                    markDirty = true,
+                )
+                advance1001IfActiveLocked(resolved, status, nowIso)
+            }
+            resolved
+        }
+        onLocalMutation()
+        return entryId
     }
 
     suspend fun logExistingEntry(
         entryId: String,
         status: ConsumptionStatus,
         notes: String? = null,
-    ): String? = mutationMutex.withLock {
-        ensureSystemSeeded()
-        followMergedId(entryId)?.also { resolved ->
-            val nowIso = nowUtcIso()
-            appendConsumptionInDao(
-                dao = dao,
-                entryId = resolved,
-                status = status,
-                notes = notes,
-                tsIso = nowIso,
-                nowIso = nowIso,
-                markDirty = true,
-            )
-            advance1001IfActiveLocked(resolved, status, nowIso)
+    ): String? {
+        val loggedId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            followMergedId(entryId)?.also { resolved ->
+                val nowIso = nowUtcIso()
+                dao.executeInTransaction {
+                    appendConsumptionInDao(
+                        dao = dao,
+                        entryId = resolved,
+                        status = status,
+                        notes = notes,
+                        tsIso = nowIso,
+                        nowIso = nowIso,
+                        markDirty = true,
+                    )
+                    advance1001IfActiveLocked(resolved, status, nowIso)
+                }
+            }
         }
+        if (loggedId != null) {
+            onLocalMutation()
+        }
+        return loggedId
     }
 
     suspend fun wantEntry(
         input: UpsertCatalogEntryInput,
         targetQueueIdOrSlug: String? = null,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        val nowIso = nowUtcIso()
-        val entryId = upsertEntryInDao(dao = dao, input = input, nowIso = nowIso, markDirty = true)
-        val queueSpec = ensureWantCollectionInDao(dao, input.kind, targetQueueIdOrSlug, nowIso)
-        addCollectionMemberInDao(
-            dao = dao,
-            spec = queueSpec,
-            entryId = entryId,
-            position = null,
-            nowIso = nowIso,
-            markDirty = true,
-        )
-        entryId
+    ): String {
+        val entryId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val nowIso = nowUtcIso()
+            var resolved = ""
+            dao.executeInTransaction {
+                resolved =
+                    upsertEntryInDao(
+                        dao = dao,
+                        input = input,
+                        nowIso = nowIso,
+                        markDirty = true,
+                    )
+                val queueSpec =
+                    ensureWantCollectionInDao(dao, input.kind, targetQueueIdOrSlug, nowIso)
+                addCollectionMemberInDao(
+                    dao = dao,
+                    spec = queueSpec,
+                    entryId = resolved,
+                    position = null,
+                    nowIso = nowIso,
+                    markDirty = true,
+                )
+            }
+            resolved
+        }
+        onLocalMutation()
+        return entryId
     }
 
     suspend fun createCustomList(
         title: String,
         role: CollectionRole = CollectionRole.LIST,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        val cleanTitle = title.trim()
-        require(cleanTitle.isNotEmpty()) { "Collection title cannot be empty" }
-        val rawSlug = slugifyTitle(cleanTitle)
-        val slug = if (role == CollectionRole.WANT) "want:$rawSlug" else rawSlug
-        val existing = dao.getCollectionSpecBySlug(slug)
-        if (existing != null) {
-            existing.collectionId
-        } else {
-            val id =
-                if (role == CollectionRole.WANT) {
-                    systemCollectionUuid(slug)
-                } else {
-                    systemCollectionUuid("custom:$slug")
+    ): String {
+        var created = false
+        val id = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val cleanTitle = title.trim()
+            require(cleanTitle.isNotEmpty()) { "Collection title cannot be empty" }
+            val rawSlug = slugifyTitle(cleanTitle)
+            val slug = if (role == CollectionRole.WANT) "want:$rawSlug" else rawSlug
+            val existing = dao.getCollectionSpecBySlug(slug)
+            if (existing != null) {
+                if (dao.getCatalogEntryById(existing.collectionId) == null) {
+                    dao.upsertCatalogEntry(buildCollectionCatalogEntry(existing))
                 }
-            val nowIso = nowUtcIso()
-            dao.upsertCollectionSpec(
-                CollectionSpecEntity(
-                    collectionId = id,
-                    title = cleanTitle,
-                    slug = slug,
-                    mode = CollectionMode.MANUAL.wireValue,
-                    role = role.wireValue,
-                    showInLists = role == CollectionRole.LIST,
-                    createdAt = nowIso,
-                    updatedAt = nowIso,
-                    isLocalDirty = true,
-                )
-            )
-            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", slug, id))
-            id
+                existing.collectionId
+            } else {
+                val newId =
+                    if (role == CollectionRole.WANT) {
+                        systemCollectionUuid(slug)
+                    } else {
+                        systemCollectionUuid("custom:$slug")
+                    }
+                val nowIso = nowUtcIso()
+                val newSpec =
+                    CollectionSpecEntity(
+                        collectionId = newId,
+                        title = cleanTitle,
+                        slug = slug,
+                        mode = CollectionMode.MANUAL.wireValue,
+                        role = role.wireValue,
+                        showInLists = role == CollectionRole.LIST,
+                        createdAt = nowIso,
+                        updatedAt = nowIso,
+                        isLocalDirty = true,
+                    )
+                dao.executeInTransaction {
+                    dao.upsertCollectionSpec(newSpec)
+                    dao.upsertCatalogEntry(buildCollectionCatalogEntry(newSpec))
+                    dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", slug, newId))
+                }
+                created = true
+                newId
+            }
         }
+        if (created) {
+            onLocalMutation()
+        }
+        return id
     }
 
     suspend fun addCollectionEntry(
         collectionIdOrSlug: String,
         entryId: String,
         position: Double? = null,
-    ) = mutationMutex.withLock {
-        ensureSystemSeeded()
-        val spec =
-            resolveCollectionSpec(collectionIdOrSlug)
-                ?: error("Collection not found: $collectionIdOrSlug")
-        val resolvedEntry = followMergedId(entryId) ?: error("Catalog entry not found: $entryId")
-        addCollectionMemberInDao(
-            dao = dao,
-            spec = spec,
-            entryId = resolvedEntry,
-            position = position,
-            nowIso = nowUtcIso(),
-            markDirty = true,
-        )
+    ) {
+        mutationMutex.withLock {
+            ensureSystemSeeded()
+            val spec =
+                resolveCollectionSpec(collectionIdOrSlug)
+                    ?: error("Collection not found: $collectionIdOrSlug")
+            val resolvedEntry =
+                followMergedId(entryId) ?: error("Catalog entry not found: $entryId")
+            dao.executeInTransaction {
+                addCollectionMemberInDao(
+                    dao = dao,
+                    spec = spec,
+                    entryId = resolvedEntry,
+                    position = position,
+                    nowIso = nowUtcIso(),
+                    markDirty = true,
+                )
+            }
+        }
+        onLocalMutation()
     }
 
     suspend fun removeCollectionEntry(
         collectionIdOrSlug: String,
         entryId: String,
-    ): Boolean = mutationMutex.withLock {
-        ensureSystemSeeded()
-        val spec =
-            resolveCollectionSpec(collectionIdOrSlug)
-                ?: error("Collection not found: $collectionIdOrSlug")
-        val mode = CollectionMode.fromWireValue(spec.mode)
-        require(mode == CollectionMode.MANUAL) {
-            "Cannot manually modify entries of ${mode.wireValue} collection '${spec.title}'"
+    ): Boolean {
+        val removed = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val spec =
+                resolveCollectionSpec(collectionIdOrSlug)
+                    ?: error("Collection not found: $collectionIdOrSlug")
+            val mode = CollectionMode.fromWireValue(spec.mode)
+            require(mode == CollectionMode.MANUAL) {
+                "Cannot manually modify entries of ${mode.wireValue} collection '${spec.title}'"
+            }
+            val resolvedEntry = followMergedId(entryId) ?: entryId.trim()
+            val existing =
+                dao.getCollectionMemberships(spec.collectionId).any {
+                    it.entryId == resolvedEntry
+                }
+            if (existing) {
+                val nowIso = nowUtcIso()
+                dao.executeInTransaction {
+                    dao.deleteCollectionEntry(spec.collectionId, resolvedEntry)
+                    dao.upsertTombstone(
+                        TombstoneEntity(
+                            entityType = COLLECTION_ENTRY_ENTITY,
+                            naturalKey =
+                                collectionEntryNaturalKey(spec.collectionId, resolvedEntry),
+                            deletedAt = nowIso,
+                        )
+                    )
+                }
+            }
+            existing
         }
-        val resolvedEntry = followMergedId(entryId) ?: entryId.trim()
-        val existing =
-            dao.getCollectionMemberships(spec.collectionId).any { it.entryId == resolvedEntry }
-        if (existing) {
-            val nowIso = nowUtcIso()
-            dao.deleteCollectionEntry(spec.collectionId, resolvedEntry)
-            dao.upsertTombstone(
-                TombstoneEntity(
-                    entityType = COLLECTION_ENTRY_ENTITY,
-                    naturalKey = collectionEntryNaturalKey(spec.collectionId, resolvedEntry),
-                    deletedAt = nowIso,
-                )
-            )
+        if (removed) {
+            onLocalMutation()
         }
-        existing
+        return removed
     }
 
     suspend fun recordComparison(
         ordering: List<List<String>>,
         scopeCollectionId: String? = null,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        EpRankingEngine.validateOrdering(ordering).getOrThrow()
-        val resolvedGroups = ordering.map { group ->
-            group.map { id -> followMergedId(id) ?: id.trim() }.distinct()
+    ): String {
+        val compId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            EpRankingEngine.validateOrdering(ordering).getOrThrow()
+            val resolvedGroups = ordering.map { group ->
+                group.map { id -> followMergedId(id) ?: id.trim() }.distinct()
+            }
+            EpRankingEngine.validateOrdering(resolvedGroups).getOrThrow()
+            val cleanScope = scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
+            val now = Instant.now()
+            val nowIso = now.toString()
+            val id =
+                deterministicComparisonId(
+                    scopeCollectionId = cleanScope,
+                    tsMillis = now.toEpochMilli(),
+                    ordering = resolvedGroups,
+                )
+            dao.insertComparisonIgnore(
+                ComparisonEntity(
+                    id = id,
+                    ts = nowIso,
+                    scopeCollectionId = cleanScope,
+                    orderingJson = canonicalOrderingJson(resolvedGroups),
+                    createdAt = nowIso,
+                    isLocalDirty = true,
+                )
+            )
+            id
         }
-        EpRankingEngine.validateOrdering(resolvedGroups).getOrThrow()
-        val cleanScope = scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
-        val now = Instant.now()
-        val nowIso = now.toString()
-        val compId =
-            deterministicComparisonId(
-                scopeCollectionId = cleanScope,
-                tsMillis = now.toEpochMilli(),
-                ordering = resolvedGroups,
-            )
-        dao.insertComparisonIgnore(
-            ComparisonEntity(
-                id = compId,
-                ts = nowIso,
-                scopeCollectionId = cleanScope,
-                orderingJson = canonicalOrderingJson(resolvedGroups),
-                createdAt = nowIso,
-                isLocalDirty = true,
-            )
-        )
-        compId
+        onLocalMutation()
+        return compId
     }
 
     suspend fun selectNextRankCluster(
@@ -426,16 +527,27 @@ class CatalogStore(
         item: ItemEntity,
         feed: FeedEntity?,
         logConsumed: Boolean,
-    ): String = mutationMutex.withLock {
-        ensureSystemSeeded()
-        materializeFeedItemInDao(
-            dao = dao,
-            item = item,
-            feed = feed,
-            logConsumed = logConsumed,
-            markDirty = false,
-            nowIso = nowUtcIso(),
-        )
+    ): String {
+        val resolvedId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            var id = ""
+            dao.executeInTransaction {
+                id =
+                    materializeFeedItemInDao(
+                        dao = dao,
+                        item = item,
+                        feed = feed,
+                        logConsumed = logConsumed,
+                        markDirty = false,
+                        nowIso = nowUtcIso(),
+                    )
+            }
+            id
+        }
+        if (logConsumed) {
+            onLocalMutation()
+        }
+        return resolvedId
     }
 
     internal suspend fun materializeReferencedFeeds(referencedIds: Set<String>, nowIso: String) {
@@ -523,6 +635,12 @@ class CatalogStore(
         return snap.albumGenerator.currentAlbum?.takeIf { it.entryId == entryId }
     }
 
+    private suspend fun loadConsistentRawTables(): RawCatalogTables {
+        var tables: RawCatalogTables? = null
+        dao.executeInTransaction { tables = loadRawCatalogTables() }
+        return checkNotNull(tables)
+    }
+
     internal suspend fun loadRawCatalogTables(): RawCatalogTables =
         RawCatalogTables(
             entries = dao.getAllCatalogEntries(),
@@ -534,13 +652,6 @@ class CatalogStore(
             comparisons = dao.getAllComparisons(),
         )
 }
-
-private data class PartialCatalogTables(
-    val entries: List<CatalogEntryEntity>,
-    val identifiers: List<EntryIdentifierEntity>,
-    val specs: List<CollectionSpecEntity>,
-    val memberships: List<CollectionEntryEntity>,
-)
 
 internal fun nowUtcIso(): String = Instant.now().truncatedTo(ChronoUnit.MILLIS).toString()
 

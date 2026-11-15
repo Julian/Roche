@@ -500,6 +500,20 @@ internal fun Modifier.trackHeadingPosition(
     }
 
 @Composable
+internal fun rememberReaderLinkStyles(): TextLinkStyles {
+    val accentBlue = LocalRocheColors.current.accentBlue
+    return remember(accentBlue) {
+        TextLinkStyles(
+            style =
+                SpanStyle(
+                    color = accentBlue,
+                    textDecoration = TextDecoration.Underline,
+                )
+        )
+    }
+}
+
+@Composable
 internal fun StructuredHtmlArticleContent(
     blocks: List<ArticleBlock>,
     baseUrl: String? = null,
@@ -507,17 +521,7 @@ internal fun StructuredHtmlArticleContent(
     scrollRootCoords: (() -> LayoutCoordinates?)? = null,
     onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
 ) {
-    val colors = LocalRocheColors.current
-    val linkStyles =
-        remember(colors.accentBlue) {
-            TextLinkStyles(
-                style =
-                    SpanStyle(
-                        color = colors.accentBlue,
-                        textDecoration = TextDecoration.Underline,
-                    )
-            )
-        }
+    val linkStyles = rememberReaderLinkStyles()
     val localOrigin = remember { ScrollCoordinateHolder() }
     val headingIndices =
         remember(blocks, onHeadingMeasured != null) {
@@ -554,7 +558,7 @@ internal fun StructuredHtmlArticleContent(
 }
 
 @Composable
-private fun RenderArticleBlock(
+internal fun RenderArticleBlock(
     block: ArticleBlock,
     linkStyles: TextLinkStyles,
     baseUrl: String?,

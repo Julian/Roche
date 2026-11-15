@@ -21,6 +21,7 @@ data class Settings(
     val defaultPlaybackSpeed: Float = DEFAULT_PLAYBACK_SPEED,
     val skipSilenceEnabled: Boolean = false,
     val smartRewindEnabled: Boolean = true,
+    val hasUndecryptableToken: Boolean = false,
 ) {
     companion object {
         const val DEFAULT_SERVER_URL = ""
@@ -77,7 +78,6 @@ internal fun normalizeServerUrl(rawUrl: String): String {
 
 private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     val lower = trimmedUrl.lowercase()
-    if (lower == HOST_ROCHE) return "$SCHEME_HTTP_PREFIX$HOST_ROCHE:$DEFAULT_ROCHE_PORT"
     if (lower.startsWith(SCHEME_HTTP_PREFIX) || lower.startsWith(SCHEME_HTTPS_PREFIX)) {
         return trimmedUrl
     }
@@ -85,9 +85,8 @@ private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
         return null
     }
     val hostPart = extractHostWithoutPort(trimmedUrl).lowercase()
-    val explicitPort = extractExplicitPort(trimmedUrl)
     val prefix =
-        if (shouldUseCleartextHttp(hostPart, explicitPort)) {
+        if (shouldUseCleartextHttp(hostPart)) {
             SCHEME_HTTP_PREFIX
         } else {
             SCHEME_HTTPS_PREFIX
@@ -95,14 +94,21 @@ private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     return "$prefix$trimmedUrl"
 }
 
-private fun shouldUseCleartextHttp(hostPart: String, explicitPort: String): Boolean {
-    val isCleartextHost =
-        hostPart in CLEARTEXT_EXACT_HOSTS ||
-            hostPart.startsWith("127.") ||
-            hostPart.startsWith("100.") ||
-            hostPart.startsWith("[")
-    val hasNonTlsPort = explicitPort.isNotBlank() && explicitPort != "443"
-    return isCleartextHost || hasNonTlsPort
+private fun shouldUseCleartextHttp(hostPart: String): Boolean {
+    val isLoopback =
+        hostPart in CLEARTEXT_LOOPBACK_HOSTS ||
+            hostPart == "[::1]" ||
+            hostPart.startsWith("127.") && isValidLoopbackIpv4(hostPart)
+    val isTailscaleIp =
+        isTailscaleCgnatIpv4(hostPart) || hostPart.startsWith(TAILSCALE_ULA_IPV6_PREFIX)
+    return isLoopback || isTailscaleIp
+}
+
+private fun isValidLoopbackIpv4(host: String): Boolean {
+    val parts = host.split('.')
+    if (parts.size != IPV4_OCTET_COUNT) return false
+    val octets = parts.map { it.toIntOrNull() ?: return false }
+    return octets[0] == LOOPBACK_FIRST_OCTET && octets.all { it in 0..MAX_IPV4_OCTET }
 }
 
 private fun extractHostWithoutPort(authority: String): String =
@@ -112,26 +118,16 @@ private fun extractHostWithoutPort(authority: String): String =
         authority.substringBefore(':')
     }
 
-private fun extractExplicitPort(authority: String): String =
-    if (authority.startsWith("[")) {
-        authority.substringAfter("]:", missingDelimiterValue = "")
-    } else {
-        authority.substringAfter(':', missingDelimiterValue = "")
-    }
-
 private fun parseCleanOriginUri(candidate: String): String? = runCatching {
     val uri = URI(candidate)
     val rawScheme = uri.scheme?.lowercase() ?: return null
     val host = uri.host?.lowercase() ?: return null
     if (!isValidOriginUri(uri, rawScheme, host)) {
         null
+    } else if (uri.port == -1) {
+        "$rawScheme://$host"
     } else {
-        val effectiveScheme = resolveEffectiveOriginScheme(rawScheme, host, uri.port)
-        if (uri.port == -1) {
-            "$effectiveScheme://$host"
-        } else {
-            "$effectiveScheme://$host:${uri.port}"
-        }
+        "$rawScheme://$host:${uri.port}"
     }
 }
     .getOrNull()
@@ -140,15 +136,6 @@ internal fun isValidOriginUri(uri: URI, rawScheme: String, host: String): Boolea
     val validScheme = rawScheme == "http" || rawScheme == "https"
     val validPort = uri.port == -1 || uri.port in 1..MAX_TCP_PORT
     return validScheme && hasNoUriExtras(uri) && validPort && host.isNotBlank()
-}
-
-internal fun resolveEffectiveOriginScheme(rawScheme: String, host: String, port: Int): String {
-    val isCleartextOrTailnet = host.endsWith(TS_NET_SUFFIX) || shouldUseCleartextHttp(host, "")
-    return if (rawScheme == "https" && port == DEFAULT_ROCHE_PORT && isCleartextOrTailnet) {
-        "http"
-    } else {
-        rawScheme
-    }
 }
 
 private fun hasNoUriExtras(uri: URI): Boolean =
@@ -174,10 +161,7 @@ internal fun parsePairingInput(
     return normalizeServerUrl(rawServerUrl) to trimmedCode
 }
 
-internal fun tailscaleDiscoveryUrls(
-    tailnetDomains: List<String> = emptyList(),
-    defaultPort: Int = DEFAULT_ROCHE_PORT,
-): List<String> {
+internal fun tailscaleDiscoveryUrls(tailnetDomains: List<String> = emptyList()): List<String> {
     val candidates = mutableListOf<String>()
     tailnetDomains
         .map { it.trim().trim('.').lowercase() }
@@ -185,9 +169,7 @@ internal fun tailscaleDiscoveryUrls(
         .distinct()
         .forEach { domain ->
             candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE.$domain")
-            candidates.add("$SCHEME_HTTP_PREFIX$HOST_ROCHE.$domain:$defaultPort")
         }
-    candidates.add("$SCHEME_HTTP_PREFIX$HOST_ROCHE:$defaultPort")
     candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE")
     return candidates.distinct()
 }
@@ -203,6 +185,10 @@ internal fun validateCanonicalDiscoveryUrl(
     }
     val cleanCanonical = parseCleanOriginUri(trimmed) ?: return null
     val cleanProbed = parseCleanOriginUri(probedBaseUrl.trim().trimEnd('/')) ?: return null
+    val isHttpsDowngrade =
+        cleanProbed.startsWith(SCHEME_HTTPS_PREFIX) &&
+            !cleanCanonical.startsWith(SCHEME_HTTPS_PREFIX)
+    if (isHttpsDowngrade) return null
     val canonicalHost =
         runCatching { URI(cleanCanonical).host?.lowercase() }.getOrNull() ?: return null
     val probedHost = runCatching { URI(cleanProbed).host?.lowercase() }.getOrNull() ?: return null
@@ -257,7 +243,9 @@ private const val HOST_ROCHE = "roche"
 private const val SCHEME_HTTP_PREFIX = "http://"
 private const val SCHEME_HTTPS_PREFIX = "https://"
 private const val TS_NET_SUFFIX = ".ts.net"
-private val CLEARTEXT_EXACT_HOSTS = setOf("localhost", HOST_ROCHE, "10.0.2.2")
+private const val TAILSCALE_ULA_IPV6_PREFIX = "[fd7a:115c:a1e0:"
+private const val LOOPBACK_FIRST_OCTET = 127
+private val CLEARTEXT_LOOPBACK_HOSTS = setOf("localhost", "10.0.2.2")
 private val TRUSTED_LOCAL_PROBE_HOSTS = setOf(HOST_ROCHE, "127.0.0.1", "localhost")
 private const val MAX_TCP_PORT = 65_535
 private const val MAX_DNS_NAME_LEN = 253

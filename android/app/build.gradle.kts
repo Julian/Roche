@@ -158,7 +158,7 @@ androidComponents {
 
 room3 { schemaDirectory("$projectDir/schemas") }
 
-android.sourceSets["androidTest"].assets.srcDir("$projectDir/schemas")
+android.sourceSets["androidTest"].assets.directories.add("$projectDir/schemas")
 
 kotlin {
     compilerOptions {
@@ -191,6 +191,9 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.jsoup)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.session)
+    implementation(libs.androidx.media3.common)
     implementation(libs.room3.runtime)
     implementation(libs.sqlite.framework)
     ksp(libs.room3.compiler)

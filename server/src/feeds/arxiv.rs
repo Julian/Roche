@@ -60,9 +60,22 @@ impl ArxivParser {
     #[must_use]
     pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
         let trimmed = url_or_id.trim();
+        let is_http = trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+            || trimmed.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"));
+        if is_http {
+            let parsed = Url::parse(trimmed).ok()?;
+            if !Self::is_arxiv_host(parsed.host_str()) {
+                return None;
+            }
+            let path = parsed.path();
+            if !path.starts_with("/abs/") && !path.starts_with("/pdf/") {
+                return None;
+            }
+        }
         let stripped_oai = trimmed
             .strip_prefix("oai:arXiv.org:")
             .or_else(|| trimmed.strip_prefix("arXiv:"))
+            .or_else(|| trimmed.strip_prefix("arxiv:"))
             .unwrap_or(trimmed);
 
         let id_part = stripped_oai

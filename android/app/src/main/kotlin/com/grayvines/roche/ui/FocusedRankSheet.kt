@@ -5,7 +5,6 @@ package com.grayvines.roche.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,18 +16,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,26 +33,145 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.DailyAlbumSnapshot
-import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.RankSettlementSummary
-import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSurfaceCard
-import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
+
+@Suppress("DataClassContainsFunctions")
+internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>) {
+    val isEmpty: Boolean
+        get() = buckets.isEmpty()
+
+    val size: Int
+        get() = buckets.sumOf { it.size }
+
+    val isAllTied: Boolean
+        get() = buckets.size == 1 && size >= 2
+
+    fun rows(): List<RankBoardRowState> {
+        val result = ArrayList<RankBoardRowState>(size)
+        var flatIdx = 0
+        val totalBuckets = buckets.size
+        buckets.forEachIndexed { bIdx, bucket ->
+            val displayRank = flatIdx + 1
+            val bSize = bucket.size
+            bucket.forEachIndexed { iIdx, candidate ->
+                result.add(
+                    RankBoardRowState(
+                        candidate = candidate,
+                        flatIndex = flatIdx,
+                        displayRank = displayRank,
+                        isTiedWithAbove = iIdx > 0,
+                        canMoveUp = bSize > 1 || bIdx > 0,
+                        canMoveDown = bSize > 1 || bIdx + 1 < totalBuckets,
+                    )
+                )
+                flatIdx++
+            }
+        }
+        return result
+    }
+
+    fun displayRanks(): List<Int> = rows().map { it.displayRank }
+
+    fun toOrderingGroups(): List<List<String>> =
+        buckets.filter { it.isNotEmpty() }.map { bucket -> bucket.map { it.entryId } }
+
+    fun moveUp(entryId: String): RankBoardState {
+        val (bIdx, iIdx) = findCoords(entryId) ?: return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        if (next[bIdx].size > 1) {
+            val item = next[bIdx].removeAt(iIdx)
+            next.add(bIdx, mutableListOf(item))
+        } else if (bIdx > 0) {
+            val prev = next[bIdx - 1]
+            next[bIdx - 1] = next[bIdx]
+            next[bIdx] = prev
+        }
+        return RankBoardState(next)
+    }
+
+    fun moveDown(entryId: String): RankBoardState {
+        val (bIdx, iIdx) = findCoords(entryId) ?: return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        if (next[bIdx].size > 1) {
+            val item = next[bIdx].removeAt(iIdx)
+            next.add(bIdx + 1, mutableListOf(item))
+        } else if (bIdx + 1 < next.size) {
+            val below = next[bIdx + 1]
+            next[bIdx + 1] = next[bIdx]
+            next[bIdx] = below
+        }
+        return RankBoardState(next)
+    }
+
+    fun toggleTieWithAbove(entryId: String): RankBoardState {
+        val (bIdx, iIdx) = findCoords(entryId) ?: return this
+        val next = buckets.map { it.toMutableList() }.toMutableList()
+        if (iIdx > 0) {
+            val head = next[bIdx].subList(0, iIdx).toMutableList()
+            val tail = next[bIdx].subList(iIdx, next[bIdx].size).toMutableList()
+            next[bIdx] = head
+            next.add(bIdx + 1, tail)
+        } else if (bIdx > 0) {
+            val merged = next.removeAt(bIdx)
+            next[bIdx - 1].addAll(merged)
+        }
+        return RankBoardState(next)
+    }
+
+    fun tieAll(): RankBoardState {
+        val flat = buckets.flatten()
+        return if (flat.isEmpty()) RankBoardState(emptyList()) else RankBoardState(listOf(flat))
+    }
+
+    private fun findCoords(entryId: String): Pair<Int, Int>? {
+        buckets.forEachIndexed { bIdx, bucket ->
+            val iIdx = bucket.indexOfFirst { it.entryId == entryId }
+            if (iIdx >= 0) return bIdx to iIdx
+        }
+        return null
+    }
+
+    internal companion object {
+        fun fromCandidates(
+            items: List<RankClusterCandidate>,
+            tiedWithAboveIds: Set<String> = emptySet(),
+        ): RankBoardState {
+            if (items.isEmpty()) return RankBoardState(emptyList())
+            val buckets = mutableListOf<MutableList<RankClusterCandidate>>()
+            items.forEachIndexed { idx, item ->
+                if (idx == 0 || item.entryId !in tiedWithAboveIds) {
+                    buckets.add(mutableListOf(item))
+                } else {
+                    buckets.last().add(item)
+                }
+            }
+            return RankBoardState(buckets)
+        }
+    }
+}
+
+internal data class RankBoardRowState(
+    val candidate: RankClusterCandidate,
+    val flatIndex: Int,
+    val displayRank: Int,
+    val isTiedWithAbove: Boolean,
+    val canMoveUp: Boolean,
+    val canMoveDown: Boolean,
+)
 
 @Composable
 internal fun TierBadgePill(
@@ -92,111 +208,6 @@ internal fun resolveTierColor(tier: Char, colors: RocheColors): Color =
         'C' -> colors.accentEcru
         else -> colors.accentIndianRed
     }
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-internal fun AlbumNoteModalSheet(
-    album: DailyAlbumSnapshot?,
-    mode: AlbumNoteDialogMode,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    var notes by rememberSaveable(album?.entryId, mode) { mutableStateOf("") }
-    val isAbandon = mode == AlbumNoteDialogMode.ABANDON
-
-    ModalBottomSheet(
-        onDismissRequest = { onAction(MainAction.CloseAlbumNoteDialog) },
-        containerColor = colors.surface,
-    ) {
-        Column(
-            modifier =
-                Modifier.fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 10.dp)
-                    .testTag("album_note_modal_sheet"),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            AlbumNoteSheetHeader(album = album, isAbandon = isAbandon)
-            OutlinedTextField(
-                value = notes,
-                onValueChange = { notes = it },
-                label = { Text("Diary notes (optional)") },
-                placeholder = { Text("Standout tracks, impressions…") },
-                minLines = 2,
-                maxLines = 4,
-                modifier = Modifier.fillMaxWidth().testTag("album_notes_input"),
-            )
-            AlbumNoteSheetFooter(isAbandon = isAbandon, notes = notes, onAction = onAction)
-            Spacer(modifier = Modifier.height(14.dp))
-        }
-    }
-}
-
-@Composable
-private fun AlbumNoteSheetHeader(
-    album: DailyAlbumSnapshot?,
-    isAbandon: Boolean,
-) {
-    val colors = LocalRocheColors.current
-    Text(
-        text = if (isAbandon) "Abandon 1001 Album" else "Finish & Rank Album",
-        color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
-        fontSize = 19.sp,
-        fontWeight = FontWeight.SemiBold,
-    )
-    if (album != null) {
-        Text(
-            text = "${album.name} — ${album.artist}",
-            color = colors.textSecondary,
-            fontSize = 13.5.sp,
-            fontWeight = FontWeight.Medium,
-        )
-    }
-    Text(
-        text =
-            if (isAbandon) {
-                "Records this album as abandoned in your Diary and draws your next 1001 Album."
-            } else {
-                "Logs this album as finished, settles its ranking against your other albums, and draws your next 1001 Album."
-            },
-        color = colors.textMuted,
-        fontSize = 12.sp,
-        lineHeight = 17.sp,
-    )
-}
-
-@Composable
-private fun AlbumNoteSheetFooter(
-    isAbandon: Boolean,
-    notes: String,
-    onAction: (MainAction) -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        HeaderActionButton(
-            label = "Cancel",
-            onClick = { onAction(MainAction.CloseAlbumNoteDialog) },
-        )
-        Spacer(modifier = Modifier.size(8.dp))
-        HeaderActionButton(
-            label = if (isAbandon) "Abandon & Draw Next" else "Finish & Rank",
-            style = RocheButtonStyle.PRIMARY,
-            onClick = {
-                val action =
-                    if (isAbandon) {
-                        MainAction.ConfirmAbandon1001Album(notes)
-                    } else {
-                        MainAction.ConfirmFinish1001Album(notes)
-                    }
-                onAction(action)
-            },
-            modifier = Modifier.testTag("album_confirm_action_btn"),
-        )
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -305,12 +316,9 @@ private fun ActiveClusterRankBody(
     val colors = LocalRocheColors.current
     val clusterKey =
         remember(session.roundIndex, session.cluster) { session.cluster.map { it.entryId } }
-    var orderedItems by remember(clusterKey) { mutableStateOf(session.cluster) }
-    var tiedWithAboveIds by remember(clusterKey) { mutableStateOf(emptySet<String>()) }
-    val rankNumbers =
-        remember(orderedItems, tiedWithAboveIds) {
-            computeDisplayGroupRanks(orderedItems, tiedWithAboveIds)
-        }
+    var board by
+        remember(clusterKey) { mutableStateOf(RankBoardState.fromCandidates(session.cluster)) }
+    val rows = remember(board) { board.rows() }
 
     Column(
         modifier =
@@ -322,28 +330,15 @@ private fun ActiveClusterRankBody(
     ) {
         ClusterRankHeader(session = session, onClose = { onAction(MainAction.CloseRankSession) })
         ClusterRankCandidateList(
-            orderedItems = orderedItems,
-            tiedWithAboveIds = tiedWithAboveIds,
-            rankNumbers = rankNumbers,
+            rows = rows,
             focusEntryId = session.focusEntryId,
-            onToggleTie = { entryId, wasTied ->
-                tiedWithAboveIds =
-                    if (wasTied) tiedWithAboveIds - entryId else tiedWithAboveIds + entryId
-            },
-            onSwap = { idxA, idxB ->
-                val swapped = orderedItems.toMutableList()
-                val itemA = swapped[idxA]
-                val itemB = swapped[idxB]
-                swapped[idxA] = itemB
-                swapped[idxB] = itemA
-                orderedItems = swapped
-                tiedWithAboveIds = tiedWithAboveIds - itemA.entryId - itemB.entryId
-            },
+            onToggleTie = { entryId -> board = board.toggleTieWithAbove(entryId) },
+            onMoveUp = { entryId -> board = board.moveUp(entryId) },
+            onMoveDown = { entryId -> board = board.moveDown(entryId) },
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         ClusterRankFooter(
-            orderedItems = orderedItems,
-            tiedWithAboveIds = tiedWithAboveIds,
+            board = board,
             onAction = onAction,
         )
         Spacer(modifier = Modifier.height(14.dp))
@@ -386,42 +381,34 @@ private fun ClusterRankHeader(
     }
 }
 
-@Suppress("LongParameterList")
 @Composable
 private fun ClusterRankCandidateList(
-    orderedItems: List<RankClusterCandidate>,
-    tiedWithAboveIds: Set<String>,
-    rankNumbers: List<Int>,
+    rows: List<RankBoardRowState>,
     focusEntryId: String?,
-    onToggleTie: (String, Boolean) -> Unit,
-    onSwap: (Int, Int) -> Unit,
+    onToggleTie: (String) -> Unit,
+    onMoveUp: (String) -> Unit,
+    onMoveDown: (String) -> Unit,
 ) {
-    orderedItems.forEachIndexed { idx, candidate ->
-        if (idx > 0) {
-            val isTied = candidate.entryId in tiedWithAboveIds
+    rows.forEach { row ->
+        if (row.flatIndex > 0) {
             TieConnectorToggle(
-                isTied = isTied,
-                onToggle = { onToggleTie(candidate.entryId, isTied) },
-                testTag = "rank_tie_toggle_$idx",
+                isTied = row.isTiedWithAbove,
+                onToggle = { onToggleTie(row.candidate.entryId) },
+                testTag = "rank_tie_toggle_${row.flatIndex}",
             )
         }
         ClusterCandidateCard(
-            candidate = candidate,
-            displayRank = rankNumbers[idx],
-            isFocused = candidate.entryId == focusEntryId,
-            canMoveUp = idx > 0,
-            canMoveDown = idx < orderedItems.lastIndex,
-            onMoveUp = { onSwap(idx - 1, idx) },
-            onMoveDown = { onSwap(idx, idx + 1) },
-            index = idx,
+            row = row,
+            isFocused = row.candidate.entryId == focusEntryId,
+            onMoveUp = { onMoveUp(row.candidate.entryId) },
+            onMoveDown = { onMoveDown(row.candidate.entryId) },
         )
     }
 }
 
 @Composable
 private fun ClusterRankFooter(
-    orderedItems: List<RankClusterCandidate>,
-    tiedWithAboveIds: Set<String>,
+    board: RankBoardState,
     onAction: (MainAction) -> Unit,
 ) {
     Row(
@@ -433,12 +420,7 @@ private fun ClusterRankFooter(
             HeaderActionButton(
                 label = "Tie All",
                 onClick = {
-                    val allBelowFirst = orderedItems.drop(1).map { it.entryId }.toSet()
-                    onAction(
-                        MainAction.SubmitRankCluster(
-                            buildOrderingGroups(orderedItems, allBelowFirst)
-                        )
-                    )
+                    onAction(MainAction.SubmitRankCluster(board.tieAll().toOrderingGroups()))
                 },
                 modifier = Modifier.testTag("rank_tie_all_btn"),
             )
@@ -451,13 +433,7 @@ private fun ClusterRankFooter(
         HeaderActionButton(
             label = "Submit Order",
             style = RocheButtonStyle.PRIMARY,
-            onClick = {
-                onAction(
-                    MainAction.SubmitRankCluster(
-                        buildOrderingGroups(orderedItems, tiedWithAboveIds)
-                    )
-                )
-            },
+            onClick = { onAction(MainAction.SubmitRankCluster(board.toOrderingGroups())) },
             modifier = Modifier.testTag("rank_submit_btn"),
         )
     }
@@ -480,14 +456,16 @@ private fun TieConnectorToggle(
         horizontalArrangement = Arrangement.Center,
     ) {
         Box(
+            contentAlignment = Alignment.Center,
             modifier =
-                Modifier.clip(shape)
+                Modifier.minimumInteractiveComponentSize()
+                    .clip(shape)
                     .background(bg)
                     .border(1.dp, border, shape)
                     .clickable(onClick = onToggle)
                     .semantics { role = Role.Button }
                     .padding(horizontal = 10.dp, vertical = 2.dp)
-                    .testTag(testTag)
+                    .testTag(testTag),
         ) {
             Text(
                 text = if (isTied) "= Tied with above" else "= Tap to tie",
@@ -501,20 +479,17 @@ private fun TieConnectorToggle(
 }
 
 @Composable
-@Suppress("LongParameterList")
 private fun ClusterCandidateCard(
-    candidate: RankClusterCandidate,
-    displayRank: Int,
+    row: RankBoardRowState,
     isFocused: Boolean,
-    canMoveUp: Boolean,
-    canMoveDown: Boolean,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
-    index: Int,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(10.dp)
     val borderColor = if (isFocused) colors.accentBlue else colors.border
+    val candidate = row.candidate
+    val idx = row.flatIndex
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -522,48 +497,59 @@ private fun ClusterCandidateCard(
                 .background(colors.surfaceElevated)
                 .border(1.dp, borderColor, shape)
                 .padding(horizontal = 12.dp, vertical = 10.dp)
-                .testTag("rank_candidate_$index"),
+                .testTag("rank_candidate_$idx"),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(
-            text = "#$displayRank",
+            text = "#${row.displayRank}",
             color = if (isFocused) colors.accentBlue else colors.accentEcru,
             fontFamily = FontFamily.Monospace,
             fontSize = 14.sp,
             fontWeight = FontWeight.Bold,
         )
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = candidate.title,
-                color = colors.textPrimary,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+        ClusterCandidateMetaColumn(candidate = candidate, modifier = Modifier.weight(1f))
+        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            SmallReorderPill(
+                "↑",
+                "Move ${candidate.title} up",
+                row.canMoveUp,
+                onMoveUp,
+                "rank_up_$idx",
             )
-            if (candidate.subtitle.isNotBlank()) {
-                Text(
-                    text = candidate.subtitle,
-                    color = colors.textSecondary,
-                    fontSize = 12.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+            SmallReorderPill(
+                "↓",
+                "Move ${candidate.title} down",
+                row.canMoveDown,
+                onMoveDown,
+                "rank_down_$idx",
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            SmallReorderPill(
-                label = "↑",
-                enabled = canMoveUp,
-                onClick = onMoveUp,
-                testTag = "rank_up_$index",
-            )
-            SmallReorderPill(
-                label = "↓",
-                enabled = canMoveDown,
-                onClick = onMoveDown,
-                testTag = "rank_down_$index",
+    }
+}
+
+@Composable
+private fun ClusterCandidateMetaColumn(
+    candidate: RankClusterCandidate,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Column(modifier = modifier) {
+        Text(
+            text = candidate.title,
+            color = colors.textPrimary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (candidate.subtitle.isNotBlank()) {
+            Text(
+                text = candidate.subtitle,
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -572,6 +558,7 @@ private fun ClusterCandidateCard(
 @Composable
 private fun SmallReorderPill(
     label: String,
+    description: String,
     enabled: Boolean,
     onClick: () -> Unit,
     testTag: String,
@@ -581,324 +568,39 @@ private fun SmallReorderPill(
     Box(
         contentAlignment = Alignment.Center,
         modifier =
-            Modifier.size(30.dp)
-                .clip(shape)
-                .background(colors.surface)
-                .border(1.dp, colors.border, shape)
+            Modifier.minimumInteractiveComponentSize()
                 .let { mod -> if (enabled) mod.clickable(onClick = onClick) else mod }
+                .semantics {
+                    role = Role.Button
+                    contentDescription = description
+                }
                 .testTag(testTag),
     ) {
-        Text(
-            text = label,
-            color = if (enabled) colors.textPrimary else colors.textMuted.copy(alpha = 0.4f),
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.size(30.dp)
+                    .clip(shape)
+                    .background(colors.surface)
+                    .border(1.dp, colors.border, shape),
+        ) {
+            Text(
+                text = label,
+                color = if (enabled) colors.textPrimary else colors.textMuted.copy(alpha = 0.4f),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
     }
 }
 
 internal fun computeDisplayGroupRanks(
     orderedItems: List<RankClusterCandidate>,
     tiedWithAboveIds: Set<String>,
-): List<Int> {
-    if (orderedItems.isEmpty()) return emptyList()
-    val ranks = ArrayList<Int>(orderedItems.size)
-    var currentRank = 1
-    orderedItems.forEachIndexed { index, item ->
-        if (index > 0 && item.entryId !in tiedWithAboveIds) {
-            currentRank = index + 1
-        }
-        ranks.add(currentRank)
-    }
-    return ranks
-}
+): List<Int> = RankBoardState.fromCandidates(orderedItems, tiedWithAboveIds).displayRanks()
 
 internal fun buildOrderingGroups(
     orderedItems: List<RankClusterCandidate>,
     tiedWithAboveIds: Set<String>,
-): List<List<String>> {
-    val groups = mutableListOf<MutableList<String>>()
-    orderedItems.forEachIndexed { idx, item ->
-        if (idx == 0 || item.entryId !in tiedWithAboveIds) {
-            groups.add(mutableListOf(item.entryId))
-        } else {
-            groups.last().add(item.entryId)
-        }
-    }
-    return groups
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-internal fun QuickLogBottomSheet(
-    defaultToWant: Boolean,
-    targetCollectionId: String? = null,
-    targetCollectionTitle: String? = null,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    ModalBottomSheet(
-        onDismissRequest = { onAction(MainAction.CloseQuickLogSheet) },
-        containerColor = colors.surface,
-    ) {
-        QuickLogSheetBody(
-            defaultToWant = defaultToWant,
-            targetCollectionId = targetCollectionId,
-            targetCollectionTitle = targetCollectionTitle,
-            onAction = onAction,
-        )
-    }
-}
-
-@Composable
-private fun QuickLogSheetBody(
-    defaultToWant: Boolean,
-    targetCollectionId: String?,
-    targetCollectionTitle: String?,
-    onAction: (MainAction) -> Unit,
-) {
-    var addToWant by rememberSaveable(defaultToWant) { mutableStateOf(defaultToWant) }
-    var kind by rememberSaveable { mutableStateOf(EntryKind.MOVIE) }
-    var status by rememberSaveable { mutableStateOf(ConsumptionStatus.CONSUMED) }
-    var title by rememberSaveable { mutableStateOf("") }
-    var creators by rememberSaveable { mutableStateOf("") }
-    var yearText by rememberSaveable { mutableStateOf("") }
-    var notes by rememberSaveable { mutableStateOf("") }
-    var rankAfterLog by rememberSaveable { mutableStateOf(true) }
-
-    Column(
-        modifier =
-            Modifier.fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 10.dp)
-                .testTag("quick_log_sheet"),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        QuickLogSelectorsSection(
-            addToWant = addToWant,
-            targetCollectionTitle = targetCollectionTitle,
-            selectedKind = kind,
-            selectedStatus = status,
-            onSelectWantMode = { addToWant = it },
-            onSelectKind = { kind = it },
-            onSelectStatus = { status = it },
-        )
-        QuickLogMetadataFields(
-            title = title,
-            creators = creators,
-            yearText = yearText,
-            onTitleChange = { title = it },
-            onCreatorsChange = { creators = it },
-            onYearChange = { yearText = it.filter(Char::isDigit).take(4) },
-        )
-        if (!addToWant) {
-            QuickLogDiaryOptions(notes, kind, status, rankAfterLog, { notes = it }) {
-                rankAfterLog = it
-            }
-        }
-        val submitAction =
-            buildQuickLogAction(
-                kind,
-                title,
-                creators,
-                yearText,
-                status,
-                notes,
-                addToWant,
-                rankAfterLog,
-                targetCollectionId,
-            )
-        QuickLogFooterRow(addToWant, { onAction(MainAction.CloseQuickLogSheet) }) {
-            onAction(submitAction)
-        }
-        Spacer(modifier = Modifier.height(14.dp))
-    }
-}
-
-@Suppress("LongParameterList")
-private fun buildQuickLogAction(
-    kind: EntryKind,
-    title: String,
-    creators: String,
-    yearText: String,
-    status: ConsumptionStatus,
-    notes: String,
-    addToWant: Boolean,
-    rankAfterLog: Boolean,
-    targetCollectionId: String?,
-): MainAction =
-    MainAction.SubmitQuickLog(
-        kind = kind,
-        title = title,
-        creatorsCsv = creators,
-        releaseYear = yearText.toIntOrNull(),
-        status = status,
-        notes = notes,
-        addToWant = addToWant,
-        rankAfterLog = rankAfterLog && status == ConsumptionStatus.CONSUMED,
-        targetCollectionId = targetCollectionId,
-    )
-
-@Suppress("LongParameterList")
-@Composable
-private fun QuickLogSelectorsSection(
-    addToWant: Boolean,
-    targetCollectionTitle: String?,
-    selectedKind: EntryKind,
-    selectedStatus: ConsumptionStatus,
-    onSelectWantMode: (Boolean) -> Unit,
-    onSelectKind: (EntryKind) -> Unit,
-    onSelectStatus: (ConsumptionStatus) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val loggableKinds = remember { QUICK_LOG_KINDS }
-    val heading =
-        when {
-            addToWant -> "Add to Want Queue"
-            !targetCollectionTitle.isNullOrBlank() -> "Log & Add to $targetCollectionTitle"
-            else -> "Log to Diary"
-        }
-    Text(
-        text = heading,
-        color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
-        fontSize = 19.sp,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FilterChipPill(
-            label = "Log Diary",
-            selected = !addToWant,
-            onClick = { onSelectWantMode(false) },
-        )
-        FilterChipPill(
-            label = "Want Queue",
-            selected = addToWant,
-            onClick = { onSelectWantMode(true) },
-        )
-    }
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        loggableKinds.forEach { kind ->
-            FilterChipPill(
-                label = kind.displayLabel,
-                selected = selectedKind == kind,
-                onClick = { onSelectKind(kind) },
-            )
-        }
-    }
-    if (!addToWant) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            ConsumptionStatus.entries.forEach { status ->
-                FilterChipPill(
-                    label = status.displayLabel,
-                    selected = selectedStatus == status,
-                    onClick = { onSelectStatus(status) },
-                )
-            }
-        }
-    }
-}
-
-@Suppress("LongParameterList")
-@Composable
-private fun QuickLogMetadataFields(
-    title: String,
-    creators: String,
-    yearText: String,
-    onTitleChange: (String) -> Unit,
-    onCreatorsChange: (String) -> Unit,
-    onYearChange: (String) -> Unit,
-) {
-    OutlinedTextField(
-        value = title,
-        onValueChange = onTitleChange,
-        label = { Text("Title") },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth().testTag("quick_log_title_input"),
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        OutlinedTextField(
-            value = creators,
-            onValueChange = onCreatorsChange,
-            label = { Text("Creator / Artist") },
-            singleLine = true,
-            modifier = Modifier.weight(1.4f).testTag("quick_log_creator_input"),
-        )
-        OutlinedTextField(
-            value = yearText,
-            onValueChange = onYearChange,
-            label = { Text("Year") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.weight(0.6f),
-        )
-    }
-}
-
-@Suppress("LongParameterList")
-@Composable
-private fun QuickLogDiaryOptions(
-    notes: String,
-    selectedKind: EntryKind,
-    selectedStatus: ConsumptionStatus,
-    rankAfterLog: Boolean,
-    onNotesChange: (String) -> Unit,
-    onRankToggle: (Boolean) -> Unit,
-) {
-    OutlinedTextField(
-        value = notes,
-        onValueChange = onNotesChange,
-        label = { Text("Notes (optional)") },
-        minLines = 2,
-        maxLines = 3,
-        modifier = Modifier.fillMaxWidth(),
-    )
-    if (selectedStatus == ConsumptionStatus.CONSUMED) {
-        SettingToggleRow(
-            title = "Rank immediately after logging",
-            subtitle = "Compare against entries in ${selectedKind.systemListTitle}",
-            checked = rankAfterLog,
-            onCheckedChange = onRankToggle,
-        )
-    }
-}
-
-@Composable
-private fun QuickLogFooterRow(
-    addToWant: Boolean,
-    onCancel: () -> Unit,
-    onSubmit: () -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
-    ) {
-        HeaderActionButton(label = "Cancel", onClick = onCancel)
-        Spacer(modifier = Modifier.size(8.dp))
-        HeaderActionButton(
-            label = if (addToWant) "Add to Want" else "Save Log",
-            style = RocheButtonStyle.PRIMARY,
-            onClick = onSubmit,
-            modifier = Modifier.testTag("quick_log_submit_btn"),
-        )
-    }
-}
-
-private val QUICK_LOG_KINDS =
-    listOf(
-        EntryKind.MOVIE,
-        EntryKind.ALBUM,
-        EntryKind.BOOK,
-        EntryKind.TV,
-        EntryKind.GAME,
-        EntryKind.SONG,
-        EntryKind.ARTICLE,
-        EntryKind.PAPER,
-        EntryKind.VIDEO,
-    )
+): List<List<String>> =
+    RankBoardState.fromCandidates(orderedItems, tiedWithAboveIds).toOrderingGroups()

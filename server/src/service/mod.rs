@@ -1,13 +1,20 @@
+pub mod catalog;
+pub use catalog::CatalogService;
+
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
+use hex::FromHex;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -31,11 +38,29 @@ const MAX_SYNC_URL_LEN: usize = 2048;
 const PAIR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
 const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
+const MAX_TAILSCALE_WEB_TOKENS_PER_USER: i64 = 3;
+
+const MAX_SYNC_FEEDS: usize = 2_000;
+const MAX_SYNC_TAGS: usize = 2_000;
+const MAX_SYNC_COLLECTIONS: usize = 5_000;
+const MAX_SYNC_ITEMS: usize = 5_000;
+const MAX_SYNC_TOMBSTONES: usize = 10_000;
+const MAX_SYNC_CATALOG_ENTRIES: usize = 10_000;
+const MAX_SYNC_COLLECTION_ENTRIES: usize = 25_000;
+const MAX_SYNC_GENERATORS: usize = 64;
+const MAX_SYNC_CONSUMPTION_LOG: usize = 25_000;
+const MAX_SYNC_COMPARISONS: usize = 25_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PairingClientKey {
+    DirectIp(IpAddr),
+    TailscaleLogin(String),
+}
 
 #[derive(Debug, Default)]
 struct PairingRateLimiterState {
     active_hash: Option<String>,
-    by_ip: HashMap<IpAddr, Vec<Instant>>,
+    by_client: HashMap<PairingClientKey, Vec<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -44,41 +69,41 @@ struct PairingRateLimiter {
 }
 
 impl PairingRateLimiter {
-    fn check_and_record(&self, active_hash: &str, client_ip: IpAddr) -> bool {
+    fn check_and_record(&self, active_hash: &str, client: PairingClientKey) -> bool {
         let now = Instant::now();
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.active_hash.as_deref() != Some(active_hash) {
             guard.active_hash = Some(active_hash.to_owned());
-            guard.by_ip.clear();
+            guard.by_client.clear();
         }
-        guard.by_ip.retain(|_, timestamps| {
+        guard.by_client.retain(|_, timestamps| {
             timestamps.retain(|&ts| now.duration_since(ts) < PAIR_RATE_LIMIT_WINDOW);
             !timestamps.is_empty()
         });
-        if let Some(timestamps) = guard.by_ip.get_mut(&client_ip) {
+        if let Some(timestamps) = guard.by_client.get_mut(&client) {
             if timestamps.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
                 return false;
             }
             timestamps.push(now);
             return true;
         }
-        if guard.by_ip.len() >= MAX_TRACKED_PAIRING_IPS
-            && let Some(oldest_ip) = guard
-                .by_ip
+        if guard.by_client.len() >= MAX_TRACKED_PAIRING_IPS
+            && let Some(oldest_key) = guard
+                .by_client
                 .iter()
                 .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
-                .map(|(&ip, _)| ip)
+                .map(|(k, _)| k.clone())
         {
-            guard.by_ip.remove(&oldest_ip);
+            guard.by_client.remove(&oldest_key);
         }
-        guard.by_ip.insert(client_ip, vec![now]);
+        guard.by_client.insert(client, vec![now]);
         true
     }
 
     fn reset(&self) {
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.active_hash = None;
-        guard.by_ip.clear();
+        guard.by_client.clear();
     }
 }
 
@@ -137,6 +162,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
     pairing_limiter: Arc<PairingRateLimiter>,
+    tailscale_web_sessions: Arc<Mutex<HashMap<String, String>>>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
 }
 
@@ -150,6 +176,7 @@ impl<F> Clone for RocheService<F> {
             ytdlp_worker: self.ytdlp_worker.clone(),
             download_semaphore: Arc::clone(&self.download_semaphore),
             pairing_limiter: Arc::clone(&self.pairing_limiter),
+            tailscale_web_sessions: Arc::clone(&self.tailscale_web_sessions),
             node_identity: self.node_identity.clone(),
         }
     }
@@ -170,6 +197,7 @@ impl<F: FeedFetcher> RocheService<F> {
             ytdlp_worker,
             download_semaphore,
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
+            tailscale_web_sessions: Arc::new(Mutex::new(HashMap::new())),
             node_identity: None,
         }
     }
@@ -212,13 +240,44 @@ impl<F: FeedFetcher> RocheService<F> {
         AuthService { service: self }
     }
 
-    pub async fn pair_device(
+    #[must_use]
+    pub fn resolve_pairing_client_key(
+        &self,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
+    ) -> PairingClientKey {
+        if self.config.tailscale.enabled && peer_addr.is_some_and(|addr| addr.ip().is_loopback()) {
+            if let Some(ts_login) = headers
+                .get("tailscale-user-login")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+            {
+                return PairingClientKey::TailscaleLogin(ts_login);
+            }
+            if let Some(fwd_ip) = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.rsplit(',').next())
+                .and_then(|raw| raw.trim().parse::<IpAddr>().ok())
+            {
+                return PairingClientKey::DirectIp(fwd_ip);
+            }
+        }
+        PairingClientKey::DirectIp(
+            peer_addr.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip()),
+        )
+    }
+
+    pub async fn pair_device_for_request(
         &self,
         device_name: &str,
         pairing_code: &str,
-        client_ip: IpAddr,
+        peer_addr: Option<SocketAddr>,
+        headers: &HeaderMap,
     ) -> Result<String, ApiError> {
-        self.auth().pair_device(device_name, pairing_code, client_ip).await
+        let key = self.resolve_pairing_client_key(peer_addr, headers);
+        self.auth().pair_device_with_key(device_name, pairing_code, key).await
     }
 
     #[must_use]
@@ -242,8 +301,8 @@ impl<F: FeedFetcher> RocheService<F> {
     }
 
     #[must_use]
-    pub const fn catalog(&self) -> crate::db::CatalogRepo<'_> {
-        self.db.catalog()
+    pub const fn catalog(&self) -> CatalogService<'_> {
+        CatalogService::new(&self.db)
     }
 
     #[must_use]
@@ -320,6 +379,7 @@ impl<F: FeedFetcher> RocheService<F> {
         Ok(SyncChanges { changes, next_since_id, latest_activity_id, has_more })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn peer_sync(&self, mut req: PeerSyncRequest) -> Result<PeerSyncResponse, ApiError> {
         let trimmed_peer = req.peer_id.trim();
         if trimmed_peer.is_empty() || trimmed_peer.len() > MAX_DEVICE_NAME_LEN {
@@ -328,7 +388,25 @@ impl<F: FeedFetcher> RocheService<F> {
             ));
         }
 
-        req.feeds.truncate(500);
+        for (field, len, limit) in [
+            ("feeds", req.feeds.len(), MAX_SYNC_FEEDS),
+            ("items", req.items.len(), MAX_SYNC_ITEMS),
+            ("tags", req.tags.len(), MAX_SYNC_TAGS),
+            ("tombstones", req.tombstones.len(), MAX_SYNC_TOMBSTONES),
+            ("collections", req.collections.len(), MAX_SYNC_COLLECTIONS),
+            ("catalog_entries", req.catalog_entries.len(), MAX_SYNC_CATALOG_ENTRIES),
+            ("collection_entries", req.collection_entries.len(), MAX_SYNC_COLLECTION_ENTRIES),
+            ("collection_generators", req.collection_generators.len(), MAX_SYNC_GENERATORS),
+            ("consumption_log", req.consumption_log.len(), MAX_SYNC_CONSUMPTION_LOG),
+            ("comparisons", req.comparisons.len(), MAX_SYNC_COMPARISONS),
+        ] {
+            if len > limit {
+                return Err(ApiError::payload_too_large(format!(
+                    "peer_sync '{field}' array ({len}) exceeds per-request limit ({limit}); paginate into smaller batches"
+                )));
+            }
+        }
+
         req.feeds.retain_mut(|f| {
             if let Err(err) = SafeHttpClient::validate_url(&f.url) {
                 tracing::warn!(
@@ -355,7 +433,6 @@ impl<F: FeedFetcher> RocheService<F> {
             }
         });
 
-        req.items.truncate(2_000);
         req.items.retain_mut(|item| {
             if !is_valid_sync_item_url(&item.url) {
                 tracing::warn!(
@@ -396,14 +473,6 @@ impl<F: FeedFetcher> RocheService<F> {
             }
             true
         });
-        req.tags.truncate(500);
-        req.tombstones.truncate(2_000);
-        req.collections.truncate(500);
-        req.catalog_entries.truncate(2_000);
-        req.collection_entries.truncate(5_000);
-        req.collection_generators.truncate(16);
-        req.consumption_log.truncate(5_000);
-        req.comparisons.truncate(5_000);
 
         let (response, mut inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
         inserted_candidates.retain(|(_, c)| SafeHttpClient::validate_url(&c.url).is_ok());
@@ -432,11 +501,11 @@ impl<F: FeedFetcher> AuthService<'_, F> {
         Ok(code)
     }
 
-    pub async fn pair_device(
+    pub async fn pair_device_with_key(
         &self,
         device_name: &str,
         pairing_code: &str,
-        client_ip: IpAddr,
+        client_key: PairingClientKey,
     ) -> Result<String, ApiError> {
         let trimmed_name = device_name.trim();
         if trimmed_name.is_empty() {
@@ -452,7 +521,7 @@ impl<F: FeedFetcher> AuthService<'_, F> {
             return Err(ApiError::unauthorized("Invalid or expired pairing code"));
         };
 
-        if !self.service.pairing_limiter.check_and_record(&active_hash, client_ip) {
+        if !self.service.pairing_limiter.check_and_record(&active_hash, client_key) {
             return Err(ApiError::too_many_requests(
                 "Too many failed pairing attempts; please wait before retrying",
             ));
@@ -493,39 +562,73 @@ impl<F: FeedFetcher> AuthService<'_, F> {
         Ok(())
     }
 
+    fn csrf_mac_bytes(raw_session_token: &str) -> [u8; 32] {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(b"roche-web-csrf-hmac-v1")
+            .expect("HMAC-SHA256 accepts keys of any size");
+        mac.update(raw_session_token.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
     #[must_use]
     pub fn csrf_token_for_session(&self, raw_session_token: &str) -> String {
         let _ = self;
-        let mut hasher = Sha256::new();
-        hasher.update(b"roche-web-csrf-v1:");
-        hasher.update(raw_session_token.as_bytes());
-        hex::encode(hasher.finalize())
+        hex::encode(Self::csrf_mac_bytes(raw_session_token))
     }
 
     #[must_use]
     pub fn verify_csrf_token(&self, raw_session_token: &str, candidate: &str) -> bool {
-        let expected = self.csrf_token_for_session(raw_session_token);
-        let cand_bytes = candidate.trim().as_bytes();
-        let exp_bytes = expected.as_bytes();
-        if cand_bytes.len() != exp_bytes.len() {
+        let _ = self;
+        let Ok(cand_bytes) = <[u8; 32]>::from_hex(candidate.trim()) else {
             return false;
-        }
-        let mut diff = 0u8;
-        for (&a, &b) in exp_bytes.iter().zip(cand_bytes.iter()) {
-            diff |= a ^ b;
-        }
-        diff == 0
+        };
+        let exp_bytes = Self::csrf_mac_bytes(raw_session_token);
+        bool::from(exp_bytes.ct_eq(&cand_bytes))
     }
 
     pub async fn mint_tailscale_web_session(&self, login: &str) -> Result<String, ApiError> {
         let clean_login = login.trim().to_ascii_lowercase();
+        let cached = self
+            .service
+            .tailscale_web_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&clean_login)
+            .cloned();
+        if let Some(existing) = cached
+            && self.authenticate(&existing).await.is_ok()
+        {
+            return Ok(existing);
+        }
+
         let raw_name = format!("Roche Web ({clean_login})");
         let safe_name: String = raw_name.chars().take(MAX_DEVICE_NAME_LEN).collect();
-        let tokens = TokenManager::new(self.service.db.auth());
-        Ok(tokens.create(&safe_name, self.service.config.auth.token_length).await?)
+        let auth_repo = self.service.db.auth();
+        let tokens = TokenManager::new(auth_repo);
+        let minted = tokens.create(&safe_name, self.service.config.auth.token_length).await?;
+        let _ = self
+            .service
+            .db
+            .auth()
+            .prune_excess_named_tokens(&safe_name, MAX_TAILSCALE_WEB_TOKENS_PER_USER)
+            .await;
+        self.service
+            .tailscale_web_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(clean_login, minted.clone());
+        Ok(minted)
     }
 
     pub async fn revoke_session_token(&self, raw_session_token: &str) -> Result<bool, ApiError> {
+        {
+            let mut guard = self
+                .service
+                .tailscale_web_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.retain(|_, tok| tok != raw_session_token);
+        }
         let token_hash = TokenManager::hash_token(raw_session_token);
         Ok(self.service.db.auth().revoke_device_by_token_hash(&token_hash).await?)
     }
@@ -624,7 +727,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {
         let repo = self.service.db.feeds();
         let media_repo = self.service.db.media();
-        let media_list = media_repo.list_for_feed(id).await?;
+        let media_list = media_repo.list_exclusively_owned_by_feed(id).await?;
 
         if !repo.delete(id).await? {
             return Err(ApiError::not_found("Feed not found"));
@@ -635,20 +738,10 @@ impl<F: FeedFetcher> FeedService<'_, F> {
     }
 
     pub async fn refresh(&self, id: &str) -> Result<Feed, ApiError> {
-        let repo = self.service.db.feeds();
         let feed = self.get(id).await?;
         let ctx = self.service.media_ingest_context();
 
-        if let Err(err) = FeedIngester::poll_with_media(&ctx, &feed).await {
-            let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
-            tracing::error!(
-                feed_title = %feed_title,
-                feed_url = %feed.url,
-                feed_id = %feed.id,
-                error = %err,
-                "Manual feed refresh failed"
-            );
-            let _ = repo.mark_error(&feed.id, &err.to_string()).await;
+        if let Err(err) = FeedIngester::poll_and_record(&ctx, &feed, "manual_refresh").await {
             return match err {
                 PollError::Upstream(upstream) => {
                     Err(ApiError::bad_gateway(format!("Failed to refresh feed: {upstream}")))
@@ -683,17 +776,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
                     return;
                 };
                 let ctx = service_clone.media_ingest_context();
-                if let Err(err) = FeedIngester::poll_with_media(&ctx, &feed).await {
-                    let feed_title = feed.title.as_deref().unwrap_or("<untitled>");
-                    tracing::error!(
-                        feed_title = %feed_title,
-                        feed_url = %feed.url,
-                        feed_id = %feed.id,
-                        error = %err,
-                        "OPML initial feed poll failed"
-                    );
-                    let _ = service_clone.db.feeds().mark_error(&feed.id, &err.to_string()).await;
-                }
+                let _ = FeedIngester::poll_and_record(&ctx, &feed, "opml_import").await;
             });
         }
         while join_set.join_next().await.is_some() {}
@@ -1068,10 +1151,33 @@ mod tests {
             let hi = u8::try_from((idx >> 8) & 0xff).unwrap();
             let lo = u8::try_from(idx & 0xff).unwrap();
             let ip = IpAddr::V4(Ipv4Addr::new(198, 51, hi, lo));
-            assert!(limiter.check_and_record(active_hash, ip));
+            assert!(limiter.check_and_record(active_hash, PairingClientKey::DirectIp(ip)));
         }
 
         let guard = limiter.state.lock().unwrap();
-        assert_eq!(guard.by_ip.len(), MAX_TRACKED_PAIRING_IPS);
+        assert_eq!(guard.by_client.len(), MAX_TRACKED_PAIRING_IPS);
+    }
+
+    #[test]
+    fn test_pairing_rate_limiter_isolates_tailscale_logins_behind_loopback() {
+        let limiter = PairingRateLimiter::default();
+        let active_hash = "hash-ts";
+
+        for _ in 0..PAIR_RATE_LIMIT_MAX_FAILURES {
+            assert!(limiter.check_and_record(
+                active_hash,
+                PairingClientKey::TailscaleLogin("alice@tailnet.ts.net".to_owned()),
+            ));
+        }
+        assert!(!limiter.check_and_record(
+            active_hash,
+            PairingClientKey::TailscaleLogin("alice@tailnet.ts.net".to_owned()),
+        ));
+
+        // Another Tailscale user behind the same 127.0.0.1 `tailscale serve` proxy is unaffected.
+        assert!(limiter.check_and_record(
+            active_hash,
+            PairingClientKey::TailscaleLogin("bob@tailnet.ts.net".to_owned()),
+        ));
     }
 }

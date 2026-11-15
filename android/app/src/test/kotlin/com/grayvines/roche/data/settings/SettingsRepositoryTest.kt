@@ -81,35 +81,35 @@ class SettingsRepositoryTest {
 
     @Test
     fun `normalizeServerUrl parsePairingInput and Tailscale candidates handle MagicDNS and bundles`() {
-        assertEquals("http://roche:8080", normalizeServerUrl("roche"))
-        assertEquals("http://roche:8080", normalizeServerUrl("roche:8080/"))
+        assertEquals("https://roche", normalizeServerUrl("roche"))
+        assertEquals("https://roche:8080", normalizeServerUrl("roche:8080/"))
         assertEquals(
-            "http://mac-mini.tail9876.ts.net:8080",
+            "https://mac-mini.tail9876.ts.net:8080",
             normalizeServerUrl("mac-mini.tail9876.ts.net:8080"),
         )
         assertEquals(
-            "http://airm.long-boa.ts.net:8080",
+            "https://airm.long-boa.ts.net:8080",
             normalizeServerUrl("https://airm.long-boa.ts.net:8080"),
         )
         assertEquals(
             "https://roche.tail9876.ts.net",
             normalizeServerUrl("roche.tail9876.ts.net"),
         )
+        assertEquals("http://100.64.0.9:8080", normalizeServerUrl("100.64.0.9:8080"))
+        assertEquals("https://100.63.0.1:8080", normalizeServerUrl("100.63.0.1:8080"))
 
         val (url, code) =
             parsePairingInput(
                 rawServerUrl = "",
-                rawPairingCode = "  http://roche.tail9876.ts.net:8080#1234-guitarist-revenue  ",
+                rawPairingCode = "  https://roche.tail9876.ts.net#1234-guitarist-revenue  ",
             )
-        assertEquals("http://roche.tail9876.ts.net:8080", url)
+        assertEquals("https://roche.tail9876.ts.net", url)
         assertEquals("1234-guitarist-revenue", code)
 
         val candidates = tailscaleDiscoveryUrls(listOf("tail9876.ts.net.", "evil.com/path#@"))
         assertEquals(
             listOf(
                 "https://roche.tail9876.ts.net",
-                "http://roche.tail9876.ts.net:8080",
-                "http://roche:8080",
                 "https://roche",
             ),
             candidates,
@@ -351,6 +351,12 @@ class SettingsRepositoryTest {
             ),
             parsed.candidateStreamingUrls(),
         )
+        assertTrue(
+            parsed
+                .copy(spotifyId = "spotify:album:spotify_album_123")
+                .candidateStreamingUrls()
+                .contains("https://open.spotify.com/album/spotify_album_123")
+        )
     }
 
     @Test
@@ -447,6 +453,54 @@ class SettingsRepositoryTest {
                     listOf(AppTab.HOME, AppTab.LISTS, AppTab.FEEDS, AppTab.SETTINGS),
                     repository.settings.first().bottomNavTabs,
                 )
+            } finally {
+                dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `unrelated settings update preserves undecryptable bearerToken ciphertext until explicit clear`() =
+        runTest {
+            val keyA = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val keyB = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val cipherA = AesGcmSecretKeyTokenCipher(keyA)
+            val cipherB = AesGcmSecretKeyTokenCipher(keyB)
+            val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val store =
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "preserve_token.preferences_pb") },
+                    )
+                val encryptedWithA = cipherA.encrypt("recoverable-token")
+                store.edit { prefs ->
+                    prefs[SettingsRepository.KEY_SERVER_URL] = "http://100.64.0.9:8080"
+                    prefs[SettingsRepository.KEY_BEARER_TOKEN] = encryptedWithA
+                    prefs[SettingsRepository.KEY_LAST_PEER_SYNC_CURSOR] = "2026-06-01T12:00:00Z"
+                }
+
+                // Cipher B temporarily fails to decrypt -> settings.bearerToken reads as ""
+                val brokenRepo = SettingsRepository(store, cipherB)
+                assertEquals("", brokenRepo.settings.first().bearerToken)
+
+                // Unrelated UI toggle MUST NOT overwrite the stored ciphertext or wipe sync cursor
+                brokenRepo.update { it.copy(ultraDenseRows = true) }
+                assertEquals(
+                    encryptedWithA,
+                    store.data.first()[SettingsRepository.KEY_BEARER_TOKEN],
+                )
+                assertEquals(
+                    "2026-06-01T12:00:00Z",
+                    store.data.first()[SettingsRepository.KEY_LAST_PEER_SYNC_CURSOR],
+                )
+
+                // Restoring Cipher A recovers the intact token!
+                val recoveredRepo = SettingsRepository(store, cipherA)
+                assertEquals("recoverable-token", recoveredRepo.settings.first().bearerToken)
+
+                // Explicit blank clear DOES wipe KEY_BEARER_TOKEN
+                brokenRepo.update { it.copy(bearerToken = "") }
+                assertEquals("", store.data.first()[SettingsRepository.KEY_BEARER_TOKEN])
             } finally {
                 dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
             }

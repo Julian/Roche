@@ -10,6 +10,7 @@ import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.ranking.EpRankingEngine
@@ -23,12 +24,17 @@ internal data class OutgoingCatalogSyncBatch(
     val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
     val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
     val comparisons: List<PeerComparisonPayload> = emptyList(),
-    val sentDirtyCollectionIds: Set<String> = emptySet(),
-    val sentDirtyEntryIds: Set<String> = emptySet(),
-    val sentDirtyMemberships: Set<Pair<String, String>> = emptySet(),
-    val sentDirtyGeneratorIds: Set<String> = emptySet(),
+    val sentDirtyCollectionUpdatedAt: Map<String, String> = emptyMap(),
+    val sentDirtyEntryUpdatedAt: Map<String, String> = emptyMap(),
+    val sentDirtyMembershipAddedAt: Map<Pair<String, String>, String> = emptyMap(),
+    val sentDirtyGeneratorUpdatedAt: Map<String, String> = emptyMap(),
     val sentDirtyLogIds: Set<String> = emptySet(),
     val sentDirtyComparisonIds: Set<String> = emptySet(),
+    val overflowCollectionIds: List<String> = emptyList(),
+    val overflowEntryIds: List<String> = emptyList(),
+    val overflowMembershipKeys: List<Pair<String, String>> = emptyList(),
+    val overflowLogIds: List<String> = emptyList(),
+    val overflowComparisonIds: List<String> = emptyList(),
     val hasAnyLocalCatalogData: Boolean = false,
 )
 
@@ -56,6 +62,11 @@ internal suspend fun hasLocalCatalogSyncData(dao: RocheDao): Boolean {
 }
 
 private const val TOMBSTONE_COLLECTION_ENTRY = "collection_entry"
+private const val MAX_SYNC_COLLECTIONS = 1_000
+private const val MAX_SYNC_CATALOG_ENTRIES = 4_000
+private const val MAX_SYNC_COLLECTION_ENTRIES = 8_000
+private const val MAX_SYNC_CONSUMPTION_LOG = 8_000
+private const val MAX_SYNC_COMPARISONS = 8_000
 
 internal suspend fun buildOutgoingCatalogSyncBatch(
     dao: RocheDao,
@@ -63,62 +74,217 @@ internal suspend fun buildOutgoingCatalogSyncBatch(
     syncedFeedIds: Set<String> = emptySet(),
     syncedItemIds: Set<String> = emptySet(),
 ): OutgoingCatalogSyncBatch {
-    val allSpecs = dao.getAllCollectionSpecs()
-    val allEntries = dao.getAllCatalogEntries()
-    val allMemberships = dao.getAllCollectionEntries()
-    val allGenerators = dao.getAllCollectionGenerators()
-    val allLogs = dao.getAllConsumptionLogs()
-    val allComparisons = dao.getAllComparisons()
-
-    val customSpecs = selectCustomSpecs(allSpecs)
-    val sentSpecs = customSpecs.filter {
-        it.isLocalDirty || isIncludedInSyncWindow(it.updatedAt, inclusiveSinceInstant)
-    }
-    val specIds = allSpecs.map { it.collectionId }.toHashSet()
-    val pool1001Ids =
-        allMemberships
-            .filter { it.collectionId == ALBUMS_1001_COLLECTION_ID }
-            .map { it.entryId }
-            .toHashSet()
+    val tables = loadOutgoingCatalogTables(dao)
+    val customSpecs = selectCustomSpecs(tables.specs)
+    val (sentSpecs, overflowSpecs) = selectOutgoingSpecs(customSpecs, inclusiveSinceInstant)
+    val specIds = tables.specs.map { it.collectionId }.toHashSet()
+    val pool1001Ids = collectPool1001Ids(tables.memberships)
+    val slices = selectOutgoingChildSlices(tables, syncedFeedIds, inclusiveSinceInstant)
     val entryFilterCtx =
-        OutgoingEntryFilterContext(
+        buildOutgoingEntryFilterCtx(
+            tables = tables,
+            slices = slices,
             specIds = specIds,
+            pool1001Ids = pool1001Ids,
             syncedFeedIds = syncedFeedIds,
             syncedItemIds = syncedItemIds,
-            pool1001Ids = pool1001Ids,
-            referencedEntryIds =
-                collectReferencedNonPoolIds(allLogs, allGenerators, allMemberships),
             inclusiveSince = inclusiveSinceInstant,
         )
-    val sentEntries = allEntries.filter { shouldSyncCatalogEntry(it, entryFilterCtx) }
-    val identsByEntryId =
-        dao.getAllEntryIdentifiers()
-            .groupBy { it.entryId }
-            .mapValues { (_, list) -> list.map { EntryIdentifierDto(it.scheme, it.value) } }
-    val specsById = allSpecs.associateBy { it.collectionId }
-    val sentMemberships =
-        selectOutgoingMemberships(allMemberships, specsById, syncedFeedIds, inclusiveSinceInstant)
-    val sentGenerators = selectOutgoingGenerators(allGenerators, inclusiveSinceInstant)
-    val sentLogs = selectOutgoingLogs(allLogs, inclusiveSinceInstant)
-    val sentComparisons = selectOutgoingComparisons(allComparisons, inclusiveSinceInstant)
+    val (sentEntries, overflowEntries) =
+        splitWithCap(
+            tables.entries
+                .filter { shouldSyncCatalogEntry(it, entryFilterCtx) }
+                .sortedWith(
+                    compareByDescending<CatalogEntryEntity> { it.isLocalDirty }
+                        .thenBy { it.updatedAt }
+                ),
+            MAX_SYNC_CATALOG_ENTRIES,
+        )
     val hasAnyLocalData =
-        customSpecs.isNotEmpty() ||
-            allLogs.isNotEmpty() ||
-            allComparisons.isNotEmpty() ||
-            allGenerators.any { it.enabled || !it.currentEntryId.isNullOrBlank() } ||
-            allEntries.any { it.id !in pool1001Ids && it.id !in specIds }
-
+        hasNonSeedCatalogRows(
+            customSpecs,
+            tables.logs,
+            tables.comparisons,
+            tables.generators,
+            tables.entries,
+            pool1001Ids,
+            specIds,
+        )
     return assembleOutgoingCatalogBatch(
         sentSpecs = sentSpecs,
         sentEntries = sentEntries,
-        identsByEntryId = identsByEntryId,
-        sentMemberships = sentMemberships,
-        sentGenerators = sentGenerators,
-        sentLogs = sentLogs,
-        sentComparisons = sentComparisons,
+        identsByEntryId = loadEntryIdentsByEntryId(dao),
+        sentMemberships = slices.sentMemberships,
+        sentGenerators = slices.sentGenerators,
+        sentLogs = slices.sentLogs,
+        sentComparisons = slices.sentComparisons,
+        overflowIds =
+            OverflowCatalogIds(
+                collectionIds = overflowSpecs.map { it.collectionId },
+                entryIds = overflowEntries.map { it.id },
+                membershipKeys = slices.overflowMemberships.map { it.collectionId to it.entryId },
+                logIds = slices.overflowLogs.map { it.id },
+                comparisonIds = slices.overflowComparisons.map { it.id },
+            ),
         hasAnyLocalCatalogData = hasAnyLocalData,
     )
 }
+
+private data class OutgoingCatalogTables(
+    val specs: List<CollectionSpecEntity>,
+    val entries: List<CatalogEntryEntity>,
+    val memberships: List<CollectionEntryEntity>,
+    val generators: List<CollectionGeneratorEntity>,
+    val logs: List<ConsumptionLogEntity>,
+    val comparisons: List<ComparisonEntity>,
+)
+
+private data class OutgoingChildSlices(
+    val sentMemberships: List<CollectionEntryEntity>,
+    val overflowMemberships: List<CollectionEntryEntity>,
+    val sentGenerators: List<CollectionGeneratorEntity>,
+    val sentLogs: List<ConsumptionLogEntity>,
+    val overflowLogs: List<ConsumptionLogEntity>,
+    val sentComparisons: List<ComparisonEntity>,
+    val overflowComparisons: List<ComparisonEntity>,
+)
+
+private suspend fun loadOutgoingCatalogTables(dao: RocheDao): OutgoingCatalogTables =
+    OutgoingCatalogTables(
+        specs = dao.getAllCollectionSpecs(),
+        entries = dao.getAllCatalogEntries(),
+        memberships = dao.getAllCollectionEntries(),
+        generators = dao.getAllCollectionGenerators(),
+        logs = dao.getAllConsumptionLogs(),
+        comparisons = dao.getAllComparisons(),
+    )
+
+private fun selectOutgoingChildSlices(
+    tables: OutgoingCatalogTables,
+    syncedFeedIds: Set<String>,
+    inclusiveSince: Instant?,
+): OutgoingChildSlices {
+    val specsById = tables.specs.associateBy { it.collectionId }
+    val (sentMem, overMem) =
+        splitWithCap(
+            selectOutgoingMemberships(tables.memberships, specsById, syncedFeedIds, inclusiveSince)
+                .sortedWith(
+                    compareByDescending<CollectionEntryEntity> { it.isLocalDirty }
+                        .thenBy { it.addedAt }
+                ),
+            MAX_SYNC_COLLECTION_ENTRIES,
+        )
+    val (sentLogs, overLogs) =
+        splitWithCap(
+            selectOutgoingLogs(tables.logs, inclusiveSince)
+                .sortedWith(
+                    compareByDescending<ConsumptionLogEntity> { it.isLocalDirty }
+                        .thenBy { it.createdAt }
+                ),
+            MAX_SYNC_CONSUMPTION_LOG,
+        )
+    val (sentComps, overComps) =
+        splitWithCap(
+            selectOutgoingComparisons(tables.comparisons, inclusiveSince)
+                .sortedWith(
+                    compareByDescending<ComparisonEntity> { it.isLocalDirty }
+                        .thenBy { it.createdAt }
+                ),
+            MAX_SYNC_COMPARISONS,
+        )
+    return OutgoingChildSlices(
+        sentMemberships = sentMem,
+        overflowMemberships = overMem,
+        sentGenerators = selectOutgoingGenerators(tables.generators, inclusiveSince),
+        sentLogs = sentLogs,
+        overflowLogs = overLogs,
+        sentComparisons = sentComps,
+        overflowComparisons = overComps,
+    )
+}
+
+@Suppress("LongParameterList")
+private fun buildOutgoingEntryFilterCtx(
+    tables: OutgoingCatalogTables,
+    slices: OutgoingChildSlices,
+    specIds: Set<String>,
+    pool1001Ids: Set<String>,
+    syncedFeedIds: Set<String>,
+    syncedItemIds: Set<String>,
+    inclusiveSince: Instant?,
+): OutgoingEntryFilterContext {
+    val outgoingRefs =
+        collectReferencedNonPoolIds(
+            allEntries = emptyList(),
+            allLogs = slices.sentLogs,
+            allGenerators = slices.sentGenerators,
+            allMemberships = slices.sentMemberships,
+            allComparisons = slices.sentComparisons,
+        ) - pool1001Ids - specIds
+    val allRefs =
+        collectReferencedNonPoolIds(
+            tables.entries,
+            tables.logs,
+            tables.generators,
+            tables.memberships,
+            tables.comparisons,
+        )
+    return OutgoingEntryFilterContext(
+        specIds = specIds,
+        syncedFeedIds = syncedFeedIds,
+        syncedItemIds = syncedItemIds,
+        pool1001Ids = pool1001Ids,
+        referencedEntryIds = allRefs,
+        outgoingReferencedIds = outgoingRefs,
+        inclusiveSince = inclusiveSince,
+    )
+}
+
+private fun <T> splitWithCap(items: List<T>, cap: Int): Pair<List<T>, List<T>> =
+    if (items.size <= cap) items to emptyList() else items.take(cap) to items.drop(cap)
+
+private fun selectOutgoingSpecs(
+    customSpecs: List<CollectionSpecEntity>,
+    inclusiveSinceInstant: Instant?,
+): Pair<List<CollectionSpecEntity>, List<CollectionSpecEntity>> =
+    splitWithCap(
+        customSpecs
+            .filter {
+                it.isLocalDirty || isIncludedInSyncWindow(it.updatedAt, inclusiveSinceInstant)
+            }
+            .sortedWith(
+                compareByDescending<CollectionSpecEntity> { it.isLocalDirty }
+                    .thenBy { it.updatedAt }
+            ),
+        MAX_SYNC_COLLECTIONS,
+    )
+
+private fun collectPool1001Ids(allMemberships: List<CollectionEntryEntity>): Set<String> =
+    allMemberships
+        .filter { it.collectionId == ALBUMS_1001_COLLECTION_ID }
+        .map { it.entryId }
+        .toHashSet()
+
+private suspend fun loadEntryIdentsByEntryId(dao: RocheDao): Map<String, List<EntryIdentifierDto>> =
+    dao.getAllEntryIdentifiers()
+        .groupBy { it.entryId }
+        .mapValues { (_, list) -> list.map { EntryIdentifierDto(it.scheme, it.value) } }
+
+@Suppress("LongParameterList")
+private fun hasNonSeedCatalogRows(
+    customSpecs: List<CollectionSpecEntity>,
+    allLogs: List<ConsumptionLogEntity>,
+    allComparisons: List<ComparisonEntity>,
+    allGenerators: List<CollectionGeneratorEntity>,
+    allEntries: List<CatalogEntryEntity>,
+    pool1001Ids: Set<String>,
+    specIds: Set<String>,
+): Boolean =
+    customSpecs.isNotEmpty() ||
+        allLogs.isNotEmpty() ||
+        allComparisons.isNotEmpty() ||
+        allGenerators.any { it.enabled || !it.currentEntryId.isNullOrBlank() } ||
+        allEntries.any { it.id !in pool1001Ids && it.id !in specIds }
 
 private data class OutgoingEntryFilterContext(
     val specIds: Set<String>,
@@ -126,7 +292,16 @@ private data class OutgoingEntryFilterContext(
     val syncedItemIds: Set<String>,
     val pool1001Ids: Set<String>,
     val referencedEntryIds: Set<String>,
+    val outgoingReferencedIds: Set<String>,
     val inclusiveSince: Instant?,
+)
+
+private data class OverflowCatalogIds(
+    val collectionIds: List<String> = emptyList(),
+    val entryIds: List<String> = emptyList(),
+    val membershipKeys: List<Pair<String, String>> = emptyList(),
+    val logIds: List<String> = emptyList(),
+    val comparisonIds: List<String> = emptyList(),
 )
 
 private fun selectCustomSpecs(allSpecs: List<CollectionSpecEntity>): List<CollectionSpecEntity> =
@@ -137,31 +312,40 @@ private fun selectCustomSpecs(allSpecs: List<CollectionSpecEntity>): List<Collec
     }
 
 private fun collectReferencedNonPoolIds(
+    allEntries: List<CatalogEntryEntity>,
     allLogs: List<ConsumptionLogEntity>,
     allGenerators: List<CollectionGeneratorEntity>,
     allMemberships: List<CollectionEntryEntity>,
+    allComparisons: List<ComparisonEntity>,
 ): Set<String> = buildSet {
+    allEntries.forEach { entry ->
+        entry.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+    }
     allLogs.forEach { add(it.entryId) }
     allGenerators.mapNotNullTo(this) { it.currentEntryId }
     allMemberships
         .filter { it.collectionId != ALBUMS_1001_COLLECTION_ID }
         .forEach { add(it.entryId) }
+    allComparisons.forEach { comp ->
+        comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+        decodeComparisonOrdering(comp.orderingJson)?.flatten()?.forEach { id ->
+            id.trim().takeIf { it.isNotEmpty() }?.let(::add)
+        }
+    }
 }
 
 private fun shouldSyncCatalogEntry(
     entry: CatalogEntryEntity,
     ctx: OutgoingEntryFilterContext,
 ): Boolean {
-    val isExcluded =
-        entry.id in ctx.specIds || entry.id in ctx.syncedFeedIds || entry.id in ctx.syncedItemIds
-    if (isExcluded) return false
-    if (entry.isLocalDirty) return true
+    if (entry.id in ctx.specIds) return false
+    if (entry.isLocalDirty || !entry.mergedIntoId.isNullOrBlank()) return true
+    if (entry.id in ctx.syncedFeedIds || entry.id in ctx.syncedItemIds) return false
+    if (entry.id in ctx.outgoingReferencedIds) return true
     return if (ctx.inclusiveSince != null) {
         isIsoTimestampAtOrAfter(entry.updatedAt, ctx.inclusiveSince)
     } else {
-        !entry.mergedIntoId.isNullOrBlank() ||
-            entry.id !in ctx.pool1001Ids ||
-            entry.id in ctx.referencedEntryIds
+        entry.id !in ctx.pool1001Ids || entry.id in ctx.referencedEntryIds
     }
 }
 
@@ -225,6 +409,7 @@ private fun assembleOutgoingCatalogBatch(
     sentGenerators: List<CollectionGeneratorEntity>,
     sentLogs: List<ConsumptionLogEntity>,
     sentComparisons: List<ComparisonEntity>,
+    overflowIds: OverflowCatalogIds,
     hasAnyLocalCatalogData: Boolean,
 ): OutgoingCatalogSyncBatch =
     OutgoingCatalogSyncBatch(
@@ -235,18 +420,23 @@ private fun assembleOutgoingCatalogBatch(
         collectionGenerators = sentGenerators.map(::toPeerGeneratorPayload),
         consumptionLog = sentLogs.map(::toPeerConsumptionLogPayload),
         comparisons = sentComparisons.mapNotNull(::toPeerComparisonPayload),
-        sentDirtyCollectionIds =
-            sentSpecs.filter { it.isLocalDirty }.map { it.collectionId }.toSet(),
-        sentDirtyEntryIds = sentEntries.filter { it.isLocalDirty }.map { it.id }.toSet(),
-        sentDirtyMemberships =
+        sentDirtyCollectionUpdatedAt =
+            sentSpecs.filter { it.isLocalDirty }.associate { it.collectionId to it.updatedAt },
+        sentDirtyEntryUpdatedAt =
+            sentEntries.filter { it.isLocalDirty }.associate { it.id to it.updatedAt },
+        sentDirtyMembershipAddedAt =
             sentMemberships
                 .filter { it.isLocalDirty }
-                .map { it.collectionId to it.entryId }
-                .toSet(),
-        sentDirtyGeneratorIds =
-            sentGenerators.filter { it.isLocalDirty }.map { it.collectionId }.toSet(),
+                .associate { Pair(it.collectionId, it.entryId) to it.addedAt },
+        sentDirtyGeneratorUpdatedAt =
+            sentGenerators.filter { it.isLocalDirty }.associate { it.collectionId to it.updatedAt },
         sentDirtyLogIds = sentLogs.filter { it.isLocalDirty }.map { it.id }.toSet(),
         sentDirtyComparisonIds = sentComparisons.filter { it.isLocalDirty }.map { it.id }.toSet(),
+        overflowCollectionIds = overflowIds.collectionIds,
+        overflowEntryIds = overflowIds.entryIds,
+        overflowMembershipKeys = overflowIds.membershipKeys,
+        overflowLogIds = overflowIds.logIds,
+        overflowComparisonIds = overflowIds.comparisonIds,
         hasAnyLocalCatalogData = hasAnyLocalCatalogData,
     )
 
@@ -269,29 +459,78 @@ internal suspend fun reconcileIncomingCatalogSync(
     }
 
     val nowIso = response.syncTimestamp.ifBlank { nowUtcIso() }
-    clearSentDirtyCatalogRows(dao, sentBatch)
-    applyCollectionEntryTombstones(dao, response)
-    mergeIncomingCollections(dao, response.collections, nowIso)
-    val redirectMap = mergeIncomingCatalogEntries(dao, response.catalogEntries, nowIso)
-    mergeIncomingCollectionEntries(dao, response.collectionEntries, redirectMap, nowIso)
-    mergeIncomingConsumptionLogs(dao, response.consumptionLog, redirectMap, nowIso)
-    mergeIncomingComparisons(dao, response.comparisons, redirectMap, nowIso)
-    mergeIncomingGenerators(dao, catalogStore, response.collectionGenerators, redirectMap, nowIso)
-    if (catalogStore != null) {
-        val referencedIds = buildSet {
-            response.consumptionLog.forEach {
-                add(followMergedInMap(it.entryId.trim(), redirectMap))
-            }
-            response.collectionEntries.forEach {
-                add(followMergedInMap(it.entryId.trim(), redirectMap))
-            }
-            response.comparisons.forEach { comp ->
-                comp.ordering.forEach { group ->
-                    group.forEach { add(followMergedInMap(it.trim(), redirectMap)) }
-                }
-            }
+    dao.executeInTransaction {
+        clearSentDirtyCatalogRows(dao, sentBatch)
+        markOverflowCatalogRowsDirty(dao, sentBatch)
+        applyCollectionEntryTombstones(dao, response)
+        val specRedirects = mergeIncomingCollections(dao, response.collections, nowIso)
+        val entryRedirects = mergeIncomingCatalogEntries(dao, response.catalogEntries, nowIso)
+        val redirectMap = specRedirects + entryRedirects
+        mergeIncomingCollectionEntries(dao, response.collectionEntries, redirectMap, nowIso)
+        mergeIncomingConsumptionLogs(dao, response.consumptionLog, redirectMap, nowIso)
+        mergeIncomingComparisons(dao, response.comparisons, redirectMap, nowIso)
+        mergeIncomingGenerators(
+            dao,
+            catalogStore,
+            response.collectionGenerators,
+            redirectMap,
+            nowIso,
+        )
+        if (catalogStore != null) {
+            val referencedIds = collectReferencedSyncIds(dao, response, redirectMap)
+            catalogStore.materializeReferencedFeeds(referencedIds, nowIso)
         }
-        catalogStore.materializeReferencedFeeds(referencedIds, nowIso)
+    }
+}
+
+private suspend fun markOverflowCatalogRowsDirty(
+    dao: RocheDao,
+    sentBatch: OutgoingCatalogSyncBatch,
+) {
+    sentBatch.overflowCollectionIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
+        dao.markCollectionSpecsDirty(it)
+    }
+    sentBatch.overflowEntryIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
+        dao.markCatalogEntriesDirty(it)
+    }
+    for ((colId, entryId) in sentBatch.overflowMembershipKeys) {
+        dao.markCollectionEntryDirty(colId, entryId)
+    }
+    sentBatch.overflowLogIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
+        dao.markConsumptionLogsDirty(it)
+    }
+    sentBatch.overflowComparisonIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach {
+        dao.markComparisonsDirty(it)
+    }
+}
+
+private suspend fun collectReferencedSyncIds(
+    dao: RocheDao,
+    response: PeerSyncResponseDto,
+    redirectMap: Map<String, String>,
+): Set<String> = buildSet {
+    response.consumptionLog.forEach { add(followMergedInMap(it.entryId.trim(), redirectMap)) }
+    response.collectionEntries.forEach { add(followMergedInMap(it.entryId.trim(), redirectMap)) }
+    response.comparisons.forEach { comp ->
+        comp.ordering.flatten().forEach { add(followMergedInMap(it.trim(), redirectMap)) }
+    }
+    val incomingIds =
+        response.items.mapTo(HashSet()) { it.id } + response.feeds.mapTo(HashSet()) { it.id }
+    if (incomingIds.isNotEmpty()) {
+        addAll(collectLocalRefsForIncomingIds(dao, incomingIds))
+    }
+}
+
+private suspend fun collectLocalRefsForIncomingIds(
+    dao: RocheDao,
+    incomingIds: Set<String>,
+): Set<String> = buildSet {
+    dao.getAllConsumptionLogs().forEach { if (it.entryId in incomingIds) add(it.entryId) }
+    dao.getAllCollectionEntries().forEach { if (it.entryId in incomingIds) add(it.entryId) }
+    dao.getAllComparisons().forEach { comp ->
+        decodeComparisonOrdering(comp.orderingJson)?.flatten()?.forEach { id ->
+            if (id in incomingIds) add(id)
+        }
     }
 }
 
@@ -299,17 +538,21 @@ private suspend fun clearSentDirtyCatalogRows(
     dao: RocheDao,
     sentBatch: OutgoingCatalogSyncBatch,
 ) {
-    if (sentBatch.sentDirtyCollectionIds.isNotEmpty()) {
-        dao.clearCollectionSpecsDirty(sentBatch.sentDirtyCollectionIds.toList())
+    for ((colId, expectedUpdatedAt) in sentBatch.sentDirtyCollectionUpdatedAt) {
+        dao.clearSpecDirtyIfSameTs(colId, expectedUpdatedAt)
     }
-    if (sentBatch.sentDirtyEntryIds.isNotEmpty()) {
-        dao.clearCatalogEntriesDirty(sentBatch.sentDirtyEntryIds.toList())
+    for ((entryId, expectedUpdatedAt) in sentBatch.sentDirtyEntryUpdatedAt) {
+        dao.clearEntryDirtyIfSameTs(entryId, expectedUpdatedAt)
     }
-    for ((colId, entryId) in sentBatch.sentDirtyMemberships) {
-        dao.clearCollectionEntryDirty(colId, entryId)
+    for ((membershipKey, expectedAddedAt) in sentBatch.sentDirtyMembershipAddedAt) {
+        dao.clearMemberDirtyIfSameTs(
+            membershipKey.first,
+            membershipKey.second,
+            expectedAddedAt,
+        )
     }
-    for (genId in sentBatch.sentDirtyGeneratorIds) {
-        dao.clearCollectionGeneratorDirty(genId)
+    for ((genId, expectedUpdatedAt) in sentBatch.sentDirtyGeneratorUpdatedAt) {
+        dao.clearGeneratorDirtyIfSameTs(genId, expectedUpdatedAt)
     }
     if (sentBatch.sentDirtyLogIds.isNotEmpty()) {
         dao.clearConsumptionLogsDirty(sentBatch.sentDirtyLogIds.toList())
@@ -350,23 +593,60 @@ private suspend fun mergeIncomingCollections(
     dao: RocheDao,
     incoming: List<PeerCollectionSpecPayload>,
     nowIso: String,
-) {
-    if (incoming.isEmpty()) return
-    val existingById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
+): Map<String, String> {
+    if (incoming.isEmpty()) return emptyMap()
+    val existingSpecs = dao.getAllCollectionSpecs()
+    val existingById = existingSpecs.associateBy { it.collectionId }.toMutableMap()
+    val existingBySlug =
+        existingSpecs
+            .mapNotNull { s ->
+                s.slug?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }?.let { it to s }
+            }
+            .toMap()
+            .toMutableMap()
+    val existingEntriesById = dao.getAllCatalogEntries().associateBy { it.id }
     val upserts = ArrayList<CollectionSpecEntity>()
+    val entryUpserts = ArrayList<CatalogEntryEntity>()
     val idents = ArrayList<EntryIdentifierEntity>()
+    val specRedirects = HashMap<String, String>()
     for (col in incoming) {
-        val merged = resolveIncomingCollectionSpec(col, existingById, nowIso) ?: continue
+        val merged =
+            resolveIncomingCollectionSpec(
+                col = col,
+                existingById = existingById,
+                existingBySlug = existingBySlug,
+                specRedirects = specRedirects,
+                nowIso = nowIso,
+            ) ?: continue
         upserts.add(merged.first)
+        existingById[merged.first.collectionId] = merged.first
+        merged.first.slug?.let { existingBySlug[it] = merged.first }
+        entryUpserts.add(
+            mergeCollectionCatalogEntry(
+                merged.first,
+                existingEntriesById[merged.first.collectionId],
+            )
+        )
         merged.second?.let(idents::add)
     }
     if (upserts.isNotEmpty()) dao.upsertCollectionSpecs(upserts)
+    if (entryUpserts.isNotEmpty()) dao.upsertCatalogEntries(entryUpserts)
     if (idents.isNotEmpty()) dao.insertEntryIdentifiersIgnore(idents)
+    return specRedirects
 }
+
+private fun mergeCollectionCatalogEntry(
+    spec: CollectionSpecEntity,
+    existing: CatalogEntryEntity?,
+): CatalogEntryEntity =
+    existing?.copy(title = spec.title, summary = spec.summary ?: existing.summary)
+        ?: buildCollectionCatalogEntry(spec)
 
 private fun resolveIncomingCollectionSpec(
     col: PeerCollectionSpecPayload,
     existingById: Map<String, CollectionSpecEntity>,
+    existingBySlug: Map<String, CollectionSpecEntity>,
+    specRedirects: MutableMap<String, String>,
     nowIso: String,
 ): Pair<CollectionSpecEntity, EntryIdentifierEntity?>? {
     val cleanTitle = col.title.trim()
@@ -375,7 +655,16 @@ private fun resolveIncomingCollectionSpec(
         return null
     }
     val slug = col.slug?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
-    val colId = resolveIncomingCollectionId(col.collectionId, slug) ?: return null
+    val candidateId = resolveIncomingCollectionId(col.collectionId, slug) ?: return null
+    val slugOwner = slug?.let { existingBySlug[it] }
+    val colId =
+        if (slugOwner != null && slugOwner.collectionId != candidateId) {
+            if (isProtectedCollectionSpec(slugOwner)) return null
+            recordCollectionSpecRedirect(specRedirects, col.collectionId, candidateId, slugOwner)
+            slugOwner.collectionId
+        } else {
+            candidateId
+        }
     val existing = existingById[colId]
     if (existing != null && CollectionRole.fromWireValue(existing.role) == CollectionRole.SYSTEM) {
         return null
@@ -383,6 +672,25 @@ private fun resolveIncomingCollectionSpec(
     val specEntity = buildIncomingSpecEntity(col, colId, cleanTitle, slug, role, existing, nowIso)
     val slugIdent = slug?.let { EntryIdentifierEntity("slug", it, colId) }
     return specEntity to slugIdent
+}
+
+private fun isProtectedCollectionSpec(spec: CollectionSpecEntity): Boolean =
+    CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
+        CollectionMode.fromWireValue(spec.mode) == CollectionMode.DYNAMIC
+
+private fun recordCollectionSpecRedirect(
+    specRedirects: MutableMap<String, String>,
+    rawId: String,
+    candidateId: String,
+    slugOwner: CollectionSpecEntity,
+) {
+    specRedirects[candidateId] = slugOwner.collectionId
+    rawId
+        .trim()
+        .takeIf { it.isNotEmpty() && it != slugOwner.collectionId }
+        ?.let {
+            specRedirects[it] = slugOwner.collectionId
+        }
 }
 
 @Suppress("LongParameterList")
@@ -394,8 +702,22 @@ private fun buildIncomingSpecEntity(
     role: CollectionRole,
     existing: CollectionSpecEntity?,
     nowIso: String,
-): CollectionSpecEntity =
-    CollectionSpecEntity(
+): CollectionSpecEntity {
+    val incomingWins =
+        shouldAcceptIncomingLwwUpdate(
+            incomingUpdatedAt = col.updatedAt,
+            localUpdatedAt = existing?.updatedAt,
+            localDirty = existing?.isLocalDirty == true,
+        )
+    if (existing != null && !incomingWins) {
+        return existing.copy(
+            summary = existing.summary ?: nonBlankOrFallback(col.summary, null),
+            slug = existing.slug ?: slug,
+            ruleJson = existing.ruleJson ?: col.ruleJson,
+            color = existing.color ?: nonBlankOrFallback(col.color, null),
+        )
+    }
+    return CollectionSpecEntity(
         collectionId = colId,
         title = cleanTitle,
         summary = nonBlankOrFallback(col.summary, existing?.summary),
@@ -406,9 +728,34 @@ private fun buildIncomingSpecEntity(
         showInLists = col.showInLists,
         color = nonBlankOrFallback(col.color, existing?.color),
         createdAt = col.createdAt ?: existing?.createdAt ?: nowIso,
-        updatedAt = col.updatedAt ?: nowIso,
-        isLocalDirty = existing?.isLocalDirty == true,
+        updatedAt = col.updatedAt?.takeIf { it.isNotBlank() } ?: existing?.updatedAt ?: nowIso,
+        isLocalDirty = existing?.isLocalDirty == true && !incomingWins,
     )
+}
+
+private fun shouldAcceptIncomingLwwUpdate(
+    incomingUpdatedAt: String?,
+    localUpdatedAt: String?,
+    localDirty: Boolean,
+): Boolean {
+    if (localUpdatedAt.isNullOrBlank()) return true
+    val localInstant =
+        runCatching { Instant.parse(localUpdatedAt.trim()) }.getOrNull() ?: return true
+    val incomingInstant =
+        incomingUpdatedAt
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let {
+                runCatching { Instant.parse(it) }.getOrNull()
+            }
+    return if (incomingInstant == null) {
+        !localDirty
+    } else if (localDirty) {
+        incomingInstant.isAfter(localInstant)
+    } else {
+        !incomingInstant.isBefore(localInstant)
+    }
+}
 
 private fun nonBlankOrFallback(raw: String?, fallback: String?): String? =
     raw?.trim()?.takeIf { it.isNotEmpty() } ?: fallback
@@ -524,18 +871,35 @@ private suspend fun repointMergedComparisonsInDao(
     dupId: String,
     canonId: String,
 ) {
-    dao.repointComparisonScope(dupId, canonId)
-    for (comp in dao.getAllComparisons().filter { it.orderingJson.contains(dupId) }) {
-        val parsed = decodeComparisonOrdering(comp.orderingJson)
-        if (parsed != null) {
-            val rewritten = rewriteOrderingAfterMerge(parsed, dupId, canonId)
-            if (rewritten.sumOf { it.size } < EpRankingEngine.MIN_K) {
-                dao.deleteComparisonById(comp.id)
-            } else {
-                dao.updateComparisonOrdering(comp.id, canonicalOrderingJson(rewritten))
-            }
+    val affected =
+        dao.getAllComparisons().filter {
+            it.scopeCollectionId == dupId || it.orderingJson.contains(dupId)
         }
+    for (comp in affected) {
+        rewriteSingleMergedComparison(dao, comp, dupId, canonId)
     }
+}
+
+private suspend fun rewriteSingleMergedComparison(
+    dao: RocheDao,
+    comp: ComparisonEntity,
+    dupId: String,
+    canonId: String,
+) {
+    val parsed = decodeComparisonOrdering(comp.orderingJson) ?: return
+    val newScope = if (comp.scopeCollectionId == dupId) canonId else comp.scopeCollectionId
+    val rewritten = rewriteOrderingAfterMerge(parsed, dupId, canonId)
+    dao.deleteComparisonById(comp.id)
+    if (rewritten.sumOf { it.size } < EpRankingEngine.MIN_K) return
+    val tsMillis = runCatching { Instant.parse(comp.ts.trim()).toEpochMilli() }.getOrDefault(0L)
+    val newId = deterministicComparisonId(newScope, tsMillis, rewritten)
+    dao.insertComparisonIgnore(
+        comp.copy(
+            id = newId,
+            scopeCollectionId = newScope,
+            orderingJson = canonicalOrderingJson(rewritten),
+        )
+    )
 }
 
 internal fun rewriteOrderingAfterMerge(
@@ -565,13 +929,15 @@ private fun buildMergedCatalogEntry(
     val id = item.id.trim()
     val title = item.title.trim()
     if (id.isEmpty() || title.isEmpty()) return null
+    val resolvedKind = EntryKind.fromWireValue(item.kind)
     val mergedInto = item.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() }
-    val entity = buildMergedCatalogEntity(item, id, title, mergedInto, existing, nowIso)
+    val entity =
+        buildMergedCatalogEntity(item, id, title, resolvedKind, mergedInto, existing, nowIso)
     val targetIdentOwner = mergedInto ?: id
     val identifiers =
         item.identifiers.mapNotNull { ident ->
-            val s = ident.scheme.trim().lowercase()
-            val v = ident.value.trim()
+            val s = normalizeIdentifierScheme(ident.scheme)
+            val v = normalizeIdentifierValue(resolvedKind, s, ident.value)
             if (s.isNotEmpty() && v.isNotEmpty()) {
                 EntryIdentifierEntity(s, v, targetIdentOwner)
             } else {
@@ -587,34 +953,101 @@ private fun buildMergedCatalogEntity(
     item: PeerCatalogEntryPayload,
     id: String,
     title: String,
+    resolvedKind: EntryKind,
     mergedInto: String?,
     existing: CatalogEntryEntity?,
     nowIso: String,
 ): CatalogEntryEntity {
-    val metadataJson = item.metadata?.toString()?.takeIf { it.isNotBlank() }
-    val creatorsJson =
-        if (item.creators.isNotEmpty()) {
-            encodeCreatorsJson(item.creators)
-        } else {
-            existing?.creatorsJson ?: "[]"
-        }
-    return CatalogEntryEntity(
+    val incomingWins =
+        shouldAcceptIncomingLwwUpdate(
+            incomingUpdatedAt = item.updatedAt,
+            localUpdatedAt = existing?.updatedAt,
+            localDirty = existing?.isLocalDirty == true,
+        )
+    val metadataJson = item.metadata?.toString()?.takeIf { it.isNotBlank() && it != "{}" }
+    return if (existing != null && !incomingWins) {
+        preserveLocalCatalogEntity(existing, item, metadataJson, mergedInto)
+    } else {
+        overwriteCatalogEntity(
+            item = item,
+            id = id,
+            title = title,
+            resolvedKind = resolvedKind,
+            metadataJson = metadataJson,
+            mergedInto = mergedInto,
+            existing = existing,
+            incomingWins = incomingWins,
+            nowIso = nowIso,
+        )
+    }
+}
+
+private fun preserveLocalCatalogEntity(
+    existing: CatalogEntryEntity,
+    item: PeerCatalogEntryPayload,
+    metadataJson: String?,
+    mergedInto: String?,
+): CatalogEntryEntity =
+    existing.copy(
+        creatorsJson =
+            when {
+                existing.creatorsJson != "[]" -> existing.creatorsJson
+                item.creators.isNotEmpty() -> encodeCreatorsJson(item.creators)
+                else -> "[]"
+            },
+        url = existing.url ?: item.url.nullIfBlankTrimmed(),
+        publishedAt = existing.publishedAt ?: item.publishedAt.nullIfBlankTrimmed(),
+        releaseYear = existing.releaseYear ?: item.releaseYear,
+        summary = existing.summary ?: item.summary.nullIfBlankTrimmed(),
+        thumbnailUrl = existing.thumbnailUrl ?: sanitizeHttpUrl(item.thumbnailUrl),
+        metadataJson =
+            if (existing.metadataJson != "{}") existing.metadataJson else metadataJson ?: "{}",
+        mergedIntoId = mergedInto ?: existing.mergedIntoId,
+    )
+
+@Suppress("LongParameterList")
+private fun overwriteCatalogEntity(
+    item: PeerCatalogEntryPayload,
+    id: String,
+    title: String,
+    resolvedKind: EntryKind,
+    metadataJson: String?,
+    mergedInto: String?,
+    existing: CatalogEntryEntity?,
+    incomingWins: Boolean,
+    nowIso: String,
+): CatalogEntryEntity =
+    CatalogEntryEntity(
         id = id,
-        kind = EntryKind.fromWireValue(item.kind).wireValue,
+        kind = resolvedKind.wireValue,
         title = title,
-        creatorsJson = creatorsJson,
-        url = item.url?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.url,
-        publishedAt = item.publishedAt?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.publishedAt,
+        creatorsJson = resolveOverwrittenCreatorsJson(item, existing),
+        url = preferNonBlank(item.url, existing?.url),
+        publishedAt = preferNonBlank(item.publishedAt, existing?.publishedAt),
         releaseYear = item.releaseYear ?: existing?.releaseYear,
-        summary = item.summary?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.summary,
+        summary = preferNonBlank(item.summary, existing?.summary),
         thumbnailUrl = sanitizeHttpUrl(item.thumbnailUrl) ?: existing?.thumbnailUrl,
         metadataJson = metadataJson ?: existing?.metadataJson ?: "{}",
         mergedIntoId = mergedInto ?: existing?.mergedIntoId,
-        createdAt = item.createdAt ?: existing?.createdAt ?: nowIso,
-        updatedAt = item.updatedAt ?: nowIso,
-        isLocalDirty = existing?.isLocalDirty == true,
+        createdAt = preferNonBlank(item.createdAt, existing?.createdAt) ?: nowIso,
+        updatedAt = preferNonBlank(item.updatedAt, existing?.updatedAt) ?: nowIso,
+        isLocalDirty = existing?.isLocalDirty == true && !incomingWins,
     )
-}
+
+private fun resolveOverwrittenCreatorsJson(
+    item: PeerCatalogEntryPayload,
+    existing: CatalogEntryEntity?,
+): String =
+    if (item.creators.isNotEmpty()) {
+        encodeCreatorsJson(item.creators)
+    } else {
+        existing?.creatorsJson ?: "[]"
+    }
+
+private fun preferNonBlank(primary: String?, fallback: String?): String? =
+    primary.nullIfBlankTrimmed() ?: fallback
+
+private fun String?.nullIfBlankTrimmed(): String? = this?.trim()?.takeIf { it.isNotEmpty() }
 
 private suspend fun mergeIncomingCollectionEntries(
     dao: RocheDao,
@@ -623,31 +1056,55 @@ private suspend fun mergeIncomingCollectionEntries(
     nowIso: String,
 ) {
     if (incoming.isEmpty()) return
+    val existingMemberships =
+        dao.getAllCollectionEntries().associateBy { it.collectionId to it.entryId }
+    val childrenByParent = HashMap<String, MutableSet<String>>()
+    for ((colId, entryId) in existingMemberships.keys) {
+        childrenByParent.getOrPut(colId) { HashSet() }.add(entryId)
+    }
     val tombstones =
         dao.getAllTombstones()
             .filter { it.entityType.equals(TOMBSTONE_COLLECTION_ENTRY, ignoreCase = true) }
             .associateBy { it.naturalKey }
+    val ctx =
+        IncomingMembershipContext(redirects, existingMemberships, tombstones, childrenByParent)
     val upserts = ArrayList<CollectionEntryEntity>()
     for (ce in incoming) {
-        val resolved = resolveIncomingMembership(ce, redirects, tombstones, nowIso) ?: continue
+        val resolved = resolveIncomingMembership(ce, ctx, nowIso) ?: continue
         resolved.second?.let { natKey -> dao.deleteTombstone(TOMBSTONE_COLLECTION_ENTRY, natKey) }
+        childrenByParent
+            .getOrPut(resolved.first.collectionId) { HashSet() }
+            .add(resolved.first.entryId)
         upserts.add(resolved.first)
     }
     if (upserts.isNotEmpty()) dao.upsertCollectionEntries(upserts)
 }
 
+private data class IncomingMembershipContext(
+    val redirects: Map<String, String>,
+    val existingMemberships: Map<Pair<String, String>, CollectionEntryEntity>,
+    val tombstones: Map<String, com.grayvines.roche.data.local.TombstoneEntity>,
+    val childrenByParent: Map<String, Set<String>>,
+)
+
 private fun resolveIncomingMembership(
     ce: PeerCollectionEntryPayload,
-    redirects: Map<String, String>,
-    tombstones: Map<String, com.grayvines.roche.data.local.TombstoneEntity>,
+    ctx: IncomingMembershipContext,
     nowIso: String,
 ): Pair<CollectionEntryEntity, String?>? {
-    val colId = followMergedInMap(ce.collectionId, redirects)
-    val entryId = followMergedInMap(ce.entryId, redirects)
+    val colId = followMergedInMap(ce.collectionId, ctx.redirects)
+    val entryId = followMergedInMap(ce.entryId, ctx.redirects)
     if (colId.isEmpty() || entryId.isEmpty() || colId == entryId) return null
     val natKey = collectionEntryNaturalKey(colId, entryId)
-    val tomb = tombstones[natKey]
+    val tomb = ctx.tombstones[natKey]
     if (isTombstoneSupersedingAdd(tomb, ce.addedAt)) return null
+    val existing = ctx.existingMemberships[colId to entryId]
+    val keepLocalDirty =
+        existing?.isLocalDirty == true &&
+            !shouldAcceptIncomingLwwUpdate(ce.addedAt, existing.addedAt, localDirty = true)
+    if (keepLocalDirty || wouldIntroduceCycleInGraph(ctx.childrenByParent, colId, entryId)) {
+        return null
+    }
     val entity =
         CollectionEntryEntity(
             collectionId = colId,
@@ -669,6 +1126,12 @@ private fun isTombstoneSupersedingAdd(
     return !addedTs.isAfter(tombTs)
 }
 
+private data class IncomingLogsPlan(
+    val toInsert: List<ConsumptionLogEntity>,
+    val maxConsumedTsByEntry: Map<String, String>,
+    val replacedAutoLogIds: Set<String>,
+)
+
 private suspend fun mergeIncomingConsumptionLogs(
     dao: RocheDao,
     incoming: List<PeerConsumptionLogPayload>,
@@ -676,48 +1139,143 @@ private suspend fun mergeIncomingConsumptionLogs(
     nowIso: String,
 ) {
     if (incoming.isEmpty()) return
-    val toInsert = ArrayList<ConsumptionLogEntity>(incoming.size)
-    val consumedIds = HashSet<String>()
+    val existingConsumedByEntry =
+        dao.getAllConsumptionLogs()
+            .filter { ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED }
+            .groupBy { it.entryId }
+    val plan = planIncomingConsumptionLogs(incoming, redirects, existingConsumedByEntry, nowIso)
+    plan.replacedAutoLogIds.forEach { dao.deleteConsumptionLogById(it) }
+    if (plan.toInsert.isNotEmpty()) {
+        dao.insertConsumptionLogsIgnore(plan.toInsert)
+    }
+    if (plan.maxConsumedTsByEntry.isNotEmpty()) {
+        removePromotedWantEntries(dao, plan.maxConsumedTsByEntry)
+    }
+}
+
+private fun planIncomingConsumptionLogs(
+    incoming: List<PeerConsumptionLogPayload>,
+    redirects: Map<String, String>,
+    existingConsumedByEntry: Map<String, List<ConsumptionLogEntity>>,
+    nowIso: String,
+): IncomingLogsPlan {
+    val acc = IncomingLogsAccumulator(existingConsumedByEntry)
     for (log in incoming) {
         val entryId = followMergedInMap(log.entryId, redirects)
-        if (entryId.isEmpty()) continue
-        val status = ConsumptionStatus.fromWireValue(log.status)
-        val tsMillis = runCatching { Instant.parse(log.ts.trim()).toEpochMilli() }.getOrDefault(0L)
-        val id =
-            log.id.trim().takeIf { it.isNotEmpty() }
-                ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
-        toInsert.add(
-            ConsumptionLogEntity(
-                id = id,
-                entryId = entryId,
-                ts = log.ts.ifBlank { nowIso },
-                status = status.wireValue,
-                notes = log.notes?.trim()?.takeIf { it.isNotEmpty() },
-                createdAt = log.createdAt ?: nowIso,
-                isLocalDirty = false,
-            )
-        )
-        if (status == ConsumptionStatus.CONSUMED) {
-            consumedIds.add(entryId)
+        if (entryId.isNotEmpty()) {
+            acc.accept(log, entryId, nowIso)
         }
     }
-    if (toInsert.isNotEmpty()) {
-        dao.insertConsumptionLogsIgnore(toInsert)
-    }
-    if (consumedIds.isNotEmpty()) {
-        val wantIds =
-            dao.getAllCollectionSpecs()
-                .filter {
-                    CollectionRole.fromWireValue(it.role) == CollectionRole.WANT ||
-                        it.collectionId == UP_NEXT_COLLECTION_ID
-                }
-                .map { it.collectionId }
-        for (entryId in consumedIds) {
-            for (wantId in wantIds) {
-                dao.deleteCollectionEntry(wantId, entryId)
+    return acc.toPlan()
+}
+
+private class IncomingLogsAccumulator(
+    private val existingConsumedByEntry: Map<String, List<ConsumptionLogEntity>>
+) {
+    private val consumedInBatch = HashSet<String>(existingConsumedByEntry.keys)
+    private val toInsert = ArrayList<ConsumptionLogEntity>()
+    private val maxConsumedTsByEntry = HashMap<String, String>()
+    private val replacedAutoIds = HashSet<String>()
+
+    fun accept(log: PeerConsumptionLogPayload, entryId: String, nowIso: String) {
+        val status = ConsumptionStatus.fromWireValue(log.status)
+        val id = resolveIncomingLogId(log, entryId, status)
+        val autoLogId = deterministicAutoLogId(entryId)
+        val isConsumed = status == ConsumptionStatus.CONSUMED
+        val effectiveTs = log.ts.ifBlank { nowIso }
+        if (isConsumed && id == autoLogId && entryId in consumedInBatch) {
+            recordConsumedTs(entryId, effectiveTs)
+            return
+        }
+        if (isConsumed && id != autoLogId) {
+            findReplaceableAutoLogId(existingConsumedByEntry[entryId], autoLogId)?.let {
+                replacedAutoIds.add(it)
             }
         }
+        toInsert.add(toConsumptionLogEntity(log, id, entryId, status, nowIso))
+        if (isConsumed) {
+            consumedInBatch.add(entryId)
+            recordConsumedTs(entryId, effectiveTs)
+        }
     }
+
+    private fun recordConsumedTs(entryId: String, incomingTs: String) {
+        var best = maxConsumedTsByEntry[entryId] ?: incomingTs
+        best = selectNewerIso(best, incomingTs)
+        for (existing in existingConsumedByEntry[entryId].orEmpty()) {
+            best = selectNewerIso(best, existing.ts)
+        }
+        maxConsumedTsByEntry[entryId] = best
+    }
+
+    fun toPlan(): IncomingLogsPlan =
+        IncomingLogsPlan(toInsert, maxConsumedTsByEntry, replacedAutoIds)
+}
+
+internal fun selectNewerIso(first: String, second: String): String {
+    val firstInst = runCatching { Instant.parse(first.trim()) }.getOrNull() ?: return second
+    val secondInst = runCatching { Instant.parse(second.trim()) }.getOrNull() ?: return first
+    return if (secondInst.isAfter(firstInst)) second else first
+}
+
+internal fun resolveIncomingLogId(
+    log: PeerConsumptionLogPayload,
+    entryId: String,
+    status: ConsumptionStatus,
+): String {
+    val tsMillis = runCatching { Instant.parse(log.ts.trim()).toEpochMilli() }.getOrDefault(0L)
+    return log.id.trim().takeIf { it.isNotEmpty() }
+        ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+}
+
+internal fun findReplaceableAutoLogId(
+    existingForEntry: List<ConsumptionLogEntity>?,
+    autoLogId: String,
+): String? =
+    existingForEntry?.firstOrNull { it.id == autoLogId && it.notes == null && !it.isLocalDirty }?.id
+
+internal fun toConsumptionLogEntity(
+    log: PeerConsumptionLogPayload,
+    id: String,
+    entryId: String,
+    status: ConsumptionStatus,
+    nowIso: String,
+): ConsumptionLogEntity =
+    ConsumptionLogEntity(
+        id = id,
+        entryId = entryId,
+        ts = log.ts.ifBlank { nowIso },
+        status = status.wireValue,
+        notes = log.notes.nullIfBlankTrimmed(),
+        createdAt = log.createdAt ?: nowIso,
+        isLocalDirty = false,
+    )
+
+private suspend fun removePromotedWantEntries(
+    dao: RocheDao,
+    maxConsumedTsByEntry: Map<String, String>,
+) {
+    val wantIds =
+        dao.getAllCollectionSpecs()
+            .filter {
+                CollectionRole.fromWireValue(it.role) == CollectionRole.WANT ||
+                    it.collectionId == UP_NEXT_COLLECTION_ID
+            }
+            .mapTo(HashSet()) { it.collectionId }
+    if (wantIds.isEmpty()) return
+    for (mem in dao.getAllCollectionEntries()) {
+        val consumedTs =
+            if (mem.collectionId in wantIds) maxConsumedTsByEntry[mem.entryId] else null
+        if (consumedTs != null && !isIsoStrictlyAfter(mem.addedAt, consumedTs)) {
+            dao.deleteCollectionEntry(mem.collectionId, mem.entryId)
+        }
+    }
+}
+
+private fun isIsoStrictlyAfter(candidateIso: String, referenceIso: String): Boolean {
+    val cand = runCatching { Instant.parse(candidateIso.trim()) }.getOrNull() ?: return false
+    val ref = runCatching { Instant.parse(referenceIso.trim()) }.getOrNull() ?: return false
+    return cand.isAfter(ref)
 }
 
 private suspend fun mergeIncomingComparisons(
@@ -731,13 +1289,12 @@ private suspend fun mergeIncomingComparisons(
     for (comp in incoming) {
         val canonicalOrdering = canonicalizeIncomingOrdering(comp.ordering, redirects)
         if (EpRankingEngine.validateOrdering(canonicalOrdering).isFailure) continue
-        val scope =
-            comp.scopeCollectionId
-                ?.let { followMergedInMap(it, redirects) }
-                ?.takeIf { it.isNotEmpty() }
+        val rawScope = comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
+        val scope = rawScope?.let { followMergedInMap(it, redirects) }?.takeIf { it.isNotEmpty() }
         val tsMillis = runCatching { Instant.parse(comp.ts.trim()).toEpochMilli() }.getOrDefault(0L)
+        val wasRewritten = canonicalOrdering != comp.ordering || scope != rawScope
         val id =
-            comp.id.trim().takeIf { it.isNotEmpty() }
+            comp.id.trim().takeIf { it.isNotEmpty() && !wasRewritten }
                 ?: deterministicComparisonId(scope, tsMillis, canonicalOrdering)
         toInsert.add(
             ComparisonEntity(
