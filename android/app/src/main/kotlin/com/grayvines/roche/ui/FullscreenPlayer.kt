@@ -399,6 +399,19 @@ private fun FullscreenPlayerTopBar(
                         )
                     }
                     DropdownMenuItem(
+                        text = { Text("Finish & Rank Episode") },
+                        onClick = {
+                            showOverflowMenu = false
+                            onAction(MainAction.CloseFullscreenPlayer)
+                            onAction(
+                                MainAction.MarkFeedEntryFinished(
+                                    entryId = entry.id,
+                                    rankImmediately = true,
+                                )
+                            )
+                        },
+                    )
+                    DropdownMenuItem(
                         text = { Text("Visit Episode Website ↗") },
                         onClick = {
                             showOverflowMenu = false

@@ -1453,3 +1453,120 @@ async fn test_per_ip_pairing_rate_limit_isolates_attacker_from_legitimate_ip() {
             .unwrap();
     assert_ne!(body["token"].as_str().unwrap(), "");
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_catalog_api_1001_generator_and_peer_sync_roundtrip() {
+    let (app, auth) = setup_app().await;
+
+    // 1. Enable 1001 Albums generator -> draws an active album; finishing draws next
+    let enable_request = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/catalog/generator/1001-albums")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"enabled":true}"#))
+        .unwrap();
+    let enable_response = app.clone().oneshot(enable_request).await.unwrap();
+    assert_eq!(enable_response.status(), StatusCode::OK);
+    let enable_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(enable_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(enable_body["enabled"], true);
+    let first_album_id = enable_body["current_entry"]["id"].as_str().unwrap().to_string();
+
+    let finish_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/generator/1001-albums/finish")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"notes":"Phenomenal arrangement"}"#))
+        .unwrap();
+    let finish_response = app.clone().oneshot(finish_request).await.unwrap();
+    assert_eq!(finish_response.status(), StatusCode::OK);
+    let finish_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(finish_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(finish_body["completed_entry"]["id"], first_album_id);
+    assert_eq!(finish_body["generator"]["consumed_count"], 1);
+    let second_album_id =
+        finish_body["generator"]["current_entry"]["id"].as_str().unwrap().to_string();
+    assert_ne!(first_album_id, second_album_id);
+
+    // 2. Reject manual entry mutation on dynamic list (`movies`) with RFC 9457 400 Bad Request
+    let dyn_mutate = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/lists/movies/entries")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(format!(r#"{{"entry_id":"{first_album_id}"}}"#)))
+        .unwrap();
+    let dyn_res = app.clone().oneshot(dyn_mutate).await.unwrap();
+    assert_eq!(dyn_res.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Peer sync round-trip: offline peer logs a second album, compares it against `first_album_id`,
+    //    and finishes `second_album_id` while offline -> server advances generator automatically!
+    let sync_payload = serde_json::json!({
+        "peer_id": "android-companion-1",
+        "device_name": "Pixel",
+        "network_tier": "wifi",
+        "catalog_entries": [{
+            "id": "",
+            "kind": "album",
+            "title": "Blue Train",
+            "creators": ["John Coltrane"],
+            "release_year": 1958,
+            "identifiers": [{"scheme": "wikipedia", "value": "Blue_Train_(album)"}]
+        }],
+        "consumption_log": [{
+            "id": "",
+            "entry_id": second_album_id,
+            "ts": "2026-11-14T12:00:00Z",
+            "status": "consumed",
+            "notes": "Listened on flight"
+        }],
+        "comparisons": [{
+            "id": "",
+            "ts": "2026-11-14T12:05:00Z",
+            "scope_collection_id": null,
+            "ordering": [[first_album_id], [second_album_id]]
+        }]
+    });
+    let peer_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sync/peer")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(sync_payload.to_string()))
+        .unwrap();
+    let peer_response = app.clone().oneshot(peer_request).await.unwrap();
+    assert_eq!(peer_response.status(), StatusCode::OK);
+    let peer_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(peer_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(peer_body["comparisons"].as_array().unwrap().len(), 1);
+    let gen_out = &peer_body["collection_generators"][0];
+    assert_ne!(
+        gen_out["current_entry_id"].as_str().unwrap(),
+        second_album_id,
+        "Peer sync finishing the active 1001 album must advance generator to a new draw"
+    );
+
+    // 4. Ranked albums endpoint reflects `first_album_id > second_album_id` with S and D tiers
+    let ranked_request = Request::builder()
+        .uri("/api/v1/catalog/lists/albums")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    let ranked_response = app.oneshot(ranked_request).await.unwrap();
+    assert_eq!(ranked_response.status(), StatusCode::OK);
+    let list_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ranked_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let rows = list_body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["entry"]["id"], first_album_id);
+    assert_eq!(rows[0]["tier"], "S");
+    assert_eq!(rows[1]["entry"]["id"], second_album_id);
+    assert_eq!(rows[1]["tier"], "D");
+}

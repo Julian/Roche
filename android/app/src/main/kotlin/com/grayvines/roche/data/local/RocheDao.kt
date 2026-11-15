@@ -378,6 +378,180 @@ interface RocheDao {
         updatedAt: String =
             java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
     )
+
+    @Query("SELECT * FROM catalog_entries")
+    fun observeCatalogEntries(): Flow<List<CatalogEntryEntity>>
+
+    @Query("SELECT * FROM entry_identifiers")
+    fun observeEntryIdentifiers(): Flow<List<EntryIdentifierEntity>>
+
+    @Query("SELECT * FROM collection_specs")
+    fun observeCollectionSpecs(): Flow<List<CollectionSpecEntity>>
+
+    @Query("SELECT * FROM collection_entries")
+    fun observeCollectionEntries(): Flow<List<CollectionEntryEntity>>
+
+    @Query("SELECT * FROM collection_generators")
+    fun observeCollectionGenerators(): Flow<List<CollectionGeneratorEntity>>
+
+    @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
+    fun observeConsumptionLogs(): Flow<List<ConsumptionLogEntity>>
+
+    @Query("SELECT * FROM comparisons ORDER BY ts ASC")
+    fun observeComparisons(): Flow<List<ComparisonEntity>>
+
+    @Query("SELECT * FROM catalog_entries")
+    suspend fun getAllCatalogEntries(): List<CatalogEntryEntity>
+
+    @Query("SELECT * FROM catalog_entries WHERE id = :id LIMIT 1")
+    suspend fun getCatalogEntryById(id: String): CatalogEntryEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCatalogEntry(entry: CatalogEntryEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCatalogEntries(entries: List<CatalogEntryEntity>)
+
+    @Query("UPDATE catalog_entries SET isLocalDirty = 0 WHERE id IN (:ids)")
+    suspend fun clearCatalogEntriesDirty(ids: List<String>)
+
+    @Query("SELECT * FROM entry_identifiers")
+    suspend fun getAllEntryIdentifiers(): List<EntryIdentifierEntity>
+
+    @Query(
+        "SELECT entryId FROM entry_identifiers " +
+            "WHERE scheme = :scheme AND value = :value LIMIT 1"
+    )
+    suspend fun getEntryIdByIdentifier(scheme: String, value: String): String?
+
+    @Query(
+        "SELECT * FROM entry_identifiers WHERE entryId = :entryId ORDER BY scheme ASC, value ASC"
+    )
+    suspend fun getIdentifiersForEntry(entryId: String): List<EntryIdentifierEntity>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntryIdentifierIgnore(identifier: EntryIdentifierEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntryIdentifiersIgnore(identifiers: List<EntryIdentifierEntity>)
+
+    @Query("UPDATE entry_identifiers SET entryId = :newEntryId WHERE entryId = :oldEntryId")
+    suspend fun repointIdentifiersToEntry(oldEntryId: String, newEntryId: String)
+
+    @Query("SELECT * FROM collection_specs ORDER BY title COLLATE NOCASE ASC")
+    suspend fun getAllCollectionSpecs(): List<CollectionSpecEntity>
+
+    @Query("SELECT * FROM collection_specs WHERE collectionId = :id LIMIT 1")
+    suspend fun getCollectionSpecById(id: String): CollectionSpecEntity?
+
+    @Query("SELECT * FROM collection_specs WHERE LOWER(slug) = LOWER(:slug) LIMIT 1")
+    suspend fun getCollectionSpecBySlug(slug: String): CollectionSpecEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCollectionSpec(spec: CollectionSpecEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCollectionSpecs(specs: List<CollectionSpecEntity>)
+
+    @Query("UPDATE collection_specs SET isLocalDirty = 0 WHERE collectionId IN (:ids)")
+    suspend fun clearCollectionSpecsDirty(ids: List<String>)
+
+    @Query("SELECT * FROM collection_entries")
+    suspend fun getAllCollectionEntries(): List<CollectionEntryEntity>
+
+    @Query(
+        "SELECT * FROM collection_entries WHERE collectionId = :collectionId " +
+            "ORDER BY COALESCE(position, 1e12) ASC, addedAt ASC"
+    )
+    suspend fun getCollectionMemberships(collectionId: String): List<CollectionEntryEntity>
+
+    @Query("SELECT * FROM collection_entries WHERE entryId = :entryId")
+    suspend fun getCollectionEntriesForEntry(entryId: String): List<CollectionEntryEntity>
+
+    @Query("SELECT COUNT(*) FROM collection_entries WHERE collectionId = :collectionId")
+    suspend fun countCollectionEntries(collectionId: String): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCollectionEntry(entry: CollectionEntryEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCollectionEntries(entries: List<CollectionEntryEntity>)
+
+    @Query(
+        "DELETE FROM collection_entries " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId"
+    )
+    suspend fun deleteCollectionEntry(collectionId: String, entryId: String)
+
+    @Query(
+        "UPDATE collection_entries SET isLocalDirty = 0 " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId"
+    )
+    suspend fun clearCollectionEntryDirty(collectionId: String, entryId: String)
+
+    @Query("SELECT * FROM collection_generators")
+    suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
+
+    @Query("SELECT * FROM collection_generators WHERE collectionId = :collectionId LIMIT 1")
+    suspend fun getCollectionGenerator(collectionId: String): CollectionGeneratorEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCollectionGenerator(generator: CollectionGeneratorEntity)
+
+    @Query("UPDATE collection_generators SET isLocalDirty = 0 WHERE collectionId = :collectionId")
+    suspend fun clearCollectionGeneratorDirty(collectionId: String)
+
+    @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
+    suspend fun getAllConsumptionLogs(): List<ConsumptionLogEntity>
+
+    @Query("SELECT * FROM consumption_log WHERE entryId = :entryId ORDER BY ts DESC")
+    suspend fun getConsumptionLogsForEntry(entryId: String): List<ConsumptionLogEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM consumption_log " +
+            "WHERE entryId = :entryId AND status IN ('consumed', 'abandoned')"
+    )
+    suspend fun countTerminalLogsForEntry(entryId: String): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertConsumptionLogIgnore(log: ConsumptionLogEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertConsumptionLog(log: ConsumptionLogEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertConsumptionLogsIgnore(logs: List<ConsumptionLogEntity>)
+
+    @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id IN (:ids)")
+    suspend fun clearConsumptionLogsDirty(ids: List<String>)
+
+    @Query("UPDATE consumption_log SET entryId = :canonicalId WHERE entryId = :dupId")
+    suspend fun repointConsumptionLogsToEntry(dupId: String, canonicalId: String)
+
+    @Query("DELETE FROM collection_entries WHERE entryId = :dupId OR collectionId = :dupId")
+    suspend fun deleteMergedDupMemberships(dupId: String)
+
+    @Query("SELECT * FROM comparisons ORDER BY ts ASC")
+    suspend fun getAllComparisons(): List<ComparisonEntity>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertComparisonIgnore(comparison: ComparisonEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertComparisonsIgnore(comparisons: List<ComparisonEntity>)
+
+    @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id IN (:ids)")
+    suspend fun clearComparisonsDirty(ids: List<String>)
+
+    @Query(
+        "UPDATE comparisons SET scopeCollectionId = :canonicalId WHERE scopeCollectionId = :dupId"
+    )
+    suspend fun repointComparisonScope(dupId: String, canonicalId: String)
+
+    @Query("UPDATE comparisons SET orderingJson = :orderingJson WHERE id = :id")
+    suspend fun updateComparisonOrdering(id: String, orderingJson: String)
+
+    @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
 }
 
 internal const val SQLITE_DELETE_CHUNK_SIZE = 500

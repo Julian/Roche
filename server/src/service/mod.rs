@@ -7,6 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -174,6 +175,11 @@ impl<F: FeedFetcher> RocheService<F> {
     }
 
     #[must_use]
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
+
+    #[must_use]
     pub fn with_node_identity(
         mut self,
         node_identity: Option<crate::tailscale::NodeIdentity>,
@@ -233,6 +239,11 @@ impl<F: FeedFetcher> RocheService<F> {
     #[must_use]
     pub const fn media(&self) -> MediaService<'_, F> {
         MediaService { service: self }
+    }
+
+    #[must_use]
+    pub const fn catalog(&self) -> crate::db::CatalogRepo<'_> {
+        self.db.catalog()
     }
 
     #[must_use]
@@ -387,6 +398,12 @@ impl<F: FeedFetcher> RocheService<F> {
         });
         req.tags.truncate(500);
         req.tombstones.truncate(2_000);
+        req.collections.truncate(500);
+        req.catalog_entries.truncate(2_000);
+        req.collection_entries.truncate(5_000);
+        req.collection_generators.truncate(16);
+        req.consumption_log.truncate(5_000);
+        req.comparisons.truncate(5_000);
 
         let (response, mut inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
         inserted_candidates.retain(|(_, c)| SafeHttpClient::validate_url(&c.url).is_ok());
@@ -474,6 +491,43 @@ impl<F: FeedFetcher> AuthService<'_, F> {
             return Err(ApiError::not_found("Device not found"));
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn csrf_token_for_session(&self, raw_session_token: &str) -> String {
+        let _ = self;
+        let mut hasher = Sha256::new();
+        hasher.update(b"roche-web-csrf-v1:");
+        hasher.update(raw_session_token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    #[must_use]
+    pub fn verify_csrf_token(&self, raw_session_token: &str, candidate: &str) -> bool {
+        let expected = self.csrf_token_for_session(raw_session_token);
+        let cand_bytes = candidate.trim().as_bytes();
+        let exp_bytes = expected.as_bytes();
+        if cand_bytes.len() != exp_bytes.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (&a, &b) in exp_bytes.iter().zip(cand_bytes.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+
+    pub async fn mint_tailscale_web_session(&self, login: &str) -> Result<String, ApiError> {
+        let clean_login = login.trim().to_ascii_lowercase();
+        let raw_name = format!("Roche Web ({clean_login})");
+        let safe_name: String = raw_name.chars().take(MAX_DEVICE_NAME_LEN).collect();
+        let tokens = TokenManager::new(self.service.db.auth());
+        Ok(tokens.create(&safe_name, self.service.config.auth.token_length).await?)
+    }
+
+    pub async fn revoke_session_token(&self, raw_session_token: &str) -> Result<bool, ApiError> {
+        let token_hash = TokenManager::hash_token(raw_session_token);
+        Ok(self.service.db.auth().revoke_device_by_token_hash(&token_hash).await?)
     }
 }
 
@@ -817,12 +871,12 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
 
     pub async fn delete(&self, id: &str) -> Result<(), ApiError> {
         let item_repo = self.service.db.items();
+        let media_repo = self.service.db.media();
+        let media_list = media_repo.list_for_item(id).await?;
         if !item_repo.delete(id).await? {
             return Err(ApiError::not_found("Item not found"));
         }
 
-        let media_repo = self.service.db.media();
-        let media_list = media_repo.list_for_item(id).await?;
         media_repo.delete_with_files(&self.service.media_store, media_list).await?;
         Ok(())
     }

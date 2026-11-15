@@ -25,6 +25,10 @@ fn test_deterministic_uuid_and_hrw_work_splitting() {
     assert_eq!(i_id1, i_id2);
     assert_ne!(f_id1, i_id1);
 
+    assert_eq!(STARRED_COLLECTION_ID, deterministic_system_collection_id("starred"));
+    assert_eq!(UP_NEXT_COLLECTION_ID, deterministic_system_collection_id("up_next"));
+    assert_eq!(ALBUMS_1001_COLLECTION_ID, deterministic_system_collection_id("1001_albums"));
+
     let now = DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z").unwrap().with_timezone(&Utc);
     let mut peers = vec![
         PeerNode {
@@ -335,13 +339,13 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
     // Delta sync: backdate Post 3 so only items modified at or after `watermark` are returned
     let watermark = now + chrono::Duration::seconds(10);
     let post3_id = deterministic_item_id(Some(feed_url.as_str()), item3_url.as_str());
-    sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
         .bind(now - chrono::Duration::seconds(60))
         .bind(&post3_id)
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
         .bind(watermark)
         .bind(&post1_id)
         .execute(db.pool())
@@ -523,7 +527,7 @@ async fn test_subsecond_delta_sync_and_multipage_content_html() {
     // Subsecond updated_after: item updated 500ms after `since` within the same second MUST be returned
     let old_ts = DateTime::parse_from_rfc3339("2026-11-11T20:00:00Z").unwrap().with_timezone(&Utc)
         - chrono::Duration::seconds(30);
-    sqlx::query("UPDATE items SET updated_at = ?").bind(old_ts).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE entries SET updated_at = ?").bind(old_ts).execute(db.pool()).await.unwrap();
 
     let since =
         DateTime::parse_from_rfc3339("2026-11-11T20:00:00.100Z").unwrap().with_timezone(&Utc);
@@ -534,13 +538,13 @@ async fn test_subsecond_delta_sync_and_multipage_content_html() {
     let id0 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-0");
     let id1 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-1");
 
-    sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
         .bind(before_in_same_sec)
         .bind(&id0)
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
         .bind(after_500ms)
         .bind(&id1)
         .execute(db.pool())
@@ -716,7 +720,7 @@ async fn test_delta_sync_cursor_safety_when_outgoing_items_exceed_cap() {
             &format!("https://example.com/cap-item-{idx}"),
         );
         let item_ts = base_ts + chrono::Duration::seconds((idx + 1) * 5);
-        sqlx::query("UPDATE items SET updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
             .bind(item_ts)
             .bind(&item_id)
             .execute(db.pool())
@@ -774,7 +778,11 @@ async fn test_delta_sync_cursor_safety_when_outgoing_items_exceed_cap() {
     // bulk archive or OPML import), paginated at cap = 2 across 3 rounds with zero duplicates
     // and zero drops.
     let tied_ts = base_ts + chrono::Duration::minutes(5);
-    sqlx::query("UPDATE items SET updated_at = ?").bind(tied_ts).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE entries SET updated_at = ?")
+        .bind(tied_ts)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     let mut tied_sorted_ids = expected_ids.clone();
     tied_sorted_ids.sort();
@@ -910,4 +918,371 @@ fn test_cross_stack_golden_vectors() {
             case.feed_url
         );
     }
+}
+
+#[tokio::test]
+async fn test_offline_peer_catalog_write_propagates_across_delta_sync_cursors() {
+    use crate::db::{CollectionMode, CollectionRole, EntryKind};
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let sync = db.sync();
+
+    let t1 = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z").unwrap().with_timezone(&Utc);
+
+    // Peer B performs an initial sync FIRST, capturing a server cursor `cursor_b > t1`.
+    let (init_b, _) = sync
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            device_name: Some("Phone B".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: None,
+            after_item_id: None,
+            feeds: Vec::new(),
+            items: Vec::new(),
+            tags: Vec::new(),
+            tombstones: Vec::new(),
+            collections: Vec::new(),
+            catalog_entries: Vec::new(),
+            collection_entries: Vec::new(),
+            collection_generators: Vec::new(),
+            consumption_log: Vec::new(),
+            comparisons: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let cursor_b = init_b.sync_timestamp;
+    assert!(cursor_b > t1);
+
+    // Peer A now reconnects and pushes an offline catalog entry + collection + membership
+    // whose client-side timestamps were recorded earlier at `t1 < cursor_b`.
+    let col_id = "11111111-2222-3333-4444-555555555555".to_owned();
+    let movie_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned();
+    let (_, _) = sync
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            device_name: Some("Tablet A".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: None,
+            after_item_id: None,
+            feeds: Vec::new(),
+            items: Vec::new(),
+            tags: Vec::new(),
+            tombstones: Vec::new(),
+            collections: vec![PeerCollectionSpecRecord {
+                collection_id: col_id.clone(),
+                title: "Sci-Fi Classics".to_owned(),
+                summary: None,
+                slug: Some("sci-fi-classics".to_owned()),
+                mode: CollectionMode::Manual,
+                role: CollectionRole::List,
+                rule_json: None,
+                show_in_lists: true,
+                color: None,
+                created_at: Some(t1),
+                updated_at: Some(t1),
+            }],
+            catalog_entries: vec![PeerCatalogEntryRecord {
+                id: movie_id.clone(),
+                kind: EntryKind::Movie,
+                title: "Solaris".to_owned(),
+                creators: vec!["Andrei Tarkovsky".to_owned()],
+                url: None,
+                published_at: None,
+                release_year: Some(1972),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(t1),
+                updated_at: Some(t1),
+            }],
+            collection_entries: vec![PeerCollectionEntryRecord {
+                collection_id: col_id.clone(),
+                entry_id: movie_id.clone(),
+                position: Some(1.0),
+                added_at: t1,
+            }],
+            collection_generators: Vec::new(),
+            consumption_log: Vec::new(),
+            comparisons: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Peer B delta-syncs using `updated_after = Some(cursor_b)` and MUST receive Peer A's offline writes!
+    let (delta_b, _) = sync
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            device_name: Some("Phone B".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: Some(cursor_b),
+            after_item_id: None,
+            feeds: Vec::new(),
+            items: Vec::new(),
+            tags: Vec::new(),
+            tombstones: Vec::new(),
+            collections: Vec::new(),
+            catalog_entries: Vec::new(),
+            collection_entries: Vec::new(),
+            collection_generators: Vec::new(),
+            consumption_log: Vec::new(),
+            comparisons: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert!(delta_b.collections.iter().any(|c| c.collection_id == col_id));
+    assert!(delta_b.catalog_entries.iter().any(|e| e.id == movie_id));
+    assert!(
+        delta_b
+            .collection_entries
+            .iter()
+            .any(|ce| ce.collection_id == col_id && ce.entry_id == movie_id)
+    );
+}
+
+#[tokio::test]
+async fn test_deleting_inbox_item_or_feed_preserves_diary_and_rankings() {
+    use crate::db::{ConsumptionStatus, EntryKind, NewItem, ReadAtPatch, UpsertEntryInput};
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://example.com/podcast.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Great Podcast"), None).await.unwrap();
+
+    let ep_consumed_url = Url::parse("https://example.com/ep1").unwrap();
+    let ep_consumed = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Episode 1 (Consumed)",
+            url: &ep_consumed_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+
+    let ep_unread_url = Url::parse("https://example.com/ep2").unwrap();
+    let ep_unread = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Episode 2 (Unread)",
+            url: &ep_unread_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+
+    // Complete Episode 1 (`progress = 1.0`) -> auto-logs `consumed` on Episode 1 + parent Podcast!
+    assert!(
+        db.items()
+            .update(
+                &ep_consumed.id,
+                Some(ItemStatus::Archived),
+                None,
+                Some(1.0),
+                ReadAtPatch::Unchanged
+            )
+            .await
+            .unwrap()
+    );
+
+    // Add a comparison ranking Episode 1 against another podcast episode.
+    let other_ep = db
+        .catalog()
+        .upsert_entry(&UpsertEntryInput {
+            id: None,
+            kind: Some(EntryKind::PodcastEpisode),
+            title: "Other Episode".to_owned(),
+            creators: Vec::new(),
+            url: None,
+            published_at: None,
+            release_year: None,
+            summary: None,
+            thumbnail_url: None,
+            metadata: None,
+            identifiers: Vec::new(),
+            parent_collection_id: None,
+            parent_position: None,
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .append_comparison(None, &[vec![ep_consumed.id.clone()], vec![other_ep.id.clone()]], None)
+        .await
+        .unwrap();
+
+    // Delete Episode 1 from Inbox: vanishes from ItemRepo, stays intact in Catalog/Diary/Rankings!
+    assert!(db.items().delete(&ep_consumed.id).await.unwrap());
+    assert!(db.items().get(&ep_consumed.id).await.unwrap().is_none());
+    let detail_after_item_del = db.catalog().get_entry_detail(&ep_consumed.id).await.unwrap();
+    assert!(detail_after_item_del.is_some());
+    assert!(
+        detail_after_item_del
+            .unwrap()
+            .log_history
+            .iter()
+            .any(|l| l.status == ConsumptionStatus::Consumed)
+    );
+
+    // Delete the Feed itself: unconsumed Episode 2 is deleted, Feed vanishes from FeedRepo,
+    // while Episode 1 + Podcast entry + consumption history + rankings remain intact!
+    assert!(db.feeds().delete(&feed.id).await.unwrap());
+    assert!(db.feeds().get(&feed.id).await.unwrap().is_none());
+    assert!(db.items().get(&ep_unread.id).await.unwrap().is_none());
+    assert!(db.catalog().get_entry_detail(&ep_unread.id).await.unwrap().is_none());
+
+    let ep_detail = db.catalog().get_entry_detail(&ep_consumed.id).await.unwrap().unwrap();
+    assert!(ep_detail.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed));
+    let podcast_detail = db.catalog().get_entry_detail(&feed.id).await.unwrap();
+    assert!(podcast_detail.is_some());
+
+    // Re-subscribing to the same feed URL later works cleanly and restores the active feed!
+    let resub = db
+        .feeds()
+        .create(FeedType::Rss, &feed_url, Some("Great Podcast Returns"), None)
+        .await
+        .unwrap();
+    assert_eq!(resub.id, feed.id);
+    assert!(resub.is_active);
+}
+
+#[tokio::test]
+async fn test_peer_sync_preserves_single_consumption_log_and_never_auto_logs_bulk_archive() {
+    use crate::db::{
+        ConsumptionStatus, NewItem,
+        sync::{PeerConsumptionLogRecord, deterministic_consumption_log_id},
+    };
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://example.com/feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Blog"), None).await.unwrap();
+
+    let ep_url = Url::parse("https://example.com/podcast-ep1").unwrap();
+    let ep = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Podcast Ep 1",
+            url: &ep_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Audio,
+        })
+        .await
+        .unwrap();
+
+    let bulk_url = Url::parse("https://example.com/bulk-article").unwrap();
+    let bulk_art = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Bulk Archived Article",
+            url: &bulk_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    let t_android =
+        DateTime::parse_from_rfc3339("2026-06-15T09:12:34.567Z").unwrap().with_timezone(&Utc);
+    let log_id = deterministic_consumption_log_id(&ep.id, t_android.timestamp_millis(), "consumed");
+
+    let (resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            device_name: Some("Android".to_owned()),
+            network_tier: NetworkTier::Wifi,
+            weight: None,
+            updated_after: None,
+            after_item_id: None,
+            feeds: Vec::new(),
+            items: vec![
+                PeerItemRecord {
+                    id: ep.id.clone(),
+                    feed_id: Some(feed.id.clone()),
+                    feed_url: Some(feed_url.clone()),
+                    title: ep.title.clone(),
+                    url: ep_url,
+                    author: None,
+                    published_at: None,
+                    created_at: Some(t_android),
+                    summary: None,
+                    content_html: None,
+                    thumbnail_url: None,
+                    audio_url: Some("https://example.com/ep1.mp3".to_owned()),
+                    duration: Some(1800),
+                    content_type: ContentType::Audio,
+                    status: ItemStatus::Unread,
+                    is_favorite: false,
+                    read_at: None,
+                    read_progress: 1.0,
+                    interaction_updated_at: Some(t_android),
+                    tag_names: Vec::new(),
+                },
+                PeerItemRecord {
+                    id: bulk_art.id.clone(),
+                    feed_id: Some(feed.id.clone()),
+                    feed_url: Some(feed_url),
+                    title: bulk_art.title.clone(),
+                    url: bulk_url,
+                    author: None,
+                    published_at: None,
+                    created_at: Some(t_android),
+                    summary: None,
+                    content_html: None,
+                    thumbnail_url: None,
+                    audio_url: None,
+                    duration: None,
+                    content_type: ContentType::Article,
+                    status: ItemStatus::Archived,
+                    is_favorite: false,
+                    read_at: Some(t_android),
+                    read_progress: 0.95,
+                    interaction_updated_at: Some(t_android),
+                    tag_names: Vec::new(),
+                },
+            ],
+            tags: Vec::new(),
+            tombstones: Vec::new(),
+            collections: Vec::new(),
+            catalog_entries: Vec::new(),
+            collection_entries: Vec::new(),
+            collection_generators: Vec::new(),
+            consumption_log: vec![PeerConsumptionLogRecord {
+                id: log_id.clone(),
+                entry_id: ep.id.clone(),
+                ts: t_android,
+                status: ConsumptionStatus::Consumed,
+                notes: None,
+                created_at: Some(t_android),
+            }],
+            comparisons: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Ep 1 MUST have exactly 1 consumption_log row (Android's `log_id`), NOT 2!
+    let ep_logs: Vec<_> = resp.consumption_log.iter().filter(|l| l.entry_id == ep.id).collect();
+    assert_eq!(ep_logs.len(), 1);
+    assert_eq!(ep_logs[0].id, log_id);
+
+    // Bulk-archived article without an explicit consumption_log row MUST NOT be auto-logged!
+    assert!(!resp.consumption_log.iter().any(|l| l.entry_id == bulk_art.id));
 }

@@ -3,6 +3,12 @@
 package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.data.NetworkTier
+import com.grayvines.roche.data.PeerCatalogEntryPayload
+import com.grayvines.roche.data.PeerCollectionEntryPayload
+import com.grayvines.roche.data.PeerCollectionGeneratorPayload
+import com.grayvines.roche.data.PeerCollectionSpecPayload
+import com.grayvines.roche.data.PeerComparisonPayload
+import com.grayvines.roche.data.PeerConsumptionLogPayload
 import com.grayvines.roche.data.PeerNodeDto
 import com.grayvines.roche.data.SyncTombstoneDto
 import com.grayvines.roche.data.inferFeedTypeWireValue
@@ -341,6 +347,15 @@ internal data class PeerSyncWireRequest(
     val items: List<PeerSyncWireItem>,
     val tags: List<PeerSyncWireTag>,
     val tombstones: List<PeerSyncWireTombstone>,
+    val collections: List<PeerCollectionSpecPayload> = emptyList(),
+    @SerialName("catalog_entries") val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
+    @SerialName("collection_entries")
+    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
+    @SerialName("collection_generators")
+    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
+    @SerialName("consumption_log")
+    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
+    val comparisons: List<PeerComparisonPayload> = emptyList(),
 )
 
 @Serializable
@@ -386,6 +401,15 @@ internal data class PeerSyncWireResponse(
     val items: List<WireItemDto> = emptyList(),
     val tags: List<WireTagDto> = emptyList(),
     val tombstones: List<WireTombstoneResponseDto> = emptyList(),
+    val collections: List<PeerCollectionSpecPayload> = emptyList(),
+    @SerialName("catalog_entries") val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
+    @SerialName("collection_entries")
+    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
+    @SerialName("collection_generators")
+    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
+    @SerialName("consumption_log")
+    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
+    val comparisons: List<PeerComparisonPayload> = emptyList(),
 )
 
 internal fun buildPairDevicePayload(code: String, deviceName: String): String =
@@ -548,6 +572,12 @@ internal fun buildPeerSyncRequestPayload(request: PeerSyncRequestDto): String =
             items = request.items.map { toPeerWireItem(it) },
             tags = request.tags.map { toPeerWireTag(it) },
             tombstones = request.tombstones.map { toPeerWireTombstone(it) },
+            collections = request.collections,
+            catalogEntries = request.catalogEntries,
+            collectionEntries = request.collectionEntries,
+            collectionGenerators = request.collectionGenerators,
+            consumptionLog = request.consumptionLog,
+            comparisons = request.comparisons,
         ),
     )
 
@@ -627,6 +657,12 @@ internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto? = runC
                     .filter { it.entityType.isNotBlank() && it.naturalKey.isNotBlank() },
             hasMore = wire.hasMore,
             nextAfterItemId = wire.nextAfterItemId.nullIfBlank(),
+            collections = wire.collections,
+            catalogEntries = wire.catalogEntries,
+            collectionEntries = wire.collectionEntries,
+            collectionGenerators = wire.collectionGenerators,
+            consumptionLog = wire.consumptionLog,
+            comparisons = wire.comparisons,
         )
     }
 }

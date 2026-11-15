@@ -3,11 +3,16 @@ package com.grayvines.roche.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.grayvines.roche.data.ConsumptionStatus
+import com.grayvines.roche.data.EntryKind
+import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.SavedResourceKind
+import com.grayvines.roche.data.UpsertCatalogEntryInput
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
@@ -28,6 +33,8 @@ import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @Suppress("TooManyFunctions", "LargeClass")
 class MainViewModel(
@@ -39,6 +46,7 @@ class MainViewModel(
 ) : ViewModel() {
 
     private val ownsPlayerController: Boolean = sharedPlayerController == null
+    private val catalogActionMutex = Mutex()
 
     private val playbackOrchestrator =
         PodcastPlaybackOrchestrator(
@@ -429,7 +437,7 @@ class MainViewModel(
             is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
             is MainAction.PairWithServer -> performPairWithServer(action)
             MainAction.DiscoverServer -> performDiscoverServer()
-            else -> Unit
+            else -> executeCatalogMutation(action)
         }
     }
 
@@ -1082,6 +1090,384 @@ class MainViewModel(
         }
     }
 
+    private suspend fun executeCatalogMutation(action: MainAction.Mutation) =
+        catalogActionMutex.withLock {
+            when (action) {
+                is MainAction.SetAlbumGeneratorEnabled ->
+                    performToggleAlbumGenerator(action.enabled)
+                is MainAction.ConfirmFinish1001Album -> performFinish1001Album(action.notes)
+                is MainAction.ConfirmAbandon1001Album -> performAbandon1001Album(action.notes)
+                is MainAction.StartRankingSession ->
+                    performStartRankingSession(action.collectionIdOrSlug, action.focusEntryId)
+                is MainAction.SubmitRankCluster -> performSubmitRankCluster(action.ordering)
+                MainAction.SkipRankCluster -> performSkipRankCluster()
+                is MainAction.MarkFeedEntryFinished ->
+                    performMarkFeedEntryFinished(action.entryId, action.rankImmediately)
+                is MainAction.SubmitQuickLog -> performSubmitQuickLog(action)
+                is MainAction.CreateCustomCatalogList -> performCreateCustomList(action.title)
+                is MainAction.CompleteWantEntry ->
+                    performCompleteWantEntry(action.entryId, action.rankImmediately)
+                is MainAction.RemoveWantEntry ->
+                    performRemoveWantEntry(action.collectionId, action.entryId)
+                else -> Unit
+            }
+        }
+
+    private suspend fun performToggleAlbumGenerator(enabled: Boolean) {
+        runSuspendCatching { repository.catalog.setAlbumGeneratorEnabled(enabled) }
+            .onSuccess { drawn ->
+                val message =
+                    when {
+                        !enabled -> "Disabled 1001 Albums Generator"
+                        drawn != null -> "1001 Albums active · ${drawn.name}"
+                        else -> "1001 Albums completed"
+                    }
+                showStatusMessage(message)
+            }
+            .onFailure { err ->
+                showStatusMessage("Album generator error (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performFinish1001Album(notes: String) {
+        transientState.update { it.copy(albumNoteDialogMode = null) }
+        runSuspendCatching { repository.catalog.finishCurrent1001Album(notes) }
+            .onSuccess { (finishedId, nextAlbum) ->
+                val openedRank =
+                    openRankSessionForCollection(
+                        collectionIdOrSlug = EntryKind.ALBUM.systemListSlug,
+                        focusEntryId = finishedId,
+                    )
+                if (!openedRank) {
+                    val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
+                    showStatusMessage("Logged #1 album to Diary$nextPart")
+                }
+            }
+            .onFailure { err ->
+                showStatusMessage("Could not finish album (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performAbandon1001Album(notes: String) {
+        transientState.update { it.copy(albumNoteDialogMode = null) }
+        runSuspendCatching { repository.catalog.abandonCurrent1001Album(notes) }
+            .onSuccess { (_, nextAlbum) ->
+                val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
+                showStatusMessage("Abandoned album$nextPart")
+            }
+            .onFailure { err ->
+                showStatusMessage("Could not abandon album (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performStartRankingSession(
+        collectionIdOrSlug: String,
+        focusEntryId: String?,
+    ) {
+        val opened =
+            openRankSessionForCollection(
+                collectionIdOrSlug = collectionIdOrSlug,
+                focusEntryId = focusEntryId,
+            )
+        if (!opened) {
+            showStatusMessage("Need at least 2 entries in this list to compare")
+        }
+    }
+
+    private suspend fun openRankSessionForCollection(
+        collectionIdOrSlug: String,
+        focusEntryId: String?,
+    ): Boolean {
+        val rankMeta = repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val title = rankMeta?.title ?: "Rankings"
+        val scopeId = rankMeta?.scopeCollectionId
+        val cluster =
+            repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = collectionIdOrSlug,
+                focusEntryId = focusEntryId,
+                roundIndex = 0,
+            )
+        val nextSession =
+            if (cluster.isNotEmpty()) {
+                ActiveRankSessionUiState(
+                    collectionIdOrSlug = collectionIdOrSlug,
+                    collectionTitle = title,
+                    scopeCollectionId = scopeId,
+                    focusEntryId = focusEntryId,
+                    roundIndex = 0,
+                    cluster = cluster,
+                    settlement = null,
+                )
+            } else {
+                val settlement =
+                    focusEntryId
+                        ?.let { repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug) }
+                        ?.takeIf { it.totalCount >= 1 }
+                settlement?.let {
+                    ActiveRankSessionUiState(
+                        collectionIdOrSlug = collectionIdOrSlug,
+                        collectionTitle = title,
+                        scopeCollectionId = scopeId,
+                        focusEntryId = focusEntryId,
+                        roundIndex = 0,
+                        cluster = emptyList(),
+                        settlement = it,
+                    )
+                }
+            }
+        if (nextSession != null) {
+            transientState.update { it.copy(rankSession = nextSession) }
+        }
+        return nextSession != null
+    }
+
+    private suspend fun performSubmitRankCluster(ordering: List<List<String>>) {
+        val session = transientState.value.rankSession ?: return
+        runSuspendCatching {
+            repository.catalog.recordComparison(
+                ordering = ordering,
+                scopeCollectionId = session.scopeCollectionId,
+            )
+        }
+            .onFailure { err ->
+                showStatusMessage("Invalid ordering (${err.message ?: "error"})")
+                return
+            }
+        val judgedSet = session.cluster.map { it.entryId }.toSet()
+        advanceRankSession(
+            session = session.copy(judgedClusters = session.judgedClusters + listOf(judgedSet)),
+            forceRandomNext = false,
+        )
+    }
+
+    private suspend fun performSkipRankCluster() {
+        val session = transientState.value.rankSession ?: return
+        advanceRankSession(session = session, forceRandomNext = true)
+    }
+
+    private suspend fun advanceRankSession(
+        session: ActiveRankSessionUiState,
+        forceRandomNext: Boolean,
+    ) {
+        val nextRound = session.roundIndex + 1
+        val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
+        if (nextCluster.isNotEmpty()) {
+            transientState.update {
+                it.copy(
+                    rankSession =
+                        session.copy(
+                            roundIndex = nextRound,
+                            cluster = nextCluster,
+                            settlement = null,
+                        )
+                )
+            }
+            return
+        }
+        val settlement =
+            session.focusEntryId?.let {
+                repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
+            }
+        if (settlement != null) {
+            transientState.update {
+                it.copy(
+                    rankSession =
+                        session.copy(
+                            roundIndex = nextRound,
+                            cluster = emptyList(),
+                            settlement = settlement,
+                        )
+                )
+            }
+        } else {
+            transientState.update { it.copy(rankSession = null) }
+            showStatusMessage("Rankings settled for ${session.collectionTitle}")
+        }
+    }
+
+    private suspend fun selectDeduplicatedNextCluster(
+        session: ActiveRankSessionUiState,
+        nextRound: Int,
+        forceRandomNext: Boolean,
+    ): List<RankClusterCandidate> {
+        if (session.focusEntryId != null && nextRound >= MAX_FOCUSED_RANK_ROUNDS) {
+            return emptyList()
+        }
+        val candidate =
+            repository.catalog.selectNextRankCluster(
+                collectionIdOrSlug = session.collectionIdOrSlug,
+                focusEntryId = session.focusEntryId,
+                roundIndex = nextRound,
+                forceRandomNext = forceRandomNext,
+            )
+        if (candidate.isEmpty() || !isAlreadyCoveredCluster(candidate, session.judgedClusters)) {
+            return candidate
+        }
+        return if (session.focusEntryId == null) {
+            repository.catalog
+                .selectNextRankCluster(
+                    collectionIdOrSlug = session.collectionIdOrSlug,
+                    focusEntryId = null,
+                    roundIndex = nextRound,
+                    forceRandomNext = true,
+                )
+                .takeUnless { isAlreadyCoveredCluster(it, session.judgedClusters) }
+                .orEmpty()
+        } else {
+            emptyList()
+        }
+    }
+
+    private fun isAlreadyCoveredCluster(
+        cluster: List<RankClusterCandidate>,
+        judgedClusters: List<Set<String>>,
+    ): Boolean {
+        val ids = cluster.map { it.entryId }
+        return ids.isNotEmpty() && judgedClusters.any { prev -> prev.containsAll(ids) }
+    }
+
+    private suspend fun performMarkFeedEntryFinished(
+        entryId: String,
+        rankImmediately: Boolean,
+    ) {
+        val resolvedId = repository.markFeedItemFinished(entryId)
+        settingsRepository.update { current ->
+            current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
+        }
+        val wasActiveAudio = playerController.state.value.currentEntryId == entryId
+        if (wasActiveAudio) {
+            playerController.stopAndClear()
+        }
+        transientState.update { it.copy(contextSheetEntryId = null) }
+        if (resolvedId == null) {
+            showStatusMessage("Entry not found")
+            return
+        }
+        if (rankImmediately) {
+            val pair = repository.prepareFeedItemForRank(entryId)
+            val slug = (pair?.second ?: EntryKind.ARTICLE).systemListSlug
+            val opened = openRankSessionForCollection(slug, resolvedId)
+            if (!opened) {
+                showStatusMessage("Logged to Diary")
+            }
+        } else {
+            showStatusMessage("Marked finished & logged to Diary")
+        }
+    }
+
+    private suspend fun performSubmitQuickLog(action: MainAction.SubmitQuickLog) {
+        val cleanTitle = action.title.trim()
+        if (cleanTitle.isEmpty()) {
+            showStatusMessage("Enter a title")
+            return
+        }
+        val targetListId = action.targetCollectionId?.trim()?.takeIf { it.isNotEmpty() }
+        runSuspendCatching { saveQuickLogEntry(action, cleanTitle, targetListId) }
+            .onSuccess { entryId ->
+                handleQuickLogSaved(action, cleanTitle, targetListId, entryId)
+            }
+            .onFailure { err ->
+                showStatusMessage("Could not save (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun saveQuickLogEntry(
+        action: MainAction.SubmitQuickLog,
+        cleanTitle: String,
+        targetListId: String?,
+    ): String {
+        val creators = action.creatorsCsv.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        val input =
+            UpsertCatalogEntryInput(
+                kind = action.kind,
+                title = cleanTitle,
+                creators = creators,
+                releaseYear = action.releaseYear,
+            )
+        return if (action.addToWant) {
+            repository.catalog.wantEntry(input)
+        } else {
+            val loggedId = repository.catalog.logEntry(input, action.status, action.notes)
+            if (targetListId != null) {
+                repository.catalog.addCollectionEntry(targetListId, loggedId)
+            }
+            loggedId
+        }
+    }
+
+    private suspend fun handleQuickLogSaved(
+        action: MainAction.SubmitQuickLog,
+        cleanTitle: String,
+        targetListId: String?,
+        entryId: String,
+    ) {
+        transientState.update {
+            it.copy(
+                isQuickLogSheetOpen = false,
+                quickLogTargetCollectionId = null,
+                quickLogTargetCollectionTitle = null,
+            )
+        }
+        if (!action.addToWant && action.rankAfterLog) {
+            val rankTarget = targetListId ?: action.kind.systemListSlug
+            if (!openRankSessionForCollection(rankTarget, entryId)) {
+                showStatusMessage("Logged \"$cleanTitle\" to Diary")
+            }
+        } else {
+            val verb = if (action.addToWant) "Added to Want Queue" else "Logged to Diary"
+            showStatusMessage("$verb · $cleanTitle")
+        }
+    }
+
+    private suspend fun performCreateCustomList(rawTitle: String) {
+        runSuspendCatching { repository.catalog.createCustomList(rawTitle) }
+            .onSuccess { specId ->
+                transientState.update {
+                    it.copy(
+                        companionSubTab = CompanionSubTab.LISTS,
+                        selectedCatalogCollectionId = specId,
+                    )
+                }
+                showStatusMessage("Created list \"${rawTitle.trim()}\"")
+            }
+            .onFailure { err ->
+                showStatusMessage("Could not create list (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performCompleteWantEntry(entryId: String, rankImmediately: Boolean) {
+        runSuspendCatching {
+            repository.catalog.logExistingEntry(entryId, ConsumptionStatus.CONSUMED, null)
+        }
+            .onSuccess { resolvedId ->
+                val targetId = resolvedId ?: entryId
+                val listSlug = repository.catalog.resolveEntrySystemListSlug(targetId)
+                if (rankImmediately && listSlug != null) {
+                    val opened = openRankSessionForCollection(listSlug, targetId)
+                    if (!opened) {
+                        showStatusMessage("Completed & logged to Diary")
+                    }
+                } else {
+                    showStatusMessage("Completed & logged to Diary")
+                }
+            }
+            .onFailure { err ->
+                showStatusMessage("Could not complete item (${err.message ?: "error"})")
+            }
+    }
+
+    private suspend fun performRemoveWantEntry(collectionId: String, entryId: String) {
+        val meta = repository.catalog.resolveCollectionRankMeta(collectionId)
+        val label = if (meta?.scopeCollectionId != null) "Want Queue" else meta?.title ?: "list"
+        runSuspendCatching {
+            repository.catalog.removeCollectionEntry(collectionId, entryId)
+        }
+            .onSuccess { showStatusMessage("Removed from $label") }
+            .onFailure { err ->
+                showStatusMessage("Could not remove (${err.message ?: "error"})")
+            }
+    }
+
     private suspend fun performSync(errorPolicy: SyncErrorPolicy = SyncErrorPolicy.SHOW_BANNER) {
         refreshLocalNetworkTier()
         if (!tryAcquireSyncLock()) return
@@ -1156,5 +1542,6 @@ class MainViewModel(
 
     private companion object {
         private const val STOP_TIMEOUT_MS = 5_000L
+        private const val MAX_FOCUSED_RANK_ROUNDS = 8
     }
 }

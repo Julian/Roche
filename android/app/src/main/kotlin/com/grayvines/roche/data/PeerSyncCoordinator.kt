@@ -24,6 +24,7 @@ internal data class BuiltPeerSyncRequest(
     val sentFeedIds: Set<String>,
     val sentItemIds: Set<String>,
     val overflowItemIds: Set<String>,
+    val sentCatalogBatch: OutgoingCatalogSyncBatch = OutgoingCatalogSyncBatch(),
 )
 
 internal data class PeerSyncPreloadedState(
@@ -47,6 +48,8 @@ internal data class PeerSyncReconcileInput(
     val sentFeedIds: Set<String>? = null,
     val sentItemIds: Set<String>? = null,
     val overflowItemIds: Set<String> = emptySet(),
+    val sentCatalogBatch: OutgoingCatalogSyncBatch = OutgoingCatalogSyncBatch(),
+    val catalogStore: CatalogStore? = null,
 )
 
 internal data class CooperativePollOutcome(
@@ -76,9 +79,11 @@ internal suspend fun buildTrackedPeerSyncRequest(
     val mutationsById =
         (preloaded?.mutations ?: dao.getAllPendingMutations()).associateBy { it.entityId }
     val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+    val syncablePeerItems = allItems.filter {
+        isSyncablePeerItem(it, unsyncedFeedIds, feedUrlsById)
+    }
     val hasSyncableData =
-        syncableFeeds.isNotEmpty() ||
-            allItems.any { isSyncablePeerItem(it, unsyncedFeedIds, feedUrlsById) }
+        syncableFeeds.isNotEmpty() || syncablePeerItems.isNotEmpty() || hasLocalCatalogSyncData(dao)
     val sinceInstant = resolveDeltaSinceInstant(config.updatedAfter, hasSyncableData)
     val inclusiveSinceInstant = sinceInstant?.minusSeconds(1)
     val (sentItems, overflowItemIds) =
@@ -89,35 +94,83 @@ internal suspend fun buildTrackedPeerSyncRequest(
             feedUrlsById = feedUrlsById,
             inclusiveSinceInstant = inclusiveSinceInstant,
         )
-    val itemPayloads = sentItems.map { item ->
-        toPeerSyncItemPayload(
-            item = item,
-            mut = mutationsById[item.id],
-            itemTagNames = itemTagsByItemId[item.id].orEmpty(),
-            feedUrlsById = feedUrlsById,
-            nowIso = nowIso,
+    val sentFeedIdSet = syncableFeeds.map { it.id }.toSet()
+    val nonOverflowSyncableItemIds =
+        syncablePeerItems.map { it.id }.filterNot { it in overflowItemIds }.toSet()
+    val catalogBatch =
+        buildOutgoingCatalogSyncBatch(
+            dao = dao,
+            inclusiveSinceInstant = inclusiveSinceInstant,
+            syncedFeedIds = sentFeedIdSet,
+            syncedItemIds = nonOverflowSyncableItemIds,
         )
-    }
+    val itemPayloads =
+        mapPeerSyncItemPayloads(sentItems, mutationsById, itemTagsByItemId, feedUrlsById, nowIso)
     val tombstones = collectPeerSyncTombstones(dao.getAllTombstones(), inclusiveSinceInstant)
-    val effectiveWeight =
-        if (config.networkTier == NetworkTier.OFFLINE) 0.0 else config.weightOverride
     val requestDto =
-        PeerSyncRequestDto(
-            peerId = config.peerId,
-            deviceName = config.deviceName,
-            networkTier = config.networkTier.wireValue,
-            weight = effectiveWeight,
-            updatedAfter = sinceInstant?.toString(),
-            feeds = syncableFeeds,
-            items = itemPayloads,
+        assemblePeerSyncRequestDto(
+            config = config,
+            sinceInstant = sinceInstant,
+            syncableFeeds = syncableFeeds,
+            itemPayloads = itemPayloads,
             tags = tags,
             tombstones = tombstones,
+            catalogBatch = catalogBatch,
         )
     return BuiltPeerSyncRequest(
         request = requestDto,
-        sentFeedIds = syncableFeeds.map { it.id }.toSet(),
+        sentFeedIds = sentFeedIdSet,
         sentItemIds = sentItems.map { it.id }.toSet(),
         overflowItemIds = overflowItemIds,
+        sentCatalogBatch = catalogBatch,
+    )
+}
+
+@Suppress("LongParameterList")
+private fun mapPeerSyncItemPayloads(
+    sentItems: List<ItemEntity>,
+    mutationsById: Map<String, PendingMutationEntity>,
+    itemTagsByItemId: Map<String, List<String>>,
+    feedUrlsById: Map<String, String>,
+    nowIso: String,
+): List<PeerSyncItemPayload> = sentItems.map { item ->
+    toPeerSyncItemPayload(
+        item = item,
+        mut = mutationsById[item.id],
+        itemTagNames = itemTagsByItemId[item.id].orEmpty(),
+        feedUrlsById = feedUrlsById,
+        nowIso = nowIso,
+    )
+}
+
+@Suppress("LongParameterList")
+private fun assemblePeerSyncRequestDto(
+    config: PeerSyncRequestConfig,
+    sinceInstant: Instant?,
+    syncableFeeds: List<FeedEntity>,
+    itemPayloads: List<PeerSyncItemPayload>,
+    tags: List<TagEntity>,
+    tombstones: List<SyncTombstoneDto>,
+    catalogBatch: OutgoingCatalogSyncBatch,
+): PeerSyncRequestDto {
+    val effectiveWeight =
+        if (config.networkTier == NetworkTier.OFFLINE) 0.0 else config.weightOverride
+    return PeerSyncRequestDto(
+        peerId = config.peerId,
+        deviceName = config.deviceName,
+        networkTier = config.networkTier.wireValue,
+        weight = effectiveWeight,
+        updatedAfter = sinceInstant?.toString(),
+        feeds = syncableFeeds,
+        items = itemPayloads,
+        tags = tags,
+        tombstones = tombstones,
+        collections = catalogBatch.collections,
+        catalogEntries = catalogBatch.catalogEntries,
+        collectionEntries = catalogBatch.collectionEntries,
+        collectionGenerators = catalogBatch.collectionGenerators,
+        consumptionLog = catalogBatch.consumptionLog,
+        comparisons = catalogBatch.comparisons,
     )
 }
 
@@ -315,6 +368,24 @@ internal class PeerResponseReconciler(
                     overflowItemIds = input.overflowItemIds,
                 ),
         )
+        val store = input.catalogStore
+        if (store != null) {
+            store.withMutationLock {
+                reconcileIncomingCatalogSync(
+                    dao = dao,
+                    catalogStore = store,
+                    response = response,
+                    sentBatch = input.sentCatalogBatch,
+                )
+            }
+        } else {
+            reconcileIncomingCatalogSync(
+                dao = dao,
+                catalogStore = null,
+                response = response,
+                sentBatch = input.sentCatalogBatch,
+            )
+        }
     }
 
     private suspend fun syncTombstones() {
@@ -430,6 +501,7 @@ internal class PeerSyncCoordinator(
     private val dao: RocheDao,
     private val apiClient: RocheApiClient,
     private val networkTier: NetworkTier = NetworkTier.WIFI,
+    private val catalogStore: CatalogStore? = null,
     private val onPeersUpdated: (List<PeerNodeDto>) -> Unit = {},
     private val onSyncCursorUpdated: suspend (String) -> Unit = {},
 ) {
@@ -608,6 +680,7 @@ internal class PeerSyncCoordinator(
                     isDeltaItems = true,
                     sentFeedIds = emptySet(),
                     sentItemIds = emptySet(),
+                    catalogStore = catalogStore,
                 ),
         )
         return response
@@ -660,6 +733,8 @@ internal class PeerSyncCoordinator(
                     sentFeedIds = tracked.sentFeedIds,
                     sentItemIds = tracked.sentItemIds,
                     overflowItemIds = tracked.overflowItemIds,
+                    sentCatalogBatch = tracked.sentCatalogBatch,
+                    catalogStore = catalogStore,
                 ),
         )
         return SinglePeerSyncResult(

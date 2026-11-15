@@ -83,7 +83,7 @@ impl SafeHttpClient {
             .dns_resolver(Arc::new(SafeDnsResolver))
             .redirect(Self::redirect_policy())
             .default_headers(default_headers)
-            .user_agent("Mozilla/5.0 (compatible; Roche/0.1; +https://github.com/julian/roche)")
+            .user_agent("Mozilla/5.0 (compatible; Roche/0.1)")
             .build()?;
         Ok(Self { client })
     }

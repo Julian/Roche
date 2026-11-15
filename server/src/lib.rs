@@ -1,15 +1,19 @@
+pub mod albums_pool;
 mod api;
 mod auth;
 pub mod cli;
 pub mod config;
 mod content;
-mod db;
+pub mod db;
 mod error;
 mod feeds;
 mod media;
+pub mod ranking;
 mod scheduler;
 mod service;
 pub mod tailscale;
+mod tui_rank;
+mod web;
 mod workers;
 
 pub struct RocheServer;
@@ -123,6 +127,10 @@ impl RocheServer {
         }
 
         tracing::info!("Shutdown signal received, stopping server");
+    }
+
+    pub(crate) async fn connect_db(cfg: &config::Config) -> anyhow::Result<db::Db> {
+        db::Db::connect(&cfg.storage.database_path).await
     }
 
     async fn connect_service(cfg: &config::Config) -> anyhow::Result<service::RocheService> {

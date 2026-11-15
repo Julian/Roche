@@ -46,6 +46,8 @@ fun BottomTabIcon(
                 )
             AppTab.HOME -> drawHomeTabIcon(tint = tint, stroke = stroke)
             AppTab.FEEDS -> drawFeedsTabIcon(tint = tint, stroke = stroke)
+            AppTab.LISTS ->
+                drawListsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
             AppTab.OFFLINE ->
                 drawArrowTray(
                     tint = tint,
@@ -147,6 +149,32 @@ private fun DrawScope.drawHomeTabIcon(tint: Color, stroke: Stroke) {
             lineTo(w * 0.59f, h * 0.84f)
         }
     drawPath(path = doorPath, color = tint, style = stroke)
+}
+
+private fun DrawScope.drawListsTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
+    val w = size.width
+    val h = size.height
+    drawRoundRect(
+        color = tint,
+        topLeft = Offset(w * 0.16f, h * 0.16f),
+        size = Size(w * 0.68f, h * 0.68f),
+        cornerRadius = CornerRadius(w * CORNER_FRACTION, w * CORNER_FRACTION),
+        style = stroke,
+    )
+    for (rowY in listOf(0.36f, 0.52f, 0.68f)) {
+        drawCircle(
+            color = tint,
+            radius = strokeWidth * 0.72f,
+            center = Offset(w * 0.30f, h * rowY),
+        )
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.42f, h * rowY),
+            end = Offset(w * 0.72f, h * rowY),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
+    }
 }
 
 /** Crisp magnifying glass icon for the floating Search overlay button and search bar. */

@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions")
+
 package com.grayvines.roche.ui
 
 import androidx.activity.compose.BackHandler
@@ -92,6 +94,7 @@ fun ReaderView(
     Column(modifier = Modifier.fillMaxSize().background(colors.background)) {
         ReaderTopToolbar(
             entry = entry,
+            scrollState = scrollState,
             backLabel = backLabel,
             showTypographyDrawer = showTypographyDrawer,
             onToggleTypography = { showTypographyDrawer = !showTypographyDrawer },
@@ -166,7 +169,7 @@ internal fun ReaderScrollProgressEffect(
     scrollState: ScrollState,
     onAction: (MainAction) -> Unit,
 ) {
-    val bodyLengthBucket = (entry.contentHtml?.length ?: 0) + (entry.contentText?.length ?: 0)
+    val bodyLengthBucket = readerBodyCharCount(entry)
     var restoredBodyBucket by remember(entry.id) { androidx.compose.runtime.mutableIntStateOf(-1) }
     var hasUserScrolled by remember(entry.id) { mutableStateOf(false) }
 
@@ -178,29 +181,89 @@ internal fun ReaderScrollProgressEffect(
             val targetScroll =
                 (entry.readProgress.coerceIn(0.0, 1.0) * scrollState.maxValue).toInt()
             scrollState.scrollTo(targetScroll)
+        } else if (shouldAutoCompleteViewportFit(entry, bodyLengthBucket, scrollState.maxValue)) {
+            androidx.compose.runtime.withFrameNanos {}
+            if (scrollState.maxValue == 0) {
+                onAction(MainAction.UpdateReadProgress(entry.id, 1.0))
+            }
         }
     }
 
-    LaunchedEffect(
-        entry.id,
-        scrollState.isScrollInProgress,
-        scrollState.maxValue,
-    ) {
+    LaunchedEffect(entry.id, scrollState.isScrollInProgress, scrollState.maxValue) {
         if (scrollState.isScrollInProgress) {
             hasUserScrolled = true
         } else if (hasUserScrolled && scrollState.maxValue > 0) {
-            val rawProgress =
-                (scrollState.value.toDouble() / scrollState.maxValue.toDouble()).coerceIn(0.0, 1.0)
-            if (kotlin.math.abs(rawProgress - entry.readProgress) >= READ_PROGRESS_MIN_DELTA) {
-                onAction(MainAction.UpdateReadProgress(entry.id, rawProgress))
-            }
+            maybeCommitScrolledProgress(entry, scrollState, onAction)
         }
     }
 }
 
+private fun readerBodyCharCount(entry: InboxEntry): Int =
+    (entry.contentHtml?.length ?: 0) +
+        (entry.contentText?.length ?: 0) +
+        (entry.summary?.length ?: 0)
+
+private fun shouldAutoCompleteViewportFit(
+    entry: InboxEntry,
+    bodyLengthBucket: Int,
+    maxScroll: Int,
+): Boolean {
+    val isReadableText =
+        entry.contentType != ContentType.VIDEO && entry.contentType != ContentType.AUDIO
+    return isReadableText && bodyLengthBucket > 0 && maxScroll == 0 && entry.readProgress < 1.0
+}
+
+private fun maybeCommitScrolledProgress(
+    entry: InboxEntry,
+    scrollState: ScrollState,
+    onAction: (MainAction) -> Unit,
+) {
+    val rawProgress =
+        (scrollState.value.toDouble() / scrollState.maxValue.toDouble()).coerceIn(0.0, 1.0)
+    val crossedCompletion =
+        rawProgress >= ARCHIVE_COMPLETION_THRESHOLD &&
+            entry.readProgress < ARCHIVE_COMPLETION_THRESHOLD
+    if (
+        crossedCompletion ||
+            kotlin.math.abs(rawProgress - entry.readProgress) >= READ_PROGRESS_MIN_DELTA
+    ) {
+        onAction(MainAction.UpdateReadProgress(entry.id, rawProgress))
+    }
+}
+
+internal fun computeLiveReaderProgress(entry: InboxEntry, scrollState: ScrollState): Double? {
+    if (entry.contentType == ContentType.VIDEO || entry.contentType == ContentType.AUDIO) {
+        return null
+    }
+    return when {
+        scrollState.maxValue > 0 ->
+            (scrollState.value.toDouble() / scrollState.maxValue.toDouble()).coerceIn(0.0, 1.0)
+        readerBodyCharCount(entry) > 0 -> 1.0
+        else -> null
+    }
+}
+
+private fun flushAndToggleReaderArchive(
+    entry: InboxEntry,
+    scrollState: ScrollState,
+    onAction: (MainAction) -> Unit,
+) {
+    val live = computeLiveReaderProgress(entry, scrollState)
+    val updatedEntry =
+        if (!entry.isArchived && live != null && live > entry.readProgress) {
+            onAction(MainAction.UpdateReadProgress(entry.id, live))
+            entry.copy(readProgress = live)
+        } else {
+            entry
+        }
+    onAction(MainAction.ToggleArchive(updatedEntry))
+}
+
 @Composable
+@Suppress("LongParameterList")
 private fun ReaderTopToolbar(
     entry: InboxEntry,
+    scrollState: ScrollState,
     backLabel: String,
     showTypographyDrawer: Boolean,
     onToggleTypography: () -> Unit,
@@ -221,14 +284,19 @@ private fun ReaderTopToolbar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            if (entry.contentType == ContentType.VIDEO) {
+                HeaderActionButton(
+                    label = "✓ Finished",
+                    style = RocheButtonStyle.PRIMARY,
+                    onClick = { onAction(MainAction.MarkFeedEntryFinished(entry.id, false)) },
+                    modifier = Modifier.testTag("reader_video_finished_btn"),
+                )
+            }
+            val aaStyle =
+                if (showTypographyDrawer) RocheButtonStyle.PRIMARY else RocheButtonStyle.SECONDARY
             HeaderActionButton(
                 label = "Aa",
-                style =
-                    if (showTypographyDrawer) {
-                        RocheButtonStyle.PRIMARY
-                    } else {
-                        RocheButtonStyle.SECONDARY
-                    },
+                style = aaStyle,
                 onClick = onToggleTypography,
                 modifier = Modifier.testTag("reader_typography_btn"),
             )
@@ -236,7 +304,7 @@ private fun ReaderTopToolbar(
                 entry = entry,
                 tagPrefix = "reader",
                 onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                onToggleArchive = { flushAndToggleReaderArchive(entry, scrollState, onAction) },
             )
             HeaderActionButton(label = "Share", onClick = onShare)
             HeaderActionButton(
@@ -787,6 +855,19 @@ private fun ContextSheetActionsList(
         )
     }
     ContextActionItem(
+        label = "✓ Finished & Log to Diary",
+        textColor = LocalRocheColors.current.accentVerdigris,
+        onClick = {
+            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = false))
+        },
+    )
+    ContextActionItem(
+        label = "★ Finish & Rank",
+        onClick = {
+            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = true))
+        },
+    )
+    ContextActionItem(
         label = "Play Next in Queue",
         onClick = { onAction(MainAction.AddToQueue(entryId = entry.id, playNext = true)) },
     )
@@ -1154,6 +1235,7 @@ fun AddUrlOrFeedBottomSheet(
 
 private const val MIN_PROGRESS = 0.08f
 private const val READ_PROGRESS_MIN_DELTA = 0.05
+private const val ARCHIVE_COMPLETION_THRESHOLD = 0.90
 private const val PERCENT_MULTIPLIER = 100
 private const val READER_SCALE_STEP = 0.10f
 private const val READER_SCALE_EPSILON = 0.03f

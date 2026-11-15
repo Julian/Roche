@@ -1,10 +1,24 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
-use super::{ActivityAction, ActivityEntityType, MediaType, SyncRepo};
+use super::{
+    ActivityAction, ActivityEntityType, MediaType, SyncRepo, sync::deterministic_enclosure_media_id,
+};
 use crate::media::MediaStore;
+
+macro_rules! local_media_select_sql {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT m.id, m.entry_id AS item_id, m.media_type, m.local_path AS path, m.file_size, m.duration
+FROM entry_media m
+WHERE m.local_path IS NOT NULL ",
+            $suffix
+        )
+    };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
@@ -27,6 +41,36 @@ impl<'a> MediaRepo<'a> {
         Self { pool }
     }
 
+    pub(crate) async fn upsert_audio_enclosure_in_tx(
+        conn: &mut SqliteConnection,
+        entry_id: &str,
+        audio_url: Option<&str>,
+        duration: Option<i64>,
+        created_at: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let clean_url = audio_url.map(str::trim).filter(|s| !s.is_empty());
+        let clean_dur = duration.filter(|&d| d > 0);
+        if clean_url.is_none() && clean_dur.is_none() {
+            return Ok(());
+        }
+        let enc_id = deterministic_enclosure_media_id(entry_id);
+        sqlx::query(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+             VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 remote_url = COALESCE(entry_media.remote_url, excluded.remote_url),
+                 duration = COALESCE(entry_media.duration, excluded.duration)",
+        )
+        .bind(&enc_id)
+        .bind(entry_id)
+        .bind(clean_url)
+        .bind(clean_dur)
+        .bind(created_at)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     pub async fn create(
         &self,
         item_id: &str,
@@ -40,8 +84,8 @@ impl<'a> MediaRepo<'a> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO media (id, item_id, media_type, path, file_size, duration, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(item_id)
@@ -75,25 +119,26 @@ impl<'a> MediaRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Media>> {
-        Ok(sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = ?")
+        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!("AND m.id = ?"))
             .bind(id)
             .fetch_optional(self.pool)
             .await?)
     }
 
     pub async fn list_for_item(&self, item_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>("SELECT * FROM media WHERE item_id = ?")
+        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!("AND m.entry_id = ?"))
             .bind(item_id)
             .fetch_all(self.pool)
             .await?)
     }
 
     pub async fn list_for_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(
-            "SELECT m.* FROM media m
-             JOIN items i ON m.item_id = i.id
-             WHERE i.feed_id = ?",
-        )
+        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
+            "AND EXISTS (
+                SELECT 1 FROM collection_entries ce
+                WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
+            )"
+        ))
         .bind(feed_id)
         .fetch_all(self.pool)
         .await?)
@@ -102,7 +147,10 @@ impl<'a> MediaRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("DELETE FROM media WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        let res = sqlx::query("DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         if res.rows_affected() > 0 {
             SyncRepo::record_activity(
                 &mut tx,
@@ -132,9 +180,9 @@ impl<'a> MediaRepo<'a> {
     }
 
     pub async fn find_orphaned(&self) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(
-            "SELECT * FROM media WHERE item_id NOT IN (SELECT id FROM items)",
-        )
+        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
+            "AND m.entry_id NOT IN (SELECT id FROM entries)"
+        ))
         .fetch_all(self.pool)
         .await?)
     }

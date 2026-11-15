@@ -1,0 +1,318 @@
+{
+  "ep_cases": [
+    {
+      "name": "cold_start_five_items",
+      "items": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e"
+      ],
+      "orderings": [],
+      "expected_scores": {
+        "a": {
+          "mean": 0.0,
+          "variance": 1.0
+        },
+        "b": {
+          "mean": 0.0,
+          "variance": 1.0
+        },
+        "c": {
+          "mean": 0.0,
+          "variance": 1.0
+        },
+        "d": {
+          "mean": 0.0,
+          "variance": 1.0
+        },
+        "e": {
+          "mean": 0.0,
+          "variance": 1.0
+        }
+      },
+      "expected_quantiles": {
+        "a": 2,
+        "b": 2,
+        "c": 2,
+        "d": 2,
+        "e": 2
+      },
+      "expected_first_pair_confusability": 0.5
+    },
+    {
+      "name": "strict_four_chain",
+      "items": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "orderings": [
+        [
+          [
+            "a"
+          ],
+          [
+            "b"
+          ],
+          [
+            "c"
+          ],
+          [
+            "d"
+          ]
+        ]
+      ],
+      "expected_scores": {
+        "a": {
+          "mean": 0.864725728,
+          "variance": 0.704949273
+        },
+        "b": {
+          "mean": 0.284586828,
+          "variance": 0.683213179
+        },
+        "c": {
+          "mean": -0.284586828,
+          "variance": 0.683213179
+        },
+        "d": {
+          "mean": -0.864725728,
+          "variance": 0.704949273
+        }
+      },
+      "expected_quantiles": {
+        "d": 0,
+        "c": 1,
+        "b": 3,
+        "a": 4
+      },
+      "expected_first_pair_confusability": 0.311220785
+    },
+    {
+      "name": "partial_ties_and_isolated",
+      "items": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "g"
+      ],
+      "orderings": [
+        [
+          [
+            "a"
+          ],
+          [
+            "b",
+            "c"
+          ],
+          [
+            "d"
+          ]
+        ],
+        [
+          [
+            "b"
+          ],
+          [
+            "d",
+            "e"
+          ]
+        ],
+        [
+          [
+            "a",
+            "f"
+          ],
+          [
+            "c"
+          ]
+        ]
+      ],
+      "expected_scores": {
+        "a": {
+          "mean": 0.911278847,
+          "variance": 0.546446593
+        },
+        "b": {
+          "mean": 0.27535399,
+          "variance": 0.530897892
+        },
+        "c": {
+          "mean": -0.275353995,
+          "variance": 0.530897889
+        },
+        "d": {
+          "mean": -0.911278843,
+          "variance": 0.546446588
+        },
+        "e": {
+          "mean": -0.509725186,
+          "variance": 0.677736501
+        },
+        "f": {
+          "mean": 0.509725187,
+          "variance": 0.677736501
+        },
+        "g": {
+          "mean": 0.0,
+          "variance": 1.0
+        }
+      },
+      "expected_quantiles": {
+        "d": 0,
+        "e": 0,
+        "c": 1,
+        "g": 2,
+        "b": 3,
+        "f": 4,
+        "a": 4
+      },
+      "expected_first_pair_confusability": 0.2700464
+    },
+    {
+      "name": "all_tied_cluster",
+      "items": [
+        "x",
+        "y",
+        "z"
+      ],
+      "orderings": [
+        [
+          [
+            "x",
+            "y",
+            "z"
+          ]
+        ]
+      ],
+      "expected_scores": {
+        "x": {
+          "mean": -0.0,
+          "variance": 0.628485493
+        },
+        "y": {
+          "mean": 0.0,
+          "variance": 0.628485493
+        },
+        "z": {
+          "mean": 0.0,
+          "variance": 0.628485493
+        }
+      },
+      "expected_quantiles": {
+        "x": 2,
+        "z": 2,
+        "y": 2
+      },
+      "expected_first_pair_confusability": 0.5
+    },
+    {
+      "name": "transitive_bridge_outside_subset",
+      "items": [
+        "album_97",
+        "album_94"
+      ],
+      "orderings": [
+        [
+          [
+            "album_97"
+          ],
+          [
+            "album_15"
+          ]
+        ],
+        [
+          [
+            "album_15"
+          ],
+          [
+            "album_94"
+          ]
+        ]
+      ],
+      "expected_scores": {
+        "album_97": {
+          "mean": 0.418940049,
+          "variance": 0.859524246
+        },
+        "album_94": {
+          "mean": -0.418940049,
+          "variance": 0.859524246
+        }
+      },
+      "expected_quantiles": {
+        "album_94": 0,
+        "album_97": 4
+      },
+      "expected_first_pair_confusability": 0.261393781
+    },
+    {
+      "name": "cyclic_upsets",
+      "items": [
+        "p",
+        "q",
+        "r"
+      ],
+      "orderings": [
+        [
+          [
+            "p"
+          ],
+          [
+            "q"
+          ]
+        ],
+        [
+          [
+            "q"
+          ],
+          [
+            "r"
+          ]
+        ],
+        [
+          [
+            "r"
+          ],
+          [
+            "p"
+          ]
+        ],
+        [
+          [
+            "p"
+          ],
+          [
+            "q"
+          ]
+        ]
+      ],
+      "expected_scores": {
+        "p": {
+          "mean": 0.248421668,
+          "variance": 0.688997567
+        },
+        "q": {
+          "mean": -0.248421668,
+          "variance": 0.688997567
+        },
+        "r": {
+          "mean": 0.0,
+          "variance": 0.75155647
+        }
+      },
+      "expected_quantiles": {
+        "q": 0,
+        "r": 2,
+        "p": 4
+      },
+      "expected_first_pair_confusability": 0.336056911
+    }
+  ]
+}

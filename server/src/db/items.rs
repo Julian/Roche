@@ -3,41 +3,102 @@ use std::collections::HashSet;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, SqlitePool};
+use sqlx::{QueryBuilder, SqliteConnection, SqlitePool};
 use url::Url;
 
 use super::{
-    ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, ItemSortField, ItemStatus,
-    ItemStatusFilter, ReadAtPatch, SortOrder, SyncRepo, Tag, TagRepo,
-    sync::{deterministic_item_id, item_natural_key},
+    ActivityAction, ActivityEntityType, ArchiveBatchScope, ContentType, EntryKind, InboxState,
+    ItemSortField, ItemStatus, ItemStatusFilter, MediaRepo, ReadAtPatch, SortOrder, SyncRepo, Tag,
+    TagRepo,
+    feeds::resolve_dedup_entry_id,
+    sync::{
+        STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, canonicalize_sync_url,
+        deterministic_consumption_log_id, deterministic_item_id, item_natural_key,
+    },
 };
+use crate::feeds::arxiv::ArxivParser;
 
 const MAX_SEARCH_TERMS: usize = 16;
 
 macro_rules! item_select_sql {
     ($content_html_expr:literal) => {
         concat!(
-            "SELECT i.id, i.feed_id, f.url AS feed_url, f.title AS feed_title, i.title, i.url, i.author,
-       i.published_at, i.created_at, i.summary, ",
+            "SELECT i.id,
+       (SELECT ce_f.collection_id
+        FROM collection_entries ce_f
+        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+        WHERE ce_f.entry_id = i.id
+        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
+        LIMIT 1) AS feed_id,
+       (SELECT fs_f.feed_url
+        FROM collection_entries ce_f
+        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+        WHERE ce_f.entry_id = i.id
+        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
+        LIMIT 1) AS feed_url,
+       (SELECT fs_f.feed_title
+        FROM collection_entries ce_f
+        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+        WHERE ce_f.entry_id = i.id
+        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
+        LIMIT 1) AS feed_title,
+       i.title,
+       COALESCE(i.url, 'https://roche.local/entry/' || i.id) AS url,
+       (SELECT group_concat(value, ', ') FROM json_each(i.creators_json)) AS author,
+       i.published_at,
+       i.created_at,
+       i.summary, ",
             $content_html_expr,
-            " AS content_html, i.thumbnail_url, i.audio_url, i.content_type, i.status,
-       i.is_favorite, i.read_at, i.read_progress, i.interaction_updated_at,
-       (SELECT m.id FROM media m WHERE m.item_id = i.id AND m.media_type = 'thumbnail' ORDER BY m.created_at DESC LIMIT 1) AS thumbnail_media_id,
-       COALESCE(i.duration, (SELECT m.duration FROM media m WHERE m.item_id = i.id AND m.duration IS NOT NULL ORDER BY m.created_at DESC LIMIT 1)) AS duration,
-       COALESCE((SELECT json_group_array(name) FROM (SELECT t.name AS name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = i.id ORDER BY t.name ASC)), '[]') AS tag_names
-FROM items i
-LEFT JOIN feeds f ON i.feed_id = f.id"
+            " AS content_html,
+       i.thumbnail_url,
+       (SELECT m.remote_url
+        FROM entry_media m
+        WHERE m.entry_id = i.id AND m.media_type = 'audio' AND m.remote_url IS NOT NULL
+        ORDER BY m.created_at DESC
+        LIMIT 1) AS audio_url,
+       COALESCE(ec.content_type, 'article') AS content_type,
+       CASE es.inbox_state WHEN 'dismissed' THEN 'archived' ELSE 'unread' END AS status,
+       EXISTS (
+           SELECT 1 FROM collection_entries ce_fav
+           WHERE ce_fav.collection_id = '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
+             AND ce_fav.entry_id = i.id
+       ) AS is_favorite,
+       es.read_at,
+       COALESCE(es.progress, 0.0) AS read_progress,
+       es.interaction_updated_at,
+       (SELECT m.id
+        FROM entry_media m
+        WHERE m.entry_id = i.id AND m.local_path IS NOT NULL AND m.media_type = 'thumbnail'
+        ORDER BY m.created_at DESC
+        LIMIT 1) AS thumbnail_media_id,
+       (SELECT m.duration
+        FROM entry_media m
+        WHERE m.entry_id = i.id AND m.duration IS NOT NULL
+        ORDER BY CASE WHEN m.local_path IS NOT NULL THEN 0 ELSE 1 END ASC, m.created_at DESC
+        LIMIT 1) AS duration,
+       COALESCE((
+           SELECT json_group_array(name) FROM (
+               SELECT e_t.title AS name
+               FROM collection_entries ce_t
+               JOIN collection_specs cs_t ON cs_t.collection_id = ce_t.collection_id
+               JOIN entries e_t ON e_t.id = ce_t.collection_id
+               WHERE ce_t.entry_id = i.id
+                 AND cs_t.collection_role = 'tag'
+                 AND e_t.merged_into_id IS NULL
+               ORDER BY e_t.title ASC
+           )
+       ), '[]') AS tag_names
+FROM entries i
+JOIN entry_state es ON es.entry_id = i.id
+LEFT JOIN entry_content ec ON ec.entry_id = i.id"
         )
     };
 }
 
-/// List query projection that caps inline `content_html` at 64 KB so multi-hundred-KB full-book
-/// essays do not blow up bulk sync page responses or Android's 2 MB SQLite `CursorWindow`;
-/// oversized articles are lazy-hydrated via `GET /api/v1/items/{id}` (`ItemRepo::get`).
-const ITEM_SELECT_LIST: &str =
-    item_select_sql!("CASE WHEN length(i.content_html) <= 65536 THEN i.content_html ELSE NULL END");
+const ITEM_SELECT_LIST: &str = item_select_sql!(
+    "CASE WHEN length(ec.content_html) <= 65536 THEN ec.content_html ELSE NULL END"
+);
 
-/// Lightweight list projection used when `include_content=false` is requested during bulk sync.
 const ITEM_SELECT_METADATA_ONLY: &str = item_select_sql!("NULL");
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,8 +246,6 @@ impl ItemFilter {
         out
     }
 
-    /// Parses user search input into structured [`SearchTerm`]s for multi-field matching across
-    /// `items_fts`, `feeds.title`, and `tags.name`.
     #[must_use]
     pub fn tokenize_search_terms(input: &str) -> Vec<SearchTerm> {
         let mut terms = Vec::new();
@@ -241,13 +300,6 @@ impl ItemFilter {
         terms
     }
 
-    /// Converts user search input into a safe SQLite FTS5 `MATCH` expression.
-    ///
-    /// - Balanced double-quoted segments (`"distributed systems"`) become exact FTS5 phrase queries.
-    /// - Individual words (`quant`) become `("quant" OR "quant"*)` so both Porter-stemmed matches
-    ///   (`computing` -> `compute`) and prefix matches (`quant` -> `quantum`) succeed.
-    /// - Special FTS5 syntax characters (`:`, `*`, `^`, `-`, `(`, `)`, unclosed `"`, boolean keywords)
-    ///   are sanitized so arbitrary user input never triggers an FTS5 syntax error.
     #[must_use]
     pub fn build_fts_query(input: &str) -> Option<String> {
         let terms = Self::tokenize_search_terms(input);
@@ -267,6 +319,128 @@ impl ItemFilter {
     }
 }
 
+/// Auto-logs feed completion (`consumed`) when:
+/// - a `podcast_episode` reaches audio playback completion (`progress >= 0.98`, or archived with `>= 0.9`), or
+/// - an `article` or `paper` is archived (`inbox_state = 'dismissed'`) with `progress >= 0.9`.
+///
+/// Also engages any parent `podcast`, `publication`, or `channel` collection so it surfaces in ranked lists.
+pub(super) async fn maybe_auto_log_feed_completion_in_tx(
+    conn: &mut SqliteConnection,
+    entry_id: &str,
+    entry_kind: EntryKind,
+    inbox_state: InboxState,
+    progress: f64,
+    ts: DateTime<Utc>,
+) -> std::result::Result<(), sqlx::Error> {
+    let should_log = match entry_kind {
+        EntryKind::PodcastEpisode => {
+            progress >= 0.98 || (inbox_state == InboxState::Dismissed && progress >= 0.9)
+        }
+        EntryKind::Article | EntryKind::Paper => {
+            inbox_state == InboxState::Dismissed && progress >= 0.9
+        }
+        _ => false,
+    };
+    if !should_log {
+        return Ok(());
+    }
+
+    ensure_consumed_log_and_parent_engagement_in_tx(conn, entry_id, ts).await
+}
+
+pub(super) async fn ensure_consumed_log_and_parent_engagement_in_tx(
+    conn: &mut SqliteConnection,
+    entry_id: &str,
+    ts: DateTime<Utc>,
+) -> std::result::Result<(), sqlx::Error> {
+    let already_consumed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    if already_consumed.is_none() {
+        let log_id = deterministic_consumption_log_id(entry_id, ts.timestamp_millis(), "consumed");
+        sqlx::query(
+            "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)
+             VALUES (?, ?, ?, 'consumed', NULL, ?)",
+        )
+        .bind(&log_id)
+        .bind(entry_id)
+        .bind(ts)
+        .bind(ts)
+        .execute(&mut *conn)
+        .await?;
+
+        // Auto-promote out of any Want queue on consumption (recording sync tombstones)
+        super::catalog::remove_from_want_queues_in_tx(conn, entry_id, ts).await?;
+    }
+
+    let parent_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT ce.collection_id
+         FROM collection_entries ce
+         JOIN entries pe ON pe.id = ce.collection_id
+         WHERE ce.entry_id = ?
+           AND pe.merged_into_id IS NULL
+           AND pe.kind IN ('podcast', 'publication', 'channel')",
+    )
+    .bind(entry_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    for parent_id in parent_ids {
+        let parent_consumed: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1",
+        )
+        .bind(&parent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if parent_consumed.is_none() {
+            let parent_log_id =
+                deterministic_consumption_log_id(&parent_id, ts.timestamp_millis(), "consumed");
+            sqlx::query(
+                "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)
+                 VALUES (?, ?, ?, 'consumed', NULL, ?)",
+            )
+            .bind(&parent_log_id)
+            .bind(&parent_id)
+            .bind(ts)
+            .bind(ts)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) async fn set_favorite_membership_in_tx(
+    conn: &mut SqliteConnection,
+    entry_id: &str,
+    is_favorite: bool,
+    now: DateTime<Utc>,
+) -> std::result::Result<(), sqlx::Error> {
+    if is_favorite {
+        sqlx::query(
+            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(STARRED_COLLECTION_ID)
+        .bind(entry_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
+            .bind(STARRED_COLLECTION_ID)
+            .bind(entry_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
 pub struct ItemRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
 }
@@ -281,7 +455,7 @@ impl<'a> ItemRepo<'a> {
     pub async fn create(&self, new_item: &NewItem<'_>) -> Result<Item> {
         let feed_url: Option<String> = match new_item.feed_id {
             Some(fid) => {
-                sqlx::query_scalar("SELECT url FROM feeds WHERE id = ?")
+                sqlx::query_scalar("SELECT feed_url FROM feed_sources WHERE collection_id = ?")
                     .bind(fid)
                     .fetch_optional(self.pool)
                     .await?
@@ -289,24 +463,75 @@ impl<'a> ItemRepo<'a> {
             None => None,
         };
         let id = deterministic_item_id(feed_url.as_deref(), new_item.url.as_str());
+        let canon_url = canonicalize_sync_url(new_item.url.as_str());
         let now = SyncRepo::now_utc();
+        let entry_kind = EntryKind::from_content_type(new_item.content_type);
+        let creators_json = new_item
+            .author
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|a| serde_json::to_string(&[a]).ok())
+            .unwrap_or_else(|| "[]".to_owned());
+
+        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO items (id, feed_id, title, url, author, published_at, summary, content_type, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO entries
+             (id, kind, title, creators_json, url, published_at, summary, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
-        .bind(new_item.feed_id)
+        .bind(entry_kind)
         .bind(new_item.title)
+        .bind(&creators_json)
         .bind(new_item.url.as_str())
-        .bind(new_item.author)
         .bind(new_item.published_at)
         .bind(new_item.summary)
-        .bind(new_item.content_type)
         .bind(now)
         .bind(now)
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, NULL, ?)",
+        )
+        .bind(&id)
+        .bind(new_item.content_type)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
+             VALUES (?, 'unread', 0.0, ?)",
+        )
+        .bind(&id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+             VALUES ('url', ?, ?)",
+        )
+        .bind(&canon_url)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(fid) = new_item.feed_id {
+            sqlx::query(
+                "INSERT INTO collection_entries (collection_id, entry_id, added_at)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(fid)
+            .bind(&id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(Item {
             id,
@@ -319,7 +544,7 @@ impl<'a> ItemRepo<'a> {
             published_at: new_item.published_at,
             created_at: now,
             summary: new_item.summary.map(String::from),
-            content_html: new_item.summary.map(String::from),
+            content_html: None,
             thumbnail_url: None,
             audio_url: None,
             content_type: new_item.content_type,
@@ -355,13 +580,17 @@ impl<'a> ItemRepo<'a> {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn save_manual_input_with_tags(
         &self,
         input: &ManualItemInput<'_>,
     ) -> std::result::Result<(Item, Vec<Tag>), sqlx::Error> {
-        let item_id = deterministic_item_id(None, input.url.as_str());
+        let det_item_id = deterministic_item_id(None, input.url.as_str());
+        let canon_url = canonicalize_sync_url(input.url.as_str());
+        let arxiv_id = ArxivParser::extract_arxiv_id(input.url.as_str());
         let now = SyncRepo::now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
+        let entry_kind = EntryKind::from_content_type(input.content_type);
         let mut tx = self.pool.begin().await?;
 
         SyncRepo::clear_tombstone(
@@ -371,33 +600,167 @@ impl<'a> ItemRepo<'a> {
         )
         .await?;
 
-        sqlx::query(
-            "INSERT INTO items
-             (id, feed_id, title, url, author, published_at, summary, content_html, thumbnail_url, audio_url, duration, content_type, created_at, updated_at)
-             VALUES (?, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&item_id)
-        .bind(input.title)
-        .bind(input.url.as_str())
-        .bind(input.summary)
-        .bind(input.content_html)
-        .bind(input.thumbnail_url)
-        .bind(input.audio_url)
-        .bind(clean_duration)
-        .bind(input.content_type)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        // Upfront deduplication: if a feed/catalog entry already owns this URL/arXiv ID (or a
+        // catalog-only entry exists with inbox_state = 'none'), promote it to unread in inbox and
+        // enrich its content rather than creating a duplicate entry.
+        let existing_dedup =
+            resolve_dedup_entry_id(&mut tx, &det_item_id, &canon_url, arxiv_id.as_deref()).await?;
+        let existing_inbox: Option<InboxState> = match existing_dedup.as_deref() {
+            Some(eid) => {
+                sqlx::query_scalar("SELECT inbox_state FROM entry_state WHERE entry_id = ?")
+                    .bind(eid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            None => None,
+        };
 
-        SyncRepo::record_activity(
-            &mut tx,
-            ActivityEntityType::Item,
-            &item_id,
-            ActivityAction::Create,
-            now,
-        )
-        .await?;
+        let final_item_id = if let Some(existing_id) = existing_dedup
+            && (existing_id != det_item_id
+                || !matches!(existing_inbox, Some(InboxState::Unread | InboxState::Dismissed)))
+        {
+            sqlx::query(
+                "UPDATE entries
+                 SET title = CASE WHEN ? = ? THEN ? ELSE title END,
+                     summary = COALESCE(summary, ?),
+                     thumbnail_url = COALESCE(thumbnail_url, ?),
+                     created_at = CASE WHEN ? = ? THEN ? ELSE created_at END,
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&existing_id)
+            .bind(&det_item_id)
+            .bind(input.title)
+            .bind(input.summary)
+            .bind(input.thumbnail_url)
+            .bind(&existing_id)
+            .bind(&det_item_id)
+            .bind(now)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_content (entry_id, content_html, content_type)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(entry_id) DO UPDATE SET
+                     content_html = COALESCE(entry_content.content_html, excluded.content_html)",
+            )
+            .bind(&existing_id)
+            .bind(input.content_html)
+            .bind(input.content_type)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
+                 VALUES (?, 'unread', 0.0, ?, ?)
+                 ON CONFLICT(entry_id) DO UPDATE SET
+                     inbox_state = 'unread',
+                     read_at = NULL,
+                     interaction_updated_at = excluded.interaction_updated_at,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(&existing_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            MediaRepo::upsert_audio_enclosure_in_tx(
+                &mut tx,
+                &existing_id,
+                input.audio_url,
+                clean_duration,
+                now,
+            )
+            .await?;
+
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Item,
+                &existing_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+            existing_id
+        } else {
+            sqlx::query(
+                "INSERT INTO entries
+                 (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
+                 VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
+            )
+            .bind(&det_item_id)
+            .bind(entry_kind)
+            .bind(input.title)
+            .bind(input.url.as_str())
+            .bind(input.summary)
+            .bind(input.thumbnail_url)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_content (entry_id, content_html, content_type)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&det_item_id)
+            .bind(input.content_html)
+            .bind(input.content_type)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
+                 VALUES (?, 'unread', 0.0, ?)",
+            )
+            .bind(&det_item_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                 VALUES ('url', ?, ?)",
+            )
+            .bind(&canon_url)
+            .bind(&det_item_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if let Some(ref aid) = arxiv_id {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+                     VALUES ('arxiv', ?, ?)",
+                )
+                .bind(aid)
+                .bind(&det_item_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            MediaRepo::upsert_audio_enclosure_in_tx(
+                &mut tx,
+                &det_item_id,
+                input.audio_url,
+                clean_duration,
+                now,
+            )
+            .await?;
+
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Item,
+                &det_item_id,
+                ActivityAction::Create,
+                now,
+            )
+            .await?;
+            det_item_id
+        };
 
         let mut seen_names = HashSet::new();
         let mut attached_tags = Vec::new();
@@ -407,45 +770,25 @@ impl<'a> ItemRepo<'a> {
                 continue;
             }
             let tag =
-                TagRepo::get_or_create_and_attach_in_tx(&mut tx, &item_id, trimmed, now).await?;
+                TagRepo::get_or_create_and_attach_in_tx(&mut tx, &final_item_id, trimmed, now)
+                    .await?;
             attached_tags.push(tag);
         }
 
+        let item: Item =
+            sqlx::query_as(concat!(item_select_sql!("ec.content_html"), " WHERE i.id = ?"))
+                .bind(&final_item_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
         tx.commit().await?;
-
-        let tag_names = TagNames(attached_tags.iter().map(|t| t.name.clone()).collect());
-        let item = Item {
-            id: item_id,
-            feed_id: None,
-            feed_url: None,
-            feed_title: None,
-            title: input.title.to_string(),
-            url: input.url.clone(),
-            author: None,
-            published_at: None,
-            created_at: now,
-            summary: input.summary.map(String::from),
-            content_html: input.content_html.map(String::from),
-            thumbnail_url: input.thumbnail_url.map(String::from),
-            audio_url: input.audio_url.map(String::from),
-            content_type: input.content_type,
-            status: ItemStatus::Unread,
-            is_favorite: false,
-            read_at: None,
-            read_progress: 0.0,
-            interaction_updated_at: None,
-            thumbnail_media_id: None,
-            duration: clean_duration,
-            tag_names,
-        };
-
         Ok((item, attached_tags))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Item>> {
         Ok(sqlx::query_as::<_, Item>(concat!(
-            item_select_sql!("i.content_html"),
-            " WHERE i.id = ?"
+            item_select_sql!("ec.content_html"),
+            " WHERE i.id = ? AND i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')"
         ))
         .bind(id)
         .fetch_optional(self.pool)
@@ -459,12 +802,16 @@ impl<'a> ItemRepo<'a> {
         limit: Option<usize>,
     ) -> Result<Vec<Item>> {
         let mut qb = QueryBuilder::new(ITEM_SELECT_LIST);
-        qb.push(" WHERE 1=1");
+        qb.push(" WHERE i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
         if let Some(s) = status {
-            qb.push(" AND i.status = ").push_bind(s);
+            qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
         }
         if let Some(f) = feed_id {
-            qb.push(" AND i.feed_id = ").push_bind(f);
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM collection_entries ce_f WHERE ce_f.entry_id = i.id AND ce_f.collection_id = ",
+            )
+            .push_bind(f)
+            .push(")");
         }
         qb.push(" ORDER BY COALESCE(i.published_at, i.created_at) DESC, i.id DESC");
         if let Some(l) = limit {
@@ -492,38 +839,54 @@ impl<'a> ItemRepo<'a> {
         let mut qb = QueryBuilder::new(base_select);
         if let Some(fts_match) = &fts_query {
             qb.push(
-                " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(items_fts, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM items_fts WHERE items_fts MATCH ",
+                " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(entries_fts, 0.0, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM entries_fts WHERE entries_fts MATCH ",
             )
             .push_bind(fts_match.clone())
             .push(") fts ON fts.fts_rowid = i.rowid");
         }
-        qb.push(" WHERE 1=1");
+        qb.push(" WHERE i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
 
         if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
-            qb.push(" AND i.status = ").push_bind(s);
+            qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
         }
         if let Some(is_read) = filter.is_read {
             if is_read {
-                qb.push(" AND i.read_at IS NOT NULL");
+                qb.push(" AND es.read_at IS NOT NULL");
             } else {
-                qb.push(" AND i.read_at IS NULL");
+                qb.push(" AND es.read_at IS NULL");
             }
         }
         if let Some(f) = &filter.feed_id {
-            qb.push(" AND i.feed_id = ").push_bind(f);
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM collection_entries ce_ff WHERE ce_ff.entry_id = i.id AND ce_ff.collection_id = ",
+            )
+            .push_bind(f)
+            .push(")");
         }
         if let Some(t) = &filter.tag_id {
             qb.push(
-                " AND EXISTS (SELECT 1 FROM item_tags it WHERE it.item_id = i.id AND it.tag_id = ",
+                " AND EXISTS (SELECT 1 FROM collection_entries ce_tf WHERE ce_tf.entry_id = i.id AND ce_tf.collection_id = ",
             )
             .push_bind(t)
             .push(")");
         }
         if let Some(ct) = filter.content_type {
-            qb.push(" AND i.content_type = ").push_bind(ct);
+            qb.push(" AND COALESCE(ec.content_type, 'article') = ").push_bind(ct);
         }
         if let Some(fav) = filter.is_favorite {
-            qb.push(" AND i.is_favorite = ").push_bind(fav);
+            if fav {
+                qb.push(
+                    " AND EXISTS (SELECT 1 FROM collection_entries ce_fav WHERE ce_fav.collection_id = ",
+                )
+                .push_bind(STARRED_COLLECTION_ID)
+                .push(" AND ce_fav.entry_id = i.id)");
+            } else {
+                qb.push(
+                    " AND NOT EXISTS (SELECT 1 FROM collection_entries ce_fav WHERE ce_fav.collection_id = ",
+                )
+                .push_bind(STARRED_COLLECTION_ID)
+                .push(" AND ce_fav.entry_id = i.id)");
+            }
         }
         Self::append_updated_after_where_clause(&mut qb, filter);
         if let Some(search) = trimmed_search {
@@ -536,7 +899,6 @@ impl<'a> ItemRepo<'a> {
             qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) ASC, i.id ASC");
         } else if sort_by_relevance {
             let rank_dir = match filter.order.unwrap_or_default() {
-                // bm25() returns negative scores where more negative = higher relevance
                 SortOrder::Desc => "ASC",
                 SortOrder::Asc => "DESC",
             };
@@ -602,19 +964,19 @@ impl<'a> ItemRepo<'a> {
                 .push_bind(pattern.clone())
                 .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")
                 .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.author, '') LIKE ")
+                .push(" ESCAPE '\\' OR COALESCE(i.creators_json, '') LIKE ")
                 .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(i.content_html, '') LIKE ")
+                .push(" ESCAPE '\\' OR COALESCE(ec.content_html, '') LIKE ")
                 .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR COALESCE(f.title, '') LIKE ")
+                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM collection_entries ce_fs JOIN feed_sources fs_s ON fs_s.collection_id = ce_fs.collection_id WHERE ce_fs.entry_id = i.id AND COALESCE(fs_s.feed_title, '') LIKE ")
                 .push_bind(pattern.clone())
-                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                .push(" ESCAPE '\\') OR EXISTS (SELECT 1 FROM collection_entries ce_ts JOIN collection_specs cs_ts ON cs_ts.collection_id = ce_ts.collection_id JOIN entries e_ts ON e_ts.id = ce_ts.collection_id WHERE ce_ts.entry_id = i.id AND cs_ts.collection_role = 'tag' AND e_ts.title LIKE ")
                 .push_bind(pattern)
                 .push(" ESCAPE '\\'))");
         } else if let [term] = search_terms {
-            qb.push(" AND (fts.fts_rowid IS NOT NULL OR COALESCE(f.title, '') LIKE ")
+            qb.push(" AND (fts.fts_rowid IS NOT NULL OR EXISTS (SELECT 1 FROM collection_entries ce_fs JOIN feed_sources fs_s ON fs_s.collection_id = ce_fs.collection_id WHERE ce_fs.entry_id = i.id AND COALESCE(fs_s.feed_title, '') LIKE ")
                 .push_bind(term.like_pattern.clone())
-                .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                .push(" ESCAPE '\\') OR EXISTS (SELECT 1 FROM collection_entries ce_ts JOIN collection_specs cs_ts ON cs_ts.collection_id = ce_ts.collection_id JOIN entries e_ts ON e_ts.id = ce_ts.collection_id WHERE ce_ts.entry_id = i.id AND cs_ts.collection_role = 'tag' AND e_ts.title LIKE ")
                 .push_bind(term.like_pattern.clone())
                 .push(" ESCAPE '\\'))");
         } else {
@@ -623,11 +985,11 @@ impl<'a> ItemRepo<'a> {
                 if idx > 0 {
                     qb.push(" AND ");
                 }
-                qb.push("(i.rowid IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ")
+                qb.push("(i.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ")
                     .push_bind(term.fts_clause.clone())
-                    .push(") OR COALESCE(f.title, '') LIKE ")
+                    .push(") OR EXISTS (SELECT 1 FROM collection_entries ce_fs JOIN feed_sources fs_s ON fs_s.collection_id = ce_fs.collection_id WHERE ce_fs.entry_id = i.id AND COALESCE(fs_s.feed_title, '') LIKE ")
                     .push_bind(term.like_pattern.clone())
-                    .push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM item_tags it_s JOIN tags t_s ON t_s.id = it_s.tag_id WHERE it_s.item_id = i.id AND t_s.name LIKE ")
+                    .push(" ESCAPE '\\') OR EXISTS (SELECT 1 FROM collection_entries ce_ts JOIN collection_specs cs_ts ON cs_ts.collection_id = ce_ts.collection_id JOIN entries e_ts ON e_ts.id = ce_ts.collection_id WHERE ce_ts.entry_id = i.id AND cs_ts.collection_role = 'tag' AND e_ts.title LIKE ")
                     .push_bind(term.like_pattern.clone())
                     .push(" ESCAPE '\\'))");
             }
@@ -644,24 +1006,40 @@ impl<'a> ItemRepo<'a> {
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
     ) -> Result<bool> {
+        type ExistingRow = (EntryKind, InboxState, bool, f64, Option<DateTime<Utc>>);
         let now = SyncRepo::now_utc();
 
-        // Read existing row state before starting the transaction so `tx` begins directly
-        // with an `UPDATE` statement (acquiring a write lock immediately without upgrading
-        // a deferred read snapshot, which prevents SQLITE_BUSY_SNAPSHOT under concurrency).
-        let existing: Option<(ItemStatus, bool, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT status, is_favorite, read_progress, read_at FROM items WHERE id = ?",
+        let existing: Option<ExistingRow> = sqlx::query_as(
+            "SELECT e.kind,
+                    es.inbox_state,
+                    EXISTS (
+                        SELECT 1 FROM collection_entries ce_fav
+                        WHERE ce_fav.collection_id = ? AND ce_fav.entry_id = e.id
+                    ),
+                    es.progress,
+                    es.read_at
+             FROM entries e
+             JOIN entry_state es ON es.entry_id = e.id
+             WHERE e.id = ? AND e.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')",
         )
+        .bind(STARRED_COLLECTION_ID)
         .bind(id)
         .fetch_optional(self.pool)
         .await?;
 
-        let Some((current_status, current_favorite, current_progress, current_read_at)) = existing
+        let Some((entry_kind, cur_inbox, current_favorite, current_progress, current_read_at)) =
+            existing
         else {
             return Ok(false);
         };
 
+        let current_status = if cur_inbox == InboxState::Dismissed {
+            ItemStatus::Archived
+        } else {
+            ItemStatus::Unread
+        };
         let target_status = status.unwrap_or(current_status);
+        let target_inbox = InboxState::from(target_status);
         let target_read_at = match target_status {
             ItemStatus::Archived => match read_at {
                 ReadAtPatch::MarkRead(explicit_ts) => Some(explicit_ts),
@@ -694,23 +1072,41 @@ impl<'a> ItemRepo<'a> {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "UPDATE items
-             SET status = ?,
+            "UPDATE entry_state
+             SET inbox_state = ?,
                  read_at = ?,
-                 is_favorite = ?,
-                 read_progress = ?,
+                 progress = ?,
                  interaction_updated_at = ?,
                  updated_at = ?
-             WHERE id = ?",
+             WHERE entry_id = ?",
         )
-        .bind(target_status)
+        .bind(target_inbox)
         .bind(target_read_at)
-        .bind(target_favorite)
         .bind(target_progress)
         .bind(now)
         .bind(now)
         .bind(id)
         .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        if fav_changed {
+            set_favorite_membership_in_tx(&mut tx, id, target_favorite, now).await?;
+        }
+
+        maybe_auto_log_feed_completion_in_tx(
+            &mut tx,
+            id,
+            entry_kind,
+            target_inbox,
+            target_progress,
+            target_read_at.unwrap_or(now),
+        )
         .await?;
 
         if status_changed {
@@ -746,6 +1142,7 @@ impl<'a> ItemRepo<'a> {
         self.update(id, Some(ItemStatus::Archived), None, None, ReadAtPatch::Unchanged).await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn archive_batch(&self, scope: &ArchiveBatchScope) -> Result<u64> {
         const MAX_BATCH_IDS: usize = 5_000;
         const CHUNK_SIZE: usize = 400;
@@ -769,7 +1166,11 @@ impl<'a> ItemRepo<'a> {
                 let mut matched = Vec::new();
                 for chunk in unique_ids.chunks(CHUNK_SIZE) {
                     let mut qb = QueryBuilder::new(
-                        "SELECT id FROM items WHERE status != 'archived' AND id IN (",
+                        "SELECT es.entry_id FROM entry_state es
+                         JOIN entries e ON e.id = es.entry_id
+                         WHERE e.merged_into_id IS NULL
+                           AND es.inbox_state = 'unread'
+                           AND es.entry_id IN (",
                     );
                     let mut sep = qb.separated(", ");
                     for id in chunk {
@@ -777,7 +1178,11 @@ impl<'a> ItemRepo<'a> {
                     }
                     sep.push_unseparated(")");
                     if let Some(fid) = feed_id.as_deref() {
-                        qb.push(" AND feed_id = ").push_bind(fid);
+                        qb.push(
+                            " AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ",
+                        )
+                        .push_bind(fid)
+                        .push(")");
                     }
                     let rows: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
                     matched.extend(rows);
@@ -786,9 +1191,20 @@ impl<'a> ItemRepo<'a> {
             }
             ArchiveBatchScope::Feed { feed_id, unread_only } => {
                 let sql = if *unread_only {
-                    "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL AND feed_id = ? LIMIT ?"
+                    "SELECT es.entry_id FROM entry_state es
+                     JOIN entries e ON e.id = es.entry_id
+                     WHERE e.merged_into_id IS NULL
+                       AND es.inbox_state = 'unread'
+                       AND es.read_at IS NULL
+                       AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ?)
+                     LIMIT ?"
                 } else {
-                    "SELECT id FROM items WHERE status != 'archived' AND feed_id = ? LIMIT ?"
+                    "SELECT es.entry_id FROM entry_state es
+                     JOIN entries e ON e.id = es.entry_id
+                     WHERE e.merged_into_id IS NULL
+                       AND es.inbox_state = 'unread'
+                       AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ?)
+                     LIMIT ?"
                 };
                 sqlx::query_scalar(sql)
                     .bind(feed_id.as_str())
@@ -798,7 +1214,12 @@ impl<'a> ItemRepo<'a> {
             }
             ArchiveBatchScope::AllUnread => {
                 sqlx::query_scalar(
-                    "SELECT id FROM items WHERE status = 'unread' AND read_at IS NULL LIMIT ?",
+                    "SELECT es.entry_id FROM entry_state es
+                     JOIN entries e ON e.id = es.entry_id
+                     WHERE e.merged_into_id IS NULL
+                       AND es.inbox_state = 'unread'
+                       AND es.read_at IS NULL
+                     LIMIT ?",
                 )
                 .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
                 .fetch_all(self.pool)
@@ -816,21 +1237,59 @@ impl<'a> ItemRepo<'a> {
 
         for chunk in candidate_ids.chunks(CHUNK_SIZE) {
             let mut qb = QueryBuilder::new(
-                "UPDATE items SET status = 'archived', read_at = COALESCE(read_at, ",
+                "UPDATE entry_state SET inbox_state = 'dismissed', read_at = COALESCE(read_at, ",
             );
             qb.push_bind(now)
                 .push("), interaction_updated_at = ")
                 .push_bind(now)
                 .push(", updated_at = ")
                 .push_bind(now)
-                .push(" WHERE status != 'archived' AND id IN (");
+                .push(" WHERE inbox_state = 'unread' AND entry_id IN (");
             let mut sep = qb.separated(", ");
             for id in chunk {
                 sep.push_bind(id.as_str());
             }
-            sep.push_unseparated(") RETURNING id");
+            sep.push_unseparated(") RETURNING entry_id");
             let updated: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
             archived_ids.extend(updated);
+        }
+
+        for chunk in archived_ids.chunks(CHUNK_SIZE) {
+            let mut qb = QueryBuilder::new("UPDATE entries SET updated_at = ");
+            qb.push_bind(now).push(" WHERE id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.as_str());
+            }
+            sep.push_unseparated(")");
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // Note: batch-archived items whose progress had already reached >= 0.9 are auto-logged,
+        // while unopened / skimmed bulk-archived items (progress < 0.9) never touch consumption_log.
+        for id in &archived_ids {
+            let row: Option<(EntryKind, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT e.kind, es.progress, es.read_at
+                 FROM entries e
+                 JOIN entry_state es ON es.entry_id = e.id
+                 WHERE e.id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((kind, prog, r_at)) = row
+                && prog >= 0.9
+            {
+                maybe_auto_log_feed_completion_in_tx(
+                    &mut tx,
+                    id,
+                    kind,
+                    InboxState::Dismissed,
+                    prog,
+                    r_at.unwrap_or(now),
+                )
+                .await?;
+            }
         }
 
         for chunk in archived_ids.chunks(CHUNK_SIZE) {
@@ -854,13 +1313,15 @@ impl<'a> ItemRepo<'a> {
         use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 
         let candidates: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, url, summary FROM items
-             WHERE summary IS NOT NULL
+            "SELECT e.id, COALESCE(e.url, ''), e.summary
+             FROM entries e
+             LEFT JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.summary IS NOT NULL
                AND (
-                 length(summary) > 320
+                 length(e.summary) > 320
                  OR (
-                   (content_html IS NULL OR content_html = '' OR summary = content_html)
-                   AND (summary LIKE '%<%' OR summary LIKE '%&%;%')
+                   (ec.content_html IS NULL OR ec.content_html = '' OR e.summary = ec.content_html)
+                   AND (e.summary LIKE '%<%' OR e.summary LIKE '%&%;%')
                  )
                )",
         )
@@ -901,9 +1362,19 @@ impl<'a> ItemRepo<'a> {
         let mut tx = self.pool.begin().await?;
         for (id, excerpt, thumb) in normalized {
             sqlx::query(
-                "UPDATE items
-                 SET content_html = COALESCE(NULLIF(content_html, ''), summary),
-                     thumbnail_url = COALESCE(thumbnail_url, ?),
+                "INSERT INTO entry_content (entry_id, content_html, content_type)
+                 SELECT id, summary, 'article' FROM entries WHERE id = ?
+                 ON CONFLICT(entry_id) DO UPDATE SET
+                     content_html = COALESCE(NULLIF(entry_content.content_html, ''), (SELECT summary FROM entries WHERE id = ?))",
+            )
+            .bind(&id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE entries
+                 SET thumbnail_url = COALESCE(thumbnail_url, ?),
                      summary = ?
                  WHERE id = ?",
             )
@@ -921,20 +1392,22 @@ impl<'a> ItemRepo<'a> {
         use crate::{content::fetcher::HtmlSanitizer, feeds::youtube::YouTubeParser};
 
         let candidates: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT id, url, content_html, thumbnail_url FROM items
+            "SELECT e.id, COALESCE(e.url, ''), ec.content_html, e.thumbnail_url
+             FROM entries e
+             LEFT JOIN entry_content ec ON ec.entry_id = e.id
              WHERE (
-                 thumbnail_url IS NULL
+                 e.thumbnail_url IS NULL
                  AND (
-                   (content_html IS NOT NULL AND (content_html LIKE '%<img%' OR content_html LIKE '%<IMG%'))
-                   OR url LIKE '%youtube.com/%'
-                   OR url LIKE '%youtu.be/%'
+                   (ec.content_html IS NOT NULL AND (ec.content_html LIKE '%<img%' OR ec.content_html LIKE '%<IMG%'))
+                   OR e.url LIKE '%youtube.com/%'
+                   OR e.url LIKE '%youtu.be/%'
                  )
                )
-               OR thumbnail_url LIKE '%.svg'
-               OR thumbnail_url LIKE '%.svg?%'
-               OR thumbnail_url LIKE '%/images/core/emoji/%'
-               OR thumbnail_url LIKE '%/wpcom-smileys/%'
-               OR thumbnail_url LIKE '%/twemoji/%'",
+               OR e.thumbnail_url LIKE '%.svg'
+               OR e.thumbnail_url LIKE '%.svg?%'
+               OR e.thumbnail_url LIKE '%/images/core/emoji/%'
+               OR e.thumbnail_url LIKE '%/wpcom-smileys/%'
+               OR e.thumbnail_url LIKE '%/twemoji/%'",
         )
         .fetch_all(self.pool)
         .await?;
@@ -975,15 +1448,11 @@ impl<'a> ItemRepo<'a> {
         let count = u64::try_from(updates.len()).unwrap_or(0);
         let mut tx = self.pool.begin().await?;
         for (id, thumb) in updates {
-            sqlx::query(
-                "UPDATE items
-                 SET thumbnail_url = ?
-                 WHERE id = ?",
-            )
-            .bind(thumb)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("UPDATE entries SET thumbnail_url = ? WHERE id = ?")
+                .bind(thumb)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(count)
@@ -993,30 +1462,127 @@ impl<'a> ItemRepo<'a> {
         self.update(id, Some(ItemStatus::Unread), None, None, ReadAtPatch::Unchanged).await
     }
 
+    pub(crate) async fn entry_has_catalog_history_in_tx(
+        conn: &mut SqliteConnection,
+        entry_id: &str,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        let quoted_id_pattern = format!("%\"{entry_id}\"%");
+        let preserved: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
+             WHERE EXISTS (SELECT 1 FROM consumption_log WHERE entry_id = ?)
+                OR EXISTS (SELECT 1 FROM comparisons WHERE ordering_json LIKE ?)
+                OR EXISTS (
+                    SELECT 1 FROM collection_entries ce
+                    JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+                    WHERE ce.entry_id = ? AND cs.collection_role IN ('list', 'want')
+                )
+                OR EXISTS (SELECT 1 FROM collection_generators WHERE current_entry_id = ?)",
+        )
+        .bind(entry_id)
+        .bind(&quoted_id_pattern)
+        .bind(entry_id)
+        .bind(entry_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(preserved.is_some())
+    }
+
+    pub(crate) async fn delete_inbox_item_preserving_history_in_tx(
+        conn: &mut SqliteConnection,
+        item_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        if Self::entry_has_catalog_history_in_tx(&mut *conn, item_id).await? {
+            let res = sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
+            if res.rows_affected() == 0 {
+                return Ok(false);
+            }
+            sqlx::query(
+                "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
+                 VALUES (?, 'none', NULL, 0.0, ?, ?)
+                 ON CONFLICT(entry_id) DO UPDATE SET
+                     inbox_state = 'none',
+                     read_at = NULL,
+                     interaction_updated_at = excluded.interaction_updated_at,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(item_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("DELETE FROM entry_content WHERE entry_id = ?")
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DELETE FROM entry_media WHERE entry_id = ? AND local_path IS NOT NULL")
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(
+                "DELETE FROM collection_entries
+                 WHERE entry_id = ?
+                   AND (
+                       collection_id IN (?, ?)
+                       OR collection_id IN (
+                           SELECT collection_id FROM collection_specs WHERE collection_role = 'tag'
+                       )
+                   )",
+            )
+            .bind(item_id)
+            .bind(STARRED_COLLECTION_ID)
+            .bind(UP_NEXT_COLLECTION_ID)
+            .execute(&mut *conn)
+            .await?;
+            Ok(true)
+        } else {
+            let res = sqlx::query("DELETE FROM entries WHERE id = ?")
+                .bind(item_id)
+                .execute(&mut *conn)
+                .await?;
+            Ok(res.rows_affected() > 0)
+        }
+    }
+
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let existing_keys: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT i.url, f.url FROM items i LEFT JOIN feeds f ON i.feed_id = f.id WHERE i.id = ?",
+        let existing_keys: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT e.url,
+                    (SELECT fs.feed_url
+                     FROM collection_entries ce
+                     JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+                     WHERE ce.entry_id = e.id
+                     ORDER BY ce.added_at ASC, ce.collection_id ASC
+                     LIMIT 1)
+             FROM entries e
+             JOIN entry_state es ON es.entry_id = e.id
+             WHERE e.id = ? AND es.inbox_state IN ('unread', 'dismissed')",
         )
         .bind(id)
         .fetch_optional(self.pool)
         .await?;
-        let Some((item_url, feed_url)) = existing_keys else {
+        let Some((item_url_opt, feed_url)) = existing_keys else {
             return Ok(false);
         };
+        let item_url = item_url_opt.unwrap_or_default();
 
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("DELETE FROM items WHERE id = ?").bind(id).execute(&mut *tx).await?;
-        if res.rows_affected() == 0 {
+        if !Self::delete_inbox_item_preserving_history_in_tx(&mut tx, id, now).await? {
             return Ok(false);
         }
-        SyncRepo::record_tombstone(
-            &mut tx,
-            ActivityEntityType::Item,
-            &item_natural_key(feed_url.as_deref(), &item_url),
-            now,
-        )
-        .await?;
+        if !item_url.is_empty() {
+            SyncRepo::record_tombstone(
+                &mut tx,
+                ActivityEntityType::Item,
+                &item_natural_key(feed_url.as_deref(), &item_url),
+                now,
+            )
+            .await?;
+        }
         SyncRepo::record_activity(
             &mut tx,
             ActivityEntityType::Item,
@@ -1030,15 +1596,25 @@ impl<'a> ItemRepo<'a> {
     }
 
     pub async fn count_by_status(&self, status: ItemStatus) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE status = ?")
-            .bind(status)
-            .fetch_one(self.pool)
-            .await?)
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM entry_state es
+             JOIN entries e ON e.id = es.entry_id
+             WHERE e.merged_into_id IS NULL AND es.inbox_state = ?",
+        )
+        .bind(InboxState::from(status))
+        .fetch_one(self.pool)
+        .await?)
     }
 
     pub async fn count_unread(&self) -> Result<i64> {
         Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM items WHERE status = 'unread' AND read_at IS NULL",
+            "SELECT COUNT(*)
+             FROM entry_state es
+             JOIN entries e ON e.id = es.entry_id
+             WHERE e.merged_into_id IS NULL
+               AND es.inbox_state = 'unread'
+               AND es.read_at IS NULL",
         )
         .fetch_one(self.pool)
         .await?)
@@ -1058,27 +1634,29 @@ impl<'a> ItemRepo<'a> {
             return Ok(());
         }
 
+        let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE items
+            "UPDATE entries
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
-                 author = COALESCE(author, ?),
+                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
                  summary = COALESCE(summary, ?),
                  updated_at = ?
              WHERE id = ?
                AND ((title = url AND ? IS NOT NULL)
-                    OR (author IS NULL AND ? IS NOT NULL)
+                    OR (creators_json = '[]' AND ? IS NOT NULL)
                     OR (summary IS NULL AND ? IS NOT NULL))",
         )
         .bind(clean_title)
         .bind(clean_title)
-        .bind(clean_author)
+        .bind(new_creators_json.as_deref())
+        .bind(new_creators_json.as_deref())
         .bind(clean_summary)
         .bind(now)
         .bind(id)
         .bind(clean_title)
-        .bind(clean_author)
+        .bind(new_creators_json.as_deref())
         .bind(clean_summary)
         .execute(&mut *tx)
         .await?;
@@ -1110,7 +1688,6 @@ mod tests {
         let items = db.items();
 
         let saved_url = Url::parse("https://example.com/saved").unwrap();
-        // Manual item deduplication (feed_id IS NULL)
         let manual = NewItem {
             feed_id: None,
             title: "Saved Article",
@@ -1123,7 +1700,6 @@ mod tests {
         items.create(&manual).await.unwrap();
         assert!(items.create(&manual).await.is_err());
 
-        // Feed item deduplication per (feed_id, url)
         let feed_url = Url::parse("https://example.com/feed").unwrap();
         let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
         let feed_item = NewItem {
@@ -1152,7 +1728,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Item 1: matches "distributed systems" only in content_html body
         let url1 = Url::parse("https://example.com/1").unwrap();
         let (body_item, _) = items
             .save_manual_input_with_tags(&ManualItemInput {
@@ -1171,7 +1746,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Item 2: matches "distributed systems" directly in the title (higher BM25 weight)
         let url2 = Url::parse("https://example.com/2").unwrap();
         let title_item = items
             .create(&NewItem {
@@ -1186,7 +1760,6 @@ mod tests {
             .await
             .unwrap();
 
-        // 1. Exact phrase search + BM25 ranking (title match ranks ahead of body-only match)
         let results = items
             .list_filtered(&ItemFilter {
                 search: Some("\"distributed systems\"".to_string()),
@@ -1198,7 +1771,6 @@ mod tests {
         assert_eq!(results[0].id, title_item.id);
         assert_eq!(results[1].id, body_item.id);
 
-        // 2. Porter stemming ("optimize" matches "optimizing" in body_item's content_html)
         let stemmed = items
             .list_filtered(&ItemFilter {
                 search: Some("optimize".to_string()),
@@ -1209,7 +1781,6 @@ mod tests {
         assert_eq!(stemmed.len(), 1);
         assert_eq!(stemmed[0].id, body_item.id);
 
-        // 3. Prefix matching ("lamp" matches author "Lamport")
         let prefix = items
             .list_filtered(&ItemFilter { search: Some("lamp".to_string()), ..Default::default() })
             .await
@@ -1217,7 +1788,6 @@ mod tests {
         assert_eq!(prefix.len(), 1);
         assert_eq!(prefix[0].id, title_item.id);
 
-        // 4. Feed title fallback ("Engineering Digest" matches feed_item via f.title)
         let by_feed = items
             .list_filtered(&ItemFilter {
                 search: Some("Engineering Digest".to_string()),
@@ -1228,7 +1798,6 @@ mod tests {
         assert_eq!(by_feed.len(), 1);
         assert_eq!(by_feed[0].id, title_item.id);
 
-        // 5. UPDATE trigger: backfill_metadata updates summary and makes new terms searchable
         items
             .backfill_metadata(&title_item.id, None, None, Some("Byzantine quorum verification"))
             .await
@@ -1243,7 +1812,6 @@ mod tests {
         assert_eq!(after_update.len(), 1);
         assert_eq!(after_update[0].id, title_item.id);
 
-        // 6. Adversarial FTS syntax characters never cause SQL errors
         let special = items
             .list_filtered(&ItemFilter {
                 search: Some("c++ \"unclosed AND OR NOT (foo:bar) -baz * ^".to_string()),
@@ -1253,7 +1821,6 @@ mod tests {
             .unwrap();
         assert!(special.is_empty());
 
-        // 7. DELETE trigger (including ON DELETE CASCADE when feed is deleted) removes from FTS
         db.feeds().delete(&feed.id).await.unwrap();
         let after_delete = items
             .list_filtered(&ItemFilter {
@@ -1290,7 +1857,6 @@ mod tests {
             .unwrap();
         db.tags().add_named_to_item(&feed_item.id, "llm-inference").await.unwrap();
 
-        // 1. Tag search (both plain and hashtag-prefixed)
         for query in ["llm-inference", "#llm-inference"] {
             let by_tag = items
                 .list_filtered(&ItemFilter {
@@ -1303,7 +1869,6 @@ mod tests {
             assert_eq!(by_tag[0].id, feed_item.id);
         }
 
-        // 2. Multi-token search spanning feed title ("Rust") + item title ("Async")
         let cross_feed_item = items
             .list_filtered(&ItemFilter {
                 search: Some("rust async".to_string()),
@@ -1314,7 +1879,6 @@ mod tests {
         assert_eq!(cross_feed_item.len(), 1);
         assert_eq!(cross_feed_item[0].id, feed_item.id);
 
-        // 3. Multi-token search spanning tag ("inference") + item title ("Closures")
         let cross_tag_item = items
             .list_filtered(&ItemFilter {
                 search: Some("#inference closures".to_string()),
@@ -1325,7 +1889,6 @@ mod tests {
         assert_eq!(cross_tag_item.len(), 1);
         assert_eq!(cross_tag_item[0].id, feed_item.id);
 
-        // 4. backfill_metadata records ActivityAction::Update only when a field is actually backfilled
         let before_id = db.sync().latest_activity_id().await.unwrap();
         items
             .backfill_metadata(
@@ -1342,7 +1905,6 @@ mod tests {
         assert_eq!(changes[0].entity_id, feed_item.id);
         assert_eq!(changes[0].action, ActivityAction::Update);
 
-        // Calling backfill_metadata again when author and summary are already populated is a no-op
         let after_first_backfill_id = db.sync().latest_activity_id().await.unwrap();
         items
             .backfill_metadata(
@@ -1416,7 +1978,6 @@ mod tests {
         assert!(refreshed_new.content_html.as_deref().unwrap().contains("<figure>"));
         assert_eq!(refreshed_new.thumbnail_url.as_deref(), Some("https://example.com/a.png"));
 
-        // Second normalization call is idempotent even when plain-text summary has literal `<`
         let url_angle = Url::parse("https://example.com/angle-post").unwrap();
         let item_angle = items
             .create(&NewItem {
@@ -1437,7 +1998,6 @@ mod tests {
         let after_second = items.get(&item_angle.id).await.unwrap().unwrap();
         assert_eq!(after_second.summary.as_deref(), Some("Use <div> or x < y > z"));
 
-        // Oversized (> 64 KB) content_html is omitted in list_filtered_page but returned by get()
         let url_huge = Url::parse("https://example.com/huge-essay").unwrap();
         let huge_html = format!("<p>{}</p>", "a".repeat(70_000));
         let (huge_item, _) = items
@@ -1461,7 +2021,6 @@ mod tests {
         let fetched_huge = items.get(&huge_item.id).await.unwrap().unwrap();
         assert_eq!(fetched_huge.content_html.as_deref(), Some(huge_html.as_str()));
 
-        // include_content=false omits content_html for all items while keeping summary and thumbnail_url
         let metadata_only = items
             .list_filtered(&ItemFilter { include_content: Some(false), ..Default::default() })
             .await
@@ -1471,7 +2030,6 @@ mod tests {
         assert_eq!(meta_new.summary.as_deref(), Some("Clean & fast summary"));
         assert_eq!(meta_new.thumbnail_url.as_deref(), Some("https://example.com/a.png"));
 
-        // Independent read state (read_at) vs archive state (status)
         let custom_read_ts =
             DateTime::parse_from_rfc3339("2026-03-31T09:30:00Z").unwrap().with_timezone(&Utc);
         assert!(
@@ -1500,8 +2058,6 @@ mod tests {
         let unread_again = items.get(&item_new.id).await.unwrap().unwrap();
         assert!(unread_again.read_at.is_none());
 
-        // Archiving with an explicit client read_at preserves the client timestamp,
-        // and Undo Archive (status=Unread + read_at=Some(custom_read_ts)) restores both
         assert!(
             items
                 .update(
@@ -1538,7 +2094,6 @@ mod tests {
             items.update(&item_new.id, None, None, None, ReadAtPatch::MarkUnread).await.unwrap()
         );
 
-        // Whitespace-only item_ids do not shadow feed_id in archive_batch
         let before_archive_id = db.sync().latest_activity_id().await.unwrap();
         let scope =
             ArchiveBatchScope::from_request(&["   ".to_string()], Some(&feed.id), false).unwrap();

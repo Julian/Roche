@@ -154,3 +154,121 @@ data class PendingMutationEntity(
             )
     }
 }
+
+@Entity(
+    tableName = "catalog_entries",
+    indices =
+        [
+            Index(value = ["kind"]),
+            Index(value = ["mergedIntoId"]),
+            Index(value = ["updatedAt"]),
+        ],
+)
+data class CatalogEntryEntity(
+    @PrimaryKey val id: String,
+    val kind: String,
+    val title: String,
+    val creatorsJson: String = "[]",
+    val url: String? = null,
+    val publishedAt: String? = null,
+    val releaseYear: Int? = null,
+    val summary: String? = null,
+    val thumbnailUrl: String? = null,
+    val metadataJson: String = "{}",
+    val mergedIntoId: String? = null,
+    val createdAt: String,
+    val updatedAt: String,
+    val isLocalDirty: Boolean = false,
+)
+
+@Entity(
+    tableName = "entry_identifiers",
+    primaryKeys = ["scheme", "value"],
+    indices = [Index(value = ["entryId"])],
+)
+data class EntryIdentifierEntity(
+    val scheme: String,
+    val value: String,
+    val entryId: String,
+)
+
+@Entity(
+    tableName = "collection_specs",
+    indices =
+        [
+            Index(value = ["slug"]),
+            Index(value = ["role"]),
+        ],
+)
+data class CollectionSpecEntity(
+    @PrimaryKey val collectionId: String,
+    val title: String,
+    val summary: String? = null,
+    val slug: String? = null,
+    val mode: String = "manual",
+    val role: String = "list",
+    val ruleJson: String? = null,
+    val showInLists: Boolean = true,
+    val color: String? = null,
+    val createdAt: String,
+    val updatedAt: String,
+    val isLocalDirty: Boolean = false,
+)
+
+@Entity(
+    tableName = "collection_entries",
+    primaryKeys = ["collectionId", "entryId"],
+    indices = [Index(value = ["entryId"])],
+)
+data class CollectionEntryEntity(
+    val collectionId: String,
+    val entryId: String,
+    val position: Double? = null,
+    val addedAt: String,
+    val isLocalDirty: Boolean = false,
+)
+
+@Entity(tableName = "collection_generators")
+data class CollectionGeneratorEntity(
+    @PrimaryKey val collectionId: String,
+    val enabled: Boolean = false,
+    val currentEntryId: String? = null,
+    val drawnAt: String? = null,
+    val updatedAt: String,
+    val isLocalDirty: Boolean = false,
+)
+
+@Entity(
+    tableName = "consumption_log",
+    indices =
+        [
+            Index(value = ["entryId"]),
+            Index(value = ["ts"]),
+        ],
+)
+data class ConsumptionLogEntity(
+    @PrimaryKey val id: String,
+    val entryId: String,
+    val ts: String,
+    val status: String,
+    val notes: String? = null,
+    val createdAt: String,
+    val isLocalDirty: Boolean = false,
+)
+
+@Entity(
+    tableName = "comparisons",
+    indices =
+        [
+            Index(value = ["scopeCollectionId"]),
+            Index(value = ["ts"]),
+        ],
+)
+data class ComparisonEntity(
+    @PrimaryKey val id: String,
+    val ts: String,
+    val scopeCollectionId: String? = null,
+    val orderingJson: String,
+    val createdAt: String,
+    val isLocalDirty: Boolean = false,
+)

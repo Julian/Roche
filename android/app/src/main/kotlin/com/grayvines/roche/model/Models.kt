@@ -74,6 +74,7 @@ enum class InboxFilter(val label: String) {
 enum class AppTab(val label: String) {
     HOME("Home"),
     FEEDS("Feeds"),
+    LISTS("Lists"),
     QUEUE("Queue"),
     STARRED("Starred"),
     INBOX("Inbox"),
@@ -82,7 +83,8 @@ enum class AppTab(val label: String) {
 
     companion object {
         const val SIDE_TAB_COUNT = 4
-        val sideTabCandidates: List<AppTab> = listOf(HOME, FEEDS, STARRED, QUEUE, OFFLINE, SETTINGS)
+        val sideTabCandidates: List<AppTab> =
+            listOf(HOME, FEEDS, LISTS, STARRED, QUEUE, OFFLINE, SETTINGS)
         val defaultSideTabs: List<AppTab> = listOf(HOME, FEEDS, STARRED, SETTINGS)
 
         fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {

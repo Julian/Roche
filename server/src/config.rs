@@ -126,11 +126,17 @@ pub struct TailscaleConfig {
     pub enabled: bool,
     pub tailscale_bin: PathBuf,
     pub advertise_service: Option<String>,
+    pub auto_auth_users: Vec<String>,
 }
 
 impl Default for TailscaleConfig {
     fn default() -> Self {
-        Self { enabled: true, tailscale_bin: PathBuf::from("tailscale"), advertise_service: None }
+        Self {
+            enabled: true,
+            tailscale_bin: PathBuf::from("tailscale"),
+            advertise_service: None,
+            auto_auth_users: Vec::new(),
+        }
     }
 }
 
@@ -191,6 +197,7 @@ impl Config {
                 "tailscale_enabled" => "tailscale.enabled".into(),
                 "tailscale_bin" | "tailscale_tailscale_bin" => "tailscale.tailscale_bin".into(),
                 "tailscale_advertise_service" => "tailscale.advertise_service".into(),
+                "tailscale_auto_auth_users" => "tailscale.auto_auth_users".into(),
                 other => other.replace("__", ".").into(),
             }
         })
@@ -229,6 +236,15 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(crate::tailscale::normalize_service_name);
+
+        let mut normalized_users: Vec<String> = Vec::new();
+        for raw_user in &cfg.tailscale.auto_auth_users {
+            let clean = raw_user.trim().to_ascii_lowercase();
+            if !clean.is_empty() && !normalized_users.contains(&clean) {
+                normalized_users.push(clean);
+            }
+        }
+        cfg.tailscale.auto_auth_users = normalized_users;
 
         cfg.validate()?;
         Ok(cfg)
@@ -424,5 +440,19 @@ host = "127.0.0.1"
 
         let bracketed_v6 = ServerConfig { host: "[::1]".to_string(), port: 9090 };
         assert_eq!(bracketed_v6.listen_addr(), "[::1]:9090");
+    }
+
+    #[test]
+    fn test_tailscale_auto_auth_users_normalizes_and_deduplicates() {
+        let toml_str = r#"
+[tailscale]
+enabled = true
+auto_auth_users = [" Alice@Example.com ", "", "bob@github", "alice@example.com"]
+"#;
+        let cfg = Config::from_toml_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.tailscale.auto_auth_users,
+            vec!["alice@example.com".to_string(), "bob@github".to_string()]
+        );
     }
 }

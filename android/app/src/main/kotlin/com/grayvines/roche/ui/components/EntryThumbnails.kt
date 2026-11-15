@@ -592,6 +592,39 @@ internal fun rememberEntryThumbnailBitmap(
     return bitmap
 }
 
+@Composable
+internal fun rememberHighResImageBitmap(
+    primaryKey: String?,
+    fallbackKey: String? = null,
+): ImageBitmap? {
+    val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
+    val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
+    val effectivePrimary = cleanPrimary ?: cleanFallback ?: return null
+    val loader = LocalThumbnailLoader.current ?: return null
+    val initialCached =
+        loader.getCachedInlineImage(effectivePrimary)
+            ?: cleanFallback?.let { loader.getCachedInlineImage(it) }
+    val bitmap by
+        produceState<ImageBitmap?>(
+            initialValue = initialCached,
+            key1 = effectivePrimary,
+            key2 = cleanFallback,
+            key3 = loader,
+        ) {
+            if (value == null) {
+                val loadedPrimary = loader.loadInlineImage(effectivePrimary)
+                value =
+                    loadedPrimary
+                        ?: if (cleanFallback != null && cleanFallback != effectivePrimary) {
+                            loader.loadInlineImage(cleanFallback)
+                        } else {
+                            null
+                        }
+            }
+        }
+    return bitmap
+}
+
 private fun DrawScope.drawVideoCanvas(colors: RocheColors) {
     val w = size.width
     val h = size.height

@@ -173,13 +173,237 @@ impl SortOrder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum EntryKind {
+    Article,
+    Paper,
+    Video,
+    PodcastEpisode,
+    Song,
+    Movie,
+    Book,
+    Game,
+    Album,
+    Tv,
+    Artist,
+    Podcast,
+    Publication,
+    Channel,
+    Collection,
+}
+
+impl EntryKind {
+    pub const ALL: [Self; 15] = [
+        Self::Article,
+        Self::Paper,
+        Self::Video,
+        Self::PodcastEpisode,
+        Self::Song,
+        Self::Movie,
+        Self::Book,
+        Self::Game,
+        Self::Album,
+        Self::Tv,
+        Self::Artist,
+        Self::Podcast,
+        Self::Publication,
+        Self::Channel,
+        Self::Collection,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Article => "article",
+            Self::Paper => "paper",
+            Self::Video => "video",
+            Self::PodcastEpisode => "podcast_episode",
+            Self::Song => "song",
+            Self::Movie => "movie",
+            Self::Book => "book",
+            Self::Game => "game",
+            Self::Album => "album",
+            Self::Tv => "tv",
+            Self::Artist => "artist",
+            Self::Podcast => "podcast",
+            Self::Publication => "publication",
+            Self::Channel => "channel",
+            Self::Collection => "collection",
+        }
+    }
+
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Article => "Article",
+            Self::Paper => "Paper",
+            Self::Video => "Video",
+            Self::PodcastEpisode => "Podcast Episode",
+            Self::Song => "Song",
+            Self::Movie => "Movie",
+            Self::Book => "Book",
+            Self::Game => "Game",
+            Self::Album => "Album",
+            Self::Tv => "TV",
+            Self::Artist => "Artist",
+            Self::Podcast => "Podcast",
+            Self::Publication => "Publication",
+            Self::Channel => "Channel",
+            Self::Collection => "Collection",
+        }
+    }
+
+    #[must_use]
+    pub const fn default_list_slug(self) -> Option<&'static str> {
+        match self {
+            Self::Movie => Some("movies"),
+            Self::Tv => Some("tv"),
+            Self::Artist => Some("artists"),
+            Self::Album => Some("albums"),
+            Self::Song => Some("songs"),
+            Self::Book => Some("books"),
+            Self::Podcast => Some("podcasts"),
+            Self::PodcastEpisode => Some("podcast_episodes"),
+            Self::Game => Some("games"),
+            Self::Article => Some("articles"),
+            Self::Paper => Some("papers"),
+            Self::Video => Some("videos"),
+            Self::Channel => Some("channels"),
+            Self::Publication => Some("publications"),
+            Self::Collection => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn parent_kind(self) -> Option<Self> {
+        match self {
+            Self::Song => Some(Self::Album),
+            Self::PodcastEpisode => Some(Self::Podcast),
+            Self::Article => Some(Self::Publication),
+            Self::Video => Some(Self::Channel),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_content_type(ct: ContentType) -> Self {
+        match ct {
+            ContentType::Article => Self::Article,
+            ContentType::Video => Self::Video,
+            ContentType::Paper | ContentType::Pdf => Self::Paper,
+            ContentType::Audio => Self::PodcastEpisode,
+        }
+    }
+
+    #[must_use]
+    pub const fn default_content_type(self) -> ContentType {
+        match self {
+            Self::Video => ContentType::Video,
+            Self::Paper => ContentType::Paper,
+            Self::PodcastEpisode | Self::Song | Self::Podcast | Self::Album => ContentType::Audio,
+            _ => ContentType::Article,
+        }
+    }
+
+    pub fn parse_flexible(raw: &str) -> Result<Self> {
+        let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match norm.as_str() {
+            "article" | "articles" => Ok(Self::Article),
+            "paper" | "papers" => Ok(Self::Paper),
+            "video" | "videos" => Ok(Self::Video),
+            "podcast_episode" | "podcast_episodes" | "episode" | "episodes" => {
+                Ok(Self::PodcastEpisode)
+            }
+            "song" | "songs" | "track" | "tracks" => Ok(Self::Song),
+            "movie" | "movies" | "film" | "films" => Ok(Self::Movie),
+            "book" | "books" => Ok(Self::Book),
+            "game" | "games" => Ok(Self::Game),
+            "album" | "albums" => Ok(Self::Album),
+            "tv" | "show" | "shows" | "series" => Ok(Self::Tv),
+            "artist" | "artists" => Ok(Self::Artist),
+            "podcast" | "podcasts" => Ok(Self::Podcast),
+            "publication" | "publications" | "blog" | "blogs" => Ok(Self::Publication),
+            "channel" | "channels" => Ok(Self::Channel),
+            "collection" | "collections" | "list" | "lists" => Ok(Self::Collection),
+            _ => anyhow::bail!("Unknown entry kind '{raw}'"),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum InboxState {
+    #[default]
+    None,
+    Unread,
+    Dismissed,
+}
+
+impl From<ItemStatus> for InboxState {
+    fn from(status: ItemStatus) -> Self {
+        match status {
+            ItemStatus::Unread => Self::Unread,
+            ItemStatus::Archived => Self::Dismissed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum CollectionMode {
+    Manual,
+    Feed,
+    Dynamic,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum CollectionRole {
+    #[default]
+    List,
+    Want,
+    System,
+    Tag,
+    Feed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum ConsumptionStatus {
+    Started,
+    Consumed,
+    Abandoned,
+}
+
+impl ConsumptionStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Consumed => "consumed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
 pub enum ActivityEntityType {
     Feed,
     Item,
     Tag,
     Media,
+    Entry,
+    Collection,
+    CollectionEntry,
+    ConsumptionLog,
+    Comparison,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
@@ -271,5 +495,20 @@ mod tests {
             })
         );
         assert_eq!(items.as_ref().and_then(ArchiveBatchScope::feed_id), Some("feed-2"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_entry_kind_all_roundtrip_and_parent_mapping() {
+        assert_eq!(EntryKind::ALL.len(), 15);
+        for kind in EntryKind::ALL {
+            assert_eq!(EntryKind::parse_flexible(kind.as_str()).unwrap(), kind);
+            let _ = kind.default_content_type();
+        }
+        assert_eq!(EntryKind::Song.parent_kind(), Some(EntryKind::Album));
+        assert_eq!(EntryKind::PodcastEpisode.parent_kind(), Some(EntryKind::Podcast));
+        assert_eq!(EntryKind::Article.parent_kind(), Some(EntryKind::Publication));
+        assert_eq!(EntryKind::Video.parent_kind(), Some(EntryKind::Channel));
+        assert_eq!(EntryKind::Movie.parent_kind(), None);
     }
 }

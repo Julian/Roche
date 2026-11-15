@@ -1,6 +1,12 @@
 package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.data.NetworkTier
+import com.grayvines.roche.data.PeerCatalogEntryPayload
+import com.grayvines.roche.data.PeerCollectionEntryPayload
+import com.grayvines.roche.data.PeerCollectionGeneratorPayload
+import com.grayvines.roche.data.PeerCollectionSpecPayload
+import com.grayvines.roche.data.PeerComparisonPayload
+import com.grayvines.roche.data.PeerConsumptionLogPayload
 import com.grayvines.roche.data.PeerNodeDto
 import com.grayvines.roche.data.SyncTombstoneDto
 import com.grayvines.roche.data.local.FeedEntity
@@ -305,6 +311,12 @@ data class PeerSyncRequestDto(
     val items: List<PeerSyncItemPayload> = emptyList(),
     val tags: List<TagEntity> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
+    val collections: List<PeerCollectionSpecPayload> = emptyList(),
+    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
+    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
+    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
+    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
+    val comparisons: List<PeerComparisonPayload> = emptyList(),
 )
 
 data class PeerSyncResponseDto(
@@ -317,6 +329,12 @@ data class PeerSyncResponseDto(
     val tombstones: List<SyncTombstoneDto>,
     val hasMore: Boolean = false,
     val nextAfterItemId: String? = null,
+    val collections: List<PeerCollectionSpecPayload> = emptyList(),
+    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
+    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
+    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
+    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
+    val comparisons: List<PeerComparisonPayload> = emptyList(),
 )
 
 data class RemoteMediaDto(
@@ -624,7 +642,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                         headers =
                             mapOf(
                                 HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                                "Accept" to EXTERNAL_IMAGE_ACCEPT,
+                                HEADER_ACCEPT to EXTERNAL_IMAGE_ACCEPT,
                             ),
                         expectBinary = true,
                     )
@@ -707,7 +725,7 @@ class RocheApiClient(private val transport: HttpTransport) {
                         headers =
                             mapOf(
                                 HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT,
-                                "Accept" to EXTERNAL_FEED_ACCEPT,
+                                HEADER_ACCEPT to EXTERNAL_FEED_ACCEPT,
                             ),
                     )
                 )
@@ -931,6 +949,7 @@ class RocheApiClient(private val transport: HttpTransport) {
 }
 
 private const val HEADER_USER_AGENT = "User-Agent"
+private const val HEADER_ACCEPT = "Accept"
 private const val HTTP_OK_START = 200
 private const val HTTP_OK_END = 299
 internal const val MAX_AUDIO_ENCLOSURE_BYTES = 500L * 1024L * 1024L

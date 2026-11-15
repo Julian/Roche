@@ -58,6 +58,9 @@ pub enum ApiError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Method not allowed: {0}")]
     MethodNotAllowed(String),
 
@@ -132,6 +135,15 @@ impl ApiError {
                     StatusCode::NOT_FOUND,
                     "urn:roche:problem:not-found",
                     "Not Found",
+                    detail.clone(),
+                ),
+            ),
+            Self::Conflict(detail) => (
+                StatusCode::CONFLICT,
+                ProblemDetails::new(
+                    StatusCode::CONFLICT,
+                    "urn:roche:problem:conflict",
+                    "Conflict",
                     detail.clone(),
                 ),
             ),
@@ -260,6 +272,19 @@ impl From<QueryRejection> for ApiError {
 impl From<PathRejection> for ApiError {
     fn from(rejection: PathRejection) -> Self {
         Self::BadRequest(rejection.body_text())
+    }
+}
+
+impl From<crate::db::CatalogError> for ApiError {
+    fn from(err: crate::db::CatalogError) -> Self {
+        match err {
+            crate::db::CatalogError::Db(db_err) => Self::Database(db_err),
+            crate::db::CatalogError::NotFound(msg) => Self::NotFound(msg),
+            crate::db::CatalogError::Conflict(msg) => Self::Conflict(msg),
+            crate::db::CatalogError::AmbiguousLookup { .. } => Self::Conflict(err.to_string()),
+            crate::db::CatalogError::ImmutableCollection { .. }
+            | crate::db::CatalogError::InvalidInput(_) => Self::BadRequest(err.to_string()),
+        }
     }
 }
 

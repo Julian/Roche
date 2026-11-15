@@ -100,6 +100,13 @@ class CrossStackVectorsTest {
             assertEquals(vector.expectedWinner, winner)
         }
     }
+
+    @Test
+    fun `deterministic system collection IDs match Rust constants`() {
+        assertEquals(STARRED_COLLECTION_ID, systemCollectionUuid("starred"))
+        assertEquals(UP_NEXT_COLLECTION_ID, systemCollectionUuid("up_next"))
+        assertEquals(ALBUMS_1001_COLLECTION_ID, systemCollectionUuid("1001_albums"))
+    }
 }
 
 internal const val MIN_CANONICAL_URL_VECTORS = 6

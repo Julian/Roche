@@ -1,4 +1,5 @@
 mod auth;
+mod catalog;
 mod feeds;
 mod items;
 mod media;
@@ -6,6 +7,8 @@ mod sync;
 mod tags;
 #[cfg(test)]
 mod tests;
+
+pub use media::serve_media_stream;
 
 use std::sync::Arc;
 
@@ -95,6 +98,7 @@ impl ApiRoutes {
             // Sync
             .route("/api/v1/sync/status", get(sync::sync_status::<F>))
             .route("/api/v1/sync/changes", get(sync::sync_changes::<F>))
+            .merge(Self::catalog_routes::<F>())
             .layer(DefaultBodyLimit::max(64 * 1024))
             .layer(RequestBodyLimitLayer::new(64 * 1024))
             .merge(large_body_routes)
@@ -120,11 +124,61 @@ impl ApiRoutes {
             .route("/health", get(Self::health::<F>))
             .merge(public_pair)
             .merge(protected)
+            .merge(crate::web::router(Arc::clone(&service)))
             .fallback(Self::handle_not_found)
             .method_not_allowed_fallback(Self::handle_method_not_allowed)
             .layer(TraceLayer::new_for_http())
             .layer(compression)
             .with_state(service)
+    }
+
+    fn catalog_routes<F: FeedFetcher>() -> Router<Arc<RocheService<F>>> {
+        Router::new()
+            .route(
+                "/api/v1/catalog/lists",
+                get(catalog::catalog_lists::<F>).post(catalog::catalog_lists_create::<F>),
+            )
+            .route("/api/v1/catalog/lists/{slug_or_id}", get(catalog::catalog_list_get::<F>))
+            .route(
+                "/api/v1/catalog/lists/{slug_or_id}/entries",
+                post(catalog::catalog_list_add_entry::<F>),
+            )
+            .route(
+                "/api/v1/catalog/lists/{slug_or_id}/entries/{entry_id}",
+                delete(catalog::catalog_list_remove_entry::<F>),
+            )
+            .route(
+                "/api/v1/catalog/entries",
+                get(catalog::catalog_entries_search::<F>)
+                    .post(catalog::catalog_entries_upsert::<F>),
+            )
+            .route("/api/v1/catalog/entries/{id}", get(catalog::catalog_entry_get::<F>))
+            .route("/api/v1/catalog/entries/{id}/merge", post(catalog::catalog_entry_merge::<F>))
+            .route("/api/v1/catalog/diary", get(catalog::catalog_diary_list::<F>))
+            .route("/api/v1/catalog/log", post(catalog::catalog_log_create::<F>))
+            .route("/api/v1/catalog/want", post(catalog::catalog_want_add::<F>))
+            .route(
+                "/api/v1/catalog/want/{queue}/{entry_id}",
+                delete(catalog::catalog_want_remove::<F>),
+            )
+            .route(
+                "/api/v1/catalog/rank/{slug_or_id}/cluster",
+                get(catalog::catalog_rank_cluster::<F>),
+            )
+            .route("/api/v1/catalog/comparisons", post(catalog::catalog_comparisons_create::<F>))
+            .route(
+                "/api/v1/catalog/generator/1001-albums",
+                get(catalog::catalog_generator_1001_get::<F>)
+                    .patch(catalog::catalog_generator_1001_patch::<F>),
+            )
+            .route(
+                "/api/v1/catalog/generator/1001-albums/finish",
+                post(catalog::catalog_generator_1001_finish::<F>),
+            )
+            .route(
+                "/api/v1/catalog/generator/1001-albums/abandon",
+                post(catalog::catalog_generator_1001_abandon::<F>),
+            )
     }
 
     fn handle_not_found() -> std::future::Ready<ApiError> {

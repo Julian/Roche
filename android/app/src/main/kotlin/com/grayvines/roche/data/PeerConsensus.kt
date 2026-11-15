@@ -142,6 +142,10 @@ internal fun itemNaturalKey(feedUrl: String?, itemUrl: String): String {
     }
 }
 
+internal const val STARRED_COLLECTION_ID = "533b1315-6e2e-57d3-ba85-dc88531c5a0b"
+internal const val UP_NEXT_COLLECTION_ID = "3864ff37-5ed3-5256-9380-f85ff8054f1c"
+internal const val ALBUMS_1001_COLLECTION_ID = "9eb44de7-bdfb-5bea-85d1-be913c542d8b"
+
 internal fun tagNaturalKey(name: String): String = name.trim().lowercase()
 
 internal fun deterministicFeedId(url: String): String =
@@ -152,6 +156,64 @@ internal fun deterministicItemId(feedUrl: String?, itemUrl: String): String =
 
 internal fun deterministicTagId(name: String): String =
     deterministicEntityUuid("tag", tagNaturalKey(name))
+
+internal fun systemCollectionUuid(slug: String): String =
+    deterministicEntityUuid("system_collection", slug.trim().lowercase())
+
+internal fun deterministicCatalogEntryId(kind: String, scheme: String, value: String): String =
+    deterministicEntityUuid(
+        "entry",
+        "${kind.trim().lowercase()}\u0000${scheme.trim().lowercase()}\u0000${value.trim()}",
+    )
+
+internal fun deterministicTitleEntryId(kind: String, title: String): String =
+    deterministicEntityUuid(
+        "entry_title",
+        "${kind.trim().lowercase()}\u0000${title.trim().lowercase()}",
+    )
+
+internal fun deterministicConsumptionLogId(
+    entryId: String,
+    tsMillis: Long,
+    status: String,
+): String =
+    deterministicEntityUuid(
+        "consumption_log",
+        "${entryId.trim()}\u0000$tsMillis\u0000${status.trim().lowercase()}",
+    )
+
+internal fun canonicalOrderingJson(ordering: List<List<String>>): String =
+    ordering.joinToString(prefix = "[", postfix = "]", separator = ",") { group ->
+        group
+            .map { it.trim() }
+            .sorted()
+            .joinToString(prefix = "[", postfix = "]", separator = ",") { id ->
+                buildString(id.length + 2) {
+                    append('"')
+                    for (ch in id) {
+                        when (ch) {
+                            '\\' -> append("\\\\")
+                            '"' -> append("\\\"")
+                            else -> append(ch)
+                        }
+                    }
+                    append('"')
+                }
+            }
+    }
+
+internal fun deterministicComparisonId(
+    scopeCollectionId: String?,
+    tsMillis: Long,
+    ordering: List<List<String>>,
+): String {
+    val scopeKey = scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() } ?: "global"
+    val ordJson = canonicalOrderingJson(ordering)
+    return deterministicEntityUuid("comparison", "$scopeKey\u0000$tsMillis\u0000$ordJson")
+}
+
+internal fun collectionEntryNaturalKey(collectionId: String, entryId: String): String =
+    "${collectionId.trim()}\u0000${entryId.trim()}"
 
 /**
  * Maps `(peerId, feedUrl, epoch)` deterministically to a uniform value in `(0.0, 1.0)` using the

@@ -144,6 +144,10 @@ internal fun SettingsHubPage(
                 onAction = onAction,
                 onOpenNavPage = onOpenNavPage,
             )
+            HomeWidgetsCardSection(
+                state = state,
+                onAction = onAction,
+            )
             SubscriptionsCardSection(
                 feedCount = state.feeds.size,
                 onImportOpml = onImportOpml,
@@ -351,6 +355,8 @@ internal fun NavigationSummaryCardSection(
                             "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
                         AppTab.STARRED ->
                             "Quick access to your unpinned tab (${state.starredEntries.size} starred)"
+                        AppTab.LISTS ->
+                            "Lists, Diary, Want Queues & rankings (${state.catalog.consumedCount} logged)"
                         else -> "Quick access to your unpinned tab"
                     }
                 HorizontalDivider(color = colors.border, thickness = 1.dp)
@@ -366,6 +372,57 @@ internal fun NavigationSummaryCardSection(
             }
         }
     }
+}
+
+@Composable
+internal fun HomeWidgetsCardSection(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val gen = state.albumGenerator
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        RocheSectionHeader(label = "Home Widgets")
+        RocheSurfaceCard {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                SettingToggleRow(
+                    title = "1001 Albums Generator",
+                    subtitle =
+                        "Draw from the bundled 1001 Albums pool on Home. Advances only when you finish & rank or abandon the active album.",
+                    checked = gen.enabled,
+                    onCheckedChange = { onAction(MainAction.SetAlbumGeneratorEnabled(it)) },
+                    modifier = Modifier.testTag("albums_generator_toggle"),
+                )
+                HomeWidgetDailyAlbumStatusLine(state = state)
+            }
+        }
+    }
+}
+
+@Composable
+internal fun HomeWidgetDailyAlbumStatusLine(state: MainUiState) {
+    val gen = state.albumGenerator
+    if (!gen.enabled) return
+    val colors = LocalRocheColors.current
+    val album = gen.currentAlbum
+    val summary =
+        if (album != null) {
+            "Active (${gen.completedCount}/${gen.totalCount}): ${album.name} — ${album.artist}"
+        } else {
+            "Pool complete (${gen.completedCount}/${gen.totalCount})"
+        }
+    Text(
+        text = summary,
+        color = colors.textSecondary,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.5.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
 }
 
 @Composable

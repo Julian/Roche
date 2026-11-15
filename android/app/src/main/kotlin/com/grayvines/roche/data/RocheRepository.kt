@@ -20,6 +20,7 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.io.File
+import java.io.InputStream
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +30,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -63,9 +65,10 @@ data class RepositorySnapshot(
     val feeds: List<FeedItem>,
     val tags: List<TagItem>,
     val activePeers: List<PeerNodeDto> = emptyList(),
+    val catalog: CatalogSnapshot = CatalogSnapshot(),
 )
 
-@Suppress("TooManyFunctions", "LargeClass")
+@Suppress("TooManyFunctions", "LargeClass", "LongParameterList")
 class RocheRepository(
     private val database: RocheDatabase,
     private val apiClient: RocheApiClient,
@@ -73,6 +76,7 @@ class RocheRepository(
     private val cacheDir: File? = null,
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
     backgroundScope: CoroutineScope? = null,
+    poolStreamProvider: (() -> InputStream?)? = null,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
@@ -80,6 +84,7 @@ class RocheRepository(
     private val mutationDispatcher = BackgroundMutationDispatcher(backgroundScope)
     private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
+    val catalog: CatalogStore = CatalogStore(dao = dao, poolStreamProvider = poolStreamProvider)
     @Volatile
     internal var latestSnapshot: RepositorySnapshot? = null
         private set
@@ -92,23 +97,30 @@ class RocheRepository(
             cacheDir = cacheDir,
         )
 
+    private val inboxSnapshotFlow: Flow<RepositorySnapshot> =
+        combine(
+            dao.observeItems(),
+            dao.observeFeeds(),
+            dao.observeTags(),
+            dao.observeItemTags(),
+            activePeersFlow,
+        ) { items, feeds, tags, itemTags, activePeers ->
+            buildSnapshot(
+                items = items,
+                feeds = feeds,
+                tags = tags,
+                itemTags = itemTags,
+                activePeers = activePeers,
+                entryCache = entryCache,
+            )
+        }
+
     val snapshot: Flow<RepositorySnapshot> =
         combine(
-                dao.observeItems(),
-                dao.observeFeeds(),
-                dao.observeTags(),
-                dao.observeItemTags(),
-                activePeersFlow,
-            ) { items, feeds, tags, itemTags, activePeers ->
-                buildSnapshot(
-                        items = items,
-                        feeds = feeds,
-                        tags = tags,
-                        itemTags = itemTags,
-                        activePeers = activePeers,
-                        entryCache = entryCache,
-                    )
-                    .also { latestSnapshot = it }
+                inboxSnapshotFlow,
+                catalog.snapshot.onStart { catalog.ensureSystemSeeded() },
+            ) { base, catalogSnap ->
+                base.copy(catalog = catalogSnap).also { latestSnapshot = it }
             }
             .flowOn(Dispatchers.Default)
 
@@ -167,7 +179,7 @@ class RocheRepository(
             )
         val newStatus = if (archived) ItemStatus.ARCHIVED else ItemStatus.UNREAD
         val isAudioItem =
-            current.contentType.equals("audio", ignoreCase = true) ||
+            current.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
                 !current.audioUrl.isNullOrBlank()
         val newReadAt =
             if (archived) {
@@ -180,6 +192,9 @@ class RocheRepository(
                 null
             }
         dao.updateItemStatusAndReadAt(itemId, newStatus.wireValue, newReadAt)
+        if (archived) {
+            maybeAutoLogFeedItemCompletion(itemId)
+        }
         if (archived && current.isCachedOffline && isAudioItem) {
             offlineCacheManager.setOfflineCacheState(itemId = itemId, enabled = false)
         }
@@ -336,7 +351,7 @@ class RocheRepository(
             val state = dao.getItemStateById(snap.itemId) ?: continue
             if (
                 state.isCachedOffline &&
-                    (state.contentType.equals("audio", ignoreCase = true) ||
+                    (state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
                         !state.audioUrl.isNullOrBlank())
             ) {
                 offlineCacheManager.setOfflineCacheState(itemId = state.id, enabled = false)
@@ -405,6 +420,7 @@ class RocheRepository(
         if (!progress.isFinite() || dao.getItemStateById(itemId) == null) return
         val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
         dao.updateReadProgress(itemId, clamped)
+        maybeAutoLogFeedItemCompletion(itemId)
         if (recordPlayedTimestamp) {
             val nowIso = Instant.now().toString()
             dao.updateItemReadAt(itemId, nowIso)
@@ -744,6 +760,7 @@ class RocheRepository(
             dao = dao,
             apiClient = apiClient,
             networkTier = networkTier,
+            catalogStore = catalog,
             onPeersUpdated = { activePeersFlow.value = it },
             onSyncCursorUpdated = { cursor ->
                 settings.update { it.copy(lastPeerSyncCursor = cursor) }
@@ -826,6 +843,52 @@ class RocheRepository(
     }
         .getOrNull()
 
+    internal suspend fun markFeedItemFinished(itemId: String): String? {
+        val item = dao.getItemById(itemId) ?: return null
+        if (ItemStatus.fromWireValue(item.status) != ItemStatus.ARCHIVED) {
+            setArchiveStateWithSnapshot(itemId = itemId, archived = true)
+        }
+        val refreshed = dao.getItemById(itemId) ?: item
+        val feed = refreshed.feedId?.let { dao.getFeedById(it) }
+        return catalog.materializeFeedItemInCatalog(
+            item = refreshed,
+            feed = feed,
+            logConsumed = true,
+        )
+    }
+
+    internal suspend fun prepareFeedItemForRank(itemId: String): Pair<String, EntryKind>? {
+        val item = dao.getItemById(itemId) ?: return null
+        val feed = item.feedId?.let { dao.getFeedById(it) }
+        val resolvedId =
+            catalog.materializeFeedItemInCatalog(item = item, feed = feed, logConsumed = false)
+        val kind =
+            dao.getCatalogEntryById(resolvedId)?.let { EntryKind.fromWireValue(it.kind) }
+                ?: EntryKind.ARTICLE
+        return resolvedId to kind
+    }
+
+    private suspend fun maybeAutoLogFeedItemCompletion(itemId: String) {
+        val state = dao.getItemStateById(itemId) ?: return
+        val isAudio =
+            state.contentType.equals(AUDIO_CONTENT_TYPE, ignoreCase = true) ||
+                !state.audioUrl.isNullOrBlank()
+        val isVideo = !isAudio && state.contentType.equals("video", ignoreCase = true)
+        if (isVideo) return
+        val isArchived = ItemStatus.fromWireValue(state.status) == ItemStatus.ARCHIVED
+        val shouldLog =
+            if (isAudio) {
+                state.readProgress >= AUDIO_COMPLETE_PROGRESS_THRESHOLD ||
+                    isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
+            } else {
+                isArchived && state.readProgress >= ARCHIVE_COMPLETE_PROGRESS_THRESHOLD
+            }
+        if (!shouldLog) return
+        val item = dao.getItemById(itemId) ?: return
+        val feed = item.feedId?.let { dao.getFeedById(it) }
+        catalog.materializeFeedItemInCatalog(item = item, feed = feed, logConsumed = true)
+    }
+
     companion object {
         fun filterEntries(
             entries: List<InboxEntry>,
@@ -844,8 +907,11 @@ class RocheRepository(
     }
 }
 
+private const val AUDIO_CONTENT_TYPE = "audio"
 private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
+private const val ARCHIVE_COMPLETE_PROGRESS_THRESHOLD = 0.9
+private const val AUDIO_COMPLETE_PROGRESS_THRESHOLD = 0.98
 private const val BOOTSTRAP_DELTA_LOOKBACK_SEC = 60L
 
 internal suspend fun bootstrapDeltaPeerSyncIfNeeded(

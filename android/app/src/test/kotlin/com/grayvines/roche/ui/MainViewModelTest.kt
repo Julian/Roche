@@ -766,7 +766,16 @@ class MainViewModelTest {
                 }
             assertEquals(2.75f, updatedFeedSpeed.playerState.playbackSpeed, 1e-3f)
 
-            viewModel.playerController.stopAndClear()
+            // Explicitly marking active episode finished clears active player and removes from
+            // queue
+            viewModel.dispatch(MainAction.MarkFeedEntryFinished("ep-1"))
+            val afterExplicitFinish =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == null &&
+                        it.queueEntries.map { e -> e.id } == listOf("art-mid")
+                }
+            assertTrue(afterExplicitFinish.allEntries.first { it.id == "ep-1" }.isArchived)
+
             collectJob.cancel()
         }
 
@@ -1066,7 +1075,13 @@ class MainViewModelTest {
             localBackend.setSimulatedPositionMs(11_200L)
             assertTrue(localVm.playerController.advanceSingleTick(tickCount = 3))
             assertEquals(2, playerEmissions)
-            assertEquals(11_200L, localVm.uiState.value.playerState.positionMs)
+            assertEquals(
+                11_200L,
+                localVm.uiState
+                    .first { it.playerState.positionMs == 11_200L }
+                    .playerState
+                    .positionMs,
+            )
             assertEquals(1, tierQueryCount)
 
             // Active sleep timer ticks still emit countdown updates even when position is stalled
@@ -1571,6 +1586,201 @@ class MainViewModelTest {
             assertEquals("", closedSearch.searchQuery)
 
             collectJob.cancel()
+        }
+
+    @Test
+    fun `native 1001 Albums generator draws from bundled pool never auto rotates and settles focused rank`() =
+        runTest {
+            val poolJson =
+                """[""" +
+                    """{"id":"11111111-1111-4111-8111-111111111111","slug":"album-a","title":"First Canon Album","artist":"Artist One","year":1971,"spotify_id":"sp1","cover_url":"https://i.scdn.co/image/1","genres":["rock"],"styles":[]},""" +
+                    """{"id":"22222222-2222-4222-8222-222222222222","slug":"album-b","title":"Second Canon Album","artist":"Artist Two","year":1975,"spotify_id":"sp2","cover_url":"https://i.scdn.co/image/2","genres":["jazz"],"styles":[]},""" +
+                    """{"id":"33333333-3333-4333-8333-333333333333","slug":"album-c","title":"Third Canon Album","artist":"Artist Three","year":1980,"spotify_id":"sp3","cover_url":"https://i.scdn.co/image/3","genres":["soul"],"styles":[]}]"""
+            val customApi = RocheApiClient { HttpResponse(statusCode = 404, body = "{}") }
+            val customRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = customApi,
+                    settings = settings,
+                    poolStreamProvider = { poolJson.byteInputStream(Charsets.UTF_8) },
+                )
+            val customVm =
+                MainViewModel(
+                    repository = customRepo,
+                    settingsRepository = settings,
+                    playerBackend = FakeAudioPlayerBackend(),
+                    mediaSessionBridge = RecordingMediaSessionBridge(),
+                )
+            val collectJob = backgroundScope.launch { customVm.uiState.collect() }
+            try {
+                assertNull(customVm.uiState.value.dailyAlbum)
+
+                customVm.dispatch(MainAction.SetAlbumGeneratorEnabled(true))
+                val drawn1 = customVm.uiState.first { it.dailyAlbum != null }
+                val firstAlbumId = drawn1.dailyAlbum!!.entryId
+                assertEquals(1, drawn1.dailyAlbum?.albumNumber)
+                assertEquals(3, drawn1.dailyAlbum?.remainingCount)
+
+                // Re-enabling or syncing NEVER auto-rotates an active unfinished album
+                customVm.dispatch(MainAction.SetAlbumGeneratorEnabled(true))
+                assertEquals(firstAlbumId, customVm.uiState.value.dailyAlbum?.entryId)
+
+                // Finishing #1 album logs consumed and draws #2
+                customVm.dispatch(MainAction.ConfirmFinish1001Album("Loved the opener"))
+                val afterFirst =
+                    customVm.uiState.first {
+                        val current = it.dailyAlbum
+                        current != null && current.entryId != firstAlbumId
+                    }
+                val secondAlbumId = afterFirst.dailyAlbum!!.entryId
+                assertEquals(1, afterFirst.albumGenerator.consumedCount)
+                assertEquals(2, afterFirst.dailyAlbum?.remainingCount)
+
+                // Finishing #2 album opens FocusedRankSession comparing #1 and #2, then settles!
+                customVm.dispatch(MainAction.ConfirmFinish1001Album("Even better"))
+                val withRank =
+                    customVm.uiState.first {
+                        it.rankSession != null && it.rankSession.cluster.size == 2
+                    }
+                customVm.dispatch(
+                    MainAction.SubmitRankCluster(
+                        listOf(listOf(secondAlbumId), listOf(firstAlbumId))
+                    )
+                )
+                val settled = customVm.uiState.first { it.rankSession?.settlement != null }
+                assertEquals(1, settled.rankSession?.settlement?.rank)
+                assertEquals(2, settled.rankSession?.settlement?.totalCount)
+
+                // Abandoning #3 completes the pool cleanly
+                customVm.dispatch(MainAction.CloseRankSession)
+                customVm.dispatch(MainAction.ConfirmAbandon1001Album("Not for me"))
+                val finishedPool = customVm.uiState.first { it.albumGenerator.abandonedCount == 1 }
+                assertNull(finishedPool.dailyAlbum)
+                assertEquals(2, finishedPool.albumGenerator.consumedCount)
+            } finally {
+                collectJob.cancel()
+                customVm.playerController.releaseController()
+                customVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `want queue priority scope completion rank handoff custom list add and tie grouping work without races`() =
+        runTest {
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            try {
+                // Seed one consumed movie so completing a Want movie has >= 2 items to rank
+                viewModel.dispatch(
+                    MainAction.SubmitQuickLog(
+                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        title = "Arrival",
+                        creatorsCsv = "Denis Villeneuve",
+                        releaseYear = 2016,
+                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        notes = "Great",
+                        addToWant = false,
+                        rankAfterLog = false,
+                    )
+                )
+                // Add two movies to Want Queue and immediately start ranking on Want Queue
+                viewModel.dispatch(
+                    MainAction.SubmitQuickLog(
+                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        title = "Stalker",
+                        creatorsCsv = "Andrei Tarkovsky",
+                        releaseYear = 1979,
+                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        notes = "",
+                        addToWant = true,
+                        rankAfterLog = false,
+                    )
+                )
+                viewModel.dispatch(
+                    MainAction.SubmitQuickLog(
+                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        title = "Solaris",
+                        creatorsCsv = "Andrei Tarkovsky",
+                        releaseYear = 1972,
+                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        notes = "",
+                        addToWant = true,
+                        rankAfterLog = false,
+                    )
+                )
+                viewModel.uiState.first { state ->
+                    state.catalog.wantQueues.any { it.entryCount == 2 }
+                }
+                viewModel.dispatch(MainAction.StartRankingSession("want:movie"))
+                val wantRankState =
+                    viewModel.uiState.first {
+                        it.rankSession != null && it.rankSession.cluster.size == 2
+                    }
+                // Priority ranking MUST be scoped to the Want collection (not global null)
+                assertNotNull(wantRankState.rankSession?.scopeCollectionId)
+
+                // Verify tie-grouping & display rank helpers
+                val cands = wantRankState.rankSession!!.cluster
+                val tiedGroups = buildOrderingGroups(cands, setOf(cands[1].entryId))
+                assertEquals(1, tiedGroups.size)
+                assertEquals(2, tiedGroups[0].size)
+                assertEquals(
+                    listOf(1, 1),
+                    computeDisplayGroupRanks(cands, setOf(cands[1].entryId)),
+                )
+
+                viewModel.dispatch(MainAction.CloseRankSession)
+
+                // CompleteWantEntry(rankImmediately = true) must open global quality rank
+                // (scopeCollectionId == null)
+                val stalkerId = cands.first().entryId
+                viewModel.dispatch(
+                    MainAction.CompleteWantEntry(entryId = stalkerId, rankImmediately = true)
+                )
+                val qualityRankState =
+                    viewModel.uiState.first {
+                        it.rankSession != null && it.rankSession.focusEntryId == stalkerId
+                    }
+                assertNull(qualityRankState.rankSession?.scopeCollectionId)
+                assertEquals("movies", qualityRankState.rankSession?.collectionIdOrSlug)
+                viewModel.dispatch(MainAction.CloseRankSession)
+
+                // Create custom manual list and log+add directly into it
+                viewModel.dispatch(MainAction.CreateCustomCatalogList("Tarkovsky Essentials"))
+                val withCustomList =
+                    viewModel.uiState.first { state ->
+                        state.catalog.lists.any { it.title == "Tarkovsky Essentials" }
+                    }
+                val customListId =
+                    withCustomList.catalog.lists
+                        .first { it.title == "Tarkovsky Essentials" }
+                        .collectionId
+                viewModel.dispatch(
+                    MainAction.SubmitQuickLog(
+                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        title = "Mirror",
+                        creatorsCsv = "Andrei Tarkovsky",
+                        releaseYear = 1975,
+                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        notes = "Poetic",
+                        addToWant = false,
+                        rankAfterLog = false,
+                        targetCollectionId = customListId,
+                    )
+                )
+                val populatedCustom =
+                    viewModel.uiState.first { state ->
+                        state.catalog.entriesByCollectionId[customListId].orEmpty().size == 1
+                    }
+                assertEquals(
+                    "Mirror",
+                    populatedCustom.catalog.entriesByCollectionId[customListId]!!
+                        .single()
+                        .entry
+                        .title,
+                )
+            } finally {
+                collectJob.cancel()
+            }
         }
 
     private class FakeAudioPlayerBackend : AudioPlayerBackend {

@@ -1,0 +1,443 @@
+use std::{fmt::Write as _, sync::Arc};
+
+use axum::{
+    Form,
+    extract::{Extension, Query, State},
+    response::{IntoResponse, Response},
+};
+use serde::Deserialize;
+
+use super::{
+    auth::WebSession,
+    html::{
+        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
+        safe_external_href, urlencode, web_api_error_response,
+    },
+    views_reader::render_audio_play_button,
+};
+use crate::{
+    db::{
+        CatalogEntry, ConsumptionLogView, ConsumptionStatus, Generator1001State, Item, ItemFilter,
+        ItemStatusFilter,
+    },
+    error::ApiError,
+    scheduler::FeedFetcher,
+    service::RocheService,
+};
+
+#[derive(Debug, Deserialize)]
+pub(super) struct GeneratorToggleForm {
+    pub enabled: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct GeneratorNotesForm {
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+pub(super) async fn home_get<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Query(flash): Query<FlashQuery>,
+) -> Response {
+    match render_home_inner(&service, &session, &flash).await {
+        Ok(resp) => resp,
+        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
+    }
+}
+
+async fn render_home_inner<F: FeedFetcher>(
+    service: &RocheService<F>,
+    session: &WebSession,
+    flash: &FlashQuery,
+) -> Result<Response, ApiError> {
+    let gen_state = service.catalog().get_1001_generator_state().await?;
+
+    let unread_page = service
+        .items()
+        .query()
+        .with_filter(ItemFilter {
+            status: Some(ItemStatusFilter::Unread),
+            include_content: Some(false),
+            per_page: Some(12),
+            ..ItemFilter::default()
+        })
+        .list_page()
+        .await?;
+    let sync_status = service.sync_status().await?;
+    let recent_diary = service.catalog().list_diary(None, None, 8).await?;
+    let collections = service.catalog().list_collections(true, false).await?;
+
+    let mut body = String::with_capacity(8_192);
+    render_1001_sleeve_section(&mut body, &gen_state, &session.csrf_token);
+    render_in_progress_section(&mut body, &unread_page.items);
+
+    let want_total: usize = collections
+        .iter()
+        .filter(|c| c.role == crate::db::CollectionRole::Want)
+        .map(|c| c.member_count)
+        .sum();
+    if want_total > 0 {
+        let _ = writeln!(
+            body,
+            "<div class=\"section-head\"><h3>Up Next Queue ({want_total})</h3>\
+             <a class=\"section-action\" href=\"/queue\">Manage Queues &rarr;</a></div>\n\
+             <p class=\"meta\">You have <em>{want_total}</em> queued works across your Want lists.</p>"
+        );
+    }
+
+    render_unread_summary_section(&mut body, &unread_page.items, sync_status.unread_items_count);
+    render_recent_diary_section(&mut body, &recent_diary);
+
+    Ok(render_page(&PageShell {
+        title: "Roche",
+        active: NavSection::Home,
+        csrf_token: &session.csrf_token,
+        flash,
+        body_html: &body,
+    })
+    .into_response())
+}
+
+fn render_1001_sleeve_section(out: &mut String, state: &Generator1001State, csrf: &str) {
+    if !state.enabled {
+        let _ = write!(
+            out,
+            "<section class=\"album-sleeve\" style=\"grid-template-columns:1fr\">\n\
+               <div>\n\
+                 <div class=\"album-kicker\">1001 Albums Generator</div>\n\
+                 <h2 class=\"album-title\">One Album at a Time</h2>\n\
+                 <p class=\"meta\" style=\"margin:0.4rem 0 0.75rem\">{} albums in pool &middot; {} heard &middot; never auto-rotates until you finish or abandon.</p>\n\
+                 <form method=\"post\" action=\"/web/1001/toggle\" class=\"inline-form\">\n\
+                   <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n\
+                   <input type=\"hidden\" name=\"enabled\" value=\"true\">\n\
+                   <button type=\"submit\" class=\"btn btn-primary\">Enable 1001 Albums</button>\n\
+                 </form>\n\
+               </div>\n\
+             </section>\n",
+            state.total_pool,
+            state.consumed_count,
+            esc(csrf),
+        );
+        return;
+    }
+
+    let Some(album) = &state.current_entry else {
+        let _ = write!(
+            out,
+            "<section class=\"album-sleeve\" style=\"grid-template-columns:1fr\">\n\
+               <div>\n\
+                 <div class=\"album-kicker\">1001 Albums Completed</div>\n\
+                 <h2 class=\"album-title\">All {} Albums Completed</h2>\n\
+                 <p class=\"meta\">{} finished &middot; {} abandoned. <a href=\"/lists/1001_albums\">View your ranked 1001 Albums &rarr;</a></p>\n\
+               </div>\n\
+             </section>\n",
+            state.total_pool, state.consumed_count, state.abandoned_count
+        );
+        return;
+    };
+
+    out.push_str("<section class=\"album-sleeve\">\n<div>\n");
+    if let Some(cover) = album.thumbnail_url.as_deref().and_then(safe_external_href) {
+        let _ = writeln!(
+            out,
+            "<img class=\"album-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\">",
+            esc(cover),
+            esc(&album.title)
+        );
+    } else {
+        out.push_str("<div class=\"album-cover-placeholder\">&#9835;</div>\n");
+    }
+    out.push_str("</div>\n<div>\n");
+
+    let album_number = state.consumed_count + state.abandoned_count + 1;
+    let _ = writeln!(
+        out,
+        "<div class=\"album-kicker\">1001 Albums &middot; #{} of {} ({} remaining)</div>",
+        album_number, state.total_pool, state.remaining_count
+    );
+    let _ = writeln!(
+        out,
+        "<h2 class=\"album-title\"><a href=\"/entries/{}\">{}</a></h2>",
+        esc(&urlencode(&album.id)),
+        esc(&album.title)
+    );
+
+    let artist_line = if album.creators.is_empty() {
+        "Unknown Artist".to_owned()
+    } else {
+        album.creators.join(", ")
+    };
+    if let Some(yr) = album.release_year {
+        let _ = writeln!(out, "<div class=\"album-artist\">{} ({yr})</div>", esc(&artist_line));
+    } else {
+        let _ = writeln!(out, "<div class=\"album-artist\">{}</div>", esc(&artist_line));
+    }
+
+    let genres = extract_album_genres(album);
+    if !genres.is_empty() {
+        let _ = writeln!(out, "<div class=\"album-genres\">{}</div>", esc(&genres.join(" · ")));
+    }
+
+    out.push_str("<div class=\"album-actions\">\n");
+    for ident in album.sorted_external_identifiers() {
+        if let Some(ext_url) = ident.external_url()
+            && let Some(safe_href) = safe_external_href(&ext_url)
+        {
+            let _ = writeln!(
+                out,
+                "<a class=\"btn btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{} &#8599;</a>",
+                esc(safe_href),
+                esc(ident.label())
+            );
+        }
+    }
+    out.push_str("</div>\n");
+
+    render_1001_mutation_forms(out, csrf);
+    out.push_str("</div>\n</section>\n");
+}
+
+fn render_1001_mutation_forms(out: &mut String, csrf: &str) {
+    let _ = write!(
+        out,
+        "<details class=\"album-inline-details\">\n\
+           <summary class=\"btn btn-primary\">Finish &amp; Rank</summary>\n\
+           <form class=\"album-inline-form\" method=\"post\" action=\"/web/1001/finish\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
+               <label for=\"finish-notes\">Listening Notes (optional)</label>\n\
+               <textarea id=\"finish-notes\" name=\"notes\" placeholder=\"Standout tracks, impressions...\"></textarea>\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn btn-primary\">Log Finished &amp; Rank</button>\n\
+           </form>\n\
+         </details>\n\
+         <details class=\"album-inline-details\">\n\
+           <summary class=\"btn btn-ghost btn-small\">Abandon Album</summary>\n\
+           <form class=\"album-inline-form\" method=\"post\" action=\"/web/1001/abandon\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
+               <label for=\"abandon-notes\">Why abandon? (optional)</label>\n\
+               <textarea id=\"abandon-notes\" name=\"notes\" placeholder=\"Stopped after side A...\"></textarea>\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn\">Abandon &amp; Draw Next</button>\n\
+           </form>\n\
+         </details>\n\
+         <form method=\"post\" action=\"/web/1001/toggle\" style=\"margin-top:0.55rem\">\n\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+           <input type=\"hidden\" name=\"enabled\" value=\"false\">\n\
+           <button type=\"submit\" class=\"link-btn\">Disable generator</button>\n\
+         </form>\n",
+        csrf = esc(csrf),
+    );
+}
+
+fn extract_album_genres(album: &CatalogEntry) -> Vec<String> {
+    let mut tags = Vec::new();
+    for key in ["genres", "styles"] {
+        if let Some(arr) = album.metadata.get(key).and_then(serde_json::Value::as_array) {
+            for val in arr {
+                if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty())
+                    && !tags.iter().any(|existing: &String| existing.eq_ignore_ascii_case(s))
+                {
+                    tags.push(s.to_owned());
+                    if tags.len() >= 5 {
+                        return tags;
+                    }
+                }
+            }
+        }
+    }
+    tags
+}
+
+fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
+    let in_progress: Vec<&Item> = unread_items
+        .iter()
+        .filter(|i| {
+            i.read_progress >= 0.03
+                || i.content_type == crate::db::ContentType::Audio
+                || i.audio_url.is_some()
+        })
+        .take(4)
+        .collect();
+    if in_progress.is_empty() {
+        return;
+    }
+
+    out.push_str(
+        "<div class=\"section-head\"><h3>Continue Reading &amp; Listening</h3>\
+         <a class=\"section-action\" href=\"/inbox\">Inbox &rarr;</a></div>\n\
+         <ul class=\"inbox-list\">\n",
+    );
+    for item in in_progress {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pct = (item.read_progress.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let _ = write!(
+            out,
+            "<li class=\"inbox-row\"><div class=\"inbox-main\">\
+             <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
+             <div class=\"item-byline\">",
+            esc(&urlencode(&item.id)),
+            esc(&item.title),
+        );
+        if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
+            let _ = write!(out, "<span>{}</span>", esc(ft));
+        }
+        if pct > 0 {
+            let _ = write!(out, "<span>{pct}%</span>");
+        }
+        out.push_str("</div></div><div class=\"inbox-controls\">");
+        render_audio_play_button(out, item);
+        out.push_str("</div></li>\n");
+    }
+    out.push_str("</ul>\n");
+}
+
+fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64) {
+    let _ = writeln!(
+        out,
+        "<div class=\"section-head\"><h3>Unread Inbox ({total_unread})</h3>\
+         <a class=\"section-action\" href=\"/inbox\">Open Inbox &rarr;</a></div>"
+    );
+    if items.is_empty() {
+        out.push_str(
+            "<p class=\"empty\">Inbox clear. <a href=\"/feeds\">Manage feeds</a> or save a URL in <a href=\"/inbox\">Inbox</a>.</p>\n",
+        );
+        return;
+    }
+
+    out.push_str("<ul class=\"inbox-list\">\n");
+    for item in items.iter().take(8) {
+        let _ = write!(
+            out,
+            "<li class=\"inbox-row\"><div class=\"inbox-main\">\
+             <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
+             <div class=\"item-byline\"><span class=\"badge\">{:?}</span>",
+            esc(&urlencode(&item.id)),
+            esc(&item.title),
+            item.content_type,
+        );
+        if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
+            let _ = write!(out, "<span>{}</span>", esc(ft));
+        }
+        if let Some(pub_at) = item.published_at {
+            let _ = write!(out, "<span>{}</span>", pub_at.format("%b %d"));
+        }
+        out.push_str("</div></div><div class=\"inbox-controls\">");
+        render_audio_play_button(out, item);
+        out.push_str("</div></li>\n");
+    }
+    out.push_str("</ul>\n");
+}
+
+fn render_recent_diary_section(out: &mut String, diary: &[ConsumptionLogView]) {
+    out.push_str(
+        "<div class=\"section-head\"><h3>Recent Diary</h3>\
+         <a class=\"section-action\" href=\"/diary\">Full Diary &rarr;</a></div>\n",
+    );
+    if diary.is_empty() {
+        out.push_str(
+            "<p class=\"empty\">No media logged yet. <a href=\"/queue\">Log a work or add to a Want queue</a>.</p>\n",
+        );
+        return;
+    }
+
+    for row in diary {
+        let _ = write!(
+            out,
+            "<div class=\"diary-row\">\
+               <span class=\"date\">{}</span>\
+               <span><a href=\"/entries/{}\">{}</a>",
+            row.ts.format("%b %d"),
+            esc(&urlencode(&row.entry.id)),
+            esc(&row.entry.title),
+        );
+        if !row.entry.creators.is_empty() {
+            let _ = write!(
+                out,
+                " <span style=\"color:var(--ink-soft)\">&mdash; {}</span>",
+                esc(&row.entry.creators.join(", "))
+            );
+        }
+        if row.status != ConsumptionStatus::Consumed {
+            let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
+        }
+        let _ = writeln!(
+            out,
+            "</span><span class=\"kind\">{}</span></div>",
+            esc(row.entry.kind.display_label())
+        );
+    }
+}
+
+pub(super) async fn post_1001_toggle<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Form(form): Form<GeneratorToggleForm>,
+) -> Response {
+    let enabled = matches!(form.enabled.trim(), "true" | "1" | "on");
+    match service.catalog().set_1001_generator_enabled(enabled).await {
+        Ok(_) => {
+            let msg = if enabled {
+                "1001 Albums Generator enabled"
+            } else {
+                "1001 Albums Generator disabled"
+            };
+            redirect_see_other(&format!("/?notice={}", urlencode(msg)))
+        }
+        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+    }
+}
+
+pub(super) async fn post_1001_finish<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Form(form): Form<GeneratorNotesForm>,
+) -> Response {
+    match service.catalog().finish_active_1001_album(form.notes.as_deref()).await {
+        Ok((completed, next_state)) => {
+            let can_rank = service
+                .catalog()
+                .get_ranked_collection("albums", false)
+                .await
+                .is_ok_and(|v| v.rows.len() >= 2);
+            if can_rank {
+                let notice =
+                    format!("Finished '{}' — rank it against your albums", completed.title);
+                redirect_see_other(&format!(
+                    "/rank/albums?focus={}&notice={}",
+                    urlencode(&completed.id),
+                    urlencode(&notice)
+                ))
+            } else {
+                let next_part = next_state
+                    .current_entry
+                    .as_ref()
+                    .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
+                let notice = format!("Logged '{}' to Diary{next_part}", completed.title);
+                redirect_see_other(&format!("/?notice={}", urlencode(&notice)))
+            }
+        }
+        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+    }
+}
+
+pub(super) async fn post_1001_abandon<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Form(form): Form<GeneratorNotesForm>,
+) -> Response {
+    match service.catalog().abandon_active_1001_album(form.notes.as_deref()).await {
+        Ok((abandoned, next_state)) => {
+            let next_part = next_state
+                .current_entry
+                .as_ref()
+                .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
+            let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
+            redirect_see_other(&format!("/?notice={}", urlencode(&notice)))
+        }
+        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+    }
+}

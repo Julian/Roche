@@ -33,6 +33,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon
@@ -53,6 +54,9 @@ fun MainScreen(
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
     onMoveTaskToBack: () -> Unit = {},
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = { album ->
+        onOpenExternalUrl(album.youtubeMusicUrl)
+    },
 ) {
     val colors = LocalRocheColors.current
     val scrollStates =
@@ -107,6 +111,7 @@ fun MainScreen(
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
+                onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
                 onImportOpml = onImportOpml,
                 onExportOpml = onExportOpml,
             )
@@ -286,6 +291,32 @@ private fun MainOverlaySheets(
             },
         )
     }
+
+    val albumDialogMode = state.albumNoteDialogMode
+    if (albumDialogMode != null) {
+        AlbumNoteModalSheet(
+            album = state.dailyAlbum,
+            mode = albumDialogMode,
+            onAction = onAction,
+        )
+    }
+
+    val activeRankSession = state.rankSession
+    if (activeRankSession != null) {
+        FocusedRankBottomSheet(
+            session = activeRankSession,
+            onAction = onAction,
+        )
+    }
+
+    if (state.isQuickLogSheetOpen) {
+        QuickLogBottomSheet(
+            defaultToWant = state.quickLogDefaultWant,
+            targetCollectionId = state.quickLogTargetCollectionId,
+            targetCollectionTitle = state.quickLogTargetCollectionTitle,
+            onAction = onAction,
+        )
+    }
 }
 
 @Composable
@@ -297,6 +328,7 @@ private fun MainBodyContent(
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
     onImportOpml: () -> Unit,
     onExportOpml: () -> Unit,
 ) {
@@ -345,6 +377,8 @@ private fun MainBodyContent(
                     state = state,
                     onAction = onAction,
                     scrollState = scrollStates.scrollState("home"),
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
                 )
             AppTab.INBOX ->
                 InboxTabContent(
@@ -377,6 +411,12 @@ private fun MainBodyContent(
                     onAction = onAction,
                     listState = scrollStates.lazyListState("offline"),
                 )
+            AppTab.LISTS ->
+                MediaCompanionScreen(
+                    state = state,
+                    onAction = onAction,
+                    listState = scrollStates.lazyListState("lists:${state.companionSubTab.name}"),
+                )
             AppTab.SETTINGS ->
                 SettingsTabContent(
                     state = state,
@@ -402,6 +442,7 @@ private fun readerBackLabel(state: MainUiState): String =
         state.activeTab == AppTab.QUEUE -> "← Queue"
         state.activeTab == AppTab.STARRED -> "← Starred"
         state.activeTab == AppTab.OFFLINE -> "← Offline"
+        state.activeTab == AppTab.LISTS -> "← Lists"
         state.selectedFeedId != null -> "← ${state.selectedFeedTitle ?: "Feed"}"
         state.selectedTag != null -> "← #${state.selectedTag}"
         else -> "← Inbox"

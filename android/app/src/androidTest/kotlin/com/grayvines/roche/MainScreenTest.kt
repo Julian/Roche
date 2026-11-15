@@ -12,6 +12,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
+import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -154,10 +155,11 @@ class MainScreenTest {
         composeRule.onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings").assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").assertExists()
-        composeRule.onNodeWithTag("import_opml_btn").assertExists()
-        composeRule.onNodeWithTag("export_opml_btn").assertExists()
+        composeRule.onNodeWithTag("albums_generator_toggle").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()
 
-        composeRule.onNodeWithTag("settings_nav_row").performClick()
+        composeRule.onNodeWithTag("settings_nav_row").performScrollTo().performClick()
         composeRule.onNodeWithText("Navigation Bar").assertExists()
         composeRule.onNodeWithTag("dock_slot_1").performClick()
         composeRule.onNodeWithTag("dock_candidate_offline").performClick()
@@ -266,7 +268,8 @@ class MainScreenTest {
         }
 
         composeRule.onNodeWithTag("home_screen").assertExists()
-        composeRule.onNodeWithTag("home_widget_pulse").assertExists()
+        composeRule.onNodeWithTag("home_widget_pulse").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_widget_daily_album").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_up_next").assertExists()
         composeRule.onNodeWithTag("home_widget_sources").assertExists()
 
@@ -274,6 +277,72 @@ class MainScreenTest {
         composeRule.onNodeWithTag("search_overlay").assertExists()
         composeRule.onNodeWithTag("close_search_btn").performClick()
         composeRule.onNodeWithTag("home_screen").assertExists()
+    }
+
+    @Test
+    fun homeTabShowsDailyAlbumWidgetWhenConfiguredAndInvokesPlayAndRateActions() {
+        val album =
+            DailyAlbumSnapshot(
+                entryId = "album-entry-11",
+                name = "Sample Album",
+                artist = "Sample Artist",
+                releaseDate = "1972",
+                genres = listOf("rock"),
+                albumNumber = 11,
+                totalCount = 1101,
+                remainingCount = 1091,
+                youtubeMusicId = "OLAK5uy_sample_playlist",
+                wikipediaUrl = "https://en.wikipedia.org/wiki/Sample_Album",
+            )
+        val openedMusicAlbums = mutableListOf<DailyAlbumSnapshot>()
+        val actions = mutableListOf<com.grayvines.roche.ui.MainAction>()
+
+        composeRule.setContent {
+            RocheTheme {
+                MainScreen(
+                    state =
+                        MainUiState(
+                            activeTab = AppTab.HOME,
+                            catalog =
+                                com.grayvines.roche.data.CatalogSnapshot(
+                                    albumGenerator =
+                                        com.grayvines.roche.data.AlbumGeneratorState(
+                                            enabled = true,
+                                            currentAlbum = album,
+                                            consumedCount = 10,
+                                            abandonedCount = 0,
+                                            totalCount = 1101,
+                                        )
+                                ),
+                        ),
+                    onAction = { actions.add(it) },
+                    onShareEntry = {},
+                    onOpenExternalUrl = {},
+                    onOpenDailyAlbumInMusicApp = { openedMusicAlbums.add(it) },
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("home_widget_daily_album").assertExists()
+        composeRule.onNodeWithTag("daily_album_cover").assertExists()
+        composeRule.onNodeWithText("Sample Album").assertExists()
+        composeRule.onNodeWithText("Sample Artist").assertExists()
+        composeRule.onNodeWithText("#11 · 1972", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("ROCK", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithText("1091 LEFT", useUnmergedTree = true).assertExists()
+
+        composeRule.onNodeWithTag("daily_album_play_btn").performScrollTo().performClick()
+        org.junit.Assert.assertEquals(listOf(album), openedMusicAlbums)
+
+        composeRule.onNodeWithTag("daily_album_finish_btn").performScrollTo().performClick()
+        org.junit.Assert.assertEquals(
+            listOf(
+                com.grayvines.roche.ui.MainAction.OpenAlbumNoteDialog(
+                    com.grayvines.roche.ui.AlbumNoteDialogMode.FINISH_AND_RANK
+                )
+            ),
+            actions,
+        )
     }
 
     @Test

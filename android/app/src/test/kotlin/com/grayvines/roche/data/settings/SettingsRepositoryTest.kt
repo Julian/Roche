@@ -1,10 +1,17 @@
+@file:Suppress("LongMethod")
+
 package com.grayvines.roche.data.settings
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
+import com.grayvines.roche.MusicUrlCandidate
+import com.grayvines.roche.MusicUrlResolution
+import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.candidateStreamingUrls
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.selectMusicUrlResolution
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.KeyGenerator
@@ -291,6 +298,155 @@ class SettingsRepositoryTest {
                 val updated = repository.settings.first()
                 assertEquals("cached-token-99", updated.bearerToken)
                 assertEquals(decryptsAfterPrewarm, decryptCount.get())
+            } finally {
+                dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `DailyAlbumSnapshot resolves vendor-neutral candidate streaming URLs`() {
+        val parsed =
+            DailyAlbumSnapshot(
+                entryId = "album-entry-1",
+                name = "Sample Album",
+                artist = "Sample Artist",
+                releaseDate = "1972",
+                imageUrl = "https://i.scdn.co/image/large",
+                thumbnailUrl = "https://i.scdn.co/image/medium",
+                genres = listOf("rock", "folk rock"),
+                albumNumber = 3,
+                totalCount = 1101,
+                remainingCount = 1099,
+                youtubeMusicId = "OLAK5uy_sample_playlist",
+                spotifyId = "spotify_album_123",
+                appleMusicId = "1015739190",
+                tidalId = "49651320",
+                qobuzId = "0075992723961",
+                deezerId = "86605",
+                amazonMusicId = "B001SAMPLE",
+                wikipediaUrl = "https://en.wikipedia.org/wiki/Sample_Album",
+            )
+        assertEquals(
+            "https://music.youtube.com/playlist?list=OLAK5uy_sample_playlist",
+            parsed.youtubeMusicUrl,
+        )
+        assertEquals(
+            "https://music.youtube.com/browse/MPREb_test123",
+            parsed.copy(youtubeMusicId = "MPREb_test123").youtubeMusicUrl,
+        )
+        assertEquals(
+            "https://music.youtube.com/search?q=Sample+Artist+Sample+Album",
+            parsed.copy(youtubeMusicId = null).youtubeMusicUrl,
+        )
+        assertEquals(
+            listOf(
+                "https://music.youtube.com/playlist?list=OLAK5uy_sample_playlist",
+                "https://open.spotify.com/album/spotify_album_123",
+                "https://music.apple.com/album/1015739190",
+                "https://tidal.com/browse/album/49651320",
+                "https://open.qobuz.com/album/0075992723961",
+                "https://www.deezer.com/album/86605",
+                "https://music.amazon.com/albums/B001SAMPLE",
+                "https://music.youtube.com/search?q=Sample+Artist+Sample+Album",
+            ),
+            parsed.candidateStreamingUrls(),
+        )
+    }
+
+    @Test
+    fun `selectMusicUrlResolution filters browsers deduplicates apps and honors user selection`() {
+        val browsers = setOf("com.android.chrome", "org.mozilla.firefox")
+        val chromeMatch =
+            MusicUrlCandidate(
+                packageName = "com.android.chrome",
+                activityName = "com.google.android.apps.chrome.Main",
+                url = "https://music.youtube.com/playlist?list=OLAK5uy_1",
+                isUserSelectedForHost = false,
+            )
+        val ytClientExact =
+            MusicUrlCandidate(
+                packageName = "org.example.ytmusicclient",
+                activityName = "org.example.ytmusicclient.MainActivity",
+                url = "https://music.youtube.com/playlist?list=OLAK5uy_1",
+                isUserSelectedForHost = false,
+            )
+        val ytClientSearch =
+            MusicUrlCandidate(
+                packageName = "org.example.ytmusicclient",
+                activityName = "org.example.ytmusicclient.MainActivity",
+                url = "https://music.youtube.com/search?q=Sample+Artist+Sample+Album",
+                isUserSelectedForHost = false,
+            )
+        val spotifyMatch =
+            MusicUrlCandidate(
+                packageName = "com.spotify.music",
+                activityName = "com.spotify.music.MainActivity",
+                url = "https://open.spotify.com/album/spotify_album_123",
+                isUserSelectedForHost = false,
+            )
+
+        assertEquals(
+            MusicUrlResolution.None,
+            selectMusicUrlResolution(
+                candidates = listOf(chromeMatch),
+                selfPackageName = "com.grayvines.roche",
+                browserPackages = browsers,
+            ),
+        )
+        assertEquals(
+            MusicUrlResolution.SingleTarget(ytClientExact),
+            selectMusicUrlResolution(
+                candidates = listOf(chromeMatch, ytClientExact, ytClientSearch),
+                selfPackageName = "com.grayvines.roche",
+                browserPackages = browsers,
+            ),
+        )
+        assertEquals(
+            MusicUrlResolution.ChooserTargets(listOf(ytClientExact, spotifyMatch)),
+            selectMusicUrlResolution(
+                candidates = listOf(chromeMatch, ytClientExact, ytClientSearch, spotifyMatch),
+                selfPackageName = "com.grayvines.roche",
+                browserPackages = browsers,
+            ),
+        )
+        val selectedClient = ytClientExact.copy(isUserSelectedForHost = true)
+        assertEquals(
+            MusicUrlResolution.SingleTarget(selectedClient),
+            selectMusicUrlResolution(
+                candidates = listOf(selectedClient, spotifyMatch),
+                selfPackageName = "com.grayvines.roche",
+                browserPackages = browsers,
+            ),
+        )
+    }
+
+    @Test
+    fun `SettingsRepository supports optional AppTab LISTS in bottomNavTabs while preserving defaults`() =
+        runTest {
+            assertEquals(
+                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                AppTab.defaultSideTabs,
+            )
+            assertTrue(AppTab.LISTS in AppTab.sideTabCandidates)
+
+            val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            try {
+                val store =
+                    PreferenceDataStoreFactory.create(
+                        scope = dataStoreScope,
+                        produceFile = { File(tempDir, "lists_nav_settings.preferences_pb") },
+                    )
+                val repository = SettingsRepository(store)
+                repository.update {
+                    it.copy(
+                        bottomNavTabs =
+                            listOf(AppTab.HOME, AppTab.LISTS, AppTab.FEEDS, AppTab.SETTINGS)
+                    )
+                }
+                assertEquals(
+                    listOf(AppTab.HOME, AppTab.LISTS, AppTab.FEEDS, AppTab.SETTINGS),
+                    repository.settings.first().bottomNavTabs,
+                )
             } finally {
                 dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
             }

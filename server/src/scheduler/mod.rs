@@ -778,7 +778,7 @@ mod tests {
 
         // If `db.media().create` fails after writing the PDF file to disk, the file is immediately
         // deleted so no orphaned file remains in `media_dir`.
-        sqlx::query("DROP TABLE media").execute(db.pool()).await.unwrap();
+        sqlx::query("DROP TABLE entry_media").execute(db.pool()).await.unwrap();
         let pdf_url = Url::parse("https://example.com/orphan.pdf").unwrap();
         FeedIngester::ingest_item_media(&ctx, "non-existent-item", ContentType::Pdf, &pdf_url)
             .await;

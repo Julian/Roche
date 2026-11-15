@@ -163,4 +163,12 @@ impl<'a> AuthRepo<'a> {
             .await?;
         Ok(res.rows_affected() > 0)
     }
+
+    pub async fn revoke_device_by_token_hash(&self, token_hash: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM device_tokens WHERE token = ?")
+            .bind(token_hash)
+            .execute(self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
 }

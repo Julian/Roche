@@ -61,8 +61,8 @@ pub fn rendezvous_uniform_unit(peer_id: &str, feed_url: &str, epoch: i64) -> f64
     ((top53 as f64) + 0.5) / ((1u64 << 53) as f64)
 }
 
-/// Computes a peer's dynamic polling weight from the work it processed (`feeds_completed`
-/// and `items_processed`) and the wall-clock duration `elapsed_secs`.
+/// Computes a peer's dynamic polling weight from processed work and elapsed wall-clock time.
+///
 /// Before any work is measured (`feeds_completed == 0`), returns `DEFAULT_ONLINE_PEER_WEIGHT` (1.0)
 /// so all online peers start with an equal preliminary allocation.
 #[must_use]
@@ -163,6 +163,7 @@ pub fn select_feed_poller<'a>(
 }
 
 /// Determines whether `local_peer_id` should poll `feed` at `now` given `active_peers`.
+///
 /// Starts with a preliminary allocation proportional to each peer's throughput weight, and
 /// progressively expands `local_peer_id`'s portion on feeds that remain unpolled past their due time.
 #[must_use]

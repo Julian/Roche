@@ -1,3 +1,5 @@
+@file:Suppress("StringLiteralDuplication")
+
 package com.grayvines.roche.data.local
 
 import android.content.Context
@@ -19,8 +21,15 @@ import androidx.sqlite.execSQL
             ItemTagEntity::class,
             PendingMutationEntity::class,
             TombstoneEntity::class,
+            CatalogEntryEntity::class,
+            EntryIdentifierEntity::class,
+            CollectionSpecEntity::class,
+            CollectionEntryEntity::class,
+            CollectionGeneratorEntity::class,
+            ConsumptionLogEntity::class,
+            ComparisonEntity::class,
         ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -135,6 +144,13 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_6_7 =
+            object : Migration(6, 7) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateCatalogSchemaV7(connection)
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(AndroidSQLiteDriver())
@@ -144,8 +160,142 @@ abstract class RocheDatabase : RoomDatabase() {
                     MIGRATION_3_4,
                     MIGRATION_4_5,
                     MIGRATION_5_6,
+                    MIGRATION_6_7,
                 )
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }
+}
+
+internal fun migrateCatalogSchemaV7(connection: SQLiteConnection) {
+    migrateCatalogEntriesV7(connection)
+    migrateCatalogCollectionsV7(connection)
+    migrateCatalogActivityV7(connection)
+}
+
+private fun migrateCatalogEntriesV7(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `catalog_entries` (" +
+            "`id` TEXT NOT NULL, " +
+            "`kind` TEXT NOT NULL, " +
+            "`title` TEXT NOT NULL, " +
+            "`creatorsJson` TEXT NOT NULL, " +
+            "`url` TEXT, " +
+            "`publishedAt` TEXT, " +
+            "`releaseYear` INTEGER, " +
+            "`summary` TEXT, " +
+            "`thumbnailUrl` TEXT, " +
+            "`metadataJson` TEXT NOT NULL, " +
+            "`mergedIntoId` TEXT, " +
+            "`createdAt` TEXT NOT NULL, " +
+            "`updatedAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`id`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_catalog_entries_kind` ON `catalog_entries` (`kind`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_catalog_entries_mergedIntoId` " +
+            "ON `catalog_entries` (`mergedIntoId`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_catalog_entries_updatedAt` " +
+            "ON `catalog_entries` (`updatedAt`)"
+    )
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `entry_identifiers` (" +
+            "`scheme` TEXT NOT NULL, " +
+            "`value` TEXT NOT NULL, " +
+            "`entryId` TEXT NOT NULL, " +
+            "PRIMARY KEY(`scheme`, `value`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_entry_identifiers_entryId` " +
+            "ON `entry_identifiers` (`entryId`)"
+    )
+}
+
+private fun migrateCatalogCollectionsV7(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `collection_specs` (" +
+            "`collectionId` TEXT NOT NULL, " +
+            "`title` TEXT NOT NULL, " +
+            "`summary` TEXT, " +
+            "`slug` TEXT, " +
+            "`mode` TEXT NOT NULL, " +
+            "`role` TEXT NOT NULL, " +
+            "`ruleJson` TEXT, " +
+            "`showInLists` INTEGER NOT NULL, " +
+            "`color` TEXT, " +
+            "`createdAt` TEXT NOT NULL, " +
+            "`updatedAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`collectionId`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_collection_specs_slug` ON `collection_specs` (`slug`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_collection_specs_role` ON `collection_specs` (`role`)"
+    )
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `collection_entries` (" +
+            "`collectionId` TEXT NOT NULL, " +
+            "`entryId` TEXT NOT NULL, " +
+            "`position` REAL, " +
+            "`addedAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`collectionId`, `entryId`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_collection_entries_entryId` " +
+            "ON `collection_entries` (`entryId`)"
+    )
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `collection_generators` (" +
+            "`collectionId` TEXT NOT NULL, " +
+            "`enabled` INTEGER NOT NULL, " +
+            "`currentEntryId` TEXT, " +
+            "`drawnAt` TEXT, " +
+            "`updatedAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`collectionId`))"
+    )
+}
+
+private fun migrateCatalogActivityV7(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `consumption_log` (" +
+            "`id` TEXT NOT NULL, " +
+            "`entryId` TEXT NOT NULL, " +
+            "`ts` TEXT NOT NULL, " +
+            "`status` TEXT NOT NULL, " +
+            "`notes` TEXT, " +
+            "`createdAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`id`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_consumption_log_entryId` " +
+            "ON `consumption_log` (`entryId`)"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_consumption_log_ts` ON `consumption_log` (`ts`)"
+    )
+    connection.execSQL(
+        "CREATE TABLE IF NOT EXISTS `comparisons` (" +
+            "`id` TEXT NOT NULL, " +
+            "`ts` TEXT NOT NULL, " +
+            "`scopeCollectionId` TEXT, " +
+            "`orderingJson` TEXT NOT NULL, " +
+            "`createdAt` TEXT NOT NULL, " +
+            "`isLocalDirty` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`id`))"
+    )
+    connection.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_comparisons_scopeCollectionId` " +
+            "ON `comparisons` (`scopeCollectionId`)"
+    )
+    connection.execSQL("CREATE INDEX IF NOT EXISTS `index_comparisons_ts` ON `comparisons` (`ts`)")
 }

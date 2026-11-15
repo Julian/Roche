@@ -45,6 +45,9 @@ class AppGraph(context: Context) {
             cacheDir = offlineCacheDir,
             networkTierProvider = networkTierProvider,
             backgroundScope = appScope,
+            poolStreamProvider = {
+                runCatching { appContext.assets.open("albums_1001_pool.json") }.getOrNull()
+            },
         )
     }
 

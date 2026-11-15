@@ -79,6 +79,9 @@ class MainActivity : ComponentActivity() {
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
                         onMoveTaskToBack = { moveTaskToBack(true) },
+                        onOpenDailyAlbumInMusicApp = { album ->
+                            openAlbumInMusicApp(this, album, ::openUrlInBrowser)
+                        },
                     )
                 }
             }

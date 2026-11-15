@@ -54,7 +54,74 @@ pub fn deterministic_item_id(feed_url: Option<&str>, item_url: &str) -> String {
     deterministic_entity_uuid("item", &item_natural_key(feed_url, item_url))
 }
 
+pub const STARRED_COLLECTION_ID: &str = "533b1315-6e2e-57d3-ba85-dc88531c5a0b";
+pub const UP_NEXT_COLLECTION_ID: &str = "3864ff37-5ed3-5256-9380-f85ff8054f1c";
+pub const ALBUMS_1001_COLLECTION_ID: &str = "9eb44de7-bdfb-5bea-85d1-be913c542d8b";
+
 #[must_use]
 pub fn deterministic_tag_id(name: &str) -> String {
     deterministic_entity_uuid("tag", &tag_natural_key(name))
+}
+
+#[must_use]
+pub fn deterministic_system_collection_id(slug: &str) -> String {
+    deterministic_entity_uuid("system_collection", &slug.trim().to_lowercase())
+}
+
+#[must_use]
+pub fn deterministic_catalog_entry_id(kind: &str, scheme: &str, value: &str) -> String {
+    let key = format!(
+        "{}\0{}\0{}",
+        kind.trim().to_lowercase(),
+        scheme.trim().to_lowercase(),
+        value.trim()
+    );
+    deterministic_entity_uuid("entry", &key)
+}
+
+#[must_use]
+pub fn deterministic_title_entry_id(kind: &str, title: &str) -> String {
+    let key = format!("{}\0{}", kind.trim().to_lowercase(), title.trim().to_lowercase());
+    deterministic_entity_uuid("entry_title", &key)
+}
+
+#[must_use]
+pub fn deterministic_enclosure_media_id(entry_id: &str) -> String {
+    format!("enclosure:{}", entry_id.trim())
+}
+
+#[must_use]
+pub fn deterministic_consumption_log_id(entry_id: &str, ts_millis: i64, status: &str) -> String {
+    let key = format!("{}\0{ts_millis}\0{}", entry_id.trim(), status.trim().to_lowercase());
+    deterministic_entity_uuid("consumption_log", &key)
+}
+
+#[must_use]
+pub fn canonical_ordering_json(ordering: &[Vec<String>]) -> String {
+    let normalized: Vec<Vec<String>> = ordering
+        .iter()
+        .map(|group| {
+            let mut sorted: Vec<String> = group.iter().map(|s| s.trim().to_owned()).collect();
+            sorted.sort();
+            sorted
+        })
+        .collect();
+    serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_owned())
+}
+
+#[must_use]
+pub fn deterministic_comparison_id(
+    scope_collection_id: Option<&str>,
+    ts_millis: i64,
+    ordering: &[Vec<String>],
+) -> String {
+    let scope_key =
+        scope_collection_id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("global");
+    let ord_json = canonical_ordering_json(ordering);
+    deterministic_entity_uuid("comparison", &format!("{scope_key}\0{ts_millis}\0{ord_json}"))
+}
+
+#[must_use]
+pub fn collection_entry_natural_key(collection_id: &str, entry_id: &str) -> String {
+    format!("{}\0{}", collection_id.trim(), entry_id.trim())
 }

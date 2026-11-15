@@ -27,7 +27,15 @@ pub(super) async fn media_get<F: FeedFetcher>(
     ProblemPath(id): ProblemPath<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let stream = service.media().open_stream(&id).await?;
+    serve_media_stream(&service, &id, &headers).await
+}
+
+pub async fn serve_media_stream<F: FeedFetcher>(
+    service: &RocheService<F>,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let stream = service.media().open_stream(id).await?;
     let disposition = format!("inline; filename=\"{}\"", stream.filename);
 
     if let Some(range_val) = headers.get(header::RANGE) {
