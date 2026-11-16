@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE device_tokens SET last_used_at = ? WHERE token = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "82411a76af500d27ae406c5579fa3bdf4d31439ded7b020fd7caf037db046274"
+}

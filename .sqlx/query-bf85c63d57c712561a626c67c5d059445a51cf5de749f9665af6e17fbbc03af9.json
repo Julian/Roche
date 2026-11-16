@@ -1,0 +1,45 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id,\n                    COALESCE(e.url, '') AS \"url!: String\",\n                    e.summary AS \"summary!: String\"\n             FROM entries e\n             LEFT JOIN entry_content ec ON ec.entry_id = e.id\n             WHERE e.summary IS NOT NULL\n               AND (\n                 length(e.summary) > 320\n                 OR (\n                   (ec.content_html IS NULL OR ec.content_html = '' OR e.summary = ec.content_html)\n                   AND (e.summary LIKE '%<%' OR e.summary LIKE '%&%;%')\n                 )\n               )",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "url!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "name": "summary!: String",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "summary"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "bf85c63d57c712561a626c67c5d059445a51cf5de749f9665af6e17fbbc03af9"
+}

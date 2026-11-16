@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT m.id,\n                    m.entry_id AS item_id,\n                    m.media_type AS \"media_type: MediaType\",\n                    m.local_path AS \"path!: String\",\n                    m.file_size,\n                    m.duration\n             FROM entry_media m\n             WHERE m.local_path IS NOT NULL\n               AND EXISTS (\n                   SELECT 1 FROM collection_entries ce\n                   WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?\n               )\n               AND NOT EXISTS (\n                   SELECT 1 FROM collection_entries ce2\n                   WHERE ce2.entry_id = m.entry_id\n                     AND ce2.collection_id != ?\n                     AND (\n                         ce2.collection_id = ?\n                         OR EXISTS (\n                             SELECT 1 FROM feed_sources fs2\n                             WHERE fs2.collection_id = ce2.collection_id\n                         )\n                     )\n               )",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "item_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "entry_id"
+          }
+        }
+      },
+      {
+        "name": "media_type: MediaType",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "media_type"
+          }
+        }
+      },
+      {
+        "name": "path!: String",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "local_path"
+          }
+        }
+      },
+      {
+        "name": "file_size",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "file_size"
+          }
+        }
+      },
+      {
+        "name": "duration",
+        "ordinal": 5,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "duration"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "ec43b3dcfd5cade5382c8ac2135539a0f68c00a6ecff7ab1bcec6ff054ece9cf"
+}

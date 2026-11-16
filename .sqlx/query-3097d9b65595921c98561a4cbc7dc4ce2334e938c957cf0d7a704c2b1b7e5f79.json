@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT DISTINCT entry_id AS \"entry_id!: String\" FROM entry_media WHERE local_path IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "entry_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3097d9b65595921c98561a4cbc7dc4ce2334e938c957cf0d7a704c2b1b7e5f79"
+}

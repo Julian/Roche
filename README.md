@@ -7,8 +7,8 @@ Track RSS/Atom blogs, arXiv papers, podcast episodes, YouTube subscriptions, boo
 ## Overview & Capabilities
 
 - **Stack**:
-  - **Server & CLI (`server/`)**: Rust 2024 (`axum`, `sqlx` SQLite WAL + FTS5, embedded SSR + ES2022 PJAX Web UI, interactive terminal TUI, and background feed/media workers).
-  - **Android (`android/`)**: Local-first Kotlin client (`Jetpack Compose`, `Room 3`, `AndroidX Media3` `ExoPlayer` + `MediaSessionService` background audio with real silence-skipping, cooperative HRW feed polling, and bidirectional peer sync).
+  - **Server & CLI (`server/`)**: Rust 2024 (`axum`, `sqlx` compile-time checked queries over `STRICT` SQLite WAL + FTS5 tables, embedded SSR + ES2022 PJAX Web UI, `ratatui` + `crossterm` terminal TUI, and background feed/media workers).
+  - **Android (`android/`)**: Local-first Kotlin client (`Jetpack Compose`, `Navigation 3` with predictive back, `Room 3` + bundled SQLite FTS5, platform `HttpEngine` HTTP/2+HTTP/3 transport, `ImageDecoder` hardware bitmaps, `AndroidX Media3` `ExoPlayer` + `MediaSessionService` background audio with silence-skipping, cooperative HRW feed polling, and bidirectional peer sync).
 - **Unified Media Catalog & Dual Ranking Model**:
   - **Shared Entry Graph**: Feed items, saved articles/PDFs/videos/episodes, manual media logs (`album`, `book`, `movie`, `tv`, `song`), and collections share a unified entry & scheme-normalized identifier space (`spotify`, `1001albums`, `imdb`, `wikipedia`, `url`, `feed_url`, `slug`) with tombstone-aware deduplication and merge convergence across peers.
   - **Global Quality vs Local Priority**: Pairwise comparisons on consumed works update global quality ratings via **Expectation Propagation (EP)** (`S`/`A`/`B`/`C`/`D` tiers + `0–10` scores) that propagate across dynamic/manual lists, whereas comparisons inside `want:*` queues stay strictly local (`scope_collection_id`) for priority ordering.

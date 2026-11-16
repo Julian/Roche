@@ -16,7 +16,7 @@ use super::{
 };
 use crate::db::{
     sync::{SyncRepo, collection_entry_natural_key, deterministic_title_entry_id},
-    types::{ActivityAction, ActivityEntityType, CollectionMode, EntryKind},
+    types::{ActivityAction, ActivityEntityType, CollectionMode, ConsumptionStatus, EntryKind},
 };
 
 impl CatalogRepo<'_> {
@@ -25,12 +25,19 @@ impl CatalogRepo<'_> {
         let Some(target_id) = canonical_id else {
             return Ok(None);
         };
-        let row: Option<RawEntryRow> = sqlx::query_as(
-            "SELECT id, kind, title, creators_json, url, published_at, release_year, summary,
-                    thumbnail_url, metadata_json, merged_into_id, created_at, updated_at
-             FROM entries WHERE id = ? AND merged_into_id IS NULL",
+        let row = sqlx::query_as!(
+            RawEntryRow,
+            r#"SELECT id as "id!", kind as "kind!: EntryKind", title as "title!",
+                      creators_json as "creators_json!", url as "url?",
+                      published_at as "published_at?: DateTime<Utc>",
+                      release_year as "release_year?: i32", summary as "summary?",
+                      thumbnail_url as "thumbnail_url?", metadata_json as "metadata_json!",
+                      merged_into_id as "merged_into_id?",
+                      created_at as "created_at!: DateTime<Utc>",
+                      updated_at as "updated_at!: DateTime<Utc>"
+               FROM entries WHERE id = ? AND merged_into_id IS NULL"#,
+            &target_id,
         )
-        .bind(&target_id)
         .fetch_optional(self.pool)
         .await?;
         let Some(raw) = row else {
@@ -44,42 +51,59 @@ impl CatalogRepo<'_> {
         let Some(entry) = self.get_entry(id).await? else {
             return Ok(None);
         };
-        let child_rows: Vec<RawEntryRow> = sqlx::query_as(
-            "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year,
-                    e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, e.updated_at
-             FROM collection_entries ce
-             JOIN entries e ON e.id = ce.entry_id
-             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-             ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC",
+        let child_rows = sqlx::query_as!(
+            RawEntryRow,
+            r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
+                      e.creators_json as "creators_json!", e.url as "url?",
+                      e.published_at as "published_at?: DateTime<Utc>",
+                      e.release_year as "release_year?: i32", e.summary as "summary?",
+                      e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
+                      e.merged_into_id as "merged_into_id?",
+                      e.created_at as "created_at!: DateTime<Utc>",
+                      e.updated_at as "updated_at!: DateTime<Utc>"
+               FROM collection_entries ce
+               JOIN entries e ON e.id = ce.entry_id
+               WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+               ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC"#,
+            &entry.id,
         )
-        .bind(&entry.id)
         .fetch_all(self.pool)
         .await?;
         let children = self.hydrate_entries(child_rows).await?;
 
-        let parent_rows: Vec<RawEntryRow> = sqlx::query_as(
-            "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year,
-                    e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, e.updated_at
-             FROM collection_entries ce
-             JOIN entries e ON e.id = ce.collection_id
-             LEFT JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE ce.entry_id = ?
-               AND e.merged_into_id IS NULL
-               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'tag'))
-             ORDER BY LOWER(e.title) ASC",
+        let parent_rows = sqlx::query_as!(
+            RawEntryRow,
+            r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
+                      e.creators_json as "creators_json!", e.url as "url?",
+                      e.published_at as "published_at?: DateTime<Utc>",
+                      e.release_year as "release_year?: i32", e.summary as "summary?",
+                      e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
+                      e.merged_into_id as "merged_into_id?",
+                      e.created_at as "created_at!: DateTime<Utc>",
+                      e.updated_at as "updated_at!: DateTime<Utc>"
+               FROM collection_entries ce
+               JOIN entries e ON e.id = ce.collection_id
+               LEFT JOIN collection_specs cs ON cs.collection_id = e.id
+               WHERE ce.entry_id = ?
+                 AND e.merged_into_id IS NULL
+                 AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'tag'))
+               ORDER BY LOWER(e.title) ASC"#,
+            &entry.id,
         )
-        .bind(&entry.id)
         .fetch_all(self.pool)
         .await?;
         let parents = self.hydrate_entries(parent_rows).await?;
 
-        let log_history: Vec<ConsumptionLogRow> = sqlx::query_as(
-            "SELECT id, entry_id, ts, status, notes, created_at
-             FROM consumption_log
-             WHERE entry_id = ?
-             ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC",
+        let log_history = sqlx::query_as!(
+            ConsumptionLogRow,
+            r#"SELECT id as "id!", entry_id as "entry_id!", ts as "ts!: DateTime<Utc>",
+                      status as "status!: ConsumptionStatus", notes as "notes?",
+                      created_at as "created_at!: DateTime<Utc>"
+               FROM consumption_log
+               WHERE entry_id = ?
+               ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC"#,
+            &entry.id,
         )
-        .bind(&entry.id)
         .fetch_all(self.pool)
         .await?;
 
@@ -139,19 +163,19 @@ impl CatalogRepo<'_> {
 
         // Fold titles with Rust's full Unicode `.to_lowercase()` rather than SQLite's ASCII-only
         // `LOWER()` so non-ASCII artists (e.g. `"Édith Piaf"`, `"Ólafur Arnalds"`) match reliably.
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT title, id FROM entries
-             WHERE kind = 'artist' AND merged_into_id IS NULL
-             ORDER BY updated_at DESC",
+        let rows = sqlx::query!(
+            r#"SELECT title as "title!", id as "id!" FROM entries
+               WHERE kind = 'artist' AND merged_into_id IS NULL
+               ORDER BY updated_at DESC"#,
         )
         .fetch_all(self.pool)
         .await?;
 
         let mut out = HashMap::with_capacity(seen.len());
-        for (title, id) in rows {
-            let lower_title = title.trim().to_lowercase();
+        for row in rows {
+            let lower_title = row.title.trim().to_lowercase();
             if seen.contains(&lower_title) {
-                out.entry(lower_title).or_insert(id);
+                out.entry(lower_title).or_insert(row.id);
             }
         }
         Ok(out)
@@ -174,11 +198,11 @@ impl CatalogRepo<'_> {
             && kind.is_none_or(|k| by_id.kind == k)
         {
             if let Some(col_id) = only_collection_id {
-                let in_col: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+                let in_col = sqlx::query_scalar!(
+                    r#"SELECT 1 as "found!: i64" FROM collection_entries WHERE collection_id = ? AND entry_id = ?"#,
+                    col_id,
+                    &by_id.id,
                 )
-                .bind(col_id)
-                .bind(&by_id.id)
                 .fetch_optional(self.pool)
                 .await?;
                 if in_col.is_some() {
@@ -341,24 +365,25 @@ impl CatalogRepo<'_> {
         // 2. Upfront deduplication across all normalized identifiers (walking merged chains)
         if matched_id.is_none() {
             for ident in &normalized_idents {
-                let raw_owner: Option<String> = sqlx::query_scalar(
-                    "SELECT entry_id FROM entry_identifiers
-                     WHERE scheme = ? AND value = ?
-                     LIMIT 1",
+                let raw_owner = sqlx::query_scalar!(
+                    r#"SELECT entry_id as "entry_id!" FROM entry_identifiers
+                       WHERE scheme = ? AND value = ?
+                       LIMIT 1"#,
+                    &ident.scheme,
+                    &ident.value,
                 )
-                .bind(&ident.scheme)
-                .bind(&ident.value)
                 .fetch_optional(&mut *tx)
                 .await?;
                 if let Some(owner_id) = raw_owner
                     && let Some(canon_owner) = Self::follow_merged_id_in_tx(tx, &owner_id).await?
                 {
                     // Avoid colliding a podcast episode with a podcast/feed when both mention feed_url
-                    let owner_kind: Option<EntryKind> =
-                        sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
-                            .bind(&canon_owner)
-                            .fetch_optional(&mut *tx)
-                            .await?;
+                    let owner_kind = sqlx::query_scalar!(
+                        r#"SELECT kind as "kind!: EntryKind" FROM entries WHERE id = ?"#,
+                        &canon_owner,
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await?;
                     let compatible = match owner_kind {
                         Some(ok) if ident.scheme == "feed_url" => ok == kind,
                         Some(_) => true,
@@ -379,25 +404,25 @@ impl CatalogRepo<'_> {
         {
             let target_artist = primary_artist.to_lowercase();
             let target_stripped = strip_album_edition_suffix(title).to_lowercase();
-            let existing_albums: Vec<(String, String, String)> = sqlx::query_as(
-                "SELECT id, title, creators_json
-                 FROM entries
-                 WHERE kind = 'album' AND merged_into_id IS NULL",
+            let existing_albums = sqlx::query!(
+                r#"SELECT id as "id!", title as "title!", creators_json as "creators_json!"
+                   FROM entries
+                   WHERE kind = 'album' AND merged_into_id IS NULL"#,
             )
             .fetch_all(&mut *tx)
             .await?;
-            for (cand_id, cand_title, cand_creators_json) in existing_albums {
+            for cand in existing_albums {
                 let cand_creators: Vec<String> =
-                    serde_json::from_str(&cand_creators_json).unwrap_or_default();
+                    serde_json::from_str(&cand.creators_json).unwrap_or_default();
                 let same_artist = cand_creators
                     .first()
                     .map(|a| a.trim())
                     .filter(|a| !a.is_empty())
                     .is_some_and(|a| a.to_lowercase() == target_artist);
                 if same_artist
-                    && strip_album_edition_suffix(&cand_title).to_lowercase() == target_stripped
+                    && strip_album_edition_suffix(&cand.title).to_lowercase() == target_stripped
                 {
-                    matched_id = Some(cand_id);
+                    matched_id = Some(cand.id);
                     break;
                 }
             }
@@ -405,12 +430,12 @@ impl CatalogRepo<'_> {
 
         // 4. Exact title match for Artists when creators/identifiers are absent
         if matched_id.is_none() && kind == EntryKind::Artist {
-            matched_id = sqlx::query_scalar(
-                "SELECT id FROM entries
-                 WHERE kind = 'artist' AND merged_into_id IS NULL AND LOWER(title) = LOWER(?)
-                 LIMIT 1",
+            matched_id = sqlx::query_scalar!(
+                r#"SELECT id as "id!" FROM entries
+                   WHERE kind = 'artist' AND merged_into_id IS NULL AND LOWER(title) = LOWER(?)
+                   LIMIT 1"#,
+                title,
             )
-            .bind(title)
             .fetch_optional(&mut *tx)
             .await?;
         }
@@ -423,22 +448,22 @@ impl CatalogRepo<'_> {
                 Self::follow_merged_id_in_tx(tx, parent_id).await?.ok_or_else(|| {
                     CatalogError::NotFound(format!("Parent collection '{parent_id}'"))
                 })?;
-            let spec_row: Option<(String, CollectionMode)> = sqlx::query_as(
-                "SELECT e.title, cs.mode
-                 FROM collection_specs cs
-                 JOIN entries e ON e.id = cs.collection_id
-                 WHERE cs.collection_id = ?
-                 LIMIT 1",
+            let spec_row = sqlx::query!(
+                r#"SELECT e.title as "title!", cs.mode as "mode!: CollectionMode"
+                   FROM collection_specs cs
+                   JOIN entries e ON e.id = cs.collection_id
+                   WHERE cs.collection_id = ?
+                   LIMIT 1"#,
+                &canon_parent,
             )
-            .bind(&canon_parent)
             .fetch_optional(&mut *tx)
             .await?;
-            if let Some((parent_title, parent_mode)) = spec_row
-                && parent_mode != CollectionMode::Manual
+            if let Some(spec) = spec_row
+                && spec.mode != CollectionMode::Manual
             {
                 return Err(CatalogError::ImmutableCollection {
-                    title: parent_title,
-                    mode: parent_mode,
+                    title: spec.title,
+                    mode: spec.mode,
                 });
             }
             Some(canon_parent)
@@ -454,14 +479,18 @@ impl CatalogRepo<'_> {
             .filter(|v| v.is_object())
             .and_then(|v| serde_json::to_string(v).ok())
             .unwrap_or_else(|| "{}".to_owned());
+        let clean_url_ref = clean_url.as_deref();
+        let clean_summary = input.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let clean_thumb = input.thumbnail_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
         let (final_id, activity_action) = if let Some(existing_id) = matched_id {
             let clean_existing_title = if kind == EntryKind::Album {
-                let current_title: String =
-                    sqlx::query_scalar("SELECT title FROM entries WHERE id = ?")
-                        .bind(&existing_id)
-                        .fetch_one(&mut *tx)
-                        .await?;
+                let current_title = sqlx::query_scalar!(
+                    r#"SELECT title as "title!" FROM entries WHERE id = ?"#,
+                    &existing_id,
+                )
+                .fetch_one(&mut *tx)
+                .await?;
                 let cur_stripped = strip_album_edition_suffix(&current_title);
                 let inc_stripped = strip_album_edition_suffix(title);
                 if current_title.len() > cur_stripped.len() && title.len() == inc_stripped.len() {
@@ -473,7 +502,7 @@ impl CatalogRepo<'_> {
                 None
             };
 
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE entries
                  SET title = COALESCE(?, title),
                      creators_json = CASE WHEN creators_json = '[]' AND ? != '[]' THEN ? ELSE creators_json END,
@@ -485,19 +514,19 @@ impl CatalogRepo<'_> {
                      metadata_json = CASE WHEN metadata_json = '{}' AND ? != '{}' THEN ? ELSE metadata_json END,
                      updated_at = ?
                  WHERE id = ?",
+                clean_existing_title,
+                &creators_json,
+                &creators_json,
+                clean_url_ref,
+                input.published_at as _,
+                input.release_year as _,
+                clean_summary,
+                clean_thumb,
+                &metadata_json,
+                &metadata_json,
+                now as _,
+                &existing_id,
             )
-            .bind(clean_existing_title)
-            .bind(&creators_json)
-            .bind(&creators_json)
-            .bind(&clean_url)
-            .bind(input.published_at)
-            .bind(input.release_year)
-            .bind(input.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-            .bind(input.thumbnail_url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-            .bind(&metadata_json)
-            .bind(&metadata_json)
-            .bind(now)
-            .bind(&existing_id)
             .execute(&mut *tx)
             .await?;
 
@@ -513,24 +542,24 @@ impl CatalogRepo<'_> {
             if let Some(found_det) = Self::follow_merged_id_in_tx(tx, &det_id).await? {
                 (found_det, ActivityAction::Update)
             } else {
-                sqlx::query(
+                sqlx::query!(
                     "INSERT INTO entries
                      (id, kind, title, creators_json, url, published_at, release_year, summary,
                       thumbnail_url, metadata_json, created_at, updated_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &det_id,
+                    kind as _,
+                    title,
+                    &creators_json,
+                    clean_url_ref,
+                    input.published_at as _,
+                    input.release_year as _,
+                    clean_summary,
+                    clean_thumb,
+                    &metadata_json,
+                    now as _,
+                    now as _,
                 )
-                .bind(&det_id)
-                .bind(kind)
-                .bind(title)
-                .bind(&creators_json)
-                .bind(&clean_url)
-                .bind(input.published_at)
-                .bind(input.release_year)
-                .bind(input.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-                .bind(input.thumbnail_url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-                .bind(&metadata_json)
-                .bind(now)
-                .bind(now)
                 .execute(&mut *tx)
                 .await?;
                 (det_id, ActivityAction::Create)
@@ -538,13 +567,13 @@ impl CatalogRepo<'_> {
         };
 
         for ident in &normalized_idents {
-            sqlx::query(
+            sqlx::query!(
                 "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
                  VALUES (?, ?, ?)",
+                &ident.scheme,
+                &ident.value,
+                &final_id,
             )
-            .bind(&ident.scheme)
-            .bind(&ident.value)
-            .bind(&final_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -562,16 +591,16 @@ impl CatalogRepo<'_> {
             }
             let nat_key = collection_entry_natural_key(&canon_parent, &final_id);
             SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT(collection_id, entry_id) DO UPDATE SET
                     position = COALESCE(excluded.position, collection_entries.position)",
+                &canon_parent,
+                &final_id,
+                input.parent_position,
+                now as _,
             )
-            .bind(&canon_parent)
-            .bind(&final_id)
-            .bind(input.parent_position)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
             SyncRepo::record_activity(
@@ -588,13 +617,13 @@ impl CatalogRepo<'_> {
         if matches!(kind, EntryKind::Album | EntryKind::Song) {
             for creator in &clean_creators {
                 let artist_id = Self::ensure_artist_entry_in_tx(tx, creator, now).await?;
-                sqlx::query(
+                sqlx::query!(
                     "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
                      VALUES (?, ?, ?)",
+                    &artist_id,
+                    &final_id,
+                    now as _,
                 )
-                .bind(&artist_id)
-                .bind(&final_id)
-                .bind(now)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -614,30 +643,30 @@ impl CatalogRepo<'_> {
         let trimmed = artist_name.trim();
         let lower_name = trimmed.to_lowercase();
         let det_artist_id = deterministic_title_entry_id("artist", &lower_name);
-        if let Some(existing) = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM entries
-             WHERE kind = 'artist' AND merged_into_id IS NULL
-               AND (id = ? OR LOWER(title) = LOWER(?))
-             LIMIT 1",
+        if let Some(existing) = sqlx::query_scalar!(
+            r#"SELECT id as "id!" FROM entries
+               WHERE kind = 'artist' AND merged_into_id IS NULL
+                 AND (id = ? OR LOWER(title) = LOWER(?))
+               LIMIT 1"#,
+            &det_artist_id,
+            trimmed,
         )
-        .bind(&det_artist_id)
-        .bind(trimmed)
         .fetch_optional(&mut *tx)
         .await?
         {
             return Ok(existing);
         }
         if !trimmed.is_ascii() {
-            let artist_rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT id, title FROM entries
-                 WHERE kind = 'artist' AND merged_into_id IS NULL
-                 ORDER BY updated_at DESC",
+            let artist_rows = sqlx::query!(
+                r#"SELECT id as "id!", title as "title!" FROM entries
+                   WHERE kind = 'artist' AND merged_into_id IS NULL
+                   ORDER BY updated_at DESC"#,
             )
             .fetch_all(&mut *tx)
             .await?;
-            for (id, title) in artist_rows {
-                if title.trim().to_lowercase() == lower_name {
-                    return Ok(id);
+            for row in artist_rows {
+                if row.title.trim().to_lowercase() == lower_name {
+                    return Ok(row.id);
                 }
             }
         }
@@ -648,14 +677,14 @@ impl CatalogRepo<'_> {
             return Ok(canon_artist_id);
         }
 
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
              VALUES (?, 'artist', ?, ?, ?)",
+            &det_artist_id,
+            trimmed,
+            now as _,
+            now as _,
         )
-        .bind(&det_artist_id)
-        .bind(trimmed)
-        .bind(now)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         if res.rows_affected() > 0 {
@@ -685,15 +714,18 @@ impl CatalogRepo<'_> {
             return Ok(None);
         }
         for _ in 0..8 {
-            let row: Option<(String, Option<String>)> =
-                sqlx::query_as("SELECT id, merged_into_id FROM entries WHERE id = ?")
-                    .bind(&cur)
-                    .fetch_optional(&mut *conn)
-                    .await?;
+            let row = sqlx::query!(
+                r#"SELECT id as "id!", merged_into_id as "merged_into_id?" FROM entries WHERE id = ?"#,
+                &cur,
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
             match row {
                 None => return Ok(None),
-                Some((found_id, None)) => return Ok(Some(found_id)),
-                Some((_, Some(next_id))) => cur = next_id,
+                Some(r) => match r.merged_into_id {
+                    None => return Ok(Some(r.id)),
+                    Some(next_id) => cur = next_id,
+                },
             }
         }
         Ok(Some(cur))
@@ -703,12 +735,13 @@ impl CatalogRepo<'_> {
         &self,
         entry_id: &str,
     ) -> CatalogResult<Vec<EntryIdentifier>> {
-        Ok(sqlx::query_as::<_, EntryIdentifier>(
-            "SELECT scheme, value FROM entry_identifiers
-             WHERE entry_id = ?
-             ORDER BY scheme ASC, value ASC",
+        Ok(sqlx::query_as!(
+            EntryIdentifier,
+            r#"SELECT scheme as "scheme!", value as "value!" FROM entry_identifiers
+               WHERE entry_id = ?
+               ORDER BY scheme ASC, value ASC"#,
+            entry_id,
         )
-        .bind(entry_id)
         .fetch_all(self.pool)
         .await?)
     }

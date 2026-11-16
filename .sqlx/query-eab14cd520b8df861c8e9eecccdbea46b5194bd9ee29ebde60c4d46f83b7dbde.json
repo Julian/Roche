@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE collection_specs SET color = ? WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "eab14cd520b8df861c8e9eecccdbea46b5194bd9ee29ebde60c4d46f83b7dbde"
+}

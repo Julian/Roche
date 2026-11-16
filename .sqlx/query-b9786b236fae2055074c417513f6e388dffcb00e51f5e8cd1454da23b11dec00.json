@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries (id, kind, title, url, release_year, summary)\n             VALUES ('strict-entry-1', 'article', 'Strict Migration Essay',\n                     'https://example.com/strict-1', 2026, 'Verifying rowid FTS alignment')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "b9786b236fae2055074c417513f6e388dffcb00e51f5e8cd1454da23b11dec00"
+}

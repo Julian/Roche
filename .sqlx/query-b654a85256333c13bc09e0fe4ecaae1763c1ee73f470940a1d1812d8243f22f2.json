@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE feed_sources SET poll_interval = ? WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b654a85256333c13bc09e0fe4ecaae1763c1ee73f470940a1d1812d8243f22f2"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entries_fts",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "cef8582de80b6c5d400215410a370565736e57bb773a4c2e03bb0ca3c6eb0074"
+}

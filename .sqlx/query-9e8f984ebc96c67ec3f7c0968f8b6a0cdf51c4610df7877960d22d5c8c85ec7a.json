@@ -1,0 +1,45 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id as \"id!\", e.creators_json as \"creators_json!\",\n                      MIN(cl.ts) as \"first_ts!: DateTime<Utc>\"\n               FROM entries e\n               JOIN consumption_log cl ON cl.entry_id = e.id AND cl.status = 'consumed'\n               WHERE e.kind IN ('album', 'song') AND e.merged_into_id IS NULL\n               GROUP BY e.id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "creators_json!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "creators_json"
+          }
+        }
+      },
+      {
+        "name": "first_ts!: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "9e8f984ebc96c67ec3f7c0968f8b6a0cdf51c4610df7877960d22d5c8c85ec7a"
+}

@@ -8,7 +8,7 @@ import androidx.room3.Room
 import androidx.room3.RoomDatabase
 import androidx.room3.migration.Migration
 import androidx.sqlite.SQLiteConnection
-import androidx.sqlite.driver.AndroidSQLiteDriver
+import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
 
 @Database(
@@ -17,6 +17,8 @@ import androidx.sqlite.execSQL
             FeedEntity::class,
             ItemEntity::class,
             ItemContentEntity::class,
+            ItemFtsEntity::class,
+            ItemContentFtsEntity::class,
             TagEntity::class,
             ItemTagEntity::class,
             PendingMutationEntity::class,
@@ -30,7 +32,7 @@ import androidx.sqlite.execSQL
             ComparisonEntity::class,
             LocalSyncFlagEntity::class,
         ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -159,9 +161,23 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_8_9 =
+            object : Migration(8, 9) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateItemsFtsSchemaV9(connection)
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
-                .setDriver(AndroidSQLiteDriver())
+                .setDriver(BundledSQLiteDriver())
+                .addCallback(
+                    object : Callback() {
+                        override suspend fun onOpen(connection: SQLiteConnection) {
+                            connection.execSQL("PRAGMA recursive_triggers = ON")
+                        }
+                    }
+                )
                 .addMigrations(
                     MIGRATION_1_2,
                     MIGRATION_2_3,
@@ -170,10 +186,85 @@ abstract class RocheDatabase : RoomDatabase() {
                     MIGRATION_5_6,
                     MIGRATION_6_7,
                     MIGRATION_7_8,
+                    MIGRATION_8_9,
                 )
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
     }
+}
+
+internal fun migrateItemsFtsSchemaV9(connection: SQLiteConnection) {
+    connection.execSQL("DROP TABLE IF EXISTS `items_fts`")
+    connection.execSQL("DROP TABLE IF EXISTS `item_contents_fts`")
+    createItemsFtsV9(connection)
+    createItemContentsFtsV9(connection)
+    connection.execSQL("INSERT INTO `items_fts`(`items_fts`) VALUES('rebuild')")
+    connection.execSQL("INSERT INTO `item_contents_fts`(`item_contents_fts`) VALUES('rebuild')")
+}
+
+private fun createItemsFtsV9(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS `items_fts` USING FTS5(" +
+            "`title`, `feedTitle`, `author`, `url`, " +
+            "`summary`, `contentText`, `contentHtml`, " +
+            "tokenize=`unicode61`, content=`items`)"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_items_fts_BEFORE_UPDATE " +
+            "BEFORE UPDATE ON `items` BEGIN " +
+            "DELETE FROM `items_fts` WHERE `rowid`=OLD.`rowid`; END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_items_fts_BEFORE_DELETE " +
+            "BEFORE DELETE ON `items` BEGIN " +
+            "DELETE FROM `items_fts` WHERE `rowid`=OLD.`rowid`; END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_items_fts_AFTER_UPDATE " +
+            "AFTER UPDATE ON `items` BEGIN " +
+            "INSERT INTO `items_fts`(`rowid`, `title`, `feedTitle`, `author`, `url`, " +
+            "`summary`, `contentText`, `contentHtml`) VALUES (" +
+            "NEW.`rowid`, NEW.`title`, NEW.`feedTitle`, NEW.`author`, NEW.`url`, " +
+            "NEW.`summary`, NEW.`contentText`, NEW.`contentHtml`); END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_items_fts_AFTER_INSERT " +
+            "AFTER INSERT ON `items` BEGIN " +
+            "INSERT INTO `items_fts`(`rowid`, `title`, `feedTitle`, `author`, `url`, " +
+            "`summary`, `contentText`, `contentHtml`) VALUES (" +
+            "NEW.`rowid`, NEW.`title`, NEW.`feedTitle`, NEW.`author`, NEW.`url`, " +
+            "NEW.`summary`, NEW.`contentText`, NEW.`contentHtml`); END"
+    )
+}
+
+private fun createItemContentsFtsV9(connection: SQLiteConnection) {
+    connection.execSQL(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS `item_contents_fts` USING FTS5(" +
+            "`summary`, `contentText`, `contentHtml`, " +
+            "tokenize=`unicode61`, content=`item_contents`)"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_item_contents_fts_BEFORE_UPDATE " +
+            "BEFORE UPDATE ON `item_contents` BEGIN " +
+            "DELETE FROM `item_contents_fts` WHERE `rowid`=OLD.`rowid`; END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_item_contents_fts_BEFORE_DELETE " +
+            "BEFORE DELETE ON `item_contents` BEGIN " +
+            "DELETE FROM `item_contents_fts` WHERE `rowid`=OLD.`rowid`; END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_item_contents_fts_AFTER_UPDATE " +
+            "AFTER UPDATE ON `item_contents` BEGIN " +
+            "INSERT INTO `item_contents_fts`(`rowid`, `summary`, `contentText`, `contentHtml`) " +
+            "VALUES (NEW.`rowid`, NEW.`summary`, NEW.`contentText`, NEW.`contentHtml`); END"
+    )
+    connection.execSQL(
+        "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_item_contents_fts_AFTER_INSERT " +
+            "AFTER INSERT ON `item_contents` BEGIN " +
+            "INSERT INTO `item_contents_fts`(`rowid`, `summary`, `contentText`, `contentHtml`) " +
+            "VALUES (NEW.`rowid`, NEW.`summary`, NEW.`contentText`, NEW.`contentHtml`); END"
+    )
 }
 
 internal fun migrateCatalogSchemaV7(connection: SQLiteConnection) {

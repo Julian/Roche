@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id,\n                        mode AS \"mode: CollectionMode\",\n                        collection_role AS \"collection_role: CollectionRole\"\n                 FROM collection_specs\n                 WHERE collection_id = ? OR (slug IS NOT NULL AND LOWER(slug) = LOWER(?))\n                 ORDER BY CASE WHEN collection_id = ? THEN 0 ELSE 1 END ASC\n                 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "name": "mode: CollectionMode",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "name": "collection_role: CollectionRole",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8c5679d3a6839164112a90c7d2ec42a9e4cc6e731cf6e3775fd641b7ef52daf9"
+}

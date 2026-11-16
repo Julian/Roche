@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id,\n                    device_name,\n                    created_at AS \"created_at: DateTime<Utc>\",\n                    last_used_at AS \"last_used_at: DateTime<Utc>\"\n             FROM device_tokens\n             ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_tokens",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "device_name",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_tokens",
+            "name": "device_name"
+          }
+        }
+      },
+      {
+        "name": "created_at: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_tokens",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "last_used_at: DateTime<Utc>",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_tokens",
+            "name": "last_used_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9f4e888901594af3e492dbf65000a50de564d82af68640224f719b81d171074b"
+}

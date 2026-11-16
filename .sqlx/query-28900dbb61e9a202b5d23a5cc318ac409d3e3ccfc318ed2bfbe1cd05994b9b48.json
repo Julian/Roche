@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT CAST(seq AS INTEGER) AS \"seq!: i64\"\n             FROM sqlite_sequence\n             WHERE name = 'activity_log'",
+  "describe": {
+    "columns": [
+      {
+        "name": "seq!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "28900dbb61e9a202b5d23a5cc318ac409d3e3ccfc318ed2bfbe1cd05994b9b48"
+}

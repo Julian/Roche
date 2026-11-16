@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE consumption_log SET notes = COALESCE(notes, ?) WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "22cf816a7cddd5b6e73cf091ce61620df90aca2fb1d1353e74b097dc00511260"
+}

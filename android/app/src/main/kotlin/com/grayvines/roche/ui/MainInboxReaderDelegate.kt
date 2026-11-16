@@ -168,7 +168,17 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 openFullscreen = openFullscreen,
             )
         if (played) {
-            vm.transientState.update { it.copy(contextSheetEntryId = null) }
+            vm.transientState.update { current ->
+                if (openFullscreen) {
+                    current.copy(
+                        selectedReaderEntryId = null,
+                        readerContent = current.readerContent?.takeIf { it.itemId == entryId },
+                        contextSheetEntryId = null,
+                    )
+                } else {
+                    current.copy(contextSheetEntryId = null)
+                }
+            }
         }
     }
 

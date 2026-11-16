@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT mode AS \"mode: CollectionMode\",\n                        collection_role AS \"collection_role: CollectionRole\"\n                 FROM collection_specs WHERE collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "mode: CollectionMode",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "name": "collection_role: CollectionRole",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1f0358a74a508be3c7a7b532529f54ddbf008a618b8e9e9b8ff5ae15f9c91491"
+}

@@ -43,7 +43,11 @@ internal suspend fun refreshFeedOnlineOrOnDevice(
         }
     return if (remoteRefreshed != null) {
         if (remoteRefreshed.id.isNotBlank()) {
-            dao.upsertFeed(toRemoteFeedEntity(remoteRefreshed, existingFeed))
+            upsertFeedAndSyncItemsTitle(
+                dao,
+                toRemoteFeedEntity(remoteRefreshed, existingFeed),
+                existingFeed,
+            )
         }
         onSyncWithServer()
         remoteRefreshed.title.ifBlank { existingTitle ?: feedId }
@@ -102,28 +106,41 @@ internal suspend fun subscribeFeedBestEffort(
             cleanTitleOverride = cleanTitleOverride,
         )
     val remoteFeed = tryCreateRemoteFeed(apiClient, currentSettings, spec)
-    val entity =
-        if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
-            toRemoteFeedEntity(
-                remoteFeed.copy(
-                    title = remoteFeed.title.ifBlank { fallbackTitle },
-                    url = remoteFeed.url.ifBlank { canonicalUrl },
-                ),
-                existingLocal,
-            )
-        } else {
-            createPendingLocalFeed(dao, existingLocal, spec)
-        }
-    dao.upsertFeed(entity)
+    val entity = buildSubscribedFeedEntity(dao, remoteFeed, existingLocal, spec)
+    upsertFeedAndSyncItemsTitle(dao, entity, existingLocal)
     if (remoteFeed == null) {
-        LocalFeedPoller.pollFeed(
-            dao = dao,
-            apiClient = apiClient,
-            feed = entity,
-            localPeerId = currentSettings.peerId,
-        )
+        LocalFeedPoller.pollFeed(dao, apiClient, entity, currentSettings.peerId)
     }
     return dao.getFeedById(entity.id)?.title ?: entity.title
+}
+
+private suspend fun buildSubscribedFeedEntity(
+    dao: RocheDao,
+    remoteFeed: RemoteFeedDto?,
+    existingLocal: FeedEntity?,
+    spec: FeedCreationSpec,
+): FeedEntity =
+    if (remoteFeed != null && remoteFeed.id.isNotBlank()) {
+        toRemoteFeedEntity(
+            remoteFeed.copy(
+                title = remoteFeed.title.ifBlank { spec.fallbackTitle },
+                url = remoteFeed.url.ifBlank { spec.canonicalUrl },
+            ),
+            existingLocal,
+        )
+    } else {
+        createPendingLocalFeed(dao, existingLocal, spec)
+    }
+
+private suspend fun upsertFeedAndSyncItemsTitle(
+    dao: RocheDao,
+    updated: FeedEntity,
+    previous: FeedEntity?,
+) {
+    dao.upsertFeed(updated)
+    if (previous != null && updated.title != previous.title) {
+        dao.updateItemsFeedTitle(updated.id, updated.title)
+    }
 }
 
 private data class FeedCreationSpec(
@@ -195,7 +212,7 @@ private suspend fun restoreArchivedLocalFeed(
             title = cleanTitleOverride ?: existingLocal.title,
             isActive = true,
         )
-    dao.upsertFeed(restored)
+    upsertFeedAndSyncItemsTitle(dao, restored, existingLocal)
     syncFeedArchiveMutation(
         dao = dao,
         apiClient = apiClient,

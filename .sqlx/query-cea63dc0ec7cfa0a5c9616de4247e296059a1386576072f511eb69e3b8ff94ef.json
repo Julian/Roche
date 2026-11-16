@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT peer_id,\n                    device_name,\n                    network_tier AS \"network_tier: NetworkTier\",\n                    weight,\n                    last_seen_at AS \"last_seen_at: DateTime<Utc>\"\n             FROM peer_nodes\n             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', last_seen_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n             ORDER BY peer_id ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "peer_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "peer_id"
+          }
+        }
+      },
+      {
+        "name": "device_name",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "device_name"
+          }
+        }
+      },
+      {
+        "name": "network_tier: NetworkTier",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "network_tier"
+          }
+        }
+      },
+      {
+        "name": "weight",
+        "ordinal": 3,
+        "type_info": "Float",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "weight"
+          }
+        }
+      },
+      {
+        "name": "last_seen_at: DateTime<Utc>",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "last_seen_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "cea63dc0ec7cfa0a5c9616de4247e296059a1386576072f511eb69e3b8ff94ef"
+}

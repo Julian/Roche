@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT scheme as \"scheme!\", value as \"value!\" FROM entry_identifiers\n               WHERE entry_id = ?\n               ORDER BY scheme ASC, value ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "scheme!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_identifiers",
+            "name": "scheme"
+          }
+        }
+      },
+      {
+        "name": "value!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_identifiers",
+            "name": "value"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "82305e5904b5c7099509c4b8ef5b9ee4c14c18431e4ad3c8f8fae9b6ee04e8da"
+}

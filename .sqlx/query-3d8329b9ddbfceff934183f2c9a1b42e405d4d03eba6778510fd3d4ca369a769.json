@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS \"count!: i64\"\n             FROM entry_state es\n             JOIN entries e ON e.id = es.entry_id\n             WHERE e.merged_into_id IS NULL AND es.inbox_state = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "count!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3d8329b9ddbfceff934183f2c9a1b42e405d4d03eba6778510fd3d4ca369a769"
+}

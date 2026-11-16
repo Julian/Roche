@@ -11,6 +11,7 @@ detekt = "2.0.0-alpha.6"
 activity = "1.13.0"
 compose-bom = "2026.09.00"
 material3 = "1.5.0-rc01"
+navigation3 = "1.2.1"
 core = "1.19.1"
 lifecycle = "2.11.0"
 datastore = "1.3.0"
@@ -42,11 +43,12 @@ room3-runtime = { module = "androidx.room3:room3-runtime", version.ref = "room3"
 room3-compiler = { module = "androidx.room3:room3-compiler", version.ref = "room3" }
 room3-testing = { module = "androidx.room3:room3-testing", version.ref = "room3" }
 androidx-media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+androidx-media3-datasource = { module = "androidx.media3:media3-datasource", version.ref = "media3" }
 androidx-media3-session = { module = "androidx.media3:media3-session", version.ref = "media3" }
 androidx-media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
 kotlinx-serialization-core = { module = "org.jetbrains.kotlinx:kotlinx-serialization-core", version.ref = "kotlinx-serialization" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
-sqlite-framework = { module = "androidx.sqlite:sqlite-framework", version.ref = "sqlite" }
+sqlite-bundled = { module = "androidx.sqlite:sqlite-bundled", version.ref = "sqlite" }
 # The -jvm artifact: unit tests run on the host, and the Android variant has no host natives.
 sqlite-bundled-jvm = { module = "androidx.sqlite:sqlite-bundled-jvm", version.ref = "sqlite" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
@@ -70,8 +72,8 @@ compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-
 compose-ui = { module = "androidx.compose.ui:ui" }
 compose-foundation = { module = "androidx.compose.foundation:foundation" }
 compose-material3 = { module = "androidx.compose.material3:material3", version.ref = "material3" }
-compose-material-icons-core = { module = "androidx.compose.material:material-icons-core" }
-compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
+androidx-navigation3-runtime = { module = "androidx.navigation3:navigation3-runtime", version.ref = "navigation3" }
+androidx-navigation3-ui = { module = "androidx.navigation3:navigation3-ui", version.ref = "navigation3" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

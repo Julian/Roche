@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT enabled AS \"enabled: bool\", current_entry_id\n             FROM collection_generators WHERE collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "enabled: bool",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "collection_generators",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "name": "current_entry_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_generators",
+            "name": "current_entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "8696809975bb03e28cb5dceff60192d7985219acc1c95ecc0b4d28c4c7eaa061"
+}

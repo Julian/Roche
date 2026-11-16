@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)\n                 VALUES (?, 'collection', ?, ?, ?, ?)\n                 ON CONFLICT(id) DO UPDATE SET\n                    title = CASE\n                        WHEN strftime('%Y-%m-%dT%H:%M:%fZ', ?) >= strftime('%Y-%m-%dT%H:%M:%fZ', entries.updated_at)\n                        THEN excluded.title\n                        ELSE entries.title\n                    END,\n                    summary = COALESCE(excluded.summary, entries.summary),\n                    updated_at = CASE\n                        WHEN strftime('%Y-%m-%dT%H:%M:%fZ', ?) >= strftime('%Y-%m-%dT%H:%M:%fZ', entries.updated_at)\n                        THEN excluded.updated_at\n                        ELSE entries.updated_at\n                    END",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "a6d8394de79fee1b3c0ee3cc18072a9ef8b71cb5e6d046556df05bf09eb105e3"
+}

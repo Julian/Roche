@@ -30,7 +30,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
 
+@Serializable
 enum class CompanionSubTab(val label: String) {
     LISTS("Lists"),
     DIARY("Diary"),
@@ -210,7 +212,10 @@ sealed interface MainAction {
 
     data class UpdateSearchQuery(val query: String) : Ui
 
-    data class OpenReader(val entryId: String) : Ui
+    data class OpenReader(
+        val entryId: String,
+        val forceArticleView: Boolean = false,
+    ) : Ui
 
     data object CloseReader : Ui
 
@@ -474,6 +479,55 @@ internal data class TransientUiState(
     val messageSequence: Long = 0L,
 )
 
+@Serializable
+internal data class SavedNavigationUiState(
+    val activeTab: AppTab = AppTab.INBOX,
+    val activeFilter: InboxFilter = InboxFilter.ALL,
+    val isSearchOpen: Boolean = false,
+    val searchQuery: String = "",
+    val selectedTag: String? = null,
+    val selectedFeedId: String? = null,
+    val scopeOriginTab: AppTab? = null,
+    val selectedReaderEntryId: String? = null,
+    val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
+    val selectedCatalogCollectionId: String? = null,
+    val selectedWantCollectionId: String? = null,
+)
+
+internal fun TransientUiState.toSavedNavigationUiState(): SavedNavigationUiState =
+    SavedNavigationUiState(
+        activeTab = activeTab,
+        activeFilter = activeFilter,
+        isSearchOpen = isSearchOpen,
+        searchQuery = searchQuery,
+        selectedTag = selectedTag,
+        selectedFeedId = selectedFeedId,
+        scopeOriginTab = scopeOriginTab,
+        selectedReaderEntryId = selectedReaderEntryId,
+        companionSubTab = companionSubTab,
+        selectedCatalogCollectionId = selectedCatalogCollectionId,
+        selectedWantCollectionId = selectedWantCollectionId,
+    )
+
+internal fun SavedNavigationUiState.toInitialTransientUiState(
+    localNetworkTier: NetworkTier
+): TransientUiState =
+    TransientUiState(
+        activeTab = activeTab,
+        activeFilter = activeFilter,
+        isSearchOpen = isSearchOpen,
+        searchQuery = searchQuery,
+        selectedTag = selectedTag,
+        selectedFeedId = selectedFeedId,
+        scopeOriginTab = scopeOriginTab,
+        selectedReaderEntryId = selectedReaderEntryId,
+        hydratingEntryIds = setOfNotNull(selectedReaderEntryId),
+        companionSubTab = companionSubTab,
+        selectedCatalogCollectionId = selectedCatalogCollectionId,
+        selectedWantCollectionId = selectedWantCollectionId,
+        localNetworkTier = localNetworkTier,
+    )
+
 internal fun TransientUiState.clearSearch(): TransientUiState =
     copy(
         isSearchOpen = false,
@@ -579,7 +633,7 @@ private fun reduceOverlayUiAction(
         is MainAction.OpenReader ->
             state.copy(
                 selectedReaderEntryId = action.entryId,
-                readerContent = null,
+                readerContent = state.readerContent?.takeIf { it.itemId == action.entryId },
                 hydratingEntryIds = state.hydratingEntryIds + action.entryId,
                 contextSheetEntryId = null,
             )
@@ -619,6 +673,9 @@ private fun reduceCatalogUiAction(
                     companionSubTab = action.subTab,
                     selectedReaderEntryId = null,
                     readerContent = null,
+                    selectedFeedId = null,
+                    selectedTag = null,
+                    scopeOriginTab = null,
                 )
         is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
         is MainAction.SelectCatalogCollection ->
@@ -1014,7 +1071,10 @@ internal fun mergeBaseWithPlayerState(
             val merged =
                 base.copy(
                     playerState =
-                        latestPlayer.copy(smartRewindEnabled = base.settings.smartRewindEnabled)
+                        latestPlayer.copy(
+                            smartRewindEnabled = base.settings.smartRewindEnabled,
+                            skipSilenceEnabled = base.settings.skipSilenceEnabled,
+                        )
                 )
             onBuilt(merged)
             trySend(merged)

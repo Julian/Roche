@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "eea6b61b02d98d25267bba4b192b3a53233dc49124a45654fb19a88a9184536e"
+}

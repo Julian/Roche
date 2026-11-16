@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entry_identifiers WHERE entry_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "bd8272f7b52c6623d9364dbfabc3c216616dd9af6a336d423bd03a66d398907a"
+}

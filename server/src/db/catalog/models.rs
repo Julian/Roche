@@ -33,7 +33,7 @@ pub enum CatalogError {
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryIdentifier {
     pub scheme: String,
     pub value: String,

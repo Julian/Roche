@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT title as \"title!\", creators_json as \"creators_json!\",\n                          url as \"url?\", release_year as \"release_year?: i32\",\n                          thumbnail_url as \"thumbnail_url?\",\n                          metadata_json as \"metadata_json!\"\n                   FROM entries WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "title!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "creators_json!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "creators_json"
+          }
+        }
+      },
+      {
+        "name": "url?",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "name": "release_year?: i32",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "release_year"
+          }
+        }
+      },
+      {
+        "name": "thumbnail_url?",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "thumbnail_url"
+          }
+        }
+      },
+      {
+        "name": "metadata_json!",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "metadata_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "f0b5da0aef63621ea7bb51fe9474ab349ebd3e28d7f63182ef3cacf791a1094d"
+}

@@ -9,6 +9,7 @@ import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
@@ -140,11 +141,17 @@ class RocheRepository(
 
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =
         withContext(Dispatchers.Default) {
-            val cleanQuery = rawQuery.trim().trimStart('#')
+            val cleanQuery = rawQuery.replace("\u0000", "").trim().trimStart('#').trim()
             if (cleanQuery.isBlank()) {
                 emptyList()
             } else {
-                val matchedItems = dao.searchFullItems(buildSqlContainsPattern(cleanQuery))
+                val likePattern = buildSqlContainsPattern(cleanQuery)
+                val tokenQueries = extractFtsTokenQueries(cleanQuery)
+                val matchedItems =
+                    dao.searchFullItemsByTokens(
+                        tokenQueries = tokenQueries,
+                        likePattern = likePattern,
+                    )
                 if (matchedItems.isEmpty()) {
                     emptyList()
                 } else {

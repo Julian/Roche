@@ -10,6 +10,7 @@ import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.THUMBNAILS_SUBDIR
+import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpResponse
@@ -20,6 +21,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.ui.components.ThumbnailLoader
+import com.grayvines.roche.ui.components.computeProportionalTargetSize
 import java.io.File
 import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
@@ -51,6 +53,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
 @OptIn(ExperimentalCoroutinesApi::class)
+@Suppress("TooManyFunctions", "LargeClass")
 class RankBoardAndGate5UiLogicTest {
     @TempDir lateinit var tempDir: File
 
@@ -350,6 +353,432 @@ class RankBoardAndGate5UiLogicTest {
         assertEquals(listOf(1, 5), targetBlockIndices)
     }
 
+    @Test
+    fun `deriveRocheBackStack and popActionForTopKey model multi-layer navigation stacks`() {
+        assertEquals(
+            listOf(RocheNavKey.Tab(AppTab.INBOX)),
+            deriveRocheBackStack(MainUiState()),
+        )
+        assertNull(popActionForTopKey(RocheNavKey.Tab(AppTab.INBOX)))
+
+        val scopedFromFeeds =
+            MainUiState(
+                activeTab = AppTab.INBOX,
+                selectedFeedId = "f-1",
+                scopeOriginTab = AppTab.FEEDS,
+                isSearchOpen = true,
+                playerState = PodcastPlayerState(currentEntryId = "ep-1", isFullscreenOpen = true),
+            )
+        val fullStack =
+            deriveRocheBackStack(
+                state = scopedFromFeeds,
+                activeReaderEntryId = "entry-search-1",
+                activeFullscreenPlayerEntryId = "ep-1",
+            )
+        assertEquals(
+            listOf(
+                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.FEEDS),
+                RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
+                RocheNavKey.Search,
+                RocheNavKey.Reader("entry-search-1"),
+                RocheNavKey.FullscreenPlayer("ep-1"),
+            ),
+            fullStack,
+        )
+        assertEquals(MainAction.CloseFullscreenPlayer, popActionForTopKey(fullStack.last()))
+        assertEquals(
+            MainAction.NavigateBackFromScope,
+            popActionForTopKey(RocheNavKey.ScopedInbox(feedId = "f-1", tag = null)),
+        )
+    }
+
+    @Test
+    fun `popActionForTopKey pops Reader back to Search and preserves searchQuery before Home`() =
+        runTest {
+            database.dao().upsertItem(sampleItem("entry-search-1", "Navigation 3 Deep Dive"))
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 1 }
+
+            viewModel.dispatch(MainAction.SelectTab(AppTab.HOME))
+            viewModel.dispatch(MainAction.OpenSearch)
+            viewModel.dispatch(MainAction.UpdateSearchQuery("Navigation"))
+            viewModel.dispatch(MainAction.OpenReader("entry-search-1"))
+
+            val readerOverSearchState =
+                viewModel.uiState.first {
+                    it.activeTab == AppTab.HOME &&
+                        it.isSearchOpen &&
+                        it.activeReaderEntry?.id == "entry-search-1"
+                }
+            val stackInReader = deriveRocheBackStack(readerOverSearchState)
+            assertEquals(
+                listOf(
+                    RocheNavKey.Tab(AppTab.INBOX),
+                    RocheNavKey.Tab(AppTab.HOME),
+                    RocheNavKey.Search,
+                    RocheNavKey.Reader("entry-search-1"),
+                ),
+                stackInReader,
+            )
+
+            val popReader = popActionForTopKey(stackInReader.last())
+            assertEquals(MainAction.CloseReader, popReader)
+            viewModel.dispatch(popReader!!)
+
+            val backInSearchState =
+                viewModel.uiState.first { it.activeReaderEntry == null && it.isSearchOpen }
+            val stackInSearch = deriveRocheBackStack(backInSearchState)
+            assertEquals(
+                listOf(
+                    RocheNavKey.Tab(AppTab.INBOX),
+                    RocheNavKey.Tab(AppTab.HOME),
+                    RocheNavKey.Search,
+                ),
+                stackInSearch,
+            )
+            assertEquals("Navigation", backInSearchState.searchQuery)
+
+            val popSearch = popActionForTopKey(stackInSearch.last())
+            assertEquals(MainAction.CloseSearch, popSearch)
+            viewModel.dispatch(popSearch!!)
+
+            val backInHomeState = viewModel.uiState.first { !it.isSearchOpen }
+            val stackInHome = deriveRocheBackStack(backInHomeState)
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Tab(AppTab.HOME)),
+                stackInHome,
+            )
+            assertEquals(MainAction.SelectTab(AppTab.INBOX), popActionForTopKey(stackInHome.last()))
+
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `computeProportionalTargetSize preserves aspect ratio and caps at MAX_BITMAP_DIMENSION_PX`() {
+        assertNull(computeProportionalTargetSize(rawWidth = 128, rawHeight = 96, targetPx = 256))
+        assertNull(computeProportionalTargetSize(rawWidth = 0, rawHeight = 100, targetPx = 256))
+        assertEquals(
+            256 to 128,
+            computeProportionalTargetSize(rawWidth = 4000, rawHeight = 2000, targetPx = 256),
+        )
+        assertEquals(
+            1024 to 2048,
+            computeProportionalTargetSize(rawWidth = 2000, rawHeight = 4000, targetPx = 4096),
+        )
+    }
+
+    @Test
+    fun `OpenCompanionSection clears scoped inbox state and destination helpers preserve back lists`() =
+        runTest {
+            seedTwoScopedFeeds()
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 2 }
+
+            viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
+            viewModel.dispatch(MainAction.FilterByFeed("f-1"))
+            val scopedState =
+                viewModel.uiState.first {
+                    it.selectedFeedId == "f-1" &&
+                        it.visibleEntries.map(InboxEntry::id) == listOf("i-f1")
+                }
+            assertEquals(AppTab.FEEDS, scopedState.scopeOriginTab)
+
+            val unscopedDuringBack = resolveUnscopedInboxState(scopedState)
+            assertNull(unscopedDuringBack.selectedFeedId)
+            assertNull(unscopedDuringBack.selectedTag)
+            assertEquals(
+                setOf("i-f1", "i-f2"),
+                unscopedDuringBack.visibleEntries.map(InboxEntry::id).toSet(),
+            )
+
+            viewModel.dispatch(MainAction.OpenCompanionSection(CompanionSubTab.DIARY))
+            val companionState = viewModel.uiState.first { it.activeTab == AppTab.LISTS }
+            assertEquals(CompanionSubTab.DIARY, companionState.companionSubTab)
+            assertNull(companionState.selectedFeedId)
+            assertNull(companionState.selectedTag)
+            assertNull(companionState.scopeOriginTab)
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Tab(AppTab.LISTS)),
+                deriveRocheBackStack(companionState),
+            )
+
+            val scopedKey = RocheNavKey.ScopedInbox(feedId = "f-1", tag = null)
+            val retainedScoped = resolveScopedInboxState(companionState, scopedKey, scopedState)
+            assertEquals("Systems Weekly", retainedScoped.selectedFeedTitle)
+            assertEquals(listOf("i-f1"), retainedScoped.visibleEntries.map(InboxEntry::id))
+
+            val openSearch = companionState.copy(isSearchOpen = true, searchQuery = "Compiler")
+            assertEquals(
+                "Compiler",
+                resolveSearchOverlayState(companionState, openSearch).searchQuery,
+            )
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `OpenReader forceArticleView and PlayAudioEntry transition cleanly between Player and Reader`() =
+        runTest {
+            seedAudioEpisode("ep-nav-1")
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 1 }
+
+            viewModel.dispatch(MainAction.OpenReader("ep-nav-1"))
+            val inPlayer =
+                viewModel.uiState.first {
+                    it.playerState.currentEntryId == "ep-nav-1" && it.playerState.isFullscreenOpen
+                }
+            assertNull(inPlayer.selectedReaderEntryId)
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.FullscreenPlayer("ep-nav-1")),
+                deriveRocheBackStack(inPlayer),
+            )
+
+            viewModel.dispatch(MainAction.SeekPlayerToMs(45_000L))
+            viewModel.uiState.first { it.playerState.positionMs == 45_000L }
+
+            viewModel.dispatch(MainAction.OpenReader("ep-nav-1", forceArticleView = true))
+            val inReader =
+                viewModel.uiState.first {
+                    !it.playerState.isFullscreenOpen && it.selectedReaderEntryId == "ep-nav-1"
+                }
+            assertTrue(inReader.playerState.isPlaying)
+            assertEquals(45_000L, inReader.playerState.positionMs)
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Reader("ep-nav-1")),
+                deriveRocheBackStack(inReader),
+            )
+
+            viewModel.dispatch(MainAction.PlayAudioEntry("ep-nav-1", openFullscreen = true))
+            val backInPlayer =
+                viewModel.uiState.first {
+                    it.playerState.isFullscreenOpen && it.selectedReaderEntryId == null
+                }
+            val playerStack = deriveRocheBackStack(backInPlayer)
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.FullscreenPlayer("ep-nav-1")),
+                playerStack,
+            )
+
+            viewModel.dispatch(popActionForTopKey(playerStack.last())!!)
+            val collapsed = viewModel.uiState.first { !it.playerState.isFullscreenOpen }
+            assertEquals(listOf(RocheNavKey.Tab(AppTab.INBOX)), deriveRocheBackStack(collapsed))
+            collectJob.cancel()
+        }
+
+    @Test
+    fun `SavedStateHandle navigation restoration and SavedScrollStateSnapshot survive process death`() =
+        runTest {
+            seedTwoScopedFeeds()
+            val deepBody = "Lead paragraph. " + "x".repeat(4_000) + " RestoredFullBodyToken55."
+            database
+                .dao()
+                .upsertItem(
+                    sampleItem("i-f1", "Systems Article", feedId = "f-1")
+                        .copy(contentText = deepBody, contentHtml = "<p>$deepBody</p>")
+                )
+            val collectJob1 = backgroundScope.launch { viewModel.uiState.collect() }
+            viewModel.uiState.first { it.allEntries.size == 2 }
+
+            viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
+            viewModel.dispatch(MainAction.FilterByFeed("f-1"))
+            viewModel.dispatch(MainAction.OpenSearch)
+            viewModel.dispatch(MainAction.UpdateSearchQuery("RestoredFullBodyToken55"))
+            viewModel.dispatch(MainAction.OpenReader("i-f1"))
+            viewModel.uiState.first {
+                it.activeReaderEntry?.contentText?.contains("RestoredFullBodyToken55") == true
+            }
+            val savedJson = viewModel.exportSavedNavigationJson()
+            collectJob1.cancel()
+
+            verifyRestoredViewModel(savedJson)
+            verifyDeletedReaderPruned()
+            verifySyncRocheNavBackStackAndScrollSnapshot()
+        }
+
+    private suspend fun kotlinx.coroutines.test.TestScope.verifyRestoredViewModel(
+        savedJson: String
+    ) {
+        val coldRepo =
+            RocheRepository(
+                database = database,
+                apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                settings = settings,
+            )
+        val restoredHandle =
+            androidx.lifecycle.SavedStateHandle(
+                mapOf(MainViewModel.SAVED_NAV_JSON_KEY to savedJson)
+            )
+        val recreatedVm =
+            MainViewModel(
+                repository = coldRepo,
+                settingsRepository = settings,
+                savedStateHandle = restoredHandle,
+            )
+        try {
+            val initialFrame = recreatedVm.uiState.value
+            assertTrue(initialFrame.isInitialLoading)
+            assertEquals(
+                listOf(
+                    RocheNavKey.Tab(AppTab.INBOX),
+                    RocheNavKey.Tab(AppTab.FEEDS),
+                    RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
+                    RocheNavKey.Search,
+                    RocheNavKey.Reader("i-f1"),
+                ),
+                deriveRocheBackStack(initialFrame),
+            )
+
+            val collectJob = backgroundScope.launch { recreatedVm.uiState.collect() }
+            val hydrated =
+                recreatedVm.uiState.first {
+                    !it.isInitialLoading &&
+                        it.activeReaderEntry?.contentText?.contains("RestoredFullBodyToken55") ==
+                            true &&
+                        it.searchResults.any { hit -> hit.id == "i-f1" }
+                }
+            assertEquals(AppTab.FEEDS, hydrated.scopeOriginTab)
+            assertEquals("f-1", hydrated.selectedFeedId)
+            collectJob.cancel()
+        } finally {
+            recreatedVm.playerController.releaseController()
+            recreatedVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+        }
+    }
+
+    private suspend fun kotlinx.coroutines.test.TestScope.verifyDeletedReaderPruned() {
+        val staleJson =
+            kotlinx.serialization.json.Json.encodeToString(
+                SavedNavigationUiState.serializer(),
+                SavedNavigationUiState(
+                    activeTab = AppTab.INBOX,
+                    selectedReaderEntryId = "missing-entry-id",
+                    selectedFeedId = "missing-feed-id",
+                    scopeOriginTab = AppTab.FEEDS,
+                ),
+            )
+        val coldRepo =
+            RocheRepository(
+                database = database,
+                apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                settings = settings,
+            )
+        val staleVm =
+            MainViewModel(
+                repository = coldRepo,
+                settingsRepository = settings,
+                savedStateHandle =
+                    androidx.lifecycle.SavedStateHandle(
+                        mapOf(MainViewModel.SAVED_NAV_JSON_KEY to staleJson)
+                    ),
+            )
+        try {
+            val collectJob = backgroundScope.launch { staleVm.uiState.collect() }
+            val reconciled =
+                staleVm.uiState.first {
+                    !it.isInitialLoading &&
+                        it.selectedReaderEntryId == null &&
+                        it.selectedFeedId == null
+                }
+            assertNull(reconciled.scopeOriginTab)
+            collectJob.cancel()
+        } finally {
+            staleVm.playerController.releaseController()
+            staleVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+        }
+    }
+
+    private fun verifySyncRocheNavBackStackAndScrollSnapshot() {
+        val liveStack =
+            mutableListOf<androidx.navigation3.runtime.NavKey>(
+                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.HOME),
+                RocheNavKey.Search,
+            )
+        syncRocheNavBackStack(
+            liveStack,
+            listOf(
+                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.FEEDS),
+                RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
+            ),
+        )
+        assertEquals(
+            listOf(
+                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.FEEDS),
+                RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
+            ),
+            liveStack,
+        )
+
+        val holder =
+            MainScrollStateHolder(
+                initialLazyPositions = mapOf("inbox:ALL" to (12 to 48)),
+                initialScrollOffsets = mapOf("home" to 320),
+            )
+        val encoded =
+            kotlinx.serialization.json.Json.encodeToString(
+                SavedScrollStateSnapshot.serializer(),
+                holder.toSavedSnapshot(),
+            )
+        val decoded =
+            MainScrollStateHolder.fromSavedSnapshot(
+                kotlinx.serialization.json.Json.decodeFromString(
+                    SavedScrollStateSnapshot.serializer(),
+                    encoded,
+                )
+            )
+        assertEquals(12, decoded.lazyListState("inbox:ALL").firstVisibleItemIndex)
+        assertEquals(48, decoded.lazyListState("inbox:ALL").firstVisibleItemScrollOffset)
+        assertEquals(320, decoded.scrollState("home").value)
+    }
+
+    private suspend fun seedTwoScopedFeeds() {
+        database
+            .dao()
+            .upsertFeeds(
+                listOf(
+                    FeedEntity(
+                        id = "f-1",
+                        title = "Systems Weekly",
+                        url = "https://a.test/rss",
+                        siteUrl = null,
+                        feedType = "rss",
+                    ),
+                    FeedEntity(
+                        id = "f-2",
+                        title = "Compiler Notes",
+                        url = "https://b.test/rss",
+                        siteUrl = null,
+                        feedType = "rss",
+                    ),
+                )
+            )
+        database
+            .dao()
+            .upsertItems(
+                listOf(
+                    sampleItem("i-f1", "Systems Article", feedId = "f-1"),
+                    sampleItem("i-f2", "Compiler Article", feedId = "f-2"),
+                )
+            )
+    }
+
+    private suspend fun seedAudioEpisode(id: String) {
+        database
+            .dao()
+            .upsertItem(
+                sampleItem(id, "Podcast Episode")
+                    .copy(
+                        contentType = "audio",
+                        audioUrl = "https://pod.example.com/$id.mp3",
+                        duration = "10:00",
+                        contentHtml = "<p>Episode show notes</p>",
+                    )
+            )
+    }
+
     private fun fakeBitmap(): ImageBitmap =
         Proxy.newProxyInstance(
             ImageBitmap::class.java.classLoader,
@@ -365,10 +794,10 @@ class RankBoardAndGate5UiLogicTest {
             }
         } as ImageBitmap
 
-    private fun sampleItem(id: String, title: String) =
+    private fun sampleItem(id: String, title: String, feedId: String = "f-1") =
         ItemEntity(
             id = id,
-            feedId = "f-1",
+            feedId = feedId,
             feedTitle = "Feed",
             title = title,
             url = "https://example.com/$id",

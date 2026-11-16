@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7f3769553d4ff60e077609ff6a795f3c3700564f5e322a38cb5398fb4b8be4e0"
+}

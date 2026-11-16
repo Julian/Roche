@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM collection_entries\n             WHERE collection_id = ?\n               AND entry_id = ?\n               AND EXISTS (\n                   SELECT 1 FROM collection_specs cs\n                   WHERE cs.collection_id = collection_entries.collection_id\n                     AND cs.collection_role = 'tag'\n               )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "384ce5016b0d1169becca86b81262979ba520aea91392b93582b4cebb97ceb19"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id\n                 FROM entries e\n                 JOIN collection_specs cs ON cs.collection_id = e.id\n                 WHERE cs.collection_role = 'tag'\n                   AND e.id != ?\n                   AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))\n                 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d5ff6b9961b252ba7dfde471b0be8c98a3019633b84cf4e8b3d47cea8d3de11d"
+}

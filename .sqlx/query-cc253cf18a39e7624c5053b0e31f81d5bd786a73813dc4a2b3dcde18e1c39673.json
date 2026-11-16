@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "task_name",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "maintenance_runs",
+            "name": "task_name"
+          }
+        }
+      },
+      {
+        "name": "completed_at",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "maintenance_runs",
+            "name": "completed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "cc253cf18a39e7624c5053b0e31f81d5bd786a73813dc4a2b3dcde18e1c39673"
+}

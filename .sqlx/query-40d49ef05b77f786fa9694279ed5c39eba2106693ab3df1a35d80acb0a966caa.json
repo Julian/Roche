@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT es.entry_id FROM entry_state es\n                     JOIN entries e ON e.id = es.entry_id\n                     WHERE e.merged_into_id IS NULL\n                       AND es.inbox_state = 'unread'\n                     LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "entry_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "40d49ef05b77f786fa9694279ed5c39eba2106693ab3df1a35d80acb0a966caa"
+}

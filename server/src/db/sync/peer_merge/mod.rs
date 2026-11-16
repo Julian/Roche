@@ -217,15 +217,19 @@ impl SyncRepo<'_> {
         let mut tx = self.pool.begin().await?;
 
         Self::ensure_server_peer_in_tx(&mut tx, now).await?;
-        let page1_seen_at: Option<DateTime<Utc>> =
-            if is_continuation_page && !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
-                sqlx::query_scalar("SELECT last_seen_at FROM peer_nodes WHERE peer_id = ?")
-                    .bind(peer_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-            } else {
-                None
-            };
+        let page1_seen_at: Option<DateTime<Utc>> = if is_continuation_page
+            && !peer_id.is_empty()
+            && peer_id != SERVER_PEER_ID
+        {
+            sqlx::query_scalar!(
+                    "SELECT last_seen_at AS \"last_seen_at: DateTime<Utc>\" FROM peer_nodes WHERE peer_id = ?",
+                    peer_id,
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            None
+        };
         if !is_continuation_page && !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
             Self::upsert_peer_in_tx(
                 &mut tx,

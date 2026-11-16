@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT current_entry_id as \"current_entry_id?\",\n                      drawn_at as \"drawn_at?: DateTime<Utc>\"\n               FROM collection_generators\n               WHERE collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "current_entry_id?",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_generators",
+            "name": "current_entry_id"
+          }
+        }
+      },
+      {
+        "name": "drawn_at?: DateTime<Utc>",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_generators",
+            "name": "drawn_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "8a0fb0b0ec44c7c344468a5fd00896b8f1e8de2e9346e3bb2eb9c936f4e34f8a"
+}

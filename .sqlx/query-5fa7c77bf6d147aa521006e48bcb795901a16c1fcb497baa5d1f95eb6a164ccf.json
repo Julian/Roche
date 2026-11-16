@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries\n                         SET url = COALESCE(url, ?),\n                             published_at = COALESCE(published_at, ?),\n                             summary = COALESCE(summary, ?),\n                             thumbnail_url = COALESCE(thumbnail_url, ?),\n                             updated_at = ?\n                         WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "5fa7c77bf6d147aa521006e48bcb795901a16c1fcb497baa5d1f95eb6a164ccf"
+}

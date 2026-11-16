@@ -7,7 +7,7 @@ import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.local.RocheDatabase
-import com.grayvines.roche.data.remote.HttpUrlConnectionTransport
+import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.VpnTransportCheck
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -21,11 +21,12 @@ import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
-class AppGraph(context: Context) {
-    private val appContext = context.applicationContext
+class AppGraph(context: Context) : AutoCloseable {
+    internal val appContext = context.applicationContext
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -33,15 +34,22 @@ class AppGraph(context: Context) {
 
     val settings: SettingsRepository by lazy { SettingsRepository.create(appContext) }
 
-    val networkTierProvider: NetworkTierProvider by lazy {
-        AndroidNetworkTierProvider(appContext)
+    private val networkTierProviderDelegate = lazy { AndroidNetworkTierProvider(appContext) }
+
+    val networkTierProvider: NetworkTierProvider by networkTierProviderDelegate
+
+    internal val vpnCheck: VpnTransportCheck by lazy {
+        VpnTransportCheck(networkTierProvider::isVpnTransportActive)
     }
 
+    private val httpTransportDelegate = lazy { HttpEngineTransport(appContext, vpnCheck) }
+
+    internal val httpTransport: HttpEngineTransport by httpTransportDelegate
+
     val apiClient: RocheApiClient by lazy {
-        val vpnCheck = VpnTransportCheck(networkTierProvider::isVpnTransportActive)
         RocheApiClient(
             vpnCheck = vpnCheck,
-            transport = HttpUrlConnectionTransport(vpnCheck = vpnCheck),
+            transport = httpTransport,
         )
     }
 
@@ -69,12 +77,17 @@ class AppGraph(context: Context) {
         )
     }
 
-    val audioPlayerBackend: ExoPlayerAudioBackend by lazy {
+    private val audioPlayerBackendDelegate = lazy {
         ExoPlayerAudioBackend(
             context = appContext,
             allowedLocalDirs = listOf(offlineCacheDir, appContext.cacheDir),
+            parentScope = appScope,
+            httpEngineProvider = { httpTransport.sharedHttpEngine },
+            httpEngineExecutorProvider = { httpTransport.sharedCallbackExecutor },
         )
     }
+
+    val audioPlayerBackend: ExoPlayerAudioBackend by audioPlayerBackendDelegate
 
     val mediaSessionBridge: PodcastMediaSessionBridge by lazy {
         AndroidPodcastMediaSessionBridge(
@@ -96,11 +109,25 @@ class AppGraph(context: Context) {
     }
 
     fun prewarm() {
+        networkTierProvider.isVpnTransportActive()
         appScope.launch {
             settings.prewarm()
             val current = settings.settings.first()
             PeerSyncScheduler.schedulePeriodicSync(appContext, current.serverUrl)
         }
         appScope.launch { repository.prewarm() }
+    }
+
+    override fun close() {
+        if (audioPlayerBackendDelegate.isInitialized()) {
+            runCatching { audioPlayerBackend.shutdownPlayer() }
+        }
+        appScope.cancel()
+        if (httpTransportDelegate.isInitialized()) {
+            runCatching { httpTransport.close() }
+        }
+        if (networkTierProviderDelegate.isInitialized()) {
+            runCatching { networkTierProviderDelegate.value.close() }
+        }
     }
 }

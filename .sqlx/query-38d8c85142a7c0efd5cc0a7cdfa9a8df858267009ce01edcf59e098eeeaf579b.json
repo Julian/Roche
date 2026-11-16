@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT updated_at as \"updated_at!: DateTime<Utc>\" FROM entries WHERE title = '2001: A Space Odyssey'",
+  "describe": {
+    "columns": [
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "38d8c85142a7c0efd5cc0a7cdfa9a8df858267009ce01edcf59e098eeeaf579b"
+}

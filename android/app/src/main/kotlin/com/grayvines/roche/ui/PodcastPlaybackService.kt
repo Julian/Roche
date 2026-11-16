@@ -5,8 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.os.Handler
-import android.os.Looper
 import android.view.KeyEvent
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
@@ -24,12 +22,15 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.grayvines.roche.MainActivity
 import com.grayvines.roche.RocheApp
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal fun mapMediaKeyCodeToCommand(keyCode: Int): MediaSessionCommand? =
     when (keyCode) {
@@ -67,26 +68,40 @@ internal fun MediaSessionMetadataSnapshot.toMetadataKey(
     )
 
 @Suppress("TooManyFunctions")
-class AndroidPodcastMediaSessionBridge(
-    context: Context,
-    private val backend: ExoPlayerAudioBackend? = null,
+class AndroidPodcastMediaSessionBridge
+internal constructor(
+    internal val appContext: Context?,
+    internal val backend: ExoPlayerAudioBackend? = null,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-    private val artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
+    internal val artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
 ) : PodcastMediaSessionBridge {
-    private val appContext: Context = context.applicationContext
-    private val mainHandler: Handler = Handler(Looper.getMainLooper())
+    private val sessionGeneration = AtomicLong(0L)
 
     @Volatile private var callbacks: PodcastMediaSessionCallbacks? = null
-    @Volatile private var latestSnapshot: MediaSessionMetadataSnapshot? = null
-    @Volatile private var cachedArtworkUrl: String? = null
-    @Volatile private var cachedArtworkBytes: ByteArray? = null
+    @Volatile internal var latestSnapshot: MediaSessionMetadataSnapshot? = null
+    @Volatile internal var cachedArtworkUrl: String? = null
+    @Volatile internal var cachedArtworkBytes: ByteArray? = null
     @Volatile private var activeMediaSession: MediaSession? = null
 
-    private var lastMetadataKey: SessionMetadataKey? = null
-    private var lastHasNextQueuedAudio: Boolean? = null
-    private var loadingArtworkUrl: String? = null
-    private var artworkLoadJob: Job? = null
+    internal var lastMetadataKey: SessionMetadataKey? = null
+    internal var lastHasNextQueuedAudio: Boolean? = null
+    internal var loadingArtworkUrl: String? = null
+    internal var artworkLoadJob: Job? = null
     private var controllerFuture: ListenableFuture<MediaController>? = null
+
+    constructor(
+        context: Context,
+        backend: ExoPlayerAudioBackend? = null,
+        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
+    ) : this(
+        appContext = context.applicationContext,
+        backend = backend,
+        scope = scope,
+        artworkBitmapLoader = artworkBitmapLoader,
+        mainDispatcher = Dispatchers.Main.immediate,
+    )
 
     override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
         this.callbacks = callbacks
@@ -107,20 +122,28 @@ class AndroidPodcastMediaSessionBridge(
     override fun abandonAudioFocus() = Unit
 
     override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
-        runOnMain { updateSessionOnMain(snapshot) }
+        val generation = sessionGeneration.incrementAndGet()
+        scope.launch(mainDispatcher) {
+            if (sessionGeneration.get() == generation) {
+                updateSessionOnMain(snapshot)
+            }
+        }
     }
 
     override fun release() {
-        runOnMain {
-            artworkLoadJob?.cancel()
-            artworkLoadJob = null
-            loadingArtworkUrl = null
-            cachedArtworkUrl = null
-            cachedArtworkBytes = null
-            latestSnapshot = null
-            lastMetadataKey = null
-            lastHasNextQueuedAudio = null
-            disconnectControllerOnMain()
+        val generationAtRelease = sessionGeneration.get()
+        scope.launch(mainDispatcher) {
+            if (sessionGeneration.get() == generationAtRelease) {
+                artworkLoadJob?.cancel()
+                artworkLoadJob = null
+                loadingArtworkUrl = null
+                cachedArtworkUrl = null
+                cachedArtworkBytes = null
+                latestSnapshot = null
+                lastMetadataKey = null
+                lastHasNextQueuedAudio = null
+                disconnectControllerOnMain()
+            }
         }
     }
 
@@ -139,7 +162,7 @@ class AndroidPodcastMediaSessionBridge(
         }
     }
 
-    private fun updateSessionOnMain(snapshot: MediaSessionMetadataSnapshot?) {
+    internal fun updateSessionOnMain(snapshot: MediaSessionMetadataSnapshot?) {
         latestSnapshot = snapshot
         if (snapshot == null) {
             artworkLoadJob?.cancel()
@@ -176,18 +199,19 @@ class AndroidPodcastMediaSessionBridge(
     }
 
     private fun connectControllerOnMain() {
+        val context = appContext ?: return
         if (controllerFuture != null || backend == null) return
         runCatching {
             val token =
                 SessionToken(
-                    appContext,
-                    ComponentName(appContext, PodcastPlaybackService::class.java),
+                    context,
+                    ComponentName(context, PodcastPlaybackService::class.java),
                 )
-            controllerFuture = MediaController.Builder(appContext, token).buildAsync()
+            controllerFuture = MediaController.Builder(context, token).buildAsync()
         }
     }
 
-    private fun disconnectControllerOnMain() {
+    internal fun disconnectControllerOnMain() {
         val existing = controllerFuture ?: return
         controllerFuture = null
         runCatching { MediaController.releaseFuture(existing) }
@@ -212,16 +236,16 @@ class AndroidPodcastMediaSessionBridge(
         loadingArtworkUrl = cleanUrl
         artworkLoadJob = scope.launch {
             val pngBytes = runCatching {
-                loader(cleanUrl)?.let(::encodeBitmapPng)
+                loader(cleanUrl)?.let(::compressArtworkPng)
             }
                 .onFailure { if (it is CancellationException) throw it }
                 .getOrNull()
-            if (pngBytes != null && pngBytes.isNotEmpty()) {
-                cachedArtworkUrl = cleanUrl
-                cachedArtworkBytes = pngBytes
-                runOnMain { applyLoadedArtworkOnMain(cleanUrl, pngBytes) }
-            }
-            runOnMain {
+            withContext(mainDispatcher) {
+                if (pngBytes != null && pngBytes.isNotEmpty()) {
+                    cachedArtworkUrl = cleanUrl
+                    cachedArtworkBytes = pngBytes
+                    applyLoadedArtworkOnMain(cleanUrl, pngBytes)
+                }
                 if (loadingArtworkUrl == cleanUrl) {
                     loadingArtworkUrl = null
                 }
@@ -229,36 +253,30 @@ class AndroidPodcastMediaSessionBridge(
         }
     }
 
-    private fun applyLoadedArtworkOnMain(loadedUrl: String, pngBytes: ByteArray) {
+    internal fun applyLoadedArtworkOnMain(loadedUrl: String, pngBytes: ByteArray) {
         val snapshot = latestSnapshot ?: return
         if (snapshot.artworkUrl?.trim() != loadedUrl) return
         lastMetadataKey = snapshot.toMetadataKey(hasArtworkBytes = true)
         backend?.updateSessionMediaMetadata(buildMedia3Metadata(snapshot, pngBytes))
     }
 
-    internal fun createOpenPlayerPendingIntent(): PendingIntent =
-        PendingIntent.getActivity(
-            appContext,
+    internal fun createOpenPlayerPendingIntent(): PendingIntent {
+        val context = checkNotNull(appContext) { "Context required for PendingIntent" }
+        return PendingIntent.getActivity(
+            context,
             REQUEST_OPEN_PLAYER,
-            Intent(appContext, MainActivity::class.java).apply {
+            Intent(context, MainActivity::class.java).apply {
                 action = PodcastPlaybackService.ACTION_OPEN_PLAYER
                 putExtra(PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER, true)
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-
-    private fun runOnMain(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            block()
-        } else {
-            mainHandler.post(block)
-        }
     }
 
     internal companion object {
-        private const val REQUEST_OPEN_PLAYER = 400
-        private const val PNG_QUALITY = 100
+        internal const val REQUEST_OPEN_PLAYER = 400
+        internal const val PNG_QUALITY = 100
 
         @OptIn(UnstableApi::class)
         internal fun buildTransportButtons(hasNextQueuedAudio: Boolean): List<CommandButton> =
@@ -310,11 +328,25 @@ class AndroidPodcastMediaSessionBridge(
             return builder.build()
         }
 
-        private fun encodeBitmapPng(bitmap: Bitmap): ByteArray =
-            ByteArrayOutputStream().use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, PNG_QUALITY, out)
-                out.toByteArray()
+        internal fun compressArtworkPng(bitmap: Bitmap): ByteArray {
+            val softwareCopy =
+                if (bitmap.config == Bitmap.Config.HARDWARE) {
+                    bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                } else {
+                    null
+                }
+            val targetBitmap = softwareCopy ?: bitmap
+            return try {
+                ByteArrayOutputStream().use { out ->
+                    targetBitmap.compress(Bitmap.CompressFormat.PNG, PNG_QUALITY, out)
+                    out.toByteArray()
+                }
+            } finally {
+                if (softwareCopy != null && softwareCopy !== bitmap) {
+                    softwareCopy.recycle()
+                }
             }
+        }
     }
 }
 

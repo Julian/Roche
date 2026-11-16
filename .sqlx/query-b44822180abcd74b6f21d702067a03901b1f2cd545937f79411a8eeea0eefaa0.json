@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO entries\n                     (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)\n                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "b44822180abcd74b6f21d702067a03901b1f2cd545937f79411a8eeea0eefaa0"
+}

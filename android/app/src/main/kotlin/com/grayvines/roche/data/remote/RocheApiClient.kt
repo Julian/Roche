@@ -3,9 +3,6 @@ package com.grayvines.roche.data.remote
 import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.File
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.withContext
 
 @Suppress("TooManyFunctions")
 class RocheApiClient(
@@ -13,7 +10,7 @@ class RocheApiClient(
     private val transport: HttpTransport,
 ) {
     constructor(
-        transport: HttpTransport = HttpUrlConnectionTransport()
+        transport: HttpTransport
     ) : this(
         vpnCheck = VpnTransportCheck { true },
         transport = transport,
@@ -243,23 +240,21 @@ class RocheApiClient(
         val validScheme =
             mediaUrl.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
                 mediaUrl.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-        val headers = authHeaders(token)
-        when {
-            !validScheme -> false
-            transport !is HttpUrlConnectionTransport ->
-                streamTransportResponseToFile(transport, mediaUrl, targetFile, maxBytes, headers)
-            else ->
-                withContext(Dispatchers.IO) {
-                    streamUrlConnectionToFile(
-                        initialUrl = mediaUrl,
-                        targetFile = targetFile,
-                        maxBytes = maxBytes,
-                        initialHeaders = headers,
+        if (!validScheme) {
+            false
+        } else {
+            transport.streamToFile(
+                request =
+                    HttpRequest(
+                        method = METHOD_GET,
+                        url = mediaUrl,
+                        headers = authHeaders(token),
+                        expectBinary = true,
                         requirePublicIp = false,
-                        vpnCheck = vpnCheck,
-                        job = coroutineContext[Job],
-                    )
-                }
+                    ),
+                targetFile = targetFile,
+                maxBytes = maxBytes,
+            )
         }
     }
         .getOrDefault(false)
@@ -295,27 +290,18 @@ class RocheApiClient(
     ): Boolean = runSuspendCatching {
         val trimmed = fileUrl.trim()
         PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
-        if (transport !is HttpUrlConnectionTransport) {
-            streamTransportResponseToFile(
-                transport = transport,
-                trimmedUrl = trimmed,
-                targetFile = targetFile,
-                maxBytes = maxBytes,
-                headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
-                requirePublicIp = true,
-            )
-        } else {
-            withContext(Dispatchers.IO) {
-                streamUrlConnectionToFile(
-                    initialUrl = trimmed,
-                    targetFile = targetFile,
-                    maxBytes = maxBytes,
-                    initialHeaders = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+        transport.streamToFile(
+            request =
+                HttpRequest(
+                    method = METHOD_GET,
+                    url = trimmed,
+                    headers = mapOf(HEADER_USER_AGENT to EXTERNAL_IMAGE_USER_AGENT),
+                    expectBinary = true,
                     requirePublicIp = true,
-                    job = coroutineContext[Job],
-                )
-            }
-        }
+                ),
+            targetFile = targetFile,
+            maxBytes = maxBytes,
+        )
     }
         .getOrDefault(false)
 

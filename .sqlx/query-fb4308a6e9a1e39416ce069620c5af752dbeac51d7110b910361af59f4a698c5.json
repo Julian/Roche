@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ce.entry_id AS item_id, ce.collection_id AS tag_id\n             FROM collection_entries ce\n             JOIN collection_specs cs ON cs.collection_id = ce.collection_id\n             WHERE cs.collection_role = 'tag'\n             ORDER BY ce.entry_id, ce.collection_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "item_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "entry_id"
+          }
+        }
+      },
+      {
+        "name": "tag_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "fb4308a6e9a1e39416ce069620c5af752dbeac51d7110b910361af59f4a698c5"
+}

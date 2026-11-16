@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"found!: i64\" FROM entries e\n                             JOIN entry_state es ON es.entry_id = e.id\n                             WHERE es.inbox_state IN ('unread', 'dismissed')\n                               AND (e.id = ? OR (e.url = ? AND NOT EXISTS (\n                                   SELECT 1 FROM collection_entries ce\n                                   JOIN feed_sources fs ON fs.collection_id = ce.collection_id\n                                   WHERE ce.entry_id = e.id\n                               )))\n                               AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3fe39e7dc4f62b26b3c136053e48f2a630e88dd4d3e4f75580608bd264f72555"
+}

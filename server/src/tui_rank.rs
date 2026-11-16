@@ -1,13 +1,41 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
-    process::{Command, Stdio},
+    io::Write,
+    sync::{
+        Once,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
+use crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
 
-use crate::{db::CatalogEntry, ranking::RankBoard};
+use crate::{
+    db::CatalogEntry,
+    ranking::{RankBoard, RankBoardRow},
+};
+
+const ACCENT_COPPER: Color = Color::Indexed(130);
+const ACCENT_FOCUS: Color = Color::Indexed(166);
+const HELP_LINE: &str = "j/k or ↑/↓ focus · J/K or Shift+↑/↓ move · 1-9 send to rank · = tie above · t tie all · s skip · o open · Enter submit · q quit";
+const COMPACT_HELP_LINE: &str =
+    "j/k focus · J/K move · 1-9 rank · =/t tie · s skip · o open · Enter · q quit";
+
+static TERMINAL_RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK_ONCE: Once = Once::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterRankOutcome {
@@ -128,117 +156,203 @@ impl ClusterRankState {
         }
     }
 
-    fn render_ansi(&self, title: &str, iteration: usize, appended: usize) -> String {
-        use std::fmt::Write as _;
+    pub fn draw(&self, frame: &mut Frame<'_>, title: &str, iteration: usize, appended: usize) {
+        let area = frame.area();
+        let footer_height = self.compute_footer_height(area.width, area.height);
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
 
-        let mut buf = String::with_capacity(2048);
-        // Clear screen & home cursor inside alternate buffer
-        buf.push_str("\x1b[2J\x1b[H");
-        let _ = write!(
-            buf,
-            "\x1b[1;38;5;130mRoche Rank\x1b[0m — \x1b[1m{}\x1b[0m  \x1b[2m(round {}, saved {})\x1b[0m\r\n",
-            sanitize_line(title),
-            iteration + 1,
-            appended
-        );
-        buf.push_str(
-            "\x1b[2mOrder best → worst. j/k or ↑/↓ focus · J/K or Shift+↑/↓ move · 1-9 send to rank · = tie above · t tie all · s skip · o open · Enter submit · q quit\x1b[0m\r\n\r\n",
-        );
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "Roche Rank",
+                    Style::default().fg(ACCENT_COPPER).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" — "),
+                Span::styled(sanitize_line(title), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  (round {}, saved {appended})", iteration + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::styled(
+                "Order best → worst (ties share a rank bucket).",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(header, chunks[0]);
 
         let rows = self.board.flat_rows();
         let has_ties = rows.iter().any(|r| r.is_tied_with_above);
+        let mut list_items = Vec::with_capacity(rows.len() * 2);
+        let mut selected_visual_index = None;
+
         for row in &rows {
             if has_ties && row.flat_index > 0 && !row.is_tied_with_above {
-                buf.push_str("  \x1b[2m┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\x1b[0m\r\n");
+                list_items.push(ListItem::new(Line::styled(
+                    "   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
             let Some(entry) = self.entries_by_id.get(&row.entry_id) else {
                 continue;
             };
-            let focused = row.is_selected;
-            let cursor_glyph = if focused { "\x1b[1;38;5;166m▸\x1b[0m" } else { " " };
-            let byline = if entry.creators.is_empty() {
-                String::new()
-            } else {
-                format!("\x1b[3;2m{}\x1b[0m ", sanitize_line(&entry.creators.join(", ")))
-            };
-            let year_suffix =
-                entry.release_year.map_or_else(String::new, |y| format!(" \x1b[2m({y})\x1b[0m"));
-            let title_styled = if focused {
-                format!("\x1b[1;4m{}\x1b[0m", sanitize_line(&entry.title))
-            } else {
-                sanitize_line(&entry.title)
-            };
-            let tie_badge = if row.is_tied_with_above { " \x1b[33m[=]\x1b[0m" } else { "" };
-            let _ = write!(
-                buf,
-                " {cursor_glyph} {:2}. {byline}{title_styled}{year_suffix}{tie_badge}\r\n",
-                row.display_rank
-            );
+            if row.is_selected {
+                selected_visual_index = Some(list_items.len());
+            }
+            list_items.push(Self::format_cluster_row(row, entry));
         }
 
+        let mut list_state = ListState::default().with_selected(selected_visual_index);
+        let list = List::new(list_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(" Cluster ", Style::default().fg(ACCENT_COPPER))),
+        );
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+        let help_text = if area.width < 90 { COMPACT_HELP_LINE } else { HELP_LINE };
+        let mut footer_lines = vec![Line::styled(help_text, Style::default().fg(Color::DarkGray))];
         if let Some(note) = &self.status_note {
-            let _ = write!(buf, "\r\n  \x1b[33m{}\x1b[0m\r\n", sanitize_line(note));
+            footer_lines
+                .push(Line::styled(sanitize_line(note), Style::default().fg(Color::Yellow)));
         }
-        buf
+        let footer = Paragraph::new(footer_lines).wrap(Wrap { trim: true });
+        frame.render_widget(footer, chunks[2]);
+    }
+
+    fn compute_footer_height(&self, width: u16, height: u16) -> u16 {
+        let usable_w = usize::from(width.max(1));
+        let help_text = if width < 90 { COMPACT_HELP_LINE } else { HELP_LINE };
+        let help_rows = word_wrapped_rows(help_text, usable_w);
+        let note_rows = self
+            .status_note
+            .as_deref()
+            .map_or(0, |n| word_wrapped_rows(&sanitize_line(n), usable_w));
+        let desired = u16::try_from(help_rows + note_rows).unwrap_or(6).max(2);
+        let max_allowed = height.saturating_sub(5).max(1);
+        desired.min(max_allowed)
+    }
+
+    fn format_cluster_row(row: &RankBoardRow, entry: &CatalogEntry) -> ListItem<'static> {
+        let mut spans = Vec::with_capacity(7);
+        if row.is_selected {
+            spans.push(Span::styled(
+                " ▸ ",
+                Style::default().fg(ACCENT_FOCUS).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            format!("{:2}. ", row.display_rank),
+            if row.is_selected {
+                Style::default().fg(ACCENT_FOCUS).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ));
+        if !entry.creators.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", sanitize_line(&entry.creators.join(", "))),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        let title_style = if row.is_selected {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(sanitize_line(&entry.title), title_style));
+        if let Some(year) = entry.release_year {
+            spans.push(Span::styled(format!(" ({year})"), Style::default().fg(Color::DarkGray)));
+        }
+        if row.is_tied_with_above {
+            spans.push(Span::styled(
+                " [=]",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+        ListItem::new(Line::from(spans))
     }
 }
 
-struct RawTtyGuard {
-    saved_stty: String,
+fn install_terminal_panic_hook() {
+    PANIC_HOOK_ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if TERMINAL_RAW_ACTIVE.swap(false, Ordering::SeqCst) {
+                if let Ok(mut tty) = open_tty_writer() {
+                    let _ = execute!(tty, Show, LeaveAlternateScreen);
+                    let _ = tty.flush();
+                }
+                let _ = disable_raw_mode();
+            }
+            prev(info);
+        }));
+    });
 }
 
-impl RawTtyGuard {
-    fn enter() -> Result<(Self, File, File)> {
-        let tty_probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .context("Interactive ranking requires an attached terminal (/dev/tty)")?;
-        let stty_out = Command::new("stty")
-            .arg("-g")
-            .stdin(Stdio::from(tty_probe))
-            .output()
-            .context("Failed to query terminal settings via stty")?;
-        if !stty_out.status.success() {
-            anyhow::bail!("stty -g failed on /dev/tty");
+struct TerminalSession<W: Write> {
+    terminal: Terminal<CrosstermBackend<W>>,
+}
+
+impl<W: Write> TerminalSession<W> {
+    fn enter(writer: W) -> Result<Self> {
+        install_terminal_panic_hook();
+        let backend = CrosstermBackend::new(writer);
+        let mut terminal =
+            Terminal::new(backend).context("Failed to initialize Ratatui terminal")?;
+        enable_raw_mode().context("Failed to enable terminal raw mode")?;
+        TERMINAL_RAW_ACTIVE.store(true, Ordering::SeqCst);
+        if let Err(err) = execute!(terminal.backend_mut(), EnterAlternateScreen, Hide) {
+            TERMINAL_RAW_ACTIVE.store(false, Ordering::SeqCst);
+            let _ = disable_raw_mode();
+            return Err(err).context("Failed to enter alternate screen");
         }
-        let saved_stty = String::from_utf8_lossy(&stty_out.stdout).trim().to_owned();
-        // Construct guard immediately so any failure below restores terminal state via Drop.
-        let guard = Self { saved_stty };
-
-        let tty_raw = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-        // Include `-isig` so Ctrl+C delivers byte 0x03 (`RankKey::Cancel`) and unwinds cleanly
-        // through `RawTtyGuard::drop` instead of killing the process with an un-restored TTY.
-        let status = Command::new("stty")
-            .args(["-icanon", "-echo", "-isig", "min", "1", "time", "0"])
-            .stdin(Stdio::from(tty_raw))
-            .status()
-            .context("Failed to enable non-canonical mode via stty")?;
-        if !status.success() {
-            anyhow::bail!("stty raw mode configuration failed");
+        if let Err(err) = terminal.clear() {
+            TERMINAL_RAW_ACTIVE.store(false, Ordering::SeqCst);
+            let _ = execute!(terminal.backend_mut(), Show, LeaveAlternateScreen);
+            let _ = terminal.backend_mut().flush();
+            let _ = disable_raw_mode();
+            return Err(err).context("Failed to clear alternate screen");
         }
-
-        let reader = OpenOptions::new().read(true).open("/dev/tty")?;
-        let mut writer = OpenOptions::new().write(true).open("/dev/tty")?;
-        writer.write_all(b"\x1b[?1049h\x1b[?25l")?;
-        writer.flush()?;
-
-        Ok((guard, reader, writer))
+        Ok(Self { terminal })
     }
 }
 
-impl Drop for RawTtyGuard {
+impl<W: Write> Drop for TerminalSession<W> {
     fn drop(&mut self) {
-        if let Ok(mut writer) = OpenOptions::new().write(true).open("/dev/tty") {
-            let _ = writer.write_all(b"\x1b[?25h\x1b[?1049l");
-            let _ = writer.flush();
-        }
-        if !self.saved_stty.is_empty()
-            && let Ok(tty) = OpenOptions::new().read(true).write(true).open("/dev/tty")
-        {
-            let _ = Command::new("stty").arg(&self.saved_stty).stdin(Stdio::from(tty)).status();
-        }
+        TERMINAL_RAW_ACTIVE.store(false, Ordering::SeqCst);
+        let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
+        let _ = self.terminal.backend_mut().flush();
+        let _ = disable_raw_mode();
     }
+}
+
+#[cfg(unix)]
+fn open_tty_writer() -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("Interactive ranking requires an attached terminal (/dev/tty)")
+}
+
+#[cfg(not(unix))]
+fn open_tty_writer() -> Result<std::io::Stdout> {
+    use std::io::IsTerminal;
+
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() || !std::io::stdin().is_terminal() {
+        anyhow::bail!("Interactive ranking requires an attached terminal");
+    }
+    Ok(stdout)
 }
 
 pub fn prompt_cluster_tty(
@@ -247,15 +361,18 @@ pub fn prompt_cluster_tty(
     iteration: usize,
     appended: usize,
 ) -> Result<ClusterRankOutcome> {
-    let (_guard, mut reader, mut writer) = RawTtyGuard::enter()?;
+    let writer = open_tty_writer()?;
+    let mut session = TerminalSession::enter(writer)?;
     let mut state = ClusterRankState::new(entries);
 
     loop {
-        let frame = state.render_ansi(collection_title, iteration, appended);
-        writer.write_all(frame.as_bytes())?;
-        writer.flush()?;
+        session.terminal.draw(|frame| state.draw(frame, collection_title, iteration, appended))?;
 
-        let Some(key) = read_next_key(&mut reader)? else {
+        let ev = event::read().context("Failed to read terminal event")?;
+        let Event::Key(key_event) = ev else {
+            continue;
+        };
+        let Some(key) = map_key_event(key_event) else {
             continue;
         };
         if key == RankKey::OpenUrl {
@@ -277,28 +394,50 @@ pub fn prompt_cluster_tty(
     }
 }
 
-fn read_next_key<R: Read>(reader: &mut R) -> Result<Option<RankKey>> {
-    let mut buf = [0u8; 64];
-    let n = reader.read(&mut buf)?;
-    if n == 0 {
-        return Ok(Some(RankKey::Cancel));
+#[must_use]
+fn map_key_event(event: KeyEvent) -> Option<RankKey> {
+    match event.kind {
+        KeyEventKind::Press => {}
+        KeyEventKind::Repeat => {
+            return match event.code {
+                KeyCode::Down | KeyCode::Char('j')
+                    if !event.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    Some(RankKey::Down)
+                }
+                KeyCode::Up | KeyCode::Char('k')
+                    if !event.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    Some(RankKey::Up)
+                }
+                _ => None,
+            };
+        }
+        KeyEventKind::Release => return None,
     }
-    Ok(parse_rank_key(&buf[..n]))
-}
 
-fn parse_rank_key(bytes: &[u8]) -> Option<RankKey> {
-    match bytes {
-        [b'j', ..] | b"\x1b[B" | b"\x1bOB" => Some(RankKey::Down),
-        [b'k', ..] | b"\x1b[A" | b"\x1bOA" => Some(RankKey::Up),
-        [b'J', ..] | b"\x1b[1;2B" => Some(RankKey::MoveDown),
-        [b'K', ..] | b"\x1b[1;2A" => Some(RankKey::MoveUp),
-        [d @ b'1'..=b'9', ..] => Some(RankKey::MoveTo(usize::from(d - b'0'))),
-        [b'=', ..] => Some(RankKey::TieWithAbove),
-        [b't', ..] => Some(RankKey::TieAll),
-        [b's', ..] => Some(RankKey::Skip),
-        [b'o', ..] => Some(RankKey::OpenUrl),
-        [b'\r' | b'\n', ..] => Some(RankKey::Submit),
-        [b'q' | 0x03 | 0x04, ..] | [0x1b] => Some(RankKey::Cancel),
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        return match event.code {
+            KeyCode::Char('c' | 'C' | 'd' | 'D') => Some(RankKey::Cancel),
+            _ => None,
+        };
+    }
+
+    let move_modifier = event.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+    match event.code {
+        KeyCode::Down if move_modifier => Some(RankKey::MoveDown),
+        KeyCode::Up if move_modifier => Some(RankKey::MoveUp),
+        KeyCode::Down | KeyCode::Char('j') => Some(RankKey::Down),
+        KeyCode::Up | KeyCode::Char('k') => Some(RankKey::Up),
+        KeyCode::Char('J') => Some(RankKey::MoveDown),
+        KeyCode::Char('K') => Some(RankKey::MoveUp),
+        KeyCode::Char(d @ '1'..='9') => Some(RankKey::MoveTo((d as u8 - b'0') as usize)),
+        KeyCode::Char('=') => Some(RankKey::TieWithAbove),
+        KeyCode::Char('t' | 'T') => Some(RankKey::TieAll),
+        KeyCode::Char('s' | 'S') => Some(RankKey::Skip),
+        KeyCode::Char('o' | 'O') => Some(RankKey::OpenUrl),
+        KeyCode::Enter => Some(RankKey::Submit),
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(RankKey::Cancel),
         _ => None,
     }
 }
@@ -317,35 +456,7 @@ fn validate_browser_open_url(raw: &str) -> Result<url::Url> {
 
 pub fn open_system_browser(url: &str) -> Result<()> {
     let parsed = validate_browser_open_url(url)?;
-    let safe_url = parsed.as_str();
-
-    #[cfg(target_os = "macos")]
-    let status = Command::new("open")
-        .arg(safe_url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let status = Command::new("xdg-open")
-        .arg(safe_url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    #[cfg(target_os = "windows")]
-    let status = Command::new("rundll32.exe")
-        .args(["url.dll,FileProtocolHandler", safe_url])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-
-    if !status.success() {
-        anyhow::bail!("Browser launcher exited with {status}");
-    }
+    open::that_detached(parsed.as_str()).context("Failed to launch system browser")?;
     Ok(())
 }
 
@@ -353,10 +464,36 @@ fn sanitize_line(input: &str) -> String {
     input.chars().filter(|c| !c.is_control()).collect()
 }
 
+fn word_wrapped_rows(text: &str, width: usize) -> usize {
+    let max_w = width.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            rows += wlen.saturating_sub(1) / max_w;
+            col = wlen % max_w;
+            if col == 0 && wlen > 0 {
+                col = max_w;
+            }
+        } else if col + 1 + wlen <= max_w {
+            col += 1 + wlen;
+        } else {
+            rows += 1 + wlen.saturating_sub(1) / max_w;
+            col = wlen % max_w;
+            if col == 0 && wlen > 0 {
+                col = max_w;
+            }
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use chrono::Utc;
+    use ratatui::backend::TestBackend;
 
     use super::*;
     use crate::db::EntryKind;
@@ -457,14 +594,97 @@ mod tests {
     }
 
     #[test]
-    fn test_read_next_key_consumes_long_escape_sequence_without_splitting_into_digits() {
-        use std::io::Cursor;
+    fn test_map_key_event_handles_modifiers_and_ignores_release_or_unknown() {
+        assert_eq!(
+            map_key_event(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            )),
+            Some(RankKey::Submit)
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new_with_kind(
+                KeyCode::Up,
+                KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            )),
+            Some(RankKey::MoveUp)
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new_with_kind(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )),
+            Some(RankKey::Cancel)
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new_with_kind(
+                KeyCode::Char('3'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            None
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new_with_kind(
+                KeyCode::F(5),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+            None
+        );
+    }
 
-        // xterm `modifyOtherKeys=2` Shift+Enter (`\x1b[27;2;13~`, 10 bytes) must be read in one shot
-        // and ignored (`None`), never leaving trailing `3~` bytes that trigger `MoveTo(3)`.
-        let mut cursor = Cursor::new(b"\x1b[27;2;13~".to_vec());
-        assert_eq!(read_next_key(&mut cursor).unwrap(), None);
-        assert_eq!(cursor.position(), 10);
-        assert_eq!(read_next_key(&mut cursor).unwrap(), Some(RankKey::Cancel));
+    #[test]
+    fn test_ratatui_render_displays_ties_and_status_note() {
+        let mut state = ClusterRankState::new(vec![
+            sample_entry("a", "OK Computer"),
+            sample_entry("b", "Kid A"),
+        ]);
+        state.apply_key(RankKey::Down);
+        state.apply_key(RankKey::TieWithAbove);
+        state.set_status_note("Opened https://example.com");
+
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| state.draw(frame, "Albums", 0, 2)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("Roche Rank"));
+        assert!(rendered.contains("OK Computer"));
+        assert!(rendered.contains("Kid A"));
+        assert!(rendered.contains("[=]"));
+        assert!(rendered.contains("Opened https://example.com"));
+    }
+
+    #[test]
+    fn test_ratatui_render_narrow_terminal_preserves_footer_and_note() {
+        let mut state = ClusterRankState::new(vec![
+            sample_entry("a", "OK Computer"),
+            sample_entry("b", "Kid A"),
+        ]);
+        state.set_status_note("No URL on focused entry");
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| state.draw(frame, "Albums", 0, 0)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("q quit"));
+        assert!(rendered.contains("No URL on focused entry"));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO activity_log (entity_type, entity_id, action, timestamp)\n             VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "5b91fe8508c4e7924ea2c270a33e79270abcee319709e6b1fb551a40df2b2afc"
+}

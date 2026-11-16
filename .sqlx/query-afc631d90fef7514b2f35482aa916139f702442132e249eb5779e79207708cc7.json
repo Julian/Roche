@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM collection_entries\n                 WHERE entry_id = ?\n                   AND (\n                       collection_id IN (?, ?)\n                       OR collection_id IN (\n                           SELECT collection_id FROM collection_specs WHERE collection_role = 'tag'\n                       )\n                   )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "afc631d90fef7514b2f35482aa916139f702442132e249eb5779e79207708cc7"
+}

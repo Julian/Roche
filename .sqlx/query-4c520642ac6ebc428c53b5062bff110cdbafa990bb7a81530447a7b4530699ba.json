@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_used_at FROM device_tokens WHERE token = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_used_at",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_tokens",
+            "name": "last_used_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "4c520642ac6ebc428c53b5062bff110cdbafa990bb7a81530447a7b4530699ba"
+}

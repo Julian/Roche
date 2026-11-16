@@ -32,7 +32,7 @@ impl NetworkTier {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerNode {
     pub peer_id: String,
     pub device_name: String,
@@ -235,7 +235,7 @@ impl SyncRepo<'_> {
     ) -> Result<()> {
         let clamped_weight =
             if network_tier == NetworkTier::Offline { 0.0 } else { weight.clamp(0.0, 10.0) };
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
@@ -243,12 +243,12 @@ impl SyncRepo<'_> {
                  network_tier = excluded.network_tier,
                  weight = excluded.weight,
                  last_seen_at = excluded.last_seen_at",
+            peer_id,
+            device_name,
+            network_tier as _,
+            clamped_weight,
+            now as _,
         )
-        .bind(peer_id)
-        .bind(device_name)
-        .bind(network_tier)
-        .bind(clamped_weight)
-        .bind(now)
         .execute(self.pool)
         .await?;
         Ok(())
@@ -256,13 +256,18 @@ impl SyncRepo<'_> {
 
     pub async fn list_active_peers(&self, now: DateTime<Utc>) -> Result<Vec<PeerNode>> {
         let cutoff = now - chrono::Duration::minutes(PEER_LEASE_TTL_MINUTES);
-        Ok(sqlx::query_as::<_, PeerNode>(
-            "SELECT peer_id, device_name, network_tier, weight, last_seen_at
+        Ok(sqlx::query_as!(
+            PeerNode,
+            "SELECT peer_id,
+                    device_name,
+                    network_tier AS \"network_tier: NetworkTier\",
+                    weight,
+                    last_seen_at AS \"last_seen_at: DateTime<Utc>\"
              FROM peer_nodes
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', last_seen_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
              ORDER BY peer_id ASC",
+            cutoff as _,
         )
-        .bind(cutoff)
         .fetch_all(self.pool)
         .await?)
     }
@@ -271,18 +276,19 @@ impl SyncRepo<'_> {
         conn: &mut SqliteConnection,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query(
+        let wifi_tier = NetworkTier::Wifi;
+        sqlx::query!(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
                  device_name = excluded.device_name,
                  last_seen_at = excluded.last_seen_at",
+            SERVER_PEER_ID,
+            "Roche Headless Peer",
+            wifi_tier as _,
+            DEFAULT_ONLINE_PEER_WEIGHT,
+            now as _,
         )
-        .bind(SERVER_PEER_ID)
-        .bind("Roche Headless Peer")
-        .bind(NetworkTier::Wifi)
-        .bind(DEFAULT_ONLINE_PEER_WEIGHT)
-        .bind(now)
         .execute(conn)
         .await?;
         Ok(())
@@ -297,7 +303,7 @@ impl SyncRepo<'_> {
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
         let initial_weight = measured_weight.unwrap_or_else(|| network_tier.default_weight());
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(peer_id) DO UPDATE SET
@@ -310,14 +316,14 @@ impl SyncRepo<'_> {
                      ELSE excluded.weight
                  END,
                  last_seen_at = excluded.last_seen_at",
+            peer_id,
+            device_name,
+            network_tier as _,
+            initial_weight,
+            now as _,
+            measured_weight as _,
+            measured_weight as _,
         )
-        .bind(peer_id)
-        .bind(device_name)
-        .bind(network_tier)
-        .bind(initial_weight)
-        .bind(now)
-        .bind(measured_weight)
-        .bind(measured_weight)
         .execute(conn)
         .await?;
         Ok(())

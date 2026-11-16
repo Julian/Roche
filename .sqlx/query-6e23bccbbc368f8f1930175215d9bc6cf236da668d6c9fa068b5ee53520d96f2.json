@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT inbox_state as \"inbox_state!\",\n                      read_at as \"read_at?: DateTime<Utc>\",\n                      progress as \"progress!: f64\",\n                      interaction_updated_at as \"interaction_updated_at?: DateTime<Utc>\"\n               FROM entry_state WHERE entry_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "inbox_state!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "inbox_state"
+          }
+        }
+      },
+      {
+        "name": "read_at?: DateTime<Utc>",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "read_at"
+          }
+        }
+      },
+      {
+        "name": "progress!: f64",
+        "ordinal": 2,
+        "type_info": "Float",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "progress"
+          }
+        }
+      },
+      {
+        "name": "interaction_updated_at?: DateTime<Utc>",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "interaction_updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "6e23bccbbc368f8f1930175215d9bc6cf236da668d6c9fa068b5ee53520d96f2"
+}

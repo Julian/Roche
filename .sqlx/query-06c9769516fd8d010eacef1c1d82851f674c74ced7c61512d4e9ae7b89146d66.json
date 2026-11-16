@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT title as \"title!\", id as \"id!\" FROM entries\n               WHERE kind = 'artist' AND merged_into_id IS NULL\n               ORDER BY updated_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "title!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "id!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "06c9769516fd8d010eacef1c1d82851f674c74ced7c61512d4e9ae7b89146d66"
+}

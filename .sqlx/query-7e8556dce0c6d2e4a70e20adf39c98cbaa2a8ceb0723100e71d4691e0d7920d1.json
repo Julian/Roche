@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries\n             SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,\n                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,\n                 summary = COALESCE(summary, ?),\n                 updated_at = ?\n             WHERE id = ?\n               AND ((title = url AND ? IS NOT NULL)\n                    OR (creators_json = '[]' AND ? IS NOT NULL)\n                    OR (summary IS NULL AND ? IS NOT NULL))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "7e8556dce0c6d2e4a70e20adf39c98cbaa2a8ceb0723100e71d4691e0d7920d1"
+}

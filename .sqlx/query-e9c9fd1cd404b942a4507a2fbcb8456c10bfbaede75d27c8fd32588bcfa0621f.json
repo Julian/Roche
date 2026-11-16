@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.url,\n                    (SELECT fs.feed_url\n                     FROM collection_entries ce\n                     JOIN feed_sources fs ON fs.collection_id = ce.collection_id\n                     WHERE ce.entry_id = e.id\n                     ORDER BY ce.added_at ASC, ce.collection_id ASC\n                     LIMIT 1) AS \"feed_url?: String\"\n             FROM entries e\n             JOIN entry_state es ON es.entry_id = e.id\n             WHERE e.id = ? AND es.inbox_state IN ('unread', 'dismissed')",
+  "describe": {
+    "columns": [
+      {
+        "name": "url",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "name": "feed_url?: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "e9c9fd1cd404b942a4507a2fbcb8456c10bfbaede75d27c8fd32588bcfa0621f"
+}

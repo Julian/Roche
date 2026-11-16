@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!\", entry_id as \"entry_id!\", ts as \"ts!: DateTime<Utc>\",\n                      status as \"status!: ConsumptionStatus\", notes as \"notes?\",\n                      created_at as \"created_at!: DateTime<Utc>\"\n               FROM consumption_log\n               WHERE entry_id = ?\n               ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) DESC, id DESC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "entry_id!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "entry_id"
+          }
+        }
+      },
+      {
+        "name": "ts!: DateTime<Utc>",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "ts"
+          }
+        }
+      },
+      {
+        "name": "status!: ConsumptionStatus",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "name": "notes?",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "notes"
+          }
+        }
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "4d764f8b16b9765a54d7dcdfffe875389e6e3948f1bc0b5573740a4c419bf04e"
+}

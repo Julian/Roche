@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)\n         VALUES (?, ?, '2026-01-01 08:30:00+00:00', 'consumed', 'Morning read', '2026-01-01 08:30:00+00:00')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "512d579e08e82ba23de97950e0fb0578cc93aebaa848f6cbfc202172749ffceb"
+}

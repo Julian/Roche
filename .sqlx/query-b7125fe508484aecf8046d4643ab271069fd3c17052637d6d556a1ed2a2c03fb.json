@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_content (entry_id, content_html, content_type)\n                 VALUES (?, ?, ?)\n                 ON CONFLICT(entry_id) DO UPDATE SET\n                     content_html = excluded.content_html,\n                     content_type = excluded.content_type",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "b7125fe508484aecf8046d4643ab271069fd3c17052637d6d556a1ed2a2c03fb"
+}

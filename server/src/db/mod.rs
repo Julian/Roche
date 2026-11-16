@@ -90,6 +90,7 @@ impl Db {
 
         prepare_pre_v010_schema_if_needed(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        verify_foreign_key_integrity(&pool).await?;
         if let Some(file_path) = file_path_for_perms {
             tighten_sqlite_sidecar_permissions(file_path).await;
         }
@@ -121,68 +122,72 @@ impl Db {
     }
 
     async fn canonicalize_entry_url_identifiers(&self) -> Result<()> {
-        let entry_urls: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, url FROM entries
+        let entry_urls = sqlx::query!(
+            "SELECT id, url AS \"url!: String\" FROM entries
              WHERE url IS NOT NULL AND TRIM(url) != '' AND merged_into_id IS NULL",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let feed_urls: Vec<(String, String)> = sqlx::query_as(
+        let feed_urls = sqlx::query!(
             "SELECT collection_id, feed_url FROM feed_sources WHERE TRIM(feed_url) != ''",
         )
         .fetch_all(&self.pool)
         .await?;
 
         let mut tx = self.pool.begin().await?;
-        for (entry_id, raw_url) in entry_urls {
+        for row in entry_urls {
+            let entry_id = row.id;
+            let raw_url = row.url;
             let canon = sync::canonicalize_sync_url(&raw_url);
             if canon.is_empty() {
                 continue;
             }
             let legacy_lower = raw_url.trim().to_lowercase();
             if legacy_lower != canon {
-                sqlx::query(
+                sqlx::query!(
                     "DELETE FROM entry_identifiers
                      WHERE entry_id = ? AND scheme = 'url' AND value = ?",
+                    entry_id,
+                    legacy_lower,
                 )
-                .bind(&entry_id)
-                .bind(&legacy_lower)
                 .execute(&mut *tx)
                 .await?;
             }
-            sqlx::query(
+            sqlx::query!(
                 "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
                  VALUES ('url', ?, ?)",
+                canon,
+                entry_id,
             )
-            .bind(&canon)
-            .bind(&entry_id)
             .execute(&mut *tx)
             .await?;
         }
 
-        for (collection_id, raw_feed_url) in feed_urls {
+        for row in feed_urls {
+            let collection_id = row.collection_id;
+            let raw_feed_url = row.feed_url;
             let canon = sync::canonicalize_sync_url(&raw_feed_url);
             if canon.is_empty() {
                 continue;
             }
             let legacy_lower = raw_feed_url.trim().to_lowercase();
             if legacy_lower != canon {
-                sqlx::query(
+                sqlx::query!(
                     "DELETE FROM entry_identifiers
                      WHERE entry_id = ? AND scheme = 'feed_url' AND value = ?",
+                    collection_id,
+                    legacy_lower,
                 )
-                .bind(&collection_id)
-                .bind(&legacy_lower)
                 .execute(&mut *tx)
                 .await?;
             }
-            sqlx::query(
+            sqlx::query!(
                 "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
                  VALUES ('feed_url', ?, ?)",
+                canon,
+                collection_id,
             )
-            .bind(&canon)
-            .bind(&collection_id)
             .execute(&mut *tx)
             .await?;
         }
@@ -224,21 +229,22 @@ impl Db {
     }
 
     async fn is_maintenance_completed(&self, task_name: &str) -> Result<bool> {
-        let found: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM maintenance_runs WHERE task_name = ? LIMIT 1")
-                .bind(task_name)
-                .fetch_optional(&self.pool)
-                .await?;
+        let found = sqlx::query_scalar!(
+            "SELECT 1 AS \"found!: i64\" FROM maintenance_runs WHERE task_name = ? LIMIT 1",
+            task_name,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(found.is_some())
     }
 
     async fn record_maintenance_completed(&self, task_name: &str) -> Result<()> {
         let completed_at = SyncRepo::now_utc().to_rfc3339();
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR REPLACE INTO maintenance_runs (task_name, completed_at) VALUES (?, ?)",
+            task_name,
+            completed_at,
         )
-        .bind(task_name)
-        .bind(completed_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -290,8 +296,8 @@ impl Db {
 /// before `010_unified_entries_model.sql` migrates `tags` into `collection_specs(slug = 'tag:' || LOWER(TRIM(name)))`,
 /// preserving the committed `010` migration checksum while preventing `UNIQUE` slug crashes.
 pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Result<()> {
-    let has_legacy_tags: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tags' LIMIT 1",
+    let has_legacy_tags = sqlx::query_scalar!(
+        "SELECT 1 AS \"found!: i64\" FROM sqlite_master WHERE type = 'table' AND name = 'tags' LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
@@ -347,6 +353,20 @@ pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Resu
     Ok(())
 }
 
+/// Verifies `PRAGMA foreign_key_check` reports zero orphaned foreign-key references after migrations.
+pub(crate) async fn verify_foreign_key_integrity(pool: &SqlitePool) -> Result<()> {
+    let violations: Vec<(String, Option<i64>, String, i64)> =
+        sqlx::query_as("PRAGMA foreign_key_check").fetch_all(pool).await?;
+    if !violations.is_empty() {
+        anyhow::bail!(
+            "SQLite foreign_key_check failed with {} violation(s): {:?}",
+            violations.len(),
+            violations.first()
+        );
+    }
+    Ok(())
+}
+
 /// Verifies `entries_fts` integrity against `entries` + `entry_content` and rebuilds the FTS5 index when needed.
 ///
 /// Rebuilds automatically if implicit `rowid` compaction (e.g. from an external SQLite `VACUUM`
@@ -358,19 +378,18 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
         .is_ok();
 
     let desynced = if btree_ok {
-        let mismatch: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
+        sqlx::query_scalar!(
+            "SELECT (EXISTS (
                  SELECT 1 FROM entries e
                  LEFT JOIN entries_fts f ON f.rowid = e.rowid AND f.entry_id = e.id
                  WHERE e.merged_into_id IS NULL AND f.rowid IS NULL
              ) OR (
                  (SELECT COUNT(*) FROM entries_fts) !=
                  (SELECT COUNT(*) FROM entries WHERE merged_into_id IS NULL)
-             )",
+             )) AS \"mismatch!: bool\"",
         )
         .fetch_one(pool)
-        .await?;
-        mismatch
+        .await?
     } else {
         true
     };
@@ -383,8 +402,8 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
         "entries_fts integrity/rowid check failed (likely after external VACUUM); rebuilding FTS5 index"
     );
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM entries_fts").execute(&mut *tx).await?;
-    sqlx::query(
+    sqlx::query!("DELETE FROM entries_fts").execute(&mut *tx).await?;
+    sqlx::query!(
         "INSERT INTO entries_fts (rowid, entry_id, title, creators, summary, content_html)
          SELECT e.rowid, e.id, e.title, e.creators_json, COALESCE(e.summary, ''), COALESCE(ec.content_html, '')
          FROM entries e
@@ -422,10 +441,11 @@ mod tests {
 
         // 1. Initial connect creates maintenance_runs records for all startup tasks
         let db1 = Db::connect(&db_path).await.unwrap();
-        let recorded_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM maintenance_runs")
-            .fetch_one(db1.pool())
-            .await
-            .unwrap();
+        let recorded_count =
+            sqlx::query_scalar!("SELECT COUNT(*) AS \"count!: i64\" FROM maintenance_runs")
+                .fetch_one(db1.pool())
+                .await
+                .unwrap();
         assert_eq!(recorded_count, 3);
 
         // Simulate a pre-009 database with unnormalized HTML summary and missing thumbnail
@@ -445,7 +465,7 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query("DELETE FROM maintenance_runs").execute(db1.pool()).await.unwrap();
+        sqlx::query!("DELETE FROM maintenance_runs").execute(db1.pool()).await.unwrap();
         db1.pool().close().await;
         drop(db1);
 
@@ -455,12 +475,15 @@ mod tests {
         assert_eq!(normalized_item.summary.as_deref(), Some("Legacy & HTML summary"));
         assert_eq!(normalized_item.thumbnail_url.as_deref(), Some("https://example.com/hero.jpg"));
 
-        let first_runs: Vec<(String, String)> = sqlx::query_as(
+        let first_runs: Vec<(String, String)> = sqlx::query!(
             "SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC",
         )
         .fetch_all(db2.pool())
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.task_name, r.completed_at))
+        .collect();
         assert_eq!(first_runs.len(), 3);
 
         // Inject raw unnormalized state while maintenance_runs already marks both tasks completed
@@ -478,15 +501,14 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query(
+        sqlx::query!(
             "UPDATE entry_content SET content_html = '<img src=\"https://example.com/skip.jpg\"/>' WHERE entry_id = ?",
+            item2.id,
         )
-        .bind(&item2.id)
         .execute(db2.pool())
         .await
         .unwrap();
-        sqlx::query("UPDATE entries SET thumbnail_url = NULL WHERE id = ?")
-            .bind(&item2.id)
+        sqlx::query!("UPDATE entries SET thumbnail_url = NULL WHERE id = ?", item2.id)
             .execute(db2.pool())
             .await
             .unwrap();
@@ -502,12 +524,15 @@ mod tests {
         );
         assert!(untouched.thumbnail_url.is_none());
 
-        let second_runs: Vec<(String, String)> = sqlx::query_as(
+        let second_runs: Vec<(String, String)> = sqlx::query!(
             "SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC",
         )
         .fetch_all(db3.pool())
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.task_name, r.completed_at))
+        .collect();
         assert_eq!(second_runs, first_runs);
 
         db3.pool().close().await;
@@ -577,24 +602,29 @@ mod tests {
         // preserves `rowid` during in-process `VACUUM`, so if `min(rowid)` is still > 1 after
         // `VACUUM`, compact `rowid` directly to reproduce the exact trigger-bypassing desync.
         sqlx::query("VACUUM").execute(db.pool()).await.unwrap();
-        let fts_rowid_2: i64 =
-            sqlx::query_scalar("SELECT rowid FROM entries_fts WHERE entry_id = ?")
-                .bind(&item2.id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        let entry_rowid_2: i64 = sqlx::query_scalar("SELECT rowid FROM entries WHERE id = ?")
-            .bind(&item2.id)
-            .fetch_one(db.pool())
+        let fts_rowid_2 = sqlx::query_scalar!(
+            "SELECT rowid AS \"rowid!: i64\" FROM entries_fts WHERE entry_id = ?",
+            item2.id,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let entry_rowid_2 = sqlx::query_scalar!(
+            "SELECT rowid AS \"rowid!: i64\" FROM entries WHERE id = ?",
+            item2.id,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if entry_rowid_2 == fts_rowid_2 {
+            sqlx::query!(
+                "UPDATE entries SET rowid = rowid - 1 WHERE id IN (?, ?)",
+                item2.id,
+                item3.id,
+            )
+            .execute(db.pool())
             .await
             .unwrap();
-        if entry_rowid_2 == fts_rowid_2 {
-            sqlx::query("UPDATE entries SET rowid = rowid - 1 WHERE id IN (?, ?)")
-                .bind(&item2.id)
-                .bind(&item3.id)
-                .execute(db.pool())
-                .await
-                .unwrap();
         }
 
         // Before self-healing, `items_fts` rowid=3 (`item3`) no longer matches any `items.rowid`.
@@ -742,7 +772,7 @@ mod tests {
         .unwrap();
 
         // Mark legacy HTML/thumbnail maintenance done while allowing URL canonicalization to run
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO maintenance_runs (task_name, completed_at) VALUES
                 ('normalize_legacy_html_summaries', '2026-01-01T00:00:00Z'),
                 ('backfill_missing_thumbnails', '2026-01-01T00:00:00Z')",
@@ -842,6 +872,181 @@ mod tests {
                 tokio::fs::metadata(&wal_path).await.unwrap().permissions().mode() & 0o777;
             assert_eq!(wal_mode, 0o600);
         }
+
+        db.pool().close().await;
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_v012_strict_tables_enforced_and_migration_preserves_fks_and_fts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-v012-strict-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let db_path = temp_dir.join("roche.db");
+
+        // 1. Connect manually and apply migrations up to 011, then populate rows with rowid gaps,
+        //    foreign keys, FTS content, and pruned high-watermark activity_log sqlite_sequence.
+        let pre_opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pre_pool =
+            SqlitePoolOptions::new().max_connections(1).connect_with(pre_opts).await.unwrap();
+        let mut migrator_v11 = sqlx::migrate!("./migrations");
+        migrator_v11.migrations.to_mut().retain(|m| m.version <= 11);
+        migrator_v11.run(&pre_pool).await.unwrap();
+
+        sqlx::query!(
+            "INSERT INTO entries (id, kind, title, summary)
+             VALUES ('ephemeral-gap-row', 'article', 'Gap Row', 'Deleted before 012')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO entries (id, kind, title, url, release_year, summary)
+             VALUES ('strict-entry-1', 'article', 'Strict Migration Essay',
+                     'https://example.com/strict-1', 2026, 'Verifying rowid FTS alignment')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!("DELETE FROM entries WHERE id = 'ephemeral-gap-row'")
+            .execute(&pre_pool)
+            .await
+            .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES ('strict-entry-1', '<p>Uniquestrictftstoken body paragraph</p>', 'article')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO entry_state (entry_id, inbox_state, progress)
+             VALUES ('strict-entry-1', 'unread', 0.4)",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO entry_identifiers (scheme, value, entry_id)
+             VALUES ('url', 'https://example.com/strict-1', 'strict-entry-1')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO consumption_log (id, entry_id, ts, status)
+             VALUES ('log-strict-1', 'strict-entry-1', '2026-06-01T12:00:00+00:00', 'started')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+
+        // Advance activity_log sqlite_sequence to 77 and delete the high row so MAX(id) < seq.
+        sqlx::query!(
+            "INSERT INTO activity_log (id, entity_type, entity_id, action)
+             VALUES (1, 'item', 'strict-entry-1', 'create'),
+                    (77, 'item', 'ephemeral-gap-row', 'delete')",
+        )
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query!("DELETE FROM activity_log WHERE id = 77").execute(&pre_pool).await.unwrap();
+
+        // Apply 012_strict_tables.sql directly before Db::connect so we verify 012 itself
+        // preserved FTS rowid alignment without needing verify_and_heal_fts_index to rebuild.
+        sqlx::migrate!("./migrations").run(&pre_pool).await.unwrap();
+
+        assert!(
+            !verify_and_heal_fts_index(&pre_pool).await.unwrap(),
+            "012_strict_tables.sql must preserve entries.rowid <-> entries_fts alignment without rebuild"
+        );
+
+        let seq_after_v12 = sqlx::query_scalar!(
+            "SELECT CAST(seq AS INTEGER) AS \"seq!: i64\"
+             FROM sqlite_sequence
+             WHERE name = 'activity_log'",
+        )
+        .fetch_one(&pre_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seq_after_v12, 77,
+            "012_strict_tables.sql must preserve sqlite_sequence high-water mark for activity_log"
+        );
+
+        pre_pool.close().await;
+        drop(pre_pool);
+
+        // 2. Connect via Db::connect and verify (a) all 17 regular tables end with STRICT,
+        //    (b) wrong storage class is rejected, and (c) FK check + FTS + sequence work end-to-end.
+        let db = Db::connect(&db_path).await.unwrap();
+
+        let regular_tables = sqlx::query!(
+            "SELECT name AS \"name!: String\", sql AS \"sql!: String\"
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name NOT IN ('sqlite_sequence', '_sqlx_migrations')
+               AND name NOT LIKE 'entries_fts%'
+             ORDER BY name ASC",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(regular_tables.len(), 17, "Expected all 17 regular tables in schema");
+        for tbl in &regular_tables {
+            let trimmed_ddl = tbl.sql.trim().trim_end_matches(';').trim_end();
+            assert!(
+                trimmed_ddl.ends_with("STRICT"),
+                "Table '{}' DDL must end with STRICT, got: {}",
+                tbl.name,
+                tbl.sql
+            );
+        }
+
+        let bad_storage_class = sqlx::query(
+            "INSERT INTO entries (id, kind, title, release_year)
+             VALUES ('invalid-strict-entry', 'movie', 'Wrong Storage Class', 'not-an-int')",
+        )
+        .execute(db.pool())
+        .await;
+        assert!(
+            bad_storage_class.is_err(),
+            "SQLite STRICT must reject inserting TEXT 'not-an-int' into INTEGER column entries.release_year"
+        );
+
+        let fk_violations =
+            sqlx::query("PRAGMA foreign_key_check").fetch_all(db.pool()).await.unwrap();
+        assert!(
+            fk_violations.is_empty(),
+            "PRAGMA foreign_key_check must return 0 rows after 012 migration"
+        );
+
+        let fts_hits = db
+            .items()
+            .list_filtered_page(&ItemFilter {
+                search: Some("uniquestrictftstoken".to_owned()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(fts_hits.items.len(), 1);
+        assert_eq!(fts_hits.items[0].id, "strict-entry-1");
+
+        sqlx::query!(
+            "INSERT INTO activity_log (entity_type, entity_id, action)
+             VALUES ('item', 'strict-entry-1', 'update')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let next_activity_id = db.sync().latest_activity_id().await.unwrap();
+        assert_eq!(next_activity_id, 78);
 
         db.pool().close().await;
         drop(db);

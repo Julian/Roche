@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE feed_sources\n             SET last_error = ?, last_error_by = ?, last_polled_at = ?\n             WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "166cffdd440ff9c5d33e8a4ad6eedc30bff696b0c4108d280610814488b5a1b5"
+}

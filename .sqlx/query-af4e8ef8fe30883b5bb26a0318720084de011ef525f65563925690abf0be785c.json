@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries\n                         SET title = ?,\n                             creators_json = ?,\n                             url = ?,\n                             release_year = ?,\n                             thumbnail_url = ?,\n                             metadata_json = ?,\n                             updated_at = ?\n                         WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "af4e8ef8fe30883b5bb26a0318720084de011ef525f65563925690abf0be785c"
+}

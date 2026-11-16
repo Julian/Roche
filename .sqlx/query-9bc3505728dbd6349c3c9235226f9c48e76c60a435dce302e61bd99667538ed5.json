@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_content (entry_id, content_html, content_type)\n             VALUES ('strict-entry-1', '<p>Uniquestrictftstoken body paragraph</p>', 'article')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "9bc3505728dbd6349c3c9235226f9c48e76c60a435dce302e61bd99667538ed5"
+}

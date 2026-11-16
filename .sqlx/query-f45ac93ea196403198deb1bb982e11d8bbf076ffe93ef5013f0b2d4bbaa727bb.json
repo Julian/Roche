@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries SET thumbnail_url = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "f45ac93ea196403198deb1bb982e11d8bbf076ffe93ef5013f0b2d4bbaa727bb"
+}

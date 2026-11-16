@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE feed_sources\n                 SET is_active = 1,\n                     feed_title = COALESCE(?, feed_title)\n                 WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2dc051e7ae1f0531b018e300edd0858b1d3f02dc72adfa354aa0197c977dc546"
+}

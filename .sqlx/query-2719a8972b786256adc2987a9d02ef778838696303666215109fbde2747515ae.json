@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT remote_url, duration FROM entry_media\n             WHERE entry_id = ? AND local_path IS NULL AND media_type = 'audio'\n             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "remote_url",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "remote_url"
+          }
+        }
+      },
+      {
+        "name": "duration",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "duration"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "2719a8972b786256adc2987a9d02ef778838696303666215109fbde2747515ae"
+}

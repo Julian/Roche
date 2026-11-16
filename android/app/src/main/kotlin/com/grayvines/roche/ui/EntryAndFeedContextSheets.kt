@@ -10,9 +10,11 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
@@ -71,6 +73,8 @@ fun EntryContextBottomSheet(
         Column(
             modifier =
                 Modifier.fillMaxWidth()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .testTag("context_bottom_sheet"),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -216,26 +220,7 @@ private fun ContextSheetActionsList(
             else -> "Download Local Offline Copy"
         }
 
-    if (isAudio) {
-        ContextActionItem(
-            label = "▶ Play Episode Now",
-            textColor = LocalRocheColors.current.accentBlue,
-            onClick = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = true)) },
-        )
-    }
-    ContextActionItem(
-        label = "✓ Finished & Log to Diary",
-        textColor = LocalRocheColors.current.accentVerdigris,
-        onClick = {
-            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = false))
-        },
-    )
-    ContextActionItem(
-        label = "★ Finish & Rank",
-        onClick = {
-            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = true))
-        },
-    )
+    ContextSheetPrimaryActions(entry = entry, isAudio = isAudio, onAction = onAction)
     ContextActionItem(
         label = "Play Next in Queue",
         onClick = { onAction(MainAction.AddToQueue(entryId = entry.id, playNext = true)) },
@@ -267,6 +252,38 @@ private fun ContextSheetActionsList(
     )
 }
 
+@Composable
+private fun ContextSheetPrimaryActions(
+    entry: InboxEntry,
+    isAudio: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    if (isAudio) {
+        ContextActionItem(
+            label = "▶ Play Episode Now",
+            textColor = LocalRocheColors.current.accentBlue,
+            onClick = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = true)) },
+        )
+        ContextActionItem(
+            label = "Open Full Show Notes in Reader",
+            onClick = { onAction(MainAction.OpenReader(entry.id, forceArticleView = true)) },
+        )
+    }
+    ContextActionItem(
+        label = "✓ Finished & Log to Diary",
+        textColor = LocalRocheColors.current.accentVerdigris,
+        onClick = {
+            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = false))
+        },
+    )
+    ContextActionItem(
+        label = "★ Finish & Rank",
+        onClick = {
+            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = true))
+        },
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FeedContextBottomSheet(
@@ -283,6 +300,8 @@ fun FeedContextBottomSheet(
         Column(
             modifier =
                 Modifier.fillMaxWidth()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .testTag("feed_context_bottom_sheet"),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -562,7 +581,11 @@ fun AddUrlOrFeedBottomSheet(
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surface) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+            modifier =
+                Modifier.fillMaxWidth()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(

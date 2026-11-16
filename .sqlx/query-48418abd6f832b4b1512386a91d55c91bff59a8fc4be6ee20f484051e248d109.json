@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries SET rowid = rowid - 1 WHERE id IN (?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "48418abd6f832b4b1512386a91d55c91bff59a8fc4be6ee20f484051e248d109"
+}

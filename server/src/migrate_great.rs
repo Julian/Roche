@@ -89,31 +89,18 @@ pub async fn migrate_great_database(
     pool_json: Option<&Path>,
     dry_run: bool,
 ) -> Result<MigrationStats> {
-    let great_toml = great_dir.join("great.toml");
-    if !great_toml.is_file() {
-        anyhow::bail!("No great.toml found in {}", great_dir.display());
-    }
+    let great_dir_owned = great_dir.to_path_buf();
+    let pool_json_owned = pool_json.map(Path::to_path_buf);
+    let preloaded = tokio::task::spawn_blocking(move || {
+        preload_great_data(&great_dir_owned, pool_json_owned.as_deref())
+    })
+    .await
+    .context("Great migration file preloader task panicked")??;
 
-    let custom_pool = if let Some(pool_path) = pool_json {
-        if !pool_path.is_file() {
-            anyhow::bail!("Missing 1001 albums pool JSON at {}", pool_path.display());
-        }
-        let raw = tokio::fs::read_to_string(pool_path)
-            .await
-            .with_context(|| format!("Failed to read {}", pool_path.display()))?;
-        let parsed: Vec<BundledAlbumEntry> = serde_json::from_str(&raw)
-            .with_context(|| format!("Invalid 1001 albums pool JSON in {}", pool_path.display()))?;
-        Some(parsed)
-    } else {
-        None
-    };
-    let pool_slice: &[BundledAlbumEntry] =
-        custom_pool.as_deref().unwrap_or_else(|| bundled_1001_albums());
-
-    let pool = open_migration_pool(db_path, dry_run).await?;
+    let (pool, dry_run_guard) = open_migration_pool(db_path, dry_run).await?;
     let mut tx = pool.begin().await?;
-    let mut migrator = GreatMigrator::new(&mut tx, great_dir, pool_slice);
-    let stats = migrator.run().await?;
+    let mut migrator = GreatMigrator::new(&mut tx);
+    let stats = migrator.run(preloaded).await?;
 
     if dry_run {
         tx.rollback().await?;
@@ -131,17 +118,67 @@ pub async fn migrate_great_database(
         tx.commit().await?;
     }
     pool.close().await;
+    if let Some(guard) = dry_run_guard {
+        let _ = tokio::fs::remove_dir_all(&guard.dir).await;
+    }
     Ok(stats)
 }
 
-async fn open_migration_pool(db_path: &Path, dry_run: bool) -> Result<SqlitePool> {
-    let db_str = db_path.to_str().unwrap_or_default();
-    let use_memory = dry_run && !db_str.starts_with("sqlite:") && !db_path.exists();
+struct DryRunTempDirGuard {
+    dir: PathBuf,
+}
 
+impl Drop for DryRunTempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn clone_db_for_dry_run(db_path: &Path) -> Result<(PathBuf, DryRunTempDirGuard)> {
+    let temp_dir =
+        std::env::temp_dir().join(format!("roche_great_dry_run_{}", uuid::Uuid::new_v4()));
+    crate::media::MediaStore::ensure_private_dir(&temp_dir).await?;
+    let guard = DryRunTempDirGuard { dir: temp_dir.clone() };
+    let cloned_db = temp_dir.join("roche.db");
+    crate::media::MediaStore::precreate_or_tighten_private_file(&cloned_db).await?;
+    tokio::fs::copy(db_path, &cloned_db)
+        .await
+        .with_context(|| format!("Failed to stage dry-run copy of {}", db_path.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut src_sidecar = db_path.as_os_str().to_os_string();
+        src_sidecar.push(suffix);
+        let src_sidecar_path = Path::new(&src_sidecar);
+        if tokio::fs::try_exists(src_sidecar_path).await.unwrap_or(false) {
+            let dst_sidecar = temp_dir.join(format!("roche.db{suffix}"));
+            crate::media::MediaStore::precreate_or_tighten_private_file(&dst_sidecar).await?;
+            tokio::fs::copy(src_sidecar_path, &dst_sidecar).await?;
+        }
+    }
+    Ok((cloned_db, guard))
+}
+
+async fn open_migration_pool(
+    db_path: &Path,
+    dry_run: bool,
+) -> Result<(SqlitePool, Option<DryRunTempDirGuard>)> {
+    let db_str = db_path.to_str().unwrap_or_default();
+    let db_exists =
+        !db_str.starts_with("sqlite:") && tokio::fs::try_exists(db_path).await.unwrap_or(false);
+    let use_memory = dry_run && !db_str.starts_with("sqlite:") && !db_exists;
+
+    let mut dry_run_guard = None;
     let file_path_for_perms =
         (!use_memory && !db_str.starts_with("sqlite:") && !dry_run).then_some(db_path);
     let connect_options = if use_memory {
         SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(30))
+    } else if dry_run && db_exists {
+        let (cloned_db, guard) = clone_db_for_dry_run(db_path).await?;
+        dry_run_guard = Some(guard);
+        SqliteConnectOptions::new()
+            .filename(cloned_db)
+            .create_if_missing(false)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(30))
     } else if db_str.starts_with("sqlite:") {
@@ -158,26 +195,24 @@ async fn open_migration_pool(db_path: &Path, dry_run: bool) -> Result<SqlitePool
             }
             crate::media::MediaStore::precreate_or_tighten_private_file(file_path).await?;
         }
-        let mut opts = SqliteConnectOptions::new()
+        SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(!dry_run)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(30));
-        if !dry_run {
-            opts = opts.journal_mode(SqliteJournalMode::Wal).synchronous(SqliteSynchronous::Normal);
-        }
-        opts
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(30))
     };
 
     let pool = SqlitePoolOptions::new().max_connections(1).connect_with(connect_options).await?;
 
-    let has_entries_table: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entries' LIMIT 1",
+    let has_entries_table = sqlx::query_scalar!(
+        r#"SELECT 1 as "found!: i64" FROM sqlite_master WHERE type = 'table' AND name = 'entries' LIMIT 1"#,
     )
     .fetch_optional(&pool)
     .await?;
-    let has_sqlx_migrations: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations' LIMIT 1",
+    let has_sqlx_migrations = sqlx::query_scalar!(
+        r#"SELECT 1 as "found!: i64" FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations' LIMIT 1"#,
     )
     .fetch_optional(&pool)
     .await?;
@@ -187,12 +222,13 @@ async fn open_migration_pool(db_path: &Path, dry_run: bool) -> Result<SqlitePool
     if has_entries_table.is_none() || has_sqlx_migrations.is_some() {
         prepare_pre_v010_schema_if_needed(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+        crate::db::verify_foreign_key_integrity(&pool).await?;
     }
     if let Some(file_path) = file_path_for_perms {
         crate::db::tighten_sqlite_sidecar_permissions(file_path).await;
     }
 
-    Ok(pool)
+    Ok((pool, dry_run_guard))
 }
 
 #[derive(Debug, Clone)]
@@ -407,10 +443,262 @@ struct GreatComparisonRecord {
     ordering: Vec<Vec<String>>,
 }
 
+#[derive(Debug)]
+struct PreloadedLogFile {
+    path: PathBuf,
+    records: Vec<(usize, GreatLogRecord)>,
+}
+
+#[derive(Debug)]
+struct PreloadedComparisonFile {
+    path: PathBuf,
+    stem: String,
+    records: Vec<(usize, GreatComparisonRecord)>,
+}
+
+#[derive(Debug)]
+struct PreloadedGreatData {
+    list_name_to_kind: HashMap<String, EntryKind>,
+    pool_albums: Option<Vec<BundledAlbumEntry>>,
+    user_items: Vec<RawGreatItem>,
+    want_items: Vec<(EntryKind, &'static str, Vec<RawGreatItem>)>,
+    albumsgenerator: Option<AlbumsGeneratorFile>,
+    antennapod: Option<AntennaPodFile>,
+    spotify: Option<SpotifySourceFile>,
+    log_files: Vec<PreloadedLogFile>,
+    comparisons: Vec<PreloadedComparisonFile>,
+    want_comparisons: Vec<PreloadedComparisonFile>,
+}
+
+fn preload_great_data(great_dir: &Path, pool_json: Option<&Path>) -> Result<PreloadedGreatData> {
+    let great_toml = great_dir.join("great.toml");
+    if !is_existing_file(&great_toml)? {
+        anyhow::bail!("No great.toml found in {}", great_dir.display());
+    }
+    let list_name_to_kind = load_great_config_lists(&great_toml)?;
+
+    let pool_albums = if let Some(pool_path) = pool_json {
+        if !is_existing_file(pool_path)? {
+            anyhow::bail!("Missing 1001 albums pool JSON at {}", pool_path.display());
+        }
+        let raw = std::fs::read_to_string(pool_path)
+            .with_context(|| format!("Failed to read {}", pool_path.display()))?;
+        let parsed: Vec<BundledAlbumEntry> = serde_json::from_str(&raw)
+            .with_context(|| format!("Invalid 1001 albums pool JSON in {}", pool_path.display()))?;
+        Some(parsed)
+    } else {
+        None
+    };
+
+    let mut user_items = Vec::new();
+    let items_dir = great_dir.join("items");
+    if is_existing_dir(&items_dir)? {
+        for kind in ORDERED_USER_ITEM_KINDS {
+            let Some(plural) = kind_plural(kind) else {
+                continue;
+            };
+            let path = items_dir.join(format!("{plural}.toml"));
+            user_items.extend(read_toml_items(&path, kind, true)?);
+        }
+    }
+
+    let mut want_items = Vec::new();
+    let want_dir = great_dir.join("want");
+    if is_existing_dir(&want_dir)? {
+        for (kind, plural, _) in KIND_PLURAL_PAIRS {
+            let path = want_dir.join(format!("{plural}.toml"));
+            let items = read_toml_items(&path, kind, true)?;
+            if !items.is_empty() {
+                want_items.push((kind, plural, items));
+            }
+        }
+    }
+
+    let sources_dir = great_dir.join("sources");
+    let (albumsgenerator, antennapod, spotify) = if is_existing_dir(&sources_dir)? {
+        (
+            read_optional_json::<AlbumsGeneratorFile>(&sources_dir.join("albumsgenerator.json"))?,
+            read_optional_json::<AntennaPodFile>(&sources_dir.join("antennapod.json"))?,
+            read_optional_json::<SpotifySourceFile>(&sources_dir.join("spotify.json"))?,
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let log_files = load_log_files(great_dir)?;
+    let comp_dir = great_dir.join("comparisons");
+    let comparisons = load_comparison_dir(&comp_dir)?;
+    let mut want_comparisons = load_comparison_dir(&comp_dir.join("want"))?;
+    want_comparisons.extend(load_comparison_dir(&want_dir.join("comparisons"))?);
+
+    Ok(PreloadedGreatData {
+        list_name_to_kind,
+        pool_albums,
+        user_items,
+        want_items,
+        albumsgenerator,
+        antennapod,
+        spotify,
+        log_files,
+        comparisons,
+        want_comparisons,
+    })
+}
+
+fn load_great_config_lists(cfg_path: &Path) -> Result<HashMap<String, EntryKind>> {
+    let mut mapping: HashMap<String, EntryKind> =
+        KIND_PLURAL_PAIRS.iter().map(|(kind, plural, _)| ((*plural).to_owned(), *kind)).collect();
+
+    let raw = std::fs::read_to_string(cfg_path)
+        .with_context(|| format!("Failed to read {}", cfg_path.display()))?;
+    let parsed: GreatConfigFile = Figment::from(Toml::string(&raw))
+        .extract()
+        .with_context(|| format!("Failed to parse {}", cfg_path.display()))?;
+
+    for lst in parsed.lists {
+        let name = lst.name.trim();
+        let raw_kind = lst.kind.trim();
+        if !name.is_empty()
+            && !raw_kind.is_empty()
+            && let Ok(kind) = EntryKind::parse_flexible(raw_kind)
+        {
+            mapping.insert(name.to_owned(), kind);
+        }
+    }
+    Ok(mapping)
+}
+
+fn read_toml_items(
+    path: &Path,
+    kind: EntryKind,
+    is_user_source: bool,
+) -> Result<Vec<RawGreatItem>> {
+    if !is_existing_file(path)? {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let parsed: GreatItemsToml = Figment::from(Toml::string(&raw))
+        .extract()
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+
+    let mut out = Vec::with_capacity(parsed.items.len());
+    for item in parsed.items {
+        let title = item.title.trim().to_owned();
+        if title.is_empty() {
+            continue;
+        }
+        let item_id = item
+            .id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&title)
+            .to_owned();
+        let creators: Vec<String> = item
+            .creators
+            .into_iter()
+            .map(|c| c.trim().to_owned())
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        let mut ext_ids = BTreeMap::new();
+        for (k, v) in item.external_ids {
+            let val_str = json_scalar_to_string(&v);
+            if !k.trim().is_empty() && !val_str.is_empty() {
+                ext_ids.insert(k.trim().to_owned(), val_str);
+            }
+        }
+
+        let mut metadata = item.metadata;
+        let thumbnail_url = metadata
+            .remove("image_url")
+            .and_then(|v| v.as_str().map(str::trim).map(str::to_owned))
+            .filter(|s| !s.is_empty());
+        let url = ext_ids.get("url").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+
+        out.push(RawGreatItem {
+            id: item_id,
+            kind,
+            title,
+            year: item.year,
+            creators,
+            parent_id: item.parent_id.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()),
+            external_ids: ext_ids,
+            metadata,
+            thumbnail_url,
+            url,
+            is_user_source,
+        });
+    }
+    Ok(out)
+}
+
+fn read_optional_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    if !is_existing_file(path)? {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let parsed = serde_json::from_str(&raw)
+        .with_context(|| format!("Invalid JSON in {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn load_log_files(great_dir: &Path) -> Result<Vec<PreloadedLogFile>> {
+    let log_dir = great_dir.join("log");
+    if !is_existing_dir(&log_dir)? {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for path in sorted_jsonl_files(&log_dir)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut records = Vec::new();
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let rec: GreatLogRecord = serde_json::from_str(line).with_context(|| {
+                format!("Invalid JSONL record in {} (line {line_no})", path.display())
+            })?;
+            records.push((line_no, rec));
+        }
+        out.push(PreloadedLogFile { path, records });
+    }
+    Ok(out)
+}
+
+fn load_comparison_dir(dir: &Path) -> Result<Vec<PreloadedComparisonFile>> {
+    if !is_existing_dir(dir)? {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for path in sorted_jsonl_files(dir)? {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_owned();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut records = Vec::new();
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let rec: GreatComparisonRecord = serde_json::from_str(line).with_context(|| {
+                format!("Invalid comparison JSONL in {} (line {line_no})", path.display())
+            })?;
+            records.push((line_no, rec));
+        }
+        out.push(PreloadedComparisonFile { path, stem, records });
+    }
+    Ok(out)
+}
+
 struct GreatMigrator<'a> {
     tx: &'a mut SqliteConnection,
-    great_root: &'a Path,
-    pool_albums: &'a [BundledAlbumEntry],
     now: DateTime<Utc>,
     stats: MigrationStats,
     id_map: HashMap<(EntryKind, String), String>,
@@ -419,15 +707,9 @@ struct GreatMigrator<'a> {
 }
 
 impl<'a> GreatMigrator<'a> {
-    fn new(
-        tx: &'a mut SqliteConnection,
-        great_root: &'a Path,
-        pool_albums: &'a [BundledAlbumEntry],
-    ) -> Self {
+    fn new(tx: &'a mut SqliteConnection) -> Self {
         Self {
             tx,
-            great_root,
-            pool_albums,
             now: SyncRepo::now_utc(),
             stats: MigrationStats::default(),
             id_map: HashMap::new(),
@@ -436,56 +718,76 @@ impl<'a> GreatMigrator<'a> {
         }
     }
 
-    async fn run(&mut self) -> Result<MigrationStats> {
-        self.seed_1001_albums_pool().await?;
+    async fn run(&mut self, preloaded: PreloadedGreatData) -> Result<MigrationStats> {
+        let PreloadedGreatData {
+            list_name_to_kind,
+            pool_albums,
+            user_items,
+            want_items,
+            albumsgenerator,
+            antennapod,
+            spotify,
+            log_files,
+            comparisons,
+            want_comparisons,
+        } = preloaded;
+        let pool_slice: &[BundledAlbumEntry] =
+            pool_albums.as_deref().unwrap_or_else(|| bundled_1001_albums());
+
+        self.seed_1001_albums_pool(pool_slice).await?;
         self.index_existing_albums().await?;
 
-        let list_name_to_kind = self.load_great_config_lists()?;
-        let user_source_entry_ids = self.import_user_items().await?;
-        let pending_wants = self.import_want_items().await?;
-        self.import_albumsgenerator_source().await?;
-        self.import_antennapod_source().await?;
-        self.import_spotify_source().await?;
-        self.import_user_logs().await?;
+        let user_source_entry_ids = self.import_user_items(user_items).await?;
+        let pending_wants = self.import_want_items(want_items).await?;
+        if let Some(ref ag_data) = albumsgenerator {
+            self.import_albumsgenerator_source(ag_data).await?;
+        }
+        if let Some(ref ap_data) = antennapod {
+            self.import_antennapod_source(ap_data).await?;
+        }
+        if let Some(sp_data) = spotify {
+            self.import_spotify_source(sp_data).await?;
+        }
+        self.import_user_logs(&log_files).await?;
         self.ensure_user_catalog_consumed_logs(&user_source_entry_ids).await?;
         self.engage_music_artists_from_consumed_works().await?;
         self.attach_want_memberships(&pending_wants).await?;
         self.link_music_works_to_existing_artists().await?;
-        self.import_comparisons(&list_name_to_kind).await?;
+        self.import_comparisons(&list_name_to_kind, &comparisons, &want_comparisons).await?;
 
         Ok(self.stats.clone())
     }
 
-    async fn seed_1001_albums_pool(&mut self) -> Result<()> {
-        sqlx::query(
+    async fn seed_1001_albums_pool(&mut self, pool_albums: &[BundledAlbumEntry]) -> Result<()> {
+        sqlx::query!(
             "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
              VALUES (?, 'collection', '1001 Albums', ?, ?)",
+            ALBUMS_1001_COLLECTION_ID,
+            self.now as _,
+            self.now as _,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
-        .bind(self.now)
-        .bind(self.now)
         .execute(&mut *self.tx)
         .await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
              VALUES (?, '1001_albums', 'manual', 'system', NULL, 0)",
+            ALBUMS_1001_COLLECTION_ID,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
         .execute(&mut *self.tx)
         .await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_generators (collection_id, enabled, updated_at)
              VALUES (?, 0, ?)",
+            ALBUMS_1001_COLLECTION_ID,
+            self.now as _,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
-        .bind(self.now)
         .execute(&mut *self.tx)
         .await?;
 
-        for (idx, album) in self.pool_albums.iter().enumerate() {
+        for (idx, album) in pool_albums.iter().enumerate() {
             let spotify_uri = format!("spotify:album:{}", album.spotify_id);
             let existing =
                 self.lookup_entry_by_identifier(EntryKind::Album, "spotify", &spotify_uri).await?;
@@ -502,20 +804,20 @@ impl<'a> GreatMigrator<'a> {
                     "styles": album.styles,
                 })
                 .to_string();
-                let res = sqlx::query(
+                let res = sqlx::query!(
                     "INSERT OR IGNORE INTO entries
                         (id, kind, title, creators_json, url, release_year, thumbnail_url,
                          metadata_json, created_at, updated_at)
                      VALUES (?, 'album', ?, ?, NULL, ?, ?, ?, ?, ?)",
+                    &album.id,
+                    &album.title,
+                    &creators_json,
+                    album.year as _,
+                    &album.cover_url as _,
+                    &metadata_json,
+                    self.now as _,
+                    self.now as _,
                 )
-                .bind(&album.id)
-                .bind(&album.title)
-                .bind(&creators_json)
-                .bind(album.year)
-                .bind(&album.cover_url)
-                .bind(&metadata_json)
-                .bind(self.now)
-                .bind(self.now)
                 .execute(&mut *self.tx)
                 .await?;
                 if res.rows_affected() > 0 {
@@ -528,14 +830,14 @@ impl<'a> GreatMigrator<'a> {
             self.attach_identifier(&target_id, EntryKind::Album, "1001albums", &album.slug).await?;
             #[allow(clippy::cast_precision_loss)]
             let position = (idx + 1) as f64;
-            sqlx::query(
+            sqlx::query!(
                 "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at)
                  VALUES (?, ?, ?, ?)",
+                ALBUMS_1001_COLLECTION_ID,
+                &target_id,
+                position,
+                self.now as _,
             )
-            .bind(ALBUMS_1001_COLLECTION_ID)
-            .bind(&target_id)
-            .bind(position)
-            .bind(self.now)
             .execute(&mut *self.tx)
             .await?;
 
@@ -546,18 +848,19 @@ impl<'a> GreatMigrator<'a> {
     }
 
     async fn index_existing_albums(&mut self) -> Result<()> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, title, creators_json
-             FROM entries
-             WHERE kind = 'album' AND merged_into_id IS NULL",
+        let rows = sqlx::query!(
+            r#"SELECT id as "id!", title as "title!", creators_json as "creators_json!"
+               FROM entries
+               WHERE kind = 'album' AND merged_into_id IS NULL"#,
         )
         .fetch_all(&mut *self.tx)
         .await?;
 
-        for (entry_id, title, creators_json) in rows {
-            let creators: Vec<String> = serde_json::from_str(&creators_json).unwrap_or_default();
-            if let Some(key) = Self::album_match_key(&creators, &title) {
-                self.album_edition_index.entry(key).or_insert(entry_id);
+        for row in rows {
+            let creators: Vec<String> =
+                serde_json::from_str(&row.creators_json).unwrap_or_default();
+            if let Some(key) = Self::album_match_key(&creators, &row.title) {
+                self.album_edition_index.entry(key).or_insert(row.id);
             }
         }
         Ok(())
@@ -569,136 +872,28 @@ impl<'a> GreatMigrator<'a> {
         if artist.is_empty() || base.is_empty() { None } else { Some((artist, base)) }
     }
 
-    fn load_great_config_lists(&self) -> Result<HashMap<String, EntryKind>> {
-        let mut mapping: HashMap<String, EntryKind> = KIND_PLURAL_PAIRS
-            .iter()
-            .map(|(kind, plural, _)| ((*plural).to_owned(), *kind))
-            .collect();
-
-        let cfg_path = self.great_root.join("great.toml");
-        if !cfg_path.is_file() {
-            return Ok(mapping);
-        }
-        let raw = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("Failed to read {}", cfg_path.display()))?;
-        let parsed: GreatConfigFile = Figment::from(Toml::string(&raw))
-            .extract()
-            .with_context(|| format!("Failed to parse {}", cfg_path.display()))?;
-
-        for lst in parsed.lists {
-            let name = lst.name.trim();
-            let raw_kind = lst.kind.trim();
-            if !name.is_empty()
-                && !raw_kind.is_empty()
-                && let Ok(kind) = EntryKind::parse_flexible(raw_kind)
-            {
-                mapping.insert(name.to_owned(), kind);
-            }
-        }
-        Ok(mapping)
-    }
-
-    fn read_toml_items(
-        path: &Path,
-        kind: EntryKind,
-        is_user_source: bool,
-    ) -> Result<Vec<RawGreatItem>> {
-        if !path.is_file() {
-            return Ok(Vec::new());
-        }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let parsed: GreatItemsToml = Figment::from(Toml::string(&raw))
-            .extract()
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-
-        let mut out = Vec::with_capacity(parsed.items.len());
-        for item in parsed.items {
-            let title = item.title.trim().to_owned();
-            if title.is_empty() {
-                continue;
-            }
-            let item_id = item
-                .id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&title)
-                .to_owned();
-            let creators: Vec<String> = item
-                .creators
-                .into_iter()
-                .map(|c| c.trim().to_owned())
-                .filter(|c| !c.is_empty())
-                .collect();
-
-            let mut ext_ids = BTreeMap::new();
-            for (k, v) in item.external_ids {
-                let val_str = json_scalar_to_string(&v);
-                if !k.trim().is_empty() && !val_str.is_empty() {
-                    ext_ids.insert(k.trim().to_owned(), val_str);
-                }
-            }
-
-            let mut metadata = item.metadata;
-            let thumbnail_url = metadata
-                .remove("image_url")
-                .and_then(|v| v.as_str().map(str::trim).map(str::to_owned))
-                .filter(|s| !s.is_empty());
-            let url = ext_ids.get("url").map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-
-            out.push(RawGreatItem {
-                id: item_id,
-                kind,
-                title,
-                year: item.year,
-                creators,
-                parent_id: item.parent_id.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()),
-                external_ids: ext_ids,
-                metadata,
-                thumbnail_url,
-                url,
-                is_user_source,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn import_user_items(&mut self) -> Result<Vec<String>> {
-        let mut user_entry_ids = Vec::new();
-        for kind in ORDERED_USER_ITEM_KINDS {
-            let Some(plural) = kind_plural(kind) else {
-                continue;
-            };
-            let path = self.great_root.join("items").join(format!("{plural}.toml"));
-            let items = Self::read_toml_items(&path, kind, true)?;
-            for item in items {
-                let entry_id = self.upsert_great_item(item).await?;
-                user_entry_ids.push(entry_id);
-            }
+    async fn import_user_items(&mut self, items: Vec<RawGreatItem>) -> Result<Vec<String>> {
+        let mut user_entry_ids = Vec::with_capacity(items.len());
+        for item in items {
+            let entry_id = self.upsert_great_item(item).await?;
+            user_entry_ids.push(entry_id);
         }
         Ok(user_entry_ids)
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn import_albumsgenerator_source(&mut self) -> Result<()> {
-        let path = self.great_root.join("sources").join("albumsgenerator.json");
-        if !path.is_file() {
-            return Ok(());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let data: AlbumsGeneratorFile = serde_json::from_str(&raw)
-            .with_context(|| format!("Invalid JSON in {}", path.display()))?;
-
-        let existing_gen: Option<(bool, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT enabled, current_entry_id, drawn_at
-             FROM collection_generators
-             WHERE collection_id = ?",
+    async fn import_albumsgenerator_source(&mut self, data: &AlbumsGeneratorFile) -> Result<()> {
+        let existing_gen = sqlx::query!(
+            r#"SELECT enabled as "enabled!: bool",
+                      current_entry_id as "current_entry_id?",
+                      drawn_at as "drawn_at?: DateTime<Utc>"
+               FROM collection_generators
+               WHERE collection_id = ?"#,
+            ALBUMS_1001_COLLECTION_ID,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
         .fetch_optional(&mut *self.tx)
-        .await?;
+        .await?
+        .map(|r| (r.enabled, r.current_entry_id, r.drawn_at));
 
         let (existing_enabled, existing_cur_id, existing_drawn_at) =
             existing_gen.unwrap_or((false, None, None));
@@ -774,20 +969,20 @@ impl<'a> GreatMigrator<'a> {
 
         let enabled = !data.paused;
         if enabled && active_id.is_none() {
-            let rem_row: Option<String> = sqlx::query_scalar(
-                "SELECT ce.entry_id
-                 FROM collection_entries ce
-                 JOIN entries e ON e.id = ce.entry_id
-                 WHERE ce.collection_id = ?
-                   AND e.merged_into_id IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM consumption_log cl
-                       WHERE cl.entry_id = ce.entry_id AND cl.status IN ('consumed', 'abandoned')
-                   )
-                 ORDER BY ce.position ASC, ce.entry_id ASC
-                 LIMIT 1",
+            let rem_row = sqlx::query_scalar!(
+                r#"SELECT ce.entry_id as "entry_id!"
+                   FROM collection_entries ce
+                   JOIN entries e ON e.id = ce.entry_id
+                   WHERE ce.collection_id = ?
+                     AND e.merged_into_id IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM consumption_log cl
+                         WHERE cl.entry_id = ce.entry_id AND cl.status IN ('consumed', 'abandoned')
+                     )
+                   ORDER BY ce.position ASC, ce.entry_id ASC
+                   LIMIT 1"#,
+                ALBUMS_1001_COLLECTION_ID,
             )
-            .bind(ALBUMS_1001_COLLECTION_ID)
             .fetch_optional(&mut *self.tx)
             .await?;
             if let Some(drawn_id) = rem_row {
@@ -803,19 +998,20 @@ impl<'a> GreatMigrator<'a> {
             || final_cur_id != prev_cur_id
             || final_drawn_at != existing_drawn_at
         {
-            sqlx::query(
+            let final_cur_id_ref = final_cur_id.as_deref();
+            sqlx::query!(
                 "UPDATE collection_generators
                  SET enabled = ?,
                      current_entry_id = ?,
                      drawn_at = ?,
                      updated_at = ?
                  WHERE collection_id = ?",
+                enabled as _,
+                final_cur_id_ref,
+                final_drawn_at as _,
+                self.now as _,
+                ALBUMS_1001_COLLECTION_ID,
             )
-            .bind(enabled)
-            .bind(&final_cur_id)
-            .bind(final_drawn_at)
-            .bind(self.now)
-            .bind(ALBUMS_1001_COLLECTION_ID)
             .execute(&mut *self.tx)
             .await?;
         }
@@ -893,16 +1089,7 @@ impl<'a> GreatMigrator<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn import_antennapod_source(&mut self) -> Result<()> {
-        let path = self.great_root.join("sources").join("antennapod.json");
-        if !path.is_file() {
-            return Ok(());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let data: AntennaPodFile = serde_json::from_str(&raw)
-            .with_context(|| format!("Invalid JSON in {}", path.display()))?;
-
+    async fn import_antennapod_source(&mut self, data: &AntennaPodFile) -> Result<()> {
         let mut feeds_by_url: HashMap<String, &AntennaPodFeed> = HashMap::new();
         let mut podcast_entry_by_url: HashMap<String, String> = HashMap::new();
 
@@ -1047,16 +1234,7 @@ impl<'a> GreatMigrator<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn import_spotify_source(&mut self) -> Result<()> {
-        let path = self.great_root.join("sources").join("spotify.json");
-        if !path.is_file() {
-            return Ok(());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let data: SpotifySourceFile = serde_json::from_str(&raw)
-            .with_context(|| format!("Invalid JSON in {}", path.display()))?;
-
+    async fn import_spotify_source(&mut self, data: SpotifySourceFile) -> Result<()> {
         for album in data.albums {
             let creators = album
                 .artist
@@ -1158,33 +1336,31 @@ impl<'a> GreatMigrator<'a> {
         Ok(())
     }
 
-    async fn import_user_logs(&mut self) -> Result<()> {
-        let log_dir = self.great_root.join("log");
-        if !log_dir.is_dir() {
-            return Ok(());
-        }
-        for path in sorted_jsonl_files(&log_dir)? {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            for raw_line in content.lines() {
-                let line = raw_line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let rec: GreatLogRecord = serde_json::from_str(line)
-                    .with_context(|| format!("Invalid JSONL record in {}", path.display()))?;
+    async fn import_user_logs(&mut self, log_files: &[PreloadedLogFile]) -> Result<()> {
+        for file in log_files {
+            for (line_no, rec) in &file.records {
                 let kind = EntryKind::parse_flexible(&rec.kind).with_context(|| {
-                    format!("Unknown kind '{}' in {}", rec.kind, path.display())
+                    format!(
+                        "Unknown kind '{}' in {} (line {line_no})",
+                        rec.kind,
+                        file.path.display()
+                    )
                 })?;
                 let status = parse_flexible_consumption_status(&rec.status).with_context(|| {
-                    format!("Unknown status '{}' in {}", rec.status, path.display())
+                    format!(
+                        "Unknown status '{}' in {} (line {line_no})",
+                        rec.status,
+                        file.path.display()
+                    )
                 })?;
                 let great_item_id = rec.item.trim();
                 if great_item_id.is_empty() {
                     continue;
                 }
                 let notes = rec.notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let ts = parse_iso_utc(&rec.ts)?;
+                let ts = parse_iso_utc(&rec.ts).with_context(|| {
+                    format!("Invalid timestamp in {} (line {line_no})", file.path.display())
+                })?;
                 let entry_id = self.resolve_or_create_placeholder(kind, great_item_id).await?;
                 self.insert_consumption_log(&entry_id, ts, status, notes).await?;
             }
@@ -1204,25 +1380,27 @@ impl<'a> GreatMigrator<'a> {
     async fn engage_music_artists_from_consumed_works(&mut self) -> Result<()> {
         // Pass 1: Synthesize & engage `artist` entries ONLY for creators of consumed songs/albums
         // (avoiding ~750 unengaged artist entries for unheard 1001-pool albums!).
-        let consumed_works: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT e.id, e.creators_json, MIN(cl.ts) AS first_ts
-             FROM entries e
-             JOIN consumption_log cl ON cl.entry_id = e.id AND cl.status = 'consumed'
-             WHERE e.kind IN ('album', 'song') AND e.merged_into_id IS NULL
-             GROUP BY e.id",
+        let consumed_works = sqlx::query!(
+            r#"SELECT e.id as "id!", e.creators_json as "creators_json!",
+                      MIN(cl.ts) as "first_ts!: DateTime<Utc>"
+               FROM entries e
+               JOIN consumption_log cl ON cl.entry_id = e.id AND cl.status = 'consumed'
+               WHERE e.kind IN ('album', 'song') AND e.merged_into_id IS NULL
+               GROUP BY e.id"#,
         )
         .fetch_all(&mut *self.tx)
         .await?;
 
-        for (_work_id, creators_json, first_ts) in consumed_works {
-            let creators: Vec<String> = serde_json::from_str(&creators_json).unwrap_or_default();
+        for work in consumed_works {
+            let creators: Vec<String> =
+                serde_json::from_str(&work.creators_json).unwrap_or_default();
             for raw_name in creators {
                 let name = raw_name.trim();
                 if name.is_empty() {
                     continue;
                 }
                 let artist_id = self.ensure_artist_entry(name).await?;
-                self.ensure_entry_consumed_once(&artist_id, first_ts).await?;
+                self.ensure_entry_consumed_once(&artist_id, work.first_ts).await?;
             }
         }
 
@@ -1234,51 +1412,52 @@ impl<'a> GreatMigrator<'a> {
         // exist in `entries`, while leaving untouched static `1001_albums` pool albums unlinked
         // so unconsumed 1001-pool albums neither pollute artist discographies nor defeat the
         // initial peer-sync static-pool filter.
-        let engaged_music_works: Vec<(String, String)> = sqlx::query_as(
-            "SELECT e.id, e.creators_json
-             FROM entries e
-             WHERE e.kind IN ('album', 'song')
-               AND e.merged_into_id IS NULL
-               AND (
-                   e.kind = 'song'
-                   OR EXISTS (SELECT 1 FROM consumption_log cl WHERE cl.entry_id = e.id)
-                   OR EXISTS (
-                       SELECT 1 FROM collection_entries ce_child
-                       WHERE ce_child.collection_id = e.id
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM collection_entries ce_list
-                       JOIN collection_specs cs_list ON cs_list.collection_id = ce_list.collection_id
-                       WHERE ce_list.entry_id = e.id AND cs_list.collection_role IN ('want', 'list')
-                   )
-                   OR NOT EXISTS (
-                       SELECT 1 FROM collection_entries ce_pool
-                       WHERE ce_pool.collection_id = ? AND ce_pool.entry_id = e.id
-                   )
-               )",
+        let engaged_music_works = sqlx::query!(
+            r#"SELECT e.id as "id!", e.creators_json as "creators_json!"
+               FROM entries e
+               WHERE e.kind IN ('album', 'song')
+                 AND e.merged_into_id IS NULL
+                 AND (
+                     e.kind = 'song'
+                     OR EXISTS (SELECT 1 FROM consumption_log cl WHERE cl.entry_id = e.id)
+                     OR EXISTS (
+                         SELECT 1 FROM collection_entries ce_child
+                         WHERE ce_child.collection_id = e.id
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM collection_entries ce_list
+                         JOIN collection_specs cs_list ON cs_list.collection_id = ce_list.collection_id
+                         WHERE ce_list.entry_id = e.id AND cs_list.collection_role IN ('want', 'list')
+                     )
+                     OR NOT EXISTS (
+                         SELECT 1 FROM collection_entries ce_pool
+                         WHERE ce_pool.collection_id = ? AND ce_pool.entry_id = e.id
+                     )
+                 )"#,
+            ALBUMS_1001_COLLECTION_ID,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
         .fetch_all(&mut *self.tx)
         .await?;
 
-        for (work_id, creators_json) in engaged_music_works {
-            let creators: Vec<String> = serde_json::from_str(&creators_json).unwrap_or_default();
+        for work in engaged_music_works {
+            let creators: Vec<String> =
+                serde_json::from_str(&work.creators_json).unwrap_or_default();
             for raw_name in creators {
                 let name = raw_name.trim();
                 if name.is_empty() {
                     continue;
                 }
                 if let Some(artist_id) = self.lookup_existing_artist_by_name(name).await?
-                    && artist_id != work_id
+                    && artist_id != work.id
                 {
-                    sqlx::query(
+                    sqlx::query!(
                         "INSERT OR IGNORE INTO collection_entries
                             (collection_id, entry_id, position, added_at)
                          VALUES (?, ?, 0, ?)",
+                        &artist_id,
+                        &work.id,
+                        self.now as _,
                     )
-                    .bind(&artist_id)
-                    .bind(&work_id)
-                    .bind(self.now)
                     .execute(&mut *self.tx)
                     .await?;
                 }
@@ -1295,27 +1474,27 @@ impl<'a> GreatMigrator<'a> {
         let trimmed = name.trim();
         let lower_name = trimmed.to_lowercase();
         let det_id = deterministic_title_entry_id("artist", &lower_name);
-        let mut found: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM entries
-             WHERE kind = 'artist' AND merged_into_id IS NULL
-               AND (id = ? OR LOWER(title) = LOWER(?))
-             LIMIT 1",
+        let mut found = sqlx::query_scalar!(
+            r#"SELECT id as "id!" FROM entries
+               WHERE kind = 'artist' AND merged_into_id IS NULL
+                 AND (id = ? OR LOWER(title) = LOWER(?))
+               LIMIT 1"#,
+            &det_id,
+            trimmed,
         )
-        .bind(&det_id)
-        .bind(trimmed)
         .fetch_optional(&mut *self.tx)
         .await?;
         if found.is_none() && !trimmed.is_ascii() {
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT id, title FROM entries
-                 WHERE kind = 'artist' AND merged_into_id IS NULL
-                 ORDER BY updated_at DESC",
+            let rows = sqlx::query!(
+                r#"SELECT id as "id!", title as "title!" FROM entries
+                   WHERE kind = 'artist' AND merged_into_id IS NULL
+                   ORDER BY updated_at DESC"#,
             )
             .fetch_all(&mut *self.tx)
             .await?;
-            for (id, title) in rows {
-                if title.trim().to_lowercase() == lower_name {
-                    found = Some(id);
+            for row in rows {
+                if row.title.trim().to_lowercase() == lower_name {
+                    found = Some(row.id);
                     break;
                 }
             }
@@ -1331,15 +1510,15 @@ impl<'a> GreatMigrator<'a> {
             return Ok(existing);
         }
         let artist_id = deterministic_title_entry_id("artist", &name.trim().to_lowercase());
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO entries
                 (id, kind, title, creators_json, metadata_json, created_at, updated_at)
              VALUES (?, 'artist', ?, '[]', '{}', ?, ?)",
+            &artist_id,
+            name,
+            self.now as _,
+            self.now as _,
         )
-        .bind(&artist_id)
-        .bind(name)
-        .bind(self.now)
-        .bind(self.now)
         .execute(&mut *self.tx)
         .await?;
         if res.rows_affected() > 0 {
@@ -1349,18 +1528,12 @@ impl<'a> GreatMigrator<'a> {
         Ok(artist_id)
     }
 
-    async fn import_want_items(&mut self) -> Result<Vec<(String, String, f64)>> {
-        let want_dir = self.great_root.join("want");
-        if !want_dir.is_dir() {
-            return Ok(Vec::new());
-        }
+    async fn import_want_items(
+        &mut self,
+        want_groups: Vec<(EntryKind, &'static str, Vec<RawGreatItem>)>,
+    ) -> Result<Vec<(String, String, f64)>> {
         let mut pending = Vec::new();
-        for (kind, plural, _) in KIND_PLURAL_PAIRS {
-            let path = want_dir.join(format!("{plural}.toml"));
-            let items = Self::read_toml_items(&path, kind, true)?;
-            if items.is_empty() {
-                continue;
-            }
+        for (kind, plural, items) in want_groups {
             let want_col_id = self.ensure_want_collection(kind, plural).await?;
             for (idx, item) in items.into_iter().enumerate() {
                 let entry_id = self.upsert_great_item(item).await?;
@@ -1377,15 +1550,16 @@ impl<'a> GreatMigrator<'a> {
             if self.has_status(entry_id, ConsumptionStatus::Consumed).await? {
                 continue;
             }
-            let res = sqlx::query(
+            let pos_val = *pos;
+            let res = sqlx::query!(
                 "INSERT OR IGNORE INTO collection_entries
                     (collection_id, entry_id, position, added_at)
                  VALUES (?, ?, ?, ?)",
+                want_col_id,
+                entry_id,
+                pos_val,
+                self.now as _,
             )
-            .bind(want_col_id)
-            .bind(entry_id)
-            .bind(*pos)
-            .bind(self.now)
             .execute(&mut *self.tx)
             .await?;
             if res.rows_affected() > 0 {
@@ -1397,34 +1571,35 @@ impl<'a> GreatMigrator<'a> {
 
     async fn ensure_want_collection(&mut self, kind: EntryKind, plural: &str) -> Result<String> {
         let want_slug = format!("want:{plural}");
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT collection_id FROM collection_specs WHERE slug = ?")
-                .bind(&want_slug)
-                .fetch_optional(&mut *self.tx)
-                .await?;
+        let existing = sqlx::query_scalar!(
+            r#"SELECT collection_id as "collection_id!" FROM collection_specs WHERE slug = ?"#,
+            &want_slug,
+        )
+        .fetch_optional(&mut *self.tx)
+        .await?;
         if let Some(col_id) = existing {
             return Ok(col_id);
         }
 
         let col_id = deterministic_system_collection_id(&want_slug);
         let label = format!("Want: {}", kind_plural_display(kind).unwrap_or(plural));
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
              VALUES (?, 'collection', ?, ?, ?)",
+            &col_id,
+            &label,
+            self.now as _,
+            self.now as _,
         )
-        .bind(&col_id)
-        .bind(&label)
-        .bind(self.now)
-        .bind(self.now)
         .execute(&mut *self.tx)
         .await?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
              VALUES (?, ?, 'manual', 'want', NULL, 0)",
+            &col_id,
+            &want_slug,
         )
-        .bind(&col_id)
-        .bind(&want_slug)
         .execute(&mut *self.tx)
         .await?;
         self.attach_identifier(&col_id, EntryKind::Collection, "slug", &want_slug).await?;
@@ -1434,28 +1609,20 @@ impl<'a> GreatMigrator<'a> {
     async fn import_comparisons(
         &mut self,
         list_name_to_kind: &HashMap<String, EntryKind>,
+        comparisons: &[PreloadedComparisonFile],
+        want_comparisons: &[PreloadedComparisonFile],
     ) -> Result<()> {
-        let comp_dir = self.great_root.join("comparisons");
-        if !comp_dir.is_dir() {
-            return Ok(());
+        for file in comparisons {
+            let expected_kind = list_name_to_kind.get(file.stem.as_str()).copied();
+            self.import_comparison_file(file, expected_kind, None).await?;
         }
 
-        for path in sorted_jsonl_files(&comp_dir)? {
-            let list_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            let expected_kind = list_name_to_kind.get(list_name).copied();
-            self.import_comparison_file(&path, expected_kind, None).await?;
-        }
-
-        let want_comp_dir = comp_dir.join("want");
-        if want_comp_dir.is_dir() {
-            for path in sorted_jsonl_files(&want_comp_dir)? {
-                let plural = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-                let Some(kind) = plural_to_kind(plural) else {
-                    continue;
-                };
-                let want_col_id = self.ensure_want_collection(kind, plural).await?;
-                self.import_comparison_file(&path, Some(kind), Some(&want_col_id)).await?;
-            }
+        for file in want_comparisons {
+            let Some(kind) = plural_to_kind(&file.stem) else {
+                continue;
+            };
+            let want_col_id = self.ensure_want_collection(kind, &file.stem).await?;
+            self.import_comparison_file(file, Some(kind), Some(&want_col_id)).await?;
         }
 
         Ok(())
@@ -1463,28 +1630,22 @@ impl<'a> GreatMigrator<'a> {
 
     async fn import_comparison_file(
         &mut self,
-        path: &Path,
+        file: &PreloadedComparisonFile,
         expected_kind: Option<EntryKind>,
         scope_collection_id: Option<&str>,
     ) -> Result<()> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let rec: GreatComparisonRecord = serde_json::from_str(line)
-                .with_context(|| format!("Invalid comparison JSONL in {}", path.display()))?;
-            let ts = parse_iso_utc(&rec.ts)?;
+        for (line_no, rec) in &file.records {
+            let ts = parse_iso_utc(&rec.ts).with_context(|| {
+                format!("Invalid timestamp in {} (line {line_no})", file.path.display())
+            })?;
 
             let mut mapped_ordering: Vec<Vec<String>> = Vec::new();
             let mut seen_ids: HashSet<String> = HashSet::new();
-            for group in rec.ordering {
+            for group in &rec.ordering {
                 let mut mapped_group = Vec::new();
                 for raw_item_id in group {
                     let entry_id =
-                        self.resolve_comparison_item_id(expected_kind, &raw_item_id).await?;
+                        self.resolve_comparison_item_id(expected_kind, raw_item_id).await?;
                     if seen_ids.insert(entry_id.clone()) {
                         mapped_group.push(entry_id);
                     }
@@ -1501,16 +1662,16 @@ impl<'a> GreatMigrator<'a> {
             let ts_ms = ts.timestamp_millis();
             let comp_id = deterministic_comparison_id(scope_collection_id, ts_ms, &mapped_ordering);
             let canon_ord = canonical_ordering_json(&mapped_ordering);
-            let res = sqlx::query(
+            let res = sqlx::query!(
                 "INSERT OR IGNORE INTO comparisons
                     (id, ts, scope_collection_id, ordering_json, created_at)
                  VALUES (?, ?, ?, ?, ?)",
+                &comp_id,
+                ts as _,
+                scope_collection_id,
+                &canon_ord,
+                self.now as _,
             )
-            .bind(&comp_id)
-            .bind(ts)
-            .bind(scope_collection_id)
-            .bind(&canon_ord)
-            .bind(self.now)
             .execute(&mut *self.tx)
             .await?;
             if res.rows_affected() > 0 {
@@ -1553,14 +1714,14 @@ impl<'a> GreatMigrator<'a> {
                 self.resolve_or_create_placeholder(parent_kind, pid).await?
             };
             if parent_entry_id != resolved_id {
-                sqlx::query(
+                sqlx::query!(
                     "INSERT OR IGNORE INTO collection_entries
                         (collection_id, entry_id, position, added_at)
                      VALUES (?, ?, NULL, ?)",
+                    &parent_entry_id,
+                    &resolved_id,
+                    self.now as _,
                 )
-                .bind(&parent_entry_id)
-                .bind(&resolved_id)
-                .bind(self.now)
                 .execute(&mut *self.tx)
                 .await?;
             }
@@ -1594,10 +1755,10 @@ impl<'a> GreatMigrator<'a> {
         if item.kind == EntryKind::Podcast {
             for ident in &norm_idents {
                 if ident.scheme == "feed_url" {
-                    let feed_col: Option<String> = sqlx::query_scalar(
-                        "SELECT collection_id FROM feed_sources WHERE feed_url = ? LIMIT 1",
+                    let feed_col = sqlx::query_scalar!(
+                        r#"SELECT collection_id as "collection_id!" FROM feed_sources WHERE feed_url = ? LIMIT 1"#,
+                        &ident.value,
                     )
-                    .bind(&ident.value)
                     .fetch_optional(&mut *self.tx)
                     .await?;
                     if let Some(fid) = feed_col
@@ -1648,25 +1809,25 @@ impl<'a> GreatMigrator<'a> {
         let mut existing_entry_updated = false;
         let was_existing = target_id.is_some();
         let resolved_id = if let Some(existing_id) = target_id {
-            type ExistingFieldsRow =
-                (String, String, Option<String>, Option<i32>, Option<String>, String);
-            let row: Option<ExistingFieldsRow> = sqlx::query_as(
-                "SELECT title, creators_json, url, release_year, thumbnail_url, metadata_json
-                     FROM entries WHERE id = ?",
+            let row = sqlx::query!(
+                r#"SELECT title as "title!", creators_json as "creators_json!",
+                          url as "url?", release_year as "release_year?: i32",
+                          thumbnail_url as "thumbnail_url?",
+                          metadata_json as "metadata_json!"
+                   FROM entries WHERE id = ?"#,
+                &existing_id,
             )
-            .bind(&existing_id)
             .fetch_optional(&mut *self.tx)
             .await?;
 
-            if let Some((
-                cur_title,
-                cur_creators_json,
-                cur_url,
-                cur_year,
-                cur_thumb,
-                cur_meta_json,
-            )) = row
-            {
+            if let Some(cur) = row {
+                let cur_title = cur.title;
+                let cur_creators_json = cur.creators_json;
+                let cur_url = cur.url;
+                let cur_year = cur.release_year;
+                let cur_thumb = cur.thumbnail_url;
+                let cur_meta_json = cur.metadata_json;
+
                 let cur_creators: Vec<String> =
                     serde_json::from_str(&cur_creators_json).unwrap_or_default();
                 let mut cur_meta: serde_json::Map<String, serde_json::Value> =
@@ -1706,7 +1867,9 @@ impl<'a> GreatMigrator<'a> {
                     || new_meta_json != cur_meta_json;
 
                 if entry_changed {
-                    sqlx::query(
+                    let new_url_ref = new_url.as_deref();
+                    let new_thumb_ref = new_thumb.as_deref();
+                    sqlx::query!(
                         "UPDATE entries
                          SET title = ?,
                              creators_json = ?,
@@ -1716,15 +1879,15 @@ impl<'a> GreatMigrator<'a> {
                              metadata_json = ?,
                              updated_at = ?
                          WHERE id = ?",
+                        &new_title,
+                        &new_creators_json,
+                        new_url_ref,
+                        new_year as _,
+                        new_thumb_ref,
+                        &new_meta_json,
+                        self.now as _,
+                        &existing_id,
                     )
-                    .bind(&new_title)
-                    .bind(&new_creators_json)
-                    .bind(&new_url)
-                    .bind(new_year)
-                    .bind(&new_thumb)
-                    .bind(&new_meta_json)
-                    .bind(self.now)
-                    .bind(&existing_id)
                     .execute(&mut *self.tx)
                     .await?;
                     existing_entry_updated = true;
@@ -1749,22 +1912,24 @@ impl<'a> GreatMigrator<'a> {
             } else {
                 serde_json::to_string(&item.metadata)?
             };
-            let res = sqlx::query(
+            let item_url_ref = item.url.as_deref();
+            let item_thumb_ref = item.thumbnail_url.as_deref();
+            let res = sqlx::query!(
                 "INSERT OR IGNORE INTO entries
                     (id, kind, title, creators_json, url, release_year, thumbnail_url,
                      metadata_json, created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &resolved_det_id,
+                item.kind as _,
+                &clean_title,
+                &creators_json,
+                item_url_ref,
+                item.year as _,
+                item_thumb_ref,
+                &metadata_json,
+                self.now as _,
+                self.now as _,
             )
-            .bind(&resolved_det_id)
-            .bind(item.kind)
-            .bind(&clean_title)
-            .bind(&creators_json)
-            .bind(&item.url)
-            .bind(item.year)
-            .bind(&item.thumbnail_url)
-            .bind(&metadata_json)
-            .bind(self.now)
-            .bind(self.now)
             .execute(&mut *self.tx)
             .await?;
             if res.rows_affected() > 0 {
@@ -1780,11 +1945,13 @@ impl<'a> GreatMigrator<'a> {
             }
         }
         if was_existing && !existing_entry_updated && any_ident_attached {
-            sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-                .bind(self.now)
-                .bind(&resolved_id)
-                .execute(&mut *self.tx)
-                .await?;
+            sqlx::query!(
+                "UPDATE entries SET updated_at = ? WHERE id = ?",
+                self.now as _,
+                &resolved_id,
+            )
+            .execute(&mut *self.tx)
+            .await?;
         }
 
         if let Some(key) = album_key {
@@ -1836,11 +2003,11 @@ impl<'a> GreatMigrator<'a> {
         if norm_scheme.is_empty() || norm_val.is_empty() {
             return Ok(None);
         }
-        let owner_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT entry_id FROM entry_identifiers WHERE scheme = ? AND value = ?",
+        let owner_ids = sqlx::query_scalar!(
+            r#"SELECT entry_id as "entry_id!" FROM entry_identifiers WHERE scheme = ? AND value = ?"#,
+            &norm_scheme,
+            &norm_val,
         )
-        .bind(&norm_scheme)
-        .bind(&norm_val)
         .fetch_all(&mut *self.tx)
         .await?;
 
@@ -1859,18 +2026,20 @@ impl<'a> GreatMigrator<'a> {
     ) -> Result<Option<String>> {
         let mut current = start_id.to_owned();
         for _ in 0..8 {
-            let row: Option<(EntryKind, Option<String>)> =
-                sqlx::query_as("SELECT kind, merged_into_id FROM entries WHERE id = ?")
-                    .bind(&current)
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-            let Some((kind, next_opt)) = row else {
+            let row = sqlx::query!(
+                r#"SELECT kind as "kind!: EntryKind", merged_into_id as "merged_into_id?"
+                   FROM entries WHERE id = ?"#,
+                &current,
+            )
+            .fetch_optional(&mut *self.tx)
+            .await?;
+            let Some(r) = row else {
                 return Ok(None);
             };
-            if let Some(next_id) = next_opt.filter(|s| !s.is_empty() && s != &current) {
+            if let Some(next_id) = r.merged_into_id.filter(|s| !s.is_empty() && s != &current) {
                 current = next_id;
             } else {
-                if expected_kind.is_some_and(|exp| exp != kind) {
+                if expected_kind.is_some_and(|exp| exp != r.kind) {
                     return Ok(None);
                 }
                 return Ok(Some(current));
@@ -1891,13 +2060,13 @@ impl<'a> GreatMigrator<'a> {
         if norm_scheme.is_empty() || norm_val.is_empty() {
             return Ok(false);
         }
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
              VALUES (?, ?, ?)",
+            &norm_scheme,
+            &norm_val,
+            entry_id,
         )
-        .bind(&norm_scheme)
-        .bind(&norm_val)
-        .bind(entry_id)
         .execute(&mut *self.tx)
         .await?;
         Ok(res.rows_affected() > 0)
@@ -1917,41 +2086,41 @@ impl<'a> GreatMigrator<'a> {
     ) -> Result<()> {
         let log_id =
             deterministic_consumption_log_id(entry_id, ts.timestamp_millis(), status.as_str());
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
+            &log_id,
+            entry_id,
+            ts as _,
+            status as _,
+            notes,
+            self.now as _,
         )
-        .bind(&log_id)
-        .bind(entry_id)
-        .bind(ts)
-        .bind(status)
-        .bind(notes)
-        .bind(self.now)
         .execute(&mut *self.tx)
         .await?;
         if res.rows_affected() > 0 {
             self.stats.consumption_logs_added += 1;
         }
         if status == ConsumptionStatus::Consumed {
-            let promoted_want_cols: Vec<String> = sqlx::query_scalar(
-                "SELECT collection_id FROM collection_entries
-                 WHERE entry_id = ?
-                   AND collection_id IN (
-                       SELECT collection_id FROM collection_specs WHERE collection_role = 'want'
-                   )",
+            let promoted_want_cols = sqlx::query_scalar!(
+                r#"SELECT collection_id as "collection_id!" FROM collection_entries
+                   WHERE entry_id = ?
+                     AND collection_id IN (
+                         SELECT collection_id FROM collection_specs WHERE collection_role = 'want'
+                     )"#,
+                entry_id,
             )
-            .bind(entry_id)
             .fetch_all(&mut *self.tx)
             .await?;
             if !promoted_want_cols.is_empty() {
-                sqlx::query(
+                sqlx::query!(
                     "DELETE FROM collection_entries
                      WHERE entry_id = ?
                        AND collection_id IN (
                            SELECT collection_id FROM collection_specs WHERE collection_role = 'want'
                        )",
+                    entry_id,
                 )
-                .bind(entry_id)
                 .execute(&mut *self.tx)
                 .await?;
                 for want_col_id in promoted_want_cols {
@@ -1981,23 +2150,23 @@ impl<'a> GreatMigrator<'a> {
     }
 
     async fn has_status(&mut self, entry_id: &str, status: ConsumptionStatus) -> Result<bool> {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = ? LIMIT 1",
+        let found = sqlx::query_scalar!(
+            r#"SELECT 1 as "found!: i64" FROM consumption_log WHERE entry_id = ? AND status = ? LIMIT 1"#,
+            entry_id,
+            status as _,
         )
-        .bind(entry_id)
-        .bind(status)
         .fetch_optional(&mut *self.tx)
         .await?;
         Ok(found.is_some())
     }
 
     async fn is_consumed_or_abandoned(&mut self, entry_id: &str) -> Result<bool> {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM consumption_log
-             WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
-             LIMIT 1",
+        let found = sqlx::query_scalar!(
+            r#"SELECT 1 as "found!: i64" FROM consumption_log
+               WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
+               LIMIT 1"#,
+            entry_id,
         )
-        .bind(entry_id)
         .fetch_optional(&mut *self.tx)
         .await?;
         Ok(found.is_some())
@@ -2139,13 +2308,34 @@ fn json_scalar_to_string(val: &serde_json::Value) -> String {
     }
 }
 
+fn is_existing_file(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Failed to access {}", path.display())),
+    }
+}
+
+fn is_existing_dir(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_dir()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Failed to access {}", path.display())),
+    }
+}
+
 fn sorted_jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+    let mut paths = Vec::new();
+    for entry_res in std::fs::read_dir(dir)
         .with_context(|| format!("Failed to read directory {}", dir.display()))?
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .collect();
+    {
+        let entry = entry_res
+            .with_context(|| format!("Failed to read directory entry in {}", dir.display()))?;
+        let path = entry.path();
+        if is_existing_file(&path)? && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            paths.push(path);
+        }
+    }
     paths.sort();
     Ok(paths)
 }
@@ -2281,7 +2471,10 @@ external_ids = { imdb = "tt0062622" }
         // 1. Dry-run leaves zero database files on disk
         let dry_stats = migrate_great_database(&db_path, &great_dir, None, true).await.unwrap();
         assert!(dry_stats.seeded_1001_albums >= 1_000);
-        assert!(!db_path.exists(), "--dry-run must not leave a database file on disk");
+        assert!(
+            !tokio::fs::try_exists(&db_path).await.unwrap(),
+            "--dry-run must not leave a database file on disk"
+        );
 
         // 2. Real migration creates and populates `roche.db`
         let stats1 = migrate_great_database(&db_path, &great_dir, None, false).await.unwrap();
@@ -2306,11 +2499,12 @@ external_ids = { imdb = "tt0062622" }
         assert!(ep_titles.contains(&"Episode Two: Akkad"));
 
         // Bug 2 verified: Only engaged artists (Elvis Presley) exist; unengaged 1001-pool artists were NOT synthesized!
-        let artist_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE kind = 'artist'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let artist_count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!: i64" FROM entries WHERE kind = 'artist'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(
             artist_count, 1,
             "only Elvis Presley should be synthesized, not ~750 pool artists"
@@ -2355,8 +2549,8 @@ external_ids = { imdb = "tt0062622" }
 
         // Re-running migration without changes MUST preserve existing `entries.updated_at` LWW timestamps!
         let db2 = Db::connect(&db_path).await.unwrap();
-        let before_rerun_ts: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT updated_at FROM entries WHERE title = '2001: A Space Odyssey'",
+        let before_rerun_ts = sqlx::query_scalar!(
+            r#"SELECT updated_at as "updated_at!: DateTime<Utc>" FROM entries WHERE title = '2001: A Space Odyssey'"#,
         )
         .fetch_one(db2.pool())
         .await
@@ -2368,8 +2562,8 @@ external_ids = { imdb = "tt0062622" }
         migrate_great_database(&db_path, &great_dir, None, false).await.unwrap();
 
         let db3 = Db::connect(&db_path).await.unwrap();
-        let after_rerun_ts: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT updated_at FROM entries WHERE title = '2001: A Space Odyssey'",
+        let after_rerun_ts = sqlx::query_scalar!(
+            r#"SELECT updated_at as "updated_at!: DateTime<Utc>" FROM entries WHERE title = '2001: A Space Odyssey'"#,
         )
         .fetch_one(db3.pool())
         .await
@@ -2451,6 +2645,126 @@ external_ids = { imdb = "tt0062622" }
         assert_eq!(books[0].title, "Designing Data-Intensive Applications");
         db.pool().close().await;
         drop(db);
+
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_migrate_great_preloader_reports_line_numbers_and_unreadable_files_before_opening_db()
+     {
+        let tmp_dir = std::env::temp_dir().join(format!("roche_mig_err_{}", uuid::Uuid::new_v4()));
+        let great_dir = tmp_dir.join("great");
+        tokio::fs::create_dir_all(great_dir.join("log")).await.unwrap();
+        tokio::fs::write(great_dir.join("great.toml"), "lists = []\n").await.unwrap();
+        let bad_log = great_dir.join("log/2026.jsonl");
+        tokio::fs::write(
+            &bad_log,
+            "{\"ts\":\"2026-04-01T10:00:00Z\",\"item\":\"ok\",\"kind\":\"movie\",\"status\":\"consumed\"}\n{broken json}\n",
+        )
+        .await
+        .unwrap();
+
+        let db_path = tmp_dir.join("never_created.db");
+        let err = migrate_great_database(&db_path, &great_dir, None, false).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("2026.jsonl"), "expected file path in error: {msg}");
+        assert!(msg.contains("line 2"), "expected line number in error: {msg}");
+        assert!(
+            !tokio::fs::try_exists(&db_path).await.unwrap(),
+            "failed preload must not create db_path on disk"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::write(&bad_log, "").await.unwrap();
+            tokio::fs::set_permissions(&bad_log, std::fs::Permissions::from_mode(0o000))
+                .await
+                .unwrap();
+            if tokio::fs::read_to_string(&bad_log).await.is_err() {
+                let perm_err =
+                    migrate_great_database(&db_path, &great_dir, None, false).await.unwrap_err();
+                assert!(format!("{perm_err:#}").contains("2026.jsonl"));
+                assert!(!tokio::fs::try_exists(&db_path).await.unwrap());
+            }
+            tokio::fs::set_permissions(&bad_log, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_migrate_great_dry_run_leaves_existing_pre_v012_db_byte_for_byte_untouched() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("roche_mig_dryrun_{}", uuid::Uuid::new_v4()));
+        let great_dir = tmp_dir.join("great");
+        tokio::fs::create_dir_all(great_dir.join("items")).await.unwrap();
+        tokio::fs::write(
+            great_dir.join("great.toml"),
+            "[[lists]]\nname = \"movies\"\nkind = \"movie\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            great_dir.join("items/movies.toml"),
+            "[[items]]\nid = \"tt0133093\"\ntitle = \"The Matrix\"\nyear = 1999\n",
+        )
+        .await
+        .unwrap();
+
+        // Create a legacy pre-v010 on-disk SQLite DB with `_sqlx_migrations` only up to v009 so
+        // `open_migration_pool` would run `010`..`012` if it opened `db_path` directly.
+        let db_path = tmp_dir.join("legacy_live.db");
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Delete);
+        let seed_pool =
+            SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+        let migrator = sqlx::migrate!("./migrations");
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
+        .execute(&seed_pool)
+        .await
+        .unwrap();
+        for m in migrator.iter().filter(|m| m.version <= 9) {
+            sqlx::raw_sql(m.sql.clone()).execute(&seed_pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                 VALUES (?, ?, 1, ?, 1)",
+            )
+            .bind(m.version)
+            .bind(m.description.as_ref())
+            .bind(m.checksum.as_ref())
+            .execute(&seed_pool)
+            .await
+            .unwrap();
+        }
+        seed_pool.close().await;
+
+        let before_bytes = tokio::fs::read(&db_path).await.unwrap();
+        let stats = migrate_great_database(&db_path, &great_dir, None, true).await.unwrap();
+        assert!(stats.entries_upserted >= 1);
+
+        let after_bytes = tokio::fs::read(&db_path).await.unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "--dry-run must not modify existing on-disk SQLite database bytes"
+        );
+        assert!(
+            !tokio::fs::try_exists(tmp_dir.join("legacy_live.db-wal")).await.unwrap(),
+            "--dry-run must not leave WAL sidecars next to db_path"
+        );
 
         let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
     }

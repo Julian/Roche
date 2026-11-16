@@ -339,16 +339,13 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
 
     // Delta sync: backdate Post 3 so only items modified at or after `watermark` are returned
     let watermark = now + chrono::Duration::seconds(10);
+    let post3_ts = now - chrono::Duration::seconds(60);
     let post3_id = deterministic_item_id(Some(feed_url.as_str()), item3_url.as_str());
-    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-        .bind(now - chrono::Duration::seconds(60))
-        .bind(&post3_id)
+    sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", post3_ts as _, post3_id)
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-        .bind(watermark)
-        .bind(&post1_id)
+    sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", watermark as _, post1_id)
         .execute(db.pool())
         .await
         .unwrap();
@@ -528,7 +525,10 @@ async fn test_subsecond_delta_sync_and_multipage_content_html() {
     // Subsecond updated_after: item updated 500ms after `since` within the same second MUST be returned
     let old_ts = DateTime::parse_from_rfc3339("2026-11-11T20:00:00Z").unwrap().with_timezone(&Utc)
         - chrono::Duration::seconds(30);
-    sqlx::query("UPDATE entries SET updated_at = ?").bind(old_ts).execute(db.pool()).await.unwrap();
+    sqlx::query!("UPDATE entries SET updated_at = ?", old_ts as _)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     let since =
         DateTime::parse_from_rfc3339("2026-11-11T20:00:00.100Z").unwrap().with_timezone(&Utc);
@@ -539,15 +539,11 @@ async fn test_subsecond_delta_sync_and_multipage_content_html() {
     let id0 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-0");
     let id1 = deterministic_item_id(Some(feed_url.as_str()), "https://example.com/article-1");
 
-    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-        .bind(before_in_same_sec)
-        .bind(&id0)
+    sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", before_in_same_sec as _, id0,)
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-        .bind(after_500ms)
-        .bind(&id1)
+    sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", after_500ms as _, id1)
         .execute(db.pool())
         .await
         .unwrap();
@@ -721,9 +717,7 @@ async fn test_delta_sync_cursor_safety_when_outgoing_items_exceed_cap() {
             &format!("https://example.com/cap-item-{idx}"),
         );
         let item_ts = base_ts + chrono::Duration::seconds((idx + 1) * 5);
-        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-            .bind(item_ts)
-            .bind(&item_id)
+        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", item_ts as _, item_id)
             .execute(db.pool())
             .await
             .unwrap();
@@ -779,8 +773,7 @@ async fn test_delta_sync_cursor_safety_when_outgoing_items_exceed_cap() {
     // bulk archive or OPML import), paginated at cap = 2 across 3 rounds with zero duplicates
     // and zero drops.
     let tied_ts = base_ts + chrono::Duration::minutes(5);
-    sqlx::query("UPDATE entries SET updated_at = ?")
-        .bind(tied_ts)
+    sqlx::query!("UPDATE entries SET updated_at = ?", tied_ts as _)
         .execute(db.pool())
         .await
         .unwrap();
@@ -1511,9 +1504,8 @@ async fn test_peer_sync_initial_pagination_referenced_entries_slug_collision_and
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-            .bind(base_ts + chrono::Duration::seconds(idx * 10))
-            .bind(&ep.id)
+        let ep_updated = base_ts + chrono::Duration::seconds(idx * 10);
+        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", ep_updated as _, ep.id)
             .execute(db.pool())
             .await
             .unwrap();
@@ -1717,12 +1709,14 @@ async fn test_peer_sync_initial_pagination_referenced_entries_slug_collision_and
         .await
         .unwrap();
 
-    let updated_before_tie: DateTime<Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
-            .bind(&created_ids[0])
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let ep0_id = &created_ids[0];
+    let updated_before_tie: DateTime<Utc> = sqlx::query_scalar!(
+        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
+        ep0_id,
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(15)).await;
 
     db.sync()
@@ -1755,12 +1749,14 @@ async fn test_peer_sync_initial_pagination_referenced_entries_slug_collision_and
         .await
         .unwrap();
 
-    let updated_after_tie: DateTime<Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
-            .bind(&created_ids[0])
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let ep0_id = &created_ids[0];
+    let updated_after_tie: DateTime<Utc> = sqlx::query_scalar!(
+        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
+        ep0_id,
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert_eq!(
         updated_after_tie, updated_before_tie,
         "Unchanged tag-tie sync must not bump entries.updated_at and cause delta ping-pong"
@@ -1791,12 +1787,14 @@ async fn test_deleted_feed_with_history_hides_from_lists_and_inbox_sync_material
         })
         .await
         .unwrap();
-    sqlx::query("INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?, ?)")
-        .bind(&feed.id)
-        .bind(&ep.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+    sqlx::query!(
+        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id) VALUES (?, ?)",
+        feed.id,
+        ep.id,
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     db.catalog()
         .log_consumption(&ep.id, ConsumptionStatus::Consumed, Some("Great episode"), None)
         .await
@@ -1929,12 +1927,13 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
         .await
         .unwrap();
 
-    let updated_before: DateTime<Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
-            .bind(&item.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let updated_before: DateTime<Utc> = sqlx::query_scalar!(
+        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
+        item.id,
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Second identical sync must be a complete no-op on `entries.updated_at`!
@@ -1967,12 +1966,13 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
         })
         .await
         .unwrap();
-    let updated_after: DateTime<Utc> =
-        sqlx::query_scalar("SELECT updated_at FROM entries WHERE id = ?")
-            .bind(&item.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let updated_after: DateTime<Utc> = sqlx::query_scalar!(
+        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
+        item.id,
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
     assert_eq!(updated_after, updated_before, "Non-ASCII tag sync must not write-amplify");
 
     // Incoming tombstone for `"ÄPFEL"` deletes `"Äpfel"`:

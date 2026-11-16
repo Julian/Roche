@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: i64\",\n                    entity_type AS \"entity_type: ActivityEntityType\",\n                    entity_id,\n                    action AS \"action: ActivityAction\",\n                    timestamp AS \"timestamp: DateTime<Utc>\"\n             FROM activity_log\n             WHERE id > ?\n             ORDER BY id ASC\n             LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "entity_type: ActivityEntityType",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "entity_type"
+          }
+        }
+      },
+      {
+        "name": "entity_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "entity_id"
+          }
+        }
+      },
+      {
+        "name": "action: ActivityAction",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "action"
+          }
+        }
+      },
+      {
+        "name": "timestamp: DateTime<Utc>",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "timestamp"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fa52d60615d46050e7e8aeb05ac13bd83cff5386fca25f414c6e75e5c3db28fa"
+}

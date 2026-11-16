@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)\n                 VALUES (?, ?, ?, ?)\n                 ON CONFLICT(collection_id, entry_id) DO UPDATE SET\n                    position = COALESCE(excluded.position, collection_entries.position)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "476688c83399595dd275cdf9142e872da590f83b6928cac89d0d7a3635adc5dc"
+}

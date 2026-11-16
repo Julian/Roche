@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM consumption_log WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "1e61d6372db74c89d4bb7e53750b7d76e07ace82b7eb3821eac3cd8404b8f41d"
+}

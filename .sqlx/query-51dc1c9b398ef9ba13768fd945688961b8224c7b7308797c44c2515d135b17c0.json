@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT feed_url FROM feed_sources WHERE collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "feed_url",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "51dc1c9b398ef9ba13768fd945688961b8224c7b7308797c44c2515d135b17c0"
+}

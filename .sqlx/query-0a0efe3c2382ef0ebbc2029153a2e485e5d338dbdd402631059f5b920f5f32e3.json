@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ordering_json as \"ordering_json!\" FROM comparisons\n                   WHERE scope_collection_id = ?\n                   ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "ordering_json!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "comparisons",
+            "name": "ordering_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0a0efe3c2382ef0ebbc2029153a2e485e5d338dbdd402631059f5b920f5f32e3"
+}

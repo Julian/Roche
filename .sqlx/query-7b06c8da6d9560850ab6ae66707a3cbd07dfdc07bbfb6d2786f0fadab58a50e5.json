@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM pairing_codes WHERE failed_attempts >= ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7b06c8da6d9560850ab6ae66707a3cbd07dfdc07bbfb6d2786f0fadab58a50e5"
+}

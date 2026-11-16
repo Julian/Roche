@@ -92,7 +92,7 @@ mod tests {
     async fn test_worker_manager_prunes_old_activity_logs_and_orphaned_media() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO activity_log (entity_type, entity_id, action, timestamp)
              VALUES ('item', '1', 'archive', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 days')),
                     ('item', '2', 'archive', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
@@ -133,11 +133,12 @@ mod tests {
         let workers = WorkerManager::new(db.clone(), 30, "/tmp/roche-test-media");
         workers.run_once().await.unwrap();
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM activity_log WHERE entity_id IN ('1', '2')")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let remaining: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"count!: i64\" FROM activity_log WHERE entity_id IN ('1', '2')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(remaining, 1);
         assert!(db.media().get(&media.id).await.unwrap().is_none());
     }

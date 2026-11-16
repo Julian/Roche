@@ -28,16 +28,16 @@ impl SyncRepo<'_> {
                 ActivityEntityType::Feed => {
                     let canon_key = feed_natural_key(key);
                     let det_id = deterministic_feed_id(&canon_key);
-                    let newer_live: Option<i64> = sqlx::query_scalar(
-                        "SELECT 1 FROM feed_sources fs
+                    let newer_live: Option<i64> = sqlx::query_scalar!(
+                        "SELECT 1 AS \"found!: i64\" FROM feed_sources fs
                          JOIN entries e ON e.id = fs.collection_id
                          WHERE (fs.feed_url = ? OR fs.collection_id = ?)
                            AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          LIMIT 1",
+                        canon_key,
+                        det_id,
+                        tomb.deleted_at as _,
                     )
-                    .bind(&canon_key)
-                    .bind(&det_id)
-                    .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
                     if newer_live.is_some() {
@@ -51,17 +51,17 @@ impl SyncRepo<'_> {
                     )
                     .await?;
 
-                    let target_feed_id: Option<String> = sqlx::query_scalar(
+                    let target_feed_id: Option<String> = sqlx::query_scalar!(
                         "SELECT fs.collection_id
                          FROM feed_sources fs
                          JOIN entries e ON e.id = fs.collection_id
                          WHERE (fs.feed_url = ? OR fs.collection_id = ?)
                            AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          LIMIT 1",
+                        canon_key,
+                        det_id,
+                        tomb.deleted_at as _,
                     )
-                    .bind(&canon_key)
-                    .bind(&det_id)
-                    .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
 
@@ -83,8 +83,8 @@ impl SyncRepo<'_> {
                         let canon_item = canonicalize_sync_url(item_url);
                         let canon_key = item_natural_key(None, &canon_item);
                         let det_id = deterministic_item_id(None, &canon_item);
-                        let newer_live: Option<i64> = sqlx::query_scalar(
-                            "SELECT 1 FROM entries e
+                        let newer_live: Option<i64> = sqlx::query_scalar!(
+                            "SELECT 1 AS \"found!: i64\" FROM entries e
                              JOIN entry_state es ON es.entry_id = e.id
                              WHERE es.inbox_state IN ('unread', 'dismissed')
                                AND (e.id = ? OR (e.url = ? AND NOT EXISTS (
@@ -94,10 +94,10 @@ impl SyncRepo<'_> {
                                )))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                              LIMIT 1",
+                            det_id,
+                            canon_item,
+                            tomb.deleted_at as _,
                         )
-                        .bind(&det_id)
-                        .bind(&canon_item)
-                        .bind(tomb.deleted_at)
                         .fetch_optional(&mut *conn)
                         .await?;
                         if newer_live.is_some() {
@@ -110,7 +110,7 @@ impl SyncRepo<'_> {
                             tomb.deleted_at,
                         )
                         .await?;
-                        let target_ids: Vec<String> = sqlx::query_scalar(
+                        let target_ids: Vec<String> = sqlx::query_scalar!(
                             "SELECT e.id FROM entries e
                              JOIN entry_state es ON es.entry_id = e.id
                              WHERE es.inbox_state IN ('unread', 'dismissed')
@@ -120,10 +120,10 @@ impl SyncRepo<'_> {
                                    WHERE ce.entry_id = e.id
                                )))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+                            det_id,
+                            canon_item,
+                            tomb.deleted_at as _,
                         )
-                        .bind(&det_id)
-                        .bind(&canon_item)
-                        .bind(tomb.deleted_at)
                         .fetch_all(&mut *conn)
                         .await?;
                         for iid in target_ids {
@@ -148,8 +148,8 @@ impl SyncRepo<'_> {
                         let canon_key = item_natural_key(Some(&canon_feed), &canon_item);
                         let det_feed_id = deterministic_feed_id(&canon_feed);
                         let det_id = deterministic_item_id(Some(&canon_feed), &canon_item);
-                        let newer_live: Option<i64> = sqlx::query_scalar(
-                            "SELECT 1 FROM entries e
+                        let newer_live: Option<i64> = sqlx::query_scalar!(
+                            "SELECT 1 AS \"found!: i64\" FROM entries e
                              JOIN entry_state es ON es.entry_id = e.id
                              WHERE es.inbox_state IN ('unread', 'dismissed')
                                AND (e.id = ? OR (e.url = ? AND EXISTS (
@@ -160,12 +160,12 @@ impl SyncRepo<'_> {
                                )))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                              LIMIT 1",
+                            det_id,
+                            canon_item,
+                            canon_feed,
+                            det_feed_id,
+                            tomb.deleted_at as _,
                         )
-                        .bind(&det_id)
-                        .bind(&canon_item)
-                        .bind(&canon_feed)
-                        .bind(&det_feed_id)
-                        .bind(tomb.deleted_at)
                         .fetch_optional(&mut *conn)
                         .await?;
                         if newer_live.is_some() {
@@ -178,7 +178,7 @@ impl SyncRepo<'_> {
                             tomb.deleted_at,
                         )
                         .await?;
-                        let target_ids: Vec<String> = sqlx::query_scalar(
+                        let target_ids: Vec<String> = sqlx::query_scalar!(
                             "SELECT e.id FROM entries e
                              JOIN entry_state es ON es.entry_id = e.id
                              WHERE es.inbox_state IN ('unread', 'dismissed')
@@ -189,12 +189,12 @@ impl SyncRepo<'_> {
                                      AND (fs.feed_url = ? OR fs.collection_id = ?)
                                )))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+                            det_id,
+                            canon_item,
+                            canon_feed,
+                            det_feed_id,
+                            tomb.deleted_at as _,
                         )
-                        .bind(&det_id)
-                        .bind(&canon_item)
-                        .bind(&canon_feed)
-                        .bind(&det_feed_id)
-                        .bind(tomb.deleted_at)
                         .fetch_all(&mut *conn)
                         .await?;
                         for iid in target_ids {
@@ -221,17 +221,17 @@ impl SyncRepo<'_> {
                 ActivityEntityType::Tag => {
                     let canon_key = tag_natural_key(key);
                     let tag_slug = format!("tag:{canon_key}");
-                    let newer_live: Option<i64> = sqlx::query_scalar(
-                        "SELECT 1 FROM entries e
+                    let newer_live: Option<i64> = sqlx::query_scalar!(
+                        "SELECT 1 AS \"found!: i64\" FROM entries e
                          JOIN collection_specs cs ON cs.collection_id = e.id
                          WHERE cs.collection_role = 'tag'
                            AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))
                            AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          LIMIT 1",
+                        tag_slug,
+                        canon_key,
+                        tomb.deleted_at as _,
                     )
-                    .bind(&tag_slug)
-                    .bind(&canon_key)
-                    .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
                     if newer_live.is_some() {
@@ -244,7 +244,7 @@ impl SyncRepo<'_> {
                         tomb.deleted_at,
                     )
                     .await?;
-                    sqlx::query(
+                    sqlx::query!(
                         "UPDATE entries SET updated_at = ?
                          WHERE id IN (
                              SELECT ce.entry_id FROM collection_entries ce
@@ -254,14 +254,14 @@ impl SyncRepo<'_> {
                                AND (cs.slug = ? OR LOWER(te.title) = LOWER(?))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', te.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          )",
+                        now as _,
+                        tag_slug,
+                        canon_key,
+                        tomb.deleted_at as _,
                     )
-                    .bind(now)
-                    .bind(&tag_slug)
-                    .bind(&canon_key)
-                    .bind(tomb.deleted_at)
                     .execute(&mut *conn)
                     .await?;
-                    let deleted_id: Option<String> = sqlx::query_scalar(
+                    let deleted_id: Option<String> = sqlx::query_scalar!(
                         "DELETE FROM entries
                          WHERE id IN (
                              SELECT e.id FROM entries e
@@ -270,11 +270,11 @@ impl SyncRepo<'_> {
                                AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                          )
-                         RETURNING id",
+                         RETURNING id AS \"id!: String\"",
+                        tag_slug,
+                        canon_key,
+                        tomb.deleted_at as _,
                     )
-                    .bind(&tag_slug)
-                    .bind(&canon_key)
-                    .bind(tomb.deleted_at)
                     .fetch_optional(&mut *conn)
                     .await?;
                     if let Some(tid) = deleted_id {
@@ -290,15 +290,15 @@ impl SyncRepo<'_> {
                 }
                 ActivityEntityType::CollectionEntry => {
                     if let Some((col_id, entry_id)) = key.split_once('\0') {
-                        let newer_live: Option<i64> = sqlx::query_scalar(
-                            "SELECT 1 FROM collection_entries
+                        let newer_live: Option<i64> = sqlx::query_scalar!(
+                            "SELECT 1 AS \"found!: i64\" FROM collection_entries
                              WHERE collection_id = ? AND entry_id = ?
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', added_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                              LIMIT 1",
+                            col_id,
+                            entry_id,
+                            tomb.deleted_at as _,
                         )
-                        .bind(col_id)
-                        .bind(entry_id)
-                        .bind(tomb.deleted_at)
                         .fetch_optional(&mut *conn)
                         .await?;
                         if newer_live.is_some() {
@@ -306,14 +306,14 @@ impl SyncRepo<'_> {
                         }
                         Self::record_tombstone(&mut *conn, tomb.entity_type, key, tomb.deleted_at)
                             .await?;
-                        sqlx::query(
+                        sqlx::query!(
                             "DELETE FROM collection_entries
                              WHERE collection_id = ? AND entry_id = ?
                                AND strftime('%Y-%m-%dT%H:%M:%fZ', added_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+                            col_id,
+                            entry_id,
+                            tomb.deleted_at as _,
                         )
-                        .bind(col_id)
-                        .bind(entry_id)
-                        .bind(tomb.deleted_at)
                         .execute(&mut *conn)
                         .await?;
                     }

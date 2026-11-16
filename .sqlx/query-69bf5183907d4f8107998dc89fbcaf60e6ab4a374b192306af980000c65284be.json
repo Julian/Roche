@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries SET updated_at = ?\n                 WHERE id IN (SELECT entry_id FROM collection_entries WHERE collection_id = ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "69bf5183907d4f8107998dc89fbcaf60e6ab4a374b192306af980000c65284be"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries\n                 (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)\n                 VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "fa43f9923cb9bd4f1d17cc29df92d0c16cbf9692830e6d0ba58251361a3dfae0"
+}

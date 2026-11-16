@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT kind as \"kind!: EntryKind\" FROM entries WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "kind!: EntryKind",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9f2d744c871580eaecbbfde2cdee06c827bd8a5ab8f26471d0c5f7d58039003b"
+}

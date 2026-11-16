@@ -1,0 +1,57 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id,\n                    COALESCE(e.url, '') AS \"url!: String\",\n                    ec.content_html AS \"content_html?: String\",\n                    e.thumbnail_url\n             FROM entries e\n             LEFT JOIN entry_content ec ON ec.entry_id = e.id\n             WHERE (\n                 e.thumbnail_url IS NULL\n                 AND (\n                   (ec.content_html IS NOT NULL AND (ec.content_html LIKE '%<img%' OR ec.content_html LIKE '%<IMG%'))\n                   OR e.url LIKE '%youtube.com/%'\n                   OR e.url LIKE '%youtu.be/%'\n                 )\n               )\n               OR e.thumbnail_url LIKE '%.svg'\n               OR e.thumbnail_url LIKE '%.svg?%'\n               OR e.thumbnail_url LIKE '%/images/core/emoji/%'\n               OR e.thumbnail_url LIKE '%/wpcom-smileys/%'\n               OR e.thumbnail_url LIKE '%/twemoji/%'",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "url!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "name": "content_html?: String",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_content",
+            "name": "content_html"
+          }
+        }
+      },
+      {
+        "name": "thumbnail_url",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "thumbnail_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "759ab45f8473b91395760ee32a4c24dc65cabf2be88967e8203f333000fa0e7f"
+}

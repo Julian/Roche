@@ -180,8 +180,8 @@ dependencies {
     implementation(libs.compose.ui)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)
-    implementation(libs.compose.material.icons.core)
-    implementation(libs.compose.material.icons.extended)
+    implementation(libs.androidx.navigation3.runtime)
+    implementation(libs.androidx.navigation3.ui)
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
@@ -192,10 +192,11 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.jsoup)
     implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.datasource)
     implementation(libs.androidx.media3.session)
     implementation(libs.androidx.media3.common)
     implementation(libs.room3.runtime)
-    implementation(libs.sqlite.framework)
+    implementation(libs.sqlite.bundled)
     ksp(libs.room3.compiler)
 
     testImplementation(libs.junit.jupiter)

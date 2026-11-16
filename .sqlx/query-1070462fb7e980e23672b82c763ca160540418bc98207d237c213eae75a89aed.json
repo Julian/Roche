@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entry_media\n             SET entry_id = ?\n             WHERE entry_id = ? AND local_path IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "1070462fb7e980e23672b82c763ca160540418bc98207d237c213eae75a89aed"
+}

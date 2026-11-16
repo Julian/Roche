@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT entry_id as \"entry_id!\" FROM entry_identifiers WHERE scheme = ? AND value = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "entry_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_identifiers",
+            "name": "entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8ffc64d2581aaa9532327cef39f583146361ca17806972f099d171bf5e4c1a4c"
+}

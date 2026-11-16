@@ -60,6 +60,7 @@ enum class HeadlineFont {
     SANS,
 }
 
+@kotlinx.serialization.Serializable
 enum class InboxFilter(val label: String) {
     ALL("All"),
     UNREAD("Unread"),
@@ -71,6 +72,7 @@ enum class InboxFilter(val label: String) {
     ARCHIVED("Archived"),
 }
 
+@kotlinx.serialization.Serializable
 enum class AppTab(val label: String) {
     HOME("Home"),
     FEEDS("Feeds"),

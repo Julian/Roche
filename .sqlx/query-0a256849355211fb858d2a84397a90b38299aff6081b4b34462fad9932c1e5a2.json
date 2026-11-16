@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_content (entry_id, content_html, content_type)\n                 SELECT id, summary, 'article' FROM entries WHERE id = ?\n                 ON CONFLICT(entry_id) DO UPDATE SET\n                     content_html = COALESCE(NULLIF(entry_content.content_html, ''), (SELECT summary FROM entries WHERE id = ?))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "0a256849355211fb858d2a84397a90b38299aff6081b4b34462fad9932c1e5a2"
+}

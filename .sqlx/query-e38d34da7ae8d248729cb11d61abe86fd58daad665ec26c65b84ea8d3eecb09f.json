@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_seen_at AS \"last_seen_at: DateTime<Utc>\" FROM peer_nodes WHERE peer_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_seen_at: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "peer_nodes",
+            "name": "last_seen_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e38d34da7ae8d248729cb11d61abe86fd58daad665ec26c65b84ea8d3eecb09f"
+}

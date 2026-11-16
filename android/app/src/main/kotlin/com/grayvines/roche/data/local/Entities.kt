@@ -2,6 +2,7 @@ package com.grayvines.roche.data.local
 
 import androidx.room3.Entity
 import androidx.room3.ForeignKey
+import androidx.room3.Fts5
 import androidx.room3.Index
 import androidx.room3.PrimaryKey
 
@@ -80,6 +81,26 @@ data class ItemContentEntity(
     val summary: String? = null,
     val contentText: String? = null,
     val contentHtml: String? = null,
+)
+
+@Entity(tableName = "items_fts")
+@Fts5(contentEntity = ItemEntity::class)
+data class ItemFtsEntity(
+    val title: String,
+    val feedTitle: String,
+    val author: String?,
+    val url: String,
+    val summary: String?,
+    val contentText: String?,
+    val contentHtml: String?,
+)
+
+@Entity(tableName = "item_contents_fts")
+@Fts5(contentEntity = ItemContentEntity::class)
+data class ItemContentFtsEntity(
+    val summary: String?,
+    val contentText: String?,
+    val contentHtml: String?,
 )
 
 data class ItemStateRow(

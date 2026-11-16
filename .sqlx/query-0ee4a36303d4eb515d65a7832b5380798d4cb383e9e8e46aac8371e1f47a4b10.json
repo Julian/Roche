@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 as \"found!: i64\" FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0ee4a36303d4eb515d65a7832b5380798d4cb383e9e8e46aac8371e1f47a4b10"
+}

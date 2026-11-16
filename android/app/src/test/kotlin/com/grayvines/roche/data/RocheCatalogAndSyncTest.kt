@@ -141,6 +141,7 @@ class RocheCatalogAndSyncTest {
                         RocheDatabase.MIGRATION_5_6,
                         RocheDatabase.MIGRATION_6_7,
                         RocheDatabase.MIGRATION_7_8,
+                        RocheDatabase.MIGRATION_8_9,
                     )
                     .build()
             try {
@@ -760,7 +761,10 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(RocheDatabase.MIGRATION_7_8)
+                    .addMigrations(
+                        RocheDatabase.MIGRATION_7_8,
+                        RocheDatabase.MIGRATION_8_9,
+                    )
                     .build()
             try {
                 val dao = migratedDb.dao()
@@ -1015,4 +1019,473 @@ class RocheCatalogAndSyncTest {
             assertEquals(null, parsedItem.audioUrl)
             assertEquals("https://feeds.example.com/ep1", parsedItem.url)
         }
+
+    @Test
+    fun `Room MIGRATION_8_9 creates items_fts and backfills v8 items and item_contents`() =
+        runTest {
+            val dbFile = File(tempDir, "roche_v8_upgrade.db")
+            val driver = BundledSQLiteDriver()
+            driver.open(dbFile.absolutePath).use { conn ->
+                createBaseV6TablesForMigrationTest(conn)
+                com.grayvines.roche.data.local.migrateCatalogSchemaV7(conn)
+                com.grayvines.roche.data.local.migrateCatalogAndSyncSchemaV8(conn)
+                conn.execSQL(
+                    "INSERT INTO `items` (`id`, `feedId`, `feedTitle`, `title`, `url`, `author`, " +
+                        "`summary`, `contentText`, `contentHtml`, `contentType`, `status`, " +
+                        "`isFavorite`, `isCachedOffline`, `createdAt`, `readProgress`) VALUES " +
+                        "('v8-inline', NULL, 'Systems Weekly', 'Brotli Transport Notes', " +
+                        "'https://example.com/brotli', 'Ada Lovelace', " +
+                        "'Inline summary AlphaInlineToken88', 'Short inline text', " +
+                        "'<p>Short inline text</p>', 'article', 'unread', 0, 0, " +
+                        "'2026-06-01T00:00:00Z', 0.0)"
+                )
+                val deepBody = "Intro. " + "w".repeat(4_000) + " DeepBackfilledToken77 tail."
+                val inlinePreview = deepBody.take(2_048)
+                conn.execSQL(
+                    "INSERT INTO `items` (`id`, `feedId`, `feedTitle`, `title`, `url`, `author`, " +
+                        "`summary`, `contentText`, `contentHtml`, `contentType`, `status`, " +
+                        "`isFavorite`, `isCachedOffline`, `createdAt`, `readProgress`) VALUES " +
+                        "('v8-deep', NULL, 'Kernel Digest', 'Extended Essay', " +
+                        "'https://example.com/deep', 'Grace Hopper', 'Preview summary', " +
+                        "'$inlinePreview', '<p>$inlinePreview</p>', 'article', 'unread', 0, 0, " +
+                        "'2026-06-02T00:00:00Z', 0.0)"
+                )
+                conn.execSQL(
+                    "INSERT INTO `item_contents` " +
+                        "(`itemId`, `summary`, `contentText`, `contentHtml`) " +
+                        "VALUES ('v8-deep', 'Extended summary', '$deepBody', '<p>$deepBody</p>')"
+                )
+                conn.execSQL("PRAGMA user_version = 8")
+            }
+
+            val migratedDb =
+                Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
+                    .setDriver(BundledSQLiteDriver())
+                    .addMigrations(RocheDatabase.MIGRATION_8_9)
+                    .build()
+            try {
+                val upgradedRepo =
+                    RocheRepository(
+                        database = migratedDb,
+                        apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                        settings = settings,
+                    )
+                val inlineHits = upgradedRepo.searchDeepEntries("AlphaInlineToken88")
+                assertEquals(listOf("v8-inline"), inlineHits.map { it.id })
+
+                val deepHits = upgradedRepo.searchDeepEntries("DeepBackfilledToken77")
+                assertEquals(listOf("v8-deep"), deepHits.map { it.id })
+
+                val syntaxEscapedHits =
+                    upgradedRepo.searchDeepEntries("\"Intro: (DeepBackfilled)* -tail")
+                assertEquals(listOf("v8-deep"), syntaxEscapedHits.map { it.id })
+                // Cross-table multi-token search: "Extended" is in items.title,
+                // "DeepBackfilledToken77" is beyond inline preview in item_contents.contentText
+                val crossTableHits =
+                    upgradedRepo.searchDeepEntries("Extended DeepBackfilledToken77")
+                assertEquals(listOf("v8-deep"), crossTableHits.map { it.id })
+                assertTrue(
+                    upgradedRepo.searchDeepEntries("\"unbalanced: (DeepBackfilled)* -AND").isEmpty()
+                )
+
+                upgradedRepo.deleteItem("v8-inline")
+                assertTrue(upgradedRepo.searchDeepEntries("AlphaInlineToken88").isEmpty())
+                upgradedRepo.deleteItem("v8-deep")
+                assertTrue(upgradedRepo.searchDeepEntries("DeepBackfilledToken77").isEmpty())
+            } finally {
+                migratedDb.close()
+            }
+
+            // Verify external-content FTS5 schema, triggers, and SQLite FTS5 integrity-check
+            driver.open(dbFile.absolutePath).use { conn ->
+                conn.execSQL("INSERT INTO `items_fts`(`items_fts`) VALUES('integrity-check')")
+                conn.execSQL(
+                    "INSERT INTO `item_contents_fts`(`item_contents_fts`) VALUES('integrity-check')"
+                )
+                conn
+                    .prepare(
+                        "SELECT COUNT(*) FROM sqlite_master " +
+                            "WHERE type = 'trigger' AND name LIKE 'room_fts_content_sync_%'"
+                    )
+                    .use { stmt ->
+                        assertTrue(stmt.step())
+                        assertEquals(8L, stmt.getLong(0))
+                    }
+            }
+        }
+
+    @Test
+    fun `parseFeedXml handles RDF YouTube Atom iTunes arXiv v1 CDATA and rejects XXE or HTML`() {
+        // 1. RDF 1.0 feed with sibling <item> elements, dc:creator, dc:date, and arXiv v1 link
+        val rdfXml =
+            listOf(
+                    """<?xml version="1.0" encoding="UTF-8"?>""",
+                    """<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"""",
+                    """         xmlns="http://purl.org/rss/1.0/"""",
+                    """         xmlns:dc="http://purl.org/dc/elements/1.1/">""",
+                    """  <channel rdf:about="https://arxiv.org/rss/cs.LG">""",
+                    """    <title>cs.LG updates on arXiv.org</title>""",
+                    """    <link>http://arxiv.org/list/cs.LG/recent</link>""",
+                    """    <description>Machine Learning papers</description>""",
+                    """  </channel>""",
+                    """  <item rdf:about="http://arxiv.org/abs/2603.11842v1">""",
+                    """    <title>Speculative Decoding at Scale</title>""",
+                    """    <link>http://arxiv.org/abs/2603.11842v1</link>""",
+                    """    <description><![CDATA[<p>Abstract line 1</p>""",
+                    """<pre><code>fn step() {""",
+                    """    decode();""",
+                    """}</code></pre>]]></description>""",
+                    """    <dc:creator>A. Researcher</dc:creator>""",
+                    """    <dc:date>2026-06-10T14:30:00Z</dc:date>""",
+                    """  </item>""",
+                    """</rdf:RDF>""",
+                )
+                .joinToString("\n")
+        val rdfBatch =
+            LocalFeedPoller.parseFeedXml(
+                xml = rdfXml,
+                feedUrl = "https://arxiv.org/rss/cs.LG",
+                feedType = "arxiv",
+            )
+        assertEquals("cs.LG updates on arXiv.org", rdfBatch.title)
+        assertEquals(1, rdfBatch.items.size)
+        val arxivItem = rdfBatch.items.single()
+        assertEquals("https://arxiv.org/abs/2603.11842", arxivItem.url)
+        assertEquals("paper", arxivItem.contentType)
+        assertEquals("A. Researcher", arxivItem.author)
+        assertEquals("2026-06-10T14:30:00Z", arxivItem.publishedAt)
+        assertTrue(arxivItem.contentHtml?.contains("fn step() {\n    decode();\n}") == true)
+
+        // 2. YouTube Atom feed with yt:videoId and media:group
+        val ytAtomXml =
+            listOf(
+                    """<?xml version="1.0" encoding="UTF-8"?>""",
+                    """<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"""",
+                    """      xmlns:media="http://search.yahoo.com/mrss/"""",
+                    """      xmlns="http://www.w3.org/2005/Atom">""",
+                    """  <title>Systems Conf</title>""",
+                    """  <link rel="alternate" href="https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw"/>""",
+                    """  <entry>""",
+                    """    <id>yt:video:dQw4w9WgXcQ</id>""",
+                    """    <yt:videoId>dQw4w9WgXcQ</yt:videoId>""",
+                    """    <title>Zero-Copy Networking</title>""",
+                    """    <link rel="alternate" href="https://www.youtube.com/watch?v=dQw4w9WgXcQ"/>""",
+                    """    <author><name>Systems Conf</name></author>""",
+                    """    <published>2026-06-11T09:00:00+00:00</published>""",
+                    """    <media:group>""",
+                    """      <media:description>Talk abstract from the systems track.</media:description>""",
+                    """      <media:thumbnail url="https://i1.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"/>""",
+                    """    </media:group>""",
+                    """  </entry>""",
+                    """</feed>""",
+                )
+                .joinToString("\n")
+        val ytBatch =
+            LocalFeedPoller.parseFeedXml(
+                xml = ytAtomXml,
+                feedUrl =
+                    "https://www.youtube.com/feeds/videos.xml?channel_id=UC_x5XG1OV2P6uZZ5FSM9Ttw",
+                feedType = "youtube",
+            )
+        assertEquals("Systems Conf", ytBatch.title)
+        val ytItem = ytBatch.items.single()
+        assertEquals("https://www.youtube.com/watch?v=dQw4w9WgXcQ", ytItem.url)
+        assertEquals("video", ytItem.contentType)
+        assertEquals("https://i1.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", ytItem.thumbnailUrl)
+        assertTrue(ytItem.summary.contains("Talk abstract from the systems track."))
+
+        // 3. iTunes podcast RSS with itunes:duration and itunes:image
+        val itunesXml =
+            listOf(
+                    """<?xml version="1.0" encoding="UTF-8"?>""",
+                    """<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">""",
+                    """  <channel>""",
+                    """    <title>Kernel Radio</title>""",
+                    """    <link>https://pod.example.com</link>""",
+                    """    <itunes:author>Linus &amp; Friends</itunes:author>""",
+                    """    <itunes:image href="https://pod.example.com/channel-art.jpg"/>""",
+                    """    <item>""",
+                    """      <title>Episode 9: io_uring</title>""",
+                    """      <link>https://pod.example.com/ep9</link>""",
+                    """      <enclosure url="https://pod.example.com/ep9.mp3" type="audio/mpeg" length="999"/>""",
+                    """      <itunes:duration>01:05:30</itunes:duration>""",
+                    """      <itunes:image href="/ep9-art.jpg"/>""",
+                    """    </item>""",
+                    """  </channel>""",
+                    """</rss>""",
+                )
+                .joinToString("\n")
+        val podBatch =
+            LocalFeedPoller.parseFeedXml(
+                xml = itunesXml,
+                feedUrl = "https://pod.example.com/feed.xml",
+                feedType = "rss",
+            )
+        val podItem = podBatch.items.single()
+        assertEquals("audio", podItem.contentType)
+        assertEquals("https://pod.example.com/ep9.mp3", podItem.audioUrl)
+        assertEquals("65:30", podItem.duration)
+        assertEquals("https://pod.example.com/ep9-art.jpg", podItem.thumbnailUrl)
+        assertEquals("Linus & Friends", podItem.author)
+
+        // 4. XXE external entity rejection (SYSTEM & PUBLIC, case-insensitive)
+        val xxeSystemXml =
+            listOf(
+                    """<?xml version="1.0"?>""",
+                    """<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>""",
+                    """<rss version="2.0"><channel><title>&xxe;</title></channel></rss>""",
+                )
+                .joinToString("\n")
+        assertThrows(IllegalArgumentException::class.java) {
+            LocalFeedPoller.parseFeedXml(xxeSystemXml, "https://example.com/rss.xml")
+        }
+        val xxePublicXml =
+            listOf(
+                    """<!DOCTYPE feed [<!entity ext public "-//W3C//ENTITIES//EN" "http://127.0.0.1/x">]>""",
+                    """<feed xmlns="http://www.w3.org/2005/Atom"><title>Bad</title></feed>""",
+                )
+                .joinToString("\n")
+        assertThrows(IllegalArgumentException::class.java) {
+            LocalFeedPoller.parseFeedXml(xxePublicXml, "https://example.com/atom.xml")
+        }
+
+        // 5. Non-feed HTML error page and rootless garbage rejection
+        assertThrows(IllegalArgumentException::class.java) {
+            LocalFeedPoller.parseFeedXml(
+                "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>",
+                "https://example.com/rss.xml",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            LocalFeedPoller.parseFeedXml(
+                "upstream proxy timeout plain text",
+                "https://example.com/rss.xml",
+            )
+        }
+    }
+
+    @Test
+    fun `parseFeedXml preserves Atom xhtml tags allows CDATA ENTITY examples and single-decodes entities`() {
+        val atomXhtml =
+            listOf(
+                    """<?xml version="1.0" encoding="UTF-8"?>""",
+                    """<feed xmlns="http://www.w3.org/2005/Atom">""",
+                    """  <title>XHTML &amp;lt;Feed&amp;gt;</title>""",
+                    """  <entry>""",
+                    """    <id>urn:uuid:1</id>""",
+                    """    <title>XHTML Post</title>""",
+                    """    <link rel="alternate" href="https://blog.example.com/posts/1"/>""",
+                    """    <content type="xhtml">""",
+                    """      <div xmlns="http://www.w3.org/1999/xhtml">""",
+                    """        <p>Intro paragraph.</p>""",
+                    """        <pre><code>fn a() {""",
+                    """    b();""",
+                    """}</code></pre>""",
+                    """        <p><a href="/docs">Docs</a><img src="/img/pic.png"/></p>""",
+                    """      </div>""",
+                    """    </content>""",
+                    """  </entry>""",
+                    """</feed>""",
+                )
+                .joinToString("\n")
+        val batch = LocalFeedPoller.parseFeedXml(atomXhtml, "https://blog.example.com/atom.xml")
+        assertEquals("XHTML &lt;Feed&gt;", batch.title)
+        val html = batch.items.single().contentHtml.orEmpty()
+        assertTrue(html.contains("<p>Intro paragraph.</p>"))
+        assertTrue(html.contains("<pre><code>fn a() {\n    b();\n}</code></pre>"))
+        assertTrue(html.contains("""<a href="/docs">Docs</a>"""))
+        assertTrue(html.contains("""src="https://blog.example.com/img/pic.png""""))
+
+        val cdataEntityRss =
+            listOf(
+                    """<?xml version="1.0"?>""",
+                    """<rss version="2.0"><channel><title>Sec Blog</title><item>""",
+                    """<title>XXE Writeup</title><link>https://sec.example.com/xxe</link>""",
+                    """<description><![CDATA[Example payload: <!ENTITY xxe SYSTEM "file:///etc/passwd">]]></description>""",
+                    """</item></channel></rss>""",
+                )
+                .joinToString("\n")
+        val secItem =
+            LocalFeedPoller.parseFeedXml(cdataEntityRss, "https://sec.example.com/rss")
+                .items
+                .single()
+        assertEquals("Example payload:", secItem.summary)
+        assertTrue(secItem.contentHtml.orEmpty().contains("<!ENTITY xxe SYSTEM"))
+        assertEquals("&lt;tag&gt; <ok>", decodeHtmlText("&amp;lt;tag&amp;gt;&nbsp;&lt;ok&gt;"))
+    }
+
+    @Test
+    fun `parseFeedXml supports RSS media_group YouTube videoId fallback and strict resolveRelativeUrl`() {
+        val mrssXml =
+            listOf(
+                    """<?xml version="1.0"?>""",
+                    """<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>""",
+                    """<title>Media Feed</title><item><title>Clip 1</title>""",
+                    """<media:group>""",
+                    """  <media:content url="https://cdn.example.com/clip1.mp4" type="video/mp4"/>""",
+                    """  <media:description>Grouped media summary</media:description>""",
+                    """  <media:thumbnail url="/thumbs/clip1.jpg"/>""",
+                    """</media:group></item></channel></rss>""",
+                )
+                .joinToString("\n")
+        val mrssItem =
+            LocalFeedPoller.parseFeedXml(mrssXml, "https://media.example.com/rss.xml")
+                .items
+                .single()
+        assertEquals("https://cdn.example.com/clip1.mp4", mrssItem.url)
+        assertEquals("Grouped media summary", mrssItem.summary)
+        assertEquals("https://media.example.com/thumbs/clip1.jpg", mrssItem.thumbnailUrl)
+
+        val ytLinklessXml =
+            listOf(
+                    """<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">""",
+                    """  <title>YT</title>""",
+                    """  <entry><id>yt:video:dQw4w9WgXcQ</id><yt:videoId>dQw4w9WgXcQ</yt:videoId><title>Ok</title></entry>""",
+                    """  <entry><id>yt:video:bad</id><yt:videoId>../evil</yt:videoId><title>Bad</title></entry>""",
+                    """</feed>""",
+                )
+                .joinToString("\n")
+        val ytItems =
+            LocalFeedPoller.parseFeedXml(
+                    ytLinklessXml,
+                    "https://www.youtube.com/feeds/videos.xml?channel_id=UC_x5XG1OV2P6uZZ5FSM9Ttw",
+                    "youtube",
+                )
+                .items
+        assertEquals(listOf("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), ytItems.map { it.url })
+
+        assertEquals(
+            null,
+            resolveRelativeUrl("https://example.com/a", "https://"),
+        )
+        assertEquals(
+            null,
+            resolveRelativeUrl("https://example.com/a", "http:///missing-host"),
+        )
+        assertEquals(
+            null,
+            resolveRelativeUrl("https://example.com/a", "https://bad host/x"),
+        )
+        assertEquals(
+            "https://example.com/ok",
+            resolveRelativeUrl("https://example.com/a", "https://example.com/ok"),
+        )
+    }
+
+    @Test
+    fun `LocalFeedPoller pollFeed promoting placeholder feed title updates existing items and FTS`() =
+        runTest {
+            val dao = database.dao()
+            dao.upsertFeed(
+                FeedEntity(
+                    id = "feed-placeholder",
+                    title = "blog.example.com",
+                    url = "https://blog.example.com/rss.xml",
+                    siteUrl = null,
+                    feedType = "rss",
+                )
+            )
+            dao.upsertItem(
+                ItemEntity(
+                    id = "older-item-1",
+                    feedId = "feed-placeholder",
+                    feedUrl = "https://blog.example.com/rss.xml",
+                    feedTitle = "blog.example.com",
+                    title = "Older Post",
+                    url = "https://blog.example.com/post-0",
+                    author = null,
+                    summary = "Summary",
+                    contentText = "Body",
+                    contentHtml = "<p>Body</p>",
+                    contentType = "article",
+                    status = "unread",
+                    isFavorite = false,
+                    isCachedOffline = false,
+                    publishedAt = "2026-06-01T00:00:00Z",
+                    createdAt = "2026-06-01T00:00:00Z",
+                    readProgress = 0.0,
+                    thumbnailMediaId = null,
+                    duration = null,
+                )
+            )
+            val rssXml =
+                listOf(
+                        """<?xml version="1.0"?>""",
+                        """<rss version="2.0"><channel><title>Promoted Feed Title99</title>""",
+                        """<item><title>New Post</title><link>https://blog.example.com/post-1</link></item>""",
+                        """</channel></rss>""",
+                    )
+                    .joinToString("\n")
+            val pollClient = RocheApiClient { HttpResponse(statusCode = 200, body = rssXml) }
+            val feed = dao.getFeedById("feed-placeholder")!!
+            LocalFeedPoller.pollFeed(dao, pollClient, feed, "peer-local").getOrThrow()
+
+            assertEquals("Promoted Feed Title99", dao.getItemById("older-item-1")?.feedTitle)
+            assertTrue(
+                repository.searchDeepEntries("Promoted Feed Title99").any {
+                    it.id == "older-item-1"
+                }
+            )
+        }
+}
+
+private fun createBaseV6TablesForMigrationTest(conn: androidx.sqlite.SQLiteConnection) {
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `feeds` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, " +
+            "`url` TEXT NOT NULL, `siteUrl` TEXT, `feedType` TEXT NOT NULL, `description` TEXT, " +
+            "`language` TEXT, `pollInterval` INTEGER NOT NULL, `lastPolled` TEXT, " +
+            "`lastPolledBy` TEXT, `lastError` TEXT, `lastErrorBy` TEXT, " +
+            "`isActive` INTEGER NOT NULL, `autoDownloadEpisodes` INTEGER NOT NULL, " +
+            "`customPlaybackSpeed` REAL, PRIMARY KEY(`id`))"
+    )
+    conn.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_feeds_url` ON `feeds` (`url`)")
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `items` (`id` TEXT NOT NULL, `feedId` TEXT, " +
+            "`feedTitle` TEXT NOT NULL, `title` TEXT NOT NULL, `url` TEXT NOT NULL, " +
+            "`author` TEXT, `summary` TEXT, `contentText` TEXT, `contentHtml` TEXT, " +
+            "`contentType` TEXT NOT NULL, `status` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, " +
+            "`isCachedOffline` INTEGER NOT NULL, `publishedAt` TEXT, `createdAt` TEXT NOT NULL, " +
+            "`readProgress` REAL NOT NULL, `thumbnailMediaId` TEXT, `duration` TEXT, " +
+            "`readAt` TEXT, `thumbnailUrl` TEXT, `feedUrl` TEXT, `interactionUpdatedAt` TEXT, " +
+            "`audioUrl` TEXT, PRIMARY KEY(`id`))"
+    )
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_items_feedId` ON `items` (`feedId`)")
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_items_status` ON `items` (`status`)")
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_items_contentType` ON `items` (`contentType`)")
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_items_isFavorite` ON `items` (`isFavorite`)")
+    conn.execSQL(
+        "CREATE INDEX IF NOT EXISTS `index_items_publishedAt_createdAt` " +
+            "ON `items` (`publishedAt`, `createdAt`)"
+    )
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `item_contents` (`itemId` TEXT NOT NULL, `summary` TEXT, " +
+            "`contentText` TEXT, `contentHtml` TEXT, PRIMARY KEY(`itemId`), " +
+            "FOREIGN KEY(`itemId`) REFERENCES `items`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
+    )
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `tags` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, " +
+            "`color` TEXT, PRIMARY KEY(`id`))"
+    )
+    conn.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_tags_name` ON `tags` (`name`)")
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `item_tags` (`itemId` TEXT NOT NULL, `tagId` TEXT NOT NULL, " +
+            "PRIMARY KEY(`itemId`, `tagId`))"
+    )
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_item_tags_itemId` ON `item_tags` (`itemId`)")
+    conn.execSQL("CREATE INDEX IF NOT EXISTS `index_item_tags_tagId` ON `item_tags` (`tagId`)")
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `pending_mutations` (`entityId` TEXT NOT NULL, " +
+            "`isLocalFeed` INTEGER NOT NULL, `isLocalItem` INTEGER NOT NULL, " +
+            "`titleOverride` TEXT, `dirtyStatus` TEXT, `dirtyFavorite` INTEGER, " +
+            "`dirtyReadProgress` REAL, `dirtyReadAt` TEXT, `addedTagsCsv` TEXT NOT NULL, " +
+            "`removedTagsCsv` TEXT NOT NULL, PRIMARY KEY(`entityId`))"
+    )
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS `sync_tombstones` (`entityType` TEXT NOT NULL, " +
+            "`naturalKey` TEXT NOT NULL, `deletedAt` TEXT NOT NULL, " +
+            "PRIMARY KEY(`entityType`, `naturalKey`))"
+    )
+    conn.execSQL(
+        "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)"
+    )
 }

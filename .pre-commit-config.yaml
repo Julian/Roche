@@ -22,10 +22,10 @@ repos:
         files: ^(Cargo\.toml|rustfmt\.toml|.*/Cargo\.toml|.*\.rs)$
       - id: clippy
         name: cargo clippy
-        entry: cargo clippy --all-targets -- -D warnings
+        entry: env SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings
         language: system
         pass_filenames: false
-        files: ^(Cargo\.(toml|lock)|.*/Cargo\.toml|.*\.rs)$
+        files: ^(Cargo\.(toml|lock)|.*/Cargo\.toml|.*\.rs|server/migrations/.*\.sql|\.sqlx/.*\.json)$
       - id: cargo-deny
         name: cargo deny
         entry: cargo deny check

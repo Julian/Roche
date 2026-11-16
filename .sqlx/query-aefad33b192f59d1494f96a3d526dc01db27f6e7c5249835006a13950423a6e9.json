@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE collection_generators\n                 SET enabled = ?, current_entry_id = ?, drawn_at = ?, updated_at = ?\n                 WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "aefad33b192f59d1494f96a3d526dc01db27f6e7c5249835006a13950423a6e9"
+}

@@ -176,12 +176,13 @@ impl ItemRepo<'_> {
         items.truncate(cap);
 
         let boundary_ts = if has_more && let Some(last_item) = items.last() {
-            let iso_str: Option<String> = sqlx::query_scalar(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) FROM entries WHERE id = ?",
+            let iso_str: Option<String> = sqlx::query_scalar!(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) AS \"iso?: String\" FROM entries WHERE id = ?",
+                last_item.id,
             )
-            .bind(&last_item.id)
             .fetch_optional(self.pool)
-            .await?;
+            .await?
+            .flatten();
             iso_str
                 .as_deref()
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -224,20 +225,21 @@ impl ItemRepo<'_> {
     }
 
     pub async fn count_by_status(&self, status: ItemStatus) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
+        let inbox_state = InboxState::from(status);
+        Ok(sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"count!: i64\"
              FROM entry_state es
              JOIN entries e ON e.id = es.entry_id
              WHERE e.merged_into_id IS NULL AND es.inbox_state = ?",
+            inbox_state as _,
         )
-        .bind(InboxState::from(status))
         .fetch_one(self.pool)
         .await?)
     }
 
     pub async fn count_unread(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
+        Ok(sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"count!: i64\"
              FROM entry_state es
              JOIN entries e ON e.id = es.entry_id
              WHERE e.merged_into_id IS NULL

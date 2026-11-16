@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_identifiers (scheme, value, entry_id)\n             VALUES ('url', 'https://example.com/strict-1', 'strict-entry-1')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "7081b8aa7a4007f4fa71ad6ae657f1b30b7aa07b6598951e0cd697e92d2e4b22"
+}

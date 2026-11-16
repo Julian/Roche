@@ -22,22 +22,24 @@ pub(super) async fn remove_from_want_queues_in_tx(
     entry_id: &str,
     ts: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
-    let want_col_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT ce.collection_id
-         FROM collection_entries ce
-         JOIN collection_specs cs ON cs.collection_id = ce.collection_id
-         WHERE ce.entry_id = ? AND cs.collection_role = 'want'",
+    let want_col_ids = sqlx::query_scalar!(
+        r#"SELECT ce.collection_id as "collection_id!"
+           FROM collection_entries ce
+           JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+           WHERE ce.entry_id = ? AND cs.collection_role = 'want'"#,
+        entry_id,
     )
-    .bind(entry_id)
     .fetch_all(&mut *conn)
     .await?;
 
     for col_id in want_col_ids {
-        sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
-            .bind(&col_id)
-            .bind(entry_id)
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+            &col_id,
+            entry_id,
+        )
+        .execute(&mut *conn)
+        .await?;
         let nat_key = collection_entry_natural_key(&col_id, entry_id);
         SyncRepo::record_tombstone(conn, ActivityEntityType::CollectionEntry, &nat_key, ts).await?;
         SyncRepo::record_activity(
@@ -48,9 +50,7 @@ pub(super) async fn remove_from_want_queues_in_tx(
             ts,
         )
         .await?;
-        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-            .bind(ts)
-            .bind(&col_id)
+        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", ts as _, &col_id,)
             .execute(&mut *conn)
             .await?;
     }
@@ -76,10 +76,15 @@ impl CatalogRepo<'_> {
             .get_entry(&canon_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{canon_id}'")))?;
-        let row: ConsumptionLogRow = sqlx::query_as(
-            "SELECT id, entry_id, ts, status, notes, created_at FROM consumption_log WHERE id = ?",
+        let row = sqlx::query_as!(
+            ConsumptionLogRow,
+            r#"SELECT id as "id!", entry_id as "entry_id!", ts as "ts!: DateTime<Utc>",
+                      status as "status!: ConsumptionStatus", notes as "notes?",
+                      created_at as "created_at!: DateTime<Utc>"
+               FROM consumption_log
+               WHERE id = ?"#,
+            &log_id,
         )
-        .bind(&log_id)
         .fetch_one(self.pool)
         .await?;
         Ok(ConsumptionLogView {
@@ -196,20 +201,22 @@ impl CatalogRepo<'_> {
         };
         let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
 
-        let existing_consumed_id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1",
+        let existing_consumed_id = sqlx::query_scalar!(
+            r#"SELECT id as "id!" FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1"#,
+            &canon_id,
         )
-        .bind(&canon_id)
         .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(existing_id) = existing_consumed_id {
             if let Some(n) = clean_notes {
-                sqlx::query("UPDATE consumption_log SET notes = COALESCE(notes, ?) WHERE id = ?")
-                    .bind(n)
-                    .bind(&existing_id)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query!(
+                    "UPDATE consumption_log SET notes = COALESCE(notes, ?) WHERE id = ?",
+                    n,
+                    &existing_id,
+                )
+                .execute(&mut *tx)
+                .await?;
             }
             remove_from_want_queues_in_tx(tx, &canon_id, now).await?;
             Self::engage_consumed_parents_in_tx(tx, &canon_id, event_ts, now).await?;
@@ -239,18 +246,18 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 notes = COALESCE(excluded.notes, consumption_log.notes)",
+            log_id,
+            canon_id,
+            event_ts as _,
+            status as _,
+            clean_notes,
+            now as _,
         )
-        .bind(log_id)
-        .bind(canon_id)
-        .bind(event_ts)
-        .bind(status)
-        .bind(clean_notes)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
@@ -276,24 +283,27 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<()> {
-        let row_meta: (EntryKind, String) =
-            sqlx::query_as("SELECT kind, creators_json FROM entries WHERE id = ?")
-                .bind(canon_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let (entry_kind, creators_json) = row_meta;
+        let row_meta = sqlx::query!(
+            r#"SELECT kind as "kind!: EntryKind", creators_json as "creators_json!"
+               FROM entries WHERE id = ?"#,
+            canon_id,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let entry_kind = row_meta.kind;
+        let creators_json = row_meta.creators_json;
 
         // Engage parent `podcast` / `publication` / `channel` when an episode/article/video is consumed.
         // Note: consuming a `song` intentionally NEVER auto-consumes its parent `album`!
-        let parent_feed_cols: Vec<String> = sqlx::query_scalar(
-            "SELECT ce.collection_id
-             FROM collection_entries ce
-             JOIN entries pe ON pe.id = ce.collection_id
-             WHERE ce.entry_id = ?
-               AND pe.merged_into_id IS NULL
-               AND pe.kind IN ('podcast', 'publication', 'channel')",
+        let parent_feed_cols = sqlx::query_scalar!(
+            r#"SELECT ce.collection_id as "collection_id!"
+               FROM collection_entries ce
+               JOIN entries pe ON pe.id = ce.collection_id
+               WHERE ce.entry_id = ?
+                 AND pe.merged_into_id IS NULL
+                 AND pe.kind IN ('podcast', 'publication', 'channel')"#,
+            canon_id,
         )
-        .bind(canon_id)
         .fetch_all(&mut *tx)
         .await?;
         for parent_id in parent_feed_cols {
@@ -306,13 +316,13 @@ impl CatalogRepo<'_> {
             for creator in creators {
                 if !creator.trim().is_empty() {
                     let artist_id = Self::ensure_artist_entry_in_tx(tx, &creator, now).await?;
-                    sqlx::query(
+                    sqlx::query!(
                         "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
                          VALUES (?, ?, ?)",
+                        &artist_id,
+                        canon_id,
+                        now as _,
                     )
-                    .bind(&artist_id)
-                    .bind(canon_id)
-                    .bind(now)
                     .execute(&mut *tx)
                     .await?;
                     Self::ensure_once_consumed_in_tx(tx, &artist_id, event_ts, now).await?;
@@ -328,22 +338,22 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        let already: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1",
+        let already = sqlx::query_scalar!(
+            r#"SELECT 1 as "found!: i64" FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1"#,
+            entry_id,
         )
-        .bind(entry_id)
         .fetch_optional(&mut *tx)
         .await?;
         if already.is_none() {
             let log_id = deterministic_auto_consumption_log_id(entry_id);
-            let res = sqlx::query(
+            let res = sqlx::query!(
                 "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)
                  VALUES (?, ?, ?, 'consumed', NULL, ?)",
+                &log_id,
+                entry_id,
+                event_ts as _,
+                now as _,
             )
-            .bind(&log_id)
-            .bind(entry_id)
-            .bind(event_ts)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
             if res.rows_affected() > 0 {

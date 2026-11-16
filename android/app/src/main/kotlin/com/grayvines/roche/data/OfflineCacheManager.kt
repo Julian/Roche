@@ -5,6 +5,7 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.moveFileAtomically
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.extractAllImageUrlsFromHtml
 import com.grayvines.roche.model.extractFirstImageUrlFromHtml
@@ -378,9 +379,7 @@ internal suspend fun copyCachedThumbnailBestEffort(
             val tempFile = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
             try {
                 sourceFile.copyTo(tempFile, overwrite = true)
-                if (!tempFile.renameTo(target)) {
-                    tempFile.copyTo(target, overwrite = true)
-                }
+                moveFileAtomically(tempFile, target)
             } finally {
                 if (tempFile.exists()) {
                     tempFile.delete()
@@ -439,9 +438,7 @@ internal fun writeBytesAtomically(parentDir: File, fileName: String, bytes: Byte
     val tempFile = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
     try {
         tempFile.writeBytes(bytes)
-        if (!tempFile.renameTo(target)) {
-            tempFile.copyTo(target, overwrite = true)
-        }
+        moveFileAtomically(tempFile, target)
     } finally {
         if (tempFile.exists()) {
             tempFile.delete()

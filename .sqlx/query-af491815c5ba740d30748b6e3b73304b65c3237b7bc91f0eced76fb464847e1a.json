@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT entry_id as \"entry_id!\" FROM entry_identifiers\n                   WHERE scheme = 'spotify' AND value = ?\n                   LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "entry_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_identifiers",
+            "name": "entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "af491815c5ba740d30748b6e3b73304b65c3237b7bc91f0eced76fb464847e1a"
+}

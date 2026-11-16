@@ -1,6 +1,5 @@
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -22,10 +21,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -40,6 +35,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.navigation3.runtime.entryProvider
+import androidx.navigation3.runtime.rememberNavBackStack
+import androidx.navigation3.ui.NavDisplay
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -54,12 +52,6 @@ import com.grayvines.roche.ui.components.ServerRackIcon
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
-private enum class SettingsPage {
-    HUB,
-    SERVER,
-    NAVIGATION,
-}
-
 @Composable
 fun SettingsTabContent(
     state: MainUiState,
@@ -67,33 +59,52 @@ fun SettingsTabContent(
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
 ) {
-    var currentPage by rememberSaveable { mutableStateOf(SettingsPage.HUB) }
-
-    BackHandler(enabled = currentPage != SettingsPage.HUB) { currentPage = SettingsPage.HUB }
-
-    when (currentPage) {
-        SettingsPage.HUB ->
-            SettingsHubPage(
-                state = state,
-                onAction = onAction,
-                onOpenServerPage = { currentPage = SettingsPage.SERVER },
-                onOpenNavPage = { currentPage = SettingsPage.NAVIGATION },
-                onImportOpml = onImportOpml,
-                onExportOpml = onExportOpml,
-            )
-        SettingsPage.SERVER ->
-            SettingsServerPage(
-                state = state,
-                onAction = onAction,
-                onBack = { currentPage = SettingsPage.HUB },
-            )
-        SettingsPage.NAVIGATION ->
-            SettingsNavigationBarPage(
-                state = state,
-                onAction = onAction,
-                onBack = { currentPage = SettingsPage.HUB },
-            )
+    val settingsBackStack = rememberNavBackStack(SettingsNavKey.Hub)
+    val popSubpage: () -> Unit = {
+        if (settingsBackStack.size > 1) {
+            settingsBackStack.removeLastOrNull()
+        }
     }
+
+    NavDisplay(
+        backStack = settingsBackStack,
+        onBack = popSubpage,
+        entryProvider =
+            entryProvider {
+                entry<SettingsNavKey.Hub> {
+                    SettingsHubPage(
+                        state = state,
+                        onAction = onAction,
+                        onOpenServerPage = {
+                            if (settingsBackStack.lastOrNull() != SettingsNavKey.Server) {
+                                settingsBackStack.add(SettingsNavKey.Server)
+                            }
+                        },
+                        onOpenNavPage = {
+                            if (settingsBackStack.lastOrNull() != SettingsNavKey.Navigation) {
+                                settingsBackStack.add(SettingsNavKey.Navigation)
+                            }
+                        },
+                        onImportOpml = onImportOpml,
+                        onExportOpml = onExportOpml,
+                    )
+                }
+                entry<SettingsNavKey.Server> {
+                    SettingsServerPage(
+                        state = state,
+                        onAction = onAction,
+                        onBack = popSubpage,
+                    )
+                }
+                entry<SettingsNavKey.Navigation> {
+                    SettingsNavigationBarPage(
+                        state = state,
+                        onAction = onAction,
+                        onBack = popSubpage,
+                    )
+                }
+            },
+    )
 }
 
 @Composable

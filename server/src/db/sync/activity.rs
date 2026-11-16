@@ -6,14 +6,14 @@ use sqlx::SqliteConnection;
 use super::SyncRepo;
 use crate::db::{ActivityAction, ActivityEntityType};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncTombstone {
     pub entity_type: ActivityEntityType,
     pub natural_key: String,
     pub deleted_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityEntry {
     pub id: i64,
     pub entity_type: ActivityEntityType,
@@ -39,14 +39,14 @@ impl SyncRepo<'_> {
         action: ActivityAction,
         timestamp: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO activity_log (entity_type, entity_id, action, timestamp)
              VALUES (?, ?, ?, ?)",
+            entity_type as _,
+            entity_id,
+            action as _,
+            timestamp as _,
         )
-        .bind(entity_type)
-        .bind(entity_id)
-        .bind(action)
-        .bind(timestamp)
         .execute(conn)
         .await?;
         Ok(())
@@ -58,7 +58,7 @@ impl SyncRepo<'_> {
         natural_key: &str,
         deleted_at: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at)
              VALUES (?, ?, ?)
              ON CONFLICT(entity_type, natural_key) DO UPDATE SET
@@ -67,10 +67,10 @@ impl SyncRepo<'_> {
                      THEN excluded.deleted_at
                      ELSE sync_tombstones.deleted_at
                  END",
+            entity_type as _,
+            natural_key,
+            deleted_at as _,
         )
-        .bind(entity_type)
-        .bind(natural_key)
-        .bind(deleted_at)
         .execute(conn)
         .await?;
         Ok(())
@@ -81,11 +81,13 @@ impl SyncRepo<'_> {
         entity_type: ActivityEntityType,
         natural_key: &str,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM sync_tombstones WHERE entity_type = ? AND natural_key = ?")
-            .bind(entity_type)
-            .bind(natural_key)
-            .execute(conn)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM sync_tombstones WHERE entity_type = ? AND natural_key = ?",
+            entity_type as _,
+            natural_key,
+        )
+        .execute(conn)
+        .await?;
         Ok(())
     }
 
@@ -106,39 +108,48 @@ impl SyncRepo<'_> {
             i64::try_from(OUTGOING_SYNC_ROW_CAP.saturating_add(1)).unwrap_or(i64::MAX);
         let mut rows: Vec<SyncTombstone> = match since {
             OutgoingSince::All => {
-                sqlx::query_as::<_, SyncTombstone>(
-                    "SELECT entity_type, natural_key, deleted_at
+                sqlx::query_as!(
+                    SyncTombstone,
+                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
+                            natural_key,
+                            deleted_at AS \"deleted_at: DateTime<Utc>\"
                      FROM sync_tombstones
                      ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
                      LIMIT ?",
+                    fetch_limit,
                 )
-                .bind(fetch_limit)
                 .fetch_all(self.pool)
                 .await?
             }
             OutgoingSince::Inclusive(ts) => {
-                sqlx::query_as::<_, SyncTombstone>(
-                    "SELECT entity_type, natural_key, deleted_at
+                sqlx::query_as!(
+                    SyncTombstone,
+                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
+                            natural_key,
+                            deleted_at AS \"deleted_at: DateTime<Utc>\"
                      FROM sync_tombstones
                      WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                      ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
                      LIMIT ?",
+                    ts as _,
+                    fetch_limit,
                 )
-                .bind(ts)
-                .bind(fetch_limit)
                 .fetch_all(self.pool)
                 .await?
             }
             OutgoingSince::StrictlyAfter(ts) => {
-                sqlx::query_as::<_, SyncTombstone>(
-                    "SELECT entity_type, natural_key, deleted_at
+                sqlx::query_as!(
+                    SyncTombstone,
+                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
+                            natural_key,
+                            deleted_at AS \"deleted_at: DateTime<Utc>\"
                      FROM sync_tombstones
                      WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
                      ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
                      LIMIT ?",
+                    ts as _,
+                    fetch_limit,
                 )
-                .bind(ts)
-                .bind(fetch_limit)
                 .fetch_all(self.pool)
                 .await?
             }
@@ -153,8 +164,13 @@ impl SyncRepo<'_> {
     }
 
     pub async fn list_activity(&self) -> Result<Vec<ActivityEntry>> {
-        Ok(sqlx::query_as::<_, ActivityEntry>(
-            "SELECT id, entity_type, entity_id, action, timestamp
+        Ok(sqlx::query_as!(
+            ActivityEntry,
+            "SELECT id AS \"id!: i64\",
+                    entity_type AS \"entity_type: ActivityEntityType\",
+                    entity_id,
+                    action AS \"action: ActivityAction\",
+                    timestamp AS \"timestamp: DateTime<Utc>\"
              FROM activity_log
              ORDER BY id DESC
              LIMIT 5000",
@@ -164,7 +180,7 @@ impl SyncRepo<'_> {
     }
 
     pub async fn latest_activity_id(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(id), 0) FROM activity_log")
+        Ok(sqlx::query_scalar!("SELECT COALESCE(MAX(id), 0) AS \"id!: i64\" FROM activity_log")
             .fetch_one(self.pool)
             .await?)
     }
@@ -176,33 +192,38 @@ impl SyncRepo<'_> {
     ) -> Result<Vec<ActivityEntry>> {
         let clamped_since = since_id.max(0);
         let clamped_limit = limit.clamp(1, 1001);
-        Ok(sqlx::query_as::<_, ActivityEntry>(
-            "SELECT id, entity_type, entity_id, action, timestamp
+        Ok(sqlx::query_as!(
+            ActivityEntry,
+            "SELECT id AS \"id!: i64\",
+                    entity_type AS \"entity_type: ActivityEntityType\",
+                    entity_id,
+                    action AS \"action: ActivityAction\",
+                    timestamp AS \"timestamp: DateTime<Utc>\"
              FROM activity_log
              WHERE id > ?
              ORDER BY id ASC
              LIMIT ?",
+            clamped_since,
+            clamped_limit,
         )
-        .bind(clamped_since)
-        .bind(clamped_limit)
         .fetch_all(self.pool)
         .await?)
     }
 
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
-        let result = sqlx::query(
+        let result = sqlx::query!(
             "DELETE FROM activity_log
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', timestamp) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+            cutoff as _,
         )
-        .bind(cutoff)
         .execute(self.pool)
         .await?;
-        let _ = sqlx::query(
+        let _ = sqlx::query!(
             "DELETE FROM sync_tombstones
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+            cutoff as _,
         )
-        .bind(cutoff)
         .execute(self.pool)
         .await;
         Ok(result.rows_affected())

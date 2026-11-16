@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id FROM entries e\n                             JOIN entry_state es ON es.entry_id = e.id\n                             WHERE es.inbox_state IN ('unread', 'dismissed')\n                               AND (e.id = ? OR (e.url = ? AND NOT EXISTS (\n                                   SELECT 1 FROM collection_entries ce\n                                   JOIN feed_sources fs ON fs.collection_id = ce.collection_id\n                                   WHERE ce.entry_id = e.id\n                               )))\n                               AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0624434ede7568e0d3139c21a755f340b87179e7c0b5ce17c8b981ef187e27fc"
+}

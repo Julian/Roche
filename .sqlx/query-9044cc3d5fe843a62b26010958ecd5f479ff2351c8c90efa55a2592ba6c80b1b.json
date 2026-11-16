@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entry_identifiers\n                     WHERE entry_id = ? AND scheme = 'url' AND value = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "9044cc3d5fe843a62b26010958ecd5f479ff2351c8c90efa55a2592ba6c80b1b"
+}

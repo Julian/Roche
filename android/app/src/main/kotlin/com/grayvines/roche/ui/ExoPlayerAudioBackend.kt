@@ -2,8 +2,7 @@ package com.grayvines.roche.ui
 
 import android.content.Context
 import android.net.Uri
-import android.os.Handler
-import android.os.Looper
+import android.net.http.HttpEngine
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
@@ -15,9 +14,21 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import java.io.File
 import java.net.URI
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 internal fun isSafeAudioPlaybackSource(
     source: String,
@@ -35,6 +46,7 @@ internal fun isSafeAudioPlaybackSource(
 }
 
 private fun isValidHttpPlaybackUri(trimmed: String): Boolean = runCatching {
+    PublicUrlValidator.ensurePublicUrlSyntax(trimmed)
     val parsed = URI.create(trimmed.replace(" ", "%20"))
     val scheme = parsed.scheme?.lowercase()
     (scheme == "https" || scheme == "http") && !parsed.host.isNullOrBlank()
@@ -114,41 +126,40 @@ internal class NoOpAudioPlayerBackend : AudioPlayerBackend {
     }
 }
 
-@Suppress("TooManyFunctions")
-class ExoPlayerAudioBackend(
-    context: Context,
-    private val allowedLocalDirs: List<File> =
-        listOf(File(context.applicationContext.filesDir, "offline_media"), context.cacheDir),
+@Suppress("TooManyFunctions", "LongParameterList")
+class ExoPlayerAudioBackend
+internal constructor(
+    private val appContext: Context?,
+    private val allowedLocalDirs: List<File>,
+    parentScope: CoroutineScope? = null,
+    private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+    private val uriResolver: (String) -> Uri? = ::defaultPlaybackUri,
+    private val httpEngineProvider: (() -> HttpEngine)? = null,
+    private val httpEngineExecutorProvider: (() -> Executor)? = null,
 ) : AudioPlayerBackend {
-    private val appContext = context.applicationContext
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val parentJob: Job? = parentScope?.coroutineContext?.get(Job)
+    private val scopeLock = Any()
+    private val loadGeneration = AtomicLong(0L)
+    @Volatile
+    internal var backendScope: CoroutineScope = createBackendScope()
+        private set
 
-    private var exoPlayer: ExoPlayer? = null
-    private var nextLoadId: Long = 0L
-    private var activeLoadId: Long = 0L
-    private var notifiedReadyLoadId: Long = -1L
-    private var lastNotifiedExternalPlaying: Boolean? = null
-    private var suppressExternalCallbacks: Boolean = false
-    private var activeOnPrepared: ((Long) -> Unit)? = null
-    private var activeOnCompletion: (() -> Unit)? = null
-    private var activeOnError: (() -> Unit)? = null
-    private var latestMetadata: MediaMetadata = MediaMetadata.EMPTY
+    internal var exoPlayer: ExoPlayer? = null
+    internal var ownedFallbackTransport: HttpEngineTransport? = null
+    internal var activeLoadId: Long = 0L
+    internal var notifiedReadyLoadId: Long = -1L
+    internal var lastNotifiedExternalPlaying: Boolean? = null
+    internal var suppressExternalCallbacks: Boolean = false
+    internal var activeOnPrepared: ((Long) -> Unit)? = null
+    internal var activeOnCompletion: (() -> Unit)? = null
+    internal var activeOnError: (() -> Unit)? = null
+    internal var latestMetadata: MediaMetadata = MediaMetadata.EMPTY
+    private var positionSyncJob: Job? = null
 
-    @Volatile private var cachedPositionMs: Long = 0L
-    @Volatile private var cachedDurationMs: Long = DEFAULT_FALLBACK_DURATION_MS
-    @Volatile private var cachedIsPlaying: Boolean = false
+    @Volatile internal var cachedPositionMs: Long = 0L
+    @Volatile internal var cachedDurationMs: Long = DEFAULT_FALLBACK_DURATION_MS
+    @Volatile internal var cachedIsPlaying: Boolean = false
     @Volatile private var externalPlayStateListener: ((Boolean) -> Unit)? = null
-
-    private val positionSyncRunnable =
-        object : Runnable {
-            override fun run() {
-                val player = exoPlayer ?: return
-                syncVolatileStateFromPlayer(player)
-                if (player.isPlaying) {
-                    mainHandler.postDelayed(this, POSITION_POLL_INTERVAL_MS)
-                }
-            }
-        }
 
     private val playerListener =
         object : Player.Listener {
@@ -180,20 +191,83 @@ class ExoPlayerAudioBackend(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 val player = exoPlayer ?: return
                 syncVolatileStateFromPlayer(player)
-                mainHandler.removeCallbacks(positionSyncRunnable)
+                stopPositionSync()
                 if (isPlaying) {
-                    mainHandler.postDelayed(positionSyncRunnable, POSITION_POLL_INTERVAL_MS)
+                    startPositionSync()
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
                 cachedIsPlaying = false
-                mainHandler.removeCallbacks(positionSyncRunnable)
+                stopPositionSync()
                 val callback = activeOnError
                 clearActiveCallbacks()
                 callback?.invoke()
             }
         }
+
+    constructor(
+        context: Context,
+        allowedLocalDirs: List<File> =
+            listOf(File(context.applicationContext.filesDir, "offline_media"), context.cacheDir),
+        parentScope: CoroutineScope? = null,
+        httpEngineProvider: (() -> HttpEngine)? = null,
+        httpEngineExecutorProvider: (() -> Executor)? = null,
+    ) : this(
+        appContext = context.applicationContext,
+        allowedLocalDirs = allowedLocalDirs,
+        parentScope = parentScope,
+        mainDispatcher = Dispatchers.Main.immediate,
+        uriResolver = ::defaultPlaybackUri,
+        httpEngineProvider = httpEngineProvider,
+        httpEngineExecutorProvider = httpEngineExecutorProvider,
+    )
+
+    private fun createBackendScope(): CoroutineScope =
+        CoroutineScope(SupervisorJob(parentJob) + mainDispatcher)
+
+    private fun activeBackendScope(): CoroutineScope =
+        synchronized(scopeLock) { activeBackendScopeLocked() }
+
+    private fun activeBackendScopeLocked(): CoroutineScope {
+        val current = backendScope
+        return if (current.isActive || parentJob?.isCancelled == true) {
+            current
+        } else {
+            createBackendScope().also { backendScope = it }
+        }
+    }
+
+    private fun rotateBackendScopeLocked(): CoroutineScope {
+        val previous = backendScope
+        if (parentJob?.isCancelled != true) {
+            backendScope = createBackendScope()
+        }
+        return previous
+    }
+
+    internal fun startPositionSync() {
+        positionSyncJob?.cancel()
+        positionSyncJob =
+            activeBackendScope().launch {
+                var keepPolling = true
+                while (isActive && keepPolling) {
+                    delay(POSITION_POLL_INTERVAL_MS)
+                    val player = exoPlayer
+                    if (player == null) {
+                        keepPolling = false
+                    } else {
+                        syncVolatileStateFromPlayer(player)
+                        keepPolling = player.isPlaying
+                    }
+                }
+            }
+    }
+
+    internal fun stopPositionSync() {
+        positionSyncJob?.cancel()
+        positionSyncJob = null
+    }
 
     override fun bindExternalPlayStateListener(listener: ((Boolean) -> Unit)?) {
         externalPlayStateListener = listener
@@ -201,13 +275,21 @@ class ExoPlayerAudioBackend(
 
     @OptIn(UnstableApi::class)
     internal fun getOrCreateExoPlayerOnMain(): ExoPlayer {
-        check(Looper.myLooper() == Looper.getMainLooper()) {
-            "ExoPlayer must be initialized on the main thread"
-        }
         exoPlayer?.let {
             return it
         }
-        return ExoPlayer.Builder(appContext)
+        val context = checkNotNull(appContext) { "Context required to build ExoPlayer" }
+        val (httpEngine, callbackExecutor) = resolveHttpEngineAndExecutor(context)
+        val audioDataSourceFactory =
+            createAudioDataSourceFactory(
+                context = context,
+                httpEngine = httpEngine,
+                callbackExecutor = callbackExecutor,
+            )
+        return ExoPlayer.Builder(context)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(context).setDataSourceFactory(audioDataSourceFactory)
+            )
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -224,6 +306,19 @@ class ExoPlayerAudioBackend(
                 created.addListener(playerListener)
                 exoPlayer = created
             }
+    }
+
+    private fun resolveHttpEngineAndExecutor(context: Context): Pair<HttpEngine, Executor> {
+        val providedEngine = httpEngineProvider?.invoke()
+        val providedExecutor = httpEngineExecutorProvider?.invoke()
+        if (providedEngine != null && providedExecutor != null) {
+            return providedEngine to providedExecutor
+        }
+        val fallback =
+            ownedFallbackTransport
+                ?: HttpEngineTransport(context).also { ownedFallbackTransport = it }
+        return (providedEngine ?: fallback.sharedHttpEngine) to
+            (providedExecutor ?: fallback.sharedCallbackExecutor)
     }
 
     override fun loadAndPlay(
@@ -244,10 +339,16 @@ class ExoPlayerAudioBackend(
         }
         val safeFallback = fallbackDurationMs.takeIf { it > 0L } ?: DEFAULT_FALLBACK_DURATION_MS
         val clampedInitial = initialPositionMs.coerceIn(0L, safeFallback)
-        cachedDurationMs = safeFallback
-        cachedPositionMs = clampedInitial
-        cachedIsPlaying = playWhenReady
-        runOnPlayerThread {
+        val loadId: Long
+        val targetScope: CoroutineScope
+        synchronized(scopeLock) {
+            loadId = loadGeneration.incrementAndGet()
+            cachedDurationMs = safeFallback
+            cachedPositionMs = clampedInitial
+            cachedIsPlaying = playWhenReady
+            targetScope = activeBackendScopeLocked()
+        }
+        targetScope.launch {
             startMediaItemOnMain(
                 source = source.trim(),
                 initialPositionMs = clampedInitial,
@@ -258,12 +359,13 @@ class ExoPlayerAudioBackend(
                 onPrepared = onPrepared,
                 onCompletion = onCompletion,
                 onError = onError,
+                loadId = loadId,
             )
         }
     }
 
     @Suppress("LongParameterList")
-    private fun startMediaItemOnMain(
+    internal fun startMediaItemOnMain(
         source: String,
         initialPositionMs: Long,
         fallbackDurationMs: Long,
@@ -273,10 +375,12 @@ class ExoPlayerAudioBackend(
         onPrepared: (durationMs: Long) -> Unit,
         onCompletion: () -> Unit,
         onError: () -> Unit,
+        loadId: Long = loadGeneration.incrementAndGet(),
     ) {
+        if (loadGeneration.get() != loadId) return
         runCatching {
             val player = getOrCreateExoPlayerOnMain()
-            activeLoadId = ++nextLoadId
+            activeLoadId = loadId
             notifiedReadyLoadId = -1L
             lastNotifiedExternalPlaying = playWhenReady
             activeOnPrepared = onPrepared
@@ -284,8 +388,12 @@ class ExoPlayerAudioBackend(
             activeOnError = onError
             cachedDurationMs = fallbackDurationMs
             cachedPositionMs = initialPositionMs
-            val uri = toPlaybackUri(source)
-            val mediaItem = MediaItem.Builder().setUri(uri).setMediaMetadata(latestMetadata).build()
+            val uri = uriResolver(source)
+            val mediaItem =
+                MediaItem.Builder()
+                    .apply { if (uri != null) setUri(uri) }
+                    .setMediaMetadata(latestMetadata)
+                    .build()
             withCallbacksSuppressed {
                 applySkipSilenceOnPlayer(player, skipSilenceEnabled)
                 player.playbackParameters = PlaybackParameters(speed.coerceIn(MIN_SPEED, MAX_SPEED))
@@ -295,8 +403,10 @@ class ExoPlayerAudioBackend(
             }
         }
             .onFailure {
-                cachedIsPlaying = false
-                clearActiveCallbacks()
+                if (loadGeneration.get() == loadId) {
+                    cachedIsPlaying = false
+                    clearActiveCallbacks()
+                }
                 onError()
             }
     }
@@ -312,7 +422,7 @@ class ExoPlayerAudioBackend(
 
     internal fun handlePlayerEnded() {
         cachedIsPlaying = false
-        mainHandler.removeCallbacks(positionSyncRunnable)
+        stopPositionSync()
         val completion = activeOnCompletion
         clearActiveCallbacks()
         completion?.invoke()
@@ -320,7 +430,7 @@ class ExoPlayerAudioBackend(
 
     override fun play() {
         cachedIsPlaying = true
-        runOnPlayerThread {
+        activeBackendScope().launch {
             lastNotifiedExternalPlaying = true
             exoPlayer?.let { player ->
                 withCallbacksSuppressed {
@@ -336,7 +446,7 @@ class ExoPlayerAudioBackend(
 
     override fun pause() {
         cachedIsPlaying = false
-        runOnPlayerThread {
+        activeBackendScope().launch {
             lastNotifiedExternalPlaying = false
             exoPlayer?.let { player ->
                 withCallbacksSuppressed { player.pause() }
@@ -348,7 +458,7 @@ class ExoPlayerAudioBackend(
     override fun seekTo(positionMs: Long) {
         val clamped = positionMs.coerceIn(0L, cachedDurationMs.coerceAtLeast(1L))
         cachedPositionMs = clamped
-        runOnPlayerThread {
+        activeBackendScope().launch {
             exoPlayer?.let { player ->
                 player.seekTo(clamped)
                 syncVolatileStateFromPlayer(player)
@@ -358,70 +468,73 @@ class ExoPlayerAudioBackend(
 
     override fun setSpeed(speed: Float) {
         val safeSpeed = speed.coerceIn(MIN_SPEED, MAX_SPEED)
-        runOnPlayerThread {
+        activeBackendScope().launch {
             exoPlayer?.playbackParameters = PlaybackParameters(safeSpeed)
         }
     }
 
     override fun setSkipSilence(enabled: Boolean) {
-        runOnPlayerThread {
+        activeBackendScope().launch {
             exoPlayer?.let { player -> applySkipSilenceOnPlayer(player, enabled) }
         }
     }
 
-    override fun currentPositionMs(): Long {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            exoPlayer?.let(::syncVolatileStateFromPlayer)
-        }
-        return cachedPositionMs
-    }
+    override fun currentPositionMs(): Long = cachedPositionMs
 
-    override fun durationMs(): Long {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            exoPlayer?.let(::syncVolatileStateFromPlayer)
-        }
-        return cachedDurationMs
-    }
+    override fun durationMs(): Long = cachedDurationMs
 
-    override fun isPlaying(): Boolean {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            exoPlayer?.let(::syncVolatileStateFromPlayer)
-        }
-        return cachedIsPlaying
-    }
+    override fun isPlaying(): Boolean = cachedIsPlaying
 
     override fun release() {
-        cachedIsPlaying = false
-        runOnPlayerThread {
-            mainHandler.removeCallbacks(positionSyncRunnable)
-            clearActiveCallbacks()
-            activeLoadId = 0L
-            notifiedReadyLoadId = -1L
-            latestMetadata = MediaMetadata.EMPTY
-            exoPlayer?.let { player ->
-                withCallbacksSuppressed {
-                    player.stop()
-                    player.clearMediaItems()
+        val generationAtRelease: Long
+        val scopeToCancel: CoroutineScope
+        synchronized(scopeLock) {
+            generationAtRelease = loadGeneration.get()
+            cachedIsPlaying = false
+            scopeToCancel = rotateBackendScopeLocked()
+        }
+        if (!scopeToCancel.isActive) return
+        scopeToCancel.launch {
+            if (loadGeneration.get() == generationAtRelease) {
+                cachedIsPlaying = false
+                stopPositionSync()
+                clearActiveCallbacks()
+                activeLoadId = 0L
+                notifiedReadyLoadId = -1L
+                latestMetadata = MediaMetadata.EMPTY
+                exoPlayer?.let { player ->
+                    withCallbacksSuppressed {
+                        player.stop()
+                        player.clearMediaItems()
+                    }
                 }
             }
+            scopeToCancel.coroutineContext[Job]?.cancel()
         }
     }
 
     internal fun shutdownPlayer() {
         cachedIsPlaying = false
-        runOnPlayerThread {
-            mainHandler.removeCallbacks(positionSyncRunnable)
+        val scopeToCancel = synchronized(scopeLock) { backendScope }
+        val dispatchScope =
+            scopeToCancel.takeIf { it.isActive } ?: CoroutineScope(SupervisorJob() + mainDispatcher)
+        dispatchScope.launch {
+            stopPositionSync()
             clearActiveCallbacks()
             exoPlayer?.let { player ->
                 player.removeListener(playerListener)
                 player.release()
             }
             exoPlayer = null
+            ownedFallbackTransport?.let { transport -> runCatching { transport.close() } }
+            ownedFallbackTransport = null
+            scopeToCancel.coroutineContext[Job]?.cancel()
+            dispatchScope.coroutineContext[Job]?.cancel()
         }
     }
 
     internal fun updateSessionMediaMetadata(metadata: MediaMetadata) {
-        runOnPlayerThread {
+        activeBackendScope().launch {
             latestMetadata = metadata
             exoPlayer?.let { player ->
                 if (player.mediaItemCount > 0) {
@@ -438,7 +551,7 @@ class ExoPlayerAudioBackend(
     }
 
     @OptIn(UnstableApi::class)
-    private fun applySkipSilenceOnPlayer(player: ExoPlayer, enabled: Boolean) {
+    internal fun applySkipSilenceOnPlayer(player: ExoPlayer, enabled: Boolean) {
         player.skipSilenceEnabled = enabled
     }
 
@@ -478,7 +591,7 @@ class ExoPlayerAudioBackend(
         activeOnError = null
     }
 
-    private inline fun withCallbacksSuppressed(block: () -> Unit) {
+    internal inline fun withCallbacksSuppressed(block: () -> Unit) {
         suppressExternalCallbacks = true
         try {
             block()
@@ -487,29 +600,23 @@ class ExoPlayerAudioBackend(
         }
     }
 
-    private fun runOnPlayerThread(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            block()
-        } else {
-            mainHandler.post(block)
-        }
-    }
-
-    private fun toPlaybackUri(source: String): Uri =
-        if (source.startsWith("/")) {
-            Uri.fromFile(File(source))
-        } else {
-            PublicUrlValidator.upgradePublicHttp(source).toUri()
-        }
+    internal fun toPlaybackUri(source: String): Uri = defaultPlaybackUri(source)
 
     internal companion object {
         internal const val SEEK_BACK_INCREMENT_MS = 15_000L
         internal const val SEEK_FORWARD_INCREMENT_MS = 30_000L
-        private const val POSITION_POLL_INTERVAL_MS = 250L
-        private const val MIN_SPEED = 0.50f
-        private const val MAX_SPEED = 3.50f
+        internal const val POSITION_POLL_INTERVAL_MS = 250L
+        internal const val MIN_SPEED = 0.50f
+        internal const val MAX_SPEED = 3.50f
     }
 }
+
+internal fun defaultPlaybackUri(source: String): Uri =
+    if (source.startsWith("/")) {
+        Uri.fromFile(File(source))
+    } else {
+        PublicUrlValidator.upgradePublicHttp(source).toUri()
+    }
 
 private const val HTTPS_PREFIX = "https://"
 private const val HTTP_PREFIX = "http://"

@@ -9,18 +9,7 @@ use super::{
 };
 use crate::media::MediaStore;
 
-macro_rules! local_media_select_sql {
-    ($suffix:literal) => {
-        concat!(
-            "SELECT m.id, m.entry_id AS item_id, m.media_type, m.local_path AS path, m.file_size, m.duration
-FROM entry_media m
-WHERE m.local_path IS NOT NULL ",
-            $suffix
-        )
-    };
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Media {
     pub id: String,
@@ -62,17 +51,17 @@ impl<'a> MediaRepo<'a> {
 
         for spec in specs {
             let id = Uuid::new_v4().to_string();
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
                  VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+                id,
+                item_id,
+                spec.media_type as _,
+                spec.path,
+                spec.file_size,
+                spec.duration,
+                now as _,
             )
-            .bind(&id)
-            .bind(item_id)
-            .bind(spec.media_type)
-            .bind(spec.path)
-            .bind(spec.file_size)
-            .bind(spec.duration)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
 
@@ -112,18 +101,18 @@ impl<'a> MediaRepo<'a> {
             return Ok(());
         }
         let enc_id = deterministic_enclosure_media_id(entry_id);
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
              VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  remote_url = COALESCE(entry_media.remote_url, excluded.remote_url),
                  duration = COALESCE(entry_media.duration, excluded.duration)",
+            enc_id,
+            entry_id,
+            clean_url,
+            clean_dur,
+            created_at as _,
         )
-        .bind(&enc_id)
-        .bind(entry_id)
-        .bind(clean_url)
-        .bind(clean_dur)
-        .bind(created_at)
         .execute(&mut *conn)
         .await?;
         Ok(())
@@ -141,17 +130,17 @@ impl<'a> MediaRepo<'a> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
              VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            id,
+            item_id,
+            media_type as _,
+            path,
+            file_size,
+            duration,
+            now as _,
         )
-        .bind(&id)
-        .bind(item_id)
-        .bind(media_type)
-        .bind(path)
-        .bind(file_size)
-        .bind(duration)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
@@ -177,27 +166,56 @@ impl<'a> MediaRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Media>> {
-        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!("AND m.id = ?"))
-            .bind(id)
-            .fetch_optional(self.pool)
-            .await?)
+        Ok(sqlx::query_as!(
+            Media,
+            "SELECT m.id,
+                    m.entry_id AS item_id,
+                    m.media_type AS \"media_type: MediaType\",
+                    m.local_path AS \"path!: String\",
+                    m.file_size,
+                    m.duration
+             FROM entry_media m
+             WHERE m.local_path IS NOT NULL AND m.id = ?",
+            id,
+        )
+        .fetch_optional(self.pool)
+        .await?)
     }
 
     pub async fn list_for_item(&self, item_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!("AND m.entry_id = ?"))
-            .bind(item_id)
-            .fetch_all(self.pool)
-            .await?)
+        Ok(sqlx::query_as!(
+            Media,
+            "SELECT m.id,
+                    m.entry_id AS item_id,
+                    m.media_type AS \"media_type: MediaType\",
+                    m.local_path AS \"path!: String\",
+                    m.file_size,
+                    m.duration
+             FROM entry_media m
+             WHERE m.local_path IS NOT NULL AND m.entry_id = ?",
+            item_id,
+        )
+        .fetch_all(self.pool)
+        .await?)
     }
 
     pub async fn list_for_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
-            "AND EXISTS (
-                SELECT 1 FROM collection_entries ce
-                WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
-            )"
-        ))
-        .bind(feed_id)
+        Ok(sqlx::query_as!(
+            Media,
+            "SELECT m.id,
+                    m.entry_id AS item_id,
+                    m.media_type AS \"media_type: MediaType\",
+                    m.local_path AS \"path!: String\",
+                    m.file_size,
+                    m.duration
+             FROM entry_media m
+             WHERE m.local_path IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM collection_entries ce
+                   WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
+               )",
+            feed_id,
+        )
         .fetch_all(self.pool)
         .await?)
     }
@@ -205,27 +223,37 @@ impl<'a> MediaRepo<'a> {
     /// Lists downloaded media files belonging to items in `feed_id` that will NOT remain in Inbox
     /// after deleting `feed_id` (i.e. items that are neither starred nor cross-posted in another feed).
     pub async fn list_exclusively_owned_by_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
-            "AND EXISTS (
-                SELECT 1 FROM collection_entries ce
-                WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM collection_entries ce2
-                WHERE ce2.entry_id = m.entry_id
-                  AND ce2.collection_id != ?
-                  AND (
-                      ce2.collection_id = ?
-                      OR EXISTS (
-                          SELECT 1 FROM feed_sources fs2
-                          WHERE fs2.collection_id = ce2.collection_id
-                      )
-                  )
-            )"
-        ))
-        .bind(feed_id)
-        .bind(feed_id)
-        .bind(super::STARRED_COLLECTION_ID)
+        let starred_id = super::STARRED_COLLECTION_ID;
+        Ok(sqlx::query_as!(
+            Media,
+            "SELECT m.id,
+                    m.entry_id AS item_id,
+                    m.media_type AS \"media_type: MediaType\",
+                    m.local_path AS \"path!: String\",
+                    m.file_size,
+                    m.duration
+             FROM entry_media m
+             WHERE m.local_path IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM collection_entries ce
+                   WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM collection_entries ce2
+                   WHERE ce2.entry_id = m.entry_id
+                     AND ce2.collection_id != ?
+                     AND (
+                         ce2.collection_id = ?
+                         OR EXISTS (
+                             SELECT 1 FROM feed_sources fs2
+                             WHERE fs2.collection_id = ce2.collection_id
+                         )
+                     )
+               )",
+            feed_id,
+            feed_id,
+            starred_id,
+        )
         .fetch_all(self.pool)
         .await?)
     }
@@ -233,10 +261,10 @@ impl<'a> MediaRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query("DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let res =
+            sqlx::query!("DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL", id,)
+                .execute(&mut *tx)
+                .await?;
         if res.rows_affected() > 0 {
             SyncRepo::record_activity(
                 &mut tx,
@@ -266,22 +294,31 @@ impl<'a> MediaRepo<'a> {
     }
 
     pub async fn find_orphaned(&self) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as::<_, Media>(local_media_select_sql!(
-            "AND (
-                m.entry_id NOT IN (SELECT id FROM entries WHERE merged_into_id IS NULL)
-                OR EXISTS (
-                    SELECT 1 FROM entry_state es
-                    WHERE es.entry_id = m.entry_id AND es.inbox_state = 'none'
-                )
-            )"
-        ))
+        Ok(sqlx::query_as!(
+            Media,
+            "SELECT m.id,
+                    m.entry_id AS item_id,
+                    m.media_type AS \"media_type: MediaType\",
+                    m.local_path AS \"path!: String\",
+                    m.file_size,
+                    m.duration
+             FROM entry_media m
+             WHERE m.local_path IS NOT NULL
+               AND (
+                   m.entry_id NOT IN (SELECT id FROM entries WHERE merged_into_id IS NULL)
+                   OR EXISTS (
+                       SELECT 1 FROM entry_state es
+                       WHERE es.entry_id = m.entry_id AND es.inbox_state = 'none'
+                   )
+               )",
+        )
         .fetch_all(self.pool)
         .await?)
     }
 
     pub async fn list_registered_item_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT entry_id FROM entry_media WHERE local_path IS NOT NULL",
+        let rows = sqlx::query_scalar!(
+            "SELECT DISTINCT entry_id AS \"entry_id!: String\" FROM entry_media WHERE local_path IS NOT NULL",
         )
         .fetch_all(self.pool)
         .await?;

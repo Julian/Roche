@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -207,7 +206,6 @@ fun FullscreenPodcastPlayer(
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    BackHandler { onAction(MainAction.CloseFullscreenPlayer) }
     val colors = LocalRocheColors.current
 
     Column(
@@ -374,6 +372,14 @@ private fun FullscreenPlayerTopBar(
                     expanded = showOverflowMenu,
                     onDismissRequest = { showOverflowMenu = false },
                 ) {
+                    DropdownMenuItem(
+                        text = { Text("Open Full Show Notes in Reader") },
+                        onClick = {
+                            showOverflowMenu = false
+                            onAction(MainAction.OpenReader(entry.id, forceArticleView = true))
+                        },
+                        modifier = Modifier.testTag("player_open_reader_btn"),
+                    )
                     if (entry.feedId != null) {
                         DropdownMenuItem(
                             text = { Text("Open Podcast (${entry.feedTitle})") },

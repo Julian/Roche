@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"found!: i64\"\n             WHERE EXISTS (SELECT 1 FROM consumption_log WHERE entry_id = ?)\n                OR EXISTS (SELECT 1 FROM comparisons WHERE ordering_json LIKE ?)\n                OR EXISTS (\n                    SELECT 1 FROM collection_entries ce\n                    JOIN collection_specs cs ON cs.collection_id = ce.collection_id\n                    WHERE ce.entry_id = ? AND cs.collection_role IN ('list', 'want')\n                )\n                OR EXISTS (SELECT 1 FROM collection_generators WHERE current_entry_id = ?)",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a37b99780ee7ed4f825dcc9bbdd86e9d82f81051af5fd718d546dd550040feff"
+}

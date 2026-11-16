@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)\n                             VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "f64a08021c9265d6a6d8a80d2fac740b1a88ea5ce4e8e681768c6fd5b7ba63e9"
+}

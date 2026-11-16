@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)\n                     VALUES ('arxiv', ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "4c99d130309cfc93935f672360a91cac95cb196ddc16f2ea1107273e7d285b18"
+}

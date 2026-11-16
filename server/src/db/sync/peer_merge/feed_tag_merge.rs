@@ -27,10 +27,10 @@ impl SyncRepo<'_> {
                 continue;
             }
             let nat_key = tag_natural_key(clean_name);
-            let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
-                "SELECT deleted_at FROM sync_tombstones WHERE entity_type = 'tag' AND natural_key = ?",
+            let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar!(
+                "SELECT deleted_at AS \"deleted_at: DateTime<Utc>\" FROM sync_tombstones WHERE entity_type = 'tag' AND natural_key = ?",
+                nat_key,
             )
-            .bind(&nat_key)
             .fetch_optional(&mut *conn)
             .await?;
             if let Some(del_at) = tomb_ts {
@@ -42,32 +42,38 @@ impl SyncRepo<'_> {
 
             let det_id = deterministic_tag_id(clean_name);
             let tag_slug = format!("tag:{nat_key}");
-            let existing: Option<(String, Option<HexColor>)> = sqlx::query_as(
-                "SELECT e.id, cs.color
+            let existing = sqlx::query!(
+                "SELECT e.id, cs.color AS \"color: HexColor\"
                  FROM entries e
                  JOIN collection_specs cs ON cs.collection_id = e.id
                  WHERE cs.collection_role = 'tag'
                    AND (e.id = ? OR cs.slug = ? OR LOWER(e.title) = LOWER(?))
                  LIMIT 1",
+                det_id,
+                tag_slug,
+                clean_name,
             )
-            .bind(&det_id)
-            .bind(&tag_slug)
-            .bind(clean_name)
             .fetch_optional(&mut *conn)
             .await?;
 
-            if let Some((tag_id, existing_color)) = existing {
+            if let Some(ex) = existing {
+                let tag_id = ex.id;
+                let existing_color = ex.color;
                 if t.color.is_some() && existing_color != t.color {
-                    sqlx::query("UPDATE collection_specs SET color = ? WHERE collection_id = ?")
-                        .bind(&t.color)
-                        .bind(&tag_id)
-                        .execute(&mut *conn)
-                        .await?;
-                    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-                        .bind(now)
-                        .bind(&tag_id)
-                        .execute(&mut *conn)
-                        .await?;
+                    sqlx::query!(
+                        "UPDATE collection_specs SET color = ? WHERE collection_id = ?",
+                        t.color as _,
+                        tag_id,
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+                    sqlx::query!(
+                        "UPDATE entries SET updated_at = ? WHERE id = ?",
+                        now as _,
+                        tag_id
+                    )
+                    .execute(&mut *conn)
+                    .await?;
                     Self::record_activity(
                         &mut *conn,
                         ActivityEntityType::Tag,
@@ -114,14 +120,13 @@ impl SyncRepo<'_> {
         feed_map: &mut HashMap<String, (String, String)>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        type ExistingFeedRow = (String, String, FeedType, Option<DateTime<Utc>>, bool);
         let feed_url = f.url.as_str();
         let nat_key = feed_natural_key(feed_url);
         let det_id = deterministic_feed_id(feed_url);
-        let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT deleted_at FROM sync_tombstones WHERE entity_type = 'feed' AND natural_key = ?",
+        let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar!(
+            "SELECT deleted_at AS \"deleted_at: DateTime<Utc>\" FROM sync_tombstones WHERE entity_type = 'feed' AND natural_key = ?",
+            nat_key,
         )
-        .bind(&nat_key)
         .fetch_optional(&mut *conn)
         .await?;
         if let Some(del_at) = tomb_ts {
@@ -131,15 +136,19 @@ impl SyncRepo<'_> {
             Self::clear_tombstone(&mut *conn, ActivityEntityType::Feed, &nat_key).await?;
         }
 
-        let existing: Option<ExistingFeedRow> = sqlx::query_as(
-            "SELECT collection_id, feed_url, source_type, last_polled_at, is_active
+        let existing = sqlx::query!(
+            "SELECT collection_id,
+                    feed_url,
+                    source_type AS \"source_type: FeedType\",
+                    last_polled_at AS \"last_polled_at: DateTime<Utc>\",
+                    is_active AS \"is_active: bool\"
              FROM feed_sources
              WHERE feed_url = ? OR collection_id = ? OR collection_id = ?
              LIMIT 1",
+            feed_url,
+            f.id,
+            det_id,
         )
-        .bind(feed_url)
-        .bind(&f.id)
-        .bind(&det_id)
         .fetch_optional(&mut *conn)
         .await?;
 
@@ -154,9 +163,12 @@ impl SyncRepo<'_> {
             None
         };
 
-        if let Some((local_id, local_url, local_feed_type, local_last_polled, local_is_active)) =
-            existing
-        {
+        if let Some(ex) = existing {
+            let local_id = ex.collection_id;
+            let local_url = ex.feed_url;
+            let local_feed_type = ex.source_type;
+            let local_last_polled = ex.last_polled_at;
+            let local_is_active = ex.is_active;
             Self::update_existing_feed_in_tx(
                 &mut *conn,
                 &local_id,
@@ -240,17 +252,23 @@ impl SyncRepo<'_> {
         let upgrade_to_podcast =
             local_feed_type == FeedType::Rss && f.feed_type == FeedType::Podcast;
         if upgrade_to_podcast {
-            sqlx::query("UPDATE feed_sources SET source_type = ? WHERE collection_id = ?")
-                .bind(FeedType::Podcast)
-                .bind(local_id)
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query("UPDATE entries SET kind = ?, updated_at = ? WHERE id = ?")
-                .bind(EntryKind::Podcast)
-                .bind(now)
-                .bind(local_id)
-                .execute(&mut *conn)
-                .await?;
+            let podcast_feed_type = FeedType::Podcast;
+            let podcast_entry_kind = EntryKind::Podcast;
+            sqlx::query!(
+                "UPDATE feed_sources SET source_type = ? WHERE collection_id = ?",
+                podcast_feed_type as _,
+                local_id,
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query!(
+                "UPDATE entries SET kind = ?, updated_at = ? WHERE id = ?",
+                podcast_entry_kind as _,
+                now as _,
+                local_id,
+            )
+            .execute(&mut *conn)
+            .await?;
         }
 
         let incoming_poll_newer = match (f.last_polled, local_last_polled) {
@@ -259,7 +277,7 @@ impl SyncRepo<'_> {
             _ => false,
         };
         if incoming_poll_newer {
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE feed_sources
                  SET feed_title = COALESCE(feed_title, ?),
                      language = COALESCE(?, language),
@@ -268,62 +286,62 @@ impl SyncRepo<'_> {
                      last_error = ?,
                      last_error_by = ?
                  WHERE collection_id = ?",
+                clean_title,
+                clean_lang,
+                f.last_polled as _,
+                clean_polled_by,
+                clean_err,
+                clean_err_by,
+                local_id,
             )
-            .bind(clean_title)
-            .bind(clean_lang)
-            .bind(f.last_polled)
-            .bind(clean_polled_by)
-            .bind(clean_err)
-            .bind(clean_err_by)
-            .bind(local_id)
             .execute(&mut *conn)
             .await?;
 
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE entries
                  SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
                      summary = COALESCE(?, summary),
                      updated_at = ?
                  WHERE id = ?",
+                local_id,
+                clean_desc,
+                now as _,
+                local_id,
             )
-            .bind(local_id)
-            .bind(clean_desc)
-            .bind(now)
-            .bind(local_id)
             .execute(&mut *conn)
             .await?;
         } else {
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE feed_sources
                  SET feed_title = COALESCE(feed_title, ?),
                      language = COALESCE(language, ?)
                  WHERE collection_id = ?",
+                clean_title,
+                clean_lang,
+                local_id,
             )
-            .bind(clean_title)
-            .bind(clean_lang)
-            .bind(local_id)
             .execute(&mut *conn)
             .await?;
 
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE entries
                  SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
                      summary = COALESCE(summary, ?)
                  WHERE id = ?",
+                local_id,
+                clean_desc,
+                local_id,
             )
-            .bind(local_id)
-            .bind(clean_desc)
-            .bind(local_id)
             .execute(&mut *conn)
             .await?;
         }
 
         if f.is_active != local_is_active {
-            let last_archive_change_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-                "SELECT MAX(timestamp) FROM activity_log
+            let last_archive_change_at: Option<DateTime<Utc>> = sqlx::query_scalar!(
+                "SELECT MAX(timestamp) AS \"ts?: DateTime<Utc>\" FROM activity_log
                  WHERE entity_type = 'feed' AND entity_id = ? AND action IN ('archive', 'unarchive')",
+                local_id,
             )
-            .bind(local_id)
             .fetch_optional(&mut *conn)
             .await?
             .flatten();
@@ -336,14 +354,14 @@ impl SyncRepo<'_> {
             };
 
             if should_update_active {
-                sqlx::query("UPDATE feed_sources SET is_active = ? WHERE collection_id = ?")
-                    .bind(f.is_active)
-                    .bind(local_id)
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(local_id)
+                sqlx::query!(
+                    "UPDATE feed_sources SET is_active = ? WHERE collection_id = ?",
+                    f.is_active as _,
+                    local_id,
+                )
+                .execute(&mut *conn)
+                .await?;
+                sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, local_id)
                     .execute(&mut *conn)
                     .await?;
                 let action =

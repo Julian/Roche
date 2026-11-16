@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"found!: i64\" FROM feed_sources fs\n                         JOIN entries e ON e.id = fs.collection_id\n                         WHERE (fs.feed_url = ? OR fs.collection_id = ?)\n                           AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                         LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a2e956da66f6299b72bedfeba7c137dc66eaa7fe58cc822e9f2ecff72a9dd455"
+}

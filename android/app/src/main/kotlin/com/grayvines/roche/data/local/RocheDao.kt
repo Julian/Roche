@@ -7,6 +7,7 @@ import androidx.room3.Insert
 import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
+import androidx.room3.Update
 import com.grayvines.roche.data.MAX_SQLITE_HTML_CHARS
 import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
 import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
@@ -170,29 +171,95 @@ interface RocheDao {
     suspend fun getUnarchivedItemStates(): List<ItemStateRow>
 
     @Query(
-        """SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, """ +
-            """SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, """ +
-            """SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, """ +
-            """SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, """ +
-            """items.contentType, items.status, items.isFavorite, items.isCachedOffline, """ +
-            """items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, """ +
-            """items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, """ +
-            """items.interactionUpdatedAt, items.audioUrl """ +
-            """FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId """ +
-            """WHERE items.title LIKE :likePattern ESCAPE '\' """ +
-            """OR items.feedTitle LIKE :likePattern ESCAPE '\' """ +
-            """OR items.author LIKE :likePattern ESCAPE '\' """ +
-            """OR items.url LIKE :likePattern ESCAPE '\' """ +
-            """OR COALESCE(ic.summary, items.summary) LIKE :likePattern ESCAPE '\' """ +
-            """OR COALESCE(ic.contentText, items.contentText) LIKE :likePattern ESCAPE '\' """ +
-            """OR COALESCE(ic.contentHtml, items.contentHtml) LIKE :likePattern ESCAPE '\' """ +
-            """OR EXISTS (""" +
-            """SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId """ +
-            """WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\'""" +
-            """) """ +
-            """ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"""
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
+            "WHERE items.rowid IN (" +
+            "SELECT rowid FROM items_fts WHERE items_fts MATCH :tokenMatchQuery" +
+            ") " +
+            "OR items.id IN (" +
+            "SELECT ic2.itemId FROM item_contents ic2 " +
+            "INNER JOIN item_contents_fts ON ic2.rowid = item_contents_fts.rowid " +
+            "WHERE item_contents_fts MATCH :tokenMatchQuery" +
+            ") " +
+            "OR EXISTS (" +
+            "SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId " +
+            "WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\\'" +
+            ") " +
+            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
     )
-    suspend fun searchFullItems(likePattern: String): List<ItemEntity>
+    suspend fun searchSingleTokenFullItems(
+        tokenMatchQuery: String,
+        likePattern: String,
+    ): List<ItemEntity>
+
+    @Query(
+        "SELECT items.id FROM items " +
+            "INNER JOIN items_fts ON items.rowid = items_fts.rowid " +
+            "WHERE items_fts MATCH :tokenMatchQuery " +
+            "UNION " +
+            "SELECT ic.itemId FROM item_contents ic " +
+            "INNER JOIN item_contents_fts ON ic.rowid = item_contents_fts.rowid " +
+            "WHERE item_contents_fts MATCH :tokenMatchQuery"
+    )
+    suspend fun matchItemIdsForFtsToken(tokenMatchQuery: String): List<String>
+
+    @Query(
+        "SELECT DISTINCT it.itemId FROM item_tags it " +
+            "INNER JOIN tags t ON t.id = it.tagId " +
+            "WHERE t.name LIKE :likePattern ESCAPE '\\'"
+    )
+    suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
+
+    @Query(
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
+            "WHERE items.id IN (:ids) " +
+            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
+    )
+    suspend fun getSearchItemsByIdsChunk(ids: List<String>): List<ItemEntity>
+
+    @Transaction
+    suspend fun searchFullItemsByTokens(
+        tokenQueries: List<String>,
+        likePattern: String,
+    ): List<ItemEntity> =
+        when (tokenQueries.size) {
+            0 -> searchItemsByTagOnly(likePattern)
+            1 -> searchSingleTokenFullItems(tokenQueries.single(), likePattern)
+            else -> executeMultiTokenSearch(tokenQueries, likePattern)
+        }
+
+    @Query(
+        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
+            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
+            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
+            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
+            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
+            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
+            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
+            "items.interactionUpdatedAt, items.audioUrl " +
+            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
+            "WHERE EXISTS (" +
+            "SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId " +
+            "WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\\'" +
+            ") " +
+            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
+    )
+    suspend fun searchItemsByTagOnly(likePattern: String): List<ItemEntity>
 
     @Query("DELETE FROM items WHERE id = :id") suspend fun deleteItemById(id: String)
 
@@ -201,11 +268,25 @@ interface RocheDao {
     @Query("DELETE FROM item_tags WHERE itemId = :itemId")
     suspend fun deleteItemTagsForItem(itemId: String)
 
-    @Query("DELETE FROM feeds WHERE id IN (:ids)") suspend fun deleteFeedsByIds(ids: List<String>)
+    @Query("DELETE FROM feeds WHERE id IN (:ids)")
+    suspend fun deleteRawFeedsByIds(ids: List<String>)
+
+    @Transaction
+    suspend fun deleteFeedsByIds(ids: List<String>) {
+        if (ids.isEmpty()) return
+        ids.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteRawFeedsByIds(chunk) }
+    }
 
     @Query("DELETE FROM tags WHERE id IN (:ids)") suspend fun deleteTagsByIds(ids: List<String>)
 
-    @Query("DELETE FROM items WHERE id IN (:ids)") suspend fun deleteItemsByIds(ids: List<String>)
+    @Query("DELETE FROM items WHERE id IN (:ids)")
+    suspend fun deleteRawItemsByIds(ids: List<String>)
+
+    @Transaction
+    suspend fun deleteItemsByIds(ids: List<String>) {
+        if (ids.isEmpty()) return
+        ids.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteRawItemsByIds(chunk) }
+    }
 
     @Query("DELETE FROM item_tags") suspend fun clearAllItemTags()
 
@@ -221,47 +302,7 @@ interface RocheDao {
         tags: List<TagEntity>,
         items: List<ItemEntity>,
         itemTags: List<ItemTagEntity>,
-    ) {
-        val existingFeedsById = getAllFeeds().associateBy { it.id }
-        val existingTagsById = getAllTags().associateBy { it.id }
-        val existingItemsById = getAllItems().associateBy { it.id }
-        val existingItemTags = getAllItemTags().toSet()
-
-        val targetFeedsById = feeds.associateBy { it.id }
-        val targetTagsById = tags.associateBy { it.id }
-        val targetItemsById = items.map { truncateItemForStorage(it) }.associateBy { it.id }
-        val targetItemTags = itemTags.toSet()
-
-        (existingItemTags - targetItemTags).forEach { removed ->
-            deleteItemTag(itemId = removed.itemId, tagId = removed.tagId)
-        }
-        deleteRemovedIdsInChunks(existingItemsById.keys, targetItemsById.keys) { ids ->
-            deleteItemsByIds(ids)
-        }
-        deleteRemovedIdsInChunks(existingFeedsById.keys, targetFeedsById.keys) { ids ->
-            deleteFeedsByIds(ids)
-        }
-        deleteRemovedIdsInChunks(existingTagsById.keys, targetTagsById.keys) { ids ->
-            deleteTagsByIds(ids)
-        }
-
-        val changedFeeds = collectChangedEntities(existingFeedsById, targetFeedsById)
-        if (changedFeeds.isNotEmpty()) {
-            upsertFeeds(changedFeeds)
-        }
-        val changedTags = collectChangedEntities(existingTagsById, targetTagsById)
-        if (changedTags.isNotEmpty()) {
-            upsertTags(changedTags)
-        }
-        val changedItems = collectChangedEntities(existingItemsById, targetItemsById)
-        if (changedItems.isNotEmpty()) {
-            upsertItems(changedItems)
-        }
-        val addedItemTags = (targetItemTags - existingItemTags).toList()
-        if (addedItemTags.isNotEmpty()) {
-            insertItemTags(addedItemTags)
-        }
-    }
+    ) = executeReconcileSnapshotDiff(feeds, tags, items, itemTags)
 
     @Transaction
     suspend fun replaceSnapshotAtomically(
@@ -286,16 +327,59 @@ interface RocheDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertFeed(feed: FeedEntity)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertRawItems(items: List<ItemEntity>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertRawItemsIgnore(items: List<ItemEntity>): List<Long>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertRawItem(item: ItemEntity)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertRawItemIgnore(item: ItemEntity): Long
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertItemContents(contents: List<ItemContentEntity>)
+    @Update suspend fun updateRawItems(items: List<ItemEntity>)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertItemContent(content: ItemContentEntity)
+    @Update suspend fun updateRawItem(item: ItemEntity)
+
+    @Transaction
+    suspend fun insertRawItems(items: List<ItemEntity>) {
+        if (items.isEmpty()) return
+        val rowIds = insertRawItemsIgnore(items)
+        val existing = items.filterIndexed { index, _ -> rowIds[index] == -1L }
+        if (existing.isNotEmpty()) {
+            updateRawItems(existing)
+        }
+    }
+
+    @Transaction
+    suspend fun insertRawItem(item: ItemEntity) {
+        if (insertRawItemIgnore(item) == -1L) {
+            updateRawItem(item)
+        }
+    }
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertItemContentsIgnore(contents: List<ItemContentEntity>): List<Long>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertItemContentIgnore(content: ItemContentEntity): Long
+
+    @Update suspend fun updateItemContents(contents: List<ItemContentEntity>)
+
+    @Update suspend fun updateItemContent(content: ItemContentEntity)
+
+    @Transaction
+    suspend fun upsertItemContents(contents: List<ItemContentEntity>) {
+        if (contents.isEmpty()) return
+        val rowIds = insertItemContentsIgnore(contents)
+        val existing = contents.filterIndexed { index, _ -> rowIds[index] == -1L }
+        if (existing.isNotEmpty()) {
+            updateItemContents(existing)
+        }
+    }
+
+    @Transaction
+    suspend fun upsertItemContent(content: ItemContentEntity) {
+        if (insertItemContentIgnore(content) == -1L) {
+            updateItemContent(content)
+        }
+    }
 
     @Query("DELETE FROM item_contents WHERE itemId IN (:itemIds)")
     suspend fun deleteItemContentsByIds(itemIds: List<String>)
@@ -308,24 +392,7 @@ interface RocheDao {
         block()
     }
 
-    @Transaction
-    suspend fun upsertItems(items: List<ItemEntity>) {
-        if (items.isEmpty()) return
-        val bounded = items.map(::truncateItemForStorage)
-        insertRawItems(bounded.map(::truncateItemForInlinePreview))
-        val (extended, inlineOnly) = bounded.partition(::hasExtendedItemContent)
-        if (extended.isNotEmpty()) {
-            upsertItemContents(extended.map(::toItemContentEntity))
-        }
-        if (inlineOnly.isNotEmpty()) {
-            inlineOnly
-                .map { it.id }
-                .chunked(SQLITE_DELETE_CHUNK_SIZE)
-                .forEach { chunk ->
-                    deleteItemContentsByIds(chunk)
-                }
-        }
-    }
+    @Transaction suspend fun upsertItems(items: List<ItemEntity>) = executeUpsertItems(items)
 
     @Transaction
     suspend fun upsertItem(item: ItemEntity) {
@@ -730,11 +797,80 @@ internal fun toItemContentEntity(item: ItemEntity): ItemContentEntity =
         contentHtml = item.contentHtml,
     )
 
+internal const val MAX_FTS_QUERY_TOKENS = 16
+private const val FTS_SEARCHABLE_COLUMNS_PREFIX =
+    "{title feedTitle author url summary contentText contentHtml} : "
+
+internal fun extractFtsTokenQueries(rawQuery: String): List<String> {
+    val sanitized = rawQuery.replace("\u0000", "").trim()
+    if (sanitized.isBlank()) return emptyList()
+    val tokens = ArrayList<String>()
+    val current = StringBuilder()
+    var hasCoreAlphaNum = false
+    var index = 0
+    while (index < sanitized.length) {
+        val cp = sanitized.codePointAt(index)
+        if (isFtsTokenCodePoint(cp)) {
+            current.appendCodePoint(cp)
+            hasCoreAlphaNum = hasCoreAlphaNum || isCoreFtsAlphaNum(cp)
+        } else {
+            flushFtsToken(current, hasCoreAlphaNum, tokens)
+            hasCoreAlphaNum = false
+        }
+        index += Character.charCount(cp)
+    }
+    flushFtsToken(current, hasCoreAlphaNum, tokens)
+    return tokens.take(MAX_FTS_QUERY_TOKENS).map { token ->
+        val escaped = token.replace("\"", "\"\"")
+        "\"$escaped\"*"
+    }
+}
+
+internal fun buildFts5MatchQuery(rawQuery: String): String? {
+    val tokenQueries = extractFtsTokenQueries(rawQuery)
+    return if (tokenQueries.isEmpty()) {
+        null
+    } else {
+        "$FTS_SEARCHABLE_COLUMNS_PREFIX(${tokenQueries.joinToString(separator = " ")})"
+    }
+}
+
+private fun flushFtsToken(
+    current: StringBuilder,
+    hasCoreAlphaNum: Boolean,
+    tokens: MutableList<String>,
+) {
+    if (current.isNotEmpty()) {
+        if (hasCoreAlphaNum) {
+            tokens.add(current.toString())
+        }
+        current.setLength(0)
+    }
+}
+
+private fun isCoreFtsAlphaNum(cp: Int): Boolean =
+    Character.isLetterOrDigit(cp) ||
+        when (Character.getType(cp).toByte()) {
+            Character.LETTER_NUMBER,
+            Character.OTHER_NUMBER -> true
+            else -> false
+        }
+
+private fun isFtsTokenCodePoint(cp: Int): Boolean =
+    isCoreFtsAlphaNum(cp) ||
+        when (Character.getType(cp).toByte()) {
+            Character.NON_SPACING_MARK,
+            Character.COMBINING_SPACING_MARK,
+            Character.ENCLOSING_MARK -> true
+            else -> false
+        }
+
 internal fun buildSqlContainsPattern(rawQuery: String): String {
+    val sanitized = rawQuery.replace("\u0000", "").trim()
     val escaped =
-        buildString(rawQuery.length + 2) {
+        buildString(sanitized.length + 2) {
             append('%')
-            for (ch in rawQuery) {
+            for (ch in sanitized) {
                 if (ch == '\\' || ch == '%' || ch == '_') {
                     append('\\')
                 }
@@ -759,3 +895,82 @@ internal fun <T> collectChangedEntities(
     existingById: Map<String, T>,
     targetById: Map<String, T>,
 ): List<T> = targetById.mapNotNull { (id, target) -> target.takeIf { existingById[id] != it } }
+
+internal suspend fun RocheDao.executeMultiTokenSearch(
+    tokenQueries: List<String>,
+    likePattern: String,
+): List<ItemEntity> {
+    val orderedTokens = tokenQueries.distinct().sortedByDescending { it.length }
+    val matchedIds = matchItemIdsForFtsToken(orderedTokens.first()).toMutableSet()
+    for (index in 1 until orderedTokens.size) {
+        if (matchedIds.isEmpty()) break
+        matchedIds.retainAll(matchItemIdsForFtsToken(orderedTokens[index]).toHashSet())
+    }
+    matchedIds.addAll(matchItemIdsByTagLike(likePattern))
+    if (matchedIds.isEmpty()) return emptyList()
+    val chunks = matchedIds.chunked(SQLITE_DELETE_CHUNK_SIZE)
+    return if (chunks.size == 1) {
+        getSearchItemsByIdsChunk(chunks.single())
+    } else {
+        chunks
+            .flatMap { chunk -> getSearchItemsByIdsChunk(chunk) }
+            .sortedByDescending { it.publishedAt ?: it.createdAt }
+    }
+}
+
+internal suspend fun RocheDao.executeUpsertItems(items: List<ItemEntity>) {
+    if (items.isEmpty()) return
+    val bounded = items.associateBy { it.id }.values.map(::truncateItemForStorage)
+    insertRawItems(bounded.map(::truncateItemForInlinePreview))
+    val (extended, inlineOnly) = bounded.partition(::hasExtendedItemContent)
+    if (extended.isNotEmpty()) {
+        upsertItemContents(extended.map(::toItemContentEntity))
+    }
+    if (inlineOnly.isNotEmpty()) {
+        inlineOnly
+            .map { it.id }
+            .chunked(SQLITE_DELETE_CHUNK_SIZE)
+            .forEach { chunk -> deleteItemContentsByIds(chunk) }
+    }
+}
+
+internal suspend fun RocheDao.executeReconcileSnapshotDiff(
+    feeds: List<FeedEntity>,
+    tags: List<TagEntity>,
+    items: List<ItemEntity>,
+    itemTags: List<ItemTagEntity>,
+) {
+    val existingFeedsById = getAllFeeds().associateBy { it.id }
+    val existingTagsById = getAllTags().associateBy { it.id }
+    val existingItemsById = getAllItems().associateBy { it.id }
+    val existingItemTags = getAllItemTags().toSet()
+
+    val targetFeedsById = feeds.associateBy { it.id }
+    val targetTagsById = tags.associateBy { it.id }
+    val targetItemsById = items.map(::truncateItemForStorage).associateBy { it.id }
+    val targetItemTags = itemTags.toSet()
+
+    (existingItemTags - targetItemTags).forEach { removed ->
+        deleteItemTag(itemId = removed.itemId, tagId = removed.tagId)
+    }
+    deleteRemovedIdsInChunks(existingItemsById.keys, targetItemsById.keys, ::deleteItemsByIds)
+    deleteRemovedIdsInChunks(existingFeedsById.keys, targetFeedsById.keys, ::deleteFeedsByIds)
+    deleteRemovedIdsInChunks(existingTagsById.keys, targetTagsById.keys, ::deleteTagsByIds)
+
+    val changedFeeds = collectChangedEntities(existingFeedsById, targetFeedsById)
+    if (changedFeeds.isNotEmpty()) {
+        upsertFeeds(changedFeeds)
+    }
+    val changedTags = collectChangedEntities(existingTagsById, targetTagsById)
+    if (changedTags.isNotEmpty()) {
+        upsertTags(changedTags)
+    }
+    val changedItems = collectChangedEntities(existingItemsById, targetItemsById)
+    if (changedItems.isNotEmpty()) {
+        upsertItems(changedItems)
+    }
+    val addedItemTags = (targetItemTags - existingItemTags).toList()
+    if (addedItemTags.isNotEmpty()) {
+        insertItemTags(addedItemTags)
+    }
+}

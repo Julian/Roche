@@ -194,20 +194,25 @@ impl SyncRepo<'_> {
                 continue;
             };
 
-            let existing_spec: Option<(String, CollectionMode, CollectionRole)> = sqlx::query_as(
-                "SELECT collection_id, mode, collection_role
+            let existing_spec = sqlx::query!(
+                "SELECT collection_id,
+                        mode AS \"mode: CollectionMode\",
+                        collection_role AS \"collection_role: CollectionRole\"
                  FROM collection_specs
                  WHERE collection_id = ? OR (slug IS NOT NULL AND LOWER(slug) = LOWER(?))
                  ORDER BY CASE WHEN collection_id = ? THEN 0 ELSE 1 END ASC
                  LIMIT 1",
+                requested_col_id,
+                slug_opt,
+                requested_col_id,
             )
-            .bind(&requested_col_id)
-            .bind(&slug_opt)
-            .bind(&requested_col_id)
             .fetch_optional(&mut *tx)
             .await?;
 
-            let target_col_id = if let Some((existing_col_id, ex_mode, ex_role)) = existing_spec {
+            let target_col_id = if let Some(ex) = existing_spec {
+                let existing_col_id = ex.collection_id;
+                let ex_mode = ex.mode;
+                let ex_role = ex.collection_role;
                 if ex_mode != CollectionMode::Manual
                     || matches!(
                         ex_role,
@@ -227,7 +232,9 @@ impl SyncRepo<'_> {
             let created = col.created_at.unwrap_or(now);
             let incoming_updated = col.updated_at.unwrap_or(now);
             let ingested_updated = incoming_updated.max(now);
-            sqlx::query(
+            let clean_summary = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let clean_color = col.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            sqlx::query!(
                 "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
                  VALUES (?, 'collection', ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
@@ -242,40 +249,40 @@ impl SyncRepo<'_> {
                         THEN excluded.updated_at
                         ELSE entries.updated_at
                     END",
+                target_col_id,
+                title,
+                clean_summary,
+                created as _,
+                ingested_updated as _,
+                incoming_updated as _,
+                incoming_updated as _,
             )
-            .bind(&target_col_id)
-            .bind(title)
-            .bind(col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()))
-            .bind(created)
-            .bind(ingested_updated)
-            .bind(incoming_updated)
-            .bind(incoming_updated)
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO collection_specs
                  (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
                  VALUES (?, ?, 'manual', ?, NULL, ?, ?)
                  ON CONFLICT(collection_id) DO UPDATE SET
                     show_in_lists = excluded.show_in_lists,
                     color = COALESCE(excluded.color, collection_specs.color)",
+                target_col_id,
+                slug_opt,
+                col.role as _,
+                col.show_in_lists as _,
+                clean_color,
             )
-            .bind(&target_col_id)
-            .bind(&slug_opt)
-            .bind(col.role)
-            .bind(col.show_in_lists)
-            .bind(col.color.as_deref().map(str::trim).filter(|s| !s.is_empty()))
             .execute(&mut *tx)
             .await?;
 
             if let Some(s) = slug_opt {
-                sqlx::query(
+                sqlx::query!(
                     "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
                      VALUES ('slug', ?, ?)",
+                    s,
+                    target_col_id,
                 )
-                .bind(s)
-                .bind(&target_col_id)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -333,22 +340,23 @@ impl SyncRepo<'_> {
                 continue;
             }
             let existing_dup: Option<Option<String>> =
-                sqlx::query_scalar("SELECT merged_into_id FROM entries WHERE id = ?")
-                    .bind(dup_id)
+                sqlx::query_scalar!("SELECT merged_into_id FROM entries WHERE id = ?", dup_id)
                     .fetch_optional(&mut *tx)
                     .await?;
             match existing_dup {
                 None => {
-                    sqlx::query(
+                    let merged_title = merged_entry.title.trim();
+                    let merged_created = merged_entry.created_at.unwrap_or(now);
+                    sqlx::query!(
                         "INSERT INTO entries (id, kind, title, merged_into_id, created_at, updated_at)
                          VALUES (?, ?, ?, ?, ?, ?)",
+                        dup_id,
+                        merged_entry.kind as _,
+                        merged_title,
+                        canon_resolved,
+                        merged_created as _,
+                        now as _,
                     )
-                    .bind(dup_id)
-                    .bind(merged_entry.kind)
-                    .bind(merged_entry.title.trim())
-                    .bind(&canon_resolved)
-                    .bind(merged_entry.created_at.unwrap_or(now))
-                    .bind(now)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -381,15 +389,17 @@ impl SyncRepo<'_> {
             if col_id == entry_id {
                 continue;
             }
-            let spec_mode: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
-                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            let spec_mode = sqlx::query!(
+                "SELECT mode AS \"mode: CollectionMode\",
+                        collection_role AS \"collection_role: CollectionRole\"
+                 FROM collection_specs WHERE collection_id = ?",
+                col_id,
             )
-            .bind(&col_id)
             .fetch_optional(&mut *tx)
             .await?;
-            if let Some((mode, role)) = spec_mode
-                && (mode != CollectionMode::Manual
-                    || matches!(role, CollectionRole::Feed | CollectionRole::Tag))
+            if let Some(spec) = spec_mode
+                && (spec.mode != CollectionMode::Manual
+                    || matches!(spec.collection_role, CollectionRole::Feed | CollectionRole::Tag))
             {
                 continue;
             }
@@ -398,11 +408,11 @@ impl SyncRepo<'_> {
             }
 
             let nat_key = collection_entry_natural_key(&col_id, &entry_id);
-            let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar(
-                "SELECT deleted_at FROM sync_tombstones
+            let tomb_ts: Option<DateTime<Utc>> = sqlx::query_scalar!(
+                "SELECT deleted_at AS \"deleted_at: DateTime<Utc>\" FROM sync_tombstones
                  WHERE entity_type = 'collection_entry' AND natural_key = ?",
+                nat_key,
             )
-            .bind(&nat_key)
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(del_at) = tomb_ts {
@@ -413,7 +423,7 @@ impl SyncRepo<'_> {
             }
 
             let ingested_added_at = ce.added_at.max(now);
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
                  VALUES (?, ?, ?, ?)
                  ON CONFLICT(collection_id, entry_id) DO UPDATE SET
@@ -424,12 +434,12 @@ impl SyncRepo<'_> {
                         THEN excluded.added_at
                         ELSE collection_entries.added_at
                     END",
+                col_id,
+                entry_id,
+                ce.position,
+                ingested_added_at as _,
+                ce.added_at as _,
             )
-            .bind(&col_id)
-            .bind(&entry_id)
-            .bind(ce.position)
-            .bind(ingested_added_at)
-            .bind(ce.added_at)
             .execute(&mut *tx)
             .await?;
         }
@@ -504,15 +514,15 @@ impl SyncRepo<'_> {
             } else {
                 comp.id.trim().to_owned()
             };
-            let res = sqlx::query(
+            let res = sqlx::query!(
                 "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
                  VALUES (?, ?, ?, ?, ?)",
+                comp_id,
+                comp.ts as _,
+                scope_id,
+                ord_json,
+                now as _,
             )
-            .bind(&comp_id)
-            .bind(comp.ts)
-            .bind(&scope_id)
-            .bind(&ord_json)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
             if res.rows_affected() > 0 {
@@ -529,22 +539,24 @@ impl SyncRepo<'_> {
 
         // 6. Collection Generators (`1001_albums` LWW + never-revive-consumed-album invariant)
         for inc_gen in collection_generators {
-            type LocalGenRow = (bool, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>);
             if inc_gen.collection_id.trim() != ALBUMS_1001_COLLECTION_ID {
                 continue;
             }
-            let local_gen: Option<LocalGenRow> = sqlx::query_as(
-                "SELECT enabled, current_entry_id, drawn_at, updated_at
+            let local_gen = sqlx::query!(
+                "SELECT enabled AS \"enabled: bool\",
+                        current_entry_id,
+                        drawn_at AS \"drawn_at: DateTime<Utc>\",
+                        updated_at AS \"updated_at: DateTime<Utc>\"
                  FROM collection_generators WHERE collection_id = ?",
+                ALBUMS_1001_COLLECTION_ID,
             )
-            .bind(ALBUMS_1001_COLLECTION_ID)
             .fetch_optional(&mut *tx)
             .await?;
             let (mut target_enabled, mut target_entry_id, mut target_drawn_at, mut target_updated) =
-                if let Some((loc_en, loc_cur, loc_drawn, loc_upd)) = local_gen {
-                    if inc_gen.updated_at > loc_upd
-                        || (inc_gen.updated_at == loc_upd
-                            && loc_cur.is_none()
+                if let Some(loc) = local_gen {
+                    if inc_gen.updated_at > loc.updated_at
+                        || (inc_gen.updated_at == loc.updated_at
+                            && loc.current_entry_id.is_none()
                             && inc_gen.current_entry_id.is_some())
                     {
                         (
@@ -554,7 +566,7 @@ impl SyncRepo<'_> {
                             inc_gen.updated_at.max(now),
                         )
                     } else {
-                        (loc_en, loc_cur, loc_drawn, loc_upd)
+                        (loc.enabled, loc.current_entry_id, loc.drawn_at, loc.updated_at)
                     }
                 } else {
                     (
@@ -568,12 +580,12 @@ impl SyncRepo<'_> {
             if let Some(ref cur_id) = target_entry_id {
                 let canon_cur = CatalogRepo::follow_merged_id_in_tx(tx, cur_id).await?;
                 if let Some(cid) = canon_cur {
-                    let already_finished: Option<i64> = sqlx::query_scalar(
-                        "SELECT 1 FROM consumption_log
+                    let already_finished: Option<i64> = sqlx::query_scalar!(
+                        "SELECT 1 AS \"found!: i64\" FROM consumption_log
                          WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
                          LIMIT 1",
+                        cid,
                     )
-                    .bind(&cid)
                     .fetch_optional(&mut *tx)
                     .await?;
                     if already_finished.is_some() {
@@ -594,53 +606,56 @@ impl SyncRepo<'_> {
             }
             let _ = &mut target_enabled;
 
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE collection_generators
                  SET enabled = ?, current_entry_id = ?, drawn_at = ?, updated_at = ?
                  WHERE collection_id = ?",
+                target_enabled as _,
+                target_entry_id,
+                target_drawn_at as _,
+                target_updated as _,
+                ALBUMS_1001_COLLECTION_ID,
             )
-            .bind(target_enabled)
-            .bind(&target_entry_id)
-            .bind(target_drawn_at)
-            .bind(target_updated)
-            .bind(ALBUMS_1001_COLLECTION_ID)
             .execute(&mut *tx)
             .await?;
         }
 
         // Also ensure that if an incoming consumption_log just finished the server's active 1001 album
         // (even without an incoming `collection_generators` entry), we advance the active draw cleanly!
-        let local_active: Option<(bool, Option<String>)> = sqlx::query_as(
-            "SELECT enabled, current_entry_id FROM collection_generators WHERE collection_id = ?",
+        let local_active = sqlx::query!(
+            "SELECT enabled AS \"enabled: bool\", current_entry_id
+             FROM collection_generators WHERE collection_id = ?",
+            ALBUMS_1001_COLLECTION_ID,
         )
-        .bind(ALBUMS_1001_COLLECTION_ID)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((loc_enabled, Some(loc_cur_id))) = local_active {
-            let done: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM consumption_log
+        if let Some(loc) = local_active
+            && let Some(loc_cur_id) = loc.current_entry_id
+        {
+            let done: Option<i64> = sqlx::query_scalar!(
+                "SELECT 1 AS \"found!: i64\" FROM consumption_log
                  WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
                  LIMIT 1",
+                loc_cur_id,
             )
-            .bind(&loc_cur_id)
             .fetch_optional(&mut *tx)
             .await?;
             if done.is_some() {
-                let next_id = if loc_enabled {
+                let next_id = if loc.enabled {
                     CatalogRepo::draw_random_remaining_1001_in_tx(tx).await?
                 } else {
                     None
                 };
                 let next_drawn = next_id.as_ref().map(|_| now);
-                sqlx::query(
+                sqlx::query!(
                     "UPDATE collection_generators
                      SET current_entry_id = ?, drawn_at = ?, updated_at = ?
                      WHERE collection_id = ?",
+                    next_id,
+                    next_drawn as _,
+                    now as _,
+                    ALBUMS_1001_COLLECTION_ID,
                 )
-                .bind(&next_id)
-                .bind(next_drawn)
-                .bind(now)
-                .bind(ALBUMS_1001_COLLECTION_ID)
                 .execute(&mut *tx)
                 .await?;
             }

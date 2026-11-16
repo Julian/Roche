@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id, feed_url FROM feed_sources\n                 WHERE feed_url = ? OR collection_id = ?\n                 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "name": "feed_url",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "12d90bc4c2858fd776b9fdbe20eef699e7621fb24be73a456af292e32e151dbc"
+}

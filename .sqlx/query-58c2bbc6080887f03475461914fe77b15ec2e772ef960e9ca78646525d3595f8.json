@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_content (entry_id, content_html, content_type)\n                         VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "58c2bbc6080887f03475461914fe77b15ec2e772ef960e9ca78646525d3595f8"
+}

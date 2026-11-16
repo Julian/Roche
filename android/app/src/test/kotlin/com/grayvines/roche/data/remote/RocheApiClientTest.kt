@@ -5,6 +5,12 @@ import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.model.ContentType
 import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.concurrent.Executors
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -13,11 +19,15 @@ import kotlinx.serialization.json.putJsonArray
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 
+@Suppress("LargeClass")
 class RocheApiClientTest {
     @TempDir lateinit var tempDir: File
 
@@ -588,6 +598,8 @@ class RocheApiClientTest {
                 )
             )
             assertFalse(failedFile.exists())
+
+            verifyCustomStreamToFileOverride(tempDir, mediaPayload)
         }
 
     @Test
@@ -635,7 +647,277 @@ class RocheApiClientTest {
 
         verifyPeerSyncWireRoundTrip()
     }
+
+    @Test
+    internal fun `RFC 9110 redirects preserve non-POST on 301 and 302 and rewrite to GET on 303`() {
+        val baseHeaders =
+            mapOf(
+                "Authorization" to "Bearer tok",
+                "content-type" to "application/json",
+                "Content-Length" to "15",
+            )
+        for (method in listOf("DELETE", "PATCH", "PUT")) {
+            val req =
+                HttpRequest(
+                    method = method,
+                    url = "https://roche.example.com/api/v1/feeds/f1",
+                    headers = baseHeaders,
+                    body = """{"force":true}""",
+                )
+            for (code in listOf(TEST_HTTP_301, TEST_HTTP_302)) {
+                val redirected =
+                    buildRedirectedRequest(req, code, "https://roche.example.com/api/v2/feeds/f1")
+                assertEquals(method, redirected.method)
+                assertEquals("""{"force":true}""", redirected.body)
+                assertEquals("application/json", redirected.headers["content-type"])
+                assertEquals("15", redirected.headers["Content-Length"])
+            }
+            val seeOther =
+                buildRedirectedRequest(
+                    req,
+                    TEST_HTTP_303,
+                    "https://roche.example.com/api/v2/feeds/f1",
+                )
+            assertPayloadStrippedGetRedirect(seeOther)
+        }
+
+        val postReq =
+            HttpRequest(
+                method = "POST",
+                url = "https://roche.example.com/api/v1/items",
+                headers = baseHeaders,
+                body = """{"url":"x"}""",
+            )
+        assertPayloadStrippedGetRedirect(
+            buildRedirectedRequest(postReq, TEST_HTTP_301, "https://roche.example.com/v2")
+        )
+        assertPayloadStrippedGetRedirect(
+            buildRedirectedRequest(postReq, TEST_HTTP_302, "https://roche.example.com/v2")
+        )
+
+        val headReq = HttpRequest(method = "HEAD", url = "https://roche.example.com/v1")
+        assertEquals(
+            "HEAD",
+            buildRedirectedRequest(headReq, TEST_HTTP_303, "https://roche.example.com/v2").method,
+        )
+    }
+
+    @Test
+    internal fun `cross-origin redirect strips sensitive headers and upgraded URL stays https`() {
+        val req =
+            HttpRequest(
+                method = "GET",
+                url = "http://feeds.example.com/old.xml",
+                headers =
+                    mapOf(
+                        "authorization" to "Bearer secret",
+                        "cookie" to "sid=abc",
+                        "Proxy-Authorization" to "Basic xyz",
+                        "Accept" to "application/rss+xml",
+                    ),
+                requirePublicIp = true,
+            )
+        val effective =
+            req.copy(
+                url =
+                    PublicUrlValidator.upgradePublicHttp(
+                        req.url,
+                        isCleartextPermitted = { false },
+                    )
+            )
+        assertEquals("https://feeds.example.com/old.xml", effective.url)
+
+        val sameOriginRelative =
+            resolveNextRedirectHop(
+                effectiveRequest = effective,
+                statusCode = TEST_HTTP_301,
+                location = "/new/index.xml",
+                hop = 0,
+                maxRedirects = MAX_REDIRECTS,
+            )!!
+        assertEquals("https://feeds.example.com/new/index.xml", sameOriginRelative.url)
+        assertEquals("Bearer secret", sameOriginRelative.headers["authorization"])
+        assertEquals("sid=abc", sameOriginRelative.headers["cookie"])
+
+        val crossOrigin =
+            resolveNextRedirectHop(
+                effectiveRequest = effective,
+                statusCode = TEST_HTTP_302,
+                location = "https://cdn.other-domain.example/feed.xml",
+                hop = 0,
+                maxRedirects = MAX_REDIRECTS,
+            )!!
+        assertFalse(crossOrigin.headers.keys.any { it.equals("Authorization", ignoreCase = true) })
+        assertFalse(crossOrigin.headers.keys.any { it.equals("Cookie", ignoreCase = true) })
+        assertFalse(
+            crossOrigin.headers.keys.any { it.equals("Proxy-Authorization", ignoreCase = true) }
+        )
+        assertEquals("application/rss+xml", crossOrigin.headers["Accept"])
+    }
+
+    @Test
+    internal fun `callbacks isolate part files protect targetFile on cancel drop text bodyBytes and report blank Location`() =
+        runTest {
+            val target = File(tempDir, "episode.mp3")
+            target.writeBytes("keep-existing".toByteArray())
+            val firstOpened = openPartFileChannel(target)!!
+            val secondOpened = openPartFileChannel(target)!!
+            assertNotEquals(firstOpened.first, secondOpened.first)
+            secondOpened.second.write(ByteBuffer.wrap("retry-bytes".toByteArray()))
+            firstOpened.second.close()
+            firstOpened.first.delete()
+            assertTrue(secondOpened.first.exists())
+            secondOpened.second.close()
+            secondOpened.first.delete()
+
+            verifyCancelledStreamingNeverOverwritesTarget(target)
+            verifyBufferedCallbackHeapAndBlankLocation()
+            assertTrue(
+                exceedsByteBudget(
+                    bytesWritten = TEST_WRITTEN_BYTES,
+                    incoming = Long.MAX_VALUE,
+                    maxBytes = TEST_MAX_BUDGET_BYTES,
+                )
+            )
+            assertFalse(
+                exceedsByteBudget(
+                    bytesWritten = TEST_WRITTEN_BYTES,
+                    incoming = TEST_SAFE_INCOMING_BYTES,
+                    maxBytes = TEST_MAX_BUDGET_BYTES,
+                )
+            )
+
+            val activePaths = mutableSetOf<String>()
+            val storagePath = prepareHttpEngineStoragePath(tempDir, activePaths)
+            assertNotNull(storagePath)
+            assertTrue(File(storagePath!!).isDirectory)
+            assertTrue(storagePath.endsWith(HTTP_ENGINE_STORAGE_DIR_NAME))
+            // Second concurrent engine on the same cacheDir avoids disk-lock collision
+            assertNull(prepareHttpEngineStoragePath(tempDir, activePaths))
+            releaseHttpEngineStoragePath(storagePath, activePaths)
+            // After close/release, cold-start or reopened engine reuses persistent QUIC/TLS cache
+            // dir
+            assertEquals(storagePath, prepareHttpEngineStoragePath(tempDir, activePaths))
+            releaseHttpEngineStoragePath(storagePath, activePaths)
+        }
 }
+
+private const val TEST_HTTP_200 = 200
+private const val TEST_HTTP_301 = 301
+private const val TEST_HTTP_302 = 302
+private const val TEST_HTTP_303 = 303
+private const val TEST_WRITTEN_BYTES = 16L
+private const val TEST_SAFE_INCOMING_BYTES = 84L
+private const val TEST_MAX_BUDGET_BYTES = 100L
+
+private fun assertPayloadStrippedGetRedirect(redirected: HttpRequest) {
+    assertEquals("GET", redirected.method)
+    assertNull(redirected.body)
+    assertFalse(redirected.headers.keys.any { it.equals("Content-Type", ignoreCase = true) })
+    assertFalse(redirected.headers.keys.any { it.equals("Content-Length", ignoreCase = true) })
+}
+
+private suspend fun verifyCancelledStreamingNeverOverwritesTarget(target: File) {
+    val scheduler = Executors.newSingleThreadScheduledExecutor()
+    try {
+        val opened = openPartFileChannel(target)!!
+        val sink =
+            StreamFileSink(
+                partFile = opened.first,
+                targetFile = target,
+                channel = opened.second,
+                maxBytes = TEST_MAX_BUDGET_BYTES,
+            )
+        var capturedCallback: StreamingUrlRequestCallback? = null
+        val job =
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined).async {
+                suspendCancellableCoroutine { cont ->
+                    val cb = StreamingUrlRequestCallback(sink, HopWatchdog(scheduler) {}, cont)
+                    capturedCallback = cb
+                    cont.invokeOnCancellation { cb.cancelFromCoroutine() }
+                    val chunk = ByteBuffer.allocate(TEST_NEW_PAYLOAD_BYTES.size)
+                    chunk.put(TEST_NEW_PAYLOAD_BYTES)
+                    assertTrue(cb.appendStreamChunk(chunk))
+                }
+            }
+        job.cancel(CancellationException("user cancelled"))
+        capturedCallback!!.handleSucceeded(TEST_HTTP_200)
+        assertFalse(sink.partFile.exists())
+        assertEquals("keep-existing", target.readText())
+    } finally {
+        scheduler.shutdownNow()
+    }
+}
+
+private val TEST_NEW_PAYLOAD_BYTES = "new-bytes".toByteArray()
+
+private suspend fun verifyBufferedCallbackHeapAndBlankLocation() {
+    val scheduler = Executors.newSingleThreadScheduledExecutor()
+    try {
+        val jsonOutcome =
+            suspendCancellableCoroutine<BufferedHopOutcome> { cont ->
+                val cb =
+                    BufferedUrlRequestCallback(
+                        httpRequest = HttpRequest("GET", "https://example.com/a.json"),
+                        watchdog = HopWatchdog(scheduler) {},
+                        continuation = cont,
+                    )
+                val buf = ByteBuffer.allocate(TEST_JSON_BYTES.size)
+                buf.put(TEST_JSON_BYTES)
+                assertTrue(cb.appendReadChunk(buf))
+                cb.handleSucceeded(TEST_HTTP_200, emptyMap())
+            }
+        assertEquals("""{"ok":true}""", jsonOutcome.response.body)
+        assertNull(jsonOutcome.response.bodyBytes)
+
+        val binOutcome =
+            suspendCancellableCoroutine<BufferedHopOutcome> { cont ->
+                val cb =
+                    BufferedUrlRequestCallback(
+                        httpRequest =
+                            HttpRequest(
+                                method = "GET",
+                                url = "https://example.com/a.bin",
+                                expectBinary = true,
+                            ),
+                        watchdog = HopWatchdog(scheduler) {},
+                        continuation = cont,
+                    )
+                val buf = ByteBuffer.allocate(TEST_NEW_PAYLOAD_BYTES.size)
+                buf.put(TEST_NEW_PAYLOAD_BYTES)
+                assertTrue(cb.appendReadChunk(buf))
+                cb.handleSucceeded(TEST_HTTP_200, emptyMap())
+            }
+        assertEquals("", binOutcome.response.body)
+        assertArrayEquals(TEST_NEW_PAYLOAD_BYTES, binOutcome.response.bodyBytes)
+
+        verifyBlankLocationRedirectError(scheduler)
+    } finally {
+        scheduler.shutdownNow()
+    }
+}
+
+private suspend fun verifyBlankLocationRedirectError(
+    scheduler: java.util.concurrent.ScheduledExecutorService
+) {
+    val err = runCatching {
+        suspendCancellableCoroutine<BufferedHopOutcome> { cont ->
+            val cb =
+                BufferedUrlRequestCallback(
+                    httpRequest = HttpRequest("GET", "https://example.com/redir"),
+                    watchdog = HopWatchdog(scheduler) {},
+                    continuation = cont,
+                )
+            cb.recordRedirectReceived(TEST_HTTP_302, emptyMap(), "   ")
+            cb.handleCanceled()
+        }
+    }
+        .exceptionOrNull()
+    assertTrue(err is IOException)
+    assertEquals(REDIRECT_MISSING_LOCATION_MESSAGE, err?.message)
+}
+
+private val TEST_JSON_BYTES = """{"ok":true}""".toByteArray()
 
 internal fun verifyPeerSyncWireRoundTrip() {
     val payload =
@@ -693,4 +975,43 @@ internal fun verifyPeerSyncWireRoundTrip() {
     assertEquals(listOf("server"), resp.activePeers.map { it.peerId })
     assertEquals(listOf("f-pod"), resp.feeds.map { it.id })
     assertEquals(listOf("t-audio"), resp.tags.map { it.id })
+}
+
+internal suspend fun verifyCustomStreamToFileOverride(
+    tempDir: File,
+    mediaPayload: ByteArray,
+) {
+    var customStreamCalls = 0
+    val directStreamTransport =
+        object : HttpTransport {
+            override suspend fun execute(request: HttpRequest): HttpResponse =
+                error("streamToFile override should bypass execute()")
+
+            override suspend fun streamToFile(
+                request: HttpRequest,
+                targetFile: File,
+                maxBytes: Long,
+            ): Boolean {
+                customStreamCalls++
+                return writeBytesAtomicallyToFile(mediaPayload, targetFile)
+            }
+        }
+    val directClient = RocheApiClient(directStreamTransport)
+    val directTarget = File(tempDir, "direct_stream.mp3")
+    assertTrue(
+        directClient.streamMediaToFile(
+            "http://localhost:8080",
+            "tok-media",
+            "audio-7",
+            directTarget,
+        )
+    )
+    assertTrue(
+        directClient.streamExternalBinaryToFile(
+            "https://cdn.example.com/episode.mp3",
+            directTarget,
+        )
+    )
+    assertEquals(2, customStreamCalls)
+    assertArrayEquals(mediaPayload, directTarget.readBytes())
 }

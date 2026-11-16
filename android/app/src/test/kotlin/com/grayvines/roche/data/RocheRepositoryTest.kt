@@ -15,6 +15,8 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.buildFts5MatchQuery
+import com.grayvines.roche.data.local.buildSqlContainsPattern
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -22,6 +24,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import java.io.File
+import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
@@ -603,8 +606,11 @@ class RocheRepositoryTest {
                 sanitizeCacheFileName(".")
             }
             assertEquals(
-                8,
-                com.grayvines.roche.ui.components.calculateInSampleSize(4000, 3000, 256, 256),
+                256 to 192,
+                com.grayvines.roche.ui.components.computeProportionalTargetSize(4000, 3000, 256),
+            )
+            assertNull(
+                com.grayvines.roche.ui.components.computeProportionalTargetSize(200, 150, 256)
             )
         }
 
@@ -1026,6 +1032,20 @@ class RocheRepositoryTest {
             assertEquals("item-deep", deepMatches.single().id)
             val snippet = extractSearchMatchSnippet(deepMatches.single(), "NeedleInHaystackToken99")
             assertTrue(snippet?.contains("NeedleInHaystackToken99") == true)
+
+            assertEquals(
+                """{title feedTitle author url summary contentText contentHtml} : ("hello"* "world"* "v2"*)""",
+                buildFts5MatchQuery("  \"hello\" -world: (v2)* "),
+            )
+            assertNull(buildFts5MatchQuery("--- () *** \"\""))
+            assertTrue(repository.searchDeepEntries("--- () ***").isEmpty())
+
+            database.dao().upsertFeeds(SeedData.feeds)
+            repository.renameFeed("feed-arxiv-cs-lg", "RenamedCustomFeed77")
+            assertEquals(
+                listOf("item-deep"),
+                repository.searchDeepEntries("RenamedCustomFeed77").map { it.id },
+            )
         }
 
     @Test
@@ -1063,6 +1083,11 @@ class RocheRepositoryTest {
             val storedShort = dao.getItemById("item-shrink")!!
             assertEquals("Short body", storedShort.contentText)
             assertNull(storedShort.duration)
+            assertTrue(repository.searchDeepEntries("word1450").isEmpty())
+            assertEquals(
+                listOf("item-shrink"),
+                repository.searchDeepEntries("Short body").map { it.id },
+            )
             val entry = repository.prewarm().entries.single { it.id == "item-shrink" }
             assertEquals("1m", entry.readEstimateLabel)
         }
@@ -1144,7 +1169,144 @@ class RocheRepositoryTest {
                 bgScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
+
+    @Test
+    internal fun `searchDeepEntries strips NUL bytes caps FTS tokens excludes itemId UUIDs and deduplicates upsertItems`() =
+        runTest {
+            val dao = database.dao()
+            val uuidId = "550e8400-e29b-41d4-a716-446655440000"
+            val baseItem =
+                SeedData.items
+                    .first()
+                    .copy(
+                        id = uuidId,
+                        title = "Morning Coffee",
+                        url = "https://example.com/coffee",
+                        summary = "DistinctSummaryToken",
+                        contentText = "Body text",
+                        contentHtml = "<p>Body text</p>",
+                    )
+            dao.upsertItem(baseItem)
+            dao.upsertTag(TagEntity(id = "tag-sys", name = "systems"))
+            dao.insertItemTag(ItemTagEntity(itemId = uuidId, tagId = "tag-sys"))
+
+            assertNull(buildFts5MatchQuery("\u0000"))
+            assertNull(buildFts5MatchQuery("  \u0000  "))
+            assertEquals("%%", buildSqlContainsPattern("\u0000"))
+            assertTrue(repository.searchDeepEntries("\u0000").isEmpty())
+            assertTrue(repository.searchDeepEntries("#\u0000").isEmpty())
+            assertTrue(repository.searchDeepEntries("550e8400").isEmpty())
+            assertTrue(repository.searchDeepEntries("Morning 550e8400").isEmpty())
+
+            val twentyTokens = (1..TEST_OVERFLOW_TOKEN_COUNT).joinToString(" ") { "tok$it" }
+            val cappedQuery = buildFts5MatchQuery(twentyTokens).orEmpty()
+            assertTrue(cappedQuery.contains("\"tok16\"*"))
+            assertFalse(cappedQuery.contains("tok17"))
+
+            val dupFirst = baseItem.copy(id = "dup-1", title = "StaleBatchToken71")
+            val dupSecond = baseItem.copy(id = "dup-1", title = "LatestBatchToken72")
+            dao.upsertItems(listOf(dupFirst, dupSecond))
+            assertTrue(repository.searchDeepEntries("StaleBatchToken71").isEmpty())
+            assertEquals(
+                listOf("dup-1"),
+                repository.searchDeepEntries("LatestBatchToken72").map { it.id },
+            )
+        }
+
+    @Test
+    internal fun `restoring archived local feed with titleOverride synchronizes items feedTitle and FTS`() =
+        runTest {
+            val dao = database.dao()
+            val feedUrl = "https://archived.example.com/rss.xml"
+            val feedId = deterministicFeedId(feedUrl)
+            dao.upsertFeed(
+                FeedEntity(
+                    id = feedId,
+                    title = "OldArchivedTitle33",
+                    url = feedUrl,
+                    siteUrl = null,
+                    feedType = "rss",
+                    isActive = false,
+                )
+            )
+            dao.upsertItem(
+                SeedData.items
+                    .first()
+                    .copy(
+                        id = "item-archived-feed",
+                        feedId = feedId,
+                        feedUrl = feedUrl,
+                        feedTitle = "OldArchivedTitle33",
+                    )
+            )
+
+            repository.saveUrlOrFeed(
+                inputUrl = feedUrl,
+                titleOverride = "RestoredFeedTitle44",
+                tagCsv = "",
+            )
+
+            assertEquals("RestoredFeedTitle44", dao.getItemById("item-archived-feed")?.feedTitle)
+            assertTrue(repository.searchDeepEntries("OldArchivedTitle33").isEmpty())
+            assertEquals(
+                listOf("item-archived-feed"),
+                repository.searchDeepEntries("RestoredFeedTitle44").map { it.id },
+            )
+        }
+
+    @Test
+    internal fun `VPN tunnel fallback active network tier and periodic job upgrade handle split-tunnel Tailscale`() {
+        val cgnat = InetAddress.getByName("100.64.0.9")
+        val tsUla = InetAddress.getByName("fd7a:115c:a1e0::1")
+        val lanIp = InetAddress.getByName("192.168.1.20")
+        val loopback = InetAddress.getByName("127.0.0.1")
+
+        assertTrue(isActiveVpnTunnelInterface("tun0", true, false, listOf(lanIp)))
+        assertTrue(isActiveVpnTunnelInterface("wg0", true, false, listOf(lanIp)))
+        assertTrue(isActiveVpnTunnelInterface("utun3", true, false, listOf(lanIp)))
+        assertTrue(isActiveVpnTunnelInterface("wlan0", true, false, listOf(cgnat)))
+        assertTrue(isActiveVpnTunnelInterface("eth0", true, false, listOf(tsUla)))
+        assertFalse(isActiveVpnTunnelInterface("wlan0", true, false, listOf(lanIp)))
+        assertFalse(isActiveVpnTunnelInterface("tun0", false, false, listOf(cgnat)))
+        assertFalse(isActiveVpnTunnelInterface("tun0", true, false, listOf(loopback)))
+
+        assertEquals(
+            NetworkTier.WIFI,
+            resolveActiveNetworkTier(false, true, false, false, true, true),
+        )
+        assertEquals(
+            NetworkTier.WIRED,
+            resolveActiveNetworkTier(true, false, true, false, false, true),
+        )
+        assertEquals(
+            NetworkTier.CELLULAR,
+            resolveActiveNetworkTier(true, true, false, false, false, false),
+        )
+        assertEquals(
+            NetworkTier.OFFLINE,
+            resolveActiveNetworkTier(false, false, false, false, false, false),
+        )
+
+        assertFalse(
+            PeerSyncScheduler.shouldKeepExistingPeriodicJob(
+                isPersisted = true,
+                intervalMillis = PeerSyncScheduler.PERIODIC_SYNC_INTERVAL_MS,
+                legacyRequiresVpnExtra = true,
+                networkAnyConfiguredExtra = false,
+            )
+        )
+        assertTrue(
+            PeerSyncScheduler.shouldKeepExistingPeriodicJob(
+                isPersisted = true,
+                intervalMillis = PeerSyncScheduler.PERIODIC_SYNC_INTERVAL_MS,
+                legacyRequiresVpnExtra = false,
+                networkAnyConfiguredExtra = true,
+            )
+        )
+    }
 }
+
+private const val TEST_OVERFLOW_TOKEN_COUNT = 20
 
 private const val EXPECTED_CONTINUATION_REQUESTS = 3
 private const val EXPECTED_PAGINATED_ITEM_COUNT = 4

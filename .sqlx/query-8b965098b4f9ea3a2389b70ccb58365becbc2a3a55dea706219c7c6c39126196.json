@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)\n                 VALUES (?, ?, ?, 'consumed', ?, ?)\n                 ON CONFLICT(id) DO UPDATE SET\n                    notes = COALESCE(consumption_log.notes, excluded.notes),\n                    created_at = excluded.created_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "8b965098b4f9ea3a2389b70ccb58365becbc2a3a55dea706219c7c6c39126196"
+}

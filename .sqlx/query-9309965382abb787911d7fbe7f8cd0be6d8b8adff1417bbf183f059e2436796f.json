@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)\n                         VALUES ('url', ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "9309965382abb787911d7fbe7f8cd0be6d8b8adff1417bbf183f059e2436796f"
+}

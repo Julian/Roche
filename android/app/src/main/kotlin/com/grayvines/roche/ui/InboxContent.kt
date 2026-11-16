@@ -2,7 +2,7 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -38,6 +38,7 @@ import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -74,6 +75,7 @@ import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlinx.coroutines.CancellationException
 
 @Composable
 fun InboxTabContent(
@@ -83,16 +85,27 @@ fun InboxTabContent(
 ) {
     val colors = LocalRocheColors.current
     var showTagFilterDrawer by rememberSaveable { mutableStateOf(false) }
+    var drawerBackProgress by remember { mutableFloatStateOf(0f) }
 
-    BackHandler(enabled = showTagFilterDrawer && state.tags.isNotEmpty()) {
-        showTagFilterDrawer = false
+    PredictiveBackHandler(enabled = showTagFilterDrawer && state.tags.isNotEmpty()) { progress ->
+        try {
+            progress.collect { backEvent -> drawerBackProgress = backEvent.progress }
+            drawerBackProgress = 0f
+            showTagFilterDrawer = false
+        } catch (cancelled: CancellationException) {
+            drawerBackProgress = 0f
+            throw cancelled
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         InboxHeaderSection(
             state = state,
             showTagFilterDrawer = showTagFilterDrawer,
-            onToggleTagDrawer = { showTagFilterDrawer = !showTagFilterDrawer },
+            onToggleTagDrawer = {
+                drawerBackProgress = 0f
+                showTagFilterDrawer = !showTagFilterDrawer
+            },
             onAction = onAction,
         )
         InboxFilterStrip(state = state, onAction = onAction)
@@ -101,7 +114,9 @@ fun InboxTabContent(
         if (showTagFilterDrawer && state.tags.isNotEmpty()) {
             InboxTagFilterDrawer(
                 state = state,
+                modifier = Modifier.predictiveBackDrawerGraphics(drawerBackProgress),
                 onSelectTag = { tagName ->
+                    drawerBackProgress = 0f
                     showTagFilterDrawer = false
                     onAction(MainAction.FilterByTag(tagName))
                 },
@@ -294,11 +309,13 @@ internal fun InboxHeaderActions(
 private fun InboxTagFilterDrawer(
     state: MainUiState,
     onSelectTag: (String?) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     Column(
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
+                .fillMaxWidth()
                 .background(colors.surface)
                 .padding(horizontal = 16.dp, vertical = 10.dp)
                 .testTag("inbox_tag_filter_drawer"),

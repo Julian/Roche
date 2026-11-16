@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!\" FROM entries\n               WHERE kind = 'artist' AND merged_into_id IS NULL\n                 AND (id = ? OR LOWER(title) = LOWER(?))\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c2dedd52d5faa1dfa166cca26a3f4acc0e531f27e6ee3561f6c81a28d23c3259"
+}

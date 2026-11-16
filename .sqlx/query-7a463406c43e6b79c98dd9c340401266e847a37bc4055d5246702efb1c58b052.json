@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM sync_tombstones WHERE entity_type = ? AND natural_key = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "7a463406c43e6b79c98dd9c340401266e847a37bc4055d5246702efb1c58b052"
+}

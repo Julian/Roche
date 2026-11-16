@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT entry_id as \"entry_id!\"\n                   FROM consumption_log\n                   WHERE status = 'consumed'\n                   GROUP BY entry_id\n                   ORDER BY MAX(strftime('%Y-%m-%dT%H:%M:%fZ', ts)) DESC\n                   LIMIT ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "entry_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "entry_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "33dab147f8bd55a534d40723056a0333972ebb362c813e4cf7588350274eac34"
+}

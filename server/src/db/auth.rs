@@ -7,7 +7,7 @@ use super::SyncRepo;
 
 const MAX_PAIRING_ATTEMPTS: i64 = 25;
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceToken {
     pub id: String,
     pub device_name: String,
@@ -30,14 +30,14 @@ impl<'a> AuthRepo<'a> {
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM pairing_codes").execute(&mut *tx).await?;
+        sqlx::query!("DELETE FROM pairing_codes").execute(&mut *tx).await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO pairing_codes (code, failed_attempts, created_at, expires_at) VALUES (?, 0, ?, ?)",
+            code_hash,
+            now as _,
+            expires_at as _,
         )
-        .bind(&code_hash)
-        .bind(now)
-        .bind(expires_at)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -46,13 +46,13 @@ impl<'a> AuthRepo<'a> {
 
     pub async fn active_pairing_code_hash(&self) -> Result<Option<String>> {
         let now = SyncRepo::now_utc();
-        Ok(sqlx::query_scalar::<_, String>(
+        Ok(sqlx::query_scalar!(
             "SELECT code FROM pairing_codes
              WHERE datetime(expires_at) > datetime(?) AND failed_attempts < ?
              LIMIT 1",
+            now as _,
+            MAX_PAIRING_ATTEMPTS,
         )
-        .bind(now)
-        .bind(MAX_PAIRING_ATTEMPTS)
         .fetch_optional(self.pool)
         .await?)
     }
@@ -63,18 +63,20 @@ impl<'a> AuthRepo<'a> {
         let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)")
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)",
+            now as _
+        )
+        .execute(&mut *tx)
+        .await?;
 
-        let result = sqlx::query(
+        let result = sqlx::query!(
             "DELETE FROM pairing_codes
              WHERE code = ? AND datetime(expires_at) > datetime(?) AND failed_attempts < ?",
+            code_hash,
+            now as _,
+            MAX_PAIRING_ATTEMPTS,
         )
-        .bind(&code_hash)
-        .bind(now)
-        .bind(MAX_PAIRING_ATTEMPTS)
         .execute(&mut *tx)
         .await?;
 
@@ -83,11 +85,10 @@ impl<'a> AuthRepo<'a> {
             return Ok(true);
         }
 
-        sqlx::query("UPDATE pairing_codes SET failed_attempts = failed_attempts + 1")
+        sqlx::query!("UPDATE pairing_codes SET failed_attempts = failed_attempts + 1")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM pairing_codes WHERE failed_attempts >= ?")
-            .bind(MAX_PAIRING_ATTEMPTS)
+        sqlx::query!("DELETE FROM pairing_codes WHERE failed_attempts >= ?", MAX_PAIRING_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
 
@@ -102,53 +103,59 @@ impl<'a> AuthRepo<'a> {
         token_hash: &str,
     ) -> Result<()> {
         let now = SyncRepo::now_utc();
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO device_tokens (id, device_name, token, created_at) VALUES (?, ?, ?, ?)",
+            id,
+            device_name,
+            token_hash,
+            now as _,
         )
-        .bind(id)
-        .bind(device_name)
-        .bind(token_hash)
-        .bind(now)
         .execute(self.pool)
         .await?;
         Ok(())
     }
 
     pub async fn validate_device_token(&self, token_hash: &str) -> Result<bool> {
-        let needs_touch: Option<(bool,)> = sqlx::query_as(
-            "SELECT (last_used_at IS NULL OR datetime(last_used_at) <= datetime('now', '-60 seconds'))
+        let needs_touch = sqlx::query_scalar!(
+            "SELECT (last_used_at IS NULL OR datetime(last_used_at) <= datetime('now', '-60 seconds')) AS \"needs_touch!: bool\"
              FROM device_tokens
              WHERE token = ?",
+            token_hash,
         )
-        .bind(token_hash)
         .fetch_optional(self.pool)
         .await?;
 
-        let Some((should_update,)) = needs_touch else {
+        let Some(should_update) = needs_touch else {
             return Ok(false);
         };
 
         if should_update {
             let now = SyncRepo::now_utc();
-            sqlx::query("UPDATE device_tokens SET last_used_at = ? WHERE token = ?")
-                .bind(now)
-                .bind(token_hash)
-                .execute(self.pool)
-                .await?;
+            sqlx::query!(
+                "UPDATE device_tokens SET last_used_at = ? WHERE token = ?",
+                now as _,
+                token_hash,
+            )
+            .execute(self.pool)
+            .await?;
         }
 
         Ok(true)
     }
 
     pub async fn count_devices(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_tokens")
+        Ok(sqlx::query_scalar!("SELECT COUNT(*) AS \"count!: i64\" FROM device_tokens")
             .fetch_one(self.pool)
             .await?)
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceToken>> {
-        Ok(sqlx::query_as::<_, DeviceToken>(
-            "SELECT id, device_name, created_at, last_used_at
+        Ok(sqlx::query_as!(
+            DeviceToken,
+            "SELECT id,
+                    device_name,
+                    created_at AS \"created_at: DateTime<Utc>\",
+                    last_used_at AS \"last_used_at: DateTime<Utc>\"
              FROM device_tokens
              ORDER BY created_at DESC",
         )
@@ -157,16 +164,13 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn revoke_device(&self, id: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM device_tokens WHERE id = ?")
-            .bind(id)
-            .execute(self.pool)
-            .await?;
+        let res =
+            sqlx::query!("DELETE FROM device_tokens WHERE id = ?", id).execute(self.pool).await?;
         Ok(res.rows_affected() > 0)
     }
 
     pub async fn revoke_device_by_token_hash(&self, token_hash: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM device_tokens WHERE token = ?")
-            .bind(token_hash)
+        let res = sqlx::query!("DELETE FROM device_tokens WHERE token = ?", token_hash)
             .execute(self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
@@ -180,7 +184,7 @@ impl<'a> AuthRepo<'a> {
         keep_most_recent: i64,
     ) -> Result<u64> {
         let keep = keep_most_recent.max(1);
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "DELETE FROM device_tokens
              WHERE device_name = ?
                AND id NOT IN (
@@ -189,10 +193,10 @@ impl<'a> AuthRepo<'a> {
                    ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC
                    LIMIT ?
                )",
+            device_name,
+            device_name,
+            keep,
         )
-        .bind(device_name)
-        .bind(device_name)
-        .bind(keep)
         .execute(self.pool)
         .await?;
         Ok(res.rows_affected())

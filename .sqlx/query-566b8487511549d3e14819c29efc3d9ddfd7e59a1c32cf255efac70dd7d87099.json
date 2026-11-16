@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO collection_specs\n                 (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)\n                 VALUES (?, ?, 'manual', ?, NULL, ?, ?)\n                 ON CONFLICT(collection_id) DO UPDATE SET\n                    show_in_lists = excluded.show_in_lists,\n                    color = COALESCE(excluded.color, collection_specs.color)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "566b8487511549d3e14819c29efc3d9ddfd7e59a1c32cf255efac70dd7d87099"
+}

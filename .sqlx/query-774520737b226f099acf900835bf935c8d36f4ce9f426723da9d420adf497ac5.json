@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)\n             VALUES (?, 'artist', ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "774520737b226f099acf900835bf935c8d36f4ce9f426723da9d420adf497ac5"
+}

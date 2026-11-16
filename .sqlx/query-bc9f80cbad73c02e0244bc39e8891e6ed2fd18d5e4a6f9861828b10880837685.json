@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT name AS \"name!: String\", sql AS \"sql!: String\"\n             FROM sqlite_master\n             WHERE type = 'table'\n               AND name NOT IN ('sqlite_sequence', '_sqlx_migrations')\n               AND name NOT LIKE 'entries_fts%'\n             ORDER BY name ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "name!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sqlite_master",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "sql!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sqlite_master",
+            "name": "sql"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "bc9f80cbad73c02e0244bc39e8891e6ed2fd18d5e4a6f9861828b10880837685"
+}

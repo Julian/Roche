@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entries WHERE id = 'ephemeral-gap-row'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "66031842ecb254e6952652771881a845b01b1c5fd19a17ec33392a310c23e48a"
+}

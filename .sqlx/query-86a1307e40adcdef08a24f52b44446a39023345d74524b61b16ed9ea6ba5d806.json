@@ -1,0 +1,170 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id as \"id!\", e.kind as \"kind!: EntryKind\", e.title as \"title!\",\n                                  e.creators_json as \"creators_json!\", e.url as \"url?\",\n                                  e.published_at as \"published_at?: DateTime<Utc>\",\n                                  e.release_year as \"release_year?: i32\", e.summary as \"summary?\",\n                                  e.thumbnail_url as \"thumbnail_url?\", e.metadata_json as \"metadata_json!\",\n                                  e.merged_into_id as \"merged_into_id?\",\n                                  e.created_at as \"created_at!: DateTime<Utc>\",\n                                  e.updated_at as \"updated_at!: DateTime<Utc>\"\n                           FROM collection_entries ce\n                           JOIN entries e ON e.id = ce.entry_id\n                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL\n                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "kind!: EntryKind",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "title!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "creators_json!",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "creators_json"
+          }
+        }
+      },
+      {
+        "name": "url?",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "name": "published_at?: DateTime<Utc>",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "published_at"
+          }
+        }
+      },
+      {
+        "name": "release_year?: i32",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "release_year"
+          }
+        }
+      },
+      {
+        "name": "summary?",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "name": "thumbnail_url?",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "thumbnail_url"
+          }
+        }
+      },
+      {
+        "name": "metadata_json!",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "metadata_json"
+          }
+        }
+      },
+      {
+        "name": "merged_into_id?",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "merged_into_id"
+          }
+        }
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 11,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "86a1307e40adcdef08a24f52b44446a39023345d74524b61b16ed9ea6ba5d806"
+}

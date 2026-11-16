@@ -2,7 +2,7 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.collection.LruCache
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -61,6 +62,7 @@ import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -142,9 +144,6 @@ fun ReaderView(
     isHydrating: Boolean = false,
 ) {
     var showTypographyDrawer by rememberSaveable { mutableStateOf(false) }
-    BackHandler {
-        if (showTypographyDrawer) showTypographyDrawer = false else onAction(MainAction.CloseReader)
-    }
     val colors = LocalRocheColors.current
     val listState = rememberLazyListState()
     val parsedState =
@@ -168,6 +167,7 @@ fun ReaderView(
         ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
         ReaderTypographySection(
             visible = showTypographyDrawer,
+            onDismiss = { showTypographyDrawer = false },
             blocks = parsedState.blocks,
             settings = settings,
             listState = listState,
@@ -188,13 +188,30 @@ internal fun orderedHeadingBlockIndices(blocks: List<ArticleBlock>): List<Int> =
     mapBlockHeadingIndices(blocks).entries.sortedBy { it.value }.map { it.key }
 
 @Composable
-private fun ReaderTypographySection(
+internal fun ReaderTypographySection(
     visible: Boolean,
+    onDismiss: () -> Unit,
     blocks: List<ArticleBlock>,
     settings: Settings,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
 ) {
+    var backProgress by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(visible) {
+        if (!visible) {
+            backProgress = 0f
+        }
+    }
+    PredictiveBackHandler(enabled = visible) { progress ->
+        try {
+            progress.collect { backEvent -> backProgress = backEvent.progress }
+            backProgress = 0f
+            onDismiss()
+        } catch (cancelled: CancellationException) {
+            backProgress = 0f
+            throw cancelled
+        }
+    }
     if (!visible) return
     val coroutineScope = rememberCoroutineScope()
     val headingBlockIndices = remember(blocks) { orderedHeadingBlockIndices(blocks) }
@@ -202,6 +219,7 @@ private fun ReaderTypographySection(
         blocks = blocks,
         settings = settings,
         onAction = onAction,
+        modifier = Modifier.predictiveBackDrawerGraphics(backProgress),
         onJumpToSection = { headingIndex ->
             headingBlockIndices.getOrNull(headingIndex)?.let { blockIdx ->
                 coroutineScope.launch {
@@ -458,6 +476,7 @@ internal fun ReaderTypographyDrawer(
     settings: Settings,
     onAction: (MainAction) -> Unit,
     onJumpToSection: (headingIndex: Int) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     val scale = settings.readerFontScale
@@ -465,7 +484,8 @@ internal fun ReaderTypographyDrawer(
 
     Column(
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
+                .fillMaxWidth()
                 .background(colors.surface)
                 .padding(horizontal = 16.dp, vertical = 10.dp)
                 .testTag("reader_typography_drawer"),

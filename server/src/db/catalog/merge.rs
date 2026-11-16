@@ -13,7 +13,7 @@ use crate::db::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
         deterministic_comparison_id,
     },
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
+    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
 };
 
 impl CatalogRepo<'_> {
@@ -51,18 +51,26 @@ impl CatalogRepo<'_> {
         dup_resolved: &str,
         canon_resolved: &str,
     ) -> CatalogResult<()> {
-        let dup_spec: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
-            "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+        let dup_spec = sqlx::query!(
+            r#"SELECT mode as "mode!: CollectionMode",
+                      collection_role as "collection_role!: CollectionRole"
+               FROM collection_specs
+               WHERE collection_id = ?"#,
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .fetch_optional(&mut *tx)
-        .await?;
-        let canon_spec: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
-            "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+        .await?
+        .map(|r| (r.mode, r.collection_role));
+        let canon_spec = sqlx::query!(
+            r#"SELECT mode as "mode!: CollectionMode",
+                      collection_role as "collection_role!: CollectionRole"
+               FROM collection_specs
+               WHERE collection_id = ?"#,
+            canon_resolved,
         )
-        .bind(canon_resolved)
         .fetch_optional(&mut *tx)
-        .await?;
+        .await?
+        .map(|r| (r.mode, r.collection_role));
 
         match (dup_spec, canon_spec) {
             (None, None) => {}
@@ -94,12 +102,12 @@ impl CatalogRepo<'_> {
             }
         }
 
-        let dup_parents: Vec<String> = sqlx::query_scalar(
-            "SELECT collection_id FROM collection_entries
-             WHERE entry_id = ? AND collection_id != ?",
+        let dup_parents = sqlx::query_scalar!(
+            r#"SELECT collection_id as "collection_id!" FROM collection_entries
+               WHERE entry_id = ? AND collection_id != ?"#,
+            dup_resolved,
+            canon_resolved,
         )
-        .bind(dup_resolved)
-        .bind(canon_resolved)
         .fetch_all(&mut *tx)
         .await?;
         for parent_col_id in dup_parents {
@@ -112,12 +120,12 @@ impl CatalogRepo<'_> {
             }
         }
 
-        let dup_children: Vec<String> = sqlx::query_scalar(
-            "SELECT entry_id FROM collection_entries
-             WHERE collection_id = ? AND entry_id != ?",
+        let dup_children = sqlx::query_scalar!(
+            r#"SELECT entry_id as "entry_id!" FROM collection_entries
+               WHERE collection_id = ? AND entry_id != ?"#,
+            dup_resolved,
+            canon_resolved,
         )
-        .bind(dup_resolved)
-        .bind(canon_resolved)
         .fetch_all(&mut *tx)
         .await?;
         for child_entry_id in dup_children {
@@ -140,30 +148,37 @@ impl CatalogRepo<'_> {
         canon_resolved: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        type StateRow = (String, Option<DateTime<Utc>>, f64, Option<DateTime<Utc>>);
-        type CompRow = (String, DateTime<Utc>, Option<String>, String);
-
         // Compress any prior chains pointing to `dup_resolved`
-        sqlx::query(
+        sqlx::query!(
             "UPDATE entries SET merged_into_id = ?, updated_at = ? WHERE merged_into_id = ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
         )
-        .bind(canon_resolved)
-        .bind(now)
-        .bind(dup_resolved)
         .execute(&mut *tx)
         .await?;
 
         // Backfill missing metadata onto canonical from duplicate
-        let dup_row: RawEntryRow = sqlx::query_as(
-            "SELECT id, kind, title, creators_json, url, published_at, release_year, summary,
-                    thumbnail_url, metadata_json, merged_into_id, created_at, updated_at
-             FROM entries WHERE id = ?",
+        let dup_row = sqlx::query_as!(
+            RawEntryRow,
+            r#"SELECT id as "id!", kind as "kind!: EntryKind", title as "title!",
+                      creators_json as "creators_json!", url as "url?",
+                      published_at as "published_at?: DateTime<Utc>",
+                      release_year as "release_year?: i32", summary as "summary?",
+                      thumbnail_url as "thumbnail_url?", metadata_json as "metadata_json!",
+                      merged_into_id as "merged_into_id?",
+                      created_at as "created_at!: DateTime<Utc>",
+                      updated_at as "updated_at!: DateTime<Utc>"
+               FROM entries WHERE id = ?"#,
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .fetch_one(&mut *tx)
         .await?;
 
-        sqlx::query(
+        let dup_url = dup_row.url.as_deref();
+        let dup_summary = dup_row.summary.as_deref();
+        let dup_thumb = dup_row.thumbnail_url.as_deref();
+        sqlx::query!(
             "UPDATE entries
              SET creators_json = CASE WHEN creators_json = '[]' AND ? != '[]' THEN ? ELSE creators_json END,
                  url = COALESCE(url, ?),
@@ -174,141 +189,151 @@ impl CatalogRepo<'_> {
                  metadata_json = CASE WHEN metadata_json = '{}' AND ? != '{}' THEN ? ELSE metadata_json END,
                  updated_at = ?
              WHERE id = ?",
+            &dup_row.creators_json,
+            &dup_row.creators_json,
+            dup_url,
+            dup_row.published_at as _,
+            dup_row.release_year as _,
+            dup_summary,
+            dup_thumb,
+            &dup_row.metadata_json,
+            &dup_row.metadata_json,
+            now as _,
+            canon_resolved,
         )
-        .bind(&dup_row.creators_json)
-        .bind(&dup_row.creators_json)
-        .bind(&dup_row.url)
-        .bind(dup_row.published_at)
-        .bind(dup_row.release_year)
-        .bind(&dup_row.summary)
-        .bind(&dup_row.thumbnail_url)
-        .bind(&dup_row.metadata_json)
-        .bind(&dup_row.metadata_json)
-        .bind(now)
-        .bind(canon_resolved)
         .execute(&mut *tx)
         .await?;
 
         // Remove duplicate manual collection spec if present (identifiers re-point below)
-        sqlx::query(
+        sqlx::query!(
             "DELETE FROM collection_specs
              WHERE collection_id = ?
                AND mode = 'manual'
                AND collection_role IN ('list', 'want')",
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .execute(&mut *tx)
         .await?;
 
         // Re-point all identifiers (preserving multi-valued schemes such as syndicated URLs)
-        sqlx::query("UPDATE OR IGNORE entry_identifiers SET entry_id = ? WHERE entry_id = ?")
-            .bind(canon_resolved)
-            .bind(dup_resolved)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM entry_identifiers WHERE entry_id = ?")
-            .bind(dup_resolved)
+        sqlx::query!(
+            "UPDATE OR IGNORE entry_identifiers SET entry_id = ? WHERE entry_id = ?",
+            canon_resolved,
+            dup_resolved,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!("DELETE FROM entry_identifiers WHERE entry_id = ?", dup_resolved)
             .execute(&mut *tx)
             .await?;
 
         // Migrate `entry_media` (both audio enclosures and downloaded local files)
-        let dup_enclosure: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
-            "SELECT remote_url, duration
-             FROM entry_media
-             WHERE entry_id = ? AND local_path IS NULL
-             LIMIT 1",
+        let dup_enclosure = sqlx::query!(
+            r#"SELECT remote_url as "remote_url?", duration as "duration?: i64"
+               FROM entry_media
+               WHERE entry_id = ? AND local_path IS NULL
+               LIMIT 1"#,
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((remote_url, duration)) = dup_enclosure {
+        if let Some(enc) = dup_enclosure {
             MediaRepo::upsert_audio_enclosure_in_tx(
                 &mut *tx,
                 canon_resolved,
-                remote_url.as_deref(),
-                duration,
+                enc.remote_url.as_deref(),
+                enc.duration,
                 now,
             )
             .await?;
-            sqlx::query("DELETE FROM entry_media WHERE entry_id = ? AND local_path IS NULL")
-                .bind(dup_resolved)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query!(
+                "DELETE FROM entry_media WHERE entry_id = ? AND local_path IS NULL",
+                dup_resolved,
+            )
+            .execute(&mut *tx)
+            .await?;
         }
-        sqlx::query(
+        sqlx::query!(
             "UPDATE entry_media
              SET entry_id = ?
              WHERE entry_id = ? AND local_path IS NOT NULL",
+            canon_resolved,
+            dup_resolved,
         )
-        .bind(canon_resolved)
-        .bind(dup_resolved)
         .execute(&mut *tx)
         .await?;
 
         // Merge reader content & state if present
-        let dup_content: Option<(Option<String>, String)> = sqlx::query_as(
-            "SELECT content_html, content_type FROM entry_content WHERE entry_id = ?",
+        let dup_content = sqlx::query!(
+            r#"SELECT content_html as "content_html?", content_type as "content_type!"
+               FROM entry_content WHERE entry_id = ?"#,
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((dup_html, dup_ct)) = dup_content {
-            sqlx::query(
+        if let Some(dc) = dup_content {
+            let dup_html = dc.content_html.as_deref();
+            sqlx::query!(
                 "INSERT INTO entry_content (entry_id, content_html, content_type)
                  VALUES (?, ?, ?)
                  ON CONFLICT(entry_id) DO UPDATE SET
                     content_html = COALESCE(entry_content.content_html, excluded.content_html)",
+                canon_resolved,
+                dup_html,
+                &dc.content_type,
             )
-            .bind(canon_resolved)
-            .bind(dup_html)
-            .bind(dup_ct)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("DELETE FROM entry_content WHERE entry_id = ?")
-                .bind(dup_resolved)
+            sqlx::query!("DELETE FROM entry_content WHERE entry_id = ?", dup_resolved)
                 .execute(&mut *tx)
                 .await?;
         }
 
-        let dup_state: Option<StateRow> = sqlx::query_as(
-            "SELECT inbox_state, read_at, progress, interaction_updated_at
-             FROM entry_state WHERE entry_id = ?",
+        let dup_state = sqlx::query!(
+            r#"SELECT inbox_state as "inbox_state!",
+                      read_at as "read_at?: DateTime<Utc>",
+                      progress as "progress!: f64",
+                      interaction_updated_at as "interaction_updated_at?: DateTime<Utc>"
+               FROM entry_state WHERE entry_id = ?"#,
+            dup_resolved,
         )
-        .bind(dup_resolved)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((dup_inbox, dup_read_at, dup_progress, dup_inter_ts)) = dup_state {
-            let canon_state: Option<StateRow> = sqlx::query_as(
-                "SELECT inbox_state, read_at, progress, interaction_updated_at
-                 FROM entry_state WHERE entry_id = ?",
+        if let Some(ds) = dup_state {
+            let canon_state = sqlx::query!(
+                r#"SELECT inbox_state as "inbox_state!",
+                          read_at as "read_at?: DateTime<Utc>",
+                          progress as "progress!: f64",
+                          interaction_updated_at as "interaction_updated_at?: DateTime<Utc>"
+                   FROM entry_state WHERE entry_id = ?"#,
+                canon_resolved,
             )
-            .bind(canon_resolved)
             .fetch_optional(&mut *tx)
             .await?;
 
             let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) =
-                if let Some((can_inbox, can_read_at, can_progress, can_inter_ts)) = canon_state {
-                    let inbox = if can_inbox == "dismissed" || dup_inbox == "dismissed" {
+                if let Some(cs) = canon_state {
+                    let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
                         "dismissed".to_owned()
-                    } else if can_inbox == "unread" || dup_inbox == "unread" {
+                    } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
                         "unread".to_owned()
                     } else {
                         "none".to_owned()
                     };
-                    let read_at = match (can_read_at, dup_read_at) {
+                    let read_at = match (cs.read_at, ds.read_at) {
                         (Some(a), Some(b)) => Some(a.min(b)),
                         (Some(a), None) => Some(a),
                         (None, Some(b)) => Some(b),
                         (None, None) => None,
                     };
-                    let progress = can_progress.max(dup_progress);
-                    let inter_ts = can_inter_ts.max(dup_inter_ts);
+                    let progress = cs.progress.max(ds.progress);
+                    let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
                     (inbox, read_at, progress, inter_ts)
                 } else {
-                    (dup_inbox, dup_read_at, dup_progress, dup_inter_ts)
+                    (ds.inbox_state, ds.read_at, ds.progress, ds.interaction_updated_at)
                 };
 
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT(entry_id) DO UPDATE SET
@@ -317,156 +342,163 @@ impl CatalogRepo<'_> {
                     progress = excluded.progress,
                     interaction_updated_at = excluded.interaction_updated_at,
                     updated_at = excluded.updated_at",
+                canon_resolved,
+                &merged_inbox,
+                merged_read_at as _,
+                merged_progress,
+                merged_inter_ts as _,
+                now as _,
             )
-            .bind(canon_resolved)
-            .bind(merged_inbox)
-            .bind(merged_read_at)
-            .bind(merged_progress)
-            .bind(merged_inter_ts)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("DELETE FROM entry_state WHERE entry_id = ?")
-                .bind(dup_resolved)
+            sqlx::query!("DELETE FROM entry_state WHERE entry_id = ?", dup_resolved)
                 .execute(&mut *tx)
                 .await?;
         }
 
         // Move collection memberships (both as member and as parent collection)
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at)
              SELECT collection_id, ?, position, ?
              FROM collection_entries
              WHERE entry_id = ? AND collection_id != ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
+            canon_resolved,
         )
-        .bind(canon_resolved)
-        .bind(now)
-        .bind(dup_resolved)
-        .bind(canon_resolved)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM collection_entries WHERE entry_id = ?")
-            .bind(dup_resolved)
+        sqlx::query!("DELETE FROM collection_entries WHERE entry_id = ?", dup_resolved)
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at)
              SELECT ?, entry_id, position, ?
              FROM collection_entries
              WHERE collection_id = ? AND entry_id != ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
+            canon_resolved,
         )
-        .bind(canon_resolved)
-        .bind(now)
-        .bind(dup_resolved)
-        .bind(canon_resolved)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM collection_entries WHERE collection_id = ?")
-            .bind(dup_resolved)
+        sqlx::query!("DELETE FROM collection_entries WHERE collection_id = ?", dup_resolved)
             .execute(&mut *tx)
             .await?;
 
         // Canonicalize auto-completion consumption_log ID if present, then re-point manual logs
         let dup_auto_id = deterministic_auto_consumption_log_id(dup_resolved);
         let canon_auto_id = deterministic_auto_consumption_log_id(canon_resolved);
-        let dup_auto_row: Option<(DateTime<Utc>, Option<String>)> =
-            sqlx::query_as("SELECT ts, notes FROM consumption_log WHERE id = ?")
-                .bind(&dup_auto_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some((auto_ts, auto_notes)) = dup_auto_row {
-            sqlx::query(
+        let dup_auto_row = sqlx::query!(
+            r#"SELECT ts as "ts!: DateTime<Utc>", notes as "notes?"
+               FROM consumption_log WHERE id = ?"#,
+            &dup_auto_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(auto_row) = dup_auto_row {
+            let auto_notes = auto_row.notes.as_deref();
+            sqlx::query!(
                 "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
                  VALUES (?, ?, ?, 'consumed', ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                     notes = COALESCE(consumption_log.notes, excluded.notes),
                     created_at = excluded.created_at",
+                &canon_auto_id,
+                canon_resolved,
+                auto_row.ts as _,
+                auto_notes,
+                now as _,
             )
-            .bind(&canon_auto_id)
-            .bind(canon_resolved)
-            .bind(auto_ts)
-            .bind(auto_notes)
-            .bind(now)
             .execute(&mut *tx)
             .await?;
-            sqlx::query("DELETE FROM consumption_log WHERE id = ?")
-                .bind(&dup_auto_id)
+            sqlx::query!("DELETE FROM consumption_log WHERE id = ?", &dup_auto_id)
                 .execute(&mut *tx)
                 .await?;
         }
 
-        sqlx::query("UPDATE consumption_log SET entry_id = ?, created_at = ? WHERE entry_id = ?")
-            .bind(canon_resolved)
-            .bind(now)
-            .bind(dup_resolved)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            "UPDATE consumption_log SET entry_id = ?, created_at = ? WHERE entry_id = ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
+        )
+        .execute(&mut *tx)
+        .await?;
 
         // Rewrite comparisons involving `dup_resolved` (in ordering OR scope_collection_id)
         // using new deterministic comparison IDs + `created_at = now` so additive peer sync converges!
         let like_dup = format!("%{dup_resolved}%");
-        let comp_rows: Vec<CompRow> = sqlx::query_as(
-            "SELECT id, ts, scope_collection_id, ordering_json
-             FROM comparisons
-             WHERE ordering_json LIKE ? OR scope_collection_id = ?",
+        let comp_rows = sqlx::query!(
+            r#"SELECT id as "id!", ts as "ts!: DateTime<Utc>",
+                      scope_collection_id as "scope_collection_id?",
+                      ordering_json as "ordering_json!"
+               FROM comparisons
+               WHERE ordering_json LIKE ? OR scope_collection_id = ?"#,
+            &like_dup,
+            dup_resolved,
         )
-        .bind(&like_dup)
-        .bind(dup_resolved)
         .fetch_all(&mut *tx)
         .await?;
 
-        for (old_comp_id, comp_ts, old_scope, ord_json) in comp_rows {
-            sqlx::query("DELETE FROM comparisons WHERE id = ?")
-                .bind(&old_comp_id)
+        for comp in comp_rows {
+            sqlx::query!("DELETE FROM comparisons WHERE id = ?", &comp.id)
                 .execute(&mut *tx)
                 .await?;
 
-            let new_scope =
-                old_scope.map(|sc| if sc == dup_resolved { canon_resolved.to_owned() } else { sc });
-            let parsed: Vec<Vec<String>> = serde_json::from_str(&ord_json).unwrap_or_default();
+            let new_scope = comp
+                .scope_collection_id
+                .map(|sc| if sc == dup_resolved { canon_resolved.to_owned() } else { sc });
+            let parsed: Vec<Vec<String>> =
+                serde_json::from_str(&comp.ordering_json).unwrap_or_default();
             let rewritten = rewrite_ordering_after_merge(&parsed, dup_resolved, canon_resolved);
             let total_items: usize = rewritten.iter().map(Vec::len).sum();
             if total_items >= 2 {
                 let new_comp_id = deterministic_comparison_id(
                     new_scope.as_deref(),
-                    comp_ts.timestamp_millis(),
+                    comp.ts.timestamp_millis(),
                     &rewritten,
                 );
                 let new_json = canonical_ordering_json(&rewritten);
-                sqlx::query(
+                let new_scope_ref = new_scope.as_deref();
+                sqlx::query!(
                     "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
                      VALUES (?, ?, ?, ?, ?)",
+                    &new_comp_id,
+                    comp.ts as _,
+                    new_scope_ref,
+                    &new_json,
+                    now as _,
                 )
-                .bind(&new_comp_id)
-                .bind(comp_ts)
-                .bind(&new_scope)
-                .bind(&new_json)
-                .bind(now)
                 .execute(&mut *tx)
                 .await?;
             }
         }
 
         // Update active generator pointer if needed
-        sqlx::query(
+        sqlx::query!(
             "UPDATE collection_generators
              SET current_entry_id = ?, updated_at = ?
              WHERE current_entry_id = ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
         )
-        .bind(canon_resolved)
-        .bind(now)
-        .bind(dup_resolved)
         .execute(&mut *tx)
         .await?;
 
         // Mark duplicate as merged tombstone (`entries_fts_au` removes it from FTS automatically)
-        sqlx::query("UPDATE entries SET merged_into_id = ?, updated_at = ? WHERE id = ?")
-            .bind(canon_resolved)
-            .bind(now)
-            .bind(dup_resolved)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            "UPDATE entries SET merged_into_id = ?, updated_at = ? WHERE id = ?",
+            canon_resolved,
+            now as _,
+            dup_resolved,
+        )
+        .execute(&mut *tx)
+        .await?;
 
         SyncRepo::record_activity(
             tx,

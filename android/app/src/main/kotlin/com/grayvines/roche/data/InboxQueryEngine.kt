@@ -79,8 +79,13 @@ internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boo
 }
 
 internal fun extractSearchMatchSnippet(entry: InboxEntry, rawQuery: String): String? {
-    val cleanQuery = rawQuery.trim().trimStart('#')
+    val cleanQuery = rawQuery.trim().trimStart('#').trim()
     if (cleanQuery.length < MIN_SNIPPET_QUERY_LEN) return null
+    val fallbackTokens =
+        cleanQuery
+            .split(WHITESPACE_REGEX)
+            .filter { it.length >= MIN_SNIPPET_QUERY_LEN }
+            .sortedByDescending { it.length }
     val candidates =
         listOfNotNull(
             entry.contentText?.takeIf { it.isNotBlank() },
@@ -89,16 +94,31 @@ internal fun extractSearchMatchSnippet(entry: InboxEntry, rawQuery: String): Str
         )
     for (source in candidates) {
         val normalizedSource = source.replace(WHITESPACE_REGEX, " ").trim()
-        val matchIndex = normalizedSource.indexOf(cleanQuery, ignoreCase = true)
-        if (matchIndex != -1) {
+        findSnippetNeedle(normalizedSource, cleanQuery, fallbackTokens)?.let { (matchIndex, len) ->
             val start = (matchIndex - SNIPPET_CONTEXT_RADIUS).coerceAtLeast(0)
             val end =
-                (matchIndex + cleanQuery.length + SNIPPET_CONTEXT_RADIUS).coerceAtMost(
-                    normalizedSource.length
-                )
+                (matchIndex + len + SNIPPET_CONTEXT_RADIUS).coerceAtMost(normalizedSource.length)
             val prefix = if (start > 0) "…" else ""
             val suffix = if (end < normalizedSource.length) "…" else ""
             return "$prefix${normalizedSource.substring(start, end).trim()}$suffix"
+        }
+    }
+    return null
+}
+
+private fun findSnippetNeedle(
+    normalizedSource: String,
+    cleanQuery: String,
+    fallbackTokens: List<String>,
+): Pair<Int, Int>? {
+    val direct = normalizedSource.indexOf(cleanQuery, ignoreCase = true)
+    if (direct != -1) {
+        return direct to cleanQuery.length
+    }
+    for (token in fallbackTokens) {
+        val tokenIdx = normalizedSource.indexOf(token, ignoreCase = true)
+        if (tokenIdx != -1) {
+            return tokenIdx to token.length
         }
     }
     return null

@@ -201,6 +201,13 @@ fun PlaybackSpeedAndPodcastSheet(
                 onCheckedChange = { enabled -> onAction(MainAction.SetSmartRewind(enabled)) },
             )
 
+            SettingToggleRow(
+                title = "Skip silence",
+                subtitle = "Trim silent pauses during speech playback",
+                checked = playerState.skipSilenceEnabled,
+                onCheckedChange = { enabled -> onAction(MainAction.SetSkipSilence(enabled)) },
+            )
+
             if (feed != null) {
                 SettingToggleRow(
                     title = "Always download new episodes",

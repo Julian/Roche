@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ce.collection_id as \"collection_id!\"\n           FROM collection_entries ce\n           JOIN collection_specs cs ON cs.collection_id = ce.collection_id\n           WHERE ce.entry_id = ? AND cs.collection_role = 'want'",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0825f3242a9f42640c48fad1abf1d9846cd5c78b9dc6504c439e54990e85e0db"
+}

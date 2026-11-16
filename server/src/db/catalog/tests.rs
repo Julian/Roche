@@ -314,8 +314,10 @@ async fn test_post_hoc_merge_folds_identifiers_media_logs_and_comparisons_and_gu
     assert_eq!(migrated_media.len(), 1);
     assert_eq!(migrated_media[0].path, "audio/ep1.mp3");
 
-    let comp_ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM comparisons").fetch_all(db.pool()).await.unwrap();
+    let comp_ids = sqlx::query_scalar!(r#"SELECT id as "id!" FROM comparisons"#)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
     assert_eq!(comp_ids.len(), 1);
     assert_ne!(
         comp_ids[0], old_comp.id,
@@ -373,12 +375,12 @@ async fn test_diary_jan_1st_space_timestamp_and_auto_consumption_idempotency() {
 
     // Insert space-delimited Jan 1st UTC timestamp directly (as sqlx / legacy SQLite rows do)
     let auto_id = deterministic_auto_consumption_log_id(&book.id);
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
          VALUES (?, ?, '2026-01-01 08:30:00+00:00', 'consumed', 'Morning read', '2026-01-01 08:30:00+00:00')",
+        &auto_id,
+        &book.id,
     )
-    .bind(&auto_id)
-    .bind(&book.id)
     .execute(db.pool())
     .await
     .unwrap();

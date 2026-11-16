@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT kind as \"kind!: EntryKind\", creators_json as \"creators_json!\"\n               FROM entries WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "kind!: EntryKind",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "creators_json!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "creators_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7043ecb1285ad96a8ab2086ad7179132d9ff9933af687c81c305ac153778a6ad"
+}

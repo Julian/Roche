@@ -2,7 +2,7 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
@@ -32,7 +32,9 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -61,6 +63,7 @@ import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import kotlinx.coroutines.CancellationException
 
 @Composable
 fun FeedsAndTagsTabContent(
@@ -72,8 +75,6 @@ fun FeedsAndTagsTabContent(
     var showFilterDrawer by rememberSaveable { mutableStateOf(false) }
     var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
     var unreadOnly by rememberSaveable { mutableStateOf(false) }
-
-    BackHandler(enabled = showFilterDrawer) { showFilterDrawer = false }
 
     val activeFeeds = state.activeFeeds
     val archivedFeeds = state.archivedFeeds
@@ -99,19 +100,19 @@ fun FeedsAndTagsTabContent(
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (showFilterDrawer) {
-            FeedsFilterDrawer(
-                state = state,
-                sortOrder = sortOrder,
-                unreadOnly = unreadOnly,
-                onSelectSortOrder = { sortOrder = it },
-                onToggleUnreadOnly = { unreadOnly = !unreadOnly },
-                onSelectTag = { tagName ->
-                    showFilterDrawer = false
-                    onAction(MainAction.FilterByTag(tagName))
-                },
-            )
-        }
+        FeedsFilterDrawerSection(
+            visible = showFilterDrawer,
+            state = state,
+            sortOrder = sortOrder,
+            unreadOnly = unreadOnly,
+            onDismiss = { showFilterDrawer = false },
+            onSelectSortOrder = { sortOrder = it },
+            onToggleUnreadOnly = { unreadOnly = !unreadOnly },
+            onSelectTag = { tagName ->
+                showFilterDrawer = false
+                onAction(MainAction.FilterByTag(tagName))
+            },
+        )
 
         PullToRefreshBox(
             isRefreshing = state.isSyncing,
@@ -127,6 +128,48 @@ fun FeedsAndTagsTabContent(
             )
         }
     }
+}
+
+@Composable
+internal fun FeedsFilterDrawerSection(
+    visible: Boolean,
+    state: MainUiState,
+    sortOrder: FeedSortOrder,
+    unreadOnly: Boolean,
+    onDismiss: () -> Unit,
+    onSelectSortOrder: (FeedSortOrder) -> Unit,
+    onToggleUnreadOnly: () -> Unit,
+    onSelectTag: (String?) -> Unit,
+) {
+    var drawerBackProgress by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(visible) {
+        if (!visible) {
+            drawerBackProgress = 0f
+        }
+    }
+    PredictiveBackHandler(enabled = visible) { progress ->
+        try {
+            progress.collect { backEvent -> drawerBackProgress = backEvent.progress }
+            drawerBackProgress = 0f
+            onDismiss()
+        } catch (cancelled: CancellationException) {
+            drawerBackProgress = 0f
+            throw cancelled
+        }
+    }
+    if (!visible) return
+    FeedsFilterDrawer(
+        state = state,
+        sortOrder = sortOrder,
+        unreadOnly = unreadOnly,
+        onSelectSortOrder = onSelectSortOrder,
+        onToggleUnreadOnly = onToggleUnreadOnly,
+        modifier = Modifier.predictiveBackDrawerGraphics(drawerBackProgress),
+        onSelectTag = { tagName ->
+            drawerBackProgress = 0f
+            onSelectTag(tagName)
+        },
+    )
 }
 
 @Composable
@@ -185,11 +228,13 @@ private fun FeedsFilterDrawer(
     onSelectSortOrder: (FeedSortOrder) -> Unit,
     onToggleUnreadOnly: () -> Unit,
     onSelectTag: (String?) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
     Column(
         modifier =
-            Modifier.fillMaxWidth()
+            modifier
+                .fillMaxWidth()
                 .background(colors.surface)
                 .padding(horizontal = 16.dp, vertical = 10.dp)
                 .testTag("feeds_filter_drawer"),
@@ -220,30 +265,45 @@ private fun FeedsFilterDrawer(
             )
         }
         if (state.tags.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = "FILTER INBOX BY TAG",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.5.sp,
+            FeedsDrawerTagFilterSection(
+                tags = state.tags,
+                selectedTag = state.selectedTag,
+                onSelectTag = onSelectTag,
             )
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                state.tags.forEach { tag ->
-                    val isSelected = state.selectedTag == tag.name
-                    FilterChipPill(
-                        label = "#${tag.name} (${tag.unreadCount})",
-                        selected = isSelected,
-                        onClick = { onSelectTag(if (isSelected) null else tag.name) },
-                    )
-                }
-            }
         }
     }
     HorizontalDivider(color = colors.border, thickness = 1.dp)
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FeedsDrawerTagFilterSection(
+    tags: List<com.grayvines.roche.model.TagItem>,
+    selectedTag: String?,
+    onSelectTag: (String?) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Spacer(modifier = Modifier.height(2.dp))
+    Text(
+        text = "FILTER INBOX BY TAG",
+        color = colors.textMuted,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 10.5.sp,
+    )
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        tags.forEach { tag ->
+            val isSelected = selectedTag == tag.name
+            FilterChipPill(
+                label = "#${tag.name} (${tag.unreadCount})",
+                selected = isSelected,
+                onClick = { onSelectTag(if (isSelected) null else tag.name) },
+            )
+        }
+    }
 }
 
 @Composable

@@ -1,0 +1,177 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fs.collection_id AS id,\n                    fs.source_type AS \"feed_type: FeedType\",\n                    fs.feed_url AS url,\n                    fs.feed_title AS title,\n                    e.summary AS description,\n                    fs.language,\n                    fs.poll_interval,\n                    fs.last_polled_at AS \"last_polled: DateTime<Utc>\",\n                    fs.last_polled_by,\n                    fs.last_error,\n                    fs.last_error_by,\n                    fs.is_active AS \"is_active: bool\",\n                    e.created_at AS \"created_at: DateTime<Utc>\",\n                    (SELECT COUNT(*)\n                     FROM collection_entries ce\n                     JOIN entry_state es ON es.entry_id = ce.entry_id\n                     JOIN entries ie ON ie.id = ce.entry_id\n                     WHERE ce.collection_id = fs.collection_id\n                       AND ie.merged_into_id IS NULL\n                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"\n             FROM feed_sources fs\n             JOIN entries e ON e.id = fs.collection_id\n             WHERE fs.is_active = 1\n               AND (\n                   fs.last_polled_at IS NULL\n                   OR datetime(fs.last_polled_at) < datetime('now', '-' || fs.poll_interval || ' minutes')\n                   OR (fs.last_error IS NOT NULL AND fs.last_error_by IS NOT NULL AND fs.last_error_by != ?)\n               )",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "name": "feed_type: FeedType",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "source_type"
+          }
+        }
+      },
+      {
+        "name": "url",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      },
+      {
+        "name": "title",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_title"
+          }
+        }
+      },
+      {
+        "name": "description",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "name": "language",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "language"
+          }
+        }
+      },
+      {
+        "name": "poll_interval",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "poll_interval"
+          }
+        }
+      },
+      {
+        "name": "last_polled: DateTime<Utc>",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "last_polled_at"
+          }
+        }
+      },
+      {
+        "name": "last_polled_by",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "last_polled_by"
+          }
+        }
+      },
+      {
+        "name": "last_error",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "last_error"
+          }
+        }
+      },
+      {
+        "name": "last_error_by",
+        "ordinal": 10,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "last_error_by"
+          }
+        }
+      },
+      {
+        "name": "is_active: bool",
+        "ordinal": 11,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "is_active"
+          }
+        }
+      },
+      {
+        "name": "created_at: DateTime<Utc>",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "unread_count!: i64",
+        "ordinal": 13,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "401bce1ff5af9c4a81dee50d23c36819e486d625c78d369f8a81a24d99916ea7"
+}

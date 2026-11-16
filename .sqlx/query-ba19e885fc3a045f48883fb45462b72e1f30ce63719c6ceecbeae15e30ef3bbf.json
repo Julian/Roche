@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO maintenance_runs (task_name, completed_at) VALUES\n                ('normalize_legacy_html_summaries', '2026-01-01T00:00:00Z'),\n                ('backfill_missing_thumbnails', '2026-01-01T00:00:00Z')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "ba19e885fc3a045f48883fb45462b72e1f30ce63719c6ceecbeae15e30ef3bbf"
+}

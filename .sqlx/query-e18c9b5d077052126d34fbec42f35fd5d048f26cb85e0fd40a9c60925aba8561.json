@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ts as \"ts!: DateTime<Utc>\", notes as \"notes?\"\n               FROM consumption_log WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "ts!: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "ts"
+          }
+        }
+      },
+      {
+        "name": "notes?",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "consumption_log",
+            "name": "notes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "e18c9b5d077052126d34fbec42f35fd5d048f26cb85e0fd40a9c60925aba8561"
+}

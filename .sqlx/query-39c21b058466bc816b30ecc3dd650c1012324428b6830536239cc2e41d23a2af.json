@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)\n             VALUES (?, ?, 'audio', ?, NULL, NULL, ?, ?)\n             ON CONFLICT(id) DO UPDATE SET\n                 remote_url = COALESCE(entry_media.remote_url, excluded.remote_url),\n                 duration = COALESCE(entry_media.duration, excluded.duration)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "39c21b058466bc816b30ecc3dd650c1012324428b6830536239cc2e41d23a2af"
+}

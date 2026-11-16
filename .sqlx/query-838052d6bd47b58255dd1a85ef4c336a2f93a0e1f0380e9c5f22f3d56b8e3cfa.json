@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id as \"id!\"\n                           FROM collection_entries ce\n                           JOIN entries e ON e.id = ce.entry_id\n                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL\n                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "838052d6bd47b58255dd1a85ef4c336a2f93a0e1f0380e9c5f22f3d56b8e3cfa"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)\n             VALUES (?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "ac1381ff570470576583ce1cd0403261fbcf9a2b69732f576c544888b151d3f1"
+}

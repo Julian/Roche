@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT fs.collection_id\n                         FROM feed_sources fs\n                         JOIN entries e ON e.id = fs.collection_id\n                         WHERE (fs.feed_url = ? OR fs.collection_id = ?)\n                           AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                         LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f128db9da41804bec604f8fb488dd48e90df8173ba81956a128f6af72e8c6911"
+}

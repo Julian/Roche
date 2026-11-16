@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
@@ -130,11 +131,12 @@ impl CatalogRepo<'_> {
             return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
         }
 
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT collection_id FROM collection_specs WHERE slug = ?")
-                .bind(&derived_slug)
-                .fetch_optional(self.pool)
-                .await?;
+        let existing = sqlx::query_scalar!(
+            r#"SELECT collection_id as "collection_id!" FROM collection_specs WHERE slug = ?"#,
+            &derived_slug,
+        )
+        .fetch_optional(self.pool)
+        .await?;
         if existing.is_some() {
             return Err(CatalogError::Conflict(format!(
                 "Collection with slug '{derived_slug}' already exists"
@@ -144,39 +146,41 @@ impl CatalogRepo<'_> {
         let id = deterministic_system_collection_id(&format!("custom:{derived_slug}"));
         let now = SyncRepo::now_utc();
         let show_in_lists = role == CollectionRole::List;
+        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
+        let clean_color = color.map(str::trim).filter(|s| !s.is_empty());
 
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
              VALUES (?, 'collection', ?, ?, ?, ?)",
+            &id,
+            clean_title,
+            clean_summary,
+            now as _,
+            now as _,
         )
-        .bind(&id)
-        .bind(clean_title)
-        .bind(summary.map(str::trim).filter(|s| !s.is_empty()))
-        .bind(now)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO collection_specs
              (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
              VALUES (?, ?, 'manual', ?, NULL, ?, ?)",
+            &id,
+            &derived_slug,
+            role as _,
+            show_in_lists as _,
+            clean_color,
         )
-        .bind(&id)
-        .bind(&derived_slug)
-        .bind(role)
-        .bind(show_in_lists)
-        .bind(color.map(str::trim).filter(|s| !s.is_empty()))
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
              VALUES ('slug', ?, ?)",
+            &derived_slug,
+            &id,
         )
-        .bind(&derived_slug)
-        .bind(&id)
         .execute(&mut *tx)
         .await?;
 
@@ -239,31 +243,31 @@ impl CatalogRepo<'_> {
         );
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
              VALUES (?, 'collection', ?, ?, ?)",
+            &id,
+            &pretty_label,
+            now as _,
+            now as _,
         )
-        .bind(&id)
-        .bind(&pretty_label)
-        .bind(now)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
              (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
              VALUES (?, ?, 'manual', 'want', NULL, 0)",
+            &id,
+            &want_slug,
         )
-        .bind(&id)
-        .bind(&want_slug)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        sqlx::query!(
             "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
              VALUES ('slug', ?, ?)",
+            &want_slug,
+            &id,
         )
-        .bind(&want_slug)
-        .bind(&id)
         .execute(&mut *tx)
         .await?;
         if res.rows_affected() > 0 {
@@ -313,22 +317,20 @@ impl CatalogRepo<'_> {
         let nat_key = collection_entry_natural_key(&col.id, &target_entry_id);
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
 
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(collection_id, entry_id) DO UPDATE SET
                 position = COALESCE(excluded.position, collection_entries.position)",
+            &col.id,
+            &target_entry_id,
+            position,
+            now as _,
         )
-        .bind(&col.id)
-        .bind(&target_entry_id)
-        .bind(position)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(&col.id)
+        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, &col.id,)
             .execute(&mut *tx)
             .await?;
 
@@ -368,12 +370,13 @@ impl CatalogRepo<'_> {
 
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
-        let res =
-            sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
-                .bind(&col.id)
-                .bind(&target_entry_id)
-                .execute(&mut *tx)
-                .await?;
+        let res = sqlx::query!(
+            "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+            &col.id,
+            &target_entry_id,
+        )
+        .execute(&mut *tx)
+        .await?;
         let removed = res.rows_affected() > 0;
         if removed {
             let nat_key = collection_entry_natural_key(&col.id, &target_entry_id);
@@ -387,9 +390,7 @@ impl CatalogRepo<'_> {
                 now,
             )
             .await?;
-            sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(&col.id)
+            sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, &col.id,)
                 .execute(&mut *tx)
                 .await?;
             SyncRepo::record_activity(
@@ -453,10 +454,10 @@ impl CatalogRepo<'_> {
         let mut queue: VecDeque<String> = VecDeque::from([parent_col_id.to_owned()]);
 
         while let Some(cur) = queue.pop_front() {
-            let ancestors: Vec<String> = sqlx::query_scalar(
-                "SELECT collection_id FROM collection_entries WHERE entry_id = ?",
+            let ancestors = sqlx::query_scalar!(
+                r#"SELECT collection_id as "collection_id!" FROM collection_entries WHERE entry_id = ?"#,
+                &cur,
             )
-            .bind(&cur)
             .fetch_all(&mut *conn)
             .await?;
 
@@ -479,21 +480,28 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<RawCollectionRow> {
         let q = slug_or_id.trim();
         let norm_slug = q.to_ascii_lowercase().replace('-', "_");
-        if let Some(row) = sqlx::query_as::<_, RawCollectionRow>(
-            "SELECT e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role,
-                    cs.rule_json, cs.show_in_lists, cs.color,
-                    EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator,
-                    e.created_at, e.updated_at
-             FROM collection_specs cs
-             JOIN entries e ON e.id = cs.collection_id
-             WHERE e.merged_into_id IS NULL
-               AND (e.id = ? OR LOWER(cs.slug) = LOWER(?) OR LOWER(cs.slug) = ? OR LOWER(e.title) = LOWER(?))
-             LIMIT 1",
+        if let Some(row) = sqlx::query_as!(
+            RawCollectionRow,
+            r#"SELECT e.id as "id!", cs.slug as "slug?", e.title as "title!",
+                      e.summary as "summary?", e.kind as "kind!: EntryKind",
+                      cs.mode as "mode!: CollectionMode",
+                      cs.collection_role as "collection_role!: CollectionRole",
+                      cs.rule_json as "rule_json?",
+                      cs.show_in_lists as "show_in_lists!: bool",
+                      cs.color as "color?",
+                      EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) as "has_generator!: bool",
+                      e.created_at as "created_at!: DateTime<Utc>",
+                      e.updated_at as "updated_at!: DateTime<Utc>"
+               FROM collection_specs cs
+               JOIN entries e ON e.id = cs.collection_id
+               WHERE e.merged_into_id IS NULL
+                 AND (e.id = ? OR LOWER(cs.slug) = LOWER(?) OR LOWER(cs.slug) = ? OR LOWER(e.title) = LOWER(?))
+               LIMIT 1"#,
+            q,
+            q,
+            &norm_slug,
+            q,
         )
-        .bind(q)
-        .bind(q)
-        .bind(&norm_slug)
-        .bind(q)
         .fetch_optional(self.pool)
         .await?
         {
@@ -503,17 +511,24 @@ impl CatalogRepo<'_> {
         if allow_kind_alias
             && let Ok(kind) = EntryKind::parse_flexible(q)
             && let Some(default_slug) = kind.default_list_slug()
-            && let Some(row) = sqlx::query_as::<_, RawCollectionRow>(
-                "SELECT e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role,
-                        cs.rule_json, cs.show_in_lists, cs.color,
-                        EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator,
-                        e.created_at, e.updated_at
-                 FROM collection_specs cs
-                 JOIN entries e ON e.id = cs.collection_id
-                 WHERE e.merged_into_id IS NULL AND cs.slug = ?
-                 LIMIT 1",
+            && let Some(row) = sqlx::query_as!(
+                RawCollectionRow,
+                r#"SELECT e.id as "id!", cs.slug as "slug?", e.title as "title!",
+                          e.summary as "summary?", e.kind as "kind!: EntryKind",
+                          cs.mode as "mode!: CollectionMode",
+                          cs.collection_role as "collection_role!: CollectionRole",
+                          cs.rule_json as "rule_json?",
+                          cs.show_in_lists as "show_in_lists!: bool",
+                          cs.color as "color?",
+                          EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) as "has_generator!: bool",
+                          e.created_at as "created_at!: DateTime<Utc>",
+                          e.updated_at as "updated_at!: DateTime<Utc>"
+                   FROM collection_specs cs
+                   JOIN entries e ON e.id = cs.collection_id
+                   WHERE e.merged_into_id IS NULL AND cs.slug = ?
+                   LIMIT 1"#,
+                default_slug,
             )
-            .bind(default_slug)
             .fetch_optional(self.pool)
             .await?
         {
@@ -570,30 +585,30 @@ impl CatalogRepo<'_> {
         match col.mode {
             CollectionMode::Manual | CollectionMode::Feed => {
                 if col.has_generator {
-                    Ok(sqlx::query_scalar(
-                        "SELECT e.id
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ?
-                           AND e.merged_into_id IS NULL
-                           AND EXISTS (
-                               SELECT 1 FROM consumption_log cl
-                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                           )
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+                    Ok(sqlx::query_scalar!(
+                        r#"SELECT e.id as "id!"
+                           FROM collection_entries ce
+                           JOIN entries e ON e.id = ce.entry_id
+                           WHERE ce.collection_id = ?
+                             AND e.merged_into_id IS NULL
+                             AND EXISTS (
+                                 SELECT 1 FROM consumption_log cl
+                                 WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                             )
+                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                        &col.id,
                     )
-                    .bind(&col.id)
                     .fetch_all(self.pool)
                     .await?)
                 } else {
-                    Ok(sqlx::query_scalar(
-                        "SELECT e.id
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+                    Ok(sqlx::query_scalar!(
+                        r#"SELECT e.id as "id!"
+                           FROM collection_entries ce
+                           JOIN entries e ON e.id = ce.entry_id
+                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                        &col.id,
                     )
-                    .bind(&col.id)
                     .fetch_all(self.pool)
                     .await?)
                 }
@@ -647,34 +662,46 @@ impl CatalogRepo<'_> {
         let raw_rows: Vec<RawEntryRow> = match col.mode {
             CollectionMode::Manual | CollectionMode::Feed => {
                 if col.has_generator {
-                    sqlx::query_as(
-                        "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at,
-                                e.release_year, e.summary, e.thumbnail_url, e.metadata_json,
-                                e.merged_into_id, e.created_at, e.updated_at
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ?
-                           AND e.merged_into_id IS NULL
-                           AND EXISTS (
-                               SELECT 1 FROM consumption_log cl
-                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                           )
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+                    sqlx::query_as!(
+                        RawEntryRow,
+                        r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
+                                  e.creators_json as "creators_json!", e.url as "url?",
+                                  e.published_at as "published_at?: DateTime<Utc>",
+                                  e.release_year as "release_year?: i32", e.summary as "summary?",
+                                  e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
+                                  e.merged_into_id as "merged_into_id?",
+                                  e.created_at as "created_at!: DateTime<Utc>",
+                                  e.updated_at as "updated_at!: DateTime<Utc>"
+                           FROM collection_entries ce
+                           JOIN entries e ON e.id = ce.entry_id
+                           WHERE ce.collection_id = ?
+                             AND e.merged_into_id IS NULL
+                             AND EXISTS (
+                                 SELECT 1 FROM consumption_log cl
+                                 WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                             )
+                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                        &col.id,
                     )
-                    .bind(&col.id)
                     .fetch_all(self.pool)
                     .await?
                 } else {
-                    sqlx::query_as(
-                        "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at,
-                                e.release_year, e.summary, e.thumbnail_url, e.metadata_json,
-                                e.merged_into_id, e.created_at, e.updated_at
-                         FROM collection_entries ce
-                         JOIN entries e ON e.id = ce.entry_id
-                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC",
+                    sqlx::query_as!(
+                        RawEntryRow,
+                        r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
+                                  e.creators_json as "creators_json!", e.url as "url?",
+                                  e.published_at as "published_at?: DateTime<Utc>",
+                                  e.release_year as "release_year?: i32", e.summary as "summary?",
+                                  e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
+                                  e.merged_into_id as "merged_into_id?",
+                                  e.created_at as "created_at!: DateTime<Utc>",
+                                  e.updated_at as "updated_at!: DateTime<Utc>"
+                           FROM collection_entries ce
+                           JOIN entries e ON e.id = ce.entry_id
+                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
+                        &col.id,
                     )
-                    .bind(&col.id)
                     .fetch_all(self.pool)
                     .await?
                 }

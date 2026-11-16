@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id as \"collection_id!\" FROM collection_specs WHERE slug = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "19362f5a269860441cd2c7a542a6ac1c54ce61d2f84b7fcfe2c53ed5ca132943"
+}

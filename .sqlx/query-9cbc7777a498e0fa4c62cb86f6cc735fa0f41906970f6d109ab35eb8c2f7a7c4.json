@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT inbox_state AS \"inbox_state: InboxState\" FROM entry_state WHERE entry_id = ? LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "inbox_state: InboxState",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "inbox_state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9cbc7777a498e0fa4c62cb86f6cc735fa0f41906970f6d109ab35eb8c2f7a7c4"
+}

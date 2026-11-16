@@ -58,17 +58,18 @@ mod tests {
         assert!(manager.validate(&token).await.unwrap());
 
         // Raw token is not stored in plaintext in the database
-        let raw_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM device_tokens WHERE token = ?")
-                .bind(&token)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        let raw_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) AS \"count!: i64\" FROM device_tokens WHERE token = ?",
+            token,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(raw_count, 0);
 
+        let hashed = TokenManager::hash_token(&token);
         let last_used: Option<String> =
-            sqlx::query_scalar("SELECT last_used_at FROM device_tokens WHERE token = ?")
-                .bind(TokenManager::hash_token(&token))
+            sqlx::query_scalar!("SELECT last_used_at FROM device_tokens WHERE token = ?", hashed,)
                 .fetch_one(db.pool())
                 .await
                 .unwrap();

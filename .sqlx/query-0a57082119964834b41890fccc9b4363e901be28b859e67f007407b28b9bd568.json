@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id as \"collection_id!\" FROM collection_entries\n               WHERE entry_id = ? AND collection_id != ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0a57082119964834b41890fccc9b4363e901be28b859e67f007407b28b9bd568"
+}

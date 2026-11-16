@@ -63,7 +63,7 @@ def _latest_server_source_mtime() -> float:
     ):
         if marker.is_file():
             latest = max(latest, marker.stat().st_mtime)
-    for subdir in (server_dir / "src", server_dir / "migrations"):
+    for subdir in (server_dir / "src", server_dir / "migrations", REPO_ROOT / ".sqlx"):
         if subdir.is_dir():
             for path in subdir.rglob("*"):
                 if path.is_file():
@@ -107,6 +107,9 @@ def _resolve_roche_binary() -> Path:
         return max(fresh_candidates, key=lambda p: p.stat().st_mtime)
 
     manifest = REPO_ROOT / "server" / "Cargo.toml"
+    build_env = dict(os.environ)
+    if "SQLX_OFFLINE" not in build_env and "DATABASE_URL" not in build_env:
+        build_env["SQLX_OFFLINE"] = "true"
     subprocess.run(
         [
             "cargo",
@@ -117,6 +120,8 @@ def _resolve_roche_binary() -> Path:
             "roche-server",
             "--locked",
         ],
+        cwd=str(REPO_ROOT),
+        env=build_env,
         check=True,
     )
     rebuilt_candidates = [

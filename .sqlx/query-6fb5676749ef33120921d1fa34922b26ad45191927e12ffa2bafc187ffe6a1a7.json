@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO maintenance_runs (task_name, completed_at) VALUES (?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "6fb5676749ef33120921d1fa34922b26ad45191927e12ffa2bafc187ffe6a1a7"
+}

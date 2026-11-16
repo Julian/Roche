@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE pairing_codes SET failed_attempts = failed_attempts + 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "55382e2f8b26910949b6d202392d2a019e49649482956e8c62f26e15b54721f9"
+}

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!\", ts as \"ts!: DateTime<Utc>\",\n                      scope_collection_id as \"scope_collection_id?\",\n                      ordering_json as \"ordering_json!\"\n               FROM comparisons\n               WHERE ordering_json LIKE ? OR scope_collection_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "comparisons",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "ts!: DateTime<Utc>",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "comparisons",
+            "name": "ts"
+          }
+        }
+      },
+      {
+        "name": "scope_collection_id?",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "comparisons",
+            "name": "scope_collection_id"
+          }
+        }
+      },
+      {
+        "name": "ordering_json!",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "comparisons",
+            "name": "ordering_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "7b0b668310ede34d60430b8edd8248dc2704e426c57664bf638f3fd6d75920f1"
+}

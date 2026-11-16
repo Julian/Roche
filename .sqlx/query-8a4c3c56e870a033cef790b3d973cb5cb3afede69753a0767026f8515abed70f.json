@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at)\n             VALUES (?, ?, ?)\n             ON CONFLICT(entity_type, natural_key) DO UPDATE SET\n                 deleted_at = CASE\n                     WHEN strftime('%Y-%m-%dT%H:%M:%fZ', excluded.deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', sync_tombstones.deleted_at)\n                     THEN excluded.deleted_at\n                     ELSE sync_tombstones.deleted_at\n                 END",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "8a4c3c56e870a033cef790b3d973cb5cb3afede69753a0767026f8515abed70f"
+}

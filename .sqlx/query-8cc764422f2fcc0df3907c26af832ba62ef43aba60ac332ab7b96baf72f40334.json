@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entry_content\n                 SET content_type = 'audio'\n                 WHERE entry_id = ? AND content_type != 'audio'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "8cc764422f2fcc0df3907c26af832ba62ef43aba60ac332ab7b96baf72f40334"
+}

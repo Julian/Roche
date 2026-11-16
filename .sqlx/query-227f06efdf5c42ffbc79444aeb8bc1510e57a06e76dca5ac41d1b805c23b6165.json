@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id, cs.color AS \"color: HexColor\"\n                 FROM entries e\n                 JOIN collection_specs cs ON cs.collection_id = e.id\n                 WHERE cs.collection_role = 'tag'\n                   AND (e.id = ? OR cs.slug = ? OR LOWER(e.title) = LOWER(?))\n                 LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "color: HexColor",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "color"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "227f06efdf5c42ffbc79444aeb8bc1510e57a06e76dca5ac41d1b805c23b6165"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)\n                     VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "a75d9fb0cc5f1afeff2f9c2348724345ad240192a108cd74773d77ecaabdfb23"
+}

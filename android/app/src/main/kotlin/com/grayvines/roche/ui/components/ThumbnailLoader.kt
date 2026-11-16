@@ -1,6 +1,6 @@
 package com.grayvines.roche.ui.components
 
-import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import androidx.collection.LruCache
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.ImageBitmap
@@ -12,9 +12,11 @@ import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.resolveSafeChildFile
 import com.grayvines.roche.data.settings.SettingsRepository
 import java.io.File
+import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -303,13 +305,21 @@ class ThumbnailLoader(
                     tmpFile.toPath(),
                     targetFile.toPath(),
                     StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
                 )
             }
                 .onFailure {
-                    if (!tmpFile.renameTo(targetFile)) {
-                        tmpFile.copyTo(targetFile, overwrite = true)
-                        tmpFile.delete()
+                    runCatching {
+                        Files.move(
+                            tmpFile.toPath(),
+                            targetFile.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
                     }
+                        .onFailure {
+                            tmpFile.copyTo(targetFile, overwrite = true)
+                            tmpFile.delete()
+                        }
                 }
             targetFile.setLastModified(clockMs())
             val bytes =
@@ -376,50 +386,43 @@ internal fun decodeFaviconBitmapBytes(bytes: ByteArray): ImageBitmap? =
     decodeBitmapBytesAtSize(bytes, TARGET_FAVICON_PX)
 
 private fun decodeBitmapBytesAtSize(bytes: ByteArray, targetPx: Int): ImageBitmap? {
-    val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOptions)
-    if (boundsOptions.outWidth <= 0 || boundsOptions.outHeight <= 0) return null
-
-    val decodeOptions =
-        BitmapFactory.Options().apply {
-            inSampleSize =
-                calculateInSampleSize(
-                    rawWidth = boundsOptions.outWidth,
-                    rawHeight = boundsOptions.outHeight,
-                    reqWidth = targetPx,
-                    reqHeight = targetPx,
-                )
-        }
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)?.asImageBitmap()
+    if (bytes.isEmpty()) return null
+    return runCatching {
+        val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+        ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                val targetDims =
+                    computeProportionalTargetSize(
+                        rawWidth = info.size.width,
+                        rawHeight = info.size.height,
+                        targetPx = targetPx,
+                    )
+                if (targetDims != null) {
+                    decoder.setTargetSize(targetDims.first, targetDims.second)
+                }
+            }
+            .asImageBitmap()
+    }
+        .getOrNull()
 }
 
-internal fun calculateInSampleSize(
+internal fun computeProportionalTargetSize(
     rawWidth: Int,
     rawHeight: Int,
-    reqWidth: Int = TARGET_THUMBNAIL_PX,
-    reqHeight: Int = TARGET_THUMBNAIL_PX,
-): Int {
-    var inSampleSize = 1
-    if (rawHeight > reqHeight || rawWidth > reqWidth) {
-        val halfHeight = rawHeight / SAMPLE_DIVISOR
-        val halfWidth = rawWidth / SAMPLE_DIVISOR
-        while (halfHeight / inSampleSize >= reqHeight || halfWidth / inSampleSize >= reqWidth) {
-            inSampleSize *= SAMPLE_DIVISOR
-        }
-    }
-    while (
-        rawHeight / inSampleSize > MAX_BITMAP_DIMENSION_PX ||
-            rawWidth / inSampleSize > MAX_BITMAP_DIMENSION_PX
-    ) {
-        inSampleSize *= SAMPLE_DIVISOR
-    }
-    return inSampleSize
+    targetPx: Int,
+): Pair<Int, Int>? {
+    if (rawWidth <= 0 || rawHeight <= 0) return null
+    val maxEdge = minOf(targetPx, MAX_BITMAP_DIMENSION_PX).coerceAtLeast(1)
+    val longerRaw = maxOf(rawWidth, rawHeight)
+    if (longerRaw <= maxEdge) return null
+    val scale = maxEdge.toDouble() / longerRaw.toDouble()
+    val targetW = (rawWidth * scale).roundToInt().coerceIn(1, maxEdge)
+    val targetH = (rawHeight * scale).roundToInt().coerceIn(1, maxEdge)
+    return targetW to targetH
 }
 
 internal const val MAX_BITMAP_DIMENSION_PX = 2048
 private const val TARGET_FAVICON_PX = 128
 private const val TARGET_THUMBNAIL_PX = 256
 private const val TARGET_INLINE_IMAGE_PX = 1440
-private const val SAMPLE_DIVISOR = 2
 internal const val BYTES_PER_PIXEL = 4L
 internal const val KIB_BYTES = 1024L

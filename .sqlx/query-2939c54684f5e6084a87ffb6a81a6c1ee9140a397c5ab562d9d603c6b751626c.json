@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM collection_specs\n             WHERE collection_id = ?\n               AND mode = 'manual'\n               AND collection_role IN ('list', 'want')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "2939c54684f5e6084a87ffb6a81a6c1ee9140a397c5ab562d9d603c6b751626c"
+}

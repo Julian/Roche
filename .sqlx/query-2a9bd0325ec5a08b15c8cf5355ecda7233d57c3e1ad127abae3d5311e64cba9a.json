@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO peer_nodes (peer_id, device_name, network_tier, weight, last_seen_at)\n             VALUES (?, ?, ?, ?, ?)\n             ON CONFLICT(peer_id) DO UPDATE SET\n                 device_name = excluded.device_name,\n                 network_tier = excluded.network_tier,\n                 weight = excluded.weight,\n                 last_seen_at = excluded.last_seen_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "2a9bd0325ec5a08b15c8cf5355ecda7233d57c3e1ad127abae3d5311e64cba9a"
+}

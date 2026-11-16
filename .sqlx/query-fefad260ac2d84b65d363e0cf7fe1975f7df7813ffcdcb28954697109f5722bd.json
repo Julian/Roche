@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.title\n             FROM collection_entries ce\n             JOIN collection_specs cs ON cs.collection_id = ce.collection_id\n             JOIN entries e ON e.id = ce.collection_id\n             WHERE ce.entry_id = ? AND cs.collection_role = 'tag' AND e.merged_into_id IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "title",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fefad260ac2d84b65d363e0cf7fe1975f7df7813ffcdcb28954697109f5722bd"
+}

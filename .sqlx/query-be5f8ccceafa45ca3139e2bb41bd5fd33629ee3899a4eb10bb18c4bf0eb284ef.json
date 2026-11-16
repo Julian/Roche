@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM maintenance_runs",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "be5f8ccceafa45ca3139e2bb41bd5fd33629ee3899a4eb10bb18c4bf0eb284ef"
+}

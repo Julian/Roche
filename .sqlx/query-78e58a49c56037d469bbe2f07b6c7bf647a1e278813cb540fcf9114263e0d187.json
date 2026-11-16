@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)\n             VALUES (?, ?, ?, ?, ?, ?)\n             ON CONFLICT(id) DO UPDATE SET\n                 kind = excluded.kind,\n                 title = excluded.title,\n                 summary = COALESCE(excluded.summary, entries.summary),\n                 created_at = excluded.created_at,\n                 updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "78e58a49c56037d469bbe2f07b6c7bf647a1e278813cb540fcf9114263e0d187"
+}

@@ -60,16 +60,17 @@ impl CatalogRepo<'_> {
         );
         let ord_json = canonical_ordering_json(&resolved_ordering);
 
+        let clean_scope_ref = clean_scope.as_deref();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(
+        let res = sqlx::query!(
             "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
              VALUES (?, ?, ?, ?, ?)",
+            &comp_id,
+            event_ts as _,
+            clean_scope_ref,
+            &ord_json,
+            now as _,
         )
-        .bind(&comp_id)
-        .bind(event_ts)
-        .bind(&clean_scope)
-        .bind(&ord_json)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         if res.rows_affected() > 0 {
@@ -242,10 +243,10 @@ impl CatalogRepo<'_> {
         if let Some(parent_id) =
             filter.from_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
         {
-            let child_ids: HashSet<String> = sqlx::query_scalar(
-                "SELECT entry_id FROM collection_entries WHERE collection_id = ?",
+            let child_ids: HashSet<String> = sqlx::query_scalar!(
+                r#"SELECT entry_id as "entry_id!" FROM collection_entries WHERE collection_id = ?"#,
+                parent_id,
             )
-            .bind(parent_id)
             .fetch_all(self.pool)
             .await?
             .into_iter()
@@ -266,15 +267,16 @@ impl CatalogRepo<'_> {
             }
             seed_pool = Some(resolved_focus);
         } else if let Some(recent_n) = filter.recent_limit.filter(|&n| n > 0) {
-            let recent_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT entry_id
-                 FROM consumption_log
-                 WHERE status = 'consumed'
-                 GROUP BY entry_id
-                 ORDER BY MAX(strftime('%Y-%m-%dT%H:%M:%fZ', ts)) DESC
-                 LIMIT ?",
+            let recent_cap = i64::try_from(recent_n).unwrap_or(50);
+            let recent_ids = sqlx::query_scalar!(
+                r#"SELECT entry_id as "entry_id!"
+                   FROM consumption_log
+                   WHERE status = 'consumed'
+                   GROUP BY entry_id
+                   ORDER BY MAX(strftime('%Y-%m-%dT%H:%M:%fZ', ts)) DESC
+                   LIMIT ?"#,
+                recent_cap,
             )
-            .bind(i64::try_from(recent_n).unwrap_or(50))
             .fetch_all(self.pool)
             .await?;
             if !recent_ids.is_empty() {
@@ -326,20 +328,20 @@ impl CatalogRepo<'_> {
         &self,
         scope_collection_id: Option<&str>,
     ) -> CatalogResult<Vec<Vec<Vec<String>>>> {
-        let json_rows: Vec<String> = if let Some(scope_id) = scope_collection_id {
-            sqlx::query_scalar(
-                "SELECT ordering_json FROM comparisons
-                 WHERE scope_collection_id = ?
-                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
+        let json_rows = if let Some(scope_id) = scope_collection_id {
+            sqlx::query_scalar!(
+                r#"SELECT ordering_json as "ordering_json!" FROM comparisons
+                   WHERE scope_collection_id = ?
+                   ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC"#,
+                scope_id,
             )
-            .bind(scope_id)
             .fetch_all(self.pool)
             .await?
         } else {
-            sqlx::query_scalar(
-                "SELECT ordering_json FROM comparisons
-                 WHERE scope_collection_id IS NULL
-                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
+            sqlx::query_scalar!(
+                r#"SELECT ordering_json as "ordering_json!" FROM comparisons
+                   WHERE scope_collection_id IS NULL
+                   ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC"#,
             )
             .fetch_all(self.pool)
             .await?

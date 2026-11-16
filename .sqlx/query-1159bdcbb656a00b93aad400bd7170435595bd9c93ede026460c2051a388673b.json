@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT (EXISTS (\n                 SELECT 1 FROM entries e\n                 LEFT JOIN entries_fts f ON f.rowid = e.rowid AND f.entry_id = e.id\n                 WHERE e.merged_into_id IS NULL AND f.rowid IS NULL\n             ) OR (\n                 (SELECT COUNT(*) FROM entries_fts) !=\n                 (SELECT COUNT(*) FROM entries WHERE merged_into_id IS NULL)\n             )) AS \"mismatch!: bool\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "mismatch!: bool",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1159bdcbb656a00b93aad400bd7170435595bd9c93ede026460c2051a388673b"
+}

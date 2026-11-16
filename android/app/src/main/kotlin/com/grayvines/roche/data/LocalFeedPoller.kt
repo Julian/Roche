@@ -8,17 +8,16 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.model.ItemStatus
-import java.io.StringReader
 import java.net.URI
 import java.time.Instant
 import java.time.OffsetDateTime
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
-import javax.xml.parsers.DocumentBuilderFactory
-import org.w3c.dom.Element
-import org.w3c.dom.Node
-import org.xml.sax.InputSource
+import java.util.Locale
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
+import org.jsoup.parser.Parser
 
 internal data class ParsedFeedCandidateItem(
     val title: String,
@@ -92,6 +91,9 @@ internal object LocalFeedPoller {
 
         val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId)
         dao.upsertFeed(updatedFeed)
+        if (updatedFeed.title != feed.title) {
+            dao.updateItemsFeedTitle(updatedFeed.id, updatedFeed.title)
+        }
 
         val insertedOrUpdatedCount =
             upsertPolledItems(
@@ -243,8 +245,12 @@ internal object LocalFeedPoller {
             feedId = existing.feedId ?: feed.id,
             feedUrl = existing.feedUrl ?: feed.url,
             feedTitle =
-                existing.feedTitle.takeIf { it.isNotBlank() && it != DEFAULT_SAVED_HOST }
-                    ?: feed.title,
+                existing.feedTitle.takeIf {
+                    it.isNotBlank() &&
+                        it != DEFAULT_SAVED_HOST &&
+                        !it.equals(extractHostTitle(feed.url), ignoreCase = true) &&
+                        it != "YouTube Channel"
+                } ?: feed.title,
             title = existing.title.ifBlank { candidate.title },
             author = existing.author?.takeIf { it.isNotBlank() } ?: candidate.author,
             publishedAt = existing.publishedAt?.takeIf { it.isNotBlank() } ?: candidate.publishedAt,
@@ -266,23 +272,17 @@ internal object LocalFeedPoller {
     ): ParsedFeedBatch {
         val cleanXml = stripLeadingBom(xml).trim()
         require(cleanXml.isNotEmpty()) { "Feed XML is empty" }
-        val factory =
-            DocumentBuilderFactory.newInstance().apply {
-                isNamespaceAware = true
-                isExpandEntityReferences = false
-                runCatching {
-                    setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-                }
-                runCatching {
-                    setFeature("http://xml.org/sax/features/external-general-entities", false)
-                }
-                runCatching {
-                    setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-                }
-            }
-        val doc = factory.newDocumentBuilder().parse(InputSource(StringReader(cleanXml)))
-        val root = doc.documentElement ?: error("Missing XML root element")
-        val rootName = root.localOrTagName().lowercase()
+        val xmlProlog = extractXmlPrologBeforeRoot(cleanXml)
+        require(!EXTERNAL_ENTITY_REGEX.containsMatchIn(xmlProlog)) {
+            "External XML entities are not allowed"
+        }
+        val doc = Jsoup.parse(cleanXml, feedUrl, Parser.xmlParser())
+        doc.outputSettings().prettyPrint(false)
+        val root = requireNotNull(doc.firstElementChild()) { "Missing XML root element" }
+        val rootName = root.localOrTagName().lowercase(Locale.ROOT)
+        require(rootName in ALLOWED_FEED_ROOT_NAMES) {
+            "Unsupported feed root element: $rootName"
+        }
 
         return if (rootName == "feed") {
             parseAtomFeed(root, feedUrl, feedType)
@@ -296,13 +296,11 @@ internal object LocalFeedPoller {
         feedUrl: String,
         feedType: String,
     ): ParsedFeedBatch {
-        val title = root.firstDirectChildText(XML_TAG_TITLE)?.let(::decodeHtmlText)
+        val title = root.firstDirectAtomText(XML_TAG_TITLE)
         val description =
-            (root.firstDirectChildText("subtitle") ?: root.firstDirectChildText("tagline"))?.let(
-                ::decodeHtmlText
-            )
+            root.firstDirectAtomText("subtitle") ?: root.firstDirectAtomText("tagline")
         val language =
-            root.getAttribute("xml:lang").takeIf { it.isNotBlank() }
+            root.attr("xml:lang").takeIf { it.isNotBlank() }
                 ?: root.firstDirectChildText(XML_TAG_LANGUAGE)
         val siteUrl = extractAtomLink(root, feedUrl, preferAlternate = true)
 
@@ -324,24 +322,25 @@ internal object LocalFeedPoller {
         feedUrl: String,
         feedType: String,
     ): ParsedFeedCandidateItem? {
-        val audioUrl = extractAudioEnclosureUrl(entry, feedUrl)
+        val mediaGroup = entry.firstDirectChildElement(XML_TAG_GROUP)
+        val audioUrl = extractAudioEnclosureUrl(entry, feedUrl, mediaGroup)
         val rawUrl = extractAtomEntryUrl(entry, feedUrl) ?: audioUrl ?: return null
         val resolvedUrl = canonicalizeEntryUrl(rawUrl, feedType)
-        val rawTitle =
-            entry.firstDirectChildText(XML_TAG_TITLE)?.let(::decodeHtmlText)?.trim().orEmpty()
+        val rawTitle = entry.firstDirectAtomText(XML_TAG_TITLE).orEmpty()
         val author = extractAtomAuthor(entry)
         val publishedIso = extractElementPublishedIso(entry)
-        val mediaGroup = entry.firstDirectChildElement("group")
         val rawContent =
-            entry.firstDirectChildText(XML_TAG_CONTENT)
-                ?: entry.firstDirectChildText("summary")
-                ?: mediaGroup?.firstDirectChildText(XML_TAG_DESCRIPTION)
+            entry.firstDirectChildRichContent(XML_TAG_CONTENT)
+                ?: entry.firstDirectChildRichContent("summary")
+                ?: mediaGroup?.firstDirectChildRichContent(XML_TAG_DESCRIPTION)
         val sanitizedHtml = sanitizeCandidateHtml(rawContent, resolvedUrl)
-        val summaryText = rawContent?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
+        val summarySource =
+            entry.firstDirectChildRichContent("summary")?.takeIf { it.isNotBlank() } ?: rawContent
+        val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
         val thumbnailUrl =
-            extractItunesImageHref(entry, resolvedUrl)
-                ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, resolvedUrl)
-        val duration = extractPodcastDurationLabel(entry)
+            extractItunesImageHref(entry, feedUrl)
+                ?: extractAtomThumbnail(entry, mediaGroup, sanitizedHtml, feedUrl, resolvedUrl)
+        val duration = extractPodcastDurationLabel(entry, mediaGroup)
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
             if (effectiveAudioUrl != null) {
@@ -382,7 +381,11 @@ internal object LocalFeedPoller {
         val channelAuthor = extractRssAuthor(channel)
 
         val itemElements =
-            (channel.directChildElements("item") + root.directChildElements("item")).distinct()
+            if (channel === root) {
+                root.directChildElements("item")
+            } else {
+                channel.directChildElements("item") + root.directChildElements("item")
+            }
         val items = itemElements.mapNotNull { item ->
             parseRssItem(
                 item = item,
@@ -408,8 +411,9 @@ internal object LocalFeedPoller {
         channelArtworkUrl: String? = null,
         channelAuthor: String? = null,
     ): ParsedFeedCandidateItem? {
-        val audioUrl = extractAudioEnclosureUrl(item, feedUrl)
-        val linkText = extractRssItemUrl(item, feedUrl) ?: audioUrl ?: return null
+        val mediaGroup = item.firstDirectChildElement(XML_TAG_GROUP)
+        val audioUrl = extractAudioEnclosureUrl(item, feedUrl, mediaGroup)
+        val linkText = extractRssItemUrl(item, feedUrl, mediaGroup) ?: audioUrl ?: return null
         val httpItemUrl = resolveRelativeUrl(feedUrl, linkText) ?: audioUrl ?: return null
         val resolvedUrl = canonicalizeEntryUrl(httpItemUrl, feedType)
         val rawTitle =
@@ -417,13 +421,11 @@ internal object LocalFeedPoller {
         val author = extractRssAuthor(item) ?: channelAuthor?.takeIf { audioUrl != null }
         val publishedIso = extractElementPublishedIso(item)
 
-        val encodedContent = item.firstDirectChildText("encoded")
-        val description = item.firstDirectChildText(XML_TAG_DESCRIPTION)
-        val primaryHtml = encodedContent?.takeIf { it.isNotBlank() } ?: description
+        val primaryHtml = extractRssPrimaryHtml(item, mediaGroup)
         val sanitizedHtml = sanitizeCandidateHtml(primaryHtml, resolvedUrl)
-        val summarySource = description?.takeIf { it.isNotBlank() } ?: encodedContent
+        val summarySource = extractRssSummarySource(item, mediaGroup)
         val summaryText = summarySource?.let(::plainTextExcerpt).orEmpty().ifBlank { rawTitle }
-        val duration = extractPodcastDurationLabel(item)
+        val duration = extractPodcastDurationLabel(item, mediaGroup)
         val effectiveAudioUrl = audioUrl ?: resolvedUrl.takeIf(::isDirectAudioUrl)
         val effectiveType =
             if (effectiveAudioUrl != null) {
@@ -434,6 +436,8 @@ internal object LocalFeedPoller {
         val thumbnailUrl =
             extractRssThumbnailUrl(
                 item = item,
+                mediaGroup = mediaGroup,
+                feedUrl = feedUrl,
                 resolvedUrl = resolvedUrl,
                 sanitizedHtml = sanitizedHtml,
                 channelArtworkUrl = channelArtworkUrl,
@@ -454,28 +458,68 @@ internal object LocalFeedPoller {
         )
     }
 
+    @Suppress("LongParameterList")
     private fun extractRssThumbnailUrl(
         item: Element,
+        mediaGroup: Element?,
+        feedUrl: String,
         resolvedUrl: String,
         sanitizedHtml: String?,
         channelArtworkUrl: String?,
         isAudio: Boolean,
     ): String? =
-        extractItunesImageHref(item, resolvedUrl)
-            ?: extractMediaThumbnail(item, resolvedUrl)
-            ?: extractEnclosureImage(item, resolvedUrl)
+        extractItunesImageHref(item, feedUrl)
+            ?: extractMediaThumbnail(item, feedUrl)
+            ?: mediaGroup?.let { extractMediaThumbnail(it, feedUrl) }
+            ?: extractEnclosureImage(item, feedUrl)
             ?: sanitizedHtml?.let { extractFirstImgUrl(it, resolvedUrl) }
             ?: channelArtworkUrl?.takeIf { isAudio }
 }
 
+internal fun extractRssPrimaryHtml(item: Element, mediaGroup: Element?): String? =
+    item.firstDirectChildRichContent("encoded")?.takeIf { it.isNotBlank() }
+        ?: item.firstDirectChildRichContent(XML_TAG_DESCRIPTION)?.takeIf { it.isNotBlank() }
+        ?: mediaGroup?.firstDirectChildRichContent(XML_TAG_DESCRIPTION)
+
+internal fun extractRssSummarySource(item: Element, mediaGroup: Element?): String? =
+    item.firstDirectChildRichContent(XML_TAG_DESCRIPTION)?.takeIf { it.isNotBlank() }
+        ?: mediaGroup?.firstDirectChildRichContent(XML_TAG_DESCRIPTION)?.takeIf { it.isNotBlank() }
+        ?: item.firstDirectChildRichContent("encoded")
+
+internal fun extractXmlPrologBeforeRoot(cleanXml: String): String {
+    var match = FEED_ROOT_START_TAG_REGEX.find(cleanXml)
+    while (match != null) {
+        val candidateProlog = cleanXml.substring(0, match.range.first)
+        val openBrackets = candidateProlog.count { it == '[' }
+        val closeBrackets = candidateProlog.count { it == ']' }
+        if (openBrackets <= closeBrackets) {
+            return candidateProlog
+        }
+        match = match.next()
+    }
+    return cleanXml
+}
+
+internal fun extractValidYoutubeVideoId(entry: Element): String? =
+    entry.firstDirectChildText("videoId")?.trim()?.takeIf { YOUTUBE_VIDEO_ID_REGEX.matches(it) }
+
 internal fun extractAtomEntryUrl(entry: Element, feedUrl: String): String? =
     extractAtomLink(entry, feedUrl, preferAlternate = true)
-        ?: entry.firstDirectChildText("id")?.trim()?.takeIf(::isHttpOrHttpsUrl)
+        ?: entry.firstDirectChildText("id")?.trim()?.takeIf(::isHttpOrHttpsUrl)?.let {
+            resolveRelativeUrl(feedUrl, it)
+        }
+        ?: extractValidYoutubeVideoId(entry)?.let { "https://www.youtube.com/watch?v=$it" }
 
-internal fun extractRssItemUrl(item: Element, feedUrl: String): String? =
+internal fun extractRssItemUrl(
+    item: Element,
+    feedUrl: String,
+    mediaGroup: Element? = item.firstDirectChildElement(XML_TAG_GROUP),
+): String? =
     item.firstDirectChildText(XML_TAG_LINK)?.trim()?.takeIf { it.isNotBlank() }
         ?: extractAtomLink(item, feedUrl, preferAlternate = true)
         ?: item.firstDirectChildText("guid")?.trim()?.takeIf(::isHttpOrHttpsUrl)
+        ?: findNonImageMediaContentUrl(item)
+        ?: mediaGroup?.let(::findNonImageMediaContentUrl)
 
 internal fun extractRssAuthor(item: Element): String? =
     (item.firstDirectChildText("creator") ?: item.firstDirectChildText(XML_TAG_AUTHOR))
@@ -499,11 +543,12 @@ internal fun extractAtomThumbnail(
     entry: Element,
     mediaGroup: Element?,
     sanitizedHtml: String?,
+    feedUrl: String,
     resolvedUrl: String,
 ): String? {
-    val videoId = entry.firstDirectChildText("videoId")?.trim()?.takeIf { it.isNotBlank() }
-    return extractMediaThumbnail(entry, resolvedUrl)
-        ?: mediaGroup?.let { extractMediaThumbnail(it, resolvedUrl) }
+    val videoId = extractValidYoutubeVideoId(entry)
+    return extractMediaThumbnail(entry, feedUrl)
+        ?: mediaGroup?.let { extractMediaThumbnail(it, feedUrl) }
         ?: videoId?.let { "https://i.ytimg.com/vi/$it/hqdefault.jpg" }
         ?: sanitizedHtml?.let { extractFirstImgUrl(it, resolvedUrl) }
 }
@@ -534,10 +579,15 @@ internal fun resolveCandidateContentType(feedType: String, itemUrl: String): Str
         else -> "article"
     }
 
-internal fun extractAudioEnclosureUrl(item: Element, baseUrl: String): String? {
+internal fun extractAudioEnclosureUrl(
+    item: Element,
+    baseUrl: String,
+    mediaGroup: Element? = item.firstDirectChildElement(XML_TAG_GROUP),
+): String? {
     val rawCandidate =
         findEnclosureTagAudioUrl(item)
             ?: findMediaContentAudioUrl(item)
+            ?: mediaGroup?.let(::findMediaContentAudioUrl)
             ?: findAtomLinkEnclosureAudioUrl(item)
     return rawCandidate?.let { raw -> resolveRelativeUrl(baseUrl, raw) }
 }
@@ -546,21 +596,21 @@ private fun findEnclosureTagAudioUrl(item: Element): String? =
     item
         .directChildElements(XML_TAG_ENCLOSURE)
         .mapNotNull { enc ->
-            val url = enc.getAttribute(ATTR_URL).ifBlank { enc.getAttribute("href") }.trim()
-            val type = enc.getAttribute("type").lowercase()
+            val url = enc.attr(ATTR_URL).ifBlank { enc.attr(ATTR_HREF) }.trim()
+            val type = enc.attr(ATTR_TYPE).lowercase()
             url.takeIf {
                 it.isNotBlank() && (type.startsWith(MIME_AUDIO_PREFIX) || isDirectAudioUrl(it))
             }
         }
         .firstOrNull()
 
-private fun findMediaContentAudioUrl(item: Element): String? =
-    item
+private fun findMediaContentAudioUrl(parent: Element): String? =
+    parent
         .directChildElements(XML_TAG_CONTENT)
         .mapNotNull { media ->
-            val url = media.getAttribute(ATTR_URL).trim()
-            val medium = media.getAttribute("medium").lowercase()
-            val type = media.getAttribute("type").lowercase()
+            val url = media.attr(ATTR_URL).trim()
+            val medium = media.attr(ATTR_MEDIUM).lowercase()
+            val type = media.attr(ATTR_TYPE).lowercase()
             url.takeIf {
                 it.isNotBlank() &&
                     (medium == CONTENT_TYPE_AUDIO ||
@@ -570,13 +620,26 @@ private fun findMediaContentAudioUrl(item: Element): String? =
         }
         .firstOrNull()
 
+private fun findNonImageMediaContentUrl(parent: Element): String? =
+    parent
+        .directChildElements(XML_TAG_CONTENT)
+        .mapNotNull { media ->
+            val url = media.attr(ATTR_URL).trim()
+            val medium = media.attr(ATTR_MEDIUM).lowercase()
+            val type = media.attr(ATTR_TYPE).lowercase()
+            url.takeIf {
+                it.isNotBlank() && medium != XML_TAG_IMAGE && !type.startsWith(MIME_IMAGE_PREFIX)
+            }
+        }
+        .firstOrNull()
+
 private fun findAtomLinkEnclosureAudioUrl(item: Element): String? =
     item
         .directChildElements(XML_TAG_LINK)
         .mapNotNull { link ->
-            val rel = link.getAttribute("rel").trim().lowercase()
-            val href = link.getAttribute("href").trim()
-            val type = link.getAttribute("type").lowercase()
+            val rel = link.attr("rel").trim().lowercase()
+            val href = link.attr(ATTR_HREF).trim()
+            val type = link.attr(ATTR_TYPE).lowercase()
             href.takeIf {
                 rel == XML_TAG_ENCLOSURE &&
                     it.isNotBlank() &&
@@ -585,26 +648,33 @@ private fun findAtomLinkEnclosureAudioUrl(item: Element): String? =
         }
         .firstOrNull()
 
-internal fun extractPodcastDurationLabel(item: Element): String? {
+internal fun extractPodcastDurationLabel(
+    item: Element,
+    mediaGroup: Element? = item.firstDirectChildElement(XML_TAG_GROUP),
+): String? {
     val raw =
         item.firstDirectChildText("duration")
-            ?: item
-                .directChildElements(XML_TAG_CONTENT)
-                .map { it.getAttribute("duration").trim() }
-                .firstOrNull { it.isNotBlank() }
+            ?: findMediaContentDuration(item)
+            ?: mediaGroup?.let(::findMediaContentDuration)
             ?: return null
     val seconds = parseDurationToSecondsLong(raw) ?: return raw
     val minutes = seconds / SECONDS_PER_MIN
     val remSeconds = seconds % SECONDS_PER_MIN
-    return "%d:%02d".format(java.util.Locale.US, minutes, remSeconds)
+    return "%d:%02d".format(Locale.US, minutes, remSeconds)
 }
+
+private fun findMediaContentDuration(parent: Element): String? =
+    parent
+        .directChildElements(XML_TAG_CONTENT)
+        .map { it.attr("duration").trim() }
+        .firstOrNull { it.isNotBlank() }
 
 internal fun extractItunesImageHref(parent: Element, baseUrl: String): String? {
     val imgEl =
         parent.directChildElements(XML_TAG_IMAGE).firstOrNull {
-            it.getAttribute("href").isNotBlank()
+            it.attr(ATTR_HREF).isNotBlank()
         } ?: return null
-    val href = imgEl.getAttribute("href").trim()
+    val href = imgEl.attr(ATTR_HREF).trim()
     return resolveRelativeUrl(baseUrl, href)
 }
 
@@ -638,17 +708,17 @@ internal fun extractAtomLink(
     val chosen =
         if (preferAlternate) {
             links.firstOrNull {
-                val rel = it.getAttribute("rel").trim().lowercase()
-                (rel.isEmpty() || rel == "alternate") && it.getAttribute("href").isNotBlank()
+                val rel = it.attr("rel").trim().lowercase()
+                (rel.isEmpty() || rel == "alternate") && it.attr(ATTR_HREF).isNotBlank()
             }
                 ?: links.firstOrNull {
-                    val rel = it.getAttribute("rel").trim().lowercase()
-                    rel != "enclosure" && it.getAttribute("href").isNotBlank()
+                    val rel = it.attr("rel").trim().lowercase()
+                    rel != "enclosure" && it.attr(ATTR_HREF).isNotBlank()
                 }
         } else {
-            links.firstOrNull { it.getAttribute("href").isNotBlank() }
+            links.firstOrNull { it.attr(ATTR_HREF).isNotBlank() }
         }
-    val href = chosen?.getAttribute("href")?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    val href = chosen?.attr(ATTR_HREF)?.trim()?.takeIf { it.isNotBlank() } ?: return null
     return resolveRelativeUrl(baseUrl, href)
 }
 
@@ -667,19 +737,19 @@ internal fun extractMediaThumbnail(parent: Element, baseUrl: String): String? {
     val fromThumbTag =
         parent
             .directChildElements("thumbnail")
-            .map { it.getAttribute(ATTR_URL).trim() }
+            .map { it.attr(ATTR_URL).trim() }
             .firstOrNull { it.isNotBlank() }
             ?.let { resolveRelativeUrl(baseUrl, it) }
     val fromMediaContent =
         parent
             .directChildElements(XML_TAG_CONTENT)
             .firstOrNull { media ->
-                val medium = media.getAttribute("medium").lowercase()
-                val type = media.getAttribute("type").lowercase()
-                val url = media.getAttribute(ATTR_URL).trim()
-                url.isNotBlank() && (medium == XML_TAG_IMAGE || type.startsWith("image/"))
+                val medium = media.attr(ATTR_MEDIUM).lowercase()
+                val type = media.attr(ATTR_TYPE).lowercase()
+                val url = media.attr(ATTR_URL).trim()
+                url.isNotBlank() && (medium == XML_TAG_IMAGE || type.startsWith(MIME_IMAGE_PREFIX))
             }
-            ?.let { resolveRelativeUrl(baseUrl, it.getAttribute(ATTR_URL).trim()) }
+            ?.let { resolveRelativeUrl(baseUrl, it.attr(ATTR_URL).trim()) }
     return fromThumbTag ?: fromMediaContent
 }
 
@@ -687,11 +757,11 @@ internal fun extractEnclosureImage(item: Element, baseUrl: String): String? =
     item
         .directChildElements(XML_TAG_ENCLOSURE)
         .firstOrNull { enclosure ->
-            val type = enclosure.getAttribute("type").lowercase()
-            val url = enclosure.getAttribute(ATTR_URL).trim()
-            url.isNotBlank() && type.startsWith("image/")
+            val type = enclosure.attr(ATTR_TYPE).lowercase()
+            val url = enclosure.attr(ATTR_URL).trim()
+            url.isNotBlank() && type.startsWith(MIME_IMAGE_PREFIX)
         }
-        ?.let { resolveRelativeUrl(baseUrl, it.getAttribute(ATTR_URL).trim()) }
+        ?.let { resolveRelativeUrl(baseUrl, it.attr(ATTR_URL).trim()) }
 
 internal fun sanitizeFeedHtml(rawHtml: String, baseUrl: String): String {
     val withoutDangerousBlocks =
@@ -746,26 +816,7 @@ internal fun plainTextExcerpt(rawHtml: String): String {
 }
 
 internal fun decodeHtmlText(raw: String): String =
-    raw.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace(NUMERIC_ENTITY_DEC_REGEX) { m ->
-            decodeCodepointOrDefault(m.groupValues[1].toIntOrNull(), m.value)
-        }
-        .replace(NUMERIC_ENTITY_HEX_REGEX) { m ->
-            decodeCodepointOrDefault(m.groupValues[1].toIntOrNull(HEX_RADIX), m.value)
-        }
-
-private fun decodeCodepointOrDefault(codepoint: Int?, fallback: String): String =
-    if (codepoint != null && codepoint in MIN_PRINTABLE_CODEPOINT..MAX_UNICODE_CODEPOINT) {
-        String(Character.toChars(codepoint))
-    } else {
-        fallback
-    }
+    Parser.unescapeEntities(raw, false).replace('\u00A0', ' ').replace("\u0000", "")
 
 internal fun normalizeFeedTimestamp(raw: String?): String? {
     val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
@@ -786,49 +837,67 @@ internal fun resolveRelativeUrl(baseUrl: String, candidate: String): String? = r
         if (isHttpOrHttpsUrl(trimmed)) {
             trimmed
         } else if (trimmed.startsWith("//")) {
-            val scheme = URI.create(baseUrl).scheme ?: "https"
+            val scheme = URI(baseUrl.trim()).scheme ?: "https"
             "$scheme:$trimmed"
         } else {
-            URI.create(baseUrl.trim()).resolve(trimmed).toString()
+            URI(baseUrl.trim()).resolve(trimmed).toString()
         }
-    resolved.takeIf(::isHttpOrHttpsUrl)
+    val parsed = URI(resolved)
+    val validScheme =
+        parsed.scheme.equals("http", ignoreCase = true) ||
+            parsed.scheme.equals("https", ignoreCase = true)
+    resolved.takeIf { validScheme && !parsed.host.isNullOrBlank() }
 }
     .getOrNull()
 
 internal fun stripLeadingBom(text: String): String = text.removePrefix("\uFEFF")
 
-internal fun Element.localOrTagName(): String =
-    localName?.takeIf { it.isNotBlank() } ?: tagName.substringAfter(':')
+internal fun Element.localOrTagName(): String = tagName().substringAfter(':')
 
-internal fun Element.directChildElements(localTarget: String): List<Element> {
-    val list = mutableListOf<Element>()
-    val children = childNodes
-    for (i in 0 until children.length) {
-        val node = children.item(i)
-        if (node.nodeType == Node.ELEMENT_NODE) {
-            val el = node as Element
-            if (el.localOrTagName().equals(localTarget, ignoreCase = true)) {
-                list.add(el)
-            }
-        }
-    }
-    return list
-}
+internal fun Element.directChildElements(localTarget: String): List<Element> =
+    children().filter { it.localOrTagName().equals(localTarget, ignoreCase = true) }
 
 internal fun Element.firstDirectChildElement(localTarget: String): Element? =
-    directChildElements(localTarget).firstOrNull()
+    children().firstOrNull { it.localOrTagName().equals(localTarget, ignoreCase = true) }
 
 internal fun Element.firstDirectChildText(localTarget: String): String? =
-    firstDirectChildElement(localTarget)?.textContent?.trim()?.takeIf { it.isNotEmpty() }
+    firstDirectChildElement(localTarget)?.wholeText()?.trim()?.takeIf { it.isNotEmpty() }
 
+internal fun Element.firstDirectAtomText(localTarget: String): String? {
+    val el = firstDirectChildElement(localTarget) ?: return null
+    val decoded =
+        when (el.attr(ATTR_TYPE).trim().lowercase(Locale.ROOT)) {
+            "html" -> decodeHtmlText(el.wholeText())
+            ATTR_VALUE_XHTML -> plainTextExcerpt(el.html())
+            else -> el.wholeText().replace('\u00A0', ' ').replace("\u0000", "")
+        }
+    return decoded.trim().takeIf { it.isNotEmpty() }
+}
+
+internal fun Element.firstDirectChildRichContent(localTarget: String): String? {
+    val el = firstDirectChildElement(localTarget) ?: return null
+    val isXhtml = el.attr(ATTR_TYPE).equals(ATTR_VALUE_XHTML, ignoreCase = true)
+    val raw =
+        if (isXhtml || el.childrenSize() > 0) {
+            el.html()
+        } else {
+            el.wholeText()
+        }
+    return raw.trim().takeIf { it.isNotEmpty() }
+}
+
+private val ALLOWED_FEED_ROOT_NAMES = setOf("feed", "rss", "rdf", "channel")
+private val FEED_ROOT_START_TAG_REGEX =
+    Regex("""<(?:[A-Za-z0-9_.-]+:)?(?:rss|feed|rdf|channel)(?=[\s/>])""", RegexOption.IGNORE_CASE)
+private val EXTERNAL_ENTITY_REGEX =
+    Regex("""<!ENTITY\b[^>]*\b(?:SYSTEM|PUBLIC)\b""", RegexOption.IGNORE_CASE)
+private val YOUTUBE_VIDEO_ID_REGEX = Regex("""^[A-Za-z0-9_-]{6,32}$""")
 private const val MAX_SUMMARY_EXCERPT_CHARS = 500
 private const val MAX_FEED_ERROR_CHARS = 120
-private const val MIN_PRINTABLE_CODEPOINT = 32
-private const val MAX_UNICODE_CODEPOINT = 0x10FFFF
-private const val HEX_RADIX = 16
 private const val XML_TAG_TITLE = "title"
 private const val XML_TAG_DESCRIPTION = "description"
 private const val XML_TAG_CONTENT = "content"
+private const val XML_TAG_GROUP = "group"
 private const val XML_TAG_LANGUAGE = "language"
 private const val XML_TAG_LINK = "link"
 private const val XML_TAG_AUTHOR = "author"
@@ -836,8 +905,13 @@ private const val XML_TAG_ENCLOSURE = "enclosure"
 private const val XML_TAG_IMAGE = "image"
 private const val CONTENT_TYPE_AUDIO = "audio"
 private const val MIME_AUDIO_PREFIX = "audio/"
+private const val MIME_IMAGE_PREFIX = "image/"
 private const val SECONDS_PER_MIN = 60L
 private const val ATTR_URL = "url"
+private const val ATTR_HREF = "href"
+private const val ATTR_TYPE = "type"
+private const val ATTR_MEDIUM = "medium"
+private const val ATTR_VALUE_XHTML = "xhtml"
 private const val HTTP_PREFIX = "http://"
 private const val HTTPS_PREFIX = "https://"
 private val YOUTUBE_CHANNEL_EXTRACT_REGEX =
@@ -859,5 +933,3 @@ private val IMG_TAG_REGEX = Regex("""<img\b[^>]*>""", RegexOption.IGNORE_CASE)
 private val IMG_SRC_VALUE_REGEX = Regex("""\bsrc\s*=\s*(["'])([^"']+)\1""", RegexOption.IGNORE_CASE)
 private val HTML_TAG_REGEX = Regex("""<[^>]+>""")
 private val WHITESPACE_RUN_REGEX = Regex("""\s+""")
-private val NUMERIC_ENTITY_DEC_REGEX = Regex("""&#(\d{1,7});""")
-private val NUMERIC_ENTITY_HEX_REGEX = Regex("""&#x([0-9a-fA-F]{1,6});""")

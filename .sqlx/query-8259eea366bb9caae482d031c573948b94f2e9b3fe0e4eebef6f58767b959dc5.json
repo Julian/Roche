@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entry_state (entry_id, inbox_state, progress)\n             VALUES ('strict-entry-1', 'unread', 0.4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "8259eea366bb9caae482d031c573948b94f2e9b3fe0e4eebef6f58767b959dc5"
+}

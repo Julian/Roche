@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)\n                 VALUES ('feed_url', ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "40ea5c2bc68a1e15fa6a672c4ac408dd1de1706e3d1a5b50107e14e1b8506dcb"
+}

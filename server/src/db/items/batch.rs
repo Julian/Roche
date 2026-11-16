@@ -59,28 +59,30 @@ impl ItemRepo<'_> {
                 matched
             }
             ArchiveBatchScope::Feed { feed_id } => {
-                sqlx::query_scalar(
+                let max_batch = i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000);
+                sqlx::query_scalar!(
                     "SELECT es.entry_id FROM entry_state es
                      JOIN entries e ON e.id = es.entry_id
                      WHERE e.merged_into_id IS NULL
                        AND es.inbox_state = 'unread'
                        AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.entry_id = es.entry_id AND ce.collection_id = ?)
                      LIMIT ?",
+                    feed_id,
+                    max_batch,
                 )
-                .bind(feed_id.as_str())
-                .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
                 .fetch_all(self.pool)
                 .await?
             }
             ArchiveBatchScope::AllUnread => {
-                sqlx::query_scalar(
+                let max_batch = i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000);
+                sqlx::query_scalar!(
                     "SELECT es.entry_id FROM entry_state es
                      JOIN entries e ON e.id = es.entry_id
                      WHERE e.merged_into_id IS NULL
                        AND es.inbox_state = 'unread'
                      LIMIT ?",
+                    max_batch,
                 )
-                .bind(i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000))
                 .fetch_all(self.pool)
                 .await?
             }
@@ -127,25 +129,27 @@ impl ItemRepo<'_> {
         // Batch-archived items whose progress had already reached >= 0.9 are auto-logged,
         // while unopened / skimmed bulk-archived items (progress < 0.9) never touch consumption_log.
         for id in &archived_ids {
-            let row: Option<(EntryKind, f64, Option<DateTime<Utc>>)> = sqlx::query_as(
-                "SELECT e.kind, es.progress, es.read_at
+            let row = sqlx::query!(
+                "SELECT e.kind AS \"kind: EntryKind\",
+                        es.progress,
+                        es.read_at AS \"read_at: DateTime<Utc>\"
                  FROM entries e
                  JOIN entry_state es ON es.entry_id = e.id
                  WHERE e.id = ?",
+                id,
             )
-            .bind(id)
             .fetch_optional(&mut *tx)
             .await?;
-            if let Some((kind, prog, r_at)) = row
-                && prog >= 0.9
+            if let Some(row) = row
+                && row.progress >= 0.9
             {
                 maybe_auto_log_feed_completion_in_tx(
                     &mut tx,
                     id,
-                    kind,
+                    row.kind,
                     InboxState::Dismissed,
-                    prog,
-                    r_at.unwrap_or(now),
+                    row.progress,
+                    row.read_at.unwrap_or(now),
                 )
                 .await?;
             }
@@ -171,8 +175,10 @@ impl ItemRepo<'_> {
     pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
         use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 
-        let candidates: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT e.id, COALESCE(e.url, ''), e.summary
+        let candidates = sqlx::query!(
+            "SELECT e.id,
+                    COALESCE(e.url, '') AS \"url!: String\",
+                    e.summary AS \"summary!: String\"
              FROM entries e
              LEFT JOIN entry_content ec ON ec.entry_id = e.id
              WHERE e.summary IS NOT NULL
@@ -195,7 +201,10 @@ impl ItemRepo<'_> {
             tokio::task::spawn_blocking(move || {
                 candidates
                     .into_iter()
-                    .filter_map(|(id, url_str, raw_summary)| {
+                    .filter_map(|row| {
+                        let id = row.id;
+                        let url_str = row.url;
+                        let raw_summary = row.summary;
                         let excerpt =
                             HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
                         if excerpt == raw_summary {
@@ -220,26 +229,26 @@ impl ItemRepo<'_> {
         let count = u64::try_from(normalized.len()).unwrap_or(0);
         let mut tx = self.pool.begin().await?;
         for (id, excerpt, thumb) in normalized {
-            sqlx::query(
+            sqlx::query!(
                 "INSERT INTO entry_content (entry_id, content_html, content_type)
                  SELECT id, summary, 'article' FROM entries WHERE id = ?
                  ON CONFLICT(entry_id) DO UPDATE SET
                      content_html = COALESCE(NULLIF(entry_content.content_html, ''), (SELECT summary FROM entries WHERE id = ?))",
+                id,
+                id,
             )
-            .bind(&id)
-            .bind(&id)
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
+            sqlx::query!(
                 "UPDATE entries
                  SET thumbnail_url = COALESCE(thumbnail_url, ?),
                      summary = ?
                  WHERE id = ?",
+                thumb,
+                excerpt,
+                id,
             )
-            .bind(thumb)
-            .bind(&excerpt)
-            .bind(&id)
             .execute(&mut *tx)
             .await?;
         }
@@ -250,8 +259,11 @@ impl ItemRepo<'_> {
     pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
         use crate::{content::fetcher::HtmlSanitizer, feeds::youtube::YouTubeParser};
 
-        let candidates: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT e.id, COALESCE(e.url, ''), ec.content_html, e.thumbnail_url
+        let candidates = sqlx::query!(
+            "SELECT e.id,
+                    COALESCE(e.url, '') AS \"url!: String\",
+                    ec.content_html AS \"content_html?: String\",
+                    e.thumbnail_url
              FROM entries e
              LEFT JOIN entry_content ec ON ec.entry_id = e.id
              WHERE (
@@ -278,7 +290,11 @@ impl ItemRepo<'_> {
         let updates: Vec<(String, Option<String>)> = tokio::task::spawn_blocking(move || {
             candidates
                 .into_iter()
-                .filter_map(|(id, url_str, html_opt, old_thumb)| {
+                .filter_map(|row| {
+                    let id = row.id;
+                    let url_str = row.url;
+                    let html_opt = row.content_html;
+                    let old_thumb = row.thumbnail_url;
                     let base_url = Url::parse(&url_str).ok();
                     let new_thumb = html_opt
                         .as_deref()
@@ -307,9 +323,7 @@ impl ItemRepo<'_> {
         let count = u64::try_from(updates.len()).unwrap_or(0);
         let mut tx = self.pool.begin().await?;
         for (id, thumb) in updates {
-            sqlx::query("UPDATE entries SET thumbnail_url = ? WHERE id = ?")
-                .bind(thumb)
-                .bind(&id)
+            sqlx::query!("UPDATE entries SET thumbnail_url = ? WHERE id = ?", thumb, id)
                 .execute(&mut *tx)
                 .await?;
         }

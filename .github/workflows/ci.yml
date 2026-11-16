@@ -45,6 +45,8 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Run tests
+        env:
+          SQLX_OFFLINE: "true"
         run: cargo test --workspace --locked
       - name: Run migration wrapper unit tests
         run: python3 -m unittest discover -s scripts -p "test_*.py" -v
@@ -205,6 +207,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Build server release binary
         env:
+          SQLX_OFFLINE: "true"
           TAG: ${{ github.ref_name }}
         run: |
           cargo build --release --locked -p roche-server

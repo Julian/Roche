@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries (id, kind, title, summary)\n             VALUES ('ephemeral-gap-row', 'article', 'Gap Row', 'Deleted before 012')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "2d138014b966adbd5c2ace2607d73d8be3caf7e6ba52424b7e59d83bf25d3aa5"
+}

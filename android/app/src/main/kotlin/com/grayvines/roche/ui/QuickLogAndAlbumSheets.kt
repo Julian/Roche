@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -59,6 +60,8 @@ internal fun AlbumNoteModalSheet(
         Column(
             modifier =
                 Modifier.fillMaxWidth()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .testTag("album_note_modal_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -187,6 +190,7 @@ private fun QuickLogSheetBody(
     Column(
         modifier =
             Modifier.fillMaxWidth()
+                .imePadding()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 10.dp)
                 .testTag("quick_log_sheet"),

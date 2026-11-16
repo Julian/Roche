@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries SET updated_at = ?\n                         WHERE id IN (\n                             SELECT ce.entry_id FROM collection_entries ce\n                             JOIN entries te ON te.id = ce.collection_id\n                             JOIN collection_specs cs ON cs.collection_id = te.id\n                             WHERE cs.collection_role = 'tag'\n                               AND (cs.slug = ? OR LOWER(te.title) = LOWER(?))\n                               AND strftime('%Y-%m-%dT%H:%M:%fZ', te.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                         )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "722d04036d86ba71380cf69704206deb1809fd12abff5f7c23fae468656b6c45"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id as \"collection_id!\" FROM collection_entries\n                   WHERE entry_id = ?\n                     AND collection_id IN (\n                         SELECT collection_id FROM collection_specs WHERE collection_role = 'want'\n                     )",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c8c1fd7049700e2e343e23a9a5c62fb13624ef15cf7bfd042ef664b088f4819c"
+}

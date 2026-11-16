@@ -1,0 +1,165 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.id as \"id!\", cs.slug as \"slug?\", e.title as \"title!\",\n                          e.summary as \"summary?\", e.kind as \"kind!: EntryKind\",\n                          cs.mode as \"mode!: CollectionMode\",\n                          cs.collection_role as \"collection_role!: CollectionRole\",\n                          cs.rule_json as \"rule_json?\",\n                          cs.show_in_lists as \"show_in_lists!: bool\",\n                          cs.color as \"color?\",\n                          EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) as \"has_generator!: bool\",\n                          e.created_at as \"created_at!: DateTime<Utc>\",\n                          e.updated_at as \"updated_at!: DateTime<Utc>\"\n                   FROM collection_specs cs\n                   JOIN entries e ON e.id = cs.collection_id\n                   WHERE e.merged_into_id IS NULL AND cs.slug = ?\n                   LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "slug?",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "name": "title!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "name": "summary?",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "name": "kind!: EntryKind",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "mode!: CollectionMode",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "name": "collection_role!: CollectionRole",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "collection_role"
+          }
+        }
+      },
+      {
+        "name": "rule_json?",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "rule_json"
+          }
+        }
+      },
+      {
+        "name": "show_in_lists!: bool",
+        "ordinal": 8,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "show_in_lists"
+          }
+        }
+      },
+      {
+        "name": "color?",
+        "ordinal": 9,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_specs",
+            "name": "color"
+          }
+        }
+      },
+      {
+        "name": "has_generator!: bool",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 11,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at!: DateTime<Utc>",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b5ca70654e505e43738a5c8a6cdab26bed7490d8b0b9f6bc7c0cf3652bf76483"
+}

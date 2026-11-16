@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE OR IGNORE entry_identifiers SET entry_id = ? WHERE entry_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5824fa8ec96977f3da4d2ef6fc2b93381ca9e061ac890ab937989188d7f1e122"
+}

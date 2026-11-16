@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO entries_fts (rowid, entry_id, title, creators, summary, content_html)\n         SELECT e.rowid, e.id, e.title, e.creators_json, COALESCE(e.summary, ''), COALESCE(ec.content_html, '')\n         FROM entries e\n         LEFT JOIN entry_content ec ON ec.entry_id = e.id\n         WHERE e.merged_into_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "1d4e03de4bb281d37327963f25540312762aa42703175677a83c94fe7d8b3cf2"
+}

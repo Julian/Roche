@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT deleted_at AS \"deleted_at: DateTime<Utc>\" FROM sync_tombstones\n                 WHERE entity_type = 'collection_entry' AND natural_key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "deleted_at: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sync_tombstones",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2bb325c4bd14cdc32305a40e490f9a590bd5bebb674680e4c8d8fcb479144684"
+}

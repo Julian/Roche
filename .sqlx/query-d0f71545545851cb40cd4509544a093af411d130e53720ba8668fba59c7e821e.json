@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) AS \"iso?: String\" FROM entries WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "iso?: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "d0f71545545851cb40cd4509544a093af411d130e53720ba8668fba59c7e821e"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)\n                 VALUES (?, ?, ?, ?)\n                 ON CONFLICT(collection_id, entry_id) DO UPDATE SET\n                    position = COALESCE(excluded.position, collection_entries.position),\n                    added_at = CASE\n                        WHEN strftime('%Y-%m-%dT%H:%M:%fZ', ?) > strftime('%Y-%m-%dT%H:%M:%fZ', collection_entries.added_at)\n                          OR (excluded.position IS NOT NULL AND excluded.position IS NOT collection_entries.position)\n                        THEN excluded.added_at\n                        ELSE collection_entries.added_at\n                    END",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "fe9d61aeede8359b289fab1e118dd4467dd9d72bcb5cf7981b642f60713b4595"
+}

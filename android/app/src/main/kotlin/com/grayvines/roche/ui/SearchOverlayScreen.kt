@@ -1,6 +1,5 @@
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -58,29 +57,55 @@ import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
+private data class RetainedSearchDisplay(
+    val state: MainUiState,
+    val canEditQuery: Boolean,
+)
+
+@Composable
+private fun rememberSearchDisplayState(
+    state: MainUiState,
+    isSearchActive: Boolean,
+): RetainedSearchDisplay {
+    var sawActiveSearch by remember { mutableStateOf(isSearchActive) }
+    var retainedState by remember { mutableStateOf(state) }
+    if (isSearchActive) {
+        sawActiveSearch = true
+        retainedState = state
+    } else if (!sawActiveSearch) {
+        retainedState = state
+    }
+    val effectiveState = if (sawActiveSearch && !isSearchActive) retainedState else state
+    return RetainedSearchDisplay(
+        state = effectiveState,
+        canEditQuery = !sawActiveSearch || isSearchActive,
+    )
+}
+
 @Composable
 fun SearchOverlay(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    isSearchActive: Boolean = state.isSearchOpen,
 ) {
-    BackHandler { onAction(MainAction.CloseSearch) }
     val colors = LocalRocheColors.current
     val focusRequester = remember { FocusRequester() }
+    val (displayState, canEditQuery) = rememberSearchDisplayState(state, isSearchActive)
     var scopeFilter by rememberSaveable { mutableStateOf(SearchScopeFilter.ALL) }
     val visibleResults =
-        remember(state.searchResults, scopeFilter) {
-            state.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
+        remember(displayState.searchResults, scopeFilter) {
+            displayState.searchResults.filter { matchesSearchScopeFilter(it, scopeFilter) }
         }
     val subtitleText =
-        if (state.searchQuery.isBlank() && scopeFilter == SearchScopeFilter.ALL) {
-            "Type to search ${state.allEntries.size} entries"
+        if (displayState.searchQuery.isBlank() && scopeFilter == SearchScopeFilter.ALL) {
+            "Type to search ${displayState.allEntries.size} entries"
         } else {
             "${visibleResults.size} matches"
         }
 
-    LaunchedEffect(Unit) {
-        if (state.searchQuery.isBlank()) {
+    LaunchedEffect(isSearchActive) {
+        if (isSearchActive && displayState.searchQuery.isBlank()) {
             runCatching { focusRequester.requestFocus() }
         }
     }
@@ -100,7 +125,8 @@ fun SearchOverlay(
             },
         )
         SearchInputHeaderControls(
-            state = state,
+            state = displayState,
+            canEditQuery = canEditQuery,
             scopeFilter = scopeFilter,
             focusRequester = focusRequester,
             onSelectScope = { scopeFilter = it },
@@ -110,12 +136,12 @@ fun SearchOverlay(
 
         SearchResultsBody(
             results = visibleResults,
-            searchQuery = state.searchQuery,
+            searchQuery = displayState.searchQuery,
             selectedScope = scopeFilter,
-            ultraDense = state.settings.ultraDenseRows,
-            swipeToArchive = state.settings.swipeToArchive,
-            playingEntryId = state.playerState.currentEntryId,
-            nextQueuedAudioEntryId = state.nextQueuedAudioEntryId,
+            ultraDense = displayState.settings.ultraDenseRows,
+            swipeToArchive = displayState.settings.swipeToArchive,
+            playingEntryId = displayState.playerState.currentEntryId,
+            nextQueuedAudioEntryId = displayState.nextQueuedAudioEntryId,
             onAction = onAction,
             listState = listState,
         )
@@ -125,6 +151,7 @@ fun SearchOverlay(
 @Composable
 private fun SearchInputHeaderControls(
     state: MainUiState,
+    canEditQuery: Boolean,
     scopeFilter: SearchScopeFilter,
     focusRequester: FocusRequester,
     onSelectScope: (SearchScopeFilter) -> Unit,
@@ -134,7 +161,11 @@ private fun SearchInputHeaderControls(
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         OutlinedTextField(
             value = state.searchQuery,
-            onValueChange = { onAction(MainAction.UpdateSearchQuery(it)) },
+            onValueChange = { next ->
+                if (canEditQuery) {
+                    onAction(MainAction.UpdateSearchQuery(next))
+                }
+            },
             leadingIcon = { SearchIcon(tint = colors.textMuted, size = 18.dp) },
             trailingIcon =
                 if (state.searchQuery.isNotEmpty()) {

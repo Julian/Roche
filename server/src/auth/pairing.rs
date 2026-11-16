@@ -82,7 +82,7 @@ mod tests {
         let code = pairing.create_code(300).await.unwrap();
 
         // Raw pairing code is never stored in plaintext in the database
-        let stored_code: String = sqlx::query_scalar("SELECT code FROM pairing_codes")
+        let stored_code: String = sqlx::query_scalar!("SELECT code FROM pairing_codes")
             .fetch_one(db.pool())
             .await
             .unwrap();

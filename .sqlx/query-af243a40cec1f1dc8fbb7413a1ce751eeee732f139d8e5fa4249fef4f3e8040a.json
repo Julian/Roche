@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE feed_sources SET feed_title = ? WHERE collection_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "af243a40cec1f1dc8fbb7413a1ce751eeee732f139d8e5fa4249fef4f3e8040a"
+}

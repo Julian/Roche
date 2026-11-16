@@ -828,12 +828,15 @@ async fn test_web_csp_and_sanitized_reader_image_privacy_attributes() {
         })
         .await
         .unwrap();
-    sqlx::query("INSERT OR REPLACE INTO entry_content (entry_id, content_html) VALUES (?, ?)")
-        .bind(&art.id)
-        .bind("<p>Body with <img src=\"/fig1.png\" referrerpolicy=\"unsafe-url\"></p>")
-        .execute(db.pool())
-        .await
-        .unwrap();
+    let raw_html = "<p>Body with <img src=\"/fig1.png\" referrerpolicy=\"unsafe-url\"></p>";
+    sqlx::query!(
+        "INSERT OR REPLACE INTO entry_content (entry_id, content_html) VALUES (?, ?)",
+        art.id,
+        raw_html,
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
 
     let resp = get_authed(&app, &format!("/reader/{}", art.id), &cookie).await;
     assert_eq!(resp.status(), StatusCode::OK);

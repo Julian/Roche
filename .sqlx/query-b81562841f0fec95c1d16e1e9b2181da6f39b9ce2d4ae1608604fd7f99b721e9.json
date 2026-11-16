@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT interaction_updated_at AS \"interaction_updated_at: DateTime<Utc>\" FROM entry_state WHERE entry_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "interaction_updated_at: DateTime<Utc>",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_state",
+            "name": "interaction_updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "b81562841f0fec95c1d16e1e9b2181da6f39b9ce2d4ae1608604fd7f99b721e9"
+}

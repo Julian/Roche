@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE entries\n             SET thumbnail_url = COALESCE(thumbnail_url, ?),\n                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,\n                 kind = CASE WHEN ? IS NOT NULL AND kind = 'article' THEN 'podcast_episode' ELSE kind END,\n                 updated_at = ?\n             WHERE id = ?\n               AND ((thumbnail_url IS NULL AND ? IS NOT NULL)\n                    OR (creators_json = '[]' AND ? IS NOT NULL)\n                    OR (kind = 'article' AND ? IS NOT NULL))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "ff8f343d8cd693b8d08f5d22d3be75fa790d6e4cccc4162508598005f3ea010a"
+}

@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT content_html as \"content_html?\", content_type as \"content_type!\"\n               FROM entry_content WHERE entry_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "content_html?",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_content",
+            "name": "content_html"
+          }
+        }
+      },
+      {
+        "name": "content_type!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_content",
+            "name": "content_type"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "7a0f07bca8f2bc49a923857cfc6559b38fff97e21a82c780ba61d7e2ed011158"
+}

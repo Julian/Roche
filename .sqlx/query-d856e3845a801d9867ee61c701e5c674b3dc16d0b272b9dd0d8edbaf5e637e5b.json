@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"found!: i64\" FROM collection_entries\n                             WHERE collection_id = ? AND entry_id = ?\n                               AND strftime('%Y-%m-%dT%H:%M:%fZ', added_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d856e3845a801d9867ee61c701e5c674b3dc16d0b272b9dd0d8edbaf5e637e5b"
+}

@@ -28,7 +28,7 @@ import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
 import com.grayvines.roche.ui.components.MAX_BITMAP_DIMENSION_PX
 import com.grayvines.roche.ui.components.ThumbnailLoader
-import com.grayvines.roche.ui.components.calculateInSampleSize
+import com.grayvines.roche.ui.components.computeProportionalTargetSize
 import com.grayvines.roche.ui.components.pruneThumbnailDiskCache
 import java.io.File
 import java.lang.reflect.Proxy
@@ -961,9 +961,15 @@ class MainViewModelTest {
             assertFalse("javascript:" in paragraphHtml)
             assertTrue("bad link" in paragraphHtml)
 
-            // Tall 1200x12000 image is downsampled so neither dimension exceeds 2048px
-            val tallSample = calculateInSampleSize(1200, 12_000, 1440, 1440)
-            assertTrue(12_000 / tallSample <= MAX_BITMAP_DIMENSION_PX)
+            // Tall 1200x12000 image is downsampled proportionally so neither dimension exceeds
+            // MAX_BITMAP_DIMENSION_PX
+            val tallTarget = computeProportionalTargetSize(1200, 12_000, 1440)
+            assertNotNull(tallTarget)
+            assertEquals(144 to 1440, tallTarget)
+            val clampedTarget = computeProportionalTargetSize(1200, 12_000, 4096)
+            assertNotNull(clampedTarget)
+            assertTrue(clampedTarget!!.first <= MAX_BITMAP_DIMENSION_PX)
+            assertTrue(clampedTarget.second <= MAX_BITMAP_DIMENSION_PX)
 
             // ThumbnailLoader retries transient failures after FAILED_RETRY_COOLDOWN_MS
             var nowMs = 1_000L

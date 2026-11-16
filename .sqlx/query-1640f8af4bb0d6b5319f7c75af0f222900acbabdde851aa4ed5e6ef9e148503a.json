@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id,\n                    feed_url,\n                    source_type AS \"source_type: FeedType\",\n                    last_polled_at AS \"last_polled_at: DateTime<Utc>\",\n                    is_active AS \"is_active: bool\"\n             FROM feed_sources\n             WHERE feed_url = ? OR collection_id = ? OR collection_id = ?\n             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "name": "feed_url",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      },
+      {
+        "name": "source_type: FeedType",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "source_type"
+          }
+        }
+      },
+      {
+        "name": "last_polled_at: DateTime<Utc>",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "last_polled_at"
+          }
+        }
+      },
+      {
+        "name": "is_active: bool",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "is_active"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "1640f8af4bb0d6b5319f7c75af0f222900acbabdde851aa4ed5e6ef9e148503a"
+}

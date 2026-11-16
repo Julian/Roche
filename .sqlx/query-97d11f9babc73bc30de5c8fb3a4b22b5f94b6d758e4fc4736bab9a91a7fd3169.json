@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT remote_url as \"remote_url?\", duration as \"duration?: i64\"\n               FROM entry_media\n               WHERE entry_id = ? AND local_path IS NULL\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "remote_url?",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "remote_url"
+          }
+        }
+      },
+      {
+        "name": "duration?: i64",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "entry_media",
+            "name": "duration"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "97d11f9babc73bc30de5c8fb3a4b22b5f94b6d758e4fc4736bab9a91a7fd3169"
+}

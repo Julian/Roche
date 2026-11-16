@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM entries\n                         WHERE id IN (\n                             SELECT e.id FROM entries e\n                             JOIN collection_specs cs ON cs.collection_id = e.id\n                             WHERE cs.collection_role = 'tag'\n                               AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))\n                               AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                         )\n                         RETURNING id AS \"id!: String\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "entries",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "59367e9b6013eb2ae2609ccab16b06de5048fa8cbfaf2c863f0cc0bf5b765de1"
+}

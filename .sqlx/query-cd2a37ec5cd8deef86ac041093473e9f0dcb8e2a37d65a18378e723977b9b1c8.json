@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO activity_log (entity_type, entity_id, action, timestamp)\n             VALUES ('item', '1', 'archive', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 days')),\n                    ('item', '2', 'archive', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "cd2a37ec5cd8deef86ac041093473e9f0dcb8e2a37d65a18378e723977b9b1c8"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT ce.collection_id as \"collection_id!\"\n               FROM collection_entries ce\n               JOIN entries pe ON pe.id = ce.collection_id\n               WHERE ce.entry_id = ?\n                 AND pe.merged_into_id IS NULL\n                 AND pe.kind IN ('podcast', 'publication', 'channel')",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collection_entries",
+            "name": "collection_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1f8b3cb955541d8a5d143970fc26d8fdf59621ed972287cd219742679122efe9"
+}

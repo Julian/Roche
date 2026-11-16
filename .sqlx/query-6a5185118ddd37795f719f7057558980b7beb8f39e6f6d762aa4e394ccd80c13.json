@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT code FROM pairing_codes\n             WHERE datetime(expires_at) > datetime(?) AND failed_attempts < ?\n             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "code",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pairing_codes",
+            "name": "code"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6a5185118ddd37795f719f7057558980b7beb8f39e6f6d762aa4e394ccd80c13"
+}

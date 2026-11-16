@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT collection_id, feed_url FROM feed_sources WHERE TRIM(feed_url) != ''",
+  "describe": {
+    "columns": [
+      {
+        "name": "collection_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "name": "feed_url",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "feed_sources",
+            "name": "feed_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8cd839f49e4eceea868158409c64bb919f7decd7b1f1a1160b0b8a98e44c9210"
+}

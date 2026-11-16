@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT 1 AS \"found!: i64\" FROM entries e\n                         JOIN collection_specs cs ON cs.collection_id = e.id\n                         WHERE cs.collection_role = 'tag'\n                           AND (cs.slug = ? OR LOWER(e.title) = LOWER(?))\n                           AND strftime('%Y-%m-%dT%H:%M:%fZ', e.created_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)\n                         LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "found!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b279ff09292bb240debfd8b1705c45d7180cf752b13d241d8a95e476b1001925"
+}
