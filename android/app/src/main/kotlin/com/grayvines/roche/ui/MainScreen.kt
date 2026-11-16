@@ -39,6 +39,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
@@ -132,7 +133,12 @@ fun MainScreen(
             0.dp
         }
 
-    Box(modifier = modifier.fillMaxSize().background(colors.background)) {
+    Box(
+        modifier =
+            modifier.fillMaxSize().background(colors.background).semantics {
+                testTagsAsResourceId = true
+            }
+    ) {
         NavDisplay(
             backStack = navBackStack,
             modifier = Modifier.fillMaxSize(),
