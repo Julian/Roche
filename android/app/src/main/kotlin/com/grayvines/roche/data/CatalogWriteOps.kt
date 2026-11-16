@@ -20,31 +20,48 @@ internal const val COLLECTION_ENTRY_ENTITY = "collection_entry"
 suspend fun CatalogStore.attachEntryIdentifiers(
     entryId: String,
     identifiers: Map<String, String>,
-) {
-    if (entryId.isBlank() || identifiers.isEmpty()) return
-    withMutationLock { attachIdentifiersInDao(dao, entryId, identifiers) }
+): Boolean {
+    if (entryId.isBlank() || identifiers.isEmpty()) return false
+    val nowIso = nowUtcIso()
+    var attachedNew = false
+    withMutationLock { attachedNew = attachIdentifiersInDao(dao, entryId, identifiers, nowIso) }
+    if (attachedNew) {
+        notifyLocalMutation()
+    }
+    return attachedNew
 }
 
 internal suspend fun attachIdentifiersInDao(
     dao: RocheDao,
     entryId: String,
     identifiers: Map<String, String>,
-) {
-    val resolvedId = followMergedIdInDao(dao, entryId) ?: return
-    val entry = dao.getCatalogEntryById(resolvedId) ?: return
+    nowIso: String = nowUtcIso(),
+): Boolean {
+    val resolvedId = followMergedIdInDao(dao, entryId) ?: return false
+    val entry = dao.getCatalogEntryById(resolvedId) ?: return false
     val kind = EntryKind.fromWireValue(entry.kind)
-    val rows = identifiers.mapNotNull { (rawScheme, rawVal) ->
-        val scheme = normalizeIdentifierScheme(rawScheme)
-        val normVal = normalizeIdentifierValue(kind, scheme, rawVal)
-        if (scheme.isEmpty() || normVal.isEmpty()) {
-            null
-        } else {
-            EntryIdentifierEntity(scheme, normVal, resolvedId)
-        }
+    val existingPairs =
+        dao.getIdentifiersForEntry(resolvedId).map { it.scheme to it.value }.toHashSet()
+    val newRows =
+        identifiers
+            .mapNotNull { (rawScheme, rawVal) ->
+                val scheme = normalizeIdentifierScheme(rawScheme)
+                val normVal = normalizeIdentifierValue(kind, scheme, rawVal)
+                if (scheme.isEmpty() || normVal.isEmpty()) {
+                    null
+                } else {
+                    EntryIdentifierEntity(scheme, normVal, resolvedId)
+                }
+            }
+            .distinctBy { it.scheme to it.value }
+            .filter { it.scheme to it.value !in existingPairs }
+    if (newRows.isEmpty()) return false
+    dao.insertEntryIdentifiersIgnore(newRows)
+    val attached = dao.getIdentifiersForEntry(resolvedId).size > existingPairs.size
+    if (attached) {
+        dao.upsertCatalogEntry(entry.copy(updatedAt = nowIso, isLocalDirty = true))
     }
-    if (rows.isNotEmpty()) {
-        dao.insertEntryIdentifiersIgnore(rows)
-    }
+    return attached
 }
 
 internal suspend fun materializeFeedsForIds(

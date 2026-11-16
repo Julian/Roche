@@ -336,16 +336,18 @@ class MainScreenTest {
         composeRule.onNodeWithTag("daily_album_cover").performScrollTo().performClick()
         org.junit.Assert.assertEquals(listOf(album), openedMusicAlbums)
 
+        composeRule
+            .onNodeWithTag("daily_album_header_open_list_btn")
+            .performScrollTo()
+            .performClick()
         composeRule.onNodeWithTag("home_open_1001_list_btn").performScrollTo().performClick()
+        val expectedOpen1001Action =
+            com.grayvines.roche.ui.MainAction.OpenCompanionSection(
+                com.grayvines.roche.ui.CompanionSubTab.LISTS,
+                com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
+            )
         org.junit.Assert.assertEquals(
-            listOf(
-                com.grayvines.roche.ui.MainAction.SelectCatalogCollection(
-                    com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
-                ),
-                com.grayvines.roche.ui.MainAction.OpenCompanionSection(
-                    com.grayvines.roche.ui.CompanionSubTab.LISTS
-                ),
-            ),
+            listOf(expectedOpen1001Action, expectedOpen1001Action),
             actions,
         )
     }

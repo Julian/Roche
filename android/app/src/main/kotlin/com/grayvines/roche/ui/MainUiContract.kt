@@ -363,7 +363,10 @@ sealed interface MainAction {
 
     data object ResetBottomNavTabs : Mutation
 
-    data class OpenCompanionSection(val subTab: CompanionSubTab) : Ui
+    data class OpenCompanionSection(
+        val subTab: CompanionSubTab,
+        val collectionId: String? = null,
+    ) : Ui
 
     data class SelectCompanionSubTab(val subTab: CompanionSubTab) : Ui
 
@@ -665,18 +668,7 @@ private fun reduceCatalogUiAction(
     action: MainAction.Ui,
 ): TransientUiState =
     when (action) {
-        is MainAction.OpenCompanionSection ->
-            state
-                .clearSearch()
-                .copy(
-                    activeTab = AppTab.LISTS,
-                    companionSubTab = action.subTab,
-                    selectedReaderEntryId = null,
-                    readerContent = null,
-                    selectedFeedId = null,
-                    selectedTag = null,
-                    scopeOriginTab = null,
-                )
+        is MainAction.OpenCompanionSection -> reduceOpenCompanionSection(state, action)
         is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
         is MainAction.SelectCatalogCollection ->
             state.copy(selectedCatalogCollectionId = action.collectionId)
@@ -700,6 +692,34 @@ private fun reduceCatalogUiAction(
         MainAction.CloseRankSession -> state.copy(rankSession = null)
         else -> state
     }
+
+private fun reduceOpenCompanionSection(
+    state: TransientUiState,
+    action: MainAction.OpenCompanionSection,
+): TransientUiState =
+    state
+        .clearSearch()
+        .copy(
+            activeTab = AppTab.LISTS,
+            companionSubTab = action.subTab,
+            selectedCatalogCollectionId =
+                if (action.subTab == CompanionSubTab.LISTS && action.collectionId != null) {
+                    action.collectionId
+                } else {
+                    state.selectedCatalogCollectionId
+                },
+            selectedWantCollectionId =
+                if (action.subTab == CompanionSubTab.WANT && action.collectionId != null) {
+                    action.collectionId
+                } else {
+                    state.selectedWantCollectionId
+                },
+            selectedReaderEntryId = null,
+            readerContent = null,
+            selectedFeedId = null,
+            selectedTag = null,
+            scopeOriginTab = null,
+        )
 
 private fun reduceUpdateSearchQuery(state: TransientUiState, query: String): TransientUiState {
     val clean = query.trim()

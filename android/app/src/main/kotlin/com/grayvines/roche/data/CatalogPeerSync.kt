@@ -58,7 +58,9 @@ internal suspend fun hasLocalCatalogSyncData(dao: RocheDao): Boolean {
     val specIds = specs.map { it.collectionId }.toHashSet()
     val pool1001Ids =
         dao.getCollectionMemberships(ALBUMS_1001_COLLECTION_ID).map { it.entryId }.toHashSet()
-    return dao.getAllCatalogEntries().any { it.id !in specIds && it.id !in pool1001Ids }
+    return dao.getAllCatalogEntries().any {
+        it.isLocalDirty || it.id !in specIds && it.id !in pool1001Ids
+    }
 }
 
 private const val TOMBSTONE_COLLECTION_ENTRY = "collection_entry"
@@ -284,7 +286,7 @@ private fun hasNonSeedCatalogRows(
         allLogs.isNotEmpty() ||
         allComparisons.isNotEmpty() ||
         allGenerators.any { it.enabled || !it.currentEntryId.isNullOrBlank() } ||
-        allEntries.any { it.id !in pool1001Ids && it.id !in specIds }
+        allEntries.any { it.isLocalDirty || it.id !in pool1001Ids && it.id !in specIds }
 
 private data class OutgoingEntryFilterContext(
     val specIds: Set<String>,

@@ -138,11 +138,17 @@ class RocheRepository(
             }
             .flowOn(Dispatchers.Default)
 
+    private val prewarmedAlbumKeys: MutableSet<String> =
+        java.util.Collections.synchronizedSet(HashSet())
+
     suspend fun prewarm(): RepositorySnapshot = snapshot.first()
 
-    suspend fun resolveDailyAlbumStreaming(album: DailyAlbumSnapshot): DailyAlbumSnapshot {
+    suspend fun resolveDailyAlbumStreaming(
+        album: DailyAlbumSnapshot,
+        includeWikipedia: Boolean = false,
+    ): DailyAlbumSnapshot {
         val resolver = albumStreamingResolver ?: return album
-        val resolved = resolver.resolveStreamingIds(album)
+        val resolved = resolver.resolveStreamingIds(album, includeWikipedia = includeWikipedia)
         if (resolved.isNotEmpty() && album.entryId.isNotBlank()) {
             catalog.attachEntryIdentifiers(album.entryId, resolved)
         }
@@ -150,8 +156,11 @@ class RocheRepository(
     }
 
     suspend fun prewarmDailyAlbumStreaming(album: DailyAlbumSnapshot) {
-        if (albumStreamingResolver == null || album.hasYoutubePlaylistId) return
-        resolveDailyAlbumStreaming(album)
+        if (albumStreamingResolver == null) return
+        if (album.hasYoutubePlaylistId && !album.wikipediaUrl.isNullOrBlank()) return
+        val dedupKey = album.entryId.ifBlank { "${album.artist}|${album.name}|${album.spotifyId}" }
+        if (!prewarmedAlbumKeys.add(dedupKey)) return
+        resolveDailyAlbumStreaming(album, includeWikipedia = album.wikipediaUrl.isNullOrBlank())
     }
 
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =

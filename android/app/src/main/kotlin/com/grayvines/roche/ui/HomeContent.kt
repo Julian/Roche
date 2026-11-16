@@ -275,11 +275,19 @@ internal fun HomeDailyAlbumWidget(
     modifier: Modifier = Modifier,
 ) {
     val album = state.dailyAlbum
+    val open1001List = {
+        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, ALBUMS_1001_COLLECTION_ID))
+    }
     Column(
         modifier = modifier.fillMaxWidth().testTag("home_widget_daily_album"),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        RocheSectionHeader(label = "1001 Albums")
+        RocheSectionHeader(
+            label = "1001 Albums",
+            actionLabel = "Open List →",
+            actionTestTag = "daily_album_header_open_list_btn",
+            onActionClick = open1001List,
+        )
         RocheSurfaceCard {
             if (album != null) {
                 DailyAlbumSleeveCardBody(
@@ -291,9 +299,7 @@ internal fun HomeDailyAlbumWidget(
                 DailyAlbumPlaceholderBody(
                     completedCount = state.albumGenerator.completedCount,
                     totalCount = state.albumGenerator.totalCount,
-                    onOpenAlbumsList = {
-                        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS))
-                    },
+                    onOpenAlbumsList = open1001List,
                 )
             }
         }
@@ -676,8 +682,12 @@ private fun CompanionShortcutChips(
                 label = "1001 Albums",
                 selected = false,
                 onClick = {
-                    onAction(MainAction.SelectCatalogCollection(ALBUMS_1001_COLLECTION_ID))
-                    onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS))
+                    onAction(
+                        MainAction.OpenCompanionSection(
+                            CompanionSubTab.LISTS,
+                            ALBUMS_1001_COLLECTION_ID,
+                        )
+                    )
                 },
                 modifier = Modifier.testTag("home_open_1001_list_btn"),
             )

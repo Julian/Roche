@@ -503,6 +503,23 @@ class RankBoardAndGate5UiLogicTest {
                 deriveRocheBackStack(companionState),
             )
 
+            viewModel.dispatch(
+                MainAction.OpenCompanionSection(
+                    CompanionSubTab.LISTS,
+                    com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
+                )
+            )
+            val albumsListState =
+                viewModel.uiState.first {
+                    it.companionSubTab == CompanionSubTab.LISTS &&
+                        it.selectedCatalogCollectionId ==
+                            com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
+                }
+            assertEquals(
+                com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
+                albumsListState.selectedCatalogCollectionId,
+            )
+
             val scopedKey = RocheNavKey.ScopedInbox(feedId = "f-1", tag = null)
             val retainedScoped = resolveScopedInboxState(companionState, scopedKey, scopedState)
             assertEquals("Systems Weekly", retainedScoped.selectedFeedTitle)

@@ -495,17 +495,52 @@ fun UndoOrStatusSnackbar(
 internal fun RocheSectionHeader(
     label: String,
     modifier: Modifier = Modifier,
+    actionLabel: String? = null,
+    actionTestTag: String? = null,
+    onActionClick: (() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
-    Text(
-        text = label.uppercase(),
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontWeight = FontWeight.SemiBold,
-        fontSize = 10.5.sp,
-        letterSpacing = 0.7.sp,
-        modifier = modifier.padding(horizontal = 4.dp),
-    )
+    if (actionLabel == null || onActionClick == null) {
+        Text(
+            text = label.uppercase(),
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 10.5.sp,
+            letterSpacing = 0.7.sp,
+            modifier = modifier.padding(horizontal = 4.dp),
+        )
+        return
+    }
+    val actionMod =
+        Modifier.clip(RoundedCornerShape(4.dp))
+            .clickable(onClick = onActionClick)
+            .semantics { role = Role.Button }
+            .padding(horizontal = 4.dp, vertical = 2.dp)
+            .let { base -> if (actionTestTag != null) base.testTag(actionTestTag) else base }
+    Row(
+        modifier = modifier.fillMaxWidth().padding(horizontal = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label.uppercase(),
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 10.5.sp,
+            letterSpacing = 0.7.sp,
+        )
+        Text(
+            text = actionLabel.uppercase(),
+            color = colors.accentVerdigris,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 10.5.sp,
+            letterSpacing = 0.5.sp,
+            modifier = actionMod,
+        )
+    }
 }
 
 @Composable

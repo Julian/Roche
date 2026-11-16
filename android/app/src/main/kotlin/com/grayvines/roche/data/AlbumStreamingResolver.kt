@@ -24,13 +24,20 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
     private val inFlightMutex = Mutex()
     private val inFlightByKey = HashMap<String, Deferred<Map<String, String>>>()
 
-    suspend fun resolveStreamingIds(album: DailyAlbumSnapshot): Map<String, String> {
-        val key = album.entryId.ifBlank { "${album.artist}|${album.name}|${album.spotifyId}" }
+    suspend fun resolveStreamingIds(
+        album: DailyAlbumSnapshot,
+        includeWikipedia: Boolean = false,
+    ): Map<String, String> {
+        val baseKey = album.entryId.ifBlank { "${album.artist}|${album.name}|${album.spotifyId}" }
+        val key = "$baseKey|wiki=$includeWikipedia"
         val (deferred, isOwner) = acquireInFlight(key)
         if (!isOwner) {
             return deferred.await()
         }
-        val result = runSuspendCatching { performResolution(album) }.getOrDefault(emptyMap())
+        val result = runSuspendCatching {
+            performResolution(album, includeWikipedia)
+        }
+            .getOrDefault(emptyMap())
         inFlightMutex.withLock { inFlightByKey.remove(key) }
         deferred.complete(result)
         return result
@@ -49,8 +56,24 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         }
     }
 
-    private suspend fun performResolution(album: DailyAlbumSnapshot): Map<String, String> {
+    private suspend fun performResolution(
+        album: DailyAlbumSnapshot,
+        includeWikipedia: Boolean,
+    ): Map<String, String> {
         val resolved = LinkedHashMap<String, String>()
+        if (!album.hasYoutubePlaylistId) {
+            resolveStreamingPlatforms(album, resolved)
+        }
+        if (includeWikipedia && album.wikipediaUrl.isNullOrBlank()) {
+            resolveAlbumWikipediaSlug(transport, album)?.let { resolved[SCHEME_WIKIPEDIA] = it }
+        }
+        return resolved
+    }
+
+    private suspend fun resolveStreamingPlatforms(
+        album: DailyAlbumSnapshot,
+        resolved: MutableMap<String, String>,
+    ) {
         val seedUrl = album.candidateStreamingUrls().firstOrNull()
         if (seedUrl != null) {
             resolved.putAll(fetchOdesliPlatformIds(seedUrl))
@@ -67,7 +90,6 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
                 resolved[SCHEME_YT_MUSIC] = resolvedYt
             }
         }
-        return resolved
     }
 
     private suspend fun fetchOdesliPlatformIds(seedUrl: String): Map<String, String> {
@@ -144,6 +166,11 @@ internal fun DailyAlbumSnapshot.withResolvedStreamingIds(
         qobuzId = qobuzId ?: resolved[SCHEME_QOBUZ],
         deezerId = deezerId ?: resolved[SCHEME_DEEZER],
         amazonMusicId = amazonMusicId ?: resolved[SCHEME_AMAZON_MUSIC],
+        wikipediaUrl =
+            wikipediaUrl
+                ?: resolved[SCHEME_WIKIPEDIA]
+                    ?.let { externalIdentifierUrl(SCHEME_WIKIPEDIA, it) }
+                    ?.let(::sanitizeHttpUrl),
     )
 }
 
@@ -279,7 +306,7 @@ private fun scoreAlbumCandidate(
     return score
 }
 
-private fun normalizeMatchTokens(raw: String): String =
+internal fun normalizeMatchTokens(raw: String): String =
     stripAlbumEditionSuffix(raw).lowercase().replace(NON_ALNUM_REGEX, " ").trim()
 
 internal fun findFirstPlaylistId(element: JsonElement): String? =
@@ -376,6 +403,7 @@ private const val SCHEME_TIDAL = "tidal"
 private const val SCHEME_QOBUZ = "qobuz"
 private const val SCHEME_DEEZER = "deezer"
 private const val SCHEME_AMAZON_MUSIC = "amazon_music"
+private const val SCHEME_WIKIPEDIA = "wikipedia"
 private const val YT_BROWSE_PREFIX = "MPREb"
 private const val YT_OLAK_PREFIX = "OLAK5uy_"
 private const val YT_MUSIC_ORIGIN_URL = "https://music.youtube.com"

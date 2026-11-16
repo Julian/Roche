@@ -40,7 +40,7 @@ pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 15] = [
     "url",
 ];
 
-pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 22] = [
+pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 23] = [
     "wikipedia",
     "arxiv",
     "musicbrainz_release",
@@ -56,11 +56,12 @@ pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 22] = [
     "igdb",
     "discogs",
     "spotify",
+    "youtube_music",
     "apple_music",
     "tidal",
     "deezer",
-    "youtube_music",
     "qobuz",
+    "amazon_music",
     "bandcamp",
     "1001albums",
 ];
@@ -86,11 +87,33 @@ pub fn external_identifier_label(scheme: &str) -> &str {
         "deezer" => "Deezer",
         "youtube_music" => "YouTube Music",
         "qobuz" => "Qobuz",
+        "amazon_music" => "Amazon Music",
         "1001albums" => "1001 Albums",
         "bandcamp" => "Bandcamp",
         "url" => "Web",
         "feed_url" => "Feed",
         other => other,
+    }
+}
+
+fn is_http_url(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn direct_or_prefixed_url(prefix: &str, v: &str) -> String {
+    if is_http_url(v) { v.to_owned() } else { format!("{prefix}{v}") }
+}
+
+fn format_youtube_music_url(v: &str) -> String {
+    if is_http_url(v) {
+        return v.to_owned();
+    }
+    let stripped = if v.starts_with("VLOLAK5uy_") || v.starts_with("VLPL") { &v[2..] } else { v };
+    if stripped.starts_with("MPREb") {
+        format!("https://music.youtube.com/browse/{stripped}")
+    } else {
+        format!("https://music.youtube.com/playlist?list={stripped}")
     }
 }
 
@@ -118,32 +141,47 @@ pub fn external_identifier_url(scheme: &str, value: &str) -> Option<String> {
                     ));
                 }
                 None
-            } else if v.starts_with("http://") || v.starts_with("https://") {
-                Some(v.to_owned())
             } else {
-                Some(format!("https://open.spotify.com/album/{v}"))
+                Some(direct_or_prefixed_url("https://open.spotify.com/album/", v))
             }
         }
-        "imdb" => Some(format!("https://www.imdb.com/title/{v}/")),
-        "tmdb_movie" => Some(format!("https://www.themoviedb.org/movie/{v}")),
-        "tmdb_tv" => Some(format!("https://www.themoviedb.org/tv/{v}")),
-        "isbn" => Some(format!("https://openlibrary.org/isbn/{v}")),
-        "openlibrary" => Some(format!("https://openlibrary.org/works/{v}")),
-        "goodreads" => Some(format!("https://www.goodreads.com/book/show/{v}")),
-        "igdb" => Some(format!("https://www.igdb.com/games/{v}")),
-        "discogs" => Some(format!("https://www.discogs.com/release/{v}")),
-        "wikipedia" => Some(format!("https://en.wikipedia.org/wiki/{v}")),
-        "arxiv" => Some(format!("https://arxiv.org/abs/{v}")),
-        "musicbrainz_release" => Some(format!("https://musicbrainz.org/release/{v}")),
-        "musicbrainz_artist" => Some(format!("https://musicbrainz.org/artist/{v}")),
-        "musicbrainz_recording" => Some(format!("https://musicbrainz.org/recording/{v}")),
-        "apple_music" => Some(format!("https://music.apple.com/album/{v}")),
-        "tidal" => Some(format!("https://tidal.com/browse/album/{v}")),
-        "deezer" => Some(format!("https://www.deezer.com/album/{v}")),
-        "youtube_music" => Some(format!("https://music.youtube.com/playlist?list={v}")),
-        "url" | "feed_url" if v.starts_with("http://") || v.starts_with("https://") => {
-            Some(v.to_owned())
+        "imdb" => {
+            if is_http_url(v) {
+                Some(v.to_owned())
+            } else {
+                Some(format!("https://www.imdb.com/title/{v}/"))
+            }
         }
+        "tmdb_movie" => Some(direct_or_prefixed_url("https://www.themoviedb.org/movie/", v)),
+        "tmdb_tv" => Some(direct_or_prefixed_url("https://www.themoviedb.org/tv/", v)),
+        "isbn" => Some(direct_or_prefixed_url("https://openlibrary.org/isbn/", v)),
+        "openlibrary" => Some(direct_or_prefixed_url("https://openlibrary.org/works/", v)),
+        "goodreads" => Some(direct_or_prefixed_url("https://www.goodreads.com/book/show/", v)),
+        "igdb" => Some(direct_or_prefixed_url("https://www.igdb.com/games/", v)),
+        "discogs" => Some(direct_or_prefixed_url("https://www.discogs.com/release/", v)),
+        "wikipedia" => {
+            if is_http_url(v) {
+                Some(v.to_owned())
+            } else {
+                let encoded = v.replace('#', "%23").replace('?', "%3F");
+                Some(format!("https://en.wikipedia.org/wiki/{encoded}"))
+            }
+        }
+        "arxiv" => Some(direct_or_prefixed_url("https://arxiv.org/abs/", v)),
+        "musicbrainz_release" => {
+            Some(direct_or_prefixed_url("https://musicbrainz.org/release/", v))
+        }
+        "musicbrainz_artist" => Some(direct_or_prefixed_url("https://musicbrainz.org/artist/", v)),
+        "musicbrainz_recording" => {
+            Some(direct_or_prefixed_url("https://musicbrainz.org/recording/", v))
+        }
+        "apple_music" => Some(direct_or_prefixed_url("https://music.apple.com/album/", v)),
+        "tidal" => Some(direct_or_prefixed_url("https://tidal.com/browse/album/", v)),
+        "deezer" => Some(direct_or_prefixed_url("https://www.deezer.com/album/", v)),
+        "qobuz" => Some(direct_or_prefixed_url("https://open.qobuz.com/album/", v)),
+        "amazon_music" => Some(direct_or_prefixed_url("https://music.amazon.com/albums/", v)),
+        "youtube_music" => Some(format_youtube_music_url(v)),
+        "url" | "feed_url" if is_http_url(v) => Some(v.to_owned()),
         _ => None,
     }
 }
@@ -361,4 +399,38 @@ pub fn choose_deterministic_entry_id(
         },
     );
     deterministic_title_entry_id(kind.as_str(), &title_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::external_identifier_url;
+
+    #[test]
+    fn test_external_identifier_url_handles_bare_ids_browse_ids_and_full_urls() {
+        assert_eq!(
+            external_identifier_url("youtube_music", "VLOLAK5uy_abc123").as_deref(),
+            Some("https://music.youtube.com/playlist?list=OLAK5uy_abc123")
+        );
+        assert_eq!(
+            external_identifier_url("youtube_music", "MPREb_xyz789").as_deref(),
+            Some("https://music.youtube.com/browse/MPREb_xyz789")
+        );
+        assert_eq!(
+            external_identifier_url("apple_music", "https://music.apple.com/us/album/foo/123")
+                .as_deref(),
+            Some("https://music.apple.com/us/album/foo/123")
+        );
+        assert_eq!(
+            external_identifier_url("qobuz", "0060253775938").as_deref(),
+            Some("https://open.qobuz.com/album/0060253775938")
+        );
+        assert_eq!(
+            external_identifier_url("amazon_music", "B001234567").as_deref(),
+            Some("https://music.amazon.com/albums/B001234567")
+        );
+        assert_eq!(
+            external_identifier_url("wikipedia", "In_the_Wee_Small_Hours").as_deref(),
+            Some("https://en.wikipedia.org/wiki/In_the_Wee_Small_Hours")
+        );
+    }
 }

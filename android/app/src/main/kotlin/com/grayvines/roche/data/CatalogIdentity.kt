@@ -241,7 +241,12 @@ internal fun externalIdentifierUrl(scheme: String, value: String): String? {
     if (clean.isEmpty()) return null
     val isHttp = clean.startsWith(HTTP_PREFIX) || clean.startsWith(HTTPS_PREFIX)
     return when (normalizeIdentifierScheme(scheme)) {
-        SCHEME_WIKIPEDIA -> if (isHttp) clean else "https://en.wikipedia.org/wiki/$clean"
+        SCHEME_WIKIPEDIA ->
+            if (isHttp) {
+                clean
+            } else {
+                "https://en.wikipedia.org/wiki/${clean.replace("#", "%23").replace("?", "%3F")}"
+            }
         SCHEME_SPOTIFY ->
             extractSpotifyEntityAndId(clean)?.let { (entity, id) ->
                 "https://open.spotify.com/$entity/$id"

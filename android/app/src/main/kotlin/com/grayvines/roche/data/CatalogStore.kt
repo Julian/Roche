@@ -554,6 +554,10 @@ class CatalogStore(
         materializeFeedsForIds(dao = dao, referencedIds = referencedIds, nowIso = nowIso)
     }
 
+    internal fun notifyLocalMutation() {
+        onLocalMutation()
+    }
+
     internal suspend fun withMutationLock(block: suspend () -> Unit) {
         mutationMutex.withLock {
             ensureSystemSeeded()
