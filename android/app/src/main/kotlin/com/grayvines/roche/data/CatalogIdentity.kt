@@ -35,7 +35,6 @@ private const val ARXIV_PDF_MARKER = "/pdf/"
 internal val PREFERRED_IDENTIFIER_SCHEMES: List<String> =
     listOf(
         SCHEME_SPOTIFY,
-        "1001albums",
         "musicbrainz_release",
         "musicbrainz_recording",
         "musicbrainz_artist",
@@ -76,8 +75,7 @@ internal fun normalizeIdentifierValue(
         "url",
         "feed_url" -> canonicalizeSyncUrl(trimmed)
         "slug",
-        "tag",
-        "1001albums" -> trimmed.lowercase()
+        "tag" -> trimmed.lowercase()
         SCHEME_SPOTIFY -> normalizeSpotifyIdentifier(kind, trimmed)
         "imdb" -> normalizeImdbIdentifier(trimmed)
         SCHEME_WIKIPEDIA -> normalizeWikipediaIdentifier(trimmed)

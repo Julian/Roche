@@ -135,7 +135,6 @@
   ],
   "preferred_identifier_schemes": [
     "spotify",
-    "1001albums",
     "musicbrainz_release",
     "musicbrainz_recording",
     "musicbrainz_artist",
@@ -192,13 +191,6 @@
       "raw_value": "512ojhOuo1ktJprKbVcKyQ",
       "expected_scheme": "spotify",
       "expected_value": "spotify:episode:512ojhOuo1ktJprKbVcKyQ"
-    },
-    {
-      "kind": "album",
-      "scheme": "1001albums",
-      "raw_value": "  Pink-Floyd-The-Dark-Side-Of-The-Moon  ",
-      "expected_scheme": "1001albums",
-      "expected_value": "pink-floyd-the-dark-side-of-the-moon"
     },
     {
       "kind": "collection",
@@ -312,7 +304,7 @@
       "creators": ["Pink Floyd"],
       "identifiers": [
         { "scheme": "url", "value": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv" },
-        { "scheme": "1001albums", "value": "pink-floyd-the-dark-side-of-the-moon" },
+        { "scheme": "musicbrainz_release", "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a" },
         { "scheme": "spotify", "value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv" }
       ],
       "expected_id": "3c5218f9-675c-55e6-819b-2673630566a4"
@@ -322,10 +314,10 @@
       "title": "The Dark Side of the Moon",
       "creators": ["Pink Floyd"],
       "identifiers": [
-        { "scheme": "1001albums", "value": "pink-floyd-the-dark-side-of-the-moon" },
+        { "scheme": "musicbrainz_release", "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a" },
         { "scheme": "url", "value": "https://example.com/dsotm" }
       ],
-      "expected_id": "abbc7eb9-c23a-5e03-b689-7394389394dc"
+      "expected_id": "d0cd4a24-3ba4-5df0-b394-5dfb22dfd8c8"
     },
     {
       "kind": "movie",

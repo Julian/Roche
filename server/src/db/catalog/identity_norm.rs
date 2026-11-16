@@ -22,9 +22,8 @@ pub const EDITION_KEYWORDS: [&str; 15] = [
     "remasters",
 ];
 
-pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 15] = [
+pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 14] = [
     "spotify",
-    "1001albums",
     "musicbrainz_release",
     "musicbrainz_recording",
     "musicbrainz_artist",
@@ -40,7 +39,7 @@ pub const PREFERRED_IDENTIFIER_SCHEMES: [&str; 15] = [
     "url",
 ];
 
-pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 23] = [
+pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 22] = [
     "wikipedia",
     "arxiv",
     "musicbrainz_release",
@@ -63,7 +62,6 @@ pub(super) const EXTERNAL_ID_DISPLAY_ORDER: [&str; 23] = [
     "qobuz",
     "amazon_music",
     "bandcamp",
-    "1001albums",
 ];
 
 #[must_use]
@@ -88,7 +86,6 @@ pub fn external_identifier_label(scheme: &str) -> &str {
         "youtube_music" => "YouTube Music",
         "qobuz" => "Qobuz",
         "amazon_music" => "Amazon Music",
-        "1001albums" => "1001 Albums",
         "bandcamp" => "Bandcamp",
         "url" => "Web",
         "feed_url" => "Feed",
@@ -202,7 +199,7 @@ pub fn normalize_identifier_value(kind: EntryKind, scheme: &str, raw_value: &str
     }
     match normalize_identifier_scheme(scheme).as_str() {
         "url" | "feed_url" => canonicalize_sync_url(trimmed),
-        "slug" | "tag" | "1001albums" => trimmed.to_lowercase(),
+        "slug" | "tag" => trimmed.to_lowercase(),
         "spotify" => normalize_spotify_identifier(kind, trimmed),
         "imdb" => normalize_imdb_identifier(trimmed),
         "wikipedia" => normalize_wikipedia_identifier(trimmed),

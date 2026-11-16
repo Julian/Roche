@@ -772,7 +772,7 @@ class RocheCatalogAndSyncTest {
                     "INSERT INTO `entry_identifiers` (`scheme`, `value`, `entryId`) VALUES ('spotify', '4sW8Eql2e2kdRP1A1R1C9t', 'alb-v7')"
                 )
                 conn.execSQL(
-                    "INSERT INTO `entry_identifiers` (`scheme`, `value`, `entryId`) VALUES ('1001albums', 'MixedCaseSlug', 'alb-v7')"
+                    "INSERT INTO `entry_identifiers` (`scheme`, `value`, `entryId`) VALUES ('slug', 'MixedCaseSlug', 'alb-v7')"
                 )
                 conn.execSQL("PRAGMA user_version = 7")
             }
@@ -791,7 +791,7 @@ class RocheCatalogAndSyncTest {
                 val idents =
                     dao.getIdentifiersForEntry("alb-v7").associate { it.scheme to it.value }
                 assertEquals("spotify:album:4sW8Eql2e2kdRP1A1R1C9t", idents["spotify"])
-                assertEquals("mixedcaseslug", idents["1001albums"])
+                assertEquals("mixedcaseslug", idents["slug"])
                 assertEquals(
                     "1",
                     dao.getLocalSyncFlag(
