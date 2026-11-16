@@ -191,7 +191,7 @@ class RocheRepositoryTest {
     @Test
     fun `pairWithCode exchanges 6 digit code and persists serverUrl and bearerToken`() = runTest {
         val pairingClient = RocheApiClient { request ->
-            assertEquals("http://100.64.0.12:8080/auth/pair", request.url)
+            assertEquals("https://100.64.0.12:8080/auth/pair", request.url)
             HttpResponse(statusCode = 200, body = """{"token":"paired-bearer-999"}""")
         }
         val pairingRepo =
@@ -207,7 +207,7 @@ class RocheRepositoryTest {
         assertEquals("paired-bearer-999", result.getOrNull())
 
         val currentSettings = settings.settings.first()
-        assertEquals("http://100.64.0.12:8080", currentSettings.serverUrl)
+        assertEquals("https://100.64.0.12:8080", currentSettings.serverUrl)
         assertEquals("paired-bearer-999", currentSettings.bearerToken)
     }
 
@@ -252,7 +252,7 @@ class RocheRepositoryTest {
         runTest {
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "secret-existing-token",
                 )
             }
@@ -283,27 +283,62 @@ class RocheRepositoryTest {
         }
 
     @Test
+    fun `discoverServer upgrades legacy cleartext ts_net URL to HTTPS and preserves token on same host`() =
+        runTest {
+            settings.update {
+                it.copy(
+                    serverUrl = "http://mac-mini.tail9876.ts.net:8080",
+                    bearerToken = "keep-my-paired-token",
+                )
+            }
+            val discoverClient = RocheApiClient { request ->
+                if (request.url == "https://mac-mini.tail9876.ts.net/health") {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"status":"ok","service":"roche","canonical_url":"https://mac-mini.tail9876.ts.net"}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
+                }
+            }
+            val repo =
+                RocheRepository(
+                    database = database,
+                    apiClient = discoverClient,
+                    settings = settings,
+                )
+
+            val discoveredUrl = repo.discoverServer().getOrThrow()
+            assertEquals("https://mac-mini.tail9876.ts.net", discoveredUrl)
+
+            val updated = settings.settings.first()
+            assertEquals("https://mac-mini.tail9876.ts.net", updated.serverUrl)
+            assertEquals("keep-my-paired-token", updated.bearerToken)
+        }
+
+    @Test
     fun `syncWithServer replaces demo seed rows populates item tags and strips html in reader`() =
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
 
             val syncClient = RocheApiClient { request ->
                 when (request.url) {
-                    "http://100.64.0.12:8080/api/v1/feeds" ->
+                    "https://100.64.0.12:8080/api/v1/feeds" ->
                         HttpResponse(
                             statusCode = 200,
                             body =
                                 """{"feeds":[{"id":"f-live","title":"Live RSS","url":"https://example.com/rss","feed_type":"rss","unread_count":1}]}""",
                         )
-                    "http://100.64.0.12:8080/api/v1/tags" ->
+                    "https://100.64.0.12:8080/api/v1/tags" ->
                         HttpResponse(
                             statusCode = 200,
                             body = """{"tags":[{"id":"t-live","name":"rust","unread_count":1}]}""",
                         )
-                    "http://100.64.0.12:8080/api/v1/items?per_page=200" ->
+                    "https://100.64.0.12:8080/api/v1/items?per_page=200" ->
                         HttpResponse(
                             statusCode = 200,
                             body =
@@ -334,7 +369,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val requests = mutableListOf<String>()
             val liveClient = RocheApiClient { request ->
@@ -375,7 +410,7 @@ class RocheRepositoryTest {
             liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "ebpf")
             assertTrue(
                 requests.contains(
-                    "DELETE http://100.64.0.12:8080/api/v1/items/item-2/tags/tag-srv-77"
+                    "DELETE https://100.64.0.12:8080/api/v1/items/item-2/tags/tag-srv-77"
                 )
             )
         }
@@ -384,7 +419,7 @@ class RocheRepositoryTest {
     internal fun `updateReadProgress and local tag removal push mutations to server`() = runTest {
         seedTestDatabase()
         settings.update {
-            it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+            it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
         }
         val requests = mutableListOf<Pair<String, String?>>()
         val liveClient = RocheApiClient { request ->
@@ -416,7 +451,7 @@ class RocheRepositoryTest {
         assertEquals(0.85, updatedItem.readProgress)
         assertTrue(
             requests.any { (endpoint, body) ->
-                endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+                endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
                     body == """{"read_progress":0.85}"""
             }
         )
@@ -429,7 +464,7 @@ class RocheRepositoryTest {
         assertTrue(
             requests.any { (endpoint, _) ->
                 endpoint ==
-                    "DELETE http://100.64.0.12:8080/api/v1/items/item-2/tags/srv-sqlite-uuid"
+                    "DELETE https://100.64.0.12:8080/api/v1/items/item-2/tags/srv-sqlite-uuid"
             }
         )
     }
@@ -452,7 +487,7 @@ class RocheRepositoryTest {
 
             // Come online and sync with server
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val pushedRequests = mutableListOf<Pair<String, String?>>()
             val syncClient = buildTwoWaySyncMockClient(pushedRequests)
@@ -506,7 +541,7 @@ class RocheRepositoryTest {
     internal fun `in-flight tag mutations on local item are preserved and synced when finalized`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val addedTagRequests = mutableListOf<String>()
             val liveClient = buildInFlightTagMockClient(addedTagRequests)
@@ -556,7 +591,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val cacheDir = File(tempDir, "offline_media")
             val pdfBytes = "%PDF-1.7-test".toByteArray(Charsets.UTF_8)
@@ -619,7 +654,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val cacheDir = File(tempDir, "delete_item_cache")
             val itemCacheDir = File(File(cacheDir, "items"), "item-1").apply { mkdirs() }
@@ -658,7 +693,7 @@ class RocheRepositoryTest {
             // Syncing back online pushes DELETE /api/v1/items/item-1 and does not resurrect item-1
             settings.update { it.copy(bearerToken = "tok-live") }
             managedRepo.syncWithServer().getOrThrow()
-            assertTrue(requests.contains("DELETE http://100.64.0.12:8080/api/v1/items/item-1"))
+            assertTrue(requests.contains("DELETE https://100.64.0.12:8080/api/v1/items/item-1"))
             assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-1" })
             assertEquals(null, database.dao().getPendingMutation("item-1"))
 
@@ -672,7 +707,7 @@ class RocheRepositoryTest {
     internal fun `remote sync leaves contentText null when server sends summary and long content_html`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val longHtml =
                 "<article><p>" + List(2_200) { "essayword$it" }.joinToString(" ") + "</p></article>"
@@ -694,7 +729,7 @@ class RocheRepositoryTest {
     internal fun `local LAN feed items tags and overflow items survive syncWithServer intact`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             seedLanFeedAndOverflowDataset(database)
             val peerSyncBodies = mutableListOf<String>()
@@ -734,7 +769,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             var patchAvailable = false
             val patchBodies = mutableListOf<String>()
@@ -786,7 +821,7 @@ class RocheRepositoryTest {
     internal fun `toggleOfflineCache leaves isCachedOffline false when audio download fails`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             database
                 .dao()
@@ -833,7 +868,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val cancellingRepo =
                 RocheRepository(
@@ -860,7 +895,7 @@ class RocheRepositoryTest {
     internal fun `reconcileSnapshotDiff applies targeted diffs chunks deletes and skips 0-change writes`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             var syncRound = 1
             val diffRepo =
@@ -902,7 +937,7 @@ class RocheRepositoryTest {
             seedPaginatedDeltaInitialState(database.dao(), feedId)
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-paginated",
                     lastPeerSyncCursor = "2026-06-01T00:00:00Z",
                 )
@@ -943,7 +978,7 @@ class RocheRepositoryTest {
         runTest {
             seedTestDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-bg")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-bg")
             }
             val patchStarted = CountDownLatch(1)
             val allowPatchFinish = CountDownLatch(1)
@@ -1097,7 +1132,7 @@ class RocheRepositoryTest {
         runTest {
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-skew",
                     lastPeerSyncCursor = "2026-06-10T12:00:00Z",
                 )
@@ -1124,7 +1159,7 @@ class RocheRepositoryTest {
     internal fun `catalog mutation with backgroundScope triggers coalesced syncWithServer and bounds mutex cache`() =
         runTest {
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-cat-bg")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-cat-bg")
             }
             val syncedLatch = CountDownLatch(1)
             val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -1427,27 +1462,27 @@ internal fun buildOfflineCacheMockClient(
     thumbBytes: ByteArray,
 ): RocheApiClient = RocheApiClient { request ->
     when (request.url) {
-        "http://100.64.0.12:8080/api/v1/items/item-5" ->
+        "https://100.64.0.12:8080/api/v1/items/item-5" ->
             HttpResponse(
                 statusCode = 200,
                 body =
                     """{"id":"item-5","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","content_html":"<p>Hydrated full paper HTML</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-27T10:00:00Z","thumbnail_media_id":"thumb-item-5"}""",
             )
-        "http://100.64.0.12:8080/api/v1/items/item-5/media" ->
+        "https://100.64.0.12:8080/api/v1/items/item-5/media" ->
             HttpResponse(
                 statusCode = 200,
                 body =
                     """{"media":[{"id":"pdf-item-5","item_id":"item-5","media_type":"pdf","file_size":13},{"id":"thumb-item-5","item_id":"item-5","media_type":"thumbnail","file_size":4}]}""",
             )
-        "http://100.64.0.12:8080/api/v1/media/pdf-item-5" ->
+        "https://100.64.0.12:8080/api/v1/media/pdf-item-5" ->
             HttpResponse(statusCode = 200, body = "", bodyBytes = pdfBytes)
-        "http://100.64.0.12:8080/api/v1/media/thumb-item-5" ->
+        "https://100.64.0.12:8080/api/v1/media/thumb-item-5" ->
             HttpResponse(statusCode = 200, body = "", bodyBytes = thumbBytes)
-        "http://100.64.0.12:8080/api/v1/feeds" ->
+        "https://100.64.0.12:8080/api/v1/feeds" ->
             HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
-        "http://100.64.0.12:8080/api/v1/tags" ->
+        "https://100.64.0.12:8080/api/v1/tags" ->
             HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-        "http://100.64.0.12:8080/api/v1/items?per_page=200" ->
+        "https://100.64.0.12:8080/api/v1/items?per_page=200" ->
             HttpResponse(
                 statusCode = 200,
                 body =
@@ -1474,25 +1509,25 @@ internal fun buildInFlightTagMockClient(addedTagRequests: MutableList<String>): 
 internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
     assertTrue(
         pushedRequests.any { (req, body) ->
-            req == "POST http://100.64.0.12:8080/api/v1/items/save" &&
+            req == "POST https://100.64.0.12:8080/api/v1/items/save" &&
                 body?.contains("https://example.com/offline-note") == true
         }
     )
     assertTrue(
         pushedRequests.any { (req, body) ->
-            req == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+            req == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
                 body == """{"status":"archived","is_favorite":false,"read_progress":0.9}"""
         }
     )
     assertTrue(
         pushedRequests.any { (req, body) ->
-            req == "POST http://100.64.0.12:8080/api/v1/items/item-1/tags" &&
+            req == "POST https://100.64.0.12:8080/api/v1/items/item-1/tags" &&
                 body == """{"name":"rust"}"""
         }
     )
     assertTrue(
         pushedRequests.any { (req, _) ->
-            req == "DELETE http://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
+            req == "DELETE https://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
         }
     )
 }
@@ -1566,7 +1601,7 @@ internal suspend fun assertReadTimestampSync(
     assertTrue(!readItem.readAt.isNullOrBlank())
     assertTrue(
         requests.any { (endpoint, body) ->
-            endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+            endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
                 body == """{"read_at":"${readItem.readAt}"}"""
         }
     )
@@ -1577,7 +1612,7 @@ internal suspend fun assertReadTimestampSync(
     assertEquals(null, unreadItem.readAt)
     assertTrue(
         requests.any { (endpoint, body) ->
-            endpoint == "PATCH http://100.64.0.12:8080/api/v1/items/item-1" &&
+            endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
                 body == """{"read_at":null}"""
         }
     )
@@ -1752,13 +1787,13 @@ private fun buildRenameFeedSyncMockClient(
 
 private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient { request ->
     when (request.url) {
-        "http://100.64.0.12:8080/api/v1/items/item-audio-broken" ->
+        "https://100.64.0.12:8080/api/v1/items/item-audio-broken" ->
             HttpResponse(
                 statusCode = 200,
                 body =
                     """{"id":"item-audio-broken","title":"Broken Episode","url":"https://podcasts.example.com/ep-1","content_type":"podcast","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","audio_url":"https://cdn.example.com/broken.mp3"}""",
             )
-        "http://100.64.0.12:8080/api/v1/items/item-audio-broken/media" ->
+        "https://100.64.0.12:8080/api/v1/items/item-audio-broken/media" ->
             HttpResponse(
                 statusCode = 200,
                 body =

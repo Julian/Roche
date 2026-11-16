@@ -21,52 +21,11 @@ impl RocheServer {
     pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
+        let (listen_cfg, ts_identity) = Self::prepare_tailscale(&cfg).await?;
+        let bootstrap_canonical_url =
+            ts_identity.as_ref().and_then(tailscale::NodeIdentity::canonical_url);
 
-        let mut ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
-
-        let listen_host = if cfg.server.host.trim().eq_ignore_ascii_case("tailscale") {
-            let ts_ip = ts_identity
-                .as_ref()
-                .and_then(|id| id.ipv4.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("`--host tailscale` requested, but no active Tailscale IPv4 address was found"))?;
-            ts_ip.to_string()
-        } else {
-            cfg.server.host.clone()
-        };
-        let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
-
-        let advertised_ok = match Self::maybe_advertise_tailscale(&cfg, &listen_cfg.host).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to auto-advertise Tailscale service");
-                false
-            }
-        };
-        if !advertised_ok && let Some(identity) = &mut ts_identity {
-            identity.service_name = None;
-        }
-        if let Some(identity) = &ts_identity {
-            let urls = identity.candidate_urls(cfg.server.port);
-            tracing::info!(tailscale_urls = ?urls, "Detected Tailscale node addresses");
-        }
-
-        let startup_worker = workers::WorkerManager::new(
-            db.clone(),
-            cfg.sync.op_log_prune_after,
-            cfg.storage.media_dir.clone(),
-        )
-        .with_download_dir(cfg.media.download_dir.clone());
-        if let Err(e) = startup_worker.cleanup_startup_partials().await {
-            tracing::warn!(error = %e, "Startup partial media cleanup failed");
-        }
-        let ytdlp_probe = media::ytdlp::YtDlpWorker::new(
-            cfg.media.clone(),
-            media::MediaStore::new(&cfg.storage.media_dir),
-        );
-        match ytdlp_probe.check_version().await {
-            Ok(ver) => tracing::info!(ytdlp_version = %ver, "Detected yt-dlp binary"),
-            Err(e) => tracing::debug!(error = %e, "yt-dlp binary unavailable at startup"),
-        }
+        Self::prepare_startup_media(&db, &cfg).await;
 
         let roche_service = service::RocheService::new(db.clone(), fetcher, cfg.clone())
             .with_node_identity(ts_identity);
@@ -78,23 +37,7 @@ impl RocheServer {
             );
         }
 
-        if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
-            match roche_service.auth().issue_pairing_code().await {
-                Ok(code) => {
-                    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-                        eprintln!("Bootstrap pairing code (valid 5m): {code}");
-                    }
-                    tracing::info!(
-                        "No paired devices found; generated 5-minute bootstrap pairing code (run `roche pair` to mint a new code)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to generate bootstrap device pairing code");
-                }
-            }
-        } else {
-            tracing::info!("Paired devices exist; run `roche pair` to generate a new pairing code");
-        }
+        Self::maybe_issue_bootstrap_code(&roche_service, bootstrap_canonical_url.as_deref()).await;
 
         let poll_scheduler = roche_service.poll_scheduler();
         let scheduler_handle = tokio::spawn(async move {
@@ -127,6 +70,87 @@ impl RocheServer {
         scheduler_handle.abort();
         worker_handle.abort();
         Ok(())
+    }
+
+    async fn prepare_tailscale(
+        cfg: &config::Config,
+    ) -> anyhow::Result<(config::ServerConfig, Option<tailscale::NodeIdentity>)> {
+        let mut ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
+        let listen_host = if cfg.server.host.trim().eq_ignore_ascii_case("tailscale") {
+            let ts_ip = ts_identity.as_ref().and_then(|id| id.ipv4.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`--host tailscale` requested, but no active Tailscale IPv4 address was found"
+                )
+            })?;
+            ts_ip.to_string()
+        } else {
+            cfg.server.host.clone()
+        };
+        let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
+
+        if ts_identity.is_some() {
+            let exposure =
+                tailscale::expose_over_tailscale(&cfg.tailscale, &listen_cfg.host, cfg.server.port)
+                    .await;
+            if let Some(identity) = &mut ts_identity {
+                identity.service_name = exposure.service_name;
+                if let Some(https_port) = exposure.node_https_port {
+                    identity.node_https_port = Some(https_port);
+                }
+                let urls = identity.candidate_urls();
+                if !urls.is_empty() {
+                    tracing::info!(tailscale_https_urls = ?urls, "Exposed Roche peer over Tailscale HTTPS");
+                }
+            }
+        }
+        Ok((listen_cfg, ts_identity))
+    }
+
+    async fn prepare_startup_media(db: &db::Db, cfg: &config::Config) {
+        let startup_worker = workers::WorkerManager::new(
+            db.clone(),
+            cfg.sync.op_log_prune_after,
+            cfg.storage.media_dir.clone(),
+        )
+        .with_download_dir(cfg.media.download_dir.clone());
+        if let Err(e) = startup_worker.cleanup_startup_partials().await {
+            tracing::warn!(error = %e, "Startup partial media cleanup failed");
+        }
+        let ytdlp_probe = media::ytdlp::YtDlpWorker::new(
+            cfg.media.clone(),
+            media::MediaStore::new(&cfg.storage.media_dir),
+        );
+        match ytdlp_probe.check_version().await {
+            Ok(ver) => tracing::info!(ytdlp_version = %ver, "Detected yt-dlp binary"),
+            Err(e) => tracing::debug!(error = %e, "yt-dlp binary unavailable at startup"),
+        }
+    }
+
+    async fn maybe_issue_bootstrap_code<F: scheduler::FeedFetcher>(
+        roche_service: &service::RocheService<F>,
+        canonical_url: Option<&str>,
+    ) {
+        if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
+            match roche_service.auth().issue_pairing_code().await {
+                Ok(code) => {
+                    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                        if let Some(url) = canonical_url {
+                            eprintln!("Bootstrap pairing bundle (valid 5m): {url}#{code}");
+                        } else {
+                            eprintln!("Bootstrap pairing code (valid 5m): {code}");
+                        }
+                    }
+                    tracing::info!(
+                        "No paired devices found; generated 5-minute bootstrap pairing code (run `roche pair` to mint a new code)"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to generate bootstrap device pairing code");
+                }
+            }
+        } else {
+            tracing::info!("Paired devices exist; run `roche pair` to generate a new pairing code");
+        }
     }
 
     async fn shutdown_signal() {
@@ -217,25 +241,7 @@ impl RocheServer {
     }
 
     pub async fn inspect_tailscale_canonical_url(cfg: &config::Config) -> Option<String> {
-        let identity = tailscale::inspect_local_node(&cfg.tailscale).await?;
-        identity.canonical_url(cfg.server.port)
-    }
-
-    async fn maybe_advertise_tailscale(
-        cfg: &config::Config,
-        listen_host: &str,
-    ) -> anyhow::Result<()> {
-        if let Some(svc) =
-            tailscale::advertise_service_with_target(&cfg.tailscale, listen_host, cfg.server.port)
-                .await?
-        {
-            tracing::info!(
-                service = %svc,
-                upstream = %tailscale::serve_upstream_host(listen_host),
-                port = cfg.server.port,
-                "Advertised Roche server on Tailnet via `tailscale serve`"
-            );
-        }
-        Ok(())
+        tailscale::resolve_live_canonical_url(&cfg.tailscale, &cfg.server.host, cfg.server.port)
+            .await
     }
 }

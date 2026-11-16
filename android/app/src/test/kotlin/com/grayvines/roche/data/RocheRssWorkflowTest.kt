@@ -83,7 +83,7 @@ class RocheRssWorkflowTest {
         runTest {
             seedDatabase()
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val requests = mutableListOf<String>()
             val batchRepo =
@@ -122,7 +122,9 @@ class RocheRssWorkflowTest {
                     allUnread = false,
                 )
             assertEquals(2, archivedCount)
-            assertTrue(requests.contains("POST http://100.64.0.12:8080/api/v1/items/archive-batch"))
+            assertTrue(
+                requests.contains("POST https://100.64.0.12:8080/api/v1/items/archive-batch")
+            )
             val afterBatch = batchRepo.snapshot.first().entries.associateBy { it.id }
             assertTrue(afterBatch.getValue("item-1").isArchived)
             assertTrue(afterBatch.getValue("item-2").isArchived)
@@ -293,7 +295,9 @@ class RocheRssWorkflowTest {
     @Test
     fun `MainViewModel performImportOpml and local batch archive work`() = runTest {
         seedDatabase()
-        settings.update { it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live") }
+        settings.update {
+            it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
+        }
         val requests = mutableListOf<String>()
         val batchRepo =
             RocheRepository(
@@ -452,7 +456,7 @@ class RocheRssWorkflowTest {
             // receives a server-blocked feed (last_error_by = "server"), rescues it on-device,
             // and pushes the rescued items back to the server in the follow-up peer sync!
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-peer")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-peer")
             }
             val totalCount = peerRepo.syncWithServer().getOrThrow()
             assertEquals(2, totalCount)
@@ -540,7 +544,7 @@ class RocheRssWorkflowTest {
             var currentTier = NetworkTier.CELLULAR
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-peer",
                     peerId = "android-peer-1",
                     deviceName = "Pixel 10 Pro",
@@ -602,7 +606,7 @@ class RocheRssWorkflowTest {
             val fallbackClient = buildOversizedPeerSyncFallbackClient(peerSyncBodies)
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-peer",
                     peerId = "android-peer-1",
                 )
@@ -627,7 +631,7 @@ class RocheRssWorkflowTest {
             var failPatch = true
             val client = buildOfflineFeedArchiveMockClient(patchedFeeds) { failPatch }
             settings.update {
-                it.copy(serverUrl = "http://100.64.0.12:8080", bearerToken = "tok-live")
+                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
             val repo = RocheRepository(database = database, apiClient = client, settings = settings)
 

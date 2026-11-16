@@ -456,7 +456,7 @@ internal fun ServerManualCredentialsCard(
                 OutlinedTextField(
                     value = serverUrl,
                     onValueChange = onServerUrlChange,
-                    label = { Text("Roche Server URL (https://<node>.<tailnet>.ts.net)") },
+                    label = { Text("Roche Server URL (https://roche.<tailnet>.ts.net)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().testTag("server_url_input"),
                 )
@@ -523,8 +523,8 @@ private fun CleartextServerWarning(serverUrl: String) {
     val colors = LocalRocheColors.current
     Text(
         text =
-            "Android blocks non-localhost cleartext HTTP. Expose Roche with " +
-                "'tailscale serve' and pair via https://<node>.<tailnet>.ts.net.",
+            "Cleartext HTTP is disabled. Run 'roche serve' and tap " +
+                "'Discover on Tailnet' (or switch URL to https://...).",
         color = colors.accentEcru,
         fontSize = 11.5.sp,
         lineHeight = 16.sp,

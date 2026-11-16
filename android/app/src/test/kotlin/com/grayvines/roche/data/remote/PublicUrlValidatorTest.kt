@@ -30,8 +30,20 @@ class PublicUrlValidatorTest {
             vpnOffClient.fetchFeeds("http://localhost:8080", "tok"),
         )
 
+        val vpnOnClient =
+            RocheApiClient(
+                vpnCheck = VpnTransportCheck { true },
+                transport = { HttpResponse(statusCode = 200, body = """{"feeds":[]}""") },
+            )
+        assertThrows(IOException::class.java) {
+            runBlocking { vpnOnClient.fetchFeeds("http://mac-mini.tail9876.ts.net:8080", "tok") }
+        }
+        assertThrows(IOException::class.java) {
+            runBlocking { vpnOnClient.fetchFeeds("http://100.64.0.9:8080", "tok") }
+        }
+
         assertTrue(PeerSyncScheduler.requiresVpnForServerUrl("https://roche.tail9876.ts.net"))
-        assertTrue(PeerSyncScheduler.requiresVpnForServerUrl("http://100.64.0.9:8080"))
+        assertTrue(PeerSyncScheduler.requiresVpnForServerUrl("https://100.64.0.9:8443"))
         assertFalse(PeerSyncScheduler.requiresVpnForServerUrl("http://localhost:8080"))
         assertFalse(PeerSyncScheduler.requiresVpnForServerUrl(""))
     }

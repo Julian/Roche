@@ -121,10 +121,8 @@ internal fun serverEndpointViolation(
     if (isTailnetOnlyHost(asciiHost) && !isVpnActive()) {
         return "Tailscale VPN must be active for Tailnet server requests ($asciiHost)"
     }
-    val requiresHttps =
-        scheme != SCHEME_HTTPS && (!isTailnetOnlyHost(asciiHost) || !isTailscaleHostOrIp(asciiHost))
-    return if (requiresHttps) {
-        "Cleartext HTTP server URL requires HTTPS via Tailscale Serve (blocked $asciiHost)"
+    return if (scheme != SCHEME_HTTPS) {
+        "HTTPS required for $asciiHost; run 'roche serve' and tap Discover on Tailnet"
     } else {
         null
     }
@@ -137,12 +135,9 @@ internal fun checkCleartextServerPolicy(
     isCleartextPermitted: (String) -> Boolean,
 ) {
     if (scheme != SCHEME_HTTP) return
-    if (!isTailscaleHostOrIp(asciiHost)) {
-        throw IOException("Blocked cleartext server request to non-Tailscale host: $asciiHost")
-    }
-    if (!isCleartextPermitted(lookupHost)) {
+    if (!isLoopbackHost(asciiHost) || !isCleartextPermitted(lookupHost)) {
         throw IOException(
-            "Android blocks cleartext HTTP to $asciiHost; expose Roche via 'tailscale serve' and use https://<node>.<tailnet>.ts.net"
+            "HTTPS required for $asciiHost; run 'roche serve' and tap Discover on Tailnet"
         )
     }
 }

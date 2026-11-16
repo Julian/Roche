@@ -1459,7 +1459,7 @@ class MainViewModelTest {
             val pruneCacheDir = File(tempDir, "prune_cache")
             settings.update {
                 it.copy(
-                    serverUrl = "http://100.64.0.12:8080",
+                    serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-thumbs",
                 )
             }

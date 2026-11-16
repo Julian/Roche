@@ -218,13 +218,12 @@ impl<F: FeedFetcher> RocheService<F> {
 
     #[must_use]
     pub fn health_payload(&self) -> serde_json::Value {
-        let port = self.config.server.port;
         let canonical_url =
-            self.node_identity.as_ref().and_then(|identity| identity.canonical_url(port));
+            self.node_identity.as_ref().and_then(crate::tailscale::NodeIdentity::canonical_url);
         let urls = self
             .node_identity
             .as_ref()
-            .map_or_else(Vec::new, |identity| identity.candidate_urls(port));
+            .map_or_else(Vec::new, crate::tailscale::NodeIdentity::candidate_urls);
 
         serde_json::json!({
             "status": "ok",

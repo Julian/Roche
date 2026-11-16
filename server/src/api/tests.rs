@@ -638,12 +638,13 @@ async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
 async fn test_health_exposes_tailscale_discovery_urls() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let identity = crate::tailscale::NodeIdentity {
-        hostname: "roche".to_string(),
-        dns_name: Some("roche.tail9876.ts.net".to_string()),
+        hostname: "mac-mini".to_string(),
+        dns_name: Some("mac-mini.tail9876.ts.net".to_string()),
         magic_dns_suffix: Some("tail9876.ts.net".to_string()),
         ipv4: Some("100.64.0.12".to_string()),
         ipv6: None,
         service_name: Some("svc:roche".to_string()),
+        node_https_port: Some(443),
     };
     let service = RocheService::new(db, FakeFeedFetcher, crate::config::Config::default())
         .with_node_identity(Some(identity));
@@ -658,11 +659,9 @@ async fn test_health_exposes_tailscale_discovery_urls() {
     assert_eq!(body["service"], "roche");
     assert_eq!(body["canonical_url"], "https://roche.tail9876.ts.net");
     let urls = body["urls"].as_array().unwrap();
-    assert_eq!(urls.len(), 4);
+    assert_eq!(urls.len(), 2);
     assert_eq!(urls[0], "https://roche.tail9876.ts.net");
-    assert_eq!(urls[1], "http://roche.tail9876.ts.net:8080");
-    assert_eq!(urls[2], "http://roche:8080");
-    assert_eq!(urls[3], "http://100.64.0.12:8080");
+    assert_eq!(urls[1], "https://mac-mini.tail9876.ts.net");
 }
 
 #[tokio::test]

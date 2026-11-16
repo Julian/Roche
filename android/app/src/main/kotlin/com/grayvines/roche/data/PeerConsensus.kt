@@ -35,6 +35,8 @@ fun interface NetworkTierProvider {
     fun currentNetworkTier(): NetworkTier
 
     fun isVpnTransportActive(): Boolean = true
+
+    fun activeTailnetDomains(): List<String> = emptyList()
 }
 
 @Suppress("LongParameterList")

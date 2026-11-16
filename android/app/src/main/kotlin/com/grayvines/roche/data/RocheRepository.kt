@@ -15,8 +15,10 @@ import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.settings.keepTokenOnDiscovery
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
+import com.grayvines.roche.data.settings.tailscaleHttpsUpgrades
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
@@ -672,13 +674,25 @@ class RocheRepository(
     internal suspend fun discoverServer(
         tailnetDomains: List<String> = emptyList()
     ): Result<String> = runSuspendCatching {
+        val savedUrl = settings.settings.first().serverUrl
+        val domains = tailnetDomains.ifEmpty { networkTierProvider.activeTailnetDomains() }
         val discovered =
-            apiClient.discoverServer(tailnetDomains = tailnetDomains)
-                ?: error("No Roche server found on Tailnet (tried roche:8080 / svc:roche)")
+            apiClient.discoverServer(
+                tailnetDomains = domains,
+                extraCandidates = tailscaleHttpsUpgrades(savedUrl),
+            )
+                ?: error(
+                    "No Roche server found on Tailnet (ensure Tailscale is active and 'roche serve' is running)"
+                )
         val preferredUrl = normalizeServerUrl(discovered.preferredUrl)
         check(preferredUrl.isNotBlank()) { "Discovered server returned an invalid URL" }
         settings.update { current ->
-            val preservedToken = if (current.serverUrl == preferredUrl) current.bearerToken else ""
+            val preservedToken =
+                if (keepTokenOnDiscovery(current.serverUrl, preferredUrl)) {
+                    current.bearerToken
+                } else {
+                    ""
+                }
             current.copy(serverUrl = preferredUrl, bearerToken = preservedToken)
         }
         preferredUrl
@@ -696,17 +710,24 @@ class RocheRepository(
                 parsedUrl
             } else {
                 val savedUrl = normalizeServerUrl(settings.settings.first().serverUrl)
-                if (savedUrl.isNotBlank()) {
+                if (
+                    savedUrl.startsWith("https://", ignoreCase = true) ||
+                        savedUrl.startsWith("http://localhost", ignoreCase = true) ||
+                        savedUrl.startsWith("http://127.", ignoreCase = true)
+                ) {
                     savedUrl
                 } else {
                     apiClient
-                        .discoverServer()
+                        .discoverServer(
+                            tailnetDomains = networkTierProvider.activeTailnetDomains(),
+                            extraCandidates = tailscaleHttpsUpgrades(savedUrl),
+                        )
                         ?.let { normalizeServerUrl(it.preferredUrl) }
                         .orEmpty()
                 }
             }
         check(resolvedUrl.isNotBlank()) {
-            "Could not auto-discover Roche server on Tailnet; enter Server URL"
+            "Could not auto-discover Roche server on Tailnet; paste the full https://...#code bundle"
         }
         val token =
             apiClient.pairDevice(

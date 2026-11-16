@@ -803,7 +803,7 @@ class RocheCatalogAndSyncTest {
                 // catalog, then clears flag
                 settings.update {
                     it.copy(
-                        serverUrl = "http://100.64.0.12:8080",
+                        serverUrl = "https://100.64.0.12:8080",
                         bearerToken = "tok-v8",
                         lastPeerSyncCursor = "2026-06-01T00:00:00Z",
                     )

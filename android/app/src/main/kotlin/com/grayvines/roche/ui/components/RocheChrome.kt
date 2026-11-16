@@ -468,7 +468,7 @@ fun UndoOrStatusSnackbar(
             text = message,
             color = colors.textPrimary,
             fontSize = 12.5.sp,
-            maxLines = 1,
+            maxLines = 4,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )

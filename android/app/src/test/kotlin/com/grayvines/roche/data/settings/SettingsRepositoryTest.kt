@@ -56,7 +56,7 @@ class SettingsRepositoryTest {
             }
 
             val current = repository.settings.first()
-            assertEquals("http://100.64.0.9:8080", current.serverUrl)
+            assertEquals("https://100.64.0.9:8080", current.serverUrl)
             assertEquals("secret-token", current.bearerToken)
             assertFalse(current.swipeToArchive)
             assertEquals(ThemeMode.LIGHT, current.themeMode)
@@ -95,8 +95,10 @@ class SettingsRepositoryTest {
             "https://roche.tail9876.ts.net",
             normalizeServerUrl("roche.tail9876.ts.net"),
         )
-        assertEquals("http://100.64.0.9:8080", normalizeServerUrl("100.64.0.9:8080"))
+        assertEquals("https://100.64.0.9:8080", normalizeServerUrl("100.64.0.9:8080"))
         assertEquals("https://100.63.0.1:8080", normalizeServerUrl("100.63.0.1:8080"))
+        assertEquals("http://localhost:8080", normalizeServerUrl("localhost:8080"))
+        assertEquals("http://127.0.0.1:8080", normalizeServerUrl("127.0.0.1:8080"))
 
         val (url, code) =
             parsePairingInput(
@@ -113,6 +115,18 @@ class SettingsRepositoryTest {
                 "https://roche",
             ),
             candidates,
+        )
+        assertEquals(
+            listOf(
+                "https://roche.tail9876.ts.net",
+                "https://mac-mini.tail9876.ts.net",
+                "https://mac-mini.tail9876.ts.net:8443",
+            ),
+            tailscaleHttpsUpgrades("http://mac-mini.tail9876.ts.net:8080"),
+        )
+        assertEquals(
+            listOf("tail9876.ts.net"),
+            extractTailnetDomains(listOf("tail9876.ts.net. lan.local, evil.com/bad")),
         )
     }
 

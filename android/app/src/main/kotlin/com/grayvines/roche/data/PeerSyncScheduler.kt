@@ -12,6 +12,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.PersistableBundle
 import com.grayvines.roche.RocheApp
+import com.grayvines.roche.data.settings.extractTailnetDomains
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.URI
@@ -61,6 +62,16 @@ class AndroidNetworkTierProvider(context: Context) : NetworkTierProvider, AutoCl
         .getOrDefault(NetworkTier.WIFI)
 
     override fun isVpnTransportActive(): Boolean = _vpnActive.value || hasActiveVpnTunnelInterface()
+
+    override fun activeTailnetDomains(): List<String> = runCatching {
+        val cm = connectivityManager ?: return emptyList()
+        val networks = buildSet {
+            addAll(activeVpnNetworks)
+            cm.activeNetwork?.let(::add)
+        }
+        extractTailnetDomains(networks.mapNotNull { net -> cm.getLinkProperties(net)?.domains })
+    }
+        .getOrDefault(emptyList())
 
     override fun close() {
         if (callbackRegistered.compareAndSet(true, false)) {

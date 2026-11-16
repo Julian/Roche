@@ -95,15 +95,10 @@ private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     return "$prefix$trimmedUrl"
 }
 
-private fun shouldUseCleartextHttp(hostPart: String): Boolean {
-    val isLoopback =
-        hostPart in CLEARTEXT_LOOPBACK_HOSTS ||
-            hostPart == "[::1]" ||
-            hostPart.startsWith("127.") && isValidLoopbackIpv4(hostPart)
-    val isTailscaleIp =
-        isTailscaleCgnatIpv4(hostPart) || hostPart.startsWith(TAILSCALE_ULA_IPV6_PREFIX)
-    return isLoopback || isTailscaleIp
-}
+private fun shouldUseCleartextHttp(hostPart: String): Boolean =
+    hostPart in CLEARTEXT_LOOPBACK_HOSTS ||
+        hostPart == HOST_LOOPBACK_V6 ||
+        hostPart.startsWith("127.") && isValidLoopbackIpv4(hostPart)
 
 private fun isValidLoopbackIpv4(host: String): Boolean {
     val parts = host.split('.')
@@ -169,11 +164,48 @@ internal fun tailscaleDiscoveryUrls(tailnetDomains: List<String> = emptyList()):
         .filter { isValidDnsName(it) }
         .distinct()
         .forEach { domain ->
-            candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE.$domain")
+            val fqdnSuffix = if (domain.endsWith(TS_NET_SUFFIX)) domain else null
+            if (fqdnSuffix != null) {
+                candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE.$fqdnSuffix")
+            } else {
+                candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE.$domain")
+            }
         }
     candidates.add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE")
     return candidates.distinct()
 }
+
+internal fun tailscaleHttpsUpgrades(rawServerUrl: String): List<String> {
+    val clean = parseCleanOriginUri(rawServerUrl.trim().trimEnd('/')) ?: return emptyList()
+    val host = runCatching { URI(clean).host?.lowercase() }.getOrNull() ?: return emptyList()
+    if (!isValidDnsName(host) || !host.endsWith(TS_NET_SUFFIX)) return emptyList()
+    val suffix = extractTsNetSuffix(host)?.let { "$it$TS_NET_SUFFIX" }
+    return buildList {
+        if (suffix != null) {
+            add("$SCHEME_HTTPS_PREFIX$HOST_ROCHE.$suffix")
+        }
+        add("$SCHEME_HTTPS_PREFIX$host")
+        add("$SCHEME_HTTPS_PREFIX$host:$FALLBACK_ROCHE_HTTPS_PORT")
+    }
+        .distinct()
+}
+
+internal fun keepTokenOnDiscovery(previousUrl: String, discoveredUrl: String): Boolean {
+    if (previousUrl == discoveredUrl) return true
+    if (!discoveredUrl.startsWith(SCHEME_HTTPS_PREFIX)) return false
+    val prevHost = runCatching { URI(previousUrl).host?.lowercase() }.getOrNull().orEmpty()
+    val nextHost = runCatching { URI(discoveredUrl).host?.lowercase() }.getOrNull().orEmpty()
+    return prevHost.isNotEmpty() && prevHost == nextHost
+}
+
+internal fun extractTailnetDomains(rawDomainsList: Iterable<String>): List<String> =
+    rawDomainsList
+        .asSequence()
+        .flatMap { raw -> raw.split(',', ' ', '\t', '\n', '\r') }
+        .map { it.trim().trim('.').lowercase() }
+        .filter { it.endsWith(TS_NET_SUFFIX) && isValidDnsName(it) }
+        .distinct()
+        .toList()
 
 internal fun validateCanonicalDiscoveryUrl(
     rawCanonical: String,
@@ -186,13 +218,12 @@ internal fun validateCanonicalDiscoveryUrl(
     }
     val cleanCanonical = parseCleanOriginUri(trimmed) ?: return null
     val cleanProbed = parseCleanOriginUri(probedBaseUrl.trim().trimEnd('/')) ?: return null
-    val isHttpsDowngrade =
-        cleanProbed.startsWith(SCHEME_HTTPS_PREFIX) &&
-            !cleanCanonical.startsWith(SCHEME_HTTPS_PREFIX)
-    if (isHttpsDowngrade) return null
+    val probedHost = runCatching { URI(cleanProbed).host?.lowercase() }.getOrNull() ?: return null
+    val isLocalProbe = probedHost in LOCAL_HTTP_PROBE_HOSTS
+    val requiresHttps = cleanProbed.startsWith(SCHEME_HTTPS_PREFIX) || !isLocalProbe
+    if (requiresHttps && !cleanCanonical.startsWith(SCHEME_HTTPS_PREFIX)) return null
     val canonicalHost =
         runCatching { URI(cleanCanonical).host?.lowercase() }.getOrNull() ?: return null
-    val probedHost = runCatching { URI(cleanProbed).host?.lowercase() }.getOrNull() ?: return null
     return if (isTrustedCanonicalHost(canonicalHost, probedHost)) cleanCanonical else null
 }
 
@@ -240,14 +271,20 @@ internal fun isValidDnsLabel(label: String): Boolean =
         label.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
 
 internal const val DEFAULT_ROCHE_PORT = 8080
+private const val FALLBACK_ROCHE_HTTPS_PORT = 8443
 private const val HOST_ROCHE = "roche"
+private const val HOST_LOCALHOST = "localhost"
+private const val HOST_LOOPBACK_V4 = "127.0.0.1"
+private const val HOST_LOOPBACK_V6 = "[::1]"
+private const val HOST_EMULATOR = "10.0.2.2"
 private const val SCHEME_HTTP_PREFIX = "http://"
 private const val SCHEME_HTTPS_PREFIX = "https://"
 private const val TS_NET_SUFFIX = ".ts.net"
-private const val TAILSCALE_ULA_IPV6_PREFIX = "[fd7a:115c:a1e0:"
 private const val LOOPBACK_FIRST_OCTET = 127
-private val CLEARTEXT_LOOPBACK_HOSTS = setOf("localhost", "10.0.2.2")
-private val TRUSTED_LOCAL_PROBE_HOSTS = setOf(HOST_ROCHE, "127.0.0.1", "localhost")
+private val CLEARTEXT_LOOPBACK_HOSTS = setOf(HOST_LOCALHOST, HOST_EMULATOR)
+private val LOCAL_HTTP_PROBE_HOSTS =
+    setOf(HOST_LOOPBACK_V4, HOST_LOCALHOST, HOST_EMULATOR, HOST_LOOPBACK_V6)
+private val TRUSTED_LOCAL_PROBE_HOSTS = setOf(HOST_ROCHE, HOST_LOOPBACK_V4, HOST_LOCALHOST)
 private const val MAX_TCP_PORT = 65_535
 private const val MAX_DNS_NAME_LEN = 253
 private const val MAX_DNS_LABEL_LEN = 63

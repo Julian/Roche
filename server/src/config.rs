@@ -183,7 +183,7 @@ impl Default for TailscaleConfig {
         Self {
             enabled: true,
             tailscale_bin: PathBuf::from("tailscale"),
-            advertise_service: None,
+            advertise_service: Some("svc:roche".to_string()),
             auto_auth_users: Vec::new(),
         }
     }
