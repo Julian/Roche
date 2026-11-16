@@ -125,6 +125,7 @@ fun MainScreen(
         showChrome &&
             topKey !is RocheNavKey.Search &&
             (topKey as? RocheNavKey.Tab)?.tab != AppTab.SETTINGS
+    val activeTabForBar = resolveBarTab(topKey, state)
     var chromeBottomPx by remember { mutableIntStateOf(0) }
     val snackbarBottomOffset =
         if (showChrome) {
@@ -139,26 +140,26 @@ fun MainScreen(
                 testTagsAsResourceId = true
             }
     ) {
-        NavDisplay(
-            backStack = navBackStack,
-            modifier = Modifier.fillMaxSize(),
-            onBack = {
-                (navBackStack.lastOrNull() as? RocheNavKey)
-                    ?.let(::popActionForTopKey)
-                    ?.let(currentOnAction)
-            },
-            entryProvider =
-                entryProvider {
-                    entry<RocheNavKey.Tab> { tabKey ->
-                        MainDestinationScaffold(
-                            state = currentState,
-                            activePlayerEntry = currentPlayerEntry,
-                            showBottomBar = true,
-                            hasFab = tabKey.tab != AppTab.SETTINGS,
-                            activeTabForBar = tabKey.tab,
-                            onChromeBottomHeightChange = { chromeBottomPx = it },
-                            onAction = currentOnAction,
-                        ) {
+        MainDestinationScaffold(
+            state = state,
+            activePlayerEntry = activePlayerEntry,
+            showBottomBar = showChrome,
+            hasFab = hasFab,
+            activeTabForBar = activeTabForBar,
+            onChromeBottomHeightChange = { chromeBottomPx = it },
+            onAction = onAction,
+        ) {
+            NavDisplay(
+                backStack = navBackStack,
+                modifier = Modifier.fillMaxSize(),
+                onBack = {
+                    (navBackStack.lastOrNull() as? RocheNavKey)
+                        ?.let(::popActionForTopKey)
+                        ?.let(currentOnAction)
+                },
+                entryProvider =
+                    entryProvider {
+                        entry<RocheNavKey.Tab> { tabKey ->
                             MainTabDestinationContent(
                                 tab = tabKey.tab,
                                 state = currentState,
@@ -170,55 +171,50 @@ fun MainScreen(
                                 onExportOpml = currentOnExportOpml,
                             )
                         }
-                    }
 
-                    entry<RocheNavKey.ScopedInbox> { scopedKey ->
-                        MainScopedInboxDestination(
-                            scopedKey = scopedKey,
-                            state = currentState,
-                            retainedFromParent = retainedScopedStates[scopedKey],
-                            activePlayerEntry = currentPlayerEntry,
-                            scrollStates = scrollStates,
-                            onChromeBottomHeightChange = { chromeBottomPx = it },
-                            onAction = currentOnAction,
-                        )
-                    }
+                        entry<RocheNavKey.ScopedInbox> { scopedKey ->
+                            MainScopedInboxDestination(
+                                scopedKey = scopedKey,
+                                state = currentState,
+                                retainedFromParent = retainedScopedStates[scopedKey],
+                                scrollStates = scrollStates,
+                                onAction = currentOnAction,
+                            )
+                        }
 
-                    entry<RocheNavKey.Search> {
-                        MainSearchDestination(
-                            state = currentState,
-                            retainedFromParent = currentRetainedSearch,
-                            activePlayerEntry = currentPlayerEntry,
-                            scrollStates = scrollStates,
-                            onChromeBottomHeightChange = { chromeBottomPx = it },
-                            onAction = currentOnAction,
-                        )
-                    }
+                        entry<RocheNavKey.Search> {
+                            MainSearchDestination(
+                                state = currentState,
+                                retainedFromParent = currentRetainedSearch,
+                                scrollStates = scrollStates,
+                                onAction = currentOnAction,
+                            )
+                        }
 
-                    entry<RocheNavKey.Reader> { readerKey ->
-                        MainReaderDestination(
-                            readerKey = readerKey,
-                            state = currentState,
-                            activeReaderEntry = currentReaderEntry,
-                            activePlayerEntry = currentPlayerEntry,
-                            onAction = currentOnAction,
-                            onShareEntry = currentOnShareEntry,
-                            onOpenExternalUrl = currentOnOpenExternalUrl,
-                        )
-                    }
+                        entry<RocheNavKey.Reader> { readerKey ->
+                            MainReaderDestination(
+                                readerKey = readerKey,
+                                state = currentState,
+                                activeReaderEntry = currentReaderEntry,
+                                onAction = currentOnAction,
+                                onShareEntry = currentOnShareEntry,
+                                onOpenExternalUrl = currentOnOpenExternalUrl,
+                            )
+                        }
 
-                    entry<RocheNavKey.FullscreenPlayer> { playerKey ->
-                        MainPlayerDestination(
-                            playerKey = playerKey,
-                            state = currentState,
-                            activePlayerEntry = currentPlayerEntry,
-                            onAction = currentOnAction,
-                            onShareEntry = currentOnShareEntry,
-                            onOpenExternalUrl = currentOnOpenExternalUrl,
-                        )
-                    }
-                },
-        )
+                        entry<RocheNavKey.FullscreenPlayer> { playerKey ->
+                            MainPlayerDestination(
+                                playerKey = playerKey,
+                                state = currentState,
+                                activePlayerEntry = currentPlayerEntry,
+                                onAction = currentOnAction,
+                                onShareEntry = currentOnShareEntry,
+                                onOpenExternalUrl = currentOnOpenExternalUrl,
+                            )
+                        }
+                    },
+            )
+        }
 
         MainSnackbarOverlay(
             state = state,
@@ -239,6 +235,13 @@ fun MainScreen(
         onOpenExternalUrl = onOpenExternalUrl,
     )
 }
+
+private fun resolveBarTab(topKey: RocheNavKey, state: MainUiState): AppTab =
+    when (topKey) {
+        is RocheNavKey.Tab -> topKey.tab
+        is RocheNavKey.ScopedInbox -> AppTab.INBOX
+        else -> state.activeTab
+    }
 
 @Composable
 internal fun rememberMainScrollStates(): MainScrollStateHolder =
@@ -464,9 +467,7 @@ private fun MainScopedInboxDestination(
     scopedKey: RocheNavKey.ScopedInbox,
     state: MainUiState,
     retainedFromParent: MainUiState?,
-    activePlayerEntry: InboxEntry?,
     scrollStates: MainScrollStateHolder,
-    onChromeBottomHeightChange: (Int) -> Unit,
     onAction: (MainAction) -> Unit,
 ) {
     var retainedState by
@@ -479,30 +480,18 @@ private fun MainScopedInboxDestination(
             scopedKey = scopedKey,
             retainedState = retainedFromParent ?: retainedState,
         )
-    MainDestinationScaffold(
+    InboxTabContent(
         state = retainedState,
-        activePlayerEntry = activePlayerEntry,
-        showBottomBar = true,
-        hasFab = true,
-        activeTabForBar = AppTab.INBOX,
-        onChromeBottomHeightChange = onChromeBottomHeightChange,
         onAction = onAction,
-    ) {
-        InboxTabContent(
-            state = retainedState,
-            onAction = onAction,
-            listState = scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
-        )
-    }
+        listState = scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
+    )
 }
 
 @Composable
 private fun MainSearchDestination(
     state: MainUiState,
     retainedFromParent: MainUiState?,
-    activePlayerEntry: InboxEntry?,
     scrollStates: MainScrollStateHolder,
-    onChromeBottomHeightChange: (Int) -> Unit,
     onAction: (MainAction) -> Unit,
 ) {
     var retainedSearchState by remember {
@@ -514,22 +503,12 @@ private fun MainSearchDestination(
         retainedSearchState = retainedFromParent
     }
     val searchScrollKey = "search:${retainedSearchState.searchQuery.trim().lowercase()}"
-    MainDestinationScaffold(
+    SearchOverlay(
         state = retainedSearchState,
-        activePlayerEntry = activePlayerEntry,
-        showBottomBar = true,
-        hasFab = false,
-        activeTabForBar = retainedSearchState.activeTab,
-        onChromeBottomHeightChange = onChromeBottomHeightChange,
         onAction = onAction,
-    ) {
-        SearchOverlay(
-            state = retainedSearchState,
-            onAction = onAction,
-            listState = scrollStates.lazyListState(searchScrollKey),
-            isSearchActive = state.isSearchOpen,
-        )
-    }
+        listState = scrollStates.lazyListState(searchScrollKey),
+        isSearchActive = state.isSearchOpen,
+    )
 }
 
 @Composable
@@ -537,7 +516,6 @@ private fun MainReaderDestination(
     readerKey: RocheNavKey.Reader,
     state: MainUiState,
     activeReaderEntry: InboxEntry?,
-    activePlayerEntry: InboxEntry?,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -553,28 +531,18 @@ private fun MainReaderDestination(
     if (activeReaderEntry?.id == readerKey.entryId) {
         retainedBackLabel = readerBackLabel(state)
     }
-    MainDestinationScaffold(
-        state = state,
-        activePlayerEntry = activePlayerEntry,
-        showBottomBar = false,
-        hasFab = false,
-        activeTabForBar = state.activeTab,
-        onChromeBottomHeightChange = {},
-        onAction = onAction,
-    ) {
-        val targetEntry = retainedEntry
-        if (targetEntry != null) {
-            CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
-                ReaderView(
-                    entry = targetEntry,
-                    settings = state.settings,
-                    isHydrating = state.isReaderHydrating,
-                    onAction = onAction,
-                    onShareEntry = onShareEntry,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    backLabel = retainedBackLabel,
-                )
-            }
+    val targetEntry = retainedEntry
+    if (targetEntry != null) {
+        CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
+            ReaderView(
+                entry = targetEntry,
+                settings = state.settings,
+                isHydrating = state.isReaderHydrating,
+                onAction = onAction,
+                onShareEntry = onShareEntry,
+                onOpenExternalUrl = onOpenExternalUrl,
+                backLabel = retainedBackLabel,
+            )
         }
     }
 }
@@ -595,30 +563,20 @@ private fun MainPlayerDestination(
     if (liveEntry != null) {
         retainedEntry = liveEntry
     }
-    MainDestinationScaffold(
-        state = state,
-        activePlayerEntry = activePlayerEntry,
-        showBottomBar = false,
-        hasFab = false,
-        activeTabForBar = state.activeTab,
-        onChromeBottomHeightChange = {},
-        onAction = onAction,
-    ) {
-        val targetEntry = retainedEntry
-        if (targetEntry != null) {
-            val resolvedFeed =
-                state.activePlayerFeed
-                    ?: targetEntry.feedId?.let { fid -> state.feeds.firstOrNull { it.id == fid } }
-            FullscreenPodcastPlayer(
-                entry = targetEntry,
-                feed = resolvedFeed,
-                playerState = state.playerState,
-                nextQueuedAudioEntry = state.nextQueuedAudioEntry,
-                onAction = onAction,
-                onShareEntry = onShareEntry,
-                onOpenExternalUrl = onOpenExternalUrl,
-            )
-        }
+    val targetEntry = retainedEntry
+    if (targetEntry != null) {
+        val resolvedFeed =
+            state.activePlayerFeed
+                ?: targetEntry.feedId?.let { fid -> state.feeds.firstOrNull { it.id == fid } }
+        FullscreenPodcastPlayer(
+            entry = targetEntry,
+            feed = resolvedFeed,
+            playerState = state.playerState,
+            nextQueuedAudioEntry = state.nextQueuedAudioEntry,
+            onAction = onAction,
+            onShareEntry = onShareEntry,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
     }
 }
 

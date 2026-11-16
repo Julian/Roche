@@ -151,11 +151,14 @@ class MainScreenTest {
             }
         }
 
-        composeRule.onNodeWithTag("settings_server_row").assertExists()
-        composeRule.onNodeWithTag("settings_nav_row").assertExists()
-        composeRule.onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings").assertExists()
-        composeRule.onNodeWithTag("settings_unpinned_tab_queue").assertExists()
-        composeRule.onNodeWithTag("settings_unpinned_tab_offline").assertExists()
+        composeRule.onNodeWithTag("settings_server_row").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_nav_row").performScrollTo().assertExists()
+        composeRule
+            .onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings")
+            .performScrollTo()
+            .assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_queue").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_offline").performScrollTo().assertExists()
         composeRule.onNodeWithTag("collection_draws_home_toggle").performScrollTo().assertExists()
         composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()

@@ -1709,14 +1709,15 @@ async fn test_peer_sync_initial_pagination_referenced_entries_slug_collision_and
         .unwrap();
 
     let ep0_id = &created_ids[0];
-    let updated_before_tie: DateTime<Utc> = sqlx::query_scalar!(
-        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
-        ep0_id,
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    let sentinel_ts =
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+        .bind(sentinel_ts)
+        .bind(ep0_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let updated_before_tie = sentinel_ts;
 
     db.sync()
         .merge_peer_state(&PeerSyncRequest {
@@ -1926,14 +1927,15 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
         .await
         .unwrap();
 
-    let updated_before: DateTime<Utc> = sqlx::query_scalar!(
-        "SELECT updated_at AS \"updated_at: DateTime<Utc>\" FROM entries WHERE id = ?",
-        item.id,
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let sentinel_u_ts =
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&Utc);
+    sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
+        .bind(sentinel_u_ts)
+        .bind(&item.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let updated_before = sentinel_u_ts;
 
     // Second identical sync must be a complete no-op on `entries.updated_at`!
     db.sync()
@@ -2022,7 +2024,6 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
         .await
         .unwrap();
     assert!(p1.has_more);
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let mid_entry = db
         .catalog()
@@ -2033,7 +2034,7 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
         })
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let p1_cursor = mid_entry.updated_at - chrono::Duration::milliseconds(1);
 
     let (p2, _) = db
         .sync()
@@ -2042,7 +2043,7 @@ async fn test_unicode_tags_readd_tombstone_and_multipage_concurrent_catalog_sync
                 peer_id: "peer-mp".to_owned(),
                 device_name: Some("Phone".to_owned()),
                 network_tier: NetworkTier::Wifi,
-                updated_after: Some(p1.sync_timestamp),
+                updated_after: Some(p1_cursor),
                 after_item_id: p1.next_after_item_id.clone(),
                 ..PeerSyncRequest::default()
             },

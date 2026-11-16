@@ -2,9 +2,7 @@
 
 package com.grayvines.roche.data
 
-import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
-import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDatabase
@@ -19,14 +17,11 @@ import com.grayvines.roche.ui.extractInboxSnippet
 import com.grayvines.roche.ui.parseHtmlArticleBlocks
 import com.grayvines.roche.ui.prepareInlineHtmlForCompose
 import java.io.File
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -45,38 +40,26 @@ import org.junit.jupiter.api.io.TempDir
 class RocheRssWorkflowTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
+    private lateinit var testEnv: TestRocheEnv
+    private val database: RocheDatabase
+        get() = testEnv.database
+
+    private val settings: SettingsRepository
+        get() = testEnv.settings
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "workflow_settings.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
+        testEnv = TestRocheEnv(tempDir, "workflow_settings.preferences_pb")
     }
 
     @AfterEach
     fun tearDown() {
-        runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
-        database.close()
+        testEnv.close()
         Dispatchers.resetMain()
     }
 
-    private suspend fun seedDatabase() {
-        val dao = database.dao()
-        dao.upsertFeeds(SeedData.feeds)
-        dao.upsertTags(SeedData.tags)
-        dao.upsertItems(SeedData.items)
-        dao.insertItemTags(SeedData.itemTags)
-    }
+    private suspend fun seedDatabase() = testEnv.seedDefaultData()
 
     @Test
     fun `hydrateItemContentIfNeeded archiveEntriesBatch OpmlImportExport and HtmlArticleBlocks work end to end`() =
@@ -760,6 +743,82 @@ class RocheRssWorkflowTest {
             assertNull(entry.contentText)
             assertEquals("12m", entry.readEstimateLabel)
         }
+
+    @Test
+    fun `syncWithServer chunks large HTML item payloads under server body limit without 413`() =
+        runTest {
+            val largeHtml = "<p>" + "a".repeat(350_000) + "</p>"
+            val baseItem = SeedData.items.first()
+            val expectedUrls = mutableSetOf<String>()
+            for (idx in 1..20) {
+                val url = "https://essays.example.com/longform-$idx"
+                expectedUrls.add(url)
+                database
+                    .dao()
+                    .upsertItem(
+                        baseItem.copy(
+                            id = "large-item-$idx",
+                            feedId = null,
+                            feedUrl = null,
+                            title = "Longform Essay $idx",
+                            url = url,
+                            contentHtml = largeHtml,
+                        )
+                    )
+            }
+            settings.update {
+                it.copy(serverUrl = "https://roche.tail9876.ts.net", bearerToken = "tok-chunked")
+            }
+
+            val receivedBodies = mutableListOf<String>()
+            val strictLimitClient = buildStrictLimitChunkingClient(receivedBodies)
+
+            val chunkRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = strictLimitClient,
+                    settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
+                )
+
+            val syncedCount = chunkRepo.syncWithServer().getOrThrow()
+            assertEquals(20, syncedCount)
+            assertTrue(receivedBodies.size >= 4)
+            expectedUrls.forEach { url ->
+                assertTrue(
+                    receivedBodies.any { it.contains(url) },
+                    "Expected $url to be pushed across chunked sync requests",
+                )
+            }
+        }
+}
+
+private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>): RocheApiClient {
+    val storedItemJsons = mutableListOf<String>()
+    return RocheApiClient { request ->
+        if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+            val body = request.body.orEmpty()
+            if (body.toByteArray().size > 6 * 1024 * 1024) {
+                HttpResponse(statusCode = 413, body = "length limit exceeded")
+            } else {
+                receivedBodies.add(body)
+                val parsedObj =
+                    kotlinx.serialization.json.Json.parseToJsonElement(body)
+                        as kotlinx.serialization.json.JsonObject
+                val incomingItems = parsedObj["items"] as? kotlinx.serialization.json.JsonArray
+                incomingItems?.forEach { storedItemJsons.add(it.toString()) }
+                val isDelta = parsedObj.containsKey("updated_after")
+                val respItems = if (isDelta) "[]" else "[${storedItemJsons.joinToString(",")}]"
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"server_peer_id":"server","sync_timestamp":"2026-11-16T20:00:00Z","active_peers":[],"feeds":[],"items":$respItems,"tags":[],"tombstones":[]}""",
+                )
+            }
+        } else {
+            HttpResponse(statusCode = 404, body = "{}")
+        }
+    }
 }
 
 private fun buildOfflineFeedArchiveMockClient(

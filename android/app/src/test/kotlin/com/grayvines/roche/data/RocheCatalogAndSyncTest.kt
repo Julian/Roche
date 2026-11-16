@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.data
 
-import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
@@ -18,11 +17,6 @@ import com.grayvines.roche.data.remote.buildPeerSyncRequestPayload
 import com.grayvines.roche.data.remote.parsePeerSyncResponseJson
 import com.grayvines.roche.data.settings.SettingsRepository
 import java.io.File
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
@@ -38,31 +32,24 @@ import org.junit.jupiter.api.io.TempDir
 class RocheCatalogAndSyncTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
-    private lateinit var repository: RocheRepository
+    private lateinit var testEnv: TestRocheEnv
+    private val database: RocheDatabase
+        get() = testEnv.database
+
+    private val settings: SettingsRepository
+        get() = testEnv.settings
+
+    private val repository: RocheRepository
+        get() = testEnv.repository
 
     @BeforeEach
     fun setUp() {
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "catalog_test.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
-        val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
-        repository =
-            RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        testEnv = TestRocheEnv(tempDir, "catalog_test.preferences_pb")
     }
 
     @AfterEach
     fun tearDown() {
-        database.close()
-        runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
+        testEnv.close()
     }
 
     @Test

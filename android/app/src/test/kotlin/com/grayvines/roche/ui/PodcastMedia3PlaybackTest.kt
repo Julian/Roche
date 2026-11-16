@@ -257,17 +257,18 @@ class PodcastMedia3PlaybackTest {
 
             val logsAfter98 = database.dao().getAllConsumptionLogs().filter { it.entryId == "ep-1" }
             assertEquals(1, logsAfter98.size)
-            val updatedAtAfterFirst = database.dao().getCatalogEntryById("ep-1")?.updatedAt
-            assertNotNull(updatedAtAfterFirst)
+            val entryAfterFirst = database.dao().getCatalogEntryById("ep-1")
+            assertNotNull(entryAfterFirst)
+            val sentinelUpdatedAt = "2026-01-01T00:00:00Z"
+            database.dao().upsertCatalogEntry(entryAfterFirst!!.copy(updatedAt = sentinelUpdatedAt))
 
-            Thread.sleep(5)
             fakeClockMs += 35_000L
             backend.simulatedPositionMs = 595_000L
             controller.advanceSingleTick(tickCount = 30)
             drainJobs()
             assertEquals(1, database.dao().getAllConsumptionLogs().count { it.entryId == "ep-1" })
             assertEquals(
-                updatedAtAfterFirst,
+                sentinelUpdatedAt,
                 database.dao().getCatalogEntryById("ep-1")?.updatedAt,
             )
 
@@ -367,18 +368,6 @@ class PodcastMedia3PlaybackTest {
                 cacheDir = File(tempDir, "cache"),
             )
         val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-        val drainJobs: suspend () -> Unit = {
-            while (true) {
-                val activeJobs =
-                    playerScope.coroutineContext[Job]
-                        ?.children
-                        ?.filter { it.isActive }
-                        ?.toList()
-                        .orEmpty()
-                if (activeJobs.isEmpty()) break
-                activeJobs.joinAll()
-            }
-        }
         val controller =
             createManagedPlayerController(
                 scope = playerScope,
@@ -388,12 +377,26 @@ class PodcastMedia3PlaybackTest {
                 clockMs = clockMs,
             )
         val vm = MainViewModel(repo, settings, sharedPlayerController = controller)
+        val drainJobs: suspend () -> Unit = {
+            while (true) {
+                val activeJobs =
+                    playerScope.coroutineContext[Job]
+                        ?.children
+                        ?.filter { !it.isCompleted }
+                        ?.toList()
+                        .orEmpty()
+                if (activeJobs.isEmpty()) break
+                activeJobs.joinAll()
+            }
+        }
         val collectJob = backgroundScope.launch { vm.uiState.collect() }
         try {
             vm.uiState.first { it.allEntries.size == 1 }
             vm.dispatch(MainAction.PlayAudioEntry("ep-1"))
             vm.uiState.first {
-                it.playerState.currentEntryId == "ep-1" && it.playerState.isPlaying
+                it.playerState.currentEntryId == "ep-1" &&
+                    it.playerState.isPlaying &&
+                    !it.playerState.isBuffering
             }
             controller.cancelAutoTickerForTest()
             drainJobs()

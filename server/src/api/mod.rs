@@ -48,8 +48,8 @@ impl ApiRoutes {
             .route("/api/v1/import/opml", post(feeds::import_opml::<F>))
             .route("/api/v1/sync/peer", post(sync::sync_peer::<F>))
             .route("/api/v1/catalog/batch", post(catalog::catalog_batch_apply::<F>))
-            .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
-            .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024));
+            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+            .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024));
 
         let protected = Router::new()
             // Auth Devices

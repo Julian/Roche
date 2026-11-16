@@ -2,9 +2,6 @@
 
 package com.grayvines.roche.data
 
-import androidx.datastore.preferences.core.PreferenceDataStoreFactory
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.ItemTagEntity
@@ -50,40 +47,27 @@ import org.junit.jupiter.api.io.TempDir
 class RocheRepositoryTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
-    private lateinit var repository: RocheRepository
+    private lateinit var testEnv: TestRocheEnv
+    private val database: RocheDatabase
+        get() = testEnv.database
+
+    private val settings: SettingsRepository
+        get() = testEnv.settings
+
+    private val repository: RocheRepository
+        get() = testEnv.repository
 
     @BeforeEach
     fun setUp() {
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "test_settings.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
-        val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
-        repository =
-            RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        testEnv = TestRocheEnv(tempDir, "test_settings.preferences_pb")
     }
 
     @AfterEach
     fun tearDown() {
-        runBlocking { dataStoreScope.coroutineContext[Job]?.cancelAndJoin() }
-        database.close()
+        testEnv.close()
     }
 
-    internal suspend fun seedTestDatabase() {
-        val dao = database.dao()
-        dao.upsertFeeds(SeedData.feeds)
-        dao.upsertTags(SeedData.tags)
-        dao.upsertItems(SeedData.items)
-        dao.insertItemTags(SeedData.itemTags)
-    }
+    internal suspend fun seedTestDatabase() = testEnv.seedDefaultData()
 
     @Test
     fun `seedTestDatabase populates initial items feeds and tags`() = runTest {
@@ -1014,17 +998,9 @@ class RocheRepositoryTest {
                 )
                 assertTrue(patchStarted.await(5, TimeUnit.SECONDS))
 
-                // Release slow HTTP PATCH and verify pending_mutations clears once pushed
+                // Release slow HTTP PATCH and deterministically join background mutation jobs
                 allowPatchFinish.countDown()
-                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-                while (
-                    database.dao().getPendingMutation("item-2") != null &&
-                        System.nanoTime() < deadline
-                ) {
-                    kotlinx.coroutines.withContext(Dispatchers.Default) {
-                        kotlinx.coroutines.delay(15)
-                    }
-                }
+                bgScope.coroutineContext[Job]?.children?.toList()?.forEach { it.join() }
                 assertNull(database.dao().getPendingMutation("item-2"))
             } finally {
                 bgScope.coroutineContext[Job]?.cancelAndJoin()

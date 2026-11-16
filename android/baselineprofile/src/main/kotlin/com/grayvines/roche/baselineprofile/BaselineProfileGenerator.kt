@@ -16,10 +16,16 @@ class BaselineProfileGenerator {
 
     @Test
     fun generate() =
-        rule.collect(packageName = PACKAGE, includeInStartupProfile = true) {
+        rule.collect(
+            packageName = PACKAGE,
+            maxIterations = MAX_ITERATIONS,
+            stableIterations = STABLE_ITERATIONS,
+            includeInStartupProfile = true,
+        ) {
             pressHome()
             startActivityAndWait()
             device.wait(Until.hasObject(By.res(BOTTOM_NAV_TAG)), TIMEOUT_MS)
+            device.wait(Until.gone(By.res(LOADING_STATE_TAG)), TIMEOUT_MS)
             device.waitForIdle()
 
             BOTTOM_TAB_TAGS.forEach { tabTag -> clickTabWithRetry(device, tabTag) }
@@ -41,7 +47,10 @@ class BaselineProfileGenerator {
     private companion object {
         const val PACKAGE = "com.grayvines.roche"
         const val BOTTOM_NAV_TAG = "bottom_nav_bar"
+        const val LOADING_STATE_TAG = "inbox_loading_state"
         const val TIMEOUT_MS = 10_000L
+        const val MAX_ITERATIONS = 6
+        const val STABLE_ITERATIONS = 2
         const val MAX_CLICK_ATTEMPTS = 3
         val BOTTOM_TAB_TAGS =
             listOf(

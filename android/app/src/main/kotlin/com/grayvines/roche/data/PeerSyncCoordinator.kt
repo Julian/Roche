@@ -12,6 +12,7 @@ import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.remote.PeerSyncItemPayload
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
+import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.Settings
 import java.io.IOException
@@ -26,9 +27,19 @@ internal data class BuiltPeerSyncRequest(
     val sentFeedIds: Set<String>,
     val sentItemIds: Set<String>,
     val overflowItemIds: Set<String>,
+    val byteOverflowItemIds: Set<String> = emptySet(),
     val sentTombstoneKeys: Set<Pair<String, String>> = emptySet(),
     val sentCatalogBatch: OutgoingCatalogSyncBatch = OutgoingCatalogSyncBatch(),
 )
+
+internal data class ItemBudgetSplit(
+    val sentItems: List<ItemEntity>,
+    val byteOverflowIds: Set<String>,
+    val countOverflowIds: Set<String>,
+) {
+    val allOverflowIds: Set<String>
+        get() = byteOverflowIds + countOverflowIds
+}
 
 internal data class PeerSyncPreloadedState(
     val feeds: List<FeedEntity>,
@@ -42,6 +53,9 @@ internal data class PeerSyncRequestConfig(
     val networkTier: NetworkTier = NetworkTier.WIFI,
     val updatedAfter: String? = null,
     val weightOverride: Double? = null,
+    val forcedItemIds: Set<String> = emptySet(),
+    val excludeItemIds: Set<String> = emptySet(),
+    val maxItemBytes: Int = MAX_PEER_SYNC_ITEM_BYTES,
 )
 
 internal data class PeerSyncReconcileInput(
@@ -79,52 +93,52 @@ internal suspend fun buildTrackedPeerSyncRequest(
     val unsyncedFeedIds = feeds.filterNot { isSyncablePublicUrl(it.url) }.map { it.id }.toSet()
     val feedUrlsById = feeds.associate { it.id to it.url }
     val tags = dao.getAllTags()
-    val itemTagsByItemId = buildItemTagNamesByItemId(dao, tags)
     val mutationsById =
         (preloaded?.mutations ?: dao.getAllPendingMutations()).associateBy { it.entityId }
     val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
-    val syncablePeerItems = allItems.filter {
-        isSyncablePeerItem(it, unsyncedFeedIds, feedUrlsById)
-    }
     val hasSyncableData =
-        syncableFeeds.isNotEmpty() || syncablePeerItems.isNotEmpty() || hasLocalCatalogSyncData(dao)
+        syncableFeeds.isNotEmpty() ||
+            allItems.any { isSyncablePeerItem(it, unsyncedFeedIds, feedUrlsById) } ||
+            hasLocalCatalogSyncData(dao)
     val sinceInstant = resolveDeltaSinceInstant(config.updatedAfter, hasSyncableData)
-    val inclusiveSinceInstant = sinceInstant?.minusSeconds(1)
-    val (sentItems, overflowItemIds) =
+    val inclusiveSince = sinceInstant?.minusSeconds(1)
+    val split =
         selectPeerSyncItems(
-            allItems = allItems,
-            mutationsById = mutationsById,
-            unsyncedFeedIds = unsyncedFeedIds,
-            feedUrlsById = feedUrlsById,
-            inclusiveSinceInstant = inclusiveSinceInstant,
+            allItems,
+            mutationsById,
+            unsyncedFeedIds,
+            feedUrlsById,
+            inclusiveSince,
+            config,
         )
-    val sentFeedIdSet = syncableFeeds.map { it.id }.toSet()
-    val sentItemIdSet = sentItems.map { it.id }.toSet()
-    val catalogBatch =
-        buildOutgoingCatalogSyncBatch(
-            dao = dao,
-            inclusiveSinceInstant = inclusiveSinceInstant,
-            syncedFeedIds = sentFeedIdSet,
-            syncedItemIds = sentItemIdSet,
-        )
+    val sentFeedIds = syncableFeeds.map { it.id }.toSet()
+    val sentItemIds = split.sentItems.map { it.id }.toSet()
+    val catalogBatch = buildOutgoingCatalogSyncBatch(dao, inclusiveSince, sentFeedIds, sentItemIds)
     val itemPayloads =
-        mapPeerSyncItemPayloads(sentItems, mutationsById, itemTagsByItemId, feedUrlsById, nowIso)
-    val tombstones = collectPeerSyncTombstones(dao.getAllTombstones(), inclusiveSinceInstant)
+        mapPeerSyncItemPayloads(
+            split.sentItems,
+            mutationsById,
+            buildItemTagNamesByItemId(dao, tags),
+            feedUrlsById,
+            nowIso,
+        )
+    val tombstones = collectPeerSyncTombstones(dao.getAllTombstones(), inclusiveSince)
     val requestDto =
         assemblePeerSyncRequestDto(
-            config = config,
-            sinceInstant = sinceInstant,
-            syncableFeeds = syncableFeeds,
-            itemPayloads = itemPayloads,
-            tags = tags,
-            tombstones = tombstones,
-            catalogBatch = catalogBatch,
+            config,
+            sinceInstant,
+            syncableFeeds,
+            itemPayloads,
+            tags,
+            tombstones,
+            catalogBatch,
         )
     return BuiltPeerSyncRequest(
         request = requestDto,
-        sentFeedIds = sentFeedIdSet,
-        sentItemIds = sentItemIdSet,
-        overflowItemIds = overflowItemIds,
+        sentFeedIds = sentFeedIds,
+        sentItemIds = sentItemIds,
+        overflowItemIds = split.allOverflowIds,
+        byteOverflowItemIds = split.byteOverflowIds,
         sentTombstoneKeys = tombstones.map { it.entityType.lowercase() to it.naturalKey }.toSet(),
         sentCatalogBatch = catalogBatch,
     )
@@ -178,28 +192,65 @@ private fun assemblePeerSyncRequestDto(
     )
 }
 
+@Suppress("LongParameterList")
 internal fun selectPeerSyncItems(
     allItems: List<ItemEntity>,
     mutationsById: Map<String, PendingMutationEntity>,
     unsyncedFeedIds: Set<String>,
     feedUrlsById: Map<String, String>,
     inclusiveSinceInstant: Instant?,
-): Pair<List<ItemEntity>, Set<String>> {
+    config: PeerSyncRequestConfig = PeerSyncRequestConfig(peerId = "", deviceName = ""),
+): ItemBudgetSplit {
     val eligibleItems =
         allItems
             .filter { item ->
-                mutationsById[item.id]?.isDeletedItem != true &&
+                item.id !in config.excludeItemIds &&
+                    mutationsById[item.id]?.isDeletedItem != true &&
                     isSyncablePeerItem(item, unsyncedFeedIds, feedUrlsById) &&
-                    isDeltaPeerSyncItem(
-                        item = item,
-                        hasPendingMutation = item.id in mutationsById,
-                        inclusiveSinceInstant = inclusiveSinceInstant,
-                    )
+                    (item.id in config.forcedItemIds ||
+                        isDeltaPeerSyncItem(
+                            item = item,
+                            hasPendingMutation = item.id in mutationsById,
+                            inclusiveSinceInstant = inclusiveSinceInstant,
+                        ))
             }
             .sortedByDescending { it.interactionUpdatedAt ?: it.publishedAt ?: it.createdAt }
-    val sentItems = eligibleItems.take(MAX_PEER_SYNC_ITEMS)
-    val overflowItemIds = eligibleItems.drop(MAX_PEER_SYNC_ITEMS).map { it.id }.toSet()
-    return sentItems to overflowItemIds
+    val capped = eligibleItems.take(MAX_PEER_SYNC_ITEMS)
+    val countOverflow = eligibleItems.drop(MAX_PEER_SYNC_ITEMS).map { it.id }.toSet()
+    val (sent, byteOverflow) = splitItemsByBudget(capped, config.maxItemBytes)
+    return ItemBudgetSplit(sent, byteOverflow, countOverflow)
+}
+
+internal fun splitItemsByBudget(
+    cappedItems: List<ItemEntity>,
+    maxBytes: Int = MAX_PEER_SYNC_ITEM_BYTES,
+): Pair<List<ItemEntity>, Set<String>> {
+    val sent = ArrayList<ItemEntity>()
+    val overflow = LinkedHashSet<String>()
+    var usedBytes = 0
+    for (item in cappedItems) {
+        val estBytes = estimateSyncItemBytes(item)
+        val fits = sent.isEmpty() || usedBytes + estBytes <= maxBytes
+        if (fits) {
+            sent.add(item)
+            usedBytes += estBytes
+        } else {
+            overflow.add(item.id)
+        }
+    }
+    return sent to overflow
+}
+
+internal fun estimateSyncItemBytes(item: ItemEntity): Int {
+    val chars =
+        item.title.length +
+            item.url.length +
+            (item.author?.length ?: 0) +
+            (item.summary?.length ?: 0) +
+            (item.contentHtml?.length ?: 0) +
+            (item.thumbnailUrl?.length ?: 0) +
+            (item.audioUrl?.length ?: 0)
+    return ITEM_JSON_BASE_BYTES + chars * UTF8_JSON_ESCAPE_FACTOR
 }
 
 internal fun isSyncablePeerItem(
@@ -333,6 +384,11 @@ private const val HH_MM_SS_PART_COUNT = 3
 private const val SECONDS_PER_MINUTE = 60L
 private const val SECONDS_PER_HOUR = 3_600L
 private const val MAX_PEER_SYNC_ITEMS = 2_000
+internal const val MAX_PEER_SYNC_ITEM_BYTES = 4 * 1024 * 1024
+private const val ITEM_JSON_BASE_BYTES = 512
+private const val UTF8_JSON_ESCAPE_FACTOR = 2
+private const val MAX_OVERFLOW_PUSH_ROUNDS = 25
+private const val HTTP_PAYLOAD_TOO_LARGE = 413
 internal const val MAX_DELTA_CONTINUATION_PAGES = 20
 private const val COOPERATIVE_POLL_SLICE_SIZE = 4
 private const val NANOS_PER_SECOND = 1_000_000_000.0
@@ -539,6 +595,8 @@ internal class PeerResponseReconciler(
 internal data class SinglePeerSyncResult(
     val response: PeerSyncResponseDto,
     val cursorUsed: String?,
+    val sentItemIds: Set<String> = emptySet(),
+    val byteOverflowItemIds: Set<String> = emptySet(),
 )
 
 internal class PeerSyncCoordinator(
@@ -564,7 +622,7 @@ internal class PeerSyncCoordinator(
             ) ?: return null
         var latestPeers = initialRound.response.activePeers
         onPeersUpdated(latestPeers)
-        val updatedSettings =
+        var updatedSettings =
             applyCursorAndContinueDelta(
                 baseSettings = currentSettings,
                 round = initialRound,
@@ -574,6 +632,16 @@ internal class PeerSyncCoordinator(
                     onPeersUpdated(peers)
                 },
             )
+        updatedSettings =
+            drainOverflowItemPushes(
+                initialSettings = updatedSettings,
+                initialSentIds = initialRound.sentItemIds,
+                initialOverflowIds = initialRound.byteOverflowItemIds,
+                weightOverride = initialWeightOverride,
+            ) { peers ->
+                latestPeers = peers
+                onPeersUpdated(peers)
+            }
         if (needsCatalogBackfill) {
             dao.deleteLocalSyncFlag(FLAG_CATALOG_BACKFILL_NEEDED)
         }
@@ -738,11 +806,54 @@ internal class PeerSyncCoordinator(
         return response
     }
 
+    private suspend fun drainOverflowItemPushes(
+        initialSettings: Settings,
+        initialSentIds: Set<String>,
+        initialOverflowIds: Set<String>,
+        weightOverride: Double?,
+        onPagePeers: (List<PeerNodeDto>) -> Unit,
+    ): Settings {
+        var settings = initialSettings
+        var remainingIds = initialOverflowIds
+        val alreadySentIds = initialSentIds.toMutableSet()
+        var roundIdx = 0
+        var keepDraining = remainingIds.isNotEmpty()
+        while (keepDraining && roundIdx < MAX_OVERFLOW_PUSH_ROUNDS) {
+            val prevCount = remainingIds.size
+            val nextRound =
+                executeSinglePeerSyncRound(
+                    currentSettings = settings,
+                    weightOverride = weightOverride,
+                    forcedItemIds = remainingIds,
+                    excludeItemIds = alreadySentIds,
+                )
+            if (nextRound == null) {
+                keepDraining = false
+            } else {
+                alreadySentIds.addAll(nextRound.sentItemIds)
+                onPagePeers(nextRound.response.activePeers)
+                settings =
+                    applyCursorAndContinueDelta(
+                        baseSettings = settings,
+                        round = nextRound,
+                        weightOverride = weightOverride,
+                        onPagePeers = onPagePeers,
+                    )
+                remainingIds = nextRound.byteOverflowItemIds - alreadySentIds
+                keepDraining = remainingIds.isNotEmpty() && remainingIds.size < prevCount
+                roundIdx++
+            }
+        }
+        return settings
+    }
+
     private suspend fun executeSinglePeerSyncRound(
         currentSettings: Settings,
         weightOverride: Double? = null,
         ignoreSyncCursor: Boolean = false,
         requestCursorOverride: String? = null,
+        forcedItemIds: Set<String> = emptySet(),
+        excludeItemIds: Set<String> = emptySet(),
     ): SinglePeerSyncResult? {
         val appliedFeedMutations = pushRemoteFeedMutations(currentSettings)
         val preloaded =
@@ -753,11 +864,7 @@ internal class PeerSyncCoordinator(
             )
         val effectiveCursor =
             requestCursorOverride
-                ?: if (ignoreSyncCursor) {
-                    null
-                } else {
-                    currentSettings.lastPeerSyncCursor
-                }
+                ?: currentSettings.lastPeerSyncCursor.takeUnless { ignoreSyncCursor }
         val tracked =
             buildTrackedPeerSyncRequest(
                 dao = dao,
@@ -768,10 +875,15 @@ internal class PeerSyncCoordinator(
                         networkTier = networkTier,
                         updatedAfter = effectiveCursor,
                         weightOverride = weightOverride,
+                        forcedItemIds = forcedItemIds,
+                        excludeItemIds = excludeItemIds,
                     ),
                 preloaded = preloaded,
             )
-        val response = callSyncPeerRound(currentSettings, tracked.request) ?: return null
+        val (response, droppedItemsOn413) =
+            callSyncPeerRound(currentSettings, tracked.request) ?: return null
+        val (sentIds, overflowIds, byteOverflowIds) =
+            resolveRoundItemSets(tracked, droppedItemsOn413)
         reconcilePeerSyncResponse(
             dao = dao,
             response = response,
@@ -781,9 +893,9 @@ internal class PeerSyncCoordinator(
                     isDeltaItems = tracked.request.updatedAfter != null,
                     appliedMutations = appliedFeedMutations,
                     sentFeedIds = tracked.sentFeedIds,
-                    sentItemIds = tracked.sentItemIds,
+                    sentItemIds = sentIds,
                     sentTombstoneKeys = tracked.sentTombstoneKeys,
-                    overflowItemIds = tracked.overflowItemIds,
+                    overflowItemIds = overflowIds,
                     sentCatalogBatch = tracked.sentCatalogBatch,
                     catalogStore = catalogStore,
                 ),
@@ -791,25 +903,52 @@ internal class PeerSyncCoordinator(
         return SinglePeerSyncResult(
             response = response,
             cursorUsed = tracked.request.updatedAfter,
+            sentItemIds = sentIds,
+            byteOverflowItemIds = byteOverflowIds,
         )
     }
+
+    private fun resolveRoundItemSets(
+        tracked: BuiltPeerSyncRequest,
+        droppedItemsOn413: Boolean,
+    ): Triple<Set<String>, Set<String>, Set<String>> =
+        if (droppedItemsOn413) {
+            Triple(
+                emptySet(),
+                tracked.sentItemIds + tracked.overflowItemIds,
+                tracked.sentItemIds + tracked.byteOverflowItemIds,
+            )
+        } else {
+            Triple(tracked.sentItemIds, tracked.overflowItemIds, tracked.byteOverflowItemIds)
+        }
 
     private suspend fun callSyncPeerRound(
         currentSettings: Settings,
         request: PeerSyncRequestDto,
-    ): PeerSyncResponseDto? = runSuspendCatching {
-        apiClient.syncPeer(
-            serverUrl = currentSettings.serverUrl,
-            token = currentSettings.bearerToken,
-            request = request,
-        )
-    }
-        .onFailure { error ->
-            val allowBootstrapFallback =
-                request.updatedAfter == null && isOversizedResponseError(error)
-            if (!allowBootstrapFallback) throw error
+    ): Pair<PeerSyncResponseDto, Boolean>? {
+        val primary = runSuspendCatching {
+            apiClient.syncPeer(
+                serverUrl = currentSettings.serverUrl,
+                token = currentSettings.bearerToken,
+                request = request,
+            )
         }
-        .getOrNull()
+        val error = primary.exceptionOrNull()
+        return when {
+            error == null -> primary.getOrNull()?.let { it to false }
+            (error as? ProblemDetailsException)?.statusCode == HTTP_PAYLOAD_TOO_LARGE &&
+                request.items.isNotEmpty() ->
+                apiClient
+                    .syncPeer(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        request = request.copy(items = emptyList()),
+                    )
+                    ?.let { it to true }
+            request.updatedAfter == null && isOversizedResponseError(error) -> null
+            else -> throw error
+        }
+    }
 
     private suspend fun pushRemoteFeedMutations(
         currentSettings: Settings

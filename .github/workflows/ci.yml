@@ -27,9 +27,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Rust components and tools
+      - name: Install pinned Rust toolchain and lint tools
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup show active-toolchain || rustup toolchain install
           cargo install --locked prek cargo-deny cargo-machete
       - name: Run prek
         run: prek run --all-files
@@ -42,8 +42,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Run tests
         env:
           SQLX_OFFLINE: "true"
@@ -66,7 +66,13 @@ jobs:
           cache-read-only: ${{ github.ref_name != 'main' }}
           cache-disabled: ${{ github.ref_type == 'tag' }} # zizmor: ignore[cache-poisoning]
       - name: Formatting, detekt, lint, unit tests, release and test builds
-        run: ./android/gradlew -p android spotlessCheck detekt :app:lintDebug :app:testDebugUnitTest :app:assembleRelease :app:assembleDebugAndroidTest
+        env:
+          EXTRA_RELEASE_TASK: ${{ github.ref_type != 'tag' && ':app:assembleRelease' || '' }}
+        run: >
+          ./android/gradlew -p android
+          spotlessCheck detekt :app:lintDebug :app:testDebugUnitTest
+          :app:assembleDebugAndroidTest :baselineprofile:compileNonMinifiedReleaseKotlin
+          $EXTRA_RELEASE_TASK
 
   instrumented:
     name: Instrumented tests (${{ matrix.device.name }})
@@ -75,11 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        device:
-          - name: Pixel 9, API 36
-            task: pixel9Api36DebugAndroidTest
-          - name: Pixel 10 Pro, API 37
-            task: pixel10ProApi37DebugAndroidTest
+        device: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('[{"name":"Pixel 9, API 36","task":"pixel9Api36DebugAndroidTest"},{"name":"Pixel 10 Pro, API 37","task":"pixel10ProApi37DebugAndroidTest"}]') || fromJSON('[{"name":"Pixel 10 Pro, API 37","task":"pixel10ProApi37DebugAndroidTest"}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,8 +210,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
         with:
           cache-disabled: true
-      - name: Install stable Rust toolchain
-        run: rustup toolchain install stable --profile minimal
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Build server release binary
         env:
           SQLX_OFFLINE: "true"

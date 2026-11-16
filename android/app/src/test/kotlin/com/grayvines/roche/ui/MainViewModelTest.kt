@@ -3,12 +3,9 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.NetworkTier
 import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
@@ -69,10 +66,16 @@ import org.junit.jupiter.api.io.TempDir
 class MainViewModelTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
-    private lateinit var repository: RocheRepository
+    private lateinit var testEnv: com.grayvines.roche.data.TestRocheEnv
+    private val database: RocheDatabase
+        get() = testEnv.database
+
+    private val settings: SettingsRepository
+        get() = testEnv.settings
+
+    private val repository: RocheRepository
+        get() = testEnv.repository
+
     private lateinit var playerBackend: FakeAudioPlayerBackend
     private lateinit var mediaSessionBridge: RecordingMediaSessionBridge
     private lateinit var viewModel: MainViewModel
@@ -80,18 +83,7 @@ class MainViewModelTest {
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "vm_test_settings.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
-        val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
-        repository =
-            RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        testEnv = com.grayvines.roche.data.TestRocheEnv(tempDir, "vm_test_settings.preferences_pb")
         playerBackend = FakeAudioPlayerBackend()
         mediaSessionBridge = RecordingMediaSessionBridge()
         viewModel =
@@ -106,11 +98,8 @@ class MainViewModelTest {
     @AfterEach
     fun tearDown() {
         viewModel.playerController.releaseController()
-        runBlocking {
-            viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
-            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
-        }
-        database.close()
+        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        testEnv.close()
         Dispatchers.resetMain()
     }
 

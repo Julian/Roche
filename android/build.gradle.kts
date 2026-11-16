@@ -48,6 +48,7 @@ tasks.register("preflight") {
         ":app:lintDebug",
         ":app:testDebugUnitTest",
         ":app:compileDebugAndroidTestKotlin",
+        ":baselineprofile:compileNonMinifiedReleaseKotlin",
     )
 }
 
