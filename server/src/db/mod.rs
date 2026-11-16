@@ -16,13 +16,14 @@ mod types;
 
 pub use auth::{AuthRepo, DeviceToken};
 pub use catalog::{
+    BatchComparisonInput, BatchEntryInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
     CatalogEntry, CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionSummary,
     ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule,
-    EntryDetailView, EntryIdentifier, Generator1001State, PREFERRED_IDENTIFIER_SCHEMES,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput, choose_deterministic_entry_id,
-    external_identifier_label, external_identifier_url, matches_dynamic_collection_rule,
-    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
-    strip_album_edition_suffix,
+    EntryDetailView, EntryIdentifier, Generator1001State, Generator1001UpdateInput,
+    PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    choose_deterministic_entry_id, external_identifier_label, external_identifier_url,
+    matches_dynamic_collection_rule, normalize_identifier_scheme, normalize_identifier_value,
+    parse_dynamic_collection_rule, strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]

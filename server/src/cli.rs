@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use figment::{
@@ -9,8 +9,8 @@ use figment::{
 use crate::{
     config::Config,
     db::{
-        CatalogEntry, ClusterSelectFilter, ConsumptionStatus, Db, EntryIdentifier, EntryKind,
-        Generator1001State, UpsertEntryInput,
+        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, ConsumptionStatus, Db,
+        EntryIdentifier, EntryKind, Generator1001State, UpsertEntryInput,
     },
     ranking::RANDOM_SEED_EVERY,
     service::CatalogService,
@@ -97,27 +97,6 @@ impl Cli {
 
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> anyhow::Result<()> {
-        if let Some(Command::MigrateGreat {
-            ref great_dir,
-            db_path: Some(ref explicit_db),
-            ref pool_json,
-            dry_run,
-            json,
-        }) = self.command
-        {
-            if self.config.is_some() {
-                let _ = self.load_config()?;
-            }
-            return run_migrate_great_cmd(
-                explicit_db,
-                great_dir,
-                pool_json.as_deref(),
-                dry_run,
-                json,
-            )
-            .await;
-        }
-
         let cfg = self.load_config()?;
         match self.command {
             Some(Command::Serve) | None => crate::RocheServer::run(cfg).await,
@@ -251,39 +230,46 @@ impl Cli {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
                 run_album_cmd(&db, action.unwrap_or(AlbumCommand::Status)).await
             }
-            Some(Command::MigrateGreat { great_dir, db_path, pool_json, dry_run, json }) => {
-                let target_db = db_path.as_deref().unwrap_or(&cfg.storage.database_path);
-                run_migrate_great_cmd(target_db, &great_dir, pool_json.as_deref(), dry_run, json)
-                    .await
-            }
+            Some(Command::Catalog { action }) => match action {
+                CatalogCommand::Apply { file, dry_run, json } => {
+                    let db = crate::RocheServer::connect_db(&cfg).await?;
+                    run_catalog_apply_cmd(&db, &file, dry_run, json).await
+                }
+            },
         }
     }
 }
 
-async fn run_migrate_great_cmd(
-    target_db: &Path,
-    great_dir: &Path,
-    pool_json: Option<&Path>,
-    dry_run: bool,
+async fn run_catalog_apply_cmd(
+    db: &Db,
+    file: &std::path::Path,
+    dry_run_flag: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let stats =
-        crate::migrate_great::migrate_great_database(target_db, great_dir, pool_json, dry_run)
-            .await?;
-    if json {
-        println!("{}", serde_json::to_string(&stats)?);
+    let raw = if file.as_os_str() == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
     } else {
-        let mode_suffix = if dry_run { " (dry run — rolled back)" } else { "" };
-        println!("Migrated Great -> Roche successfully{mode_suffix}:");
-        println!("  1001 Albums seeded:     {}", stats.seeded_1001_albums);
-        println!("  Catalog entries added:  {}", stats.entries_upserted);
-        println!("  Want queue memberships: {}", stats.want_entries_added);
-        println!("  Consumption log rows:   {}", stats.consumption_logs_added);
-        println!("  Comparisons imported:   {}", stats.comparisons_added);
-        println!(
-            "  Active 1001 Album ID:   {}",
-            stats.active_1001_album_id.as_deref().unwrap_or("(none)")
-        );
+        tokio::fs::read_to_string(file).await?
+    };
+    let mut batch: CatalogBatchInput = serde_json::from_str(&raw)?;
+    if dry_run_flag {
+        batch.dry_run = true;
+    }
+    let result = db.catalog().apply_batch(&batch).await?;
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        let suffix = if result.dry_run { " (dry run — rolled back)" } else { "" };
+        println!("Applied catalog batch{suffix}:");
+        println!("  Entries processed:    {}", result.entries_processed);
+        println!("  Consumption logs:     {}", result.logs_recorded);
+        println!("  Comparisons recorded: {}", result.comparisons_recorded);
+        if let Some(active_id) = &result.active_1001_entry_id {
+            println!("  Active 1001 Album ID: {active_id}");
+        }
     }
     Ok(())
 }
@@ -384,20 +370,24 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<AlbumCommand>,
     },
-    /// Migrate a Great data repository into Roche's unified SQLite database
-    MigrateGreat {
-        /// Path to the Great repository directory (containing `great.toml`)
-        great_dir: PathBuf,
-        /// Optional SQLite database path override (defaults to `storage.database_path`)
-        #[arg(long, visible_alias = "roche-db", value_name = "FILE")]
-        db_path: Option<PathBuf>,
-        /// Optional override path to `albums_1001_pool.json`
-        #[arg(long, value_name = "FILE")]
-        pool_json: Option<PathBuf>,
-        /// Validate and simulate migration in a rolled-back transaction without modifying disk
+    /// Apply declarative operations against the unified media catalog
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCommand {
+    /// Apply a JSON batch of catalog entries, logs, comparisons, and generator updates
+    Apply {
+        /// Path to the JSON batch file (or `-` to read from stdin)
+        #[arg(default_value = "-")]
+        file: PathBuf,
+        /// Validate and simulate inside a rolled-back transaction without modifying disk
         #[arg(long)]
         dry_run: bool,
-        /// Emit machine-readable JSON stats to stdout
+        /// Emit machine-readable JSON result to stdout
         #[arg(long)]
         json: bool,
     },
@@ -955,24 +945,23 @@ mod tests {
             })
         );
 
-        let migrate_cmd = Cli::try_parse_from([
+        let catalog_cmd = Cli::try_parse_from([
             "roche",
-            "migrate-great",
-            "/tmp/great",
-            "--roche-db",
-            "/tmp/roche.db",
+            "catalog",
+            "apply",
+            "/tmp/batch.json",
             "--dry-run",
             "--json",
         ])
         .unwrap();
         assert_eq!(
-            migrate_cmd.command,
-            Some(Command::MigrateGreat {
-                great_dir: PathBuf::from("/tmp/great"),
-                db_path: Some(PathBuf::from("/tmp/roche.db")),
-                pool_json: None,
-                dry_run: true,
-                json: true,
+            catalog_cmd.command,
+            Some(Command::Catalog {
+                action: CatalogCommand::Apply {
+                    file: PathBuf::from("/tmp/batch.json"),
+                    dry_run: true,
+                    json: true,
+                },
             })
         );
     }

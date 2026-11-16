@@ -16,7 +16,7 @@ Track RSS/Atom blogs, arXiv papers, podcast episodes, YouTube subscriptions, boo
 - **CLI & TUI**:
   - Daemon & pairing: `roche` (alias `roche serve`), `roche pair`, `roche discover`, `roche devices <list|revoke>`.
   - Subscriptions: `roche import <file.opml> [--poll]`, `roche export [-o file.opml]`.
-  - Catalog & ranking: `roche consumed <kind> <title> [--creator ...] [--year ...] [--rank]`, `roche want <kind> <title> [--notes ...]`, `roche lists [--want]`, `roche show <target> [--want]`, `roche rank <collection_slug_or_id>` (interactive bucket-tie TUI), and `roche migrate-great <great_dir>` (idempotent importer for legacy Great catalogs).
+  - Catalog & ranking: `roche consumed <kind> <title> [--creator ...] [--year ...] [--rank]`, `roche want <kind> <title> [--notes ...]`, `roche lists [--want]`, `roche show <target> [--want]`, `roche rank <collection_slug_or_id>` (interactive bucket-tie TUI), and `roche catalog apply <file.json>` (atomic declarative batch upsert/log/rank).
 - **Configuration**:
   - Overrides apply in order: CLI flags (`--host`, `--port`, `--data-dir`, `--advertise-service`) > `ROCHE_*` env vars (`ROCHE_CONFIG`, `ROCHE_HOST`, `ROCHE_PORT`, `ROCHE_DATA_DIR`, `ROCHE_TAILSCALE_AUTO_AUTH_USERS`, etc.) > `./config.toml` > defaults (`127.0.0.1:8080`, `./data`).
 

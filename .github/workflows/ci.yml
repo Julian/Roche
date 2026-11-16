@@ -48,8 +48,6 @@ jobs:
         env:
           SQLX_OFFLINE: "true"
         run: cargo test --workspace --locked
-      - name: Run migration wrapper unit tests
-        run: python3 -m unittest discover -s scripts -p "test_*.py" -v
 
   checks:
     name: Android build, lint and unit tests

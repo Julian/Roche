@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     db::{
-        CatalogEntry, ClusterSelectFilter, CollectionRole, CollectionSummary, ComparisonRecord,
-        ConsumptionLogView, ConsumptionStatus, EntryDetailView, EntryKind, Generator1001State,
-        RankedCollectionView, UpsertEntryInput,
+        CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter, CollectionRole,
+        CollectionSummary, ComparisonRecord, ConsumptionLogView, ConsumptionStatus,
+        EntryDetailView, EntryKind, Generator1001State, RankedCollectionView, UpsertEntryInput,
     },
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
     ranking::Score,
@@ -123,9 +123,14 @@ pub(super) struct CreateComparisonRequest {
     ts: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct GeneratorEnableRequest {
-    enabled: bool,
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct GeneratorUpdateRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    current_entry_id: Option<String>,
+    #[serde(default)]
+    drawn_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -323,6 +328,14 @@ pub(super) async fn catalog_comparisons_create<F: FeedFetcher>(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
+pub(super) async fn catalog_batch_apply<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    ProblemJson(batch): ProblemJson<CatalogBatchInput>,
+) -> Result<Json<CatalogBatchResult>, ApiError> {
+    let result = service.catalog().apply_batch(&batch).await?;
+    Ok(Json(result))
+}
+
 pub(super) async fn catalog_generator_1001_get<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
 ) -> Result<Json<Generator1001State>, ApiError> {
@@ -332,9 +345,12 @@ pub(super) async fn catalog_generator_1001_get<F: FeedFetcher>(
 
 pub(super) async fn catalog_generator_1001_patch<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
-    ProblemJson(req): ProblemJson<GeneratorEnableRequest>,
+    ProblemJson(req): ProblemJson<GeneratorUpdateRequest>,
 ) -> Result<Json<Generator1001State>, ApiError> {
-    let state = service.catalog().set_1001_generator_enabled(req.enabled).await?;
+    let state = service
+        .catalog()
+        .update_1001_generator(req.enabled, req.current_entry_id.as_deref(), req.drawn_at)
+        .await?;
     Ok(Json(state))
 }
 

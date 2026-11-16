@@ -8,7 +8,6 @@ pub mod db;
 mod error;
 mod feeds;
 mod media;
-pub mod migrate_great;
 pub mod ranking;
 mod scheduler;
 mod service;

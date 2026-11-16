@@ -34,6 +34,36 @@ impl CatalogRepo<'_> {
 
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+        let seeded = Self::seed_1001_albums_in_tx(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(seeded)
+    }
+
+    pub(super) async fn ensure_1001_albums_seeded_in_tx(
+        tx: &mut SqliteConnection,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<usize> {
+        let pool_albums = bundled_1001_albums();
+        let current_count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!: i64"
+               FROM collection_entries ce
+               JOIN entries e ON e.id = ce.entry_id
+               WHERE ce.collection_id = ? AND e.merged_into_id IS NULL"#,
+            ALBUMS_1001_COLLECTION_ID,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if usize::try_from(current_count).unwrap_or(0) >= pool_albums.len() {
+            return Ok(0);
+        }
+        Self::seed_1001_albums_in_tx(tx, now).await
+    }
+
+    async fn seed_1001_albums_in_tx(
+        tx: &mut SqliteConnection,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<usize> {
+        let pool_albums = bundled_1001_albums();
         let mut seeded = 0usize;
 
         for (idx, album) in pool_albums.iter().enumerate() {
@@ -57,12 +87,12 @@ impl CatalogRepo<'_> {
             .await?;
 
             let mut existing_canon = if let Some(owner_id) = raw_owner {
-                Self::follow_merged_id_in_tx(&mut tx, &owner_id).await?
+                Self::follow_merged_id_in_tx(tx, &owner_id).await?
             } else {
                 None
             };
             if existing_canon.is_none() {
-                existing_canon = Self::follow_merged_id_in_tx(&mut tx, &album.id).await?;
+                existing_canon = Self::follow_merged_id_in_tx(tx, &album.id).await?;
             }
 
             let target_id = if let Some(eid) = existing_canon {
@@ -115,7 +145,6 @@ impl CatalogRepo<'_> {
             .await?;
         }
 
-        tx.commit().await?;
         Ok(seeded)
     }
 
@@ -211,27 +240,56 @@ impl CatalogRepo<'_> {
         &self,
         enabled: bool,
     ) -> CatalogResult<Generator1001State> {
+        self.update_1001_generator(Some(enabled), None, None).await
+    }
+
+    pub async fn update_1001_generator(
+        &self,
+        enabled: Option<bool>,
+        explicit_entry_id: Option<&str>,
+        explicit_drawn_at: Option<DateTime<Utc>>,
+    ) -> CatalogResult<Generator1001State> {
         self.ensure_1001_albums_seeded().await?;
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
+        Self::update_1001_generator_in_tx(
+            &mut tx,
+            enabled,
+            explicit_entry_id,
+            explicit_drawn_at,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_1001_generator_state().await
+    }
 
+    pub(super) async fn update_1001_generator_in_tx(
+        tx: &mut SqliteConnection,
+        enabled_override: Option<bool>,
+        explicit_entry_id: Option<&str>,
+        explicit_drawn_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<Option<String>> {
         let cur = sqlx::query!(
-            r#"SELECT current_entry_id as "current_entry_id?",
-                      drawn_at as "drawn_at?: DateTime<Utc>"
+            r#"SELECT enabled as "enabled!: bool",
+                      current_entry_id as "current_entry_id?",
+                      drawn_at as "drawn_at?: DateTime<Utc>",
+                      updated_at as "updated_at!: DateTime<Utc>"
                FROM collection_generators
                WHERE collection_id = ?"#,
             ALBUMS_1001_COLLECTION_ID,
         )
         .fetch_one(&mut *tx)
         .await?;
+        let _ = cur.updated_at;
+        let enabled = enabled_override.unwrap_or(cur.enabled);
         let mut drawn_at = cur.drawn_at;
         let mut current_id = match cur.current_entry_id {
-            Some(cid) => Self::follow_merged_id_in_tx(&mut tx, &cid).await?,
+            Some(cid) => Self::follow_merged_id_in_tx(tx, &cid).await?,
             None => None,
         };
 
-        // If `current_id` was already finished or abandoned externally (e.g. via CLI `roche consumed`),
-        // clear it so enabling draws a fresh album; otherwise strictly preserve `current_id`.
         if let Some(cid) = &current_id {
             let done = sqlx::query_scalar!(
                 r#"SELECT 1 as "found!: i64" FROM consumption_log
@@ -246,8 +304,43 @@ impl CatalogRepo<'_> {
             }
         }
 
+        if let Some(raw_explicit) = explicit_entry_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let canon_explicit =
+                Self::follow_merged_id_in_tx(tx, raw_explicit).await?.ok_or_else(|| {
+                    CatalogError::NotFound(format!("1001 Album entry '{raw_explicit}'"))
+                })?;
+            let in_pool = sqlx::query_scalar!(
+                r#"SELECT 1 as "found!: i64" FROM collection_entries WHERE collection_id = ? AND entry_id = ?"#,
+                ALBUMS_1001_COLLECTION_ID,
+                &canon_explicit,
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if in_pool.is_none() {
+                return Err(CatalogError::InvalidInput(format!(
+                    "Entry '{canon_explicit}' is not a member of 1001 Albums"
+                )));
+            }
+            let explicit_done = sqlx::query_scalar!(
+                r#"SELECT 1 as "found!: i64" FROM consumption_log
+                   WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
+                   LIMIT 1"#,
+                &canon_explicit,
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if explicit_done.is_none() {
+                current_id = Some(canon_explicit);
+                drawn_at = Some(explicit_drawn_at.unwrap_or(now));
+            }
+        } else if let Some(ts) = explicit_drawn_at
+            && current_id.is_some()
+        {
+            drawn_at = Some(ts);
+        }
+
         if enabled && current_id.is_none() {
-            current_id = Self::draw_random_remaining_1001_in_tx(&mut tx).await?;
+            current_id = Self::draw_random_remaining_1001_in_tx(tx).await?;
             if current_id.is_some() {
                 drawn_at = Some(now);
             }
@@ -268,7 +361,7 @@ impl CatalogRepo<'_> {
         .await?;
 
         SyncRepo::record_activity(
-            &mut tx,
+            tx,
             ActivityEntityType::Entry,
             ALBUMS_1001_COLLECTION_ID,
             ActivityAction::Update,
@@ -276,8 +369,7 @@ impl CatalogRepo<'_> {
         )
         .await?;
 
-        tx.commit().await?;
-        self.get_1001_generator_state().await
+        Ok(current_id)
     }
 
     pub async fn finish_active_1001_album(

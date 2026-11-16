@@ -313,3 +313,63 @@ pub(super) struct RawCollectionRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchEntryInput {
+    #[serde(default)]
+    pub ref_key: Option<String>,
+    #[serde(flatten)]
+    pub entry: UpsertEntryInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchLogInput {
+    pub entry_ref: String,
+    pub status: ConsumptionStatus,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchComparisonInput {
+    #[serde(default)]
+    pub scope_collection_id: Option<String>,
+    pub ordering: Vec<Vec<String>>,
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Generator1001UpdateInput {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub current_entry_ref: Option<String>,
+    #[serde(default)]
+    pub drawn_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogBatchInput {
+    #[serde(default)]
+    pub entries: Vec<BatchEntryInput>,
+    #[serde(default)]
+    pub logs: Vec<BatchLogInput>,
+    #[serde(default)]
+    pub comparisons: Vec<BatchComparisonInput>,
+    #[serde(default)]
+    pub generator_1001: Option<Generator1001UpdateInput>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogBatchResult {
+    pub entries_processed: usize,
+    pub logs_recorded: usize,
+    pub comparisons_recorded: usize,
+    pub active_1001_entry_id: Option<String>,
+    pub dry_run: bool,
+}

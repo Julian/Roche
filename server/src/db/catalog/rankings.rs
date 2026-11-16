@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
@@ -53,6 +54,21 @@ impl CatalogRepo<'_> {
 
         let now = SyncRepo::now_utc();
         let event_ts = ts.unwrap_or(now);
+        let mut tx = self.pool.begin().await?;
+        let (record, _) =
+            Self::append_comparison_in_tx(&mut tx, clean_scope, resolved_ordering, event_ts, now)
+                .await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    pub(super) async fn append_comparison_in_tx(
+        tx: &mut SqliteConnection,
+        clean_scope: Option<String>,
+        resolved_ordering: Vec<Vec<String>>,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<(ComparisonRecord, bool)> {
         let comp_id = deterministic_comparison_id(
             clean_scope.as_deref(),
             event_ts.timestamp_millis(),
@@ -61,7 +77,6 @@ impl CatalogRepo<'_> {
         let ord_json = canonical_ordering_json(&resolved_ordering);
 
         let clean_scope_ref = clean_scope.as_deref();
-        let mut tx = self.pool.begin().await?;
         let res = sqlx::query!(
             "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
              VALUES (?, ?, ?, ?, ?)",
@@ -73,9 +88,10 @@ impl CatalogRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
-        if res.rows_affected() > 0 {
+        let inserted = res.rows_affected() > 0;
+        if inserted {
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::Comparison,
                 &comp_id,
                 ActivityAction::Create,
@@ -83,17 +99,19 @@ impl CatalogRepo<'_> {
             )
             .await?;
         }
-        tx.commit().await?;
 
         let canonical_groups: Vec<Vec<String>> =
             serde_json::from_str(&ord_json).unwrap_or(resolved_ordering);
-        Ok(ComparisonRecord {
-            id: comp_id,
-            ts: event_ts,
-            scope_collection_id: clean_scope,
-            ordering: canonical_groups,
-            created_at: now,
-        })
+        Ok((
+            ComparisonRecord {
+                id: comp_id,
+                ts: event_ts,
+                scope_collection_id: clean_scope,
+                ordering: canonical_groups,
+                created_at: now,
+            },
+            inserted,
+        ))
     }
 
     pub async fn get_ranked_collection(

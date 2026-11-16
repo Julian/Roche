@@ -530,6 +530,35 @@ impl CatalogRepo<'_> {
             .execute(&mut *tx)
             .await?;
 
+            if let Some(serde_json::Value::Object(inc_map)) = &input.metadata
+                && !inc_map.is_empty()
+            {
+                let cur_meta_str: String =
+                    sqlx::query_scalar("SELECT metadata_json FROM entries WHERE id = ?")
+                        .bind(&existing_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let mut merged_obj = serde_json::from_str::<serde_json::Value>(&cur_meta_str)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let mut changed = false;
+                for (k, v) in inc_map {
+                    if !merged_obj.contains_key(k) {
+                        merged_obj.insert(k.clone(), v.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let merged_json = serde_json::Value::Object(merged_obj).to_string();
+                    sqlx::query("UPDATE entries SET metadata_json = ? WHERE id = ?")
+                        .bind(&merged_json)
+                        .bind(&existing_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+
             (existing_id, ActivityAction::Update)
         } else {
             let det_id = choose_deterministic_entry_id(
