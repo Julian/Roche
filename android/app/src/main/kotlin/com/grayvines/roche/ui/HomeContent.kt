@@ -52,6 +52,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
 import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
@@ -283,7 +284,6 @@ internal fun HomeDailyAlbumWidget(
             if (album != null) {
                 DailyAlbumSleeveCardBody(
                     album = album,
-                    onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
                 )
@@ -303,7 +303,6 @@ internal fun HomeDailyAlbumWidget(
 @Composable
 internal fun DailyAlbumSleeveCardBody(
     album: DailyAlbumSnapshot,
-    onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
 ) {
@@ -324,6 +323,7 @@ internal fun DailyAlbumSleeveCardBody(
         modifier =
             Modifier.fillMaxWidth()
                 .clickable { onOpenDailyAlbumInMusicApp(album) }
+                .testTag("daily_album_meta")
                 .padding(horizontal = 12.dp, vertical = 11.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
@@ -357,14 +357,25 @@ internal fun DailyAlbumSleeveCardBody(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        Spacer(modifier = Modifier.height(4.dp))
-        DailyAlbumCompactActions(
-            album = album,
-            onAction = onAction,
+        DailyAlbumWikiButton(
+            wikiUrl = album.wikipediaUrl,
             onOpenExternalUrl = onOpenExternalUrl,
-            onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
         )
     }
+}
+
+@Composable
+private fun DailyAlbumWikiButton(
+    wikiUrl: String?,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    if (wikiUrl.isNullOrBlank()) return
+    Spacer(modifier = Modifier.height(4.dp))
+    CompactCardActionButton(
+        label = "Wiki ↗",
+        onClick = { onOpenExternalUrl(wikiUrl) },
+        modifier = Modifier.fillMaxWidth().testTag("daily_album_wiki_btn"),
+    )
 }
 
 @Composable
@@ -515,50 +526,6 @@ internal fun DrawScope.drawVinylSleeveArtwork(colors: RocheColors) {
 }
 
 @Composable
-internal fun DailyAlbumCompactActions(
-    album: DailyAlbumSnapshot,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        CompactCardActionButton(
-            label = "Play Album",
-            style = RocheButtonStyle.PRIMARY,
-            onClick = { onOpenDailyAlbumInMusicApp(album) },
-            modifier = Modifier.fillMaxWidth().testTag("daily_album_play_btn"),
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            CompactCardActionButton(
-                label = "Finish & Rank",
-                onClick = {
-                    onAction(MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.FINISH_AND_RANK))
-                },
-                modifier = Modifier.weight(1f).testTag("daily_album_finish_btn"),
-            )
-            CompactCardActionButton(
-                label = "Abandon",
-                onClick = {
-                    onAction(MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.ABANDON))
-                },
-                modifier = Modifier.weight(1f).testTag("daily_album_abandon_btn"),
-            )
-        }
-        val wikiUrl = album.wikipediaUrl
-        if (!wikiUrl.isNullOrBlank()) {
-            CompactCardActionButton(
-                label = "Wiki ↗",
-                onClick = { onOpenExternalUrl(wikiUrl) },
-                modifier = Modifier.fillMaxWidth().testTag("daily_album_wiki_btn"),
-            )
-        }
-    }
-}
-
-@Composable
 internal fun CompactCardActionButton(
     label: String,
     onClick: () -> Unit,
@@ -679,7 +646,10 @@ internal fun HomeMediaCompanionWidget(
                         modifier = Modifier.testTag("home_quick_log_btn"),
                     )
                 }
-                CompanionShortcutChips(onAction = onAction)
+                CompanionShortcutChips(
+                    show1001Shortcut = state.albumGenerator.enabled,
+                    onAction = onAction,
+                )
             }
         }
     }
@@ -687,7 +657,10 @@ internal fun HomeMediaCompanionWidget(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun CompanionShortcutChips(onAction: (MainAction) -> Unit) {
+private fun CompanionShortcutChips(
+    show1001Shortcut: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
     FlowRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -698,6 +671,17 @@ private fun CompanionShortcutChips(onAction: (MainAction) -> Unit) {
             onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS)) },
             modifier = Modifier.testTag("home_open_lists_btn"),
         )
+        if (show1001Shortcut) {
+            FilterChipPill(
+                label = "1001 Albums",
+                selected = false,
+                onClick = {
+                    onAction(MainAction.SelectCatalogCollection(ALBUMS_1001_COLLECTION_ID))
+                    onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS))
+                },
+                modifier = Modifier.testTag("home_open_1001_list_btn"),
+            )
+        }
         FilterChipPill(
             label = "Diary",
             selected = false,

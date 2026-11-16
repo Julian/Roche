@@ -2,6 +2,7 @@ package com.grayvines.roche
 
 import android.content.Context
 import androidx.compose.ui.graphics.asAndroidBitmap
+import com.grayvines.roche.data.AlbumStreamingResolver
 import com.grayvines.roche.data.AndroidNetworkTierProvider
 import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.PeerSyncScheduler
@@ -66,6 +67,7 @@ class AppGraph(context: Context) : AutoCloseable {
             poolStreamProvider = {
                 runCatching { appContext.assets.open("albums_1001_pool.json") }.getOrNull()
             },
+            albumStreamingResolver = AlbumStreamingResolver(httpTransport),
         )
     }
 

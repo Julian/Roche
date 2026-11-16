@@ -330,16 +330,21 @@ class MainScreenTest {
         composeRule.onNodeWithText("#11 · 1972", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("ROCK", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("1091 LEFT", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithTag("daily_album_finish_btn").assertDoesNotExist()
+        composeRule.onNodeWithTag("daily_album_abandon_btn").assertDoesNotExist()
 
-        composeRule.onNodeWithTag("daily_album_play_btn").performScrollTo().performClick()
+        composeRule.onNodeWithTag("daily_album_cover").performScrollTo().performClick()
         org.junit.Assert.assertEquals(listOf(album), openedMusicAlbums)
 
-        composeRule.onNodeWithTag("daily_album_finish_btn").performScrollTo().performClick()
+        composeRule.onNodeWithTag("home_open_1001_list_btn").performScrollTo().performClick()
         org.junit.Assert.assertEquals(
             listOf(
-                com.grayvines.roche.ui.MainAction.OpenAlbumNoteDialog(
-                    com.grayvines.roche.ui.AlbumNoteDialogMode.FINISH_AND_RANK
-                )
+                com.grayvines.roche.ui.MainAction.SelectCatalogCollection(
+                    com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
+                ),
+                com.grayvines.roche.ui.MainAction.OpenCompanionSection(
+                    com.grayvines.roche.ui.CompanionSubTab.LISTS
+                ),
             ),
             actions,
         )

@@ -766,6 +766,7 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 listState = scrollStates.lazyListState(companionScrollKey(state)),
+                onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
             )
         AppTab.SETTINGS ->
             SettingsTabContent(

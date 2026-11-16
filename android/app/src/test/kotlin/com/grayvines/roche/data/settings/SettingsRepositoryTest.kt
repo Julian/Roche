@@ -344,12 +344,25 @@ class SettingsRepositoryTest {
                 "https://open.spotify.com/album/spotify_album_123",
                 "https://music.apple.com/album/1015739190",
                 "https://tidal.com/browse/album/49651320",
+                "https://listen.tidal.com/album/49651320",
                 "https://open.qobuz.com/album/0075992723961",
                 "https://www.deezer.com/album/86605",
                 "https://music.amazon.com/albums/B001SAMPLE",
-                "https://music.youtube.com/search?q=Sample+Artist+Sample+Album",
             ),
             parsed.candidateStreamingUrls(),
+        )
+        assertEquals(
+            listOf("https://open.spotify.com/album/spotify_album_123"),
+            parsed
+                .copy(
+                    youtubeMusicId = null,
+                    appleMusicId = null,
+                    tidalId = null,
+                    qobuzId = null,
+                    deezerId = null,
+                    amazonMusicId = null,
+                )
+                .candidateStreamingUrls(),
         )
         assertTrue(
             parsed

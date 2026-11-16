@@ -46,6 +46,7 @@ import com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
 import com.grayvines.roche.data.CatalogListSummary
 import com.grayvines.roche.data.CollectionMode
 import com.grayvines.roche.data.ConsumptionStatus
+import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.data.DiaryEntryItem
 import com.grayvines.roche.data.RankedCatalogEntry
 import com.grayvines.roche.model.HeadlineFont
@@ -64,6 +65,7 @@ fun MediaCompanionScreen(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
@@ -86,6 +88,7 @@ fun MediaCompanionScreen(
                     listState = listState,
                     onAction = onAction,
                     onOpenCreateList = { showCreateListDialog = true },
+                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
                 )
             CompanionSubTab.DIARY ->
                 DiaryHistoryPane(
@@ -172,6 +175,7 @@ private fun RankedListsPane(
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCreateList: () -> Unit,
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
 ) {
     val lists = state.catalog.lists
     val activeList =
@@ -214,12 +218,16 @@ private fun RankedListsPane(
                 },
             )
         }
+        val active1001Album =
+            state.dailyAlbum.takeIf { activeList?.collectionId == ALBUMS_1001_COLLECTION_ID }
         RankedListBody(
             activeList = activeList,
+            active1001Album = active1001Album,
             canEditManualList = canEditManualList,
             rankedEntries = rankedEntries,
             listState = listState,
             onAction = onAction,
+            onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
         )
     }
 }
@@ -261,15 +269,18 @@ private fun CatalogListChipsRow(
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun RankedListBody(
     activeList: CatalogListSummary?,
+    active1001Album: DailyAlbumSnapshot?,
     canEditManualList: Boolean,
     rankedEntries: List<RankedCatalogEntry>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
 ) {
-    if (rankedEntries.isEmpty()) {
+    if (rankedEntries.isEmpty() && active1001Album == null) {
         CompanionEmptyCard(
             title = "No entries in ${activeList?.title ?: "this list"} yet",
             body = "Log movies, albums, books, games, or finish feed items to build your rankings.",
@@ -286,39 +297,130 @@ private fun RankedListBody(
         )
         return
     }
+    RankedListLazyColumn(
+        activeList = activeList,
+        active1001Album = active1001Album,
+        canEditManualList = canEditManualList,
+        rankedEntries = rankedEntries,
+        listState = listState,
+        onAction = onAction,
+        onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+    )
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun RankedListLazyColumn(
+    activeList: CatalogListSummary?,
+    active1001Album: DailyAlbumSnapshot?,
+    canEditManualList: Boolean,
+    rankedEntries: List<RankedCatalogEntry>,
+    listState: LazyListState,
+    onAction: (MainAction) -> Unit,
+    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+) {
     LazyColumn(
         state = listState,
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
+        if (active1001Album != null) {
+            item(key = "active_1001_album_${active1001Album.entryId}") {
+                Active1001AlbumListCard(
+                    album = active1001Album,
+                    onAction = onAction,
+                    onPlay = { onOpenDailyAlbumInMusicApp(active1001Album) },
+                )
+            }
+        }
         items(rankedEntries, key = { it.entry.id }) { item ->
             RankedEntryCardRow(
                 item = item,
                 showQualityMeta = activeList?.isPriorityScoped != true,
                 onRemoveFromList =
-                    if (canEditManualList && activeList != null) {
-                        {
-                            onAction(
-                                MainAction.RemoveWantEntry(activeList.collectionId, item.entry.id)
-                            )
-                        }
-                    } else {
-                        null
-                    },
+                    buildRemoveListAction(activeList, canEditManualList, item, onAction),
                 onFocusRank = {
-                    if (activeList != null) {
-                        onAction(
-                            MainAction.StartRankingSession(
-                                collectionIdOrSlug = activeList.collectionId,
-                                focusEntryId = item.entry.id,
-                            )
-                        )
+                    activeList?.let {
+                        onAction(MainAction.StartRankingSession(it.collectionId, item.entry.id))
                     }
                 },
             )
         }
         item { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+private fun buildRemoveListAction(
+    activeList: CatalogListSummary?,
+    canEditManualList: Boolean,
+    item: RankedCatalogEntry,
+    onAction: (MainAction) -> Unit,
+): (() -> Unit)? =
+    if (canEditManualList && activeList != null) {
+        { onAction(MainAction.RemoveWantEntry(activeList.collectionId, item.entry.id)) }
+    } else {
+        null
+    }
+
+@Composable
+private fun Active1001AlbumListCard(
+    album: DailyAlbumSnapshot,
+    onAction: (MainAction) -> Unit,
+    onPlay: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheSurfaceCard {
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 11.dp)
+                    .testTag("companion_active_1001_card"),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "ACTIVE DRAW · #${album.albumNumber} (${album.remainingCount} LEFT)",
+                color = colors.accentVerdigris,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = "${album.name} — ${album.artist}",
+                color = colors.textPrimary,
+                fontSize = 14.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                HeaderActionButton(
+                    label = "Play",
+                    style = RocheButtonStyle.PRIMARY,
+                    onClick = onPlay,
+                    modifier = Modifier.testTag("companion_1001_play_btn"),
+                )
+                HeaderActionButton(
+                    label = "Finish & Rank",
+                    onClick = {
+                        onAction(
+                            MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.FINISH_AND_RANK)
+                        )
+                    },
+                    modifier = Modifier.testTag("companion_1001_finish_btn"),
+                )
+                HeaderActionButton(
+                    label = "Abandon",
+                    onClick = {
+                        onAction(MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.ABANDON))
+                    },
+                    modifier = Modifier.testTag("companion_1001_abandon_btn"),
+                )
+            }
+        }
     }
 }
 

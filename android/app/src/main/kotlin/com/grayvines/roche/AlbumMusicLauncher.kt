@@ -27,11 +27,10 @@ internal sealed interface MusicUrlResolution {
     data class ChooserTargets(val targets: List<MusicUrlCandidate>) : MusicUrlResolution
 }
 
-internal fun openAlbumInMusicApp(
+internal fun tryOpenDirectAlbumNow(
     context: Context,
     album: DailyAlbumSnapshot,
-    onOpenFallbackUrl: (String) -> Unit,
-) {
+): Boolean {
     val candidates = queryStreamingUrlCandidates(context, album)
     val resolution =
         selectMusicUrlResolution(
@@ -39,7 +38,26 @@ internal fun openAlbumInMusicApp(
             selfPackageName = context.packageName,
             browserPackages = queryBrowserPackages(context.packageManager),
         )
-    if (launchStreamingResolution(context, album, resolution)) {
+    return launchStreamingResolution(context, album, resolution)
+}
+
+internal fun hasInstalledMusicApp(context: Context): Boolean {
+    val candidates = queryUrlListCandidates(context, PLATFORM_PROBE_URLS)
+    val resolution =
+        selectMusicUrlResolution(
+            candidates = candidates,
+            selfPackageName = context.packageName,
+            browserPackages = queryBrowserPackages(context.packageManager),
+        )
+    return resolution != MusicUrlResolution.None
+}
+
+internal fun openAlbumInMusicApp(
+    context: Context,
+    album: DailyAlbumSnapshot,
+    onOpenFallbackUrl: (String) -> Unit,
+) {
+    if (tryOpenDirectAlbumNow(context, album)) {
         return
     }
     if (tryLaunchMediaSearch(context, album)) {
@@ -79,13 +97,18 @@ internal fun selectMusicUrlResolution(
 internal fun queryStreamingUrlCandidates(
     context: Context,
     album: DailyAlbumSnapshot,
+): List<MusicUrlCandidate> = queryUrlListCandidates(context, album.candidateStreamingUrls())
+
+private fun queryUrlListCandidates(
+    context: Context,
+    urls: List<String>,
 ): List<MusicUrlCandidate> {
     val pm = context.packageManager
     val dvm = context.getSystemService(DomainVerificationManager::class.java)
     val flags = PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong())
     val discovered = mutableListOf<MusicUrlCandidate>()
 
-    for (url in album.candidateStreamingUrls()) {
+    for (url in urls) {
         val uri = url.toUri()
         val host = uri.host?.lowercase().orEmpty()
         val probe = Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)
@@ -215,3 +238,16 @@ internal fun buildAlbumSearchIntent(
 }
 
 private const val BROWSER_PROBE_URL = "https://example.invalid"
+
+private val PLATFORM_PROBE_URLS =
+    listOf(
+        "https://music.youtube.com/playlist?list=OLAK5uy_probe",
+        "https://music.youtube.com/browse/MPREb_probe",
+        "https://open.spotify.com/album/0probe",
+        "https://music.apple.com/album/1",
+        "https://tidal.com/browse/album/1",
+        "https://listen.tidal.com/album/1",
+        "https://open.qobuz.com/album/1",
+        "https://www.deezer.com/album/1",
+        "https://music.amazon.com/albums/B000000000",
+    )

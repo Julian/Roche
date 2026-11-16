@@ -12,8 +12,10 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.core.net.toUri
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.remote.readBoundedText
 import com.grayvines.roche.model.InboxEntry
@@ -26,6 +28,7 @@ import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : ComponentActivity() {
 
@@ -86,9 +89,7 @@ class MainActivity : ComponentActivity() {
                         onOpenExternalUrl = ::openUrlInBrowser,
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
-                        onOpenDailyAlbumInMusicApp = { album ->
-                            openAlbumInMusicApp(this, album, ::openUrlInBrowser)
-                        },
+                        onOpenDailyAlbumInMusicApp = ::openDailyAlbumInMusicApp,
                     )
                 }
             }
@@ -149,6 +150,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun openDailyAlbumInMusicApp(album: DailyAlbumSnapshot) {
+        if (tryOpenDirectAlbumNow(this, album)) {
+            return
+        }
+        if (!hasInstalledMusicApp(this)) {
+            openAlbumInMusicApp(this, album, ::openUrlInBrowser)
+            return
+        }
+        val repo = (application as RocheApp).graph.repository
+        lifecycleScope.launch {
+            val enriched =
+                withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
+                    repo.resolveDailyAlbumStreaming(album)
+                } ?: album
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
+            }
+        }
+    }
+
     private fun openUrlInBrowser(url: String) {
         runCatching {
             val uri = url.trim().toUri()
@@ -202,6 +223,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private companion object {
+        private const val ALBUM_RESOLVE_TIMEOUT_MS = 5_000L
         private val ALLOWED_EXTERNAL_SCHEMES = setOf("http", "https", "mailto")
         private val OPML_MIME_TYPES = arrayOf("text/xml", "application/xml", "text/x-opml", "*/*")
     }

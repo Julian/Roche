@@ -27,7 +27,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 class CatalogStore(
-    private val dao: RocheDao,
+    internal val dao: RocheDao,
     poolStreamProvider: (() -> InputStream?)? = null,
     private val random: Random = Random.Default,
     private val onLocalMutation: () -> Unit = {},

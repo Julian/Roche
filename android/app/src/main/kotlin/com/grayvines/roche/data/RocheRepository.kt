@@ -82,6 +82,7 @@ class RocheRepository(
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
     private val backgroundScope: CoroutineScope? = null,
     poolStreamProvider: (() -> InputStream?)? = null,
+    private val albumStreamingResolver: AlbumStreamingResolver? = null,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
@@ -138,6 +139,20 @@ class RocheRepository(
             .flowOn(Dispatchers.Default)
 
     suspend fun prewarm(): RepositorySnapshot = snapshot.first()
+
+    suspend fun resolveDailyAlbumStreaming(album: DailyAlbumSnapshot): DailyAlbumSnapshot {
+        val resolver = albumStreamingResolver ?: return album
+        val resolved = resolver.resolveStreamingIds(album)
+        if (resolved.isNotEmpty() && album.entryId.isNotBlank()) {
+            catalog.attachEntryIdentifiers(album.entryId, resolved)
+        }
+        return album.withResolvedStreamingIds(resolved)
+    }
+
+    suspend fun prewarmDailyAlbumStreaming(album: DailyAlbumSnapshot) {
+        if (albumStreamingResolver == null || album.hasYoutubePlaylistId) return
+        resolveDailyAlbumStreaming(album)
+    }
 
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =
         withContext(Dispatchers.Default) {

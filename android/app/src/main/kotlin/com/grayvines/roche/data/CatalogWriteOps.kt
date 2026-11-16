@@ -17,6 +17,36 @@ import java.time.Instant
 
 internal const val COLLECTION_ENTRY_ENTITY = "collection_entry"
 
+suspend fun CatalogStore.attachEntryIdentifiers(
+    entryId: String,
+    identifiers: Map<String, String>,
+) {
+    if (entryId.isBlank() || identifiers.isEmpty()) return
+    withMutationLock { attachIdentifiersInDao(dao, entryId, identifiers) }
+}
+
+internal suspend fun attachIdentifiersInDao(
+    dao: RocheDao,
+    entryId: String,
+    identifiers: Map<String, String>,
+) {
+    val resolvedId = followMergedIdInDao(dao, entryId) ?: return
+    val entry = dao.getCatalogEntryById(resolvedId) ?: return
+    val kind = EntryKind.fromWireValue(entry.kind)
+    val rows = identifiers.mapNotNull { (rawScheme, rawVal) ->
+        val scheme = normalizeIdentifierScheme(rawScheme)
+        val normVal = normalizeIdentifierValue(kind, scheme, rawVal)
+        if (scheme.isEmpty() || normVal.isEmpty()) {
+            null
+        } else {
+            EntryIdentifierEntity(scheme, normVal, resolvedId)
+        }
+    }
+    if (rows.isNotEmpty()) {
+        dao.insertEntryIdentifiersIgnore(rows)
+    }
+}
+
 internal suspend fun materializeFeedsForIds(
     dao: RocheDao,
     referencedIds: Set<String>,

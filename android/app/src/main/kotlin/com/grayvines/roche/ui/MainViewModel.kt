@@ -119,7 +119,18 @@ class MainViewModel(
         }
         playerController.setUiErrorListener(uiErrorListener)
         observeActiveEpisodeNotes()
+        observeActiveDailyAlbum()
         restoredNavState?.let(::restoreNavigationSideEffects)
+    }
+
+    private fun observeActiveDailyAlbum() {
+        viewModelScope.launch {
+            repository.snapshot
+                .map { it.catalog.albumGenerator.currentAlbum }
+                .distinctUntilChanged()
+                .filterNotNull()
+                .collect { album -> repository.prewarmDailyAlbumStreaming(album) }
+        }
     }
 
     private fun buildInitialUiState(): MainUiState {

@@ -535,6 +535,7 @@ internal fun toDailyAlbumSnapshot(
     remainingCount: Int,
 ): DailyAlbumSnapshot {
     val identsByScheme = entry.identifiers.associate { it.scheme.lowercase() to it.value }
+    val ytMusicId = pickPreferredYoutubeMusicId(entry.identifiers)
     val genres = extractMetadataGenres(raw.metadataJson)
     return DailyAlbumSnapshot(
         entryId = entry.id,
@@ -547,7 +548,7 @@ internal fun toDailyAlbumSnapshot(
         albumNumber = albumNumber,
         totalCount = totalCount,
         remainingCount = remainingCount,
-        youtubeMusicId = identsByScheme["youtube_music"],
+        youtubeMusicId = ytMusicId,
         spotifyId = identsByScheme["spotify"],
         appleMusicId = identsByScheme["apple_music"],
         tidalId = identsByScheme["tidal"],
@@ -559,6 +560,17 @@ internal fun toDailyAlbumSnapshot(
                 ?.let { externalIdentifierUrl("wikipedia", it) }
                 ?.let(::sanitizeHttpUrl),
     )
+}
+
+private fun pickPreferredYoutubeMusicId(identifiers: List<EntryIdentifierDto>): String? {
+    val values =
+        identifiers
+            .filter { it.scheme.equals("youtube_music", ignoreCase = true) }
+            .map { it.value.trim() }
+            .filter { it.isNotEmpty() }
+    return values.firstOrNull {
+        buildYoutubeMusicAlbumUrl(it).startsWith("https://music.youtube.com/playlist?list=")
+    } ?: values.firstOrNull()
 }
 
 internal fun extractMetadataGenres(metadataJson: String): List<String> {
