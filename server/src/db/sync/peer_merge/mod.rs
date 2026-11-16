@@ -18,8 +18,8 @@ use super::{
     hrw::{NetworkTier, PeerNode, SERVER_PEER_ID},
 };
 use crate::db::{
-    CatalogRepo, ContentType, Feed, FeedRepo, FeedType, HexColor, Item, ItemRepo, ItemStatus,
-    PollItemCandidate, Tag, TagRepo,
+    ContentType, Feed, FeedRepo, FeedType, HexColor, Item, ItemRepo, ItemStatus, PollItemCandidate,
+    Tag, TagRepo,
 };
 
 pub const MAX_PEER_SYNC_OUTGOING_ITEMS: usize = 5_000;
@@ -189,9 +189,6 @@ impl SyncRepo<'_> {
             &req.consumption_log,
             &req.comparisons,
         );
-        if has_catalog_payload {
-            let _ = CatalogRepo::new(self.pool).ensure_1001_albums_seeded().await?;
-        }
 
         // Sanitize HTML, resolve URLs, and compute excerpts on a blocking thread BEFORE opening
         // the SQLite write transaction so CPU-bound `ammonia` work never holds the DB write lock.

@@ -506,18 +506,17 @@ class RankBoardAndGate5UiLogicTest {
             viewModel.dispatch(
                 MainAction.OpenCompanionSection(
                     CompanionSubTab.LISTS,
-                    com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
+                    "col-essential-cinema",
                 )
             )
-            val albumsListState =
+            val customListState =
                 viewModel.uiState.first {
                     it.companionSubTab == CompanionSubTab.LISTS &&
-                        it.selectedCatalogCollectionId ==
-                            com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
+                        it.selectedCatalogCollectionId == "col-essential-cinema"
                 }
             assertEquals(
-                com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
-                albumsListState.selectedCatalogCollectionId,
+                "col-essential-cinema",
+                customListState.selectedCatalogCollectionId,
             )
 
             val scopedKey = RocheNavKey.ScopedInbox(feedId = "f-1", tag = null)

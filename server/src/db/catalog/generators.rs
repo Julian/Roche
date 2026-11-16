@@ -1,0 +1,502 @@
+use chrono::{DateTime, Utc};
+use rand::RngExt;
+use sqlx::SqliteConnection;
+
+use super::{
+    CatalogRepo,
+    models::{
+        CatalogEntry, CatalogError, CatalogResult, CollectionGeneratorState, RawCollectionRow,
+    },
+};
+use crate::db::{
+    sync::SyncRepo,
+    types::{
+        ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, ConsumptionStatus,
+    },
+};
+
+#[derive(sqlx::FromRow)]
+struct RawGeneratorRow {
+    collection_id: String,
+    collection_slug: Option<String>,
+    collection_title: String,
+    enabled: bool,
+    current_entry_id: Option<String>,
+    drawn_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RawExistingGenRow {
+    enabled: bool,
+    current_entry_id: Option<String>,
+    drawn_at: Option<DateTime<Utc>>,
+}
+
+type GeneratorStateTuple = (bool, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>);
+
+impl CatalogRepo<'_> {
+    pub async fn list_collection_generators(
+        &self,
+        only_enabled: bool,
+    ) -> CatalogResult<Vec<CollectionGeneratorState>> {
+        let sql = if only_enabled {
+            "SELECT cg.collection_id, cs.slug AS collection_slug, e.title AS collection_title,
+                    cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at
+             FROM collection_generators cg
+             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
+             JOIN entries e ON e.id = cg.collection_id
+             WHERE e.merged_into_id IS NULL
+               AND cs.mode = 'manual'
+               AND cs.collection_role = 'list'
+               AND cg.enabled = 1
+             ORDER BY LOWER(e.title) ASC, cg.collection_id ASC"
+        } else {
+            "SELECT cg.collection_id, cs.slug AS collection_slug, e.title AS collection_title,
+                    cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at
+             FROM collection_generators cg
+             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
+             JOIN entries e ON e.id = cg.collection_id
+             WHERE e.merged_into_id IS NULL
+               AND cs.mode = 'manual'
+               AND cs.collection_role = 'list'
+             ORDER BY cg.enabled DESC, LOWER(e.title) ASC, cg.collection_id ASC"
+        };
+        let rows: Vec<RawGeneratorRow> = sqlx::query_as(sql).fetch_all(self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.hydrate_generator_state(row).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn get_collection_generator(
+        &self,
+        slug_or_id: &str,
+    ) -> CatalogResult<CollectionGeneratorState> {
+        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
+        let gen_row: Option<GeneratorStateTuple> = sqlx::query_as(
+            "SELECT enabled, current_entry_id, drawn_at, updated_at
+             FROM collection_generators
+             WHERE collection_id = ?",
+        )
+        .bind(&col.id)
+        .fetch_optional(self.pool)
+        .await?;
+
+        let (enabled, current_entry_id, drawn_at, updated_at) =
+            gen_row.unwrap_or((false, None, None, col.updated_at));
+
+        self.hydrate_generator_state(RawGeneratorRow {
+            collection_id: col.id,
+            collection_slug: col.slug,
+            collection_title: col.title,
+            enabled,
+            current_entry_id,
+            drawn_at,
+            updated_at,
+        })
+        .await
+    }
+
+    pub async fn set_collection_generator_enabled(
+        &self,
+        slug_or_id: &str,
+        enabled: bool,
+    ) -> CatalogResult<CollectionGeneratorState> {
+        self.update_collection_generator(slug_or_id, Some(enabled), None, None).await
+    }
+
+    pub async fn update_collection_generator(
+        &self,
+        slug_or_id: &str,
+        enabled: Option<bool>,
+        explicit_entry_id: Option<&str>,
+        explicit_drawn_at: Option<DateTime<Utc>>,
+    ) -> CatalogResult<CollectionGeneratorState> {
+        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+        Self::update_collection_generator_in_tx(
+            &mut tx,
+            &col.id,
+            &col.title,
+            enabled,
+            explicit_entry_id,
+            explicit_drawn_at,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_collection_generator(&col.id).await
+    }
+
+    pub async fn remove_collection_generator(&self, slug_or_id: &str) -> CatalogResult<bool> {
+        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
+            .bind(&col.id)
+            .execute(&mut *tx)
+            .await?;
+        let removed = res.rows_affected() > 0;
+        if removed {
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::Entry,
+                &col.id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    pub async fn finish_active_generator_entry(
+        &self,
+        slug_or_id: &str,
+        notes: Option<&str>,
+    ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
+        self.advance_active_generator_entry(slug_or_id, ConsumptionStatus::Consumed, notes).await
+    }
+
+    pub async fn abandon_active_generator_entry(
+        &self,
+        slug_or_id: &str,
+        notes: Option<&str>,
+    ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
+        self.advance_active_generator_entry(slug_or_id, ConsumptionStatus::Abandoned, notes).await
+    }
+
+    async fn advance_active_generator_entry(
+        &self,
+        slug_or_id: &str,
+        status: ConsumptionStatus,
+        notes: Option<&str>,
+    ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
+        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
+        let now = SyncRepo::now_utc();
+        let mut tx = self.pool.begin().await?;
+
+        let active_opt: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT current_entry_id FROM collection_generators WHERE collection_id = ?",
+        )
+        .bind(&col.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let active_id = active_opt.and_then(|r| r.0).ok_or_else(|| {
+            CatalogError::InvalidInput(format!(
+                "No active entry is currently drawn for '{}'",
+                col.title
+            ))
+        })?;
+
+        // `log_consumption_in_tx` automatically advances all generators holding `active_id`.
+        let (_, canon_finished_id) =
+            Self::log_consumption_in_tx(&mut tx, &active_id, status, notes, now, now).await?;
+
+        tx.commit().await?;
+
+        let finished_entry = self
+            .get_entry(&canon_finished_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(format!("Entry '{canon_finished_id}'")))?;
+        let next_state = self.get_collection_generator(&col.id).await?;
+        Ok((finished_entry, next_state))
+    }
+
+    async fn lookup_generator_eligible_collection(
+        &self,
+        slug_or_id: &str,
+    ) -> CatalogResult<RawCollectionRow> {
+        let col = self.lookup_collection_row(slug_or_id, false).await?;
+        if col.mode != CollectionMode::Manual || col.collection_role != CollectionRole::List {
+            return Err(CatalogError::InvalidInput(format!(
+                "Collection '{}' cannot use a generator (must be a manual list)",
+                col.title
+            )));
+        }
+        Ok(col)
+    }
+
+    async fn hydrate_generator_state(
+        &self,
+        raw: RawGeneratorRow,
+    ) -> CatalogResult<CollectionGeneratorState> {
+        let current_entry = match raw.current_entry_id.as_deref() {
+            Some(cid) => self.get_entry(cid).await?,
+            None => None,
+        };
+
+        let total_pool: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
+        )
+        .bind(&raw.collection_id)
+        .fetch_one(self.pool)
+        .await?;
+
+        let consumed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT ce.entry_id)
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM consumption_log cl
+                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+               )",
+        )
+        .bind(&raw.collection_id)
+        .fetch_one(self.pool)
+        .await?;
+
+        let abandoned_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT ce.entry_id)
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM consumption_log cl
+                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+               )
+               AND EXISTS (
+                   SELECT 1 FROM consumption_log cl
+                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'abandoned'
+               )",
+        )
+        .bind(&raw.collection_id)
+        .fetch_one(self.pool)
+        .await?;
+
+        let total = usize::try_from(total_pool).unwrap_or(0);
+        let consumed = usize::try_from(consumed_count).unwrap_or(0);
+        let abandoned = usize::try_from(abandoned_count).unwrap_or(0);
+        let remaining = total.saturating_sub(consumed + abandoned);
+
+        Ok(CollectionGeneratorState {
+            collection_id: raw.collection_id,
+            collection_slug: raw.collection_slug,
+            collection_title: raw.collection_title,
+            enabled: raw.enabled,
+            current_entry,
+            drawn_at: raw.drawn_at,
+            updated_at: raw.updated_at,
+            total_pool: total,
+            consumed_count: consumed,
+            abandoned_count: abandoned,
+            remaining_count: remaining,
+        })
+    }
+
+    pub(super) async fn update_collection_generator_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id: &str,
+        collection_title: &str,
+        enabled_override: Option<bool>,
+        explicit_entry_id: Option<&str>,
+        explicit_drawn_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<Option<String>> {
+        let cur: Option<RawExistingGenRow> = sqlx::query_as(
+            "SELECT enabled, current_entry_id, drawn_at
+             FROM collection_generators
+             WHERE collection_id = ?",
+        )
+        .bind(collection_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let enabled = enabled_override.unwrap_or_else(|| cur.as_ref().is_some_and(|c| c.enabled));
+        let mut drawn_at = cur.as_ref().and_then(|c| c.drawn_at);
+        let mut current_id = match cur.and_then(|c| c.current_entry_id) {
+            Some(cid) => Self::follow_merged_id_in_tx(tx, &cid).await?,
+            None => None,
+        };
+
+        if let Some(cid) = &current_id
+            && Self::is_entry_terminal_in_tx(tx, cid).await?
+        {
+            current_id = None;
+        }
+
+        Self::apply_explicit_generator_entry_in_tx(
+            tx,
+            collection_id,
+            collection_title,
+            explicit_entry_id,
+            explicit_drawn_at,
+            now,
+            &mut current_id,
+            &mut drawn_at,
+        )
+        .await?;
+
+        if enabled && current_id.is_none() {
+            current_id = Self::draw_random_remaining_in_tx(tx, collection_id).await?;
+            if current_id.is_some() {
+                drawn_at = Some(now);
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO collection_generators
+             (collection_id, enabled, current_entry_id, drawn_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                current_entry_id = excluded.current_entry_id,
+                drawn_at = excluded.drawn_at,
+                updated_at = excluded.updated_at",
+        )
+        .bind(collection_id)
+        .bind(enabled)
+        .bind(current_id.as_deref())
+        .bind(drawn_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        SyncRepo::record_activity(
+            tx,
+            ActivityEntityType::Entry,
+            collection_id,
+            ActivityAction::Update,
+            now,
+        )
+        .await?;
+
+        Ok(current_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_explicit_generator_entry_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id: &str,
+        collection_title: &str,
+        explicit_entry_id: Option<&str>,
+        explicit_drawn_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        current_id: &mut Option<String>,
+        drawn_at: &mut Option<DateTime<Utc>>,
+    ) -> CatalogResult<()> {
+        if let Some(raw_explicit) = explicit_entry_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let canon_explicit =
+                Self::follow_merged_id_in_tx(tx, raw_explicit).await?.ok_or_else(|| {
+                    CatalogError::NotFound(format!("Generator entry '{raw_explicit}'"))
+                })?;
+            let in_pool: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+            )
+            .bind(collection_id)
+            .bind(&canon_explicit)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if in_pool.is_none() {
+                return Err(CatalogError::InvalidInput(format!(
+                    "Entry '{canon_explicit}' is not a member of '{collection_title}'"
+                )));
+            }
+            if !Self::is_entry_terminal_in_tx(tx, &canon_explicit).await? {
+                *current_id = Some(canon_explicit);
+                *drawn_at = Some(explicit_drawn_at.unwrap_or(now));
+            }
+        } else if let Some(ts) = explicit_drawn_at
+            && current_id.is_some()
+        {
+            *drawn_at = Some(ts);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn is_entry_terminal_in_tx(
+        tx: &mut SqliteConnection,
+        entry_id: &str,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        let done: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM consumption_log
+             WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
+             LIMIT 1",
+        )
+        .bind(entry_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(done.is_some())
+    }
+
+    pub(crate) async fn advance_generators_for_entry_in_tx(
+        tx: &mut SqliteConnection,
+        canon_entry_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let affected: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT collection_id, enabled
+             FROM collection_generators
+             WHERE current_entry_id = ?",
+        )
+        .bind(canon_entry_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (col_id, enabled) in affected {
+            let next_id =
+                if enabled { Self::draw_random_remaining_in_tx(tx, &col_id).await? } else { None };
+            let next_drawn = next_id.as_ref().map(|_| now);
+            sqlx::query(
+                "UPDATE collection_generators
+                 SET current_entry_id = ?, drawn_at = ?, updated_at = ?
+                 WHERE collection_id = ?",
+            )
+            .bind(next_id.as_deref())
+            .bind(next_drawn)
+            .bind(now)
+            .bind(&col_id)
+            .execute(&mut *tx)
+            .await?;
+
+            SyncRepo::record_activity(
+                tx,
+                ActivityEntityType::Entry,
+                &col_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn draw_random_remaining_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id: &str,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT ce.entry_id
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ?
+               AND e.merged_into_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM consumption_log cl
+                   WHERE cl.entry_id = ce.entry_id AND cl.status IN ('consumed', 'abandoned')
+               )
+             ORDER BY ce.position ASC, ce.entry_id ASC",
+        )
+        .bind(collection_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if remaining.is_empty() {
+            return Ok(None);
+        }
+        let mut rng = rand::rng();
+        let idx = rng.random_range(0..remaining.len());
+        Ok(Some(remaining[idx].clone()))
+    }
+}

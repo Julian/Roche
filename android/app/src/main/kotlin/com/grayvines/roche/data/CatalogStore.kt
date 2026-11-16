@@ -1,4 +1,4 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("TooManyFunctions", "LargeClass")
 
 package com.grayvines.roche.data
 
@@ -11,7 +11,6 @@ import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.ranking.EpRankingEngine
-import java.io.InputStream
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlin.random.Random
@@ -28,11 +27,10 @@ import kotlinx.coroutines.sync.withLock
 
 class CatalogStore(
     internal val dao: RocheDao,
-    poolStreamProvider: (() -> InputStream?)? = null,
     private val random: Random = Random.Default,
     private val onLocalMutation: () -> Unit = {},
 ) {
-    private val seeder = CatalogSeeder(dao = dao, poolStreamProvider = poolStreamProvider)
+    private val seeder = CatalogSeeder(dao = dao)
     private val mutationMutex = Mutex()
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -59,15 +57,19 @@ class CatalogStore(
 
     suspend fun ensureSystemSeeded() = seeder.ensureSystemSeeded()
 
-    suspend fun ensure1001PoolSeeded() = seeder.ensure1001PoolSeeded()
-
-    suspend fun setAlbumGeneratorEnabled(enabled: Boolean): DailyAlbumSnapshot? {
+    suspend fun setCollectionGeneratorEnabled(
+        collectionIdOrSlug: String,
+        enabled: Boolean,
+    ): CollectionDrawSnapshot? {
         val result = mutationMutex.withLock {
-            ensure1001PoolSeeded()
+            ensureSystemSeeded()
+            val spec =
+                resolveEligibleGeneratorSpec(collectionIdOrSlug)
+                    ?: error("Collection '$collectionIdOrSlug' cannot use a generator")
             val nowIso = nowUtcIso()
             var drawnActiveId: String? = null
             dao.executeInTransaction {
-                val current = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
+                val current = dao.getCollectionGenerator(spec.collectionId)
                 var activeId =
                     current?.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
                 if (activeId != null && dao.countTerminalLogsForEntry(activeId) > 0) {
@@ -75,7 +77,7 @@ class CatalogStore(
                 }
                 val drawnAt =
                     if (enabled && activeId == null) {
-                        activeId = drawRandomRemaining1001Id()
+                        activeId = drawRandomRemainingId(spec.collectionId)
                         activeId?.let { nowIso }
                     } else {
                         current?.drawnAt
@@ -83,7 +85,7 @@ class CatalogStore(
                 drawnActiveId = activeId
                 dao.upsertCollectionGenerator(
                     CollectionGeneratorEntity(
-                        collectionId = ALBUMS_1001_COLLECTION_ID,
+                        collectionId = spec.collectionId,
                         enabled = enabled,
                         currentEntryId = activeId,
                         drawnAt = drawnAt,
@@ -92,33 +94,42 @@ class CatalogStore(
                     )
                 )
             }
-            drawnActiveId?.takeIf { enabled }?.let { resolveAlbumSnapshotById(it) }
+            drawnActiveId?.takeIf { enabled }?.let { resolveDrawSnapshot(spec.collectionId, it) }
         }
         onLocalMutation()
         return result
     }
 
-    suspend fun finishCurrent1001Album(notes: String? = null): Album1001StepResult =
-        completeActive1001Album(status = ConsumptionStatus.CONSUMED, notes = notes)
+    suspend fun finishActiveDraw(
+        collectionIdOrSlug: String,
+        notes: String? = null,
+    ): CollectionDrawStepResult =
+        completeActiveDraw(collectionIdOrSlug, status = ConsumptionStatus.CONSUMED, notes = notes)
 
-    suspend fun abandonCurrent1001Album(notes: String? = null): Album1001StepResult =
-        completeActive1001Album(status = ConsumptionStatus.ABANDONED, notes = notes)
+    suspend fun abandonActiveDraw(
+        collectionIdOrSlug: String,
+        notes: String? = null,
+    ): CollectionDrawStepResult =
+        completeActiveDraw(collectionIdOrSlug, status = ConsumptionStatus.ABANDONED, notes = notes)
 
-    private suspend fun completeActive1001Album(
+    private suspend fun completeActiveDraw(
+        collectionIdOrSlug: String,
         status: ConsumptionStatus,
         notes: String?,
-    ): Album1001StepResult {
+    ): CollectionDrawStepResult {
         val result = mutationMutex.withLock {
-            ensure1001PoolSeeded()
+            ensureSystemSeeded()
+            val spec =
+                resolveEligibleGeneratorSpec(collectionIdOrSlug)
+                    ?: error("Collection '$collectionIdOrSlug' not found")
             val gen =
-                dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
-                    ?: error("1001 Albums generator not initialized")
+                dao.getCollectionGenerator(spec.collectionId)
+                    ?: error("Generator not initialized for '${spec.title}'")
             val verb = if (status == ConsumptionStatus.CONSUMED) "finish" else "abandon"
             val currentId =
                 gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
-                    ?: error("No active 1001 album to $verb")
+                    ?: error("No active item to $verb in '${spec.title}'")
             val nowIso = nowUtcIso()
-            var nextId: String? = null
             dao.executeInTransaction {
                 appendConsumptionInDao(
                     dao = dao,
@@ -129,16 +140,15 @@ class CatalogStore(
                     nowIso = nowIso,
                     markDirty = true,
                 )
-                nextId =
-                    advance1001GeneratorLocked(
-                        enabled = gen.enabled,
-                        nowIso = nowIso,
-                        markDirty = true,
-                    )
+                advanceActiveDrawsLocked(currentId, status, nowIso)
             }
-            Album1001StepResult(
+            val updatedGen = dao.getCollectionGenerator(spec.collectionId)
+            val nextId = updatedGen?.currentEntryId?.takeIf { it.isNotBlank() }
+            CollectionDrawStepResult(
                 entryId = currentId,
-                nextAlbum = nextId?.let { resolveAlbumSnapshotById(it) },
+                collectionId = spec.collectionId,
+                collectionTitle = spec.title,
+                nextDraw = nextId?.let { resolveDrawSnapshot(spec.collectionId, it) },
             )
         }
         onLocalMutation()
@@ -195,7 +205,7 @@ class CatalogStore(
                     nowIso = nowIso,
                     markDirty = true,
                 )
-                advance1001IfActiveLocked(resolved, status, nowIso)
+                advanceActiveDrawsLocked(resolved, status, nowIso)
             }
             resolved
         }
@@ -222,7 +232,7 @@ class CatalogStore(
                         nowIso = nowIso,
                         markDirty = true,
                     )
-                    advance1001IfActiveLocked(resolved, status, nowIso)
+                    advanceActiveDrawsLocked(resolved, status, nowIso)
                 }
             }
         }
@@ -565,27 +575,44 @@ class CatalogStore(
         }
     }
 
-    private suspend fun advance1001IfActiveLocked(
+    private suspend fun resolveEligibleGeneratorSpec(idOrSlug: String): CollectionSpecEntity? {
+        val spec = resolveCollectionSpec(idOrSlug) ?: return null
+        val isManualList =
+            CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
+                CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
+        return spec.takeIf { isManualList }
+    }
+
+    private suspend fun advanceActiveDrawsLocked(
         entryId: String,
         status: ConsumptionStatus,
         nowIso: String,
     ) {
         if (status != ConsumptionStatus.CONSUMED && status != ConsumptionStatus.ABANDONED) return
-        val gen = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID) ?: return
-        if (gen.currentEntryId == entryId) {
-            advance1001GeneratorLocked(enabled = gen.enabled, nowIso = nowIso, markDirty = true)
+        for (gen in dao.getAllCollectionGenerators()) {
+            val canonCur =
+                gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
+            if (canonCur == entryId) {
+                advanceSingleGeneratorLocked(
+                    collectionId = gen.collectionId,
+                    enabled = gen.enabled,
+                    nowIso = nowIso,
+                    markDirty = true,
+                )
+            }
         }
     }
 
-    private suspend fun advance1001GeneratorLocked(
+    private suspend fun advanceSingleGeneratorLocked(
+        collectionId: String,
         enabled: Boolean,
         nowIso: String,
         markDirty: Boolean,
     ): String? {
-        val nextId = if (enabled) drawRandomRemaining1001Id() else null
+        val nextId = if (enabled) drawRandomRemainingId(collectionId) else null
         dao.upsertCollectionGenerator(
             CollectionGeneratorEntity(
-                collectionId = ALBUMS_1001_COLLECTION_ID,
+                collectionId = collectionId,
                 enabled = enabled,
                 currentEntryId = nextId,
                 drawnAt = nextId?.let { nowIso },
@@ -596,8 +623,8 @@ class CatalogStore(
         return nextId
     }
 
-    internal suspend fun drawRandomRemaining1001Id(): String? {
-        val poolMembers = dao.getCollectionMemberships(ALBUMS_1001_COLLECTION_ID).map { it.entryId }
+    internal suspend fun drawRandomRemainingId(collectionId: String): String? {
+        val poolMembers = dao.getCollectionMemberships(collectionId).map { it.entryId }
         if (poolMembers.isEmpty()) return null
         val activeIds =
             dao.getAllCatalogEntries()
@@ -634,9 +661,12 @@ class CatalogStore(
     internal suspend fun followMergedId(entryId: String): String? =
         followMergedIdInDao(dao, entryId)
 
-    private suspend fun resolveAlbumSnapshotById(entryId: String): DailyAlbumSnapshot? {
+    private suspend fun resolveDrawSnapshot(
+        collectionId: String,
+        entryId: String,
+    ): CollectionDrawSnapshot? {
         val snap = buildCatalogSnapshot(loadRawCatalogTables())
-        return snap.albumGenerator.currentAlbum?.takeIf { it.entryId == entryId }
+        return snap.generatorFor(collectionId)?.currentDraw?.takeIf { it.entryId == entryId }
     }
 
     private suspend fun loadConsistentRawTables(): RawCatalogTables {

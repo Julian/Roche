@@ -28,7 +28,6 @@ fn test_deterministic_uuid_and_hrw_work_splitting() {
 
     assert_eq!(STARRED_COLLECTION_ID, deterministic_system_collection_id("starred"));
     assert_eq!(UP_NEXT_COLLECTION_ID, deterministic_system_collection_id("up_next"));
-    assert_eq!(ALBUMS_1001_COLLECTION_ID, deterministic_system_collection_id("1001_albums"));
 
     let now = DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z").unwrap().with_timezone(&Utc);
     let mut peers = vec![

@@ -12,7 +12,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
+import com.grayvines.roche.data.CollectionGeneratorState
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -155,7 +156,7 @@ class MainScreenTest {
         composeRule.onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings").assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").assertExists()
-        composeRule.onNodeWithTag("albums_generator_toggle").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("collection_draws_home_toggle").performScrollTo().assertExists()
         composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()
 
@@ -269,7 +270,7 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("home_screen").assertExists()
         composeRule.onNodeWithTag("home_widget_pulse").assertDoesNotExist()
-        composeRule.onNodeWithTag("home_widget_daily_album").assertDoesNotExist()
+        composeRule.onNodeWithTag("home_widget_collection_draw").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_up_next").assertExists()
         composeRule.onNodeWithTag("home_widget_sources").assertExists()
 
@@ -280,21 +281,24 @@ class MainScreenTest {
     }
 
     @Test
-    fun homeTabShowsDailyAlbumWidgetWhenConfiguredAndInvokesPlayAndRateActions() {
-        val album =
-            DailyAlbumSnapshot(
+    fun homeTabShowsCollectionDrawWidgetWhenEnabledAndInvokesOpenAndJumpActions() {
+        val draw =
+            CollectionDrawSnapshot(
+                collectionId = "col-jazz-canon",
+                collectionSlug = "jazz_canon",
+                collectionTitle = "Jazz Canon",
                 entryId = "album-entry-11",
-                name = "Sample Album",
-                artist = "Sample Artist",
+                title = "Sample Album",
+                creator = "Sample Artist",
                 releaseDate = "1972",
-                genres = listOf("rock"),
-                albumNumber = 11,
-                totalCount = 1101,
-                remainingCount = 1091,
+                tags = listOf("rock"),
+                drawNumber = 11,
+                totalCount = 50,
+                remainingCount = 40,
                 youtubeMusicId = "OLAK5uy_sample_playlist",
                 wikipediaUrl = "https://en.wikipedia.org/wiki/Sample_Album",
             )
-        val openedMusicAlbums = mutableListOf<DailyAlbumSnapshot>()
+        val openedDraws = mutableListOf<CollectionDrawSnapshot>()
         val actions = mutableListOf<com.grayvines.roche.ui.MainAction>()
 
         composeRule.setContent {
@@ -305,49 +309,54 @@ class MainScreenTest {
                             activeTab = AppTab.HOME,
                             catalog =
                                 com.grayvines.roche.data.CatalogSnapshot(
-                                    albumGenerator =
-                                        com.grayvines.roche.data.AlbumGeneratorState(
-                                            enabled = true,
-                                            currentAlbum = album,
-                                            consumedCount = 10,
-                                            abandonedCount = 0,
-                                            totalCount = 1101,
+                                    generators =
+                                        listOf(
+                                            CollectionGeneratorState(
+                                                collectionId = "col-jazz-canon",
+                                                collectionSlug = "jazz_canon",
+                                                collectionTitle = "Jazz Canon",
+                                                enabled = true,
+                                                currentDraw = draw,
+                                                consumedCount = 10,
+                                                abandonedCount = 0,
+                                                totalCount = 50,
+                                            )
                                         )
                                 ),
                         ),
                     onAction = { actions.add(it) },
                     onShareEntry = {},
                     onOpenExternalUrl = {},
-                    onOpenDailyAlbumInMusicApp = { openedMusicAlbums.add(it) },
+                    onOpenCollectionDraw = { openedDraws.add(it) },
                 )
             }
         }
 
-        composeRule.onNodeWithTag("home_widget_daily_album").assertExists()
-        composeRule.onNodeWithTag("daily_album_cover").assertExists()
+        composeRule.onNodeWithTag("home_widget_collection_draw").assertExists()
+        composeRule.onNodeWithTag("collection_draw_cover").assertExists()
         composeRule.onNodeWithText("Sample Album").assertExists()
         composeRule.onNodeWithText("Sample Artist").assertExists()
         composeRule.onNodeWithText("#11 · 1972", useUnmergedTree = true).assertExists()
         composeRule.onNodeWithText("ROCK", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("1091 LEFT", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithTag("daily_album_finish_btn").assertDoesNotExist()
-        composeRule.onNodeWithTag("daily_album_abandon_btn").assertDoesNotExist()
+        composeRule.onNodeWithText("40 LEFT", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithTag("companion_draw_finish_btn").assertDoesNotExist()
+        composeRule.onNodeWithTag("companion_draw_abandon_btn").assertDoesNotExist()
 
-        composeRule.onNodeWithTag("daily_album_cover").performScrollTo().performClick()
-        org.junit.Assert.assertEquals(listOf(album), openedMusicAlbums)
+        composeRule.onNodeWithTag("collection_draw_cover").performScrollTo().performClick()
+        org.junit.Assert.assertEquals(listOf(draw), openedDraws)
 
         composeRule
-            .onNodeWithTag("daily_album_header_open_list_btn")
+            .onNodeWithTag("collection_draw_header_open_list_btn")
             .performScrollTo()
             .performClick()
-        composeRule.onNodeWithTag("home_open_1001_list_btn").performScrollTo().performClick()
-        val expectedOpen1001Action =
+        composeRule.onNodeWithTag("home_open_draw_list_jazz_canon").performScrollTo().performClick()
+        val expectedOpenListAction =
             com.grayvines.roche.ui.MainAction.OpenCompanionSection(
                 com.grayvines.roche.ui.CompanionSubTab.LISTS,
-                com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID,
+                "col-jazz-canon",
             )
         org.junit.Assert.assertEquals(
-            listOf(expectedOpen1001Action, expectedOpen1001Action),
+            listOf(expectedOpenListAction, expectedOpenListAction),
             actions,
         )
     }

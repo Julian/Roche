@@ -6,15 +6,20 @@ import java.nio.charset.StandardCharsets
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class DailyAlbumSnapshot(
+data class CollectionDrawSnapshot(
+    val collectionId: String = "",
+    val collectionSlug: String = "",
+    val collectionTitle: String = "",
     val entryId: String = "",
-    val name: String,
-    val artist: String,
+    val kind: EntryKind = EntryKind.ALBUM,
+    val title: String,
+    val creator: String = "",
     val releaseDate: String = "",
+    val url: String? = null,
     val imageUrl: String? = null,
     val thumbnailUrl: String? = null,
-    val genres: List<String> = emptyList(),
-    val albumNumber: Int = 0,
+    val tags: List<String> = emptyList(),
+    val drawNumber: Int = 0,
     val totalCount: Int = 0,
     val remainingCount: Int = 0,
     val youtubeMusicId: String? = null,
@@ -26,9 +31,12 @@ data class DailyAlbumSnapshot(
     val amazonMusicId: String? = null,
     val wikipediaUrl: String? = null,
 ) {
+    val isMusicKind: Boolean
+        get() = kind == EntryKind.ALBUM || kind == EntryKind.SONG
+
     val youtubeMusicSearchUrl: String
         get() {
-            val query = "$artist $name".trim().ifBlank { name }
+            val query = "$creator $title".trim().ifBlank { title }
             return "$YT_MUSIC_ORIGIN/search?q=${encodeQueryValue(query)}"
         }
 
@@ -41,14 +49,20 @@ data class DailyAlbumSnapshot(
                 buildYoutubeMusicAlbumUrl(cleanId)
             }
         }
+
+    val primaryExternalUrl: String?
+        get() =
+            sanitizeHttpUrl(url)
+                ?: sanitizeHttpUrl(wikipediaUrl)
+                ?: candidateStreamingUrls().firstOrNull()
 }
 
-internal val DailyAlbumSnapshot.hasYoutubePlaylistId: Boolean
+internal val CollectionDrawSnapshot.hasYoutubePlaylistId: Boolean
     get() =
         !youtubeMusicId.isNullOrBlank() &&
             youtubeMusicUrl.startsWith("$YT_MUSIC_ORIGIN/playlist?list=")
 
-internal fun DailyAlbumSnapshot.candidateStreamingUrls(): List<String> = buildList {
+internal fun CollectionDrawSnapshot.candidateStreamingUrls(): List<String> = buildList {
     if (!youtubeMusicId.isNullOrBlank()) {
         add(youtubeMusicUrl)
     }

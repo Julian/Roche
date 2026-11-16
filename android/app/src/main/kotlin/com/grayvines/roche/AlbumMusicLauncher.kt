@@ -9,7 +9,7 @@ import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
 import android.provider.MediaStore
 import androidx.core.net.toUri
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.candidateStreamingUrls
 
 internal data class MusicUrlCandidate(
@@ -29,7 +29,7 @@ internal sealed interface MusicUrlResolution {
 
 internal fun tryOpenDirectAlbumNow(
     context: Context,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): Boolean {
     val candidates = queryStreamingUrlCandidates(context, album)
     val resolution =
@@ -54,7 +54,7 @@ internal fun hasInstalledMusicApp(context: Context): Boolean {
 
 internal fun openAlbumInMusicApp(
     context: Context,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
     onOpenFallbackUrl: (String) -> Unit,
 ) {
     if (tryOpenDirectAlbumNow(context, album)) {
@@ -96,7 +96,7 @@ internal fun selectMusicUrlResolution(
 
 internal fun queryStreamingUrlCandidates(
     context: Context,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): List<MusicUrlCandidate> = queryUrlListCandidates(context, album.candidateStreamingUrls())
 
 private fun queryUrlListCandidates(
@@ -164,7 +164,7 @@ internal fun queryBrowserPackages(packageManager: PackageManager): Set<String> {
 
 internal fun launchStreamingResolution(
     context: Context,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
     resolution: MusicUrlResolution,
 ): Boolean =
     when (resolution) {
@@ -180,7 +180,8 @@ internal fun launchStreamingResolution(
         }
         is MusicUrlResolution.ChooserTargets -> {
             val intents = resolution.targets.map(::buildExplicitViewIntent)
-            val chooserTitle = "${album.name} — ${album.artist}"
+            val chooserTitle =
+                if (album.creator.isNotBlank()) "${album.title} — ${album.creator}" else album.title
             val chooser =
                 Intent.createChooser(intents.first(), chooserTitle).apply {
                     val extras = intents.drop(1).toTypedArray()
@@ -208,7 +209,7 @@ internal fun buildExplicitViewIntent(target: MusicUrlCandidate): Intent =
 
 internal fun tryLaunchMediaSearch(
     context: Context,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): Boolean {
     val actions =
         listOf(
@@ -226,13 +227,13 @@ internal fun tryLaunchMediaSearch(
 
 internal fun buildAlbumSearchIntent(
     action: String,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): Intent {
-    val query = "${album.artist} ${album.name}".trim().ifBlank { album.name }
+    val query = "${album.creator} ${album.title}".trim().ifBlank { album.title }
     return Intent(action).apply {
         putExtra(MediaStore.EXTRA_MEDIA_FOCUS, MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE)
-        putExtra(MediaStore.EXTRA_MEDIA_ALBUM, album.name)
-        putExtra(MediaStore.EXTRA_MEDIA_ARTIST, album.artist)
+        putExtra(MediaStore.EXTRA_MEDIA_ALBUM, album.title)
+        putExtra(MediaStore.EXTRA_MEDIA_ARTIST, album.creator)
         putExtra(SearchManager.QUERY, query)
     }
 }

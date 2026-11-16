@@ -9,8 +9,8 @@ use figment::{
 use crate::{
     config::Config,
     db::{
-        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, ConsumptionStatus, Db,
-        EntryIdentifier, EntryKind, Generator1001State, UpsertEntryInput,
+        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, CollectionGeneratorState,
+        ConsumptionStatus, Db, EntryIdentifier, EntryKind, UpsertEntryInput,
     },
     ranking::RANDOM_SEED_EVERY,
     service::CatalogService,
@@ -226,9 +226,9 @@ impl Cli {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
                 run_rank_cmd(&db, &rank_args).await
             }
-            Some(Command::Album { action }) => {
+            Some(Command::Draw { action }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
-                run_album_cmd(&db, action.unwrap_or(AlbumCommand::Status)).await
+                run_draw_cmd(&db, action.unwrap_or(DrawCommand::Status { collection: None })).await
             }
             Some(Command::Catalog { action }) => match action {
                 CatalogCommand::Apply { file, dry_run, json } => {
@@ -264,12 +264,11 @@ async fn run_catalog_apply_cmd(
     } else {
         let suffix = if result.dry_run { " (dry run — rolled back)" } else { "" };
         println!("Applied catalog batch{suffix}:");
-        println!("  Entries processed:    {}", result.entries_processed);
-        println!("  Consumption logs:     {}", result.logs_recorded);
-        println!("  Comparisons recorded: {}", result.comparisons_recorded);
-        if let Some(active_id) = &result.active_1001_entry_id {
-            println!("  Active 1001 Album ID: {active_id}");
-        }
+        println!("  Collections processed: {}", result.collections_processed);
+        println!("  Entries processed:     {}", result.entries_processed);
+        println!("  Consumption logs:      {}", result.logs_recorded);
+        println!("  Comparisons recorded:  {}", result.comparisons_recorded);
+        println!("  Generators updated:    {}", result.generators_updated);
     }
     Ok(())
 }
@@ -365,10 +364,10 @@ pub enum Command {
     },
     /// Run an interactive k-way terminal ranking session
     Rank(RankArgs),
-    /// Manage the native 1001 Albums generator (status, enable, finish, abandon)
-    Album {
+    /// Manage random active draws across manual lists (status, enable, finish, abandon)
+    Draw {
         #[command(subcommand)]
-        action: Option<AlbumCommand>,
+        action: Option<DrawCommand>,
     },
     /// Apply declarative operations against the unified media catalog
     Catalog {
@@ -462,7 +461,7 @@ impl MediaEntryArgs {
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct RankArgs {
-    /// Target collection slug or kind (e.g. `albums`, `movies`, `1001_albums`)
+    /// Target collection slug or kind (e.g. `albums`, `movies`, `sci_fi_canon`)
     pub target: String,
     /// Rank the want-queue priority order for `target`
     #[arg(long)]
@@ -488,26 +487,42 @@ pub struct RankArgs {
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub enum AlbumCommand {
-    /// Display the active 1001 Album draw and pool statistics
-    Status,
-    /// Enable the 1001 Albums generator (drawing an initial album if none is active)
-    Enable,
-    /// Disable the 1001 Albums generator (preserving any active draw)
-    Disable,
-    /// Open the active 1001 Album in the system browser
-    Open,
-    /// Finish the active 1001 Album, run focused ranking, and draw the next album
+pub enum DrawCommand {
+    /// Display active collection draws (or a specific list's generator status)
+    Status {
+        /// Optional manual list slug or ID
+        collection: Option<String>,
+    },
+    /// Enable random draws on a manual list (drawing an initial item if none is active)
+    Enable {
+        /// Manual list slug or ID
+        collection: String,
+    },
+    /// Pause random draws on a manual list (preserving any active draw)
+    Disable {
+        /// Manual list slug or ID
+        collection: String,
+    },
+    /// Open the active drawn item in the system browser
+    Open {
+        /// Optional manual list slug or ID (auto-selected if exactly one draw is active)
+        collection: Option<String>,
+    },
+    /// Finish the active drawn item, run focused ranking, and draw the next item
     Finish {
-        /// Optional listening notes
+        /// Optional manual list slug or ID (auto-selected if exactly one draw is active)
+        collection: Option<String>,
+        /// Optional notes
         #[arg(long)]
         notes: Option<String>,
         /// Skip the interactive ranking prompt after finishing
         #[arg(long)]
         no_rank: bool,
     },
-    /// Abandon the active 1001 Album without ranking it and draw the next album
+    /// Abandon the active drawn item without ranking it and draw the next item
     Abandon {
+        /// Optional manual list slug or ID (auto-selected if exactly one draw is active)
+        collection: Option<String>,
         /// Optional notes on why it was abandoned
         #[arg(long)]
         notes: Option<String>,
@@ -742,25 +757,72 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_album_cmd(db: &Db, action: AlbumCommand) -> anyhow::Result<()> {
+async fn resolve_target_generator_collection(
+    catalog: &CatalogService<'_>,
+    explicit: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(col) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(col.to_owned());
+    }
+    let active = catalog.list_collection_generators(true).await?;
+    match active.as_slice() {
+        [single] => Ok(single.collection_id.clone()),
+        [] => anyhow::bail!(
+            "No manual lists currently have an enabled draw. Enable one with `roche draw enable <list>`."
+        ),
+        many => {
+            let names: Vec<String> = many
+                .iter()
+                .map(|g| g.collection_slug.as_deref().unwrap_or(&g.collection_title).to_owned())
+                .collect();
+            anyhow::bail!(
+                "Multiple list draws are active ({}); specify which collection to target.",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+async fn run_draw_cmd(db: &Db, action: DrawCommand) -> anyhow::Result<()> {
     let catalog = CatalogService::new(db);
     match action {
-        AlbumCommand::Status => {
-            let state = catalog.get_1001_generator_state().await?;
-            print_1001_state(&state);
+        DrawCommand::Status { collection } => {
+            if let Some(col) = collection.as_deref() {
+                let state = catalog.get_collection_generator(col).await?;
+                print_generator_state(&state);
+            } else {
+                let states = catalog.list_collection_generators(false).await?;
+                if states.is_empty() {
+                    println!(
+                        "No collection draws configured. Run `roche draw enable <list>` to start one."
+                    );
+                } else {
+                    for (idx, state) in states.iter().enumerate() {
+                        if idx > 0 {
+                            println!();
+                        }
+                        print_generator_state(state);
+                    }
+                }
+            }
         }
-        AlbumCommand::Enable => {
-            let state = catalog.set_1001_generator_enabled(true).await?;
-            print_1001_state(&state);
+        DrawCommand::Enable { collection } => {
+            let state = catalog.set_collection_generator_enabled(&collection, true).await?;
+            print_generator_state(&state);
         }
-        AlbumCommand::Disable => {
-            let state = catalog.set_1001_generator_enabled(false).await?;
-            print_1001_state(&state);
+        DrawCommand::Disable { collection } => {
+            let state = catalog.set_collection_generator_enabled(&collection, false).await?;
+            print_generator_state(&state);
         }
-        AlbumCommand::Open => {
-            let state = catalog.get_1001_generator_state().await?;
+        DrawCommand::Open { collection } => {
+            let target =
+                resolve_target_generator_collection(&catalog, collection.as_deref()).await?;
+            let state = catalog.get_collection_generator(&target).await?;
             let Some(active) = state.current_entry else {
-                anyhow::bail!("No active 1001 Album is currently drawn.");
+                anyhow::bail!(
+                    "No active entry is currently drawn for '{}'.",
+                    state.collection_title
+                );
             };
             let Some(url) = active.primary_open_url() else {
                 anyhow::bail!("No external URL available for '{}'.", active.title);
@@ -768,82 +830,113 @@ async fn run_album_cmd(db: &Db, action: AlbumCommand) -> anyhow::Result<()> {
             open_system_browser(&url)?;
             println!("Opened {url}");
         }
-        AlbumCommand::Finish { notes, no_rank } => {
-            let (finished, next_state) = catalog.finish_active_1001_album(notes.as_deref()).await?;
-            println!(
-                "Finished '{}' — {}",
-                sanitize_terminal_text(&finished.title),
-                sanitize_terminal_text(&finished.creators.join(", "))
-            );
-            if !no_rank {
-                if let Some(list_slug) = catalog.rank_target_after_consumption(&finished).await? {
-                    let rank_args = RankArgs {
-                        target: list_slug,
-                        want: false,
-                        max_k: 5,
-                        max_iters: 20,
-                        focus: Some(finished.id.clone()),
-                        recent: None,
-                        by: None,
-                        from: None,
-                    };
-                    if let Err(err) = run_rank_cmd(db, &rank_args).await {
-                        eprintln!("Skipped interactive ranking ({err})");
-                    }
-                } else {
-                    println!("Ranked #1 in Albums (finish at least 2 albums to compare).");
-                }
-            }
-            println!();
-            print_1001_state(&next_state);
+        DrawCommand::Finish { collection, notes, no_rank } => {
+            run_draw_finish_cmd(db, &catalog, collection.as_deref(), notes.as_deref(), no_rank)
+                .await?;
         }
-        AlbumCommand::Abandon { notes } => {
+        DrawCommand::Abandon { collection, notes } => {
+            let target =
+                resolve_target_generator_collection(&catalog, collection.as_deref()).await?;
             let (abandoned, next_state) =
-                catalog.abandon_active_1001_album(notes.as_deref()).await?;
+                catalog.abandon_active_generator_entry(&target, notes.as_deref()).await?;
             println!(
                 "Abandoned '{}' — {}",
                 sanitize_terminal_text(&abandoned.title),
                 sanitize_terminal_text(&abandoned.creators.join(", "))
             );
             println!();
-            print_1001_state(&next_state);
+            print_generator_state(&next_state);
         }
     }
     Ok(())
 }
 
-fn print_1001_state(state: &Generator1001State) {
-    let status_word = if state.enabled { "enabled" } else { "disabled" };
+async fn run_draw_finish_cmd(
+    db: &Db,
+    catalog: &CatalogService<'_>,
+    collection: Option<&str>,
+    notes: Option<&str>,
+    no_rank: bool,
+) -> anyhow::Result<()> {
+    let target = resolve_target_generator_collection(catalog, collection).await?;
+    let (finished, next_state) = catalog.finish_active_generator_entry(&target, notes).await?;
     println!(
-        "1001 Albums Generator ({status_word}) — {}/{} finished, {} abandoned, {} remaining",
-        state.consumed_count, state.total_pool, state.abandoned_count, state.remaining_count
+        "Finished '{}' — {}",
+        sanitize_terminal_text(&finished.title),
+        sanitize_terminal_text(&finished.creators.join(", "))
+    );
+    if !no_rank {
+        let rank_target =
+            if catalog.can_rank_collection(&next_state.collection_id, false).await.unwrap_or(false)
+            {
+                Some(next_state.collection_id.clone())
+            } else {
+                catalog.rank_target_after_consumption(&finished).await?
+            };
+        if let Some(list_slug) = rank_target {
+            let rank_args = RankArgs {
+                target: list_slug,
+                want: false,
+                max_k: 5,
+                max_iters: 20,
+                focus: Some(finished.id.clone()),
+                recent: None,
+                by: None,
+                from: None,
+            };
+            if let Err(err) = run_rank_cmd(db, &rank_args).await {
+                eprintln!("Skipped interactive ranking ({err})");
+            }
+        }
+    }
+    println!();
+    print_generator_state(&next_state);
+    Ok(())
+}
+
+fn print_generator_state(state: &CollectionGeneratorState) {
+    let status_word = if state.enabled { "enabled" } else { "paused" };
+    println!(
+        "{} Draw ({status_word}) — {}/{} finished, {} abandoned, {} remaining",
+        sanitize_terminal_text(&state.collection_title),
+        state.consumed_count,
+        state.total_pool,
+        state.abandoned_count,
+        state.remaining_count
     );
     if let Some(entry) = &state.current_entry {
-        print_active_album_card(entry);
+        print_active_draw_card(entry);
     } else if !state.enabled {
-        println!("Run `roche album enable` to draw your next album.");
+        let slug = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
+        println!(
+            "Run `roche draw enable {}` to draw your next item.",
+            sanitize_terminal_text(slug)
+        );
     } else {
-        println!("Congratulations — no albums remain in the 1001 pool!");
+        println!(
+            "All items in '{}' have been completed!",
+            sanitize_terminal_text(&state.collection_title)
+        );
     }
 }
 
-fn print_active_album_card(entry: &CatalogEntry) {
-    let artist = if entry.creators.is_empty() {
-        "Unknown Artist".to_owned()
+fn print_active_draw_card(entry: &CatalogEntry) {
+    let creator_suffix = if entry.creators.is_empty() {
+        String::new()
     } else {
-        sanitize_terminal_text(&entry.creators.join(", "))
+        format!(" — {}", sanitize_terminal_text(&entry.creators.join(", ")))
     };
     let year = entry.release_year.map_or_else(String::new, |y| format!(" ({y})"));
-    println!("Active draw: {} — {artist}{year}", sanitize_terminal_text(&entry.title));
+    println!("Active draw: {}{creator_suffix}{year}", sanitize_terminal_text(&entry.title));
     if let Some(genres) = entry.metadata.get("genres").and_then(|v| v.as_array()) {
         let joined: Vec<String> =
             genres.iter().filter_map(|v| v.as_str()).map(sanitize_terminal_text).collect();
         if !joined.is_empty() {
-            println!("Genres:      {}", joined.join(", "));
+            println!("Tags:        {}", joined.join(", "));
         }
     }
     if let Some(open_url) = entry.primary_open_url() {
-        println!("Listen:      {}", sanitize_terminal_text(&open_url));
+        println!("Open:        {}", sanitize_terminal_text(&open_url));
     }
     let providers: Vec<&str> =
         entry.sorted_external_identifiers().into_iter().map(EntryIdentifier::label).collect();
@@ -903,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parses_media_catalog_ranking_and_album_commands() {
+    fn test_cli_parses_media_catalog_ranking_and_draw_commands() {
         let consumed = Cli::try_parse_from([
             "roche",
             "consumed",
@@ -932,13 +1025,21 @@ mod tests {
             Some(Command::Rank(RankArgs { max_k: 4, recent: Some(10), .. }))
         ));
 
-        let album_finish =
-            Cli::try_parse_from(["roche", "album", "finish", "--notes", "Superb", "--no-rank"])
-                .unwrap();
+        let draw_finish = Cli::try_parse_from([
+            "roche",
+            "draw",
+            "finish",
+            "canon_queue",
+            "--notes",
+            "Superb",
+            "--no-rank",
+        ])
+        .unwrap();
         assert_eq!(
-            album_finish.command,
-            Some(Command::Album {
-                action: Some(AlbumCommand::Finish {
+            draw_finish.command,
+            Some(Command::Draw {
+                action: Some(DrawCommand::Finish {
+                    collection: Some("canon_queue".to_owned()),
                     notes: Some("Superb".to_owned()),
                     no_rank: true,
                 }),

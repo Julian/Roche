@@ -161,19 +161,6 @@ internal data class DynamicCollectionRuleDto(
     @SerialName("creator_contains") val creatorContains: String? = null,
 )
 
-@Serializable
-internal data class BundledAlbumPoolItem(
-    val id: String,
-    @SerialName("spotify_id") val spotifyId: String = "",
-    val slug: String = "",
-    val title: String,
-    val artist: String,
-    val year: Int? = null,
-    @SerialName("cover_url") val coverUrl: String? = null,
-    val genres: List<String> = emptyList(),
-    val styles: List<String> = emptyList(),
-)
-
 data class CatalogEntryItem(
     val id: String,
     val kind: EntryKind,
@@ -216,6 +203,10 @@ data class CatalogListSummary(
     val role: CollectionRole,
     val entryCount: Int,
     val isPriorityScoped: Boolean,
+    val hasGenerator: Boolean = false,
+    val generatorEnabled: Boolean = false,
+    val poolTotalCount: Int = 0,
+    val poolRemainingCount: Int = 0,
 )
 
 data class DiaryEntryItem(
@@ -233,9 +224,12 @@ data class DiaryEntryItem(
     val tier: Char?,
 )
 
-data class AlbumGeneratorState(
+data class CollectionGeneratorState(
+    val collectionId: String,
+    val collectionSlug: String,
+    val collectionTitle: String,
     val enabled: Boolean = false,
-    val currentAlbum: DailyAlbumSnapshot? = null,
+    val currentDraw: CollectionDrawSnapshot? = null,
     val consumedCount: Int = 0,
     val abandonedCount: Int = 0,
     val totalCount: Int = 0,
@@ -252,7 +246,7 @@ data class CatalogSnapshot(
     val wantQueues: List<CatalogListSummary> = emptyList(),
     val entriesByCollectionId: Map<String, List<RankedCatalogEntry>> = emptyMap(),
     val diaryEntries: List<DiaryEntryItem> = emptyList(),
-    val albumGenerator: AlbumGeneratorState = AlbumGeneratorState(),
+    val generators: List<CollectionGeneratorState> = emptyList(),
     val comparisonCount: Int = 0,
 ) {
     val consumedCount: Int
@@ -266,6 +260,11 @@ data class CatalogSnapshot(
     val wantItemCount: Int
         get() = wantQueues.sumOf { it.entryCount }
 }
+
+fun CatalogSnapshot.generatorFor(collectionId: String): CollectionGeneratorState? =
+    generators.firstOrNull {
+        it.collectionId == collectionId
+    }
 
 data class UpsertCatalogEntryInput(
     val id: String? = null,
@@ -299,9 +298,11 @@ data class RankSettlementSummary(
     val tier: Char?,
 )
 
-data class Album1001StepResult(
+data class CollectionDrawStepResult(
     val entryId: String,
-    val nextAlbum: DailyAlbumSnapshot?,
+    val collectionId: String,
+    val collectionTitle: String,
+    val nextDraw: CollectionDrawSnapshot?,
 )
 
 data class CollectionRankMeta(

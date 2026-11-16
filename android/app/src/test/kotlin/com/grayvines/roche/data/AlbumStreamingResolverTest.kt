@@ -8,7 +8,6 @@ import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.HttpTransport
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
-import java.io.ByteArrayInputStream
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -36,10 +35,10 @@ class AlbumStreamingResolverTest {
             }
             val resolver = AlbumStreamingResolver(transport)
             val album =
-                DailyAlbumSnapshot(
+                CollectionDrawSnapshot(
                     entryId = "entry-1",
-                    name = "In The Wee Small Hours",
-                    artist = "Frank Sinatra",
+                    title = "In The Wee Small Hours",
+                    creator = "Frank Sinatra",
                     spotifyId = "3GmwKB1tgPZgXeRJZSm9WX",
                 )
 
@@ -81,10 +80,10 @@ class AlbumStreamingResolverTest {
             }
             val resolver = AlbumStreamingResolver(transport)
             val album =
-                DailyAlbumSnapshot(
+                CollectionDrawSnapshot(
                     entryId = "entry-2",
-                    name = "Ellington at Newport (Remastered)",
-                    artist = "Duke Ellington",
+                    title = "Ellington at Newport (Remastered)",
+                    creator = "Duke Ellington",
                     spotifyId = "0t41BkcZayaAsa0FdRelfz",
                 )
 
@@ -107,9 +106,9 @@ class AlbumStreamingResolverTest {
                 ),
             )
         val elvisAlbum =
-            DailyAlbumSnapshot(
-                name = "Elvis Presley",
-                artist = "Elvis Presley",
+            CollectionDrawSnapshot(
+                title = "Elvis Presley",
+                creator = "Elvis Presley",
                 releaseDate = "1956",
             )
         assertEquals("Elvis_Presley_(album)", selectBestWikipediaSlug(elvisHits, elvisAlbum))
@@ -130,7 +129,7 @@ class AlbumStreamingResolverTest {
                 ),
             )
         val purpleRainAlbum =
-            DailyAlbumSnapshot(name = "Purple Rain", artist = "Prince", releaseDate = "1984")
+            CollectionDrawSnapshot(title = "Purple Rain", creator = "Prince", releaseDate = "1984")
         assertEquals(
             "Purple_Rain_(album)",
             selectBestWikipediaSlug(purpleRainHits, purpleRainAlbum),
@@ -143,7 +142,7 @@ class AlbumStreamingResolverTest {
     }
 
     @Test
-    fun `prewarmDailyAlbumStreaming persists YouTube Music and Wikipedia IDs and marks entry dirty for sync`() =
+    fun `prewarmCollectionDraw persists YouTube Music and Wikipedia IDs and marks entry dirty for sync`() =
         runTest {
             val db =
                 Room.inMemoryDatabaseBuilder<RocheDatabase>()
@@ -168,23 +167,35 @@ class AlbumStreamingResolverTest {
                         database = db,
                         apiClient = RocheApiClient(transport = transport),
                         settings = SettingsRepository(settingsStore),
-                        poolStreamProvider = {
-                            ByteArrayInputStream(SAMPLE_POOL_JSON.toByteArray(Charsets.UTF_8))
-                        },
                         albumStreamingResolver = AlbumStreamingResolver(transport),
                     )
+                val listId = repo.catalog.createCustomList("Jazz Canon")
+                val entryId =
+                    repo.catalog.upsertEntry(
+                        UpsertCatalogEntryInput(
+                            id = "83f8410d-71bc-5ea4-911e-06869fe1b039",
+                            kind = EntryKind.ALBUM,
+                            title = "In The Wee Small Hours",
+                            creators = listOf("Frank Sinatra"),
+                            releaseYear = 1955,
+                            identifiers =
+                                listOf(EntryIdentifierDto("spotify", "3GmwKB1tgPZgXeRJZSm9WX")),
+                        ),
+                        markDirty = false,
+                    )
+                repo.catalog.addCollectionEntry(listId, entryId, position = 1.0)
 
-                val drawn = checkNotNull(repo.catalog.setAlbumGeneratorEnabled(true))
-                repo.prewarmDailyAlbumStreaming(drawn)
+                val drawn = checkNotNull(repo.catalog.setCollectionGeneratorEnabled(listId, true))
+                repo.prewarmCollectionDraw(drawn)
 
                 val updated =
                     repo.snapshot.first {
-                        val cur = it.catalog.albumGenerator.currentAlbum
+                        val cur = it.catalog.generatorFor(listId)?.currentDraw
                         cur?.youtubeMusicId == "OLAK5uy_persisted_1" &&
                             cur.wikipediaUrl ==
                                 "https://en.wikipedia.org/wiki/In_the_Wee_Small_Hours"
                     }
-                val active = checkNotNull(updated.catalog.albumGenerator.currentAlbum)
+                val active = checkNotNull(updated.catalog.generatorFor(listId)?.currentDraw)
                 assertResolvedSyncAndIdempotency(db, repo, active)
             } finally {
                 db.close()
@@ -196,7 +207,7 @@ class AlbumStreamingResolverTest {
 private suspend fun assertResolvedSyncAndIdempotency(
     db: RocheDatabase,
     repo: RocheRepository,
-    active: DailyAlbumSnapshot,
+    active: CollectionDrawSnapshot,
 ) {
     assertEquals(
         "https://music.youtube.com/playlist?list=OLAK5uy_persisted_1",
@@ -280,21 +291,6 @@ private const val SAMPLE_INNERTUBE_BROWSE_JSON =
     }
   }
 }"""
-
-private const val SAMPLE_POOL_JSON =
-    """[
-  {
-    "id": "83f8410d-71bc-5ea4-911e-06869fe1b039",
-    "spotify_id": "3GmwKB1tgPZgXeRJZSm9WX",
-    "slug": "in-the-wee-small-hours",
-    "title": "In The Wee Small Hours",
-    "artist": "Frank Sinatra",
-    "year": 1955,
-    "cover_url": "https://i.scdn.co/image/cover",
-    "genres": ["jazz"],
-    "styles": ["swing"]
-  }
-]"""
 
 private const val SAMPLE_PERSIST_ODESLI_JSON =
     """{

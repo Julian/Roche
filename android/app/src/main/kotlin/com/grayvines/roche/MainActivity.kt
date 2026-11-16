@@ -15,10 +15,11 @@ import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.remote.readBoundedText
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.CompanionSubTab
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
@@ -89,7 +90,7 @@ class MainActivity : ComponentActivity() {
                         onOpenExternalUrl = ::openUrlInBrowser,
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
-                        onOpenDailyAlbumInMusicApp = ::openDailyAlbumInMusicApp,
+                        onOpenCollectionDraw = ::openCollectionDraw,
                     )
                 }
             }
@@ -150,20 +151,37 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun openDailyAlbumInMusicApp(album: DailyAlbumSnapshot) {
-        if (tryOpenDirectAlbumNow(this, album)) {
+    private fun openCollectionDraw(draw: CollectionDrawSnapshot) {
+        if (draw.isMusicKind) {
+            openMusicCollectionDraw(draw)
+            return
+        }
+        val inInbox = viewModel.uiState.value.allEntries.any { it.id == draw.entryId }
+        val extUrl = draw.primaryExternalUrl
+        when {
+            inInbox -> viewModel.dispatch(MainAction.OpenReader(draw.entryId))
+            !extUrl.isNullOrBlank() -> openUrlInBrowser(extUrl)
+            draw.collectionId.isNotBlank() ->
+                viewModel.dispatch(
+                    MainAction.OpenCompanionSection(CompanionSubTab.LISTS, draw.collectionId)
+                )
+        }
+    }
+
+    private fun openMusicCollectionDraw(draw: CollectionDrawSnapshot) {
+        if (tryOpenDirectAlbumNow(this, draw)) {
             return
         }
         if (!hasInstalledMusicApp(this)) {
-            openAlbumInMusicApp(this, album, ::openUrlInBrowser)
+            openAlbumInMusicApp(this, draw, ::openUrlInBrowser)
             return
         }
         val repo = (application as RocheApp).graph.repository
         lifecycleScope.launch {
             val enriched =
                 withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
-                    repo.resolveDailyAlbumStreaming(album)
-                } ?: album
+                    repo.resolveCollectionDrawStreaming(draw)
+                } ?: draw
             if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
                 openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
             }

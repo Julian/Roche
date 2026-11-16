@@ -8,9 +8,8 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 use super::{
     SyncRepo,
     identity::{
-        ALBUMS_1001_COLLECTION_ID, STARRED_COLLECTION_ID, canonical_ordering_json,
-        collection_entry_natural_key, deterministic_comparison_id,
-        deterministic_system_collection_id,
+        STARRED_COLLECTION_ID, canonical_ordering_json, collection_entry_natural_key,
+        deterministic_comparison_id, deterministic_system_collection_id,
     },
 };
 use crate::{
@@ -140,6 +139,8 @@ type OutgoingRawEntryRow = (
     DateTime<Utc>,
     DateTime<Utc>,
 );
+
+type GeneratorSyncTuple = (bool, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>);
 
 impl SyncRepo<'_> {
     pub(super) const fn has_incoming_catalog_payload(
@@ -537,130 +538,141 @@ impl SyncRepo<'_> {
             }
         }
 
-        // 6. Collection Generators (`1001_albums` LWW + never-revive-consumed-album invariant)
+        // 6. Collection Generators (generic LWW + never-revive-consumed-entry invariant)
+        Self::merge_incoming_generators_in_tx(tx, &collection_id_remap, collection_generators, now)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn merge_incoming_generators_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id_remap: &HashMap<String, String>,
+        collection_generators: &[PeerCollectionGeneratorRecord],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         for inc_gen in collection_generators {
-            if inc_gen.collection_id.trim() != ALBUMS_1001_COLLECTION_ID {
-                continue;
-            }
-            let local_gen = sqlx::query!(
-                "SELECT enabled AS \"enabled: bool\",
-                        current_entry_id,
-                        drawn_at AS \"drawn_at: DateTime<Utc>\",
-                        updated_at AS \"updated_at: DateTime<Utc>\"
-                 FROM collection_generators WHERE collection_id = ?",
-                ALBUMS_1001_COLLECTION_ID,
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            let (mut target_enabled, mut target_entry_id, mut target_drawn_at, mut target_updated) =
-                if let Some(loc) = local_gen {
-                    if inc_gen.updated_at > loc.updated_at
-                        || (inc_gen.updated_at == loc.updated_at
-                            && loc.current_entry_id.is_none()
-                            && inc_gen.current_entry_id.is_some())
-                    {
-                        (
-                            inc_gen.enabled,
-                            inc_gen.current_entry_id.clone(),
-                            inc_gen.drawn_at,
-                            inc_gen.updated_at.max(now),
-                        )
-                    } else {
-                        (loc.enabled, loc.current_entry_id, loc.drawn_at, loc.updated_at)
-                    }
-                } else {
-                    (
-                        inc_gen.enabled,
-                        inc_gen.current_entry_id.clone(),
-                        inc_gen.drawn_at,
-                        inc_gen.updated_at.max(now),
-                    )
-                };
-
-            if let Some(ref cur_id) = target_entry_id {
-                let canon_cur = CatalogRepo::follow_merged_id_in_tx(tx, cur_id).await?;
-                if let Some(cid) = canon_cur {
-                    let already_finished: Option<i64> = sqlx::query_scalar!(
-                        "SELECT 1 AS \"found!: i64\" FROM consumption_log
-                         WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
-                         LIMIT 1",
-                        cid,
-                    )
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                    if already_finished.is_some() {
-                        target_entry_id = None;
-                        target_updated = now;
-                    } else {
-                        target_entry_id = Some(cid);
-                    }
-                } else {
-                    target_entry_id = None;
-                }
-            }
-
-            if target_enabled && target_entry_id.is_none() {
-                target_entry_id = CatalogRepo::draw_random_remaining_1001_in_tx(tx).await?;
-                target_drawn_at = target_entry_id.as_ref().map(|_| now);
-                target_updated = now;
-            }
-            let _ = &mut target_enabled;
-
-            sqlx::query!(
-                "UPDATE collection_generators
-                 SET enabled = ?, current_entry_id = ?, drawn_at = ?, updated_at = ?
-                 WHERE collection_id = ?",
-                target_enabled as _,
-                target_entry_id,
-                target_drawn_at as _,
-                target_updated as _,
-                ALBUMS_1001_COLLECTION_ID,
-            )
-            .execute(&mut *tx)
-            .await?;
+            Self::merge_single_incoming_generator_in_tx(tx, collection_id_remap, inc_gen, now)
+                .await?;
         }
+        Self::advance_terminal_local_generators_in_tx(tx, now).await
+    }
 
-        // Also ensure that if an incoming consumption_log just finished the server's active 1001 album
-        // (even without an incoming `collection_generators` entry), we advance the active draw cleanly!
-        let local_active = sqlx::query!(
-            "SELECT enabled AS \"enabled: bool\", current_entry_id
-             FROM collection_generators WHERE collection_id = ?",
-            ALBUMS_1001_COLLECTION_ID,
+    async fn merge_single_incoming_generator_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id_remap: &HashMap<String, String>,
+        inc_gen: &PeerCollectionGeneratorRecord,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let raw_col_id = inc_gen.collection_id.trim();
+        if raw_col_id.is_empty() {
+            return Ok(());
+        }
+        let mapped_col = collection_id_remap.get(raw_col_id).map_or(raw_col_id, String::as_str);
+        let Some(col_id) = CatalogRepo::follow_merged_id_in_tx(tx, mapped_col).await? else {
+            return Ok(());
+        };
+
+        let spec_ok: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
+            "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
         )
+        .bind(&col_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(loc) = local_active
-            && let Some(loc_cur_id) = loc.current_entry_id
-        {
-            let done: Option<i64> = sqlx::query_scalar!(
-                "SELECT 1 AS \"found!: i64\" FROM consumption_log
-                 WHERE entry_id = ? AND status IN ('consumed', 'abandoned')
-                 LIMIT 1",
-                loc_cur_id,
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            if done.is_some() {
-                let next_id = if loc.enabled {
-                    CatalogRepo::draw_random_remaining_1001_in_tx(tx).await?
+        if !matches!(spec_ok, Some((CollectionMode::Manual, CollectionRole::List))) {
+            return Ok(());
+        }
+
+        let local_gen: Option<GeneratorSyncTuple> = sqlx::query_as(
+            "SELECT enabled, current_entry_id, drawn_at, updated_at
+             FROM collection_generators WHERE collection_id = ?",
+        )
+        .bind(&col_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let (target_enabled, mut target_entry_id, mut target_drawn_at, mut target_updated) =
+            resolve_merged_generator_tuple(local_gen, inc_gen, now);
+
+        if let Some(ref cur_id) = target_entry_id {
+            if let Some(cid) = CatalogRepo::follow_merged_id_in_tx(tx, cur_id).await? {
+                let in_pool: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+                )
+                .bind(&col_id)
+                .bind(&cid)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if in_pool.is_none() || CatalogRepo::is_entry_terminal_in_tx(tx, &cid).await? {
+                    target_entry_id = None;
+                    target_updated = now;
+                } else {
+                    target_entry_id = Some(cid);
+                }
+            } else {
+                target_entry_id = None;
+            }
+        }
+
+        if target_enabled && target_entry_id.is_none() {
+            target_entry_id = CatalogRepo::draw_random_remaining_in_tx(tx, &col_id).await?;
+            target_drawn_at = target_entry_id.as_ref().map(|_| now);
+            target_updated = now;
+        }
+
+        sqlx::query(
+            "INSERT INTO collection_generators
+             (collection_id, enabled, current_entry_id, drawn_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                current_entry_id = excluded.current_entry_id,
+                drawn_at = excluded.drawn_at,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&col_id)
+        .bind(target_enabled)
+        .bind(target_entry_id.as_deref())
+        .bind(target_drawn_at)
+        .bind(target_updated)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn advance_terminal_local_generators_in_tx(
+        tx: &mut SqliteConnection,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let local_active: Vec<(String, bool, String)> = sqlx::query_as(
+            "SELECT collection_id, enabled, current_entry_id
+             FROM collection_generators
+             WHERE current_entry_id IS NOT NULL",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (col_id, enabled, cur_id) in local_active {
+            if CatalogRepo::is_entry_terminal_in_tx(tx, &cur_id).await? {
+                let next_id = if enabled {
+                    CatalogRepo::draw_random_remaining_in_tx(tx, &col_id).await?
                 } else {
                     None
                 };
                 let next_drawn = next_id.as_ref().map(|_| now);
-                sqlx::query!(
+                sqlx::query(
                     "UPDATE collection_generators
                      SET current_entry_id = ?, drawn_at = ?, updated_at = ?
                      WHERE collection_id = ?",
-                    next_id,
-                    next_drawn as _,
-                    now as _,
-                    ALBUMS_1001_COLLECTION_ID,
                 )
+                .bind(next_id.as_deref())
+                .bind(next_drawn)
+                .bind(now)
+                .bind(&col_id)
                 .execute(&mut *tx)
                 .await?;
             }
         }
-
         Ok(())
     }
 
@@ -763,7 +775,7 @@ impl SyncRepo<'_> {
             })
             .collect();
 
-        // 2. Collection entries (excluding `1001_albums`, `starred`, `feed`, and `tag`)
+        // 2. Collection entries (excluding `starred`, `feed`, and `tag`)
         let mut memberships_qb = QueryBuilder::<Sqlite>::new(
             "SELECT ce.collection_id, ce.entry_id, ce.position, ce.added_at
              FROM collection_entries ce
@@ -771,8 +783,6 @@ impl SyncRepo<'_> {
              WHERE ce.collection_id != ",
         );
         memberships_qb
-            .push_bind(ALBUMS_1001_COLLECTION_ID)
-            .push(" AND ce.collection_id != ")
             .push_bind(STARRED_COLLECTION_ID)
             .push(" AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('feed', 'tag'))");
         push_since(&mut memberships_qb, "ce.added_at", true);
@@ -786,12 +796,14 @@ impl SyncRepo<'_> {
             record_trunc(collection_entries.last().map(|r| r.added_at));
         }
 
-        // 3. Collection generators (`1001_albums`)
+        // 3. Collection generators
         let mut generators_qb = QueryBuilder::<Sqlite>::new(
-            "SELECT collection_id, enabled, current_entry_id, drawn_at, updated_at
-             FROM collection_generators",
+            "SELECT cg.collection_id, cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at
+             FROM collection_generators cg
+             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
+             WHERE cs.mode = 'manual' AND cs.collection_role = 'list'",
         );
-        push_since(&mut generators_qb, "updated_at", false);
+        push_since(&mut generators_qb, "cg.updated_at", true);
         let collection_generators: Vec<PeerCollectionGeneratorRecord> =
             generators_qb.build_query_as().fetch_all(self.pool).await?;
 
@@ -853,34 +865,7 @@ impl SyncRepo<'_> {
                  SELECT 1 FROM collection_specs cs WHERE cs.collection_id = e.id
              )",
         );
-        match since_mode {
-            OutgoingSince::Inclusive(_) | OutgoingSince::StrictlyAfter(_) => {
-                push_since(&mut ent_qb, "e.updated_at", true);
-            }
-            OutgoingSince::All => {
-                // Omit untouched static 1001-album pool rows on initial sync unless active/logged/ranked/merged
-                ent_qb
-                    .push(
-                        " AND (
-                        e.merged_into_id IS NOT NULL
-                        OR NOT EXISTS (
-                            SELECT 1 FROM collection_entries ce_pool
-                            WHERE ce_pool.collection_id = ",
-                    )
-                    .push_bind(ALBUMS_1001_COLLECTION_ID)
-                    .push(
-                        " AND ce_pool.entry_id = e.id
-                        )
-                        OR EXISTS (SELECT 1 FROM consumption_log cl WHERE cl.entry_id = e.id)
-                        OR EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.current_entry_id = e.id)
-                        OR EXISTS (
-                            SELECT 1 FROM collection_entries ce_other
-                            WHERE ce_other.entry_id = e.id AND ce_other.collection_id != ",
-                    )
-                    .push_bind(ALBUMS_1001_COLLECTION_ID)
-                    .push("))");
-            }
-        }
+        push_since(&mut ent_qb, "e.updated_at", true);
         ent_qb
             .push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', e.updated_at) ASC, e.id ASC LIMIT ")
             .push_bind(fetch_limit);
@@ -1022,5 +1007,35 @@ impl SyncRepo<'_> {
             ),
             min_trunc_ts,
         ))
+    }
+}
+
+fn resolve_merged_generator_tuple(
+    local_gen: Option<GeneratorSyncTuple>,
+    inc_gen: &PeerCollectionGeneratorRecord,
+    now: DateTime<Utc>,
+) -> GeneratorSyncTuple {
+    if let Some((loc_enabled, loc_cur, loc_drawn, loc_updated)) = local_gen {
+        let remote_wins = inc_gen.updated_at > loc_updated
+            || (inc_gen.updated_at == loc_updated
+                && loc_cur.is_none()
+                && inc_gen.current_entry_id.is_some());
+        if remote_wins {
+            (
+                inc_gen.enabled,
+                inc_gen.current_entry_id.clone(),
+                inc_gen.drawn_at,
+                inc_gen.updated_at.max(now),
+            )
+        } else {
+            (loc_enabled, loc_cur, loc_drawn, loc_updated)
+        }
+    } else {
+        (
+            inc_gen.enabled,
+            inc_gen.current_entry_id.clone(),
+            inc_gen.drawn_at,
+            inc_gen.updated_at.max(now),
+        )
     }
 }

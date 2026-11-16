@@ -81,6 +81,12 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 vm.settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
                 true
             }
+            is MainAction.SetShowCollectionDrawsOnHome -> {
+                vm.settingsRepository.update {
+                    it.copy(showCollectionDrawsOnHome = action.enabled)
+                }
+                true
+            }
             is MainAction.SetBottomNavSlot -> {
                 vm.settingsRepository.update { current ->
                     val updatedTabs =

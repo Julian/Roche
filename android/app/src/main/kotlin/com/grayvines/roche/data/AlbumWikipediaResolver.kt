@@ -17,11 +17,11 @@ internal data class WikipediaSearchHit(
 
 internal suspend fun resolveAlbumWikipediaSlug(
     transport: HttpTransport,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): String? {
-    val cleanTitle = stripAlbumEditionSuffix(album.name).trim()
+    val cleanTitle = stripAlbumEditionSuffix(album.title).trim()
     if (cleanTitle.isEmpty()) return null
-    val query = "$cleanTitle ${album.artist} album".trim()
+    val query = "$cleanTitle ${album.creator} album".trim()
     val url = "$WIKIPEDIA_SEARCH_ENDPOINT&srsearch=${encodeQueryValue(query)}"
     val response = runSuspendCatching {
         transport.execute(
@@ -60,11 +60,11 @@ private fun toWikipediaSearchHit(
 
 internal fun selectBestWikipediaSlug(
     hits: List<WikipediaSearchHit>,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): String? {
-    val normTitle = normalizeMatchTokens(album.name)
+    val normTitle = normalizeMatchTokens(album.title)
     if (normTitle.isEmpty() || hits.isEmpty()) return null
-    val normArtist = normalizeMatchTokens(album.artist)
+    val normArtist = normalizeMatchTokens(album.creator)
     val scored =
         hits
             .map { hit -> hit to scoreWikipediaHit(hit, normTitle, normArtist, album.releaseDate) }

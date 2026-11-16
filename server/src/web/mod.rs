@@ -42,11 +42,11 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
 
     let protected = Router::new()
         .route("/logout", post(auth::logout_post::<F>))
-        // Home & 1001 Albums Generator
+        // Home & Active Collection Draws
         .route("/", get(views_home::home_get::<F>))
-        .route("/web/1001/toggle", post(views_home::post_1001_toggle::<F>))
-        .route("/web/1001/finish", post(views_home::post_1001_finish::<F>))
-        .route("/web/1001/abandon", post(views_home::post_1001_abandon::<F>))
+        .route("/web/lists/{slug}/generator/toggle", post(views_home::post_generator_toggle::<F>))
+        .route("/web/lists/{slug}/generator/finish", post(views_home::post_generator_finish::<F>))
+        .route("/web/lists/{slug}/generator/abandon", post(views_home::post_generator_abandon::<F>))
         // Reader, Inbox, Starred, Feeds & Media Streaming
         .route("/inbox", get(views_reader::inbox_get::<F>))
         .route("/starred", get(views_reader::starred_get::<F>))

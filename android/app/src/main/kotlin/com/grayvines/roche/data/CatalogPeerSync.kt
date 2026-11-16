@@ -56,11 +56,7 @@ internal suspend fun hasLocalCatalogSyncData(dao: RocheDao): Boolean {
         return true
     }
     val specIds = specs.map { it.collectionId }.toHashSet()
-    val pool1001Ids =
-        dao.getCollectionMemberships(ALBUMS_1001_COLLECTION_ID).map { it.entryId }.toHashSet()
-    return dao.getAllCatalogEntries().any {
-        it.isLocalDirty || it.id !in specIds && it.id !in pool1001Ids
-    }
+    return dao.getAllCatalogEntries().any { it.isLocalDirty || it.id !in specIds }
 }
 
 private const val TOMBSTONE_COLLECTION_ENTRY = "collection_entry"
@@ -80,14 +76,11 @@ internal suspend fun buildOutgoingCatalogSyncBatch(
     val customSpecs = selectCustomSpecs(tables.specs)
     val (sentSpecs, overflowSpecs) = selectOutgoingSpecs(customSpecs, inclusiveSinceInstant)
     val specIds = tables.specs.map { it.collectionId }.toHashSet()
-    val pool1001Ids = collectPool1001Ids(tables.memberships)
     val slices = selectOutgoingChildSlices(tables, syncedFeedIds, inclusiveSinceInstant)
     val entryFilterCtx =
         buildOutgoingEntryFilterCtx(
-            tables = tables,
             slices = slices,
             specIds = specIds,
-            pool1001Ids = pool1001Ids,
             syncedFeedIds = syncedFeedIds,
             syncedItemIds = syncedItemIds,
             inclusiveSince = inclusiveSinceInstant,
@@ -109,7 +102,6 @@ internal suspend fun buildOutgoingCatalogSyncBatch(
             tables.comparisons,
             tables.generators,
             tables.entries,
-            pool1001Ids,
             specIds,
         )
     return assembleOutgoingCatalogBatch(
@@ -197,7 +189,7 @@ private fun selectOutgoingChildSlices(
     return OutgoingChildSlices(
         sentMemberships = sentMem,
         overflowMemberships = overMem,
-        sentGenerators = selectOutgoingGenerators(tables.generators, inclusiveSince),
+        sentGenerators = selectOutgoingGenerators(tables.generators, specsById, inclusiveSince),
         sentLogs = sentLogs,
         overflowLogs = overLogs,
         sentComparisons = sentComps,
@@ -207,36 +199,24 @@ private fun selectOutgoingChildSlices(
 
 @Suppress("LongParameterList")
 private fun buildOutgoingEntryFilterCtx(
-    tables: OutgoingCatalogTables,
     slices: OutgoingChildSlices,
     specIds: Set<String>,
-    pool1001Ids: Set<String>,
     syncedFeedIds: Set<String>,
     syncedItemIds: Set<String>,
     inclusiveSince: Instant?,
 ): OutgoingEntryFilterContext {
     val outgoingRefs =
-        collectReferencedNonPoolIds(
+        collectReferencedIds(
             allEntries = emptyList(),
             allLogs = slices.sentLogs,
             allGenerators = slices.sentGenerators,
             allMemberships = slices.sentMemberships,
             allComparisons = slices.sentComparisons,
-        ) - pool1001Ids - specIds
-    val allRefs =
-        collectReferencedNonPoolIds(
-            tables.entries,
-            tables.logs,
-            tables.generators,
-            tables.memberships,
-            tables.comparisons,
-        )
+        ) - specIds
     return OutgoingEntryFilterContext(
         specIds = specIds,
         syncedFeedIds = syncedFeedIds,
         syncedItemIds = syncedItemIds,
-        pool1001Ids = pool1001Ids,
-        referencedEntryIds = allRefs,
         outgoingReferencedIds = outgoingRefs,
         inclusiveSince = inclusiveSince,
     )
@@ -261,12 +241,6 @@ private fun selectOutgoingSpecs(
         MAX_SYNC_COLLECTIONS,
     )
 
-private fun collectPool1001Ids(allMemberships: List<CollectionEntryEntity>): Set<String> =
-    allMemberships
-        .filter { it.collectionId == ALBUMS_1001_COLLECTION_ID }
-        .map { it.entryId }
-        .toHashSet()
-
 private suspend fun loadEntryIdentsByEntryId(dao: RocheDao): Map<String, List<EntryIdentifierDto>> =
     dao.getAllEntryIdentifiers()
         .groupBy { it.entryId }
@@ -279,21 +253,18 @@ private fun hasNonSeedCatalogRows(
     allComparisons: List<ComparisonEntity>,
     allGenerators: List<CollectionGeneratorEntity>,
     allEntries: List<CatalogEntryEntity>,
-    pool1001Ids: Set<String>,
     specIds: Set<String>,
 ): Boolean =
     customSpecs.isNotEmpty() ||
         allLogs.isNotEmpty() ||
         allComparisons.isNotEmpty() ||
-        allGenerators.any { it.enabled || !it.currentEntryId.isNullOrBlank() } ||
-        allEntries.any { it.isLocalDirty || it.id !in pool1001Ids && it.id !in specIds }
+        allGenerators.any { it.enabled || !it.currentEntryId.isNullOrBlank() || it.isLocalDirty } ||
+        allEntries.any { it.isLocalDirty || it.id !in specIds }
 
 private data class OutgoingEntryFilterContext(
     val specIds: Set<String>,
     val syncedFeedIds: Set<String>,
     val syncedItemIds: Set<String>,
-    val pool1001Ids: Set<String>,
-    val referencedEntryIds: Set<String>,
     val outgoingReferencedIds: Set<String>,
     val inclusiveSince: Instant?,
 )
@@ -313,7 +284,7 @@ private fun selectCustomSpecs(allSpecs: List<CollectionSpecEntity>): List<Collec
             (role == CollectionRole.LIST || role == CollectionRole.WANT)
     }
 
-private fun collectReferencedNonPoolIds(
+private fun collectReferencedIds(
     allEntries: List<CatalogEntryEntity>,
     allLogs: List<ConsumptionLogEntity>,
     allGenerators: List<CollectionGeneratorEntity>,
@@ -325,9 +296,7 @@ private fun collectReferencedNonPoolIds(
     }
     allLogs.forEach { add(it.entryId) }
     allGenerators.mapNotNullTo(this) { it.currentEntryId }
-    allMemberships
-        .filter { it.collectionId != ALBUMS_1001_COLLECTION_ID }
-        .forEach { add(it.entryId) }
+    allMemberships.forEach { add(it.entryId) }
     allComparisons.forEach { comp ->
         comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
         decodeComparisonOrdering(comp.orderingJson)?.flatten()?.forEach { id ->
@@ -344,11 +313,8 @@ private fun shouldSyncCatalogEntry(
     if (entry.isLocalDirty || !entry.mergedIntoId.isNullOrBlank()) return true
     if (entry.id in ctx.syncedFeedIds || entry.id in ctx.syncedItemIds) return false
     if (entry.id in ctx.outgoingReferencedIds) return true
-    return if (ctx.inclusiveSince != null) {
+    return ctx.inclusiveSince == null ||
         isIsoTimestampAtOrAfter(entry.updatedAt, ctx.inclusiveSince)
-    } else {
-        entry.id !in ctx.pool1001Ids || entry.id in ctx.referencedEntryIds
-    }
 }
 
 private fun selectOutgoingMemberships(
@@ -359,8 +325,7 @@ private fun selectOutgoingMemberships(
 ): List<CollectionEntryEntity> = allMemberships.filter { mem ->
     val role = specsById[mem.collectionId]?.let { CollectionRole.fromWireValue(it.role) }
     val eligibleCollection =
-        mem.collectionId != ALBUMS_1001_COLLECTION_ID &&
-            mem.collectionId != STARRED_COLLECTION_ID &&
+        mem.collectionId != STARRED_COLLECTION_ID &&
             mem.collectionId !in syncedFeedIds &&
             role != CollectionRole.FEED &&
             role != CollectionRole.TAG
@@ -370,15 +335,21 @@ private fun selectOutgoingMemberships(
 
 private fun selectOutgoingGenerators(
     allGenerators: List<CollectionGeneratorEntity>,
+    specsById: Map<String, CollectionSpecEntity>,
     inclusiveSinceInstant: Instant?,
 ): List<CollectionGeneratorEntity> = allGenerators.filter { gen ->
+    val spec = specsById[gen.collectionId]
+    val isManualList =
+        spec != null &&
+            CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
+            CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
     val matchesWindow =
         if (inclusiveSinceInstant == null) {
-            gen.enabled
+            true
         } else {
             isIsoTimestampAtOrAfter(gen.updatedAt, inclusiveSinceInstant)
         }
-    gen.collectionId == ALBUMS_1001_COLLECTION_ID && (gen.isLocalDirty || matchesWindow)
+    isManualList && (gen.isLocalDirty || matchesWindow)
 }
 
 private fun selectOutgoingLogs(
@@ -450,14 +421,6 @@ internal suspend fun reconcileIncomingCatalogSync(
 ) {
     if (catalogStore != null) {
         catalogStore.ensureSystemSeeded()
-        val needsPool =
-            response.collectionGenerators.any {
-                it.collectionId == ALBUMS_1001_COLLECTION_ID &&
-                    (it.enabled || !it.currentEntryId.isNullOrBlank())
-            }
-        if (needsPool) {
-            catalogStore.ensure1001PoolSeeded()
-        }
     }
 
     val nowIso = response.syncTimestamp.ifBlank { nowUtcIso() }
@@ -836,9 +799,10 @@ private suspend fun foldMergedDuplicateInDao(
     repointMergedMembershipsInDao(dao, dupId, canonId, nowIso)
     dao.repointConsumptionLogsToEntry(dupId, canonId)
     repointMergedComparisonsInDao(dao, dupId, canonId)
-    val gen = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
-    if (gen?.currentEntryId == dupId) {
-        dao.upsertCollectionGenerator(gen.copy(currentEntryId = canonId, updatedAt = nowIso))
+    for (gen in dao.getAllCollectionGenerators()) {
+        if (gen.currentEntryId == dupId) {
+            dao.upsertCollectionGenerator(gen.copy(currentEntryId = canonId, updatedAt = nowIso))
+        }
     }
 }
 
@@ -1335,27 +1299,69 @@ private suspend fun mergeIncomingGenerators(
     redirects: Map<String, String>,
     nowIso: String,
 ) {
-    val remoteGen = incoming.firstOrNull { it.collectionId == ALBUMS_1001_COLLECTION_ID }
-    val localGen = dao.getCollectionGenerator(ALBUMS_1001_COLLECTION_ID)
-    if (remoteGen == null && localGen == null) return
+    val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
+    val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
+    val remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects)
+    val candidateIds = (localByColId.keys + remoteByColId.keys).distinct()
+    for (colId in candidateIds) {
+        val merged =
+            reconcileMergedGenerator(
+                dao = dao,
+                catalogStore = catalogStore,
+                colId = colId,
+                localGen = localByColId[colId],
+                remoteGen = remoteByColId[colId],
+                redirects = redirects,
+                nowIso = nowIso,
+            )
+        dao.upsertCollectionGenerator(merged)
+    }
+}
 
-    var base = selectBaseGeneratorEntity(localGen, remoteGen, nowIso)
+private fun indexEligibleRemoteGenerators(
+    incoming: List<PeerCollectionGeneratorPayload>,
+    specsById: Map<String, CollectionSpecEntity>,
+    redirects: Map<String, String>,
+): Map<String, PeerCollectionGeneratorPayload> {
+    val remoteByColId = LinkedHashMap<String, PeerCollectionGeneratorPayload>()
+    for (remote in incoming) {
+        val rawColId = remote.collectionId.trim()
+        if (rawColId.isNotEmpty()) {
+            val resolvedColId = followMergedInMap(rawColId, redirects)
+            val spec = specsById[resolvedColId]
+            val isManualList =
+                spec != null &&
+                    CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
+                    CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
+            if (isManualList) {
+                remoteByColId[resolvedColId] = remote.copy(collectionId = resolvedColId)
+            }
+        }
+    }
+    return remoteByColId
+}
+
+@Suppress("LongParameterList")
+private suspend fun reconcileMergedGenerator(
+    dao: RocheDao,
+    catalogStore: CatalogStore?,
+    colId: String,
+    localGen: CollectionGeneratorEntity?,
+    remoteGen: PeerCollectionGeneratorPayload?,
+    redirects: Map<String, String>,
+    nowIso: String,
+): CollectionGeneratorEntity {
+    var base = selectBaseGeneratorEntity(colId, localGen, remoteGen, nowIso)
     val activeId =
         base.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedInMap(it, redirects) }
     if (activeId != base.currentEntryId) {
         base = base.copy(currentEntryId = activeId)
     }
     if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
-        base =
-            base.copy(
-                currentEntryId = null,
-                updatedAt = nowIso,
-                isLocalDirty = true,
-            )
+        base = base.copy(currentEntryId = null, updatedAt = nowIso, isLocalDirty = true)
     }
     if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
-        catalogStore.ensure1001PoolSeeded()
-        val drawn = catalogStore.drawRandomRemaining1001Id()
+        val drawn = catalogStore.drawRandomRemainingId(colId)
         base =
             base.copy(
                 currentEntryId = drawn,
@@ -1364,17 +1370,18 @@ private suspend fun mergeIncomingGenerators(
                 isLocalDirty = true,
             )
     }
-    dao.upsertCollectionGenerator(base)
+    return base
 }
 
 private fun selectBaseGeneratorEntity(
+    collectionId: String,
     localGen: CollectionGeneratorEntity?,
     remoteGen: PeerCollectionGeneratorPayload?,
     nowIso: String,
 ): CollectionGeneratorEntity {
     if (remoteGen != null && shouldPreferRemoteGenerator(localGen, remoteGen)) {
         return CollectionGeneratorEntity(
-            collectionId = ALBUMS_1001_COLLECTION_ID,
+            collectionId = collectionId,
             enabled = remoteGen.enabled,
             currentEntryId = remoteGen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() },
             drawnAt = remoteGen.drawnAt,
@@ -1384,7 +1391,7 @@ private fun selectBaseGeneratorEntity(
     }
     return localGen
         ?: CollectionGeneratorEntity(
-            collectionId = ALBUMS_1001_COLLECTION_ID,
+            collectionId = collectionId,
             enabled = false,
             currentEntryId = null,
             drawnAt = null,

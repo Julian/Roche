@@ -120,6 +120,7 @@ internal constructor(
             prefs[KEY_DEFAULT_PLAYBACK_SPEED] = updated.defaultPlaybackSpeed
             prefs[KEY_SKIP_SILENCE_ENABLED] = updated.skipSilenceEnabled
             prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
+            prefs[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] = updated.showCollectionDrawsOnHome
             latestSettings = updated
         }
     }
@@ -206,6 +207,7 @@ internal constructor(
                     this[KEY_DEFAULT_PLAYBACK_SPEED] ?: Settings.DEFAULT_PLAYBACK_SPEED,
                 skipSilenceEnabled = this[KEY_SKIP_SILENCE_ENABLED] ?: false,
                 smartRewindEnabled = this[KEY_SMART_REWIND_ENABLED] ?: true,
+                showCollectionDrawsOnHome = this[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] ?: true,
                 hasUndecryptableToken = rawStoredToken.isNotEmpty() && decodedToken.isEmpty(),
             )
             .clamped()
@@ -228,6 +230,8 @@ internal constructor(
         internal val KEY_DEFAULT_PLAYBACK_SPEED = floatPreferencesKey("default_playback_speed")
         internal val KEY_SKIP_SILENCE_ENABLED = booleanPreferencesKey("skip_silence_enabled")
         internal val KEY_SMART_REWIND_ENABLED = booleanPreferencesKey("smart_rewind_enabled")
+        internal val KEY_SHOW_COLLECTION_DRAWS_ON_HOME =
+            booleanPreferencesKey("show_collection_draws_on_home")
 
         fun create(context: Context): SettingsRepository {
             val appContext = context.applicationContext

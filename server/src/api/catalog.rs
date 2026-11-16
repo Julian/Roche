@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     db::{
-        CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter, CollectionRole,
-        CollectionSummary, ComparisonRecord, ConsumptionLogView, ConsumptionStatus,
-        EntryDetailView, EntryKind, Generator1001State, RankedCollectionView, UpsertEntryInput,
+        CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter,
+        CollectionGeneratorState, CollectionRole, CollectionSummary, ComparisonRecord,
+        ConsumptionLogView, ConsumptionStatus, EntryDetailView, EntryKind, RankedCollectionView,
+        UpsertEntryInput,
     },
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
     ranking::Score,
@@ -139,10 +140,16 @@ pub(super) struct GeneratorAdvanceRequest {
     notes: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct GeneratorsListQuery {
+    #[serde(default)]
+    enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct GeneratorAdvanceResponse {
     completed_entry: CatalogEntry,
-    generator: Generator1001State,
+    generator: CollectionGeneratorState,
 }
 
 pub(super) async fn catalog_lists<F: FeedFetcher>(
@@ -336,38 +343,63 @@ pub(super) async fn catalog_batch_apply<F: FeedFetcher>(
     Ok(Json(result))
 }
 
-pub(super) async fn catalog_generator_1001_get<F: FeedFetcher>(
+pub(super) async fn catalog_generators_list<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
-) -> Result<Json<Generator1001State>, ApiError> {
-    let state = service.catalog().get_1001_generator_state().await?;
+    ProblemQuery(q): ProblemQuery<GeneratorsListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let generators = service.catalog().list_collection_generators(q.enabled).await?;
+    Ok(Json(serde_json::json!({ "generators": generators })))
+}
+
+pub(super) async fn catalog_list_generator_get<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    ProblemPath(slug_or_id): ProblemPath<String>,
+) -> Result<Json<CollectionGeneratorState>, ApiError> {
+    let state = service.catalog().get_collection_generator(&slug_or_id).await?;
     Ok(Json(state))
 }
 
-pub(super) async fn catalog_generator_1001_patch<F: FeedFetcher>(
+pub(super) async fn catalog_list_generator_patch<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
+    ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorUpdateRequest>,
-) -> Result<Json<Generator1001State>, ApiError> {
+) -> Result<Json<CollectionGeneratorState>, ApiError> {
     let state = service
         .catalog()
-        .update_1001_generator(req.enabled, req.current_entry_id.as_deref(), req.drawn_at)
+        .update_collection_generator(
+            &slug_or_id,
+            req.enabled,
+            req.current_entry_id.as_deref(),
+            req.drawn_at,
+        )
         .await?;
     Ok(Json(state))
 }
 
-pub(super) async fn catalog_generator_1001_finish<F: FeedFetcher>(
+pub(super) async fn catalog_list_generator_delete<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
+    ProblemPath(slug_or_id): ProblemPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let _ = service.catalog().remove_collection_generator(&slug_or_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn catalog_list_generator_finish<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorAdvanceRequest>,
 ) -> Result<Json<GeneratorAdvanceResponse>, ApiError> {
     let (completed_entry, generator) =
-        service.catalog().finish_active_1001_album(req.notes.as_deref()).await?;
+        service.catalog().finish_active_generator_entry(&slug_or_id, req.notes.as_deref()).await?;
     Ok(Json(GeneratorAdvanceResponse { completed_entry, generator }))
 }
 
-pub(super) async fn catalog_generator_1001_abandon<F: FeedFetcher>(
+pub(super) async fn catalog_list_generator_abandon<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
+    ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorAdvanceRequest>,
 ) -> Result<Json<GeneratorAdvanceResponse>, ApiError> {
     let (completed_entry, generator) =
-        service.catalog().abandon_active_1001_album(req.notes.as_deref()).await?;
+        service.catalog().abandon_active_generator_entry(&slug_or_id, req.notes.as_deref()).await?;
     Ok(Json(GeneratorAdvanceResponse { completed_entry, generator }))
 }

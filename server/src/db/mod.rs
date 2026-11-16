@@ -16,14 +16,15 @@ mod types;
 
 pub use auth::{AuthRepo, DeviceToken};
 pub use catalog::{
-    BatchComparisonInput, BatchEntryInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
-    CatalogEntry, CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionSummary,
-    ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule,
-    EntryDetailView, EntryIdentifier, Generator1001State, Generator1001UpdateInput,
-    PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
-    choose_deterministic_entry_id, external_identifier_label, external_identifier_url,
-    matches_dynamic_collection_rule, normalize_identifier_scheme, normalize_identifier_value,
-    parse_dynamic_collection_rule, strip_album_edition_suffix,
+    BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
+    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
+    CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionGeneratorState,
+    CollectionSummary, ComparisonRecord, ConsumptionLogRow, ConsumptionLogView,
+    DynamicCollectionRule, EntryDetailView, EntryIdentifier, PREFERRED_IDENTIFIER_SCHEMES,
+    RankedCollectionView, RankedEntryRow, UpsertEntryInput, choose_deterministic_entry_id,
+    external_identifier_label, external_identifier_url, matches_dynamic_collection_rule,
+    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
+    strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
@@ -31,12 +32,11 @@ pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo, NewMediaSpec};
 pub use sync::{
-    ALBUMS_1001_COLLECTION_ID, ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier,
-    PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID, SyncRepo,
-    UP_NEXT_COLLECTION_ID, canonical_ordering_json, canonicalize_sync_url,
-    collection_entry_natural_key, compute_throughput_weight, deterministic_comparison_id,
-    deterministic_consumption_log_id, deterministic_system_collection_id,
-    deterministic_title_entry_id, should_peer_poll_feed,
+    ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier, PeerSyncRequest, PeerSyncResponse,
+    SERVER_PEER_ID, STARRED_COLLECTION_ID, SyncRepo, UP_NEXT_COLLECTION_ID,
+    canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
+    compute_throughput_weight, deterministic_comparison_id, deterministic_consumption_log_id,
+    deterministic_system_collection_id, deterministic_title_entry_id, should_peer_poll_feed,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{

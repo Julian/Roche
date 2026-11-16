@@ -375,7 +375,6 @@ internal fun HomeWidgetsCardSection(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
 ) {
-    val gen = state.albumGenerator
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Home Widgets")
         RocheSurfaceCard {
@@ -384,39 +383,42 @@ internal fun HomeWidgetsCardSection(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 SettingToggleRow(
-                    title = "1001 Albums Generator",
-                    subtitle =
-                        "Draw from the bundled 1001 Albums pool on Home. Advances only when you finish & rank or abandon the active album.",
-                    checked = gen.enabled,
-                    onCheckedChange = { onAction(MainAction.SetAlbumGeneratorEnabled(it)) },
-                    modifier = Modifier.testTag("albums_generator_toggle"),
+                    title = "Active List Draws",
+                    subtitle = "Show active random draws from generator-enabled lists on Home.",
+                    checked = state.settings.showCollectionDrawsOnHome,
+                    onCheckedChange = { onAction(MainAction.SetShowCollectionDrawsOnHome(it)) },
+                    modifier = Modifier.testTag("collection_draws_home_toggle"),
                 )
-                HomeWidgetDailyAlbumStatusLine(state = state)
+                HomeDrawsStatusLines(state = state)
             }
         }
     }
 }
 
 @Composable
-internal fun HomeWidgetDailyAlbumStatusLine(state: MainUiState) {
-    val gen = state.albumGenerator
-    if (!gen.enabled) return
+internal fun HomeDrawsStatusLines(state: MainUiState) {
+    val enabled = state.enabledGenerators
+    if (!state.settings.showCollectionDrawsOnHome || enabled.isEmpty()) return
     val colors = LocalRocheColors.current
-    val album = gen.currentAlbum
-    val summary =
-        if (album != null) {
-            "Active (${gen.completedCount}/${gen.totalCount}): ${album.name} — ${album.artist}"
-        } else {
-            "Pool complete (${gen.completedCount}/${gen.totalCount})"
-        }
-    Text(
-        text = summary,
-        color = colors.textSecondary,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 11.5.sp,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-    )
+    enabled.forEach { gen ->
+        val draw = gen.currentDraw
+        val summary =
+            if (draw != null) {
+                val byPart = draw.creator.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
+                "${gen.collectionTitle} (${gen.completedCount}/${gen.totalCount}): " +
+                    "${draw.title}$byPart"
+            } else {
+                "${gen.collectionTitle}: pool complete (${gen.completedCount}/${gen.totalCount})"
+            }
+        Text(
+            text = summary,
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 @Composable

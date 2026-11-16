@@ -52,8 +52,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
+import com.grayvines.roche.data.CollectionGeneratorState
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
@@ -81,8 +81,12 @@ fun HomeTabContent(
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
     onOpenExternalUrl: (String) -> Unit = {},
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = { album ->
-        onOpenExternalUrl(album.youtubeMusicUrl)
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
+        val fallback =
+            if (draw.isMusicKind) draw.youtubeMusicUrl else draw.primaryExternalUrl.orEmpty()
+        if (fallback.isNotBlank()) {
+            onOpenExternalUrl(fallback)
+        }
     },
 ) {
     val colors = LocalRocheColors.current
@@ -123,7 +127,7 @@ fun HomeTabContent(
                 isBentoTwoColumn = isBentoTwoColumn,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
-                onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                onOpenCollectionDraw = onOpenCollectionDraw,
             )
         }
     }
@@ -137,9 +141,10 @@ internal fun HomeScrollableGrid(
     isBentoTwoColumn: Boolean,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
-    val hasDailyAlbum = state.albumGenerator.enabled
+    val activeDraws = state.activeCollectionDraws
+    val hasActiveDraws = activeDraws.isNotEmpty()
     Column(
         modifier =
             Modifier.fillMaxSize()
@@ -151,37 +156,38 @@ internal fun HomeScrollableGrid(
             isWideLayout -> {
                 HomeWideTwoColumnDashboard(
                     state = state,
-                    hasDailyAlbum = hasDailyAlbum,
+                    activeDraws = activeDraws,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             }
-            hasDailyAlbum && isBentoTwoColumn -> {
+            hasActiveDraws && isBentoTwoColumn -> {
                 HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
                 HomeBentoTwoColumnRow(
                     state = state,
+                    activeDraws = activeDraws,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
                 )
                 HomeMediaCompanionWidget(state = state, onAction = onAction)
             }
             else -> {
                 HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
-                if (hasDailyAlbum) {
-                    HomeDailyAlbumWidget(
-                        state = state,
+                activeDraws.forEach { gen ->
+                    HomeCollectionDrawWidget(
+                        generator = gen,
                         onAction = onAction,
                         onOpenExternalUrl = onOpenExternalUrl,
-                        onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                        onOpenCollectionDraw = onOpenCollectionDraw,
                     )
                 }
                 HomeMediaCompanionWidget(state = state, onAction = onAction)
                 HomeActiveSourcesWidget(
                     state = state,
                     onAction = onAction,
-                    splitColumnsWhenUnconfigured = !hasDailyAlbum && isBentoTwoColumn,
+                    splitColumnsWhenUnconfigured = !hasActiveDraws && isBentoTwoColumn,
                 )
             }
         }
@@ -192,22 +198,29 @@ internal fun HomeScrollableGrid(
 @Composable
 internal fun HomeBentoTwoColumnRow(
     state: MainUiState,
+    activeDraws: List<CollectionGeneratorState>,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        HomeDailyAlbumWidget(
-            state = state,
-            onAction = onAction,
-            onOpenExternalUrl = onOpenExternalUrl,
-            onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+        Column(
             modifier = Modifier.weight(1f),
-        )
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            activeDraws.forEach { gen ->
+                HomeCollectionDrawWidget(
+                    generator = gen,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
+                )
+            }
+        }
         HomeActiveSourcesWidget(
             state = state,
             onAction = onAction,
@@ -220,11 +233,12 @@ internal fun HomeBentoTwoColumnRow(
 @Composable
 internal fun HomeWideTwoColumnDashboard(
     state: MainUiState,
-    hasDailyAlbum: Boolean,
+    activeDraws: List<CollectionGeneratorState>,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
+    val hasActiveDraws = activeDraws.isNotEmpty()
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -236,7 +250,7 @@ internal fun HomeWideTwoColumnDashboard(
         ) {
             HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = true)
             HomeMediaCompanionWidget(state = state, onAction = onAction)
-            if (hasDailyAlbum) {
+            if (hasActiveDraws) {
                 HomeActiveSourcesWidget(
                     state = state,
                     onAction = onAction,
@@ -248,13 +262,15 @@ internal fun HomeWideTwoColumnDashboard(
             modifier = Modifier.weight(0.88f),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (hasDailyAlbum) {
-                HomeDailyAlbumWidget(
-                    state = state,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
-                )
+            if (hasActiveDraws) {
+                activeDraws.forEach { gen ->
+                    HomeCollectionDrawWidget(
+                        generator = gen,
+                        onAction = onAction,
+                        onOpenExternalUrl = onOpenExternalUrl,
+                        onOpenCollectionDraw = onOpenCollectionDraw,
+                    )
+                }
             } else {
                 HomeActiveSourcesWidget(
                     state = state,
@@ -267,39 +283,40 @@ internal fun HomeWideTwoColumnDashboard(
 }
 
 @Composable
-internal fun HomeDailyAlbumWidget(
-    state: MainUiState,
+internal fun HomeCollectionDrawWidget(
+    generator: CollectionGeneratorState,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val album = state.dailyAlbum
-    val open1001List = {
-        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, ALBUMS_1001_COLLECTION_ID))
+    val draw = generator.currentDraw
+    val openCollectionList = {
+        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, generator.collectionId))
     }
     Column(
-        modifier = modifier.fillMaxWidth().testTag("home_widget_daily_album"),
+        modifier = modifier.fillMaxWidth().testTag("home_widget_collection_draw"),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         RocheSectionHeader(
-            label = "1001 Albums",
+            label = generator.collectionTitle,
             actionLabel = "Open List →",
-            actionTestTag = "daily_album_header_open_list_btn",
-            onActionClick = open1001List,
+            actionTestTag = "collection_draw_header_open_list_btn",
+            onActionClick = openCollectionList,
         )
         RocheSurfaceCard {
-            if (album != null) {
-                DailyAlbumSleeveCardBody(
-                    album = album,
+            if (draw != null) {
+                CollectionDrawSleeveCardBody(
+                    draw = draw,
                     onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             } else {
-                DailyAlbumPlaceholderBody(
-                    completedCount = state.albumGenerator.completedCount,
-                    totalCount = state.albumGenerator.totalCount,
-                    onOpenAlbumsList = open1001List,
+                CollectionDrawPlaceholderBody(
+                    collectionTitle = generator.collectionTitle,
+                    completedCount = generator.completedCount,
+                    totalCount = generator.totalCount,
+                    onOpenList = openCollectionList,
                 )
             }
         }
@@ -307,10 +324,10 @@ internal fun HomeDailyAlbumWidget(
 }
 
 @Composable
-internal fun DailyAlbumSleeveCardBody(
-    album: DailyAlbumSnapshot,
+internal fun CollectionDrawSleeveCardBody(
+    draw: CollectionDrawSnapshot,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily =
@@ -320,23 +337,23 @@ internal fun DailyAlbumSleeveCardBody(
             FontFamily.SansSerif
         }
 
-    DailyAlbumSquareCover(
-        album = album,
-        onClick = { onOpenDailyAlbumInMusicApp(album) },
+    CollectionDrawSquareCover(
+        draw = draw,
+        onClick = { onOpenCollectionDraw(draw) },
     )
     HorizontalDivider(color = colors.border, thickness = 1.dp)
     Column(
         modifier =
             Modifier.fillMaxWidth()
-                .clickable { onOpenDailyAlbumInMusicApp(album) }
-                .testTag("daily_album_meta")
+                .clickable { onOpenCollectionDraw(draw) }
+                .testTag("collection_draw_meta")
                 .padding(horizontal = 12.dp, vertical = 11.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        val genreKicker = remember(album.genres) { buildDailyAlbumGenreKicker(album) }
-        if (genreKicker.isNotEmpty()) {
+        val tagKicker = remember(draw.tags) { buildCollectionDrawTagKicker(draw) }
+        if (tagKicker.isNotEmpty()) {
             Text(
-                text = genreKicker,
+                text = tagKicker,
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 9.5.sp,
@@ -346,7 +363,7 @@ internal fun DailyAlbumSleeveCardBody(
             )
         }
         Text(
-            text = album.name,
+            text = draw.title,
             color = colors.textPrimary,
             fontFamily = headlineFamily,
             fontSize = 16.sp,
@@ -355,23 +372,25 @@ internal fun DailyAlbumSleeveCardBody(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
-        Text(
-            text = album.artist,
-            color = colors.textSecondary,
-            fontSize = 12.5.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        DailyAlbumWikiButton(
-            wikiUrl = album.wikipediaUrl,
+        if (draw.creator.isNotBlank()) {
+            Text(
+                text = draw.creator,
+                color = colors.textSecondary,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        CollectionDrawWikiButton(
+            wikiUrl = draw.wikipediaUrl,
             onOpenExternalUrl = onOpenExternalUrl,
         )
     }
 }
 
 @Composable
-private fun DailyAlbumWikiButton(
+private fun CollectionDrawWikiButton(
     wikiUrl: String?,
     onOpenExternalUrl: (String) -> Unit,
 ) {
@@ -380,22 +399,23 @@ private fun DailyAlbumWikiButton(
     CompactCardActionButton(
         label = "Wiki ↗",
         onClick = { onOpenExternalUrl(wikiUrl) },
-        modifier = Modifier.fillMaxWidth().testTag("daily_album_wiki_btn"),
+        modifier = Modifier.fillMaxWidth().testTag("collection_draw_wiki_btn"),
     )
 }
 
 @Composable
-internal fun DailyAlbumSquareCover(
-    album: DailyAlbumSnapshot,
+internal fun CollectionDrawSquareCover(
+    draw: CollectionDrawSnapshot,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val bitmap =
         rememberHighResImageBitmap(
-            primaryKey = album.imageUrl,
-            fallbackKey = album.thumbnailUrl,
+            primaryKey = draw.imageUrl,
+            fallbackKey = draw.thumbnailUrl,
         )
-    val sleeveBadge = remember(album) { buildDailyAlbumSleeveBadge(album) }
+    val sleeveBadge = remember(draw) { buildCollectionDrawSleeveBadge(draw) }
+    val desc = if (draw.creator.isNotBlank()) "${draw.title} by ${draw.creator}" else draw.title
 
     Box(
         modifier =
@@ -403,12 +423,12 @@ internal fun DailyAlbumSquareCover(
                 .aspectRatio(1f)
                 .background(colors.surfaceElevated)
                 .clickable(onClick = onClick)
-                .testTag("daily_album_cover")
+                .testTag("collection_draw_cover")
     ) {
         if (bitmap != null) {
             Image(
                 bitmap = bitmap,
-                contentDescription = "${album.name} by ${album.artist}",
+                contentDescription = desc,
                 contentScale = ContentScale.Crop,
                 filterQuality = FilterQuality.Medium,
                 modifier = Modifier.fillMaxSize(),
@@ -424,9 +444,9 @@ internal fun DailyAlbumSquareCover(
                 modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
             )
         }
-        if (album.remainingCount > 0) {
+        if (draw.remainingCount > 0) {
             AlbumCoverFloatingPill(
-                label = "${album.remainingCount} LEFT",
+                label = "${draw.remainingCount} LEFT",
                 textColor = Color(0xFFD4B483),
                 modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
             )
@@ -568,27 +588,28 @@ internal fun CompactCardActionButton(
     }
 }
 
-internal fun buildDailyAlbumSleeveBadge(album: DailyAlbumSnapshot): String = buildList {
-    if (album.albumNumber > 0) add("#${album.albumNumber}")
-    if (album.releaseDate.isNotBlank()) add(album.releaseDate)
+internal fun buildCollectionDrawSleeveBadge(draw: CollectionDrawSnapshot): String = buildList {
+    if (draw.drawNumber > 0) add("#${draw.drawNumber}")
+    if (draw.releaseDate.isNotBlank()) add(draw.releaseDate)
 }
     .joinToString(" · ")
 
-internal fun buildDailyAlbumGenreKicker(album: DailyAlbumSnapshot): String =
-    album.genres.joinToString(" / ") { it.uppercase() }
+internal fun buildCollectionDrawTagKicker(draw: CollectionDrawSnapshot): String =
+    draw.tags.joinToString(" / ") { it.uppercase() }
 
 @Composable
-internal fun DailyAlbumPlaceholderBody(
+internal fun CollectionDrawPlaceholderBody(
+    collectionTitle: String,
     completedCount: Int,
     totalCount: Int,
-    onOpenAlbumsList: () -> Unit,
+    onOpenList: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val statusText =
         if (totalCount > 0 && completedCount >= totalCount) {
-            "All $totalCount albums in 1001 Albums completed!"
+            "All $totalCount entries in $collectionTitle completed!"
         } else {
-            "Preparing 1001 Albums pool…"
+            "Add unconsumed entries to $collectionTitle to draw your next item."
         }
     Box(modifier = Modifier.fillMaxWidth().aspectRatio(1.35f).background(colors.surfaceElevated)) {
         Canvas(modifier = Modifier.fillMaxSize()) { drawVinylSleeveArtwork(colors) }
@@ -605,10 +626,10 @@ internal fun DailyAlbumPlaceholderBody(
             lineHeight = 17.sp,
         )
         CompactCardActionButton(
-            label = "View Ranked Albums",
+            label = "View List",
             style = RocheButtonStyle.PRIMARY,
-            onClick = onOpenAlbumsList,
-            modifier = Modifier.fillMaxWidth().testTag("daily_album_view_list_btn"),
+            onClick = onOpenList,
+            modifier = Modifier.fillMaxWidth().testTag("collection_draw_view_list_btn"),
         )
     }
 }
@@ -653,7 +674,7 @@ internal fun HomeMediaCompanionWidget(
                     )
                 }
                 CompanionShortcutChips(
-                    show1001Shortcut = state.albumGenerator.enabled,
+                    enabledGenerators = state.enabledGenerators,
                     onAction = onAction,
                 )
             }
@@ -664,7 +685,7 @@ internal fun HomeMediaCompanionWidget(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CompanionShortcutChips(
-    show1001Shortcut: Boolean,
+    enabledGenerators: List<CollectionGeneratorState>,
     onAction: (MainAction) -> Unit,
 ) {
     FlowRow(
@@ -677,19 +698,16 @@ private fun CompanionShortcutChips(
             onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS)) },
             modifier = Modifier.testTag("home_open_lists_btn"),
         )
-        if (show1001Shortcut) {
+        enabledGenerators.forEach { gen ->
             FilterChipPill(
-                label = "1001 Albums",
+                label = gen.collectionTitle,
                 selected = false,
                 onClick = {
                     onAction(
-                        MainAction.OpenCompanionSection(
-                            CompanionSubTab.LISTS,
-                            ALBUMS_1001_COLLECTION_ID,
-                        )
+                        MainAction.OpenCompanionSection(CompanionSubTab.LISTS, gen.collectionId)
                     )
                 },
-                modifier = Modifier.testTag("home_open_1001_list_btn"),
+                modifier = Modifier.testTag("home_open_draw_list_${gen.collectionSlug}"),
             )
         }
         FilterChipPill(

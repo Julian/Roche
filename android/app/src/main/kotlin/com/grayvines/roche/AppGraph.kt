@@ -64,9 +64,6 @@ class AppGraph(context: Context) : AutoCloseable {
             cacheDir = offlineCacheDir,
             networkTierProvider = networkTierProvider,
             backgroundScope = appScope,
-            poolStreamProvider = {
-                runCatching { appContext.assets.open("albums_1001_pool.json") }.getOrNull()
-            },
             albumStreamingResolver = AlbumStreamingResolver(httpTransport),
         )
     }

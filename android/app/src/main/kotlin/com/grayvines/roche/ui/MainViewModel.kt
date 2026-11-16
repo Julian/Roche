@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
+import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
@@ -119,17 +120,23 @@ class MainViewModel(
         }
         playerController.setUiErrorListener(uiErrorListener)
         observeActiveEpisodeNotes()
-        observeActiveDailyAlbum()
+        observeActiveCollectionDraws()
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
 
-    private fun observeActiveDailyAlbum() {
+    private fun observeActiveCollectionDraws() {
         viewModelScope.launch {
             repository.snapshot
-                .map { it.catalog.albumGenerator.currentAlbum }
+                .map { snap ->
+                    snap.catalog.generators
+                        .filter { it.enabled }
+                        .mapNotNull { it.currentDraw }
+                        .filter { it.kind == EntryKind.ALBUM }
+                }
                 .distinctUntilChanged()
-                .filterNotNull()
-                .collect { album -> repository.prewarmDailyAlbumStreaming(album) }
+                .collect { draws ->
+                    draws.forEach { draw -> repository.prewarmCollectionDraw(draw) }
+                }
         }
     }
 

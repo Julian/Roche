@@ -239,7 +239,7 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
 
     let mut forged_post = Request::builder()
         .method("POST")
-        .uri("/web/1001/toggle")
+        .uri("/web/lists/test_list/generator/toggle")
         .header("Tailscale-User-Login", "reader@example.ts.net")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from("enabled=true"))
@@ -270,23 +270,56 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
     );
 }
 
+async fn seed_album_queue_pool(db: &crate::db::Db) {
+    let pool = db
+        .catalog()
+        .create_manual_collection(
+            "Album Queue",
+            Some("album_queue"),
+            crate::db::CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for (pos, title) in
+        [(1.0, "Kind of Blue"), (2.0, "Time Out"), (3.0, "Mingus Ah Um"), (4.0, "Blue Train")]
+    {
+        db.catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(crate::db::EntryKind::Album),
+                title: title.to_owned(),
+                parent_collection_id: Some(pool.id.clone()),
+                parent_position: Some(pos),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
-async fn test_web_1001_albums_finish_rank_and_abandon_flows() {
+async fn test_web_collection_generator_finish_rank_and_abandon_flows() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
+    seed_album_queue_pool(&db).await;
 
-    let toggle_resp =
-        post_form(&app, "/web/1001/toggle", &cookie, &[("_csrf", &csrf), ("enabled", "true")])
-            .await;
+    let toggle_resp = post_form(
+        &app,
+        "/web/lists/album_queue/generator/toggle",
+        &cookie,
+        &[("_csrf", &csrf), ("enabled", "true")],
+    )
+    .await;
     assert_eq!(toggle_resp.status(), StatusCode::SEE_OTHER);
 
-    let state1 = db.catalog().get_1001_generator_state().await.unwrap();
+    let state1 = db.catalog().get_collection_generator("album_queue").await.unwrap();
     assert!(state1.enabled);
     let first_id = state1.current_entry.as_ref().unwrap().id.clone();
 
     let finish1_resp = post_form(
         &app,
-        "/web/1001/finish",
+        "/web/lists/album_queue/generator/finish",
         &cookie,
         &[("_csrf", &csrf), ("notes", "Great opener <script>xss()</script>")],
     )
@@ -302,20 +335,22 @@ async fn test_web_1001_albums_finish_rank_and_abandon_flows() {
             .starts_with("/?notice=")
     );
 
-    let state2 = db.catalog().get_1001_generator_state().await.unwrap();
+    let state2 = db.catalog().get_collection_generator("album_queue").await.unwrap();
     let second_id = state2.current_entry.as_ref().unwrap().id.clone();
     assert_ne!(first_id, second_id);
     assert_eq!(state2.consumed_count, 1);
 
-    let finish2_resp = post_form(&app, "/web/1001/finish", &cookie, &[("_csrf", &csrf)]).await;
+    let finish2_resp =
+        post_form(&app, "/web/lists/album_queue/generator/finish", &cookie, &[("_csrf", &csrf)])
+            .await;
     assert_eq!(finish2_resp.status(), StatusCode::SEE_OTHER);
     let loc2 = finish2_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-    assert!(loc2.starts_with(&format!("/rank/albums?focus={second_id}")), "got: {loc2}");
+    assert!(loc2.starts_with(&format!("/rank/album_queue?focus={second_id}")), "got: {loc2}");
 
     let ord_json = serde_json::to_string(&vec![vec![&second_id], vec![&first_id]]).unwrap();
     let rank_post_resp = post_form(
         &app,
-        "/rank/albums",
+        "/rank/album_queue",
         &cookie,
         &[
             ("_csrf", &csrf),
@@ -328,20 +363,27 @@ async fn test_web_1001_albums_finish_rank_and_abandon_flows() {
     .await;
     assert_eq!(rank_post_resp.status(), StatusCode::SEE_OTHER);
 
-    let ranked_albums = db.catalog().get_ranked_collection("1001-albums", false).await.unwrap();
+    let ranked_albums = db.catalog().get_ranked_collection("album-queue", false).await.unwrap();
     assert_eq!(ranked_albums.rows.len(), 2);
     assert_eq!(ranked_albums.rows[0].entry.id, second_id);
 
-    let third_id = db.catalog().get_1001_generator_state().await.unwrap().current_entry.unwrap().id;
+    let third_id = db
+        .catalog()
+        .get_collection_generator("album_queue")
+        .await
+        .unwrap()
+        .current_entry
+        .unwrap()
+        .id;
     let abandon_resp = post_form(
         &app,
-        "/web/1001/abandon",
+        "/web/lists/album_queue/generator/abandon",
         &cookie,
         &[("_csrf", &csrf), ("notes", "Not my style")],
     )
     .await;
     assert_eq!(abandon_resp.status(), StatusCode::SEE_OTHER);
-    let state4 = db.catalog().get_1001_generator_state().await.unwrap();
+    let state4 = db.catalog().get_collection_generator("album_queue").await.unwrap();
     assert_eq!(state4.consumed_count, 2);
     assert_eq!(state4.abandoned_count, 1);
     assert_ne!(state4.current_entry.as_ref().unwrap().id, third_id);

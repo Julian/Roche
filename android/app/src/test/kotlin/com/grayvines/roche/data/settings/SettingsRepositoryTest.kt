@@ -6,7 +6,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
 import com.grayvines.roche.MusicUrlCandidate
 import com.grayvines.roche.MusicUrlResolution
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.candidateStreamingUrls
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
@@ -304,17 +304,20 @@ class SettingsRepositoryTest {
         }
 
     @Test
-    fun `DailyAlbumSnapshot resolves vendor-neutral candidate streaming URLs`() {
+    fun `CollectionDrawSnapshot resolves vendor-neutral candidate streaming URLs`() {
         val parsed =
-            DailyAlbumSnapshot(
+            CollectionDrawSnapshot(
+                collectionId = "col-jazz",
+                collectionSlug = "jazz_canon",
+                collectionTitle = "Jazz Canon",
                 entryId = "album-entry-1",
-                name = "Sample Album",
-                artist = "Sample Artist",
+                title = "Sample Album",
+                creator = "Sample Artist",
                 releaseDate = "1972",
                 imageUrl = "https://i.scdn.co/image/large",
                 thumbnailUrl = "https://i.scdn.co/image/medium",
-                genres = listOf("rock", "folk rock"),
-                albumNumber = 3,
+                tags = listOf("rock", "folk rock"),
+                drawNumber = 3,
                 totalCount = 1101,
                 remainingCount = 1099,
                 youtubeMusicId = "OLAK5uy_sample_playlist",

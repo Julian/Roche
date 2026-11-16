@@ -45,8 +45,9 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
-import com.grayvines.roche.data.DailyAlbumSnapshot
+import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon
@@ -67,8 +68,8 @@ fun MainScreen(
     modifier: Modifier = Modifier,
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = { album ->
-        onOpenExternalUrl(album.youtubeMusicUrl)
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
+        openCollectionDrawFallback(draw, onOpenExternalUrl)
     },
 ) {
     val colors = LocalRocheColors.current
@@ -105,7 +106,7 @@ fun MainScreen(
     val currentOnOpenExternalUrl by rememberUpdatedState(onOpenExternalUrl)
     val currentOnImportOpml by rememberUpdatedState(onImportOpml)
     val currentOnExportOpml by rememberUpdatedState(onExportOpml)
-    val currentOnOpenDailyAlbum by rememberUpdatedState(onOpenDailyAlbumInMusicApp)
+    val currentOnOpenCollectionDraw by rememberUpdatedState(onOpenCollectionDraw)
     val activeFullscreenPlayerEntryId =
         activePlayerEntry?.id?.takeIf { state.playerState.isFullscreenOpen }
     val desiredBackStack =
@@ -158,7 +159,7 @@ fun MainScreen(
                                 scrollStates = scrollStates,
                                 onAction = currentOnAction,
                                 onOpenExternalUrl = currentOnOpenExternalUrl,
-                                onOpenDailyAlbumInMusicApp = currentOnOpenDailyAlbum,
+                                onOpenCollectionDraw = currentOnOpenCollectionDraw,
                                 onImportOpml = currentOnImportOpml,
                                 onExportOpml = currentOnExportOpml,
                             )
@@ -425,11 +426,11 @@ internal fun MainOverlaySheets(
         )
     }
 
-    val albumDialogMode = state.albumNoteDialogMode
-    if (albumDialogMode != null) {
-        AlbumNoteModalSheet(
-            album = state.dailyAlbum,
-            mode = albumDialogMode,
+    val drawDialog = state.drawNoteDialog
+    if (drawDialog != null) {
+        CollectionDrawNoteModalSheet(
+            dialog = drawDialog,
+            generator = state.catalog.generatorFor(drawDialog.collectionId),
             onAction = onAction,
         )
     }
@@ -717,7 +718,7 @@ internal fun MainTabDestinationContent(
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
     onImportOpml: () -> Unit,
     onExportOpml: () -> Unit,
 ) {
@@ -728,7 +729,7 @@ internal fun MainTabDestinationContent(
                 onAction = onAction,
                 scrollState = scrollStates.scrollState("home"),
                 onOpenExternalUrl = onOpenExternalUrl,
-                onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                onOpenCollectionDraw = onOpenCollectionDraw,
             )
         AppTab.INBOX ->
             UnscopedInboxTabDestination(
@@ -766,7 +767,7 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 listState = scrollStates.lazyListState(companionScrollKey(state)),
-                onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                onOpenCollectionDraw = onOpenCollectionDraw,
             )
         AppTab.SETTINGS ->
             SettingsTabContent(
@@ -793,7 +794,7 @@ internal fun companionScrollKey(state: MainUiState): String =
                 lists
                     .firstOrNull { it.collectionId == state.selectedCatalogCollectionId }
                     ?.collectionId
-                    ?: lists.firstOrNull { it.entryCount > 0 }?.collectionId
+                    ?: lists.firstOrNull { it.entryCount > 0 || it.generatorEnabled }?.collectionId
                     ?: lists.firstOrNull()?.collectionId
                     ?: "default"
             "lists:LISTS:$activeId"
@@ -813,6 +814,16 @@ internal fun companionScrollKey(state: MainUiState): String =
             "lists:DIARY"
         }
     }
+
+internal fun openCollectionDrawFallback(
+    draw: CollectionDrawSnapshot,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val fallback = if (draw.isMusicKind) draw.youtubeMusicUrl else draw.primaryExternalUrl.orEmpty()
+    if (fallback.isNotBlank()) {
+        onOpenExternalUrl(fallback)
+    }
+}
 
 internal fun readerBackLabel(state: MainUiState): String =
     when {

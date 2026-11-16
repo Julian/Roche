@@ -84,9 +84,12 @@ class HttpEngineTransport(
     context: Context,
     private val vpnCheck: VpnTransportCheck = VpnTransportCheck { true },
 ) : HttpTransport, AutoCloseable {
+    private val appContext: Context = context.applicationContext ?: context
     private var lockedStoragePath: String? = null
 
-    private val httpEngine: HttpEngine = buildConfiguredHttpEngine(context)
+    private val httpEngineDelegate = lazy { buildConfiguredHttpEngine(appContext) }
+    private val httpEngine: HttpEngine
+        get() = httpEngineDelegate.value
 
     private val executor: ScheduledExecutorService =
         Executors.newScheduledThreadPool(HTTP_ENGINE_CALLBACK_THREADS) { runnable ->
@@ -116,7 +119,9 @@ class HttpEngineTransport(
         }
 
     override fun close() {
-        runCatching { httpEngine.shutdown() }
+        if (httpEngineDelegate.isInitialized()) {
+            runCatching { httpEngineDelegate.value.shutdown() }
+        }
         lockedStoragePath?.let(::releaseHttpEngineStoragePath)
         lockedStoragePath = null
         executor.shutdown()

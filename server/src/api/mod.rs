@@ -167,18 +167,20 @@ impl ApiRoutes {
                 get(catalog::catalog_rank_cluster::<F>),
             )
             .route("/api/v1/catalog/comparisons", post(catalog::catalog_comparisons_create::<F>))
+            .route("/api/v1/catalog/generators", get(catalog::catalog_generators_list::<F>))
             .route(
-                "/api/v1/catalog/generator/1001-albums",
-                get(catalog::catalog_generator_1001_get::<F>)
-                    .patch(catalog::catalog_generator_1001_patch::<F>),
+                "/api/v1/catalog/lists/{slug_or_id}/generator",
+                get(catalog::catalog_list_generator_get::<F>)
+                    .patch(catalog::catalog_list_generator_patch::<F>)
+                    .delete(catalog::catalog_list_generator_delete::<F>),
             )
             .route(
-                "/api/v1/catalog/generator/1001-albums/finish",
-                post(catalog::catalog_generator_1001_finish::<F>),
+                "/api/v1/catalog/lists/{slug_or_id}/generator/finish",
+                post(catalog::catalog_list_generator_finish::<F>),
             )
             .route(
-                "/api/v1/catalog/generator/1001-albums/abandon",
-                post(catalog::catalog_generator_1001_abandon::<F>),
+                "/api/v1/catalog/lists/{slug_or_id}/generator/abandon",
+                post(catalog::catalog_list_generator_abandon::<F>),
             )
     }
 

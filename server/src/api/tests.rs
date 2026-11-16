@@ -1456,13 +1456,40 @@ async fn test_per_ip_pairing_rate_limit_isolates_attacker_from_legitimate_ip() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn test_catalog_api_1001_generator_and_peer_sync_roundtrip() {
+async fn test_catalog_api_collection_generator_and_peer_sync_roundtrip() {
     let (app, auth) = setup_app().await;
 
-    // 1. Enable 1001 Albums generator -> draws an active album; finishing draws next
+    let seed_batch = serde_json::json!({
+        "collections": [{
+            "ref_key": "col:pool",
+            "title": "Album Backlog",
+            "slug": "album_backlog",
+            "role": "list",
+            "members": [
+                {"entry_ref": "a1", "position": 1.0},
+                {"entry_ref": "a2", "position": 2.0},
+                {"entry_ref": "a3", "position": 3.0}
+            ]
+        }],
+        "entries": [
+            {"ref_key": "a1", "kind": "album", "title": "Kind of Blue", "creators": ["Miles Davis"]},
+            {"ref_key": "a2", "kind": "album", "title": "Time Out", "creators": ["Dave Brubeck"]},
+            {"ref_key": "a3", "kind": "album", "title": "Mingus Ah Um", "creators": ["Charles Mingus"]}
+        ]
+    });
+    let seed_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/batch")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(seed_batch.to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(seed_req).await.unwrap().status(), StatusCode::OK);
+
+    // 1. Enable collection generator -> draws an active album; finishing draws next
     let enable_request = Request::builder()
         .method("PATCH")
-        .uri("/api/v1/catalog/generator/1001-albums")
+        .uri("/api/v1/catalog/lists/album_backlog/generator")
         .header(header::AUTHORIZATION, &auth)
         .header("content-type", "application/json")
         .body(Body::from(r#"{"enabled":true}"#))
@@ -1477,7 +1504,7 @@ async fn test_catalog_api_1001_generator_and_peer_sync_roundtrip() {
 
     let finish_request = Request::builder()
         .method("POST")
-        .uri("/api/v1/catalog/generator/1001-albums/finish")
+        .uri("/api/v1/catalog/lists/album_backlog/generator/finish")
         .header(header::AUTHORIZATION, &auth)
         .header("content-type", "application/json")
         .body(Body::from(r#"{"notes":"Phenomenal arrangement"}"#))
@@ -1549,7 +1576,7 @@ async fn test_catalog_api_1001_generator_and_peer_sync_roundtrip() {
     assert_ne!(
         gen_out["current_entry_id"].as_str().unwrap(),
         second_album_id,
-        "Peer sync finishing the active 1001 album must advance generator to a new draw"
+        "Peer sync finishing the active drawn entry must advance collection generator to a new draw"
     );
 
     // 4. Ranked albums endpoint reflects `first_album_id > second_album_id` with S and D tiers

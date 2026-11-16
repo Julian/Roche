@@ -398,7 +398,7 @@ details.editorial-panel[open] > summary {
   color: var(--paper);
 }
 
-/* --- 1001 Albums Editorial Sleeve Card --- */
+/* --- Active Collection Draw Editorial Sleeve Card --- */
 
 .album-sleeve {
   display: grid;

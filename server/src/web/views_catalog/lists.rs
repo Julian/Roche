@@ -11,7 +11,10 @@ use super::{
     parse_optional_year, render_kind_options,
 };
 use crate::{
-    db::{CollectionMode, CollectionRole, EntryKind, RankedCollectionView, UpsertEntryInput},
+    db::{
+        CollectionGeneratorState, CollectionMode, CollectionRole, EntryKind, RankedCollectionView,
+        UpsertEntryInput,
+    },
     error::ApiError,
     scheduler::FeedFetcher,
     service::RocheService,
@@ -21,6 +24,7 @@ use crate::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
             web_api_error_response,
         },
+        views_home::render_collection_draw_section,
     },
 };
 
@@ -153,10 +157,19 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
         .collect();
     let artist_links = load_artist_id_by_lower_name(&service, &page_creators).await;
 
+    let gen_state = if view.collection.mode == CollectionMode::Manual
+        && view.collection.role == CollectionRole::List
+    {
+        service.catalog().get_collection_generator(&view.collection.id).await.ok()
+    } else {
+        None
+    };
+
     let mut body = String::with_capacity(12_288);
     render_ranked_list_body(
         &mut body,
         &view,
+        gen_state.as_ref(),
         page_num,
         total_pages,
         &artist_links,
@@ -177,32 +190,50 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
 fn render_ranked_list_body(
     out: &mut String,
     view: &RankedCollectionView,
+    gen_state: Option<&CollectionGeneratorState>,
     page_num: usize,
     total_pages: usize,
     artist_links: &HashMap<String, String>,
     csrf: &str,
 ) {
     let slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
-    let is_editable_manual = view.collection.mode == CollectionMode::Manual
-        && !view.collection.has_generator
+    let slug_enc = urlencode(slug);
+    let is_manual_list = view.collection.mode == CollectionMode::Manual
         && view.collection.role == CollectionRole::List;
+    let is_editable_manual = is_manual_list && !view.collection.has_generator;
 
     let _ = write!(
         out,
         "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\n\
-           <h2>{}</h2>\n",
+           <h2>{}</h2>\n\
+           <div style=\"display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap\">",
         esc(&view.collection.title)
     );
+    if let Some(gs) = gen_state {
+        let next_enabled = if gs.enabled { "false" } else { "true" };
+        let label = if gs.enabled { "Pause Draw" } else { "Enable Draw" };
+        let _ = write!(
+            out,
+            "<form method=\"post\" action=\"/web/lists/{}/generator/toggle\" class=\"inline-form\">\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
+               <input type=\"hidden\" name=\"enabled\" value=\"{next_enabled}\">\
+               <input type=\"hidden\" name=\"redirect_list\" value=\"true\">\
+               <button type=\"submit\" class=\"btn btn-small\">{label}</button>\
+             </form>",
+            esc(&slug_enc),
+            esc(csrf),
+        );
+    }
     if view.rows.len() >= 2 {
         let want_suffix =
             if view.collection.role == CollectionRole::Want { "?want=true" } else { "" };
         let _ = write!(
             out,
             "<a class=\"btn btn-primary btn-small\" href=\"/rank/{}{want_suffix}\">Compare &amp; Rank</a>",
-            esc(&urlencode(slug))
+            esc(&slug_enc)
         );
     }
-    out.push_str("</div>\n");
+    out.push_str("</div></div>\n");
 
     let _ = writeln!(
         out,
@@ -216,7 +247,13 @@ fn render_ranked_list_body(
             .map_or_else(String::new, |s| format!(" &mdash; {}", esc(s))),
     );
 
-    if is_editable_manual {
+    if let Some(gs) = gen_state
+        && gs.enabled
+    {
+        render_collection_draw_section(out, gs, csrf);
+    }
+
+    if is_manual_list {
         render_manual_list_add_panel(out, slug, csrf);
     }
 

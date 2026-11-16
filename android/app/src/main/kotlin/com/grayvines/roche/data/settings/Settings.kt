@@ -21,6 +21,7 @@ data class Settings(
     val defaultPlaybackSpeed: Float = DEFAULT_PLAYBACK_SPEED,
     val skipSilenceEnabled: Boolean = false,
     val smartRewindEnabled: Boolean = true,
+    val showCollectionDrawsOnHome: Boolean = true,
     val hasUndecryptableToken: Boolean = false,
 ) {
     companion object {

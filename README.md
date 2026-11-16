@@ -12,11 +12,11 @@ Track RSS/Atom blogs, arXiv papers, podcast episodes, YouTube subscriptions, boo
 - **Unified Media Catalog & Dual Ranking Model**:
   - **Shared Entry Graph**: Feed items, saved articles/PDFs/videos/episodes, manual media logs (`album`, `book`, `movie`, `tv`, `song`), and collections share a unified entry & scheme-normalized identifier space (`spotify`, `1001albums`, `imdb`, `wikipedia`, `url`, `feed_url`, `slug`) with tombstone-aware deduplication and merge convergence across peers.
   - **Global Quality vs Local Priority**: Pairwise comparisons on consumed works update global quality ratings via **Expectation Propagation (EP)** (`S`/`A`/`B`/`C`/`D` tiers + `0–10` scores) that propagate across dynamic/manual lists, whereas comparisons inside `want:*` queues stay strictly local (`scope_collection_id`) for priority ordering.
-  - **1001 Albums Generator**: Built-in daily draw workflow over the bundled 1,101-album canon with streaming deep-links, listen/skip tracking, and immediate post-listen cluster ranking.
+  - **Collection Generators**: Any manual list can enable an active random draw workflow with streaming/external deep-links, finish/abandon tracking, and immediate post-completion cluster ranking.
 - **CLI & TUI**:
   - Daemon & pairing: `roche` (alias `roche serve`), `roche pair`, `roche discover`, `roche devices <list|revoke>`.
   - Subscriptions: `roche import <file.opml> [--poll]`, `roche export [-o file.opml]`.
-  - Catalog & ranking: `roche consumed <kind> <title> [--creator ...] [--year ...] [--rank]`, `roche want <kind> <title> [--notes ...]`, `roche lists [--want]`, `roche show <target> [--want]`, `roche rank <collection_slug_or_id>` (interactive bucket-tie TUI), and `roche catalog apply <file.json>` (atomic declarative batch upsert/log/rank).
+  - Catalog & ranking: `roche consumed <kind> <title> [--creator ...] [--year ...] [--rank]`, `roche want <kind> <title> [--notes ...]`, `roche lists [--want]`, `roche show <target> [--want]`, `roche draw [status|enable|disable|finish|abandon]`, `roche rank <collection_slug_or_id>` (interactive bucket-tie TUI), and `roche catalog apply <file.json>` (atomic declarative batch upsert/log/rank).
 - **Configuration**:
   - Overrides apply in order: CLI flags (`--host`, `--port`, `--data-dir`, `--advertise-service`) > `ROCHE_*` env vars (`ROCHE_CONFIG`, `ROCHE_HOST`, `ROCHE_PORT`, `ROCHE_DATA_DIR`, `ROCHE_TAILSCALE_AUTO_AUTH_USERS`, etc.) > `./config.toml` > defaults (`127.0.0.1:8080`, `./data`).
 

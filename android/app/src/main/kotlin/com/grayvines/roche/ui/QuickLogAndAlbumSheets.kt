@@ -33,8 +33,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.CollectionGeneratorState
 import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -44,17 +44,19 @@ import com.grayvines.roche.ui.theme.LocalRocheColors
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AlbumNoteModalSheet(
-    album: DailyAlbumSnapshot?,
-    mode: AlbumNoteDialogMode,
+internal fun CollectionDrawNoteModalSheet(
+    dialog: DrawNoteDialogState,
+    generator: CollectionGeneratorState?,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    var notes by rememberSaveable(album?.entryId, mode) { mutableStateOf("") }
-    val isAbandon = mode == AlbumNoteDialogMode.ABANDON
+    val draw = generator?.currentDraw
+    var notes by
+        rememberSaveable(dialog.collectionId, draw?.entryId, dialog.mode) { mutableStateOf("") }
+    val isAbandon = dialog.mode == DrawNoteDialogMode.ABANDON
 
     ModalBottomSheet(
-        onDismissRequest = { onAction(MainAction.CloseAlbumNoteDialog) },
+        onDismissRequest = { onAction(MainAction.CloseDrawNoteDialog) },
         containerColor = colors.surface,
     ) {
         Column(
@@ -63,41 +65,50 @@ internal fun AlbumNoteModalSheet(
                     .imePadding()
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
-                    .testTag("album_note_modal_sheet"),
+                    .testTag("draw_note_modal_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            AlbumNoteSheetHeader(album = album, isAbandon = isAbandon)
+            DrawNoteSheetHeader(generator = generator, isAbandon = isAbandon)
             OutlinedTextField(
                 value = notes,
                 onValueChange = { notes = it },
                 label = { Text("Diary notes (optional)") },
-                placeholder = { Text("Standout tracks, impressions…") },
+                placeholder = { Text("Standout moments, impressions…") },
                 minLines = 2,
                 maxLines = 4,
-                modifier = Modifier.fillMaxWidth().testTag("album_notes_input"),
+                modifier = Modifier.fillMaxWidth().testTag("draw_notes_input"),
             )
-            AlbumNoteSheetFooter(isAbandon = isAbandon, notes = notes, onAction = onAction)
+            DrawNoteSheetFooter(
+                collectionId = dialog.collectionId,
+                isAbandon = isAbandon,
+                notes = notes,
+                onAction = onAction,
+            )
             Spacer(modifier = Modifier.height(14.dp))
         }
     }
 }
 
 @Composable
-private fun AlbumNoteSheetHeader(
-    album: DailyAlbumSnapshot?,
+private fun DrawNoteSheetHeader(
+    generator: CollectionGeneratorState?,
     isAbandon: Boolean,
 ) {
     val colors = LocalRocheColors.current
+    val draw = generator?.currentDraw
+    val listTitle = generator?.collectionTitle ?: "List"
     Text(
-        text = if (isAbandon) "Abandon 1001 Album" else "Finish & Rank Album",
+        text = if (isAbandon) "Abandon Draw" else "Finish & Rank",
         color = colors.textPrimary,
         fontFamily = FontFamily.Serif,
         fontSize = 19.sp,
         fontWeight = FontWeight.SemiBold,
     )
-    if (album != null) {
+    if (draw != null) {
+        val subtitle =
+            if (draw.creator.isNotBlank()) "${draw.title} — ${draw.creator}" else draw.title
         Text(
-            text = "${album.name} — ${album.artist}",
+            text = subtitle,
             color = colors.textSecondary,
             fontSize = 13.5.sp,
             fontWeight = FontWeight.Medium,
@@ -106,9 +117,9 @@ private fun AlbumNoteSheetHeader(
     Text(
         text =
             if (isAbandon) {
-                "Records this album as abandoned in your Diary and draws your next 1001 Album."
+                "Records this entry as abandoned in your Diary and draws your next item from $listTitle."
             } else {
-                "Logs this album as finished, settles its ranking against your other albums, and draws your next 1001 Album."
+                "Logs this entry as finished, settles its ranking, and draws your next item from $listTitle."
             },
         color = colors.textMuted,
         fontSize = 12.sp,
@@ -117,7 +128,8 @@ private fun AlbumNoteSheetHeader(
 }
 
 @Composable
-private fun AlbumNoteSheetFooter(
+private fun DrawNoteSheetFooter(
+    collectionId: String,
     isAbandon: Boolean,
     notes: String,
     onAction: (MainAction) -> Unit,
@@ -129,7 +141,7 @@ private fun AlbumNoteSheetFooter(
     ) {
         HeaderActionButton(
             label = "Cancel",
-            onClick = { onAction(MainAction.CloseAlbumNoteDialog) },
+            onClick = { onAction(MainAction.CloseDrawNoteDialog) },
         )
         Spacer(modifier = Modifier.size(8.dp))
         HeaderActionButton(
@@ -138,13 +150,13 @@ private fun AlbumNoteSheetFooter(
             onClick = {
                 val action =
                     if (isAbandon) {
-                        MainAction.ConfirmAbandon1001Album(notes)
+                        MainAction.ConfirmAbandonDraw(collectionId, notes)
                     } else {
-                        MainAction.ConfirmFinish1001Album(notes)
+                        MainAction.ConfirmFinishDraw(collectionId, notes)
                     }
                 onAction(action)
             },
-            modifier = Modifier.testTag("album_confirm_action_btn"),
+            modifier = Modifier.testTag("draw_confirm_action_btn"),
         )
     }
 }

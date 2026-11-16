@@ -1,4 +1,3 @@
-pub mod albums_pool;
 mod api;
 mod auth;
 pub mod cli;

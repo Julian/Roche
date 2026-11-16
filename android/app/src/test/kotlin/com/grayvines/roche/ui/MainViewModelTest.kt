@@ -12,6 +12,7 @@ import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.NetworkTier
 import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
@@ -1595,78 +1596,106 @@ class MainViewModelTest {
         }
 
     @Test
-    fun `native 1001 Albums generator draws from bundled pool never auto rotates and settles focused rank`() =
+    fun `collection generator draws from manual list pool never auto rotates and settles focused rank`() =
         runTest {
-            val poolJson =
-                """[""" +
-                    """{"id":"11111111-1111-4111-8111-111111111111","slug":"album-a","title":"First Canon Album","artist":"Artist One","year":1971,"spotify_id":"sp1","cover_url":"https://i.scdn.co/image/1","genres":["rock"],"styles":[]},""" +
-                    """{"id":"22222222-2222-4222-8222-222222222222","slug":"album-b","title":"Second Canon Album","artist":"Artist Two","year":1975,"spotify_id":"sp2","cover_url":"https://i.scdn.co/image/2","genres":["jazz"],"styles":[]},""" +
-                    """{"id":"33333333-3333-4333-8333-333333333333","slug":"album-c","title":"Third Canon Album","artist":"Artist Three","year":1980,"spotify_id":"sp3","cover_url":"https://i.scdn.co/image/3","genres":["soul"],"styles":[]}]"""
-            val customApi = RocheApiClient { HttpResponse(statusCode = 404, body = "{}") }
-            val customRepo =
-                RocheRepository(
-                    database = database,
-                    apiClient = customApi,
-                    settings = settings,
-                    poolStreamProvider = { poolJson.byteInputStream(Charsets.UTF_8) },
+            val listId = repository.catalog.createCustomList("Essential Albums")
+            listOf(
+                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                        id = "11111111-1111-4111-8111-111111111111",
+                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        title = "First Canon Album",
+                        creators = listOf("Artist One"),
+                        releaseYear = 1971,
+                        identifiers =
+                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp1")),
+                    ),
+                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                        id = "22222222-2222-4222-8222-222222222222",
+                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        title = "Second Canon Album",
+                        creators = listOf("Artist Two"),
+                        releaseYear = 1975,
+                        identifiers =
+                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp2")),
+                    ),
+                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                        id = "33333333-3333-4333-8333-333333333333",
+                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        title = "Third Canon Album",
+                        creators = listOf("Artist Three"),
+                        releaseYear = 1980,
+                        identifiers =
+                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp3")),
+                    ),
                 )
-            val customVm =
-                MainViewModel(
-                    repository = customRepo,
-                    settingsRepository = settings,
-                    playerBackend = FakeAudioPlayerBackend(),
-                    mediaSessionBridge = RecordingMediaSessionBridge(),
-                )
-            val collectJob = backgroundScope.launch { customVm.uiState.collect() }
+                .forEachIndexed { idx, input ->
+                    val id = repository.catalog.upsertEntry(input)
+                    repository.catalog.addCollectionEntry(
+                        listId,
+                        id,
+                        position = (idx + 1).toDouble(),
+                    )
+                }
+            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
             try {
-                assertNull(customVm.uiState.value.dailyAlbum)
+                assertTrue(viewModel.uiState.value.activeCollectionDraws.isEmpty())
 
-                customVm.dispatch(MainAction.SetAlbumGeneratorEnabled(true))
-                val drawn1 = customVm.uiState.first { it.dailyAlbum != null }
-                val firstAlbumId = drawn1.dailyAlbum!!.entryId
-                assertEquals(1, drawn1.dailyAlbum?.albumNumber)
-                assertEquals(3, drawn1.dailyAlbum?.remainingCount)
+                viewModel.dispatch(MainAction.SetCollectionGeneratorEnabled(listId, true))
+                val drawn1 =
+                    viewModel.uiState.first {
+                        it.catalog.generatorFor(listId)?.currentDraw != null
+                    }
+                val firstDraw = drawn1.catalog.generatorFor(listId)!!.currentDraw!!
+                val firstAlbumId = firstDraw.entryId
+                assertEquals(1, firstDraw.drawNumber)
+                assertEquals(3, firstDraw.remainingCount)
 
-                // Re-enabling or syncing NEVER auto-rotates an active unfinished album
-                customVm.dispatch(MainAction.SetAlbumGeneratorEnabled(true))
-                assertEquals(firstAlbumId, customVm.uiState.value.dailyAlbum?.entryId)
+                // Re-enabling NEVER auto-rotates an active unfinished draw
+                viewModel.dispatch(MainAction.SetCollectionGeneratorEnabled(listId, true))
+                assertEquals(
+                    firstAlbumId,
+                    viewModel.uiState.value.catalog.generatorFor(listId)?.currentDraw?.entryId,
+                )
 
-                // Finishing #1 album logs consumed and draws #2
-                customVm.dispatch(MainAction.ConfirmFinish1001Album("Loved the opener"))
+                // Finishing #1 item logs consumed and draws #2
+                viewModel.dispatch(MainAction.ConfirmFinishDraw(listId, "Loved the opener"))
                 val afterFirst =
-                    customVm.uiState.first {
-                        val current = it.dailyAlbum
+                    viewModel.uiState.first {
+                        val current = it.catalog.generatorFor(listId)?.currentDraw
                         current != null && current.entryId != firstAlbumId
                     }
-                val secondAlbumId = afterFirst.dailyAlbum!!.entryId
-                assertEquals(1, afterFirst.albumGenerator.consumedCount)
-                assertEquals(2, afterFirst.dailyAlbum?.remainingCount)
+                val genAfterFirst = afterFirst.catalog.generatorFor(listId)!!
+                val secondDraw = genAfterFirst.currentDraw!!
+                val secondAlbumId = secondDraw.entryId
+                assertEquals(1, genAfterFirst.consumedCount)
+                assertEquals(2, secondDraw.remainingCount)
 
-                // Finishing #2 album opens FocusedRankSession comparing #1 and #2, then settles!
-                customVm.dispatch(MainAction.ConfirmFinish1001Album("Even better"))
-                val withRank =
-                    customVm.uiState.first {
-                        it.rankSession != null && it.rankSession.cluster.size == 2
-                    }
-                customVm.dispatch(
+                // Finishing #2 item opens FocusedRankSession comparing #1 and #2, then settles!
+                viewModel.dispatch(MainAction.ConfirmFinishDraw(listId, "Even better"))
+                viewModel.uiState.first {
+                    it.rankSession != null && it.rankSession.cluster.size == 2
+                }
+                viewModel.dispatch(
                     MainAction.SubmitRankCluster(
                         listOf(listOf(secondAlbumId), listOf(firstAlbumId))
                     )
                 )
-                val settled = customVm.uiState.first { it.rankSession?.settlement != null }
+                val settled = viewModel.uiState.first { it.rankSession?.settlement != null }
                 assertEquals(1, settled.rankSession?.settlement?.rank)
                 assertEquals(2, settled.rankSession?.settlement?.totalCount)
 
                 // Abandoning #3 completes the pool cleanly
-                customVm.dispatch(MainAction.CloseRankSession)
-                customVm.dispatch(MainAction.ConfirmAbandon1001Album("Not for me"))
-                val finishedPool = customVm.uiState.first { it.albumGenerator.abandonedCount == 1 }
-                assertNull(finishedPool.dailyAlbum)
-                assertEquals(2, finishedPool.albumGenerator.consumedCount)
+                viewModel.dispatch(MainAction.CloseRankSession)
+                viewModel.dispatch(MainAction.ConfirmAbandonDraw(listId, "Not for me"))
+                val finishedPool =
+                    viewModel.uiState.first {
+                        it.catalog.generatorFor(listId)?.abandonedCount == 1
+                    }
+                val finalGen = finishedPool.catalog.generatorFor(listId)!!
+                assertNull(finalGen.currentDraw)
+                assertEquals(2, finalGen.consumedCount)
             } finally {
                 collectJob.cancel()
-                customVm.playerController.releaseController()
-                customVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 

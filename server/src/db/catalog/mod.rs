@@ -1,10 +1,10 @@
 use sqlx::SqlitePool;
 
-mod albums_1001;
 mod batch;
 mod collections;
 mod consumption;
 mod entries;
+mod generators;
 mod identity_norm;
 mod merge;
 mod models;
@@ -20,11 +20,11 @@ pub use identity_norm::{
     strip_album_edition_suffix,
 };
 pub use models::{
-    BatchComparisonInput, BatchEntryInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult,
-    CatalogEntry, CatalogError, CatalogResult, ClusterSelectFilter, CollectionSummary,
+    BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
+    BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
+    CatalogError, CatalogResult, ClusterSelectFilter, CollectionGeneratorState, CollectionSummary,
     ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule,
-    EntryDetailView, EntryIdentifier, Generator1001State, Generator1001UpdateInput,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    EntryDetailView, EntryIdentifier, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
 };
 
 #[derive(Clone, Copy)]

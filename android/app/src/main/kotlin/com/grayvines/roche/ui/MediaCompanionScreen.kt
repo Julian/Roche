@@ -42,13 +42,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.ALBUMS_1001_COLLECTION_ID
 import com.grayvines.roche.data.CatalogListSummary
+import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.CollectionMode
+import com.grayvines.roche.data.CollectionRole
 import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.data.DiaryEntryItem
 import com.grayvines.roche.data.RankedCatalogEntry
+import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -65,7 +66,7 @@ fun MediaCompanionScreen(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit = {},
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
@@ -88,7 +89,7 @@ fun MediaCompanionScreen(
                     listState = listState,
                     onAction = onAction,
                     onOpenCreateList = { showCreateListDialog = true },
-                    onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             CompanionSubTab.DIARY ->
                 DiaryHistoryPane(
@@ -175,22 +176,16 @@ private fun RankedListsPane(
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCreateList: () -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val lists = state.catalog.lists
     val activeList =
         remember(lists, state.selectedCatalogCollectionId) {
-            lists.firstOrNull { it.collectionId == state.selectedCatalogCollectionId }
-                ?: lists.firstOrNull { it.entryCount > 0 }
-                ?: lists.firstOrNull()
+            resolveActiveCatalogList(lists, state.selectedCatalogCollectionId)
         }
     val rankedEntries =
         activeList?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
-    val canEditManualList =
-        activeList != null &&
-            activeList.mode == CollectionMode.MANUAL &&
-            activeList.collectionId != ALBUMS_1001_COLLECTION_ID &&
-            !activeList.isPriorityScoped
+    val canEditManualList = isEditableManualUserList(activeList)
 
     Column(modifier = Modifier.fillMaxSize()) {
         CatalogListChipsRow(
@@ -203,34 +198,38 @@ private fun RankedListsPane(
             ActiveListToolbar(
                 list = activeList,
                 canRank = rankedEntries.size >= 2,
-                canAddEntry = canEditManualList,
-                onAddEntry = {
-                    onAction(
-                        MainAction.OpenQuickLogSheet(
-                            defaultToWant = false,
-                            targetCollectionId = activeList.collectionId,
-                            targetCollectionTitle = activeList.title,
-                        )
-                    )
-                },
-                onStartRank = {
-                    onAction(MainAction.StartRankingSession(activeList.collectionId))
-                },
+                canEditManualList = canEditManualList,
+                onAction = onAction,
             )
         }
-        val active1001Album =
-            state.dailyAlbum.takeIf { activeList?.collectionId == ALBUMS_1001_COLLECTION_ID }
+        val activeDraw = activeList?.let {
+            state.catalog.generatorFor(it.collectionId)?.currentDraw
+        }
         RankedListBody(
             activeList = activeList,
-            active1001Album = active1001Album,
+            activeDraw = activeDraw,
             canEditManualList = canEditManualList,
             rankedEntries = rankedEntries,
             listState = listState,
             onAction = onAction,
-            onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+            onOpenCollectionDraw = onOpenCollectionDraw,
         )
     }
 }
+
+private fun resolveActiveCatalogList(
+    lists: List<CatalogListSummary>,
+    selectedId: String?,
+): CatalogListSummary? =
+    lists.firstOrNull { it.collectionId == selectedId }
+        ?: lists.firstOrNull { it.entryCount > 0 || it.generatorEnabled }
+        ?: lists.firstOrNull()
+
+private fun isEditableManualUserList(list: CatalogListSummary?): Boolean =
+    list != null &&
+        list.mode == CollectionMode.MANUAL &&
+        list.role == CollectionRole.LIST &&
+        !list.isPriorityScoped
 
 @Composable
 private fun CatalogListChipsRow(
@@ -249,10 +248,11 @@ private fun CatalogListChipsRow(
     ) {
         lists.forEach { summary ->
             val chipLabel =
-                if (summary.entryCount > 0) {
-                    "${summary.title} (${summary.entryCount})"
-                } else {
-                    summary.title
+                when {
+                    summary.entryCount > 0 -> "${summary.title} (${summary.entryCount})"
+                    summary.generatorEnabled && summary.poolTotalCount > 0 ->
+                        "${summary.title} (0/${summary.poolTotalCount})"
+                    else -> summary.title
                 }
             FilterChipPill(
                 label = chipLabel,
@@ -273,14 +273,14 @@ private fun CatalogListChipsRow(
 @Composable
 private fun RankedListBody(
     activeList: CatalogListSummary?,
-    active1001Album: DailyAlbumSnapshot?,
+    activeDraw: CollectionDrawSnapshot?,
     canEditManualList: Boolean,
     rankedEntries: List<RankedCatalogEntry>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
-    if (rankedEntries.isEmpty() && active1001Album == null) {
+    if (rankedEntries.isEmpty() && activeDraw == null) {
         CompanionEmptyCard(
             title = "No entries in ${activeList?.title ?: "this list"} yet",
             body = "Log movies, albums, books, games, or finish feed items to build your rankings.",
@@ -299,12 +299,12 @@ private fun RankedListBody(
     }
     RankedListLazyColumn(
         activeList = activeList,
-        active1001Album = active1001Album,
+        activeDraw = activeDraw,
         canEditManualList = canEditManualList,
         rankedEntries = rankedEntries,
         listState = listState,
         onAction = onAction,
-        onOpenDailyAlbumInMusicApp = onOpenDailyAlbumInMusicApp,
+        onOpenCollectionDraw = onOpenCollectionDraw,
     )
 }
 
@@ -312,12 +312,12 @@ private fun RankedListBody(
 @Composable
 private fun RankedListLazyColumn(
     activeList: CatalogListSummary?,
-    active1001Album: DailyAlbumSnapshot?,
+    activeDraw: CollectionDrawSnapshot?,
     canEditManualList: Boolean,
     rankedEntries: List<RankedCatalogEntry>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
-    onOpenDailyAlbumInMusicApp: (DailyAlbumSnapshot) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     LazyColumn(
         state = listState,
@@ -325,12 +325,12 @@ private fun RankedListLazyColumn(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         modifier = Modifier.fillMaxSize(),
     ) {
-        if (active1001Album != null) {
-            item(key = "active_1001_album_${active1001Album.entryId}") {
-                Active1001AlbumListCard(
-                    album = active1001Album,
+        if (activeDraw != null) {
+            item(key = "active_draw_${activeDraw.collectionId}_${activeDraw.entryId}") {
+                ActiveCollectionDrawListCard(
+                    draw = activeDraw,
                     onAction = onAction,
-                    onPlay = { onOpenDailyAlbumInMusicApp(active1001Album) },
+                    onOpen = { onOpenCollectionDraw(activeDraw) },
                 )
             }
         }
@@ -364,63 +364,78 @@ private fun buildRemoveListAction(
     }
 
 @Composable
-private fun Active1001AlbumListCard(
-    album: DailyAlbumSnapshot,
+private fun ActiveCollectionDrawListCard(
+    draw: CollectionDrawSnapshot,
     onAction: (MainAction) -> Unit,
-    onPlay: () -> Unit,
+    onOpen: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val titleLine = if (draw.creator.isNotBlank()) "${draw.title} — ${draw.creator}" else draw.title
     RocheSurfaceCard {
         Column(
             modifier =
                 Modifier.fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 11.dp)
-                    .testTag("companion_active_1001_card"),
+                    .testTag("companion_active_draw_card"),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Text(
-                text = "ACTIVE DRAW · #${album.albumNumber} (${album.remainingCount} LEFT)",
+                text = "ACTIVE DRAW · #${draw.drawNumber} (${draw.remainingCount} LEFT)",
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
             )
             Text(
-                text = "${album.name} — ${album.artist}",
+                text = titleLine,
                 color = colors.textPrimary,
                 fontSize = 14.5.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                HeaderActionButton(
-                    label = "Play",
-                    style = RocheButtonStyle.PRIMARY,
-                    onClick = onPlay,
-                    modifier = Modifier.testTag("companion_1001_play_btn"),
-                )
-                HeaderActionButton(
-                    label = "Finish & Rank",
-                    onClick = {
-                        onAction(
-                            MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.FINISH_AND_RANK)
-                        )
-                    },
-                    modifier = Modifier.testTag("companion_1001_finish_btn"),
-                )
-                HeaderActionButton(
-                    label = "Abandon",
-                    onClick = {
-                        onAction(MainAction.OpenAlbumNoteDialog(AlbumNoteDialogMode.ABANDON))
-                    },
-                    modifier = Modifier.testTag("companion_1001_abandon_btn"),
-                )
-            }
+            ActiveDrawActionRow(draw = draw, onAction = onAction, onOpen = onOpen)
         }
+    }
+}
+
+@Composable
+private fun ActiveDrawActionRow(
+    draw: CollectionDrawSnapshot,
+    onAction: (MainAction) -> Unit,
+    onOpen: () -> Unit,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HeaderActionButton(
+            label = if (draw.isMusicKind) "Play" else "Open",
+            style = RocheButtonStyle.PRIMARY,
+            onClick = onOpen,
+            modifier = Modifier.testTag("companion_draw_open_btn"),
+        )
+        HeaderActionButton(
+            label = "Finish & Rank",
+            onClick = {
+                onAction(
+                    MainAction.OpenDrawNoteDialog(
+                        draw.collectionId,
+                        DrawNoteDialogMode.FINISH_AND_RANK,
+                    )
+                )
+            },
+            modifier = Modifier.testTag("companion_draw_finish_btn"),
+        )
+        HeaderActionButton(
+            label = "Abandon",
+            onClick = {
+                onAction(
+                    MainAction.OpenDrawNoteDialog(draw.collectionId, DrawNoteDialogMode.ABANDON)
+                )
+            },
+            modifier = Modifier.testTag("companion_draw_abandon_btn"),
+        )
     }
 }
 
@@ -428,9 +443,8 @@ private fun Active1001AlbumListCard(
 private fun ActiveListToolbar(
     list: CatalogListSummary,
     canRank: Boolean,
-    canAddEntry: Boolean = false,
-    onAddEntry: (() -> Unit)? = null,
-    onStartRank: () -> Unit,
+    canEditManualList: Boolean = false,
+    onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Row(
@@ -444,26 +458,64 @@ private fun ActiveListToolbar(
             fontFamily = FontFamily.Monospace,
             fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
         )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (canAddEntry && onAddEntry != null) {
-                HeaderActionButton(
-                    label = "+ Add",
-                    onClick = onAddEntry,
-                    modifier = Modifier.testTag("companion_add_list_entry_btn"),
-                )
-            }
-            if (canRank) {
-                HeaderActionButton(
-                    label = if (list.isPriorityScoped) "Prioritize" else "Compare / Rank",
-                    style = RocheButtonStyle.PRIMARY,
-                    onClick = onStartRank,
-                    modifier = Modifier.testTag("companion_rank_list_btn"),
-                )
-            }
+        ActiveListToolbarButtons(
+            list = list,
+            canRank = canRank,
+            canEditManualList = canEditManualList,
+            onAction = onAction,
+        )
+    }
+}
+
+@Composable
+private fun ActiveListToolbarButtons(
+    list: CatalogListSummary,
+    canRank: Boolean,
+    canEditManualList: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (canEditManualList) {
+            HeaderActionButton(
+                label = "+ Add",
+                onClick = {
+                    onAction(
+                        MainAction.OpenQuickLogSheet(
+                            defaultToWant = false,
+                            targetCollectionId = list.collectionId,
+                            targetCollectionTitle = list.title,
+                        )
+                    )
+                },
+                modifier = Modifier.testTag("companion_add_list_entry_btn"),
+            )
+            HeaderActionButton(
+                label = if (list.generatorEnabled) "Pause Draw" else "Enable Draw",
+                onClick = {
+                    onAction(
+                        MainAction.SetCollectionGeneratorEnabled(
+                            collectionIdOrSlug = list.collectionId,
+                            enabled = !list.generatorEnabled,
+                        )
+                    )
+                },
+                modifier = Modifier.testTag("companion_toggle_draw_btn"),
+            )
+        }
+        if (canRank) {
+            HeaderActionButton(
+                label = if (list.isPriorityScoped) "Prioritize" else "Compare / Rank",
+                style = RocheButtonStyle.PRIMARY,
+                onClick = { onAction(MainAction.StartRankingSession(list.collectionId)) },
+                modifier = Modifier.testTag("companion_rank_list_btn"),
+            )
         }
     }
 }
@@ -592,7 +644,7 @@ private fun DiaryHistoryPane(
         CompanionEmptyCard(
             title = "Your consumption diary is empty",
             body =
-                "Finished podcasts, archived read articles, 1001 Albums, and logged media appear here chronologically.",
+                "Finished podcasts, archived read articles, active list draws, and logged media appear here chronologically.",
             ctaLabel = "+ Log First Entry",
             onCta = onOpenQuickLog,
         )
@@ -739,9 +791,7 @@ private fun WantQueuesPane(
             ActiveListToolbar(
                 list = activeQueue,
                 canRank = entries.size >= 2,
-                onStartRank = {
-                    onAction(MainAction.StartRankingSession(activeQueue.collectionId))
-                },
+                onAction = onAction,
             )
         }
         if (entries.isEmpty()) {

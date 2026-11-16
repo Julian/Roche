@@ -25,10 +25,10 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
     private val inFlightByKey = HashMap<String, Deferred<Map<String, String>>>()
 
     suspend fun resolveStreamingIds(
-        album: DailyAlbumSnapshot,
+        album: CollectionDrawSnapshot,
         includeWikipedia: Boolean = false,
     ): Map<String, String> {
-        val baseKey = album.entryId.ifBlank { "${album.artist}|${album.name}|${album.spotifyId}" }
+        val baseKey = album.entryId.ifBlank { "${album.creator}|${album.title}|${album.spotifyId}" }
         val key = "$baseKey|wiki=$includeWikipedia"
         val (deferred, isOwner) = acquireInFlight(key)
         if (!isOwner) {
@@ -57,7 +57,7 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
     }
 
     private suspend fun performResolution(
-        album: DailyAlbumSnapshot,
+        album: CollectionDrawSnapshot,
         includeWikipedia: Boolean,
     ): Map<String, String> {
         val resolved = LinkedHashMap<String, String>()
@@ -71,7 +71,7 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
     }
 
     private suspend fun resolveStreamingPlatforms(
-        album: DailyAlbumSnapshot,
+        album: CollectionDrawSnapshot,
         resolved: MutableMap<String, String>,
     ) {
         val seedUrl = album.candidateStreamingUrls().firstOrNull()
@@ -111,8 +111,8 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         return parseOdesliLinksPayload(response.body)
     }
 
-    private suspend fun searchInnertubeAlbumId(album: DailyAlbumSnapshot): String? {
-        val query = "${album.artist} ${album.name}".trim().ifBlank { album.name.trim() }
+    private suspend fun searchInnertubeAlbumId(album: CollectionDrawSnapshot): String? {
+        val query = "${album.creator} ${album.title}".trim().ifBlank { album.title.trim() }
         if (query.isEmpty()) return null
         val payload = buildInnertubeSearchBody(query)
         val root = postInnertubeJson(INNERTUBE_SEARCH_URL, payload) ?: return null
@@ -155,9 +155,9 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
     }
 }
 
-internal fun DailyAlbumSnapshot.withResolvedStreamingIds(
+internal fun CollectionDrawSnapshot.withResolvedStreamingIds(
     resolved: Map<String, String>
-): DailyAlbumSnapshot {
+): CollectionDrawSnapshot {
     if (resolved.isEmpty()) return this
     return copy(
         youtubeMusicId = resolved[SCHEME_YT_MUSIC] ?: youtubeMusicId,
@@ -283,11 +283,11 @@ private fun toAlbumCandidate(renderer: JsonObject): InnertubeAlbumCandidate? {
 
 internal fun selectBestAlbumCandidate(
     candidates: List<InnertubeAlbumCandidate>,
-    album: DailyAlbumSnapshot,
+    album: CollectionDrawSnapshot,
 ): InnertubeAlbumCandidate? {
     if (candidates.isEmpty()) return null
-    val normTitle = normalizeMatchTokens(album.name)
-    val normArtist = normalizeMatchTokens(album.artist)
+    val normTitle = normalizeMatchTokens(album.title)
+    val normArtist = normalizeMatchTokens(album.creator)
     return candidates.maxByOrNull { candidate ->
         scoreAlbumCandidate(candidate, normTitle, normArtist)
     }

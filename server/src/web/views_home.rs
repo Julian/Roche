@@ -2,7 +2,7 @@ use std::{fmt::Write as _, sync::Arc};
 
 use axum::{
     Form,
-    extract::{Extension, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -17,8 +17,8 @@ use super::{
 };
 use crate::{
     db::{
-        CatalogEntry, ConsumptionLogView, ConsumptionStatus, Generator1001State, Item, ItemFilter,
-        ItemStatusFilter,
+        CatalogEntry, CollectionGeneratorState, ConsumptionLogView, ConsumptionStatus, Item,
+        ItemFilter, ItemStatusFilter,
     },
     error::ApiError,
     scheduler::FeedFetcher,
@@ -28,6 +28,8 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub(super) struct GeneratorToggleForm {
     pub enabled: String,
+    #[serde(default)]
+    pub redirect_list: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,7 +54,7 @@ async fn render_home_inner<F: FeedFetcher>(
     session: &WebSession,
     flash: &FlashQuery,
 ) -> Result<Response, ApiError> {
-    let gen_state = service.catalog().get_1001_generator_state().await?;
+    let active_generators = service.catalog().list_collection_generators(true).await?;
 
     let unread_page = service
         .items()
@@ -70,7 +72,9 @@ async fn render_home_inner<F: FeedFetcher>(
     let collections = service.catalog().list_collections(true, false).await?;
 
     let mut body = String::with_capacity(8_192);
-    render_1001_sleeve_section(&mut body, &gen_state, &session.csrf_token);
+    for gen_state in &active_generators {
+        render_collection_draw_section(&mut body, gen_state, &session.csrf_token);
+    }
     render_in_progress_section(&mut body, &unread_page.items);
 
     let want_total: usize = collections
@@ -100,88 +104,93 @@ async fn render_home_inner<F: FeedFetcher>(
     .into_response())
 }
 
-fn render_1001_sleeve_section(out: &mut String, state: &Generator1001State, csrf: &str) {
+pub(in crate::web) fn render_collection_draw_section(
+    out: &mut String,
+    state: &CollectionGeneratorState,
+    csrf: &str,
+) {
+    let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
+    let list_key_enc = urlencode(list_key);
     if !state.enabled {
-        let _ = write!(
-            out,
-            "<section class=\"album-sleeve\" style=\"grid-template-columns:1fr\">\n\
-               <div>\n\
-                 <div class=\"album-kicker\">1001 Albums Generator</div>\n\
-                 <h2 class=\"album-title\">One Album at a Time</h2>\n\
-                 <p class=\"meta\" style=\"margin:0.4rem 0 0.75rem\">{} albums in pool &middot; {} heard &middot; never auto-rotates until you finish or abandon.</p>\n\
-                 <form method=\"post\" action=\"/web/1001/toggle\" class=\"inline-form\">\n\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n\
-                   <input type=\"hidden\" name=\"enabled\" value=\"true\">\n\
-                   <button type=\"submit\" class=\"btn btn-primary\">Enable 1001 Albums</button>\n\
-                 </form>\n\
-               </div>\n\
-             </section>\n",
-            state.total_pool,
-            state.consumed_count,
-            esc(csrf),
-        );
         return;
     }
 
-    let Some(album) = &state.current_entry else {
+    let Some(entry) = &state.current_entry else {
         let _ = write!(
             out,
             "<section class=\"album-sleeve\" style=\"grid-template-columns:1fr\">\n\
                <div>\n\
-                 <div class=\"album-kicker\">1001 Albums Completed</div>\n\
-                 <h2 class=\"album-title\">All {} Albums Completed</h2>\n\
-                 <p class=\"meta\">{} finished &middot; {} abandoned. <a href=\"/lists/1001_albums\">View your ranked 1001 Albums &rarr;</a></p>\n\
+                 <div class=\"album-kicker\">{} Completed</div>\n\
+                 <h2 class=\"album-title\">All {} Works Completed</h2>\n\
+                 <p class=\"meta\">{} finished &middot; {} abandoned. <a href=\"/lists/{}\">View ranked list &rarr;</a></p>\n\
                </div>\n\
              </section>\n",
-            state.total_pool, state.consumed_count, state.abandoned_count
+            esc(&state.collection_title),
+            state.total_pool,
+            state.consumed_count,
+            state.abandoned_count,
+            esc(&list_key_enc),
         );
         return;
     };
 
     out.push_str("<section class=\"album-sleeve\">\n<div>\n");
-    if let Some(cover) = album.thumbnail_url.as_deref().and_then(safe_external_href) {
+    if let Some(cover) = entry.thumbnail_url.as_deref().and_then(safe_external_href) {
         let _ = writeln!(
             out,
             "<img class=\"album-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\">",
             esc(cover),
-            esc(&album.title)
+            esc(&entry.title)
         );
     } else {
         out.push_str("<div class=\"album-cover-placeholder\">&#9835;</div>\n");
     }
     out.push_str("</div>\n<div>\n");
 
-    let album_number = state.consumed_count + state.abandoned_count + 1;
+    let draw_number = state.consumed_count + state.abandoned_count + 1;
     let _ = writeln!(
         out,
-        "<div class=\"album-kicker\">1001 Albums &middot; #{} of {} ({} remaining)</div>",
-        album_number, state.total_pool, state.remaining_count
+        "<div class=\"album-kicker\"><a href=\"/lists/{}\">{}</a> &middot; #{} of {} ({} remaining)</div>",
+        esc(&list_key_enc),
+        esc(&state.collection_title),
+        draw_number,
+        state.total_pool,
+        state.remaining_count
     );
     let _ = writeln!(
         out,
         "<h2 class=\"album-title\"><a href=\"/entries/{}\">{}</a></h2>",
-        esc(&urlencode(&album.id)),
-        esc(&album.title)
+        esc(&urlencode(&entry.id)),
+        esc(&entry.title)
     );
 
-    let artist_line = if album.creators.is_empty() {
-        "Unknown Artist".to_owned()
-    } else {
-        album.creators.join(", ")
-    };
-    if let Some(yr) = album.release_year {
-        let _ = writeln!(out, "<div class=\"album-artist\">{} ({yr})</div>", esc(&artist_line));
-    } else {
-        let _ = writeln!(out, "<div class=\"album-artist\">{}</div>", esc(&artist_line));
+    if !entry.creators.is_empty() || entry.release_year.is_some() {
+        let creator_line = entry.creators.join(", ");
+        match (creator_line.is_empty(), entry.release_year) {
+            (false, Some(yr)) => {
+                let _ = writeln!(
+                    out,
+                    "<div class=\"album-artist\">{} ({yr})</div>",
+                    esc(&creator_line)
+                );
+            }
+            (false, None) => {
+                let _ = writeln!(out, "<div class=\"album-artist\">{}</div>", esc(&creator_line));
+            }
+            (true, Some(yr)) => {
+                let _ = writeln!(out, "<div class=\"album-artist\">{yr}</div>");
+            }
+            (true, None) => {}
+        }
     }
 
-    let genres = extract_album_genres(album);
+    let genres = extract_entry_tags(entry);
     if !genres.is_empty() {
         let _ = writeln!(out, "<div class=\"album-genres\">{}</div>", esc(&genres.join(" · ")));
     }
 
     out.push_str("<div class=\"album-actions\">\n");
-    for ident in album.sorted_external_identifiers() {
+    for ident in entry.sorted_external_identifiers() {
         if let Some(ext_url) = ident.external_url()
             && let Some(safe_href) = safe_external_href(&ext_url)
         {
@@ -195,48 +204,49 @@ fn render_1001_sleeve_section(out: &mut String, state: &Generator1001State, csrf
     }
     out.push_str("</div>\n");
 
-    render_1001_mutation_forms(out, csrf);
+    render_draw_mutation_forms(out, &list_key_enc, csrf);
     out.push_str("</div>\n</section>\n");
 }
 
-fn render_1001_mutation_forms(out: &mut String, csrf: &str) {
+fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) {
     let _ = write!(
         out,
         "<details class=\"album-inline-details\">\n\
            <summary class=\"btn btn-primary\">Finish &amp; Rank</summary>\n\
-           <form class=\"album-inline-form\" method=\"post\" action=\"/web/1001/finish\">\n\
+           <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/finish\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
              <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
-               <label for=\"finish-notes\">Listening Notes (optional)</label>\n\
-               <textarea id=\"finish-notes\" name=\"notes\" placeholder=\"Standout tracks, impressions...\"></textarea>\n\
+               <label for=\"finish-notes-{list}\">Notes (optional)</label>\n\
+               <textarea id=\"finish-notes-{list}\" name=\"notes\" placeholder=\"Impressions, standout moments...\"></textarea>\n\
              </div>\n\
              <button type=\"submit\" class=\"btn btn-primary\">Log Finished &amp; Rank</button>\n\
            </form>\n\
          </details>\n\
          <details class=\"album-inline-details\">\n\
-           <summary class=\"btn btn-ghost btn-small\">Abandon Album</summary>\n\
-           <form class=\"album-inline-form\" method=\"post\" action=\"/web/1001/abandon\">\n\
+           <summary class=\"btn btn-ghost btn-small\">Abandon</summary>\n\
+           <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/abandon\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
              <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
-               <label for=\"abandon-notes\">Why abandon? (optional)</label>\n\
-               <textarea id=\"abandon-notes\" name=\"notes\" placeholder=\"Stopped after side A...\"></textarea>\n\
+               <label for=\"abandon-notes-{list}\">Why abandon? (optional)</label>\n\
+               <textarea id=\"abandon-notes-{list}\" name=\"notes\" placeholder=\"Optional note...\"></textarea>\n\
              </div>\n\
              <button type=\"submit\" class=\"btn\">Abandon &amp; Draw Next</button>\n\
            </form>\n\
          </details>\n\
-         <form method=\"post\" action=\"/web/1001/toggle\" style=\"margin-top:0.55rem\">\n\
+         <form method=\"post\" action=\"/web/lists/{list}/generator/toggle\" style=\"margin-top:0.55rem\">\n\
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
            <input type=\"hidden\" name=\"enabled\" value=\"false\">\n\
-           <button type=\"submit\" class=\"link-btn\">Disable generator</button>\n\
+           <button type=\"submit\" class=\"link-btn\">Pause draw</button>\n\
          </form>\n",
+        list = esc(list_key_enc),
         csrf = esc(csrf),
     );
 }
 
-fn extract_album_genres(album: &CatalogEntry) -> Vec<String> {
+fn extract_entry_tags(entry: &CatalogEntry) -> Vec<String> {
     let mut tags = Vec::new();
-    for key in ["genres", "styles"] {
-        if let Some(arr) = album.metadata.get(key).and_then(serde_json::Value::as_array) {
+    for key in ["genres", "styles", "topics"] {
+        if let Some(arr) = entry.metadata.get(key).and_then(serde_json::Value::as_array) {
             for val in arr {
                 if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty())
                     && !tags.iter().any(|existing: &String| existing.eq_ignore_ascii_case(s))
@@ -372,39 +382,60 @@ fn render_recent_diary_section(out: &mut String, diary: &[ConsumptionLogView]) {
     }
 }
 
-pub(super) async fn post_1001_toggle<F: FeedFetcher>(
+pub(super) async fn post_generator_toggle<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     Extension(session): Extension<WebSession>,
+    Path(slug): Path<String>,
     Form(form): Form<GeneratorToggleForm>,
 ) -> Response {
     let enabled = matches!(form.enabled.trim(), "true" | "1" | "on");
-    match service.catalog().set_1001_generator_enabled(enabled).await {
-        Ok(_) => {
+    match service.catalog().set_collection_generator_enabled(&slug, enabled).await {
+        Ok(state) => {
             let msg = if enabled {
-                "1001 Albums Generator enabled"
+                format!("Enabled active draw for '{}'", state.collection_title)
             } else {
-                "1001 Albums Generator disabled"
+                format!("Paused active draw for '{}'", state.collection_title)
             };
-            redirect_see_other(&format!("/?notice={}", urlencode(msg)))
+            let to_list = form.redirect_list.as_deref().is_some_and(|v| v == "true" || v == "1");
+            if to_list {
+                let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
+                redirect_see_other(&format!(
+                    "/lists/{}?notice={}",
+                    urlencode(list_key),
+                    urlencode(&msg)
+                ))
+            } else {
+                redirect_see_other(&format!("/?notice={}", urlencode(&msg)))
+            }
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }
 
-pub(super) async fn post_1001_finish<F: FeedFetcher>(
+pub(super) async fn post_generator_finish<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     Extension(session): Extension<WebSession>,
+    Path(slug): Path<String>,
     Form(form): Form<GeneratorNotesForm>,
 ) -> Response {
-    match service.catalog().finish_active_1001_album(form.notes.as_deref()).await {
+    match service.catalog().finish_active_generator_entry(&slug, form.notes.as_deref()).await {
         Ok((completed, next_state)) => {
-            let can_rank =
-                service.catalog().can_rank_collection("albums", false).await.unwrap_or(false);
-            if can_rank {
-                let notice =
-                    format!("Finished '{}' — rank it against your albums", completed.title);
+            let list_key =
+                next_state.collection_slug.as_deref().unwrap_or(&next_state.collection_id);
+            let rank_slug =
+                if service.catalog().can_rank_collection(list_key, false).await.unwrap_or(false) {
+                    Some(list_key.to_owned())
+                } else {
+                    service.catalog().rank_target_after_consumption(&completed).await.ok().flatten()
+                };
+            if let Some(target_slug) = rank_slug {
+                let notice = format!(
+                    "Finished '{}' — rank it in {}",
+                    completed.title, next_state.collection_title
+                );
                 redirect_see_other(&format!(
-                    "/rank/albums?focus={}&notice={}",
+                    "/rank/{}?focus={}&notice={}",
+                    urlencode(&target_slug),
                     urlencode(&completed.id),
                     urlencode(&notice)
                 ))
@@ -421,12 +452,13 @@ pub(super) async fn post_1001_finish<F: FeedFetcher>(
     }
 }
 
-pub(super) async fn post_1001_abandon<F: FeedFetcher>(
+pub(super) async fn post_generator_abandon<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     Extension(session): Extension<WebSession>,
+    Path(slug): Path<String>,
     Form(form): Form<GeneratorNotesForm>,
 ) -> Response {
-    match service.catalog().abandon_active_1001_album(form.notes.as_deref()).await {
+    match service.catalog().abandon_active_generator_entry(&slug, form.notes.as_deref()).await {
         Ok((abandoned, next_state)) => {
             let next_part = next_state
                 .current_entry

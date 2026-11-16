@@ -267,8 +267,10 @@ pub struct ComparisonRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Generator1001State {
+pub struct CollectionGeneratorState {
     pub collection_id: String,
+    pub collection_slug: Option<String>,
+    pub collection_title: String,
     pub enabled: bool,
     pub current_entry: Option<CatalogEntry>,
     pub drawn_at: Option<DateTime<Utc>>,
@@ -342,7 +344,38 @@ pub struct BatchComparisonInput {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Generator1001UpdateInput {
+pub struct BatchCollectionMemberInput {
+    pub entry_ref: String,
+    #[serde(default)]
+    pub position: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCollectionInput {
+    #[serde(default)]
+    pub ref_key: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default = "default_batch_collection_role")]
+    pub role: CollectionRole,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub members: Vec<BatchCollectionMemberInput>,
+}
+
+const fn default_batch_collection_role() -> CollectionRole {
+    CollectionRole::List
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchGeneratorInput {
+    pub collection_ref: String,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -354,22 +387,25 @@ pub struct Generator1001UpdateInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatalogBatchInput {
     #[serde(default)]
+    pub collections: Vec<BatchCollectionInput>,
+    #[serde(default)]
     pub entries: Vec<BatchEntryInput>,
     #[serde(default)]
     pub logs: Vec<BatchLogInput>,
     #[serde(default)]
     pub comparisons: Vec<BatchComparisonInput>,
     #[serde(default)]
-    pub generator_1001: Option<Generator1001UpdateInput>,
+    pub generators: Vec<BatchGeneratorInput>,
     #[serde(default)]
     pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogBatchResult {
+    pub collections_processed: usize,
     pub entries_processed: usize,
     pub logs_recorded: usize,
     pub comparisons_recorded: usize,
-    pub active_1001_entry_id: Option<String>,
+    pub generators_updated: usize,
     pub dry_run: bool,
 }

@@ -15,9 +15,11 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
 
     internal suspend fun execute(action: MainAction.Mutation) = catalogActionMutex.withLock {
         when (action) {
-            is MainAction.SetAlbumGeneratorEnabled -> performToggleAlbumGenerator(action.enabled)
-            is MainAction.ConfirmFinish1001Album -> performFinish1001Album(action.notes)
-            is MainAction.ConfirmAbandon1001Album -> performAbandon1001Album(action.notes)
+            is MainAction.SetCollectionGeneratorEnabled ->
+                performToggleGenerator(action.collectionIdOrSlug, action.enabled)
+            is MainAction.ConfirmFinishDraw -> performFinishDraw(action.collectionId, action.notes)
+            is MainAction.ConfirmAbandonDraw ->
+                performAbandonDraw(action.collectionId, action.notes)
             is MainAction.StartRankingSession ->
                 performStartRankingSession(action.collectionIdOrSlug, action.focusEntryId)
             is MainAction.SubmitRankCluster -> performSubmitRankCluster(action.ordering)
@@ -34,50 +36,69 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         }
     }
 
-    private suspend fun performToggleAlbumGenerator(enabled: Boolean) {
-        runSuspendCatching { vm.repository.catalog.setAlbumGeneratorEnabled(enabled) }
+    private suspend fun performToggleGenerator(
+        collectionIdOrSlug: String,
+        enabled: Boolean,
+    ) {
+        val meta = vm.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val title = meta?.title ?: "List"
+        runSuspendCatching {
+            vm.repository.catalog.setCollectionGeneratorEnabled(collectionIdOrSlug, enabled)
+        }
             .onSuccess { drawn ->
                 val message =
                     when {
-                        !enabled -> "Disabled 1001 Albums Generator"
-                        drawn != null -> "1001 Albums active · ${drawn.name}"
-                        else -> "1001 Albums completed"
+                        !enabled -> "Paused draw for $title"
+                        drawn != null -> "$title draw active · ${drawn.title}"
+                        else -> "$title pool complete"
                     }
                 vm.showStatusMessage(message)
             }
             .onFailure { err ->
-                vm.showStatusMessage("Album generator error (${err.message ?: "error"})")
+                vm.showStatusMessage("Draw error (${err.message ?: "error"})")
             }
     }
 
-    private suspend fun performFinish1001Album(notes: String) {
-        vm.transientState.update { it.copy(albumNoteDialogMode = null) }
-        runSuspendCatching { vm.repository.catalog.finishCurrent1001Album(notes) }
-            .onSuccess { (finishedId, nextAlbum) ->
-                val openedRank =
+    private suspend fun performFinishDraw(
+        collectionId: String,
+        notes: String,
+    ) {
+        vm.transientState.update { it.copy(drawNoteDialog = null) }
+        runSuspendCatching { vm.repository.catalog.finishActiveDraw(collectionId, notes) }
+            .onSuccess { step ->
+                val openedInList =
                     openRankSessionForCollection(
-                        collectionIdOrSlug = EntryKind.ALBUM.systemListSlug,
-                        focusEntryId = finishedId,
+                        collectionIdOrSlug = step.collectionId,
+                        focusEntryId = step.entryId,
                     )
+                val openedRank =
+                    openedInList ||
+                        vm.repository.catalog.resolveEntrySystemListSlug(step.entryId)?.let { slug
+                            ->
+                            openRankSessionForCollection(slug, step.entryId)
+                        } == true
                 if (!openedRank) {
-                    val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
-                    vm.showStatusMessage("Logged #1 album to Diary$nextPart")
+                    val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
+                    vm.showStatusMessage("Logged to Diary$nextPart")
                 }
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not finish album (${err.message ?: "error"})")
+                vm.showStatusMessage("Could not finish draw (${err.message ?: "error"})")
             }
     }
 
-    private suspend fun performAbandon1001Album(notes: String) {
-        vm.transientState.update { it.copy(albumNoteDialogMode = null) }
-        runSuspendCatching { vm.repository.catalog.abandonCurrent1001Album(notes) }
-            .onSuccess { (_, nextAlbum) ->
-                val nextPart = nextAlbum?.let { " · Next: ${it.name}" }.orEmpty()
-                vm.showStatusMessage("Abandoned album$nextPart")
+    private suspend fun performAbandonDraw(
+        collectionId: String,
+        notes: String,
+    ) {
+        vm.transientState.update { it.copy(drawNoteDialog = null) }
+        runSuspendCatching { vm.repository.catalog.abandonActiveDraw(collectionId, notes) }
+            .onSuccess { step ->
+                val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
+                vm.showStatusMessage("Abandoned draw$nextPart")
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not abandon album (${err.message ?: "error"})")
+                vm.showStatusMessage("Could not abandon draw (${err.message ?: "error"})")
             }
     }
 

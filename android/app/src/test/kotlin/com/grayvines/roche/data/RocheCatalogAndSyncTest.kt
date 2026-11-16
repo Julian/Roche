@@ -560,27 +560,46 @@ class RocheCatalogAndSyncTest {
         }
 
     @Test
-    fun `1001 Albums list excludes unheard pool albums and diary excludes container kinds`() =
+    fun `generator-enabled manual list excludes unconsumed pool items and diary excludes container kinds`() =
         runTest {
             val catalog = repository.catalog
-            catalog.setAlbumGeneratorEnabled(true)
+            val listId = catalog.createCustomList("Essential Jazz")
+            val albA =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(
+                        kind = EntryKind.ALBUM,
+                        title = "Kind of Blue",
+                        creators = listOf("Miles Davis"),
+                        releaseYear = 1959,
+                    )
+                )
+            val albB =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(
+                        kind = EntryKind.ALBUM,
+                        title = "A Love Supreme",
+                        creators = listOf("John Coltrane"),
+                        releaseYear = 1965,
+                    )
+                )
+            catalog.addCollectionEntry(listId, albA, position = 1.0)
+            catalog.addCollectionEntry(listId, albB, position = 2.0)
+            catalog.setCollectionGeneratorEnabled(listId, true)
 
             val initialSnap = catalog.snapshot.first()
-            val list1001Before =
-                initialSnap.lists.first { it.collectionId == ALBUMS_1001_COLLECTION_ID }
-            assertEquals(0, list1001Before.entryCount)
-            assertTrue(catalog.selectNextRankCluster(ALBUMS_1001_COLLECTION_ID).isEmpty())
+            val listBefore = initialSnap.lists.first { it.collectionId == listId }
+            assertEquals(0, listBefore.entryCount)
+            assertEquals(2, listBefore.poolTotalCount)
+            assertEquals(2, listBefore.poolRemainingCount)
+            assertTrue(catalog.selectNextRankCluster(listId).isEmpty())
 
-            val finished1 = catalog.finishCurrent1001Album("First listen")
+            val finished1 = catalog.finishActiveDraw(listId, "First listen")
             val afterOneSnap = catalog.snapshot.first()
-            val list1001AfterOne =
-                afterOneSnap.lists.first { it.collectionId == ALBUMS_1001_COLLECTION_ID }
-            assertEquals(1, list1001AfterOne.entryCount)
+            val listAfterOne = afterOneSnap.lists.first { it.collectionId == listId }
+            assertEquals(1, listAfterOne.entryCount)
             assertEquals(
                 listOf(finished1.entryId),
-                afterOneSnap.entriesByCollectionId[ALBUMS_1001_COLLECTION_ID].orEmpty().map {
-                    it.entry.id
-                },
+                afterOneSnap.entriesByCollectionId[listId].orEmpty().map { it.entry.id },
             )
             // Synthesized ARTIST row is present in dynamic `artists` list, NOT in Diary or
             // consumedCount

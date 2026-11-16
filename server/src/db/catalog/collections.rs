@@ -34,9 +34,7 @@ impl CatalogRepo<'_> {
             qb.push(" AND cs.collection_role != 'want'");
         }
         if !include_system {
-            qb.push(
-                " AND (cs.show_in_lists = 1 OR cs.collection_role = 'want' OR cs.slug = '1001_albums')",
-            );
+            qb.push(" AND (cs.show_in_lists = 1 OR cs.collection_role = 'want')");
         }
         qb.push(" ORDER BY cs.collection_role ASC, LOWER(e.title) ASC");
         let rows: Vec<RawCollectionRow> = qb.build_query_as().fetch_all(self.pool).await?;

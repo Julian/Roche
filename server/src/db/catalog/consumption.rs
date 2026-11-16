@@ -274,6 +274,9 @@ impl CatalogRepo<'_> {
             remove_from_want_queues_in_tx(tx, canon_id, now).await?;
             Self::engage_consumed_parents_in_tx(tx, canon_id, event_ts, now).await?;
         }
+        if matches!(status, ConsumptionStatus::Consumed | ConsumptionStatus::Abandoned) {
+            Self::advance_generators_for_entry_in_tx(tx, canon_id, now).await?;
+        }
         Ok(())
     }
 

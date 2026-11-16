@@ -323,7 +323,6 @@ internal fun itemNaturalKey(feedUrl: String?, itemUrl: String): String {
 
 internal const val STARRED_COLLECTION_ID = "533b1315-6e2e-57d3-ba85-dc88531c5a0b"
 internal const val UP_NEXT_COLLECTION_ID = "3864ff37-5ed3-5256-9380-f85ff8054f1c"
-internal const val ALBUMS_1001_COLLECTION_ID = "9eb44de7-bdfb-5bea-85d1-be913c542d8b"
 
 internal fun tagNaturalKey(name: String): String = name.trim().lowercase()
 

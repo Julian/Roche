@@ -638,6 +638,18 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertCollectionGenerator(generator: CollectionGeneratorEntity)
 
+    @Query("DELETE FROM collection_generators WHERE collectionId = :collectionId")
+    suspend fun deleteCollectionGenerator(collectionId: String)
+
+    @Query("DELETE FROM collection_specs WHERE collectionId = :collectionId")
+    suspend fun deleteCollectionSpec(collectionId: String)
+
+    @Query("DELETE FROM entry_identifiers WHERE entryId = :entryId")
+    suspend fun deleteIdentifiersForEntry(entryId: String)
+
+    @Query("DELETE FROM catalog_entries WHERE id = :id")
+    suspend fun deleteCatalogEntryById(id: String)
+
     @Query("UPDATE collection_generators SET isLocalDirty = 0 WHERE collectionId = :collectionId")
     suspend fun clearCollectionGeneratorDirty(collectionId: String)
 

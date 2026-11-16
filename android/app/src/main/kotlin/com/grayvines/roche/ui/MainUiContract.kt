@@ -1,10 +1,9 @@
 package com.grayvines.roche.ui
 
-import com.grayvines.roche.data.AlbumGeneratorState
 import com.grayvines.roche.data.ArchiveStateSnapshot
 import com.grayvines.roche.data.CatalogSnapshot
+import com.grayvines.roche.data.CollectionGeneratorState
 import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.DailyAlbumSnapshot
 import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.NetworkTier
 import com.grayvines.roche.data.PeerNodeDto
@@ -39,10 +38,15 @@ enum class CompanionSubTab(val label: String) {
     WANT("Want"),
 }
 
-enum class AlbumNoteDialogMode {
+enum class DrawNoteDialogMode {
     FINISH_AND_RANK,
     ABANDON,
 }
+
+data class DrawNoteDialogState(
+    val collectionId: String,
+    val mode: DrawNoteDialogMode,
+)
 
 data class ActiveRankSessionUiState(
     val collectionIdOrSlug: String,
@@ -103,18 +107,18 @@ data class MainUiState(
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
     val quickLogTargetCollectionTitle: String? = null,
-    val albumNoteDialogMode: AlbumNoteDialogMode? = null,
+    val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val playerState: PodcastPlayerState = PodcastPlayerState(),
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
 ) {
-    val albumGenerator: AlbumGeneratorState
-        get() = catalog.albumGenerator
+    val enabledGenerators: List<CollectionGeneratorState>
+        get() = catalog.generators.filter { it.enabled }
 
-    val dailyAlbum: DailyAlbumSnapshot?
-        get() = catalog.albumGenerator.currentAlbum
+    val activeCollectionDraws: List<CollectionGeneratorState>
+        get() = if (settings.showCollectionDrawsOnHome) enabledGenerators else emptyList()
 
     val activePlayerEntry: InboxEntry?
         get() {
@@ -359,6 +363,8 @@ sealed interface MainAction {
 
     data class SetSwipeToArchive(val enabled: Boolean) : Mutation
 
+    data class SetShowCollectionDrawsOnHome(val enabled: Boolean) : Mutation
+
     data class SetBottomNavSlot(val slotIndex: Int, val tab: AppTab) : Mutation
 
     data object ResetBottomNavTabs : Mutation
@@ -382,17 +388,29 @@ sealed interface MainAction {
 
     data object CloseQuickLogSheet : Ui
 
-    data class OpenAlbumNoteDialog(val mode: AlbumNoteDialogMode) : Ui
+    data class OpenDrawNoteDialog(
+        val collectionId: String,
+        val mode: DrawNoteDialogMode,
+    ) : Ui
 
-    data object CloseAlbumNoteDialog : Ui
+    data object CloseDrawNoteDialog : Ui
 
     data object CloseRankSession : Ui
 
-    data class SetAlbumGeneratorEnabled(val enabled: Boolean) : Mutation
+    data class SetCollectionGeneratorEnabled(
+        val collectionIdOrSlug: String,
+        val enabled: Boolean,
+    ) : Mutation
 
-    data class ConfirmFinish1001Album(val notes: String) : Mutation
+    data class ConfirmFinishDraw(
+        val collectionId: String,
+        val notes: String,
+    ) : Mutation
 
-    data class ConfirmAbandon1001Album(val notes: String) : Mutation
+    data class ConfirmAbandonDraw(
+        val collectionId: String,
+        val notes: String,
+    ) : Mutation
 
     data class StartRankingSession(
         val collectionIdOrSlug: String,
@@ -474,7 +492,7 @@ internal data class TransientUiState(
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
     val quickLogTargetCollectionTitle: String? = null,
-    val albumNoteDialogMode: AlbumNoteDialogMode? = null,
+    val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val undoEvent: UndoArchiveEvent? = null,
@@ -687,8 +705,9 @@ private fun reduceCatalogUiAction(
                 quickLogTargetCollectionId = null,
                 quickLogTargetCollectionTitle = null,
             )
-        is MainAction.OpenAlbumNoteDialog -> state.copy(albumNoteDialogMode = action.mode)
-        MainAction.CloseAlbumNoteDialog -> state.copy(albumNoteDialogMode = null)
+        is MainAction.OpenDrawNoteDialog ->
+            state.copy(drawNoteDialog = DrawNoteDialogState(action.collectionId, action.mode))
+        MainAction.CloseDrawNoteDialog -> state.copy(drawNoteDialog = null)
         MainAction.CloseRankSession -> state.copy(rankSession = null)
         else -> state
     }
@@ -884,7 +903,7 @@ internal class MainUiStateMemoizer {
             quickLogDefaultWant = local.quickLogDefaultWant,
             quickLogTargetCollectionId = local.quickLogTargetCollectionId,
             quickLogTargetCollectionTitle = local.quickLogTargetCollectionTitle,
-            albumNoteDialogMode = local.albumNoteDialogMode,
+            drawNoteDialog = local.drawNoteDialog,
             rankSession = local.rankSession,
             playerState = playerState,
             undoEvent = local.undoEvent,

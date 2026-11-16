@@ -63,9 +63,39 @@ async fn test_upfront_dedup_edition_merging_artist_synthesis_and_song_vs_album_r
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let catalog = db.catalog();
 
-    // 1. Seed 1001 Albums and verify logging a Deluxe Edition resolves to the exact 1001 Album
-    let seeded = catalog.ensure_1001_albums_seeded().await.unwrap();
-    assert!(seeded >= 1_000);
+    // 1. Seed two album entries in a manual pool and verify logging a Deluxe Edition resolves to the exact canonical album
+    let pool = catalog
+        .create_manual_collection(
+            "Jazz Canon",
+            Some("jazz_canon"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let sinatra_orig = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "In The Wee Small Hours".to_owned(),
+            creators: vec!["Frank Sinatra".to_owned()],
+            parent_collection_id: Some(pool.id.clone()),
+            parent_position: Some(1.0),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let newport = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Ellington at Newport".to_owned(),
+            creators: vec!["Duke Ellington".to_owned()],
+            parent_collection_id: Some(pool.id.clone()),
+            parent_position: Some(2.0),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
 
     let sinatra_remaster = catalog
         .upsert_entry(&UpsertEntryInput {
@@ -76,18 +106,17 @@ async fn test_upfront_dedup_edition_merging_artist_synthesis_and_song_vs_album_r
         })
         .await
         .unwrap();
-    assert_eq!(sinatra_remaster.id, "83f8410d-71bc-5ea4-911e-06869fe1b039");
+    assert_eq!(sinatra_remaster.id, sinatra_orig.id);
     assert_eq!(sinatra_remaster.title, "In The Wee Small Hours");
 
-    // 2. Consuming a single `song` on an unheard 1001 album engages `artist` ("Duke Ellington")
+    // 2. Consuming a single `song` on an unheard album engages `artist` ("Duke Ellington")
     //    but NEVER marks the parent `album` ("Ellington at Newport") consumed!
-    let newport_id = "c8edff07-31ae-5f23-9d42-03468251904a";
     let track = catalog
         .upsert_entry(&UpsertEntryInput {
             kind: Some(EntryKind::Song),
             title: "Diminuendo and Crescendo in Blue".to_owned(),
             creators: vec!["Duke Ellington".to_owned()],
-            parent_collection_id: Some(newport_id.to_owned()),
+            parent_collection_id: Some(newport.id.clone()),
             parent_position: Some(4.0),
             ..UpsertEntryInput::default()
         })
@@ -105,9 +134,9 @@ async fn test_upfront_dedup_edition_merging_artist_synthesis_and_song_vs_album_r
         albums_ranked.rows.is_empty(),
         "Consuming a single song must NEVER mark its parent album as consumed"
     );
-    let gen_state = catalog.get_1001_generator_state().await.unwrap();
+    let gen_state = catalog.get_collection_generator(&pool.id).await.unwrap();
     assert_eq!(gen_state.consumed_count, 0);
-    assert_eq!(gen_state.remaining_count, gen_state.total_pool);
+    assert_eq!(gen_state.remaining_count, 2);
 }
 
 #[tokio::test]
@@ -405,44 +434,68 @@ async fn test_diary_jan_1st_space_timestamp_and_auto_consumption_idempotency() {
 }
 
 #[tokio::test]
-async fn test_strict_1001_albums_generator_never_auto_rotates_and_advances_on_finish_or_abandon() {
+async fn test_generic_collection_generator_never_auto_rotates_and_advances_on_finish_or_abandon() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let catalog = db.catalog();
 
-    let initial = catalog.get_1001_generator_state().await.unwrap();
+    let pool = catalog
+        .create_manual_collection(
+            "Reading Pile",
+            Some("reading_pile"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    for (pos, title) in [(1.0, "Dune"), (2.0, "Solaris"), (3.0, "Roadside Picnic")] {
+        catalog
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Book),
+                title: title.to_owned(),
+                parent_collection_id: Some(pool.id.clone()),
+                parent_position: Some(pos),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let initial = catalog.get_collection_generator("reading_pile").await.unwrap();
     assert!(!initial.enabled);
     assert!(initial.current_entry.is_none());
-    assert_eq!(initial.total_pool, 1_101);
+    assert_eq!(initial.total_pool, 3);
 
-    // Enabling draws one album
-    let enabled1 = catalog.set_1001_generator_enabled(true).await.unwrap();
+    // Enabling draws one work
+    let enabled1 = catalog.set_collection_generator_enabled("reading_pile", true).await.unwrap();
     assert!(enabled1.enabled);
     let draw1 = enabled1.current_entry.unwrap();
 
-    // Calling enable again or disable -> enable MUST preserve the exact same active album (never auto-rotates!)
-    let enabled_again = catalog.set_1001_generator_enabled(true).await.unwrap();
+    // Calling enable again or pause -> enable MUST preserve the exact same active draw (never auto-rotates!)
+    let enabled_again =
+        catalog.set_collection_generator_enabled("reading_pile", true).await.unwrap();
     assert_eq!(enabled_again.current_entry.unwrap().id, draw1.id);
-    catalog.set_1001_generator_enabled(false).await.unwrap();
-    let reenabled = catalog.set_1001_generator_enabled(true).await.unwrap();
+    catalog.set_collection_generator_enabled("reading_pile", false).await.unwrap();
+    let reenabled = catalog.set_collection_generator_enabled("reading_pile", true).await.unwrap();
     assert_eq!(reenabled.current_entry.unwrap().id, draw1.id);
 
     // Finishing logs `consumed` and draws next
     let (finished, after_finish) =
-        catalog.finish_active_1001_album(Some("Loved side B")).await.unwrap();
+        catalog.finish_active_generator_entry("reading_pile", Some("Great ending")).await.unwrap();
     assert_eq!(finished.id, draw1.id);
     assert_eq!(after_finish.consumed_count, 1);
     assert_eq!(after_finish.abandoned_count, 0);
-    assert_eq!(after_finish.remaining_count, 1_100);
+    assert_eq!(after_finish.remaining_count, 2);
     let draw2 = after_finish.current_entry.unwrap();
     assert_ne!(draw2.id, draw1.id);
 
-    // Abandoning logs `abandoned` and draws next
+    // Abandoning logs `abandoned` and draws the remaining work
     let (abandoned, after_abandon) =
-        catalog.abandon_active_1001_album(Some("Not for me")).await.unwrap();
+        catalog.abandon_active_generator_entry("reading_pile", Some("Not for me")).await.unwrap();
     assert_eq!(abandoned.id, draw2.id);
     assert_eq!(after_abandon.consumed_count, 1);
     assert_eq!(after_abandon.abandoned_count, 1);
-    assert_eq!(after_abandon.remaining_count, 1_099);
+    assert_eq!(after_abandon.remaining_count, 1);
     assert_ne!(after_abandon.current_entry.unwrap().id, draw2.id);
 }
 

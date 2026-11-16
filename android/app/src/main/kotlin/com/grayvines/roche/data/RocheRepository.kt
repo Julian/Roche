@@ -23,7 +23,6 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.io.File
-import java.io.InputStream
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -81,7 +80,6 @@ class RocheRepository(
     private val cacheDir: File? = null,
     private val networkTierProvider: NetworkTierProvider = NetworkTierProvider { NetworkTier.WIFI },
     private val backgroundScope: CoroutineScope? = null,
-    poolStreamProvider: (() -> InputStream?)? = null,
     private val albumStreamingResolver: AlbumStreamingResolver? = null,
 ) {
     private val dao = database.dao()
@@ -96,7 +94,6 @@ class RocheRepository(
     val catalog: CatalogStore =
         CatalogStore(
             dao = dao,
-            poolStreamProvider = poolStreamProvider,
             onLocalMutation = ::triggerBackgroundCatalogSync,
         )
     @Volatile
@@ -143,24 +140,25 @@ class RocheRepository(
 
     suspend fun prewarm(): RepositorySnapshot = snapshot.first()
 
-    suspend fun resolveDailyAlbumStreaming(
-        album: DailyAlbumSnapshot,
+    suspend fun resolveCollectionDrawStreaming(
+        draw: CollectionDrawSnapshot,
         includeWikipedia: Boolean = false,
-    ): DailyAlbumSnapshot {
-        val resolver = albumStreamingResolver ?: return album
-        val resolved = resolver.resolveStreamingIds(album, includeWikipedia = includeWikipedia)
-        if (resolved.isNotEmpty() && album.entryId.isNotBlank()) {
-            catalog.attachEntryIdentifiers(album.entryId, resolved)
+    ): CollectionDrawSnapshot {
+        val resolver = albumStreamingResolver ?: return draw
+        if (!draw.isMusicKind) return draw
+        val resolved = resolver.resolveStreamingIds(draw, includeWikipedia = includeWikipedia)
+        if (resolved.isNotEmpty() && draw.entryId.isNotBlank()) {
+            catalog.attachEntryIdentifiers(draw.entryId, resolved)
         }
-        return album.withResolvedStreamingIds(resolved)
+        return draw.withResolvedStreamingIds(resolved)
     }
 
-    suspend fun prewarmDailyAlbumStreaming(album: DailyAlbumSnapshot) {
-        if (albumStreamingResolver == null) return
-        if (album.hasYoutubePlaylistId && !album.wikipediaUrl.isNullOrBlank()) return
-        val dedupKey = album.entryId.ifBlank { "${album.artist}|${album.name}|${album.spotifyId}" }
+    suspend fun prewarmCollectionDraw(draw: CollectionDrawSnapshot) {
+        if (albumStreamingResolver == null || draw.kind != EntryKind.ALBUM) return
+        if (draw.hasYoutubePlaylistId && !draw.wikipediaUrl.isNullOrBlank()) return
+        val dedupKey = draw.entryId.ifBlank { "${draw.creator}|${draw.title}|${draw.spotifyId}" }
         if (!prewarmedAlbumKeys.add(dedupKey)) return
-        resolveDailyAlbumStreaming(album, includeWikipedia = album.wikipediaUrl.isNullOrBlank())
+        resolveCollectionDrawStreaming(draw, includeWikipedia = draw.wikipediaUrl.isNullOrBlank())
     }
 
     internal suspend fun searchDeepEntries(rawQuery: String): List<InboxEntry> =

@@ -14,7 +14,6 @@ import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.lang.reflect.Proxy
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -215,7 +214,6 @@ class PodcastMedia3PlaybackTest {
                     apiClient = apiClient,
                     settings = settings,
                     cacheDir = File(tempDir, "cache_skip_init"),
-                    poolStreamProvider = { ByteArrayInputStream(ByteArray(0)) },
                 )
             val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
             val controller =
@@ -367,7 +365,6 @@ class PodcastMedia3PlaybackTest {
                 apiClient = apiClient,
                 settings = settings,
                 cacheDir = File(tempDir, "cache"),
-                poolStreamProvider = { ByteArrayInputStream(ByteArray(0)) },
             )
         val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         val drainJobs: suspend () -> Unit = {

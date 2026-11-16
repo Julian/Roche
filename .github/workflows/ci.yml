@@ -159,6 +159,13 @@ jobs:
           done
       - name: Record the profile on the managed AOSP emulator
         run: ./android/gradlew -p android :app:generateReleaseBaselineProfile -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+      - name: Upload baseline profile test report on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: baselineprofile-test-report
+          path: android/baselineprofile/build/reports/androidTests/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: baseline-profile
