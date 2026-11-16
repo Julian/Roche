@@ -170,7 +170,7 @@ class MainScreenTest {
         org.junit.Assert.assertTrue(dispatched.contains(MainAction.ResetBottomNavTabs))
         composeRule.onNodeWithTag("settings_subpage_back_btn").performClick()
 
-        composeRule.onNodeWithTag("settings_server_row").performClick()
+        composeRule.onNodeWithTag("settings_server_row").performScrollTo().performClick()
         composeRule.onNodeWithText("Server & Pairing").assertExists()
         composeRule.onNodeWithTag("server_url_input").assertExists()
         composeRule.onNodeWithTag("pairing_code_input").assertExists()
