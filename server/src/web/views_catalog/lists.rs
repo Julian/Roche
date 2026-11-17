@@ -7,13 +7,13 @@ use axum::{
 };
 
 use super::{
-    AddListEntryForm, CreateListForm, ListPageQuery, parse_csv_list, parse_optional_year,
-    render_kind_options,
+    AddListEntryForm, CreateListForm, ListPageQuery, ListsOverviewQuery, parse_csv_list,
+    parse_optional_year, render_kind_options, render_search_kind_options,
 };
 use crate::{
     db::{
-        CollectionGeneratorState, CollectionMode, CollectionRole, EntryKind, RankedCollectionView,
-        UpsertEntryInput,
+        CatalogEntry, CollectionGeneratorState, CollectionMode, CollectionRole, EntryKind,
+        RankedCollectionView, UpsertEntryInput,
     },
     error::ApiError,
     scheduler::FeedFetcher,
@@ -30,11 +30,12 @@ use crate::{
 };
 
 const LIST_PAGE_SIZE: usize = 200;
+const CATALOG_SEARCH_LIMIT: usize = 80;
 
 pub(in crate::web) async fn lists_get<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     Extension(session): Extension<WebSession>,
-    Query(flash): Query<FlashQuery>,
+    Query(query): Query<ListsOverviewQuery>,
 ) -> Response {
     let collections = match service.catalog().list_collections(false, false).await {
         Ok(cols) => cols,
@@ -43,14 +44,132 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
         }
     };
 
-    let mut body = String::with_capacity(4_096);
+    let clean_q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let raw_kind = query.kind.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let (parsed_kind, invalid_kind) =
+        raw_kind.map_or((None, None), |raw| match EntryKind::parse_flexible(raw) {
+            Ok(k) if k != EntryKind::Collection => (Some(k), None),
+            _ => (None, Some(raw)),
+        });
+    let is_searching = clean_q.is_some() || parsed_kind.is_some() || invalid_kind.is_some();
+
+    let search_bundle = if invalid_kind.is_some() {
+        Some((Vec::new(), HashMap::new(), false))
+    } else if is_searching {
+        let fetch_limit = if parsed_kind.is_none() { 500 } else { CATALOG_SEARCH_LIMIT + 1 };
+        let non_collections =
+            match service.catalog().search_entries(clean_q, parsed_kind, fetch_limit).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|e| e.kind != EntryKind::Collection)
+                    .take(CATALOG_SEARCH_LIMIT + 1)
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
+                }
+            };
+        let truncated = non_collections.len() > CATALOG_SEARCH_LIMIT;
+        let matched: Vec<CatalogEntry> =
+            non_collections.into_iter().take(CATALOG_SEARCH_LIMIT).collect();
+        let creators: Vec<String> =
+            matched.iter().flat_map(|e| e.creators.iter().cloned()).collect();
+        let artist_links = load_artist_id_by_lower_name(&service, &creators).await;
+        Some((matched, artist_links, truncated))
+    } else {
+        None
+    };
+
+    let mut body = String::with_capacity(6_144);
     body.push_str(
         "<h2>Lists</h2>\n\
          <p class=\"lede\">Global quality rankings across media collections, inferred from tie-aware k-way comparisons.</p>\n",
     );
+    render_catalog_search_form(&mut body, clean_q, parsed_kind, is_searching);
+    if let Some((ref matched, ref artist_links, truncated)) = search_bundle {
+        render_catalog_search_results(&mut body, matched, artist_links, truncated);
+    }
+    render_new_manual_list_panel(&mut body, &session.csrf_token);
+    if is_searching {
+        body.push_str("<h3>All Lists</h3>\n");
+    }
+    render_lists_overview_table(&mut body, &collections);
 
+    let err =
+        query.err.or_else(|| invalid_kind.map(|bad| format!("Unknown entry kind filter '{bad}'")));
+    let flash = FlashQuery { notice: query.notice, err };
+    render_page(&PageShell {
+        title: "Lists",
+        active: NavSection::Lists,
+        csrf_token: &session.csrf_token,
+        flash: &flash,
+        body_html: &body,
+    })
+    .into_response()
+}
+
+fn render_catalog_search_form(
+    out: &mut String,
+    clean_q: Option<&str>,
+    parsed_kind: Option<EntryKind>,
+    is_searching: bool,
+) {
     let _ = write!(
-        body,
+        out,
+        "<form method=\"get\" action=\"/lists\" style=\"display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem\">\n\
+           <input type=\"search\" name=\"q\" aria-label=\"Search catalog\" value=\"{}\" placeholder=\"Search catalog works, artists, creators, identifiers...\" style=\"flex:1;min-width:14rem\">\n\
+           <select name=\"kind\" aria-label=\"Filter by kind\">{}</select>\n\
+           <button type=\"submit\" class=\"btn\">Search</button>",
+        esc(clean_q.unwrap_or("")),
+        render_search_kind_options(parsed_kind),
+    );
+    if is_searching {
+        out.push_str("\n<a class=\"btn btn-ghost\" href=\"/lists\">Clear</a>");
+    }
+    out.push_str("\n</form>\n");
+}
+
+fn render_catalog_search_results(
+    out: &mut String,
+    results: &[CatalogEntry],
+    artist_links: &HashMap<String, String>,
+    truncated: bool,
+) {
+    let count_suffix = if truncated { "+" } else { "" };
+    let _ = writeln!(
+        out,
+        "<div class=\"section-head\"><h3>Search Results ({}{count_suffix})</h3>\
+         <a class=\"section-action\" href=\"/lists\">Clear &times;</a></div>",
+        results.len()
+    );
+    if results.is_empty() {
+        out.push_str("<p class=\"empty\">No matching works in catalog.</p>\n");
+        return;
+    }
+    out.push_str("<ul class=\"plain\" style=\"margin-bottom:1.75rem\">\n");
+    for entry in results {
+        let _ = write!(
+            out,
+            "<li><a href=\"/entries/{}\">{}</a>",
+            esc(&urlencode(&entry.id)),
+            esc(&entry.title),
+        );
+        if !entry.creators.is_empty() {
+            out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+            render_creator_links(out, &entry.creators, artist_links, false);
+            out.push_str("</span>");
+        }
+        if let Some(yr) = entry.release_year {
+            let _ = write!(out, " <span style=\"color:var(--ink-faint)\">({yr})</span>");
+        }
+        let _ =
+            writeln!(out, " <span class=\"badge\">{}</span></li>", esc(entry.kind.display_label()));
+    }
+    out.push_str("</ul>\n");
+}
+
+fn render_new_manual_list_panel(out: &mut String, csrf: &str) {
+    let _ = write!(
+        out,
         "<details class=\"editorial-panel\">\n\
            <summary>+ New Manual List</summary>\n\
            <form method=\"post\" action=\"/web/lists/create\">\n\
@@ -64,47 +183,40 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
              <button type=\"submit\" class=\"btn btn-primary\">Create List</button>\n\
            </form>\n\
          </details>\n",
-        csrf = esc(&session.csrf_token),
+        csrf = esc(csrf),
     );
+}
 
+fn render_lists_overview_table(out: &mut String, collections: &[crate::db::CollectionSummary]) {
     if collections.is_empty() {
-        body.push_str("<p class=\"empty\">No lists yet.</p>\n");
-    } else {
-        body.push_str("<table class=\"lists\">\n<tbody>\n");
-        for col in &collections {
-            let slug = col.slug.as_deref().unwrap_or(&col.id);
-            let _ = write!(
-                body,
-                "<tr>\n\
-                   <td class=\"name\"><a href=\"/lists/{slug_enc}\">{title}</a></td>\n\
-                   <td class=\"stat\">{members} works</td>\n\
-                   <td class=\"stat\">{comps} comparisons</td>\n\
-                   <td class=\"stat\">",
-                slug_enc = esc(&urlencode(slug)),
-                title = esc(&col.title),
-                members = col.member_count,
-                comps = col.comparison_count,
-            );
-            if col.member_count >= 2 {
-                let _ = write!(
-                    body,
-                    "<a class=\"btn btn-small\" href=\"/rank/{}\">Compare</a>",
-                    esc(&urlencode(slug))
-                );
-            }
-            body.push_str("</td>\n</tr>\n");
-        }
-        body.push_str("</tbody>\n</table>\n");
+        out.push_str("<p class=\"empty\">No lists yet.</p>\n");
+        return;
     }
-
-    render_page(&PageShell {
-        title: "Lists",
-        active: NavSection::Lists,
-        csrf_token: &session.csrf_token,
-        flash: &flash,
-        body_html: &body,
-    })
-    .into_response()
+    out.push_str("<table class=\"lists\">\n<tbody>\n");
+    for col in collections {
+        let slug = col.slug.as_deref().unwrap_or(&col.id);
+        let _ = write!(
+            out,
+            "<tr>\n\
+               <td class=\"name\"><a href=\"/lists/{slug_enc}\">{title}</a></td>\n\
+               <td class=\"stat\">{members} works</td>\n\
+               <td class=\"stat\">{comps} comparisons</td>\n\
+               <td class=\"stat\">",
+            slug_enc = esc(&urlencode(slug)),
+            title = esc(&col.title),
+            members = col.member_count,
+            comps = col.comparison_count,
+        );
+        if col.member_count >= 2 {
+            let _ = write!(
+                out,
+                "<a class=\"btn btn-small\" href=\"/rank/{}\">Compare</a>",
+                esc(&urlencode(slug))
+            );
+        }
+        out.push_str("</td>\n</tr>\n");
+    }
+    out.push_str("</tbody>\n</table>\n");
 }
 
 pub(in crate::web) async fn post_list_create<F: FeedFetcher>(

@@ -7,7 +7,9 @@ import com.grayvines.roche.data.remote.HttpTransport
 import com.grayvines.roche.data.remote.rocheJson
 import java.net.URI
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonArray
@@ -20,9 +22,15 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 
-class AlbumStreamingResolver(private val transport: HttpTransport) {
+class AlbumStreamingResolver(
+    private val transport: HttpTransport,
+    private val backgroundScope: CoroutineScope? = null,
+    private val catalogStoreProvider: (() -> CatalogStore)? = null,
+    private val onArtistIdsResolved: (suspend (String, Map<String, String>) -> Unit)? = null,
+) {
     private val inFlightMutex = Mutex()
     private val inFlightByKey = HashMap<String, Deferred<Map<String, String>>>()
+    private val completedArtistSchemes = HashSet<Pair<String, String>>()
 
     suspend fun resolveStreamingIds(
         album: CollectionDrawSnapshot,
@@ -34,13 +42,145 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         if (!isOwner) {
             return deferred.await()
         }
-        val result = runSuspendCatching {
-            performResolution(album, includeWikipedia)
+        val result: Map<String, String>
+        try {
+            result =
+                runSuspendCatching { performResolution(album, includeWikipedia) }
+                    .getOrDefault(emptyMap())
+            deferred.complete(result)
+        } finally {
+            inFlightMutex.withLock { inFlightByKey.remove(key) }
+            deferred.complete(emptyMap())
         }
-            .getOrDefault(emptyMap())
-        inFlightMutex.withLock { inFlightByKey.remove(key) }
-        deferred.complete(result)
+        scheduleArtistEnrichment(album)
         return result
+    }
+
+    private suspend fun scheduleArtistEnrichment(album: CollectionDrawSnapshot) {
+        if (catalogStoreProvider == null && onArtistIdsResolved == null) return
+        if (backgroundScope != null) {
+            backgroundScope.launch { enrichAlbumArtistBestEffort(album) }
+        } else {
+            enrichAlbumArtistBestEffort(album)
+        }
+    }
+
+    private suspend fun enrichAlbumArtistBestEffort(album: CollectionDrawSnapshot) {
+        val cleanArtist = album.creator.trim()
+        if (cleanArtist.isEmpty() || cleanArtist.equals(VARIOUS_ARTISTS_NAME, ignoreCase = true)) {
+            return
+        }
+        val plan = buildArtistEnrichmentPlan(cleanArtist, album.spotifyId) ?: return
+        val artistIds =
+            resolveArtistStreamingIds(
+                artistName = cleanArtist,
+                albumTitle = album.title,
+                albumSpotifyId = album.spotifyId,
+                needWikipedia = plan.needWikipedia,
+                needSpotify = plan.needSpotify,
+            )
+        inFlightMutex.withLock {
+            if (plan.needWikipedia) {
+                completedArtistSchemes.add(plan.lowerArtist to SCHEME_WIKIPEDIA)
+            }
+            if (plan.needSpotify) {
+                completedArtistSchemes.add(plan.lowerArtist to SCHEME_SPOTIFY)
+            }
+        }
+        if (artistIds.isNotEmpty()) {
+            runSuspendCatching {
+                catalogStoreProvider?.invoke()?.attachEntryIdentifiers(plan.artistId, artistIds)
+                onArtistIdsResolved?.invoke(plan.artistId, artistIds)
+            }
+        }
+    }
+
+    private suspend fun buildArtistEnrichmentPlan(
+        cleanArtist: String,
+        albumSpotifyId: String?,
+    ): ArtistEnrichmentPlan? {
+        val lowerArtist = cleanArtist.lowercase()
+        val detId = deterministicTitleEntryId("artist", lowerArtist)
+        val store = catalogStoreProvider?.invoke()
+        val resolvedId = if (store != null) store.followMergedId(detId) ?: return null else detId
+        val existingSchemes =
+            store
+                ?.dao
+                ?.getIdentifiersForEntry(resolvedId)
+                ?.map { it.scheme.lowercase() }
+                ?.toSet()
+                .orEmpty()
+        val (doneWiki, doneSpotify) =
+            inFlightMutex.withLock {
+                val wikiDone = lowerArtist to SCHEME_WIKIPEDIA in completedArtistSchemes
+                val spDone = lowerArtist to SCHEME_SPOTIFY in completedArtistSchemes
+                wikiDone to spDone
+            }
+        val needWiki = SCHEME_WIKIPEDIA !in existingSchemes && !doneWiki
+        val needSpotify =
+            SCHEME_SPOTIFY !in existingSchemes && !albumSpotifyId.isNullOrBlank() && !doneSpotify
+        return if (needWiki || needSpotify) {
+            ArtistEnrichmentPlan(resolvedId, lowerArtist, needWiki, needSpotify)
+        } else {
+            null
+        }
+    }
+
+    @Suppress("LongParameterList")
+    suspend fun resolveArtistStreamingIds(
+        artistName: String,
+        albumTitle: String = "",
+        albumSpotifyId: String? = null,
+        needWikipedia: Boolean = true,
+        needSpotify: Boolean = true,
+    ): Map<String, String> {
+        val cleanArtist = artistName.trim()
+        if (cleanArtist.isEmpty() || !needWikipedia && !needSpotify) {
+            return emptyMap()
+        }
+        val key = "artist|${cleanArtist.lowercase()}|wiki=$needWikipedia|sp=$needSpotify"
+        val (deferred, isOwner) = acquireInFlight(key)
+        if (!isOwner) {
+            return deferred.await()
+        }
+        return try {
+            val result = runSuspendCatching {
+                performArtistResolution(
+                    artistName = cleanArtist,
+                    albumTitle = albumTitle,
+                    albumSpotifyId = albumSpotifyId,
+                    needWikipedia = needWikipedia,
+                    needSpotify = needSpotify,
+                )
+            }
+                .getOrDefault(emptyMap())
+            deferred.complete(result)
+            result
+        } finally {
+            inFlightMutex.withLock { inFlightByKey.remove(key) }
+            deferred.complete(emptyMap())
+        }
+    }
+
+    private suspend fun performArtistResolution(
+        artistName: String,
+        albumTitle: String,
+        albumSpotifyId: String?,
+        needWikipedia: Boolean,
+        needSpotify: Boolean,
+    ): Map<String, String> {
+        val resolved = LinkedHashMap<String, String>()
+        if (needWikipedia) {
+            resolveArtistWikiSlug(transport, artistName, albumTitle)?.let {
+                resolved[SCHEME_WIKIPEDIA] = it
+            }
+        }
+        if (needSpotify && !albumSpotifyId.isNullOrBlank()) {
+            resolveSpotifyArtistUri(transport, albumSpotifyId, artistName)?.let {
+                resolved[SCHEME_SPOTIFY] = it
+            }
+        }
+        return resolved
     }
 
     private suspend fun acquireInFlight(
@@ -444,6 +584,13 @@ private fun JsonObjectBuilder.putInnertubeContext() {
     }
 }
 
+private data class ArtistEnrichmentPlan(
+    val artistId: String,
+    val lowerArtist: String,
+    val needWikipedia: Boolean,
+    val needSpotify: Boolean,
+)
+
 private const val SCHEME_YT_MUSIC = "youtube_music"
 private const val SCHEME_APPLE_MUSIC = "apple_music"
 private const val SCHEME_TIDAL = "tidal"
@@ -451,6 +598,7 @@ private const val SCHEME_QOBUZ = "qobuz"
 private const val SCHEME_DEEZER = "deezer"
 private const val SCHEME_AMAZON_MUSIC = "amazon_music"
 private const val SCHEME_WIKIPEDIA = "wikipedia"
+private const val SCHEME_SPOTIFY = "spotify"
 private const val YT_BROWSE_PREFIX = "MPREb"
 private const val YT_OLAK_PREFIX = "OLAK5uy_"
 private const val YT_MUSIC_ORIGIN_URL = "https://music.youtube.com"

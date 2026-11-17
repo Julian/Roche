@@ -16,12 +16,16 @@ use crate::{
     scheduler::FeedFetcher,
     service::RocheService,
     web::{
+        artist_enrich::enrich_artist_detail_if_needed,
         auth::WebSession,
         html::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
             web_api_error_response,
         },
-        links::{collect_web_external_links, load_artist_id_by_lower_name, render_creator_links},
+        links::{
+            collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
+            render_creator_links, sanitize_non_local_href,
+        },
     },
 };
 
@@ -31,7 +35,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
     Path(id): Path<String>,
     Query(flash): Query<FlashQuery>,
 ) -> Response {
-    let detail = match service.catalog().get_entry_detail(&id).await {
+    let mut detail = match service.catalog().get_entry_detail(&id).await {
         Ok(Some(d)) => d,
         Ok(None) => {
             return web_api_error_response(
@@ -43,6 +47,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
             return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
         }
     };
+    enrich_artist_detail_if_needed(&service, &mut detail).await;
 
     let mut relevant_creators: Vec<String> = detail.entry.creators.clone();
     relevant_creators.extend(detail.children.iter().flat_map(|c| c.creators.iter().cloned()));
@@ -137,8 +142,48 @@ fn render_entry_detail_body(
     csrf: &str,
 ) {
     let entry = &detail.entry;
-    let _ = writeln!(out, "<h2>{}</h2>", esc(&entry.title));
+    let artwork_url = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href);
+    if let Some(thumb) = artwork_url {
+        let _ = write!(
+            out,
+            "<div class=\"entry-hero\">\n\
+               <img class=\"entry-artwork\" src=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\n\
+               <div class=\"entry-hero-main\">\n",
+            esc(thumb),
+            esc(&entry.title),
+        );
+    }
 
+    let _ = writeln!(out, "<h2>{}</h2>", esc(&entry.title));
+    render_entry_facts(out, entry, appearances, artist_links);
+
+    if has_reader_item {
+        let _ = writeln!(
+            out,
+            "<p><a class=\"btn btn-primary btn-small\" href=\"/reader/{}\">Open in Reader &rarr;</a></p>",
+            esc(&urlencode(&entry.id))
+        );
+    }
+
+    if let Some(sum) = entry.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = writeln!(out, "<p class=\"meta\">{}</p>", esc(sum));
+    }
+
+    render_entry_external_links(out, entry);
+    if artwork_url.is_some() {
+        out.push_str("</div>\n</div>\n");
+    }
+
+    render_entry_relations(out, detail);
+    render_entry_diary_and_actions(out, detail, manual_lists, csrf);
+}
+
+fn render_entry_facts(
+    out: &mut String,
+    entry: &CatalogEntry,
+    appearances: &[EntryListAppearance],
+    artist_links: &HashMap<String, String>,
+) {
     out.push_str("<dl class=\"facts\">\n");
     let _ = writeln!(out, "<dt>Kind</dt><dd>{}</dd>", esc(entry.kind.display_label()));
     if !entry.creators.is_empty() {
@@ -148,6 +193,10 @@ fn render_entry_detail_body(
     }
     if let Some(yr) = entry.release_year {
         let _ = writeln!(out, "<dt>Year</dt><dd>{yr}</dd>");
+    }
+    let genres = extract_entry_tags(entry);
+    if !genres.is_empty() {
+        let _ = writeln!(out, "<dt>Genres</dt><dd>{}</dd>", esc(&genres.join(" · ")));
     }
     if !appearances.is_empty() {
         out.push_str("<dt>Rankings</dt><dd><ul class=\"plain\">");
@@ -176,22 +225,6 @@ fn render_entry_detail_body(
         out.push_str("</ul></dd>\n");
     }
     out.push_str("</dl>\n");
-
-    if has_reader_item {
-        let _ = writeln!(
-            out,
-            "<p><a class=\"btn btn-primary btn-small\" href=\"/reader/{}\">Open in Reader &rarr;</a></p>",
-            esc(&urlencode(&entry.id))
-        );
-    }
-
-    if let Some(sum) = entry.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "<p class=\"meta\">{}</p>", esc(sum));
-    }
-
-    render_entry_external_links(out, entry);
-    render_entry_relations(out, detail);
-    render_entry_diary_and_actions(out, detail, manual_lists, csrf);
 }
 
 fn render_entry_external_links(out: &mut String, entry: &CatalogEntry) {

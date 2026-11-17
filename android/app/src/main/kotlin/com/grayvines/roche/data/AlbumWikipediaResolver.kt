@@ -139,7 +139,7 @@ private fun computePositiveWikiScore(
     return score
 }
 
-private fun splitWikipediaDisambiguator(rawTitle: String): Pair<String, String> {
+internal fun splitWikipediaDisambiguator(rawTitle: String): Pair<String, String> {
     val trimmed = rawTitle.trim()
     if (!trimmed.endsWith(')')) return trimmed to ""
     val openIdx = trimmed.lastIndexOf(" (")
@@ -151,19 +151,16 @@ private fun splitWikipediaDisambiguator(rawTitle: String): Pair<String, String> 
     }
 }
 
-private fun stripWikipediaSnippetHtml(raw: String): String =
-    raw.replace(HTML_TAG_REGEX, " ")
-        .replace("&quot;", " ")
-        .replace("&amp;", " ")
-        .replace("&#039;", "")
+internal fun stripWikipediaSnippetHtml(raw: String): String =
+    decodeHtmlEntities(raw.replace(WIKI_HTML_TAG_REGEX, " "))
 
-private fun containsWord(haystack: String, word: String): Boolean =
+internal fun containsWord(haystack: String, word: String): Boolean =
     haystack.split(' ').any { it == word }
 
 private const val WORD_ALBUM = "album"
 private const val DISAMBIG_PREFIX_LEN = 2
-private const val WIKI_HTTP_OK_START = 200
-private const val WIKI_HTTP_OK_END = 299
+internal const val WIKI_HTTP_OK_START = 200
+internal const val WIKI_HTTP_OK_END = 299
 private const val EXACT_TITLE_SCORE = 20
 private const val PARTIAL_TITLE_SCORE = 10
 private const val DISAMBIG_ALBUM_SCORE = 14
@@ -172,8 +169,8 @@ private const val SNIPPET_ALBUM_SCORE = 6
 private const val WIKI_YEAR_SCORE = 4
 private const val NON_ALBUM_PENALTY = 25
 private val NON_ALBUM_DISAMBIG_WORDS = setOf("song", "single", "film", "tour", "band", "musician")
-private val HTML_TAG_REGEX = Regex("<[^>]+>")
-private const val WIKIPEDIA_SEARCH_ENDPOINT =
+internal val WIKI_HTML_TAG_REGEX = Regex("<[^>]+>")
+internal const val WIKIPEDIA_SEARCH_ENDPOINT =
     "https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=5&utf8=1&format=json"
 internal val WIKIPEDIA_HEADERS =
     mapOf(

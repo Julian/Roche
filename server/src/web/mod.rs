@@ -1,3 +1,4 @@
+mod artist_enrich;
 mod auth;
 mod html;
 mod links;

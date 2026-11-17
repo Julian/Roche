@@ -18,6 +18,14 @@ pub(super) use lists::{
 };
 
 #[derive(Debug, Default, Deserialize)]
+pub(super) struct ListsOverviewQuery {
+    pub q: Option<String>,
+    pub kind: Option<String>,
+    pub notice: Option<String>,
+    pub err: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct ListPageQuery {
     pub page: Option<usize>,
     pub notice: Option<String>,
@@ -108,6 +116,38 @@ pub(super) fn render_kind_options(selected: EntryKind) -> String {
     let mut out = String::with_capacity(512);
     for k in LOGGABLE {
         let sel = if k == selected { " selected" } else { "" };
+        let _ = write!(
+            out,
+            "<option value=\"{}\"{sel}>{}</option>",
+            k.as_str(),
+            esc(k.display_label())
+        );
+    }
+    out
+}
+
+pub(super) fn render_search_kind_options(selected: Option<EntryKind>) -> String {
+    const SEARCHABLE: [EntryKind; 14] = [
+        EntryKind::Album,
+        EntryKind::Artist,
+        EntryKind::Movie,
+        EntryKind::Book,
+        EntryKind::Tv,
+        EntryKind::Game,
+        EntryKind::Song,
+        EntryKind::Article,
+        EntryKind::Paper,
+        EntryKind::Podcast,
+        EntryKind::PodcastEpisode,
+        EntryKind::Video,
+        EntryKind::Publication,
+        EntryKind::Channel,
+    ];
+    let mut out = String::with_capacity(640);
+    let all_sel = if selected.is_none() { " selected" } else { "" };
+    let _ = write!(out, "<option value=\"\"{all_sel}>All kinds</option>");
+    for k in SEARCHABLE {
+        let sel = if selected == Some(k) { " selected" } else { "" };
         let _ = write!(
             out,
             "<option value=\"{}\"{sel}>{}</option>",

@@ -10,16 +10,19 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-        safe_external_href, urlencode, web_api_error_response,
+        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+        web_api_error_response,
     },
-    links::{collect_web_external_links, load_artist_id_by_lower_name, render_creator_links},
+    links::{
+        collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
+        render_creator_links, sanitize_non_local_href,
+    },
     views_reader::render_audio_play_button,
 };
 use crate::{
     db::{
-        CatalogEntry, CollectionGeneratorState, ConsumptionLogView, ConsumptionStatus, Item,
-        ItemFilter, ItemStatusFilter,
+        CollectionGeneratorState, ConsumptionLogView, ConsumptionStatus, Item, ItemFilter,
+        ItemStatusFilter,
     },
     error::ApiError,
     scheduler::FeedFetcher,
@@ -145,10 +148,10 @@ pub(in crate::web) fn render_collection_draw_section(
     };
 
     out.push_str("<section class=\"album-sleeve\">\n<div>\n");
-    if let Some(cover) = entry.thumbnail_url.as_deref().and_then(safe_external_href) {
+    if let Some(cover) = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
         let _ = writeln!(
             out,
-            "<img class=\"album-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\">",
+            "<img class=\"album-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
             esc(cover),
             esc(&entry.title)
         );
@@ -239,25 +242,6 @@ fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) 
         list = esc(list_key_enc),
         csrf = esc(csrf),
     );
-}
-
-fn extract_entry_tags(entry: &CatalogEntry) -> Vec<String> {
-    let mut tags = Vec::new();
-    for key in ["genres", "styles", "topics"] {
-        if let Some(arr) = entry.metadata.get(key).and_then(serde_json::Value::as_array) {
-            for val in arr {
-                if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty())
-                    && !tags.iter().any(|existing: &String| existing.eq_ignore_ascii_case(s))
-                {
-                    tags.push(s.to_owned());
-                    if tags.len() >= 5 {
-                        return tags;
-                    }
-                }
-            }
-        }
-    }
-    tags
 }
 
 fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {

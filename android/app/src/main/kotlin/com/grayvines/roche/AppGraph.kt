@@ -57,15 +57,24 @@ class AppGraph(context: Context) : AutoCloseable {
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
 
     val repository: RocheRepository by lazy {
-        RocheRepository(
-            database = database,
-            apiClient = apiClient,
-            settings = settings,
-            cacheDir = offlineCacheDir,
-            networkTierProvider = networkTierProvider,
-            backgroundScope = appScope,
-            albumStreamingResolver = AlbumStreamingResolver(httpTransport),
-        )
+        lateinit var repo: RocheRepository
+        val resolver =
+            AlbumStreamingResolver(
+                transport = httpTransport,
+                backgroundScope = appScope,
+                catalogStoreProvider = { repo.catalog },
+            )
+        repo =
+            RocheRepository(
+                database = database,
+                apiClient = apiClient,
+                settings = settings,
+                cacheDir = offlineCacheDir,
+                networkTierProvider = networkTierProvider,
+                backgroundScope = appScope,
+                albumStreamingResolver = resolver,
+            )
+        repo
     }
 
     val thumbnailLoader: ThumbnailLoader by lazy {

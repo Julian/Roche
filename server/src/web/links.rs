@@ -133,8 +133,38 @@ fn classify_url_host(raw_url: &str) -> Option<UrlHostClass> {
     None
 }
 
-fn sanitize_non_local_href(raw: &str) -> Option<&str> {
-    safe_external_href(raw).filter(|u| !u.starts_with("https://roche.local/"))
+#[must_use]
+pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
+    let href = safe_external_href(raw)?;
+    let parsed = url::Url::parse(href).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    match parsed.host()? {
+        url::Host::Domain(domain) => {
+            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+            if lower.is_empty()
+                || !lower.contains('.')
+                || lower.rsplit('.').next().is_some_and(|tld| matches!(tld, "local" | "localhost"))
+            {
+                return None;
+            }
+        }
+        url::Host::Ipv4(v4) => {
+            if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+                return None;
+            }
+        }
+        url::Host::Ipv6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return None;
+            }
+        }
+    }
+    Some(href)
 }
 
 fn has_valid_scheme(entry: &CatalogEntry, target_scheme: &str) -> bool {
@@ -287,4 +317,24 @@ pub(in crate::web) fn render_creator_links(
             let _ = write!(out, "{}", esc(creator));
         }
     }
+}
+
+#[must_use]
+pub(in crate::web) fn extract_entry_tags(entry: &CatalogEntry) -> Vec<String> {
+    let mut tags = Vec::new();
+    for key in ["genres", "styles", "topics"] {
+        if let Some(arr) = entry.metadata.get(key).and_then(serde_json::Value::as_array) {
+            for val in arr {
+                if let Some(s) = val.as_str().map(str::trim).filter(|s| !s.is_empty())
+                    && !tags.iter().any(|existing: &String| existing.eq_ignore_ascii_case(s))
+                {
+                    tags.push(s.to_owned());
+                    if tags.len() >= 5 {
+                        return tags;
+                    }
+                }
+            }
+        }
+    }
+    tags
 }

@@ -1099,3 +1099,215 @@ async fn test_web_unused_music_suppression_spotify_dedup_and_non_music_icons() {
     assert!(movie_html.contains("<span>IMDb</span>"));
     assert!(movie_html.contains("<svg class=\"icon\""));
 }
+
+#[tokio::test]
+async fn test_entry_detail_renders_artwork_and_metadata_genres() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let album = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Kind of Blue".to_owned(),
+            creators: vec!["Miles Davis".to_owned()],
+            release_year: Some(1959),
+            thumbnail_url: Some("https://i.scdn.co/image/ab67616d0000b273kindofblue".to_owned()),
+            metadata: Some(serde_json::json!({
+                "genres": ["Modal Jazz", "Cool Jazz"],
+                "styles": ["Post-Bop", "modal jazz"]
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let resp = get_authed(&app, &format!("/entries/{}", album.id), &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html =
+        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("<div class=\"entry-hero\">"));
+    assert!(html.contains("class=\"entry-artwork\""));
+    assert!(html.contains("src=\"https://i.scdn.co/image/ab67616d0000b273kindofblue\""));
+    assert!(html.contains("referrerpolicy=\"no-referrer\""));
+    assert!(html.contains("<dt>Genres</dt><dd>Modal Jazz · Cool Jazz · Post-Bop</dd>"));
+}
+
+#[tokio::test]
+async fn test_lists_overview_catalog_search_and_kind_filter() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let album = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Vespertine".to_owned(),
+            creators: vec!["Björk".to_owned()],
+            release_year: Some(2001),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let movie = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Dancer in the Dark".to_owned(),
+            creators: vec!["Lars von Trier".to_owned()],
+            release_year: Some(2000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let artists = db.catalog().find_artist_ids_by_names(&["Björk".to_owned()]).await.unwrap();
+    let bjork_id = artists.get("björk").expect("synthesized artist for Björk");
+
+    let q_resp = get_authed(&app, "/lists?q=Vespertine", &cookie).await;
+    assert_eq!(q_resp.status(), StatusCode::OK);
+    let q_html =
+        String::from_utf8(to_bytes(q_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(q_html.contains("Search Results (1)"));
+    assert!(q_html.contains(&format!("/entries/{}\">Vespertine</a>", album.id)));
+    assert!(q_html.contains(&format!("<a href=\"/entries/{bjork_id}\">Björk</a>")));
+    assert!(q_html.contains("(2001)"));
+    assert!(q_html.contains("<span class=\"badge\">Album</span>"));
+    assert!(!q_html.contains("Dancer in the Dark"));
+
+    let kind_resp = get_authed(&app, "/lists?kind=artist", &cookie).await;
+    let kind_html =
+        String::from_utf8(to_bytes(kind_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(kind_html.contains(&format!("/entries/{bjork_id}\">Björk</a>")));
+    assert!(!kind_html.contains(&format!("/entries/{}\">Dancer in the Dark</a>", movie.id)));
+
+    let bogus_resp = get_authed(&app, "/lists?q=Vespertine&kind=bogus", &cookie).await;
+    let bogus_html =
+        String::from_utf8(to_bytes(bogus_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(bogus_html.contains("Unknown entry kind filter &#39;bogus&#39;"));
+    assert!(bogus_html.contains("Search Results (0)"));
+    assert!(!bogus_html.contains(&format!("/entries/{}\">Vespertine</a>", album.id)));
+}
+
+#[test]
+fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
+    use super::artist_enrich::{
+        WikipediaSearchHit, encode_wiki_path_segment, extract_spotify_artist_uri_from_album_html,
+        parse_wikipedia_artist_summary_json, select_best_artist_wikipedia_slug,
+    };
+    use super::links::sanitize_non_local_href;
+
+    assert_eq!(sanitize_non_local_href("HTTPS://ROCHE.LOCAL/entry/123"), None);
+    assert_eq!(sanitize_non_local_href("http://127.0.0.1:8080/thumb.jpg"), None);
+    assert_eq!(encode_wiki_path_segment("AC/DC"), "AC%2FDC");
+
+    let nirvana_hits = vec![
+        WikipediaSearchHit {
+            title: "Nirvana".to_owned(),
+            snippet: "In Indian religions, nirvana is the liberation from samsara.".to_owned(),
+        },
+        WikipediaSearchHit {
+            title: "Nirvana (band)".to_owned(),
+            snippet: "American rock band formed in Aberdeen in 1987.".to_owned(),
+        },
+        WikipediaSearchHit {
+            title: "Nirvana (UK band)".to_owned(),
+            snippet: "British progressive rock band formed in London in 1967.".to_owned(),
+        },
+    ];
+    // Equal-score tie breaks in favor of Wikipedia's top-ranked hit (`Nirvana (band)`)
+    assert_eq!(
+        select_best_artist_wikipedia_slug(&nirvana_hits, "Nirvana", &[]),
+        Some("Nirvana_(band)".to_owned())
+    );
+
+    let elvis_hits = vec![
+        WikipediaSearchHit {
+            title: "Elvis Presley (album)".to_owned(),
+            snippet: "Debut studio album by American singer Elvis Presley.".to_owned(),
+        },
+        WikipediaSearchHit {
+            title: "Elvis Presley".to_owned(),
+            snippet: "American singer and actor (1935–1977).".to_owned(),
+        },
+    ];
+    assert_eq!(
+        select_best_artist_wikipedia_slug(&elvis_hits, "Elvis Presley", &["Elvis Presley".into()]),
+        Some("Elvis_Presley".to_owned())
+    );
+
+    // `<script>if (x<a && y>z)` must not corrupt anchor scanning or numeric HTML entity decoding
+    let collab_html = r#"
+        <script>if (x<a && y>z) { console.log("ok"); }</script>
+        <meta name="music:musician" content="https://open.spotify.com/artist/1111111111111111111111"/>
+        <meta name="music:musician" content="https://open.spotify.com/artist/2222222222222222222222"/>
+        <a href="/artist/1111111111111111111111">Guns N&#8217; Roses</a>
+        <a href="/artist/2222222222222222222222">Brian Eno</a>
+    "#;
+    assert_eq!(
+        extract_spotify_artist_uri_from_album_html(collab_html, "Guns N' Roses", false),
+        Some("spotify:artist:1111111111111111111111".to_owned())
+    );
+    assert_eq!(
+        extract_spotify_artist_uri_from_album_html(collab_html, "Brian Eno", false),
+        Some("spotify:artist:2222222222222222222222".to_owned())
+    );
+    assert_eq!(extract_spotify_artist_uri_from_album_html(collab_html, "Unknown", true), None);
+
+    // Mid-paragraph "debut album by" and "step by step" must NOT reject valid artist summaries
+    let arctic_json = r#"{"type":"standard","description":"English rock band","extract":"Arctic Monkeys are an English rock band formed in Sheffield in 2002. Moving step by step, their 2006 record became the fastest-selling debut album by a band in UK chart history."}"#;
+    assert!(parse_wikipedia_artist_summary_json(arctic_json, true).is_some());
+
+    let furniture_json = r#"{"type":"standard","description":"Item of furniture","extract":"A table is an item of furniture with a flat top."}"#;
+    assert_eq!(parse_wikipedia_artist_summary_json(furniture_json, true), None);
+}
+
+#[tokio::test]
+async fn test_artist_detail_enrichment_persists_links_portrait_and_bio() {
+    use super::artist_enrich::enrich_artist_detail_with_fetcher;
+
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    db.catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "21".to_owned(),
+            creators: vec!["Adele".to_owned()],
+            identifiers: vec![ident("spotify", "spotify:album:5duyQokC4FMcWPYTV9Gpf9")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let artists = db.catalog().find_artist_ids_by_names(&["Adele".to_owned()]).await.unwrap();
+    let adele_id = artists.get("adele").unwrap().clone();
+    let mut detail = db.catalog().get_entry_detail(&adele_id).await.unwrap().unwrap();
+
+    let service = RocheService::new(db.clone(), DummyWebFetcher, Config::default());
+    let mock_fetcher = |url: &Url| -> Option<String> {
+        let s = url.as_str();
+        if s.contains("open.spotify.com/album/") {
+            Some(r#"<meta name="music:musician" content="https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"/><a href="/artist/4dpARuHxo51G3z768sgnrY">Adele</a>"#.to_owned())
+        } else if s.contains("w/api.php") {
+            Some(r#"{"query":{"search":[{"title":"Adele","snippet":"English singer-songwriter (born 1988)."}]}}"#.to_owned())
+        } else if s.contains("api/rest_v1/page/summary/Adele") {
+            Some(r#"{"type":"standard","description":"English singer-songwriter","extract":"Adele Laurie Blue Adkins is an English singer-songwriter.","thumbnail":{"source":"https://upload.wikimedia.org/wikipedia/commons/adele.jpg"}}"#.to_owned())
+        } else {
+            None
+        }
+    };
+    enrich_artist_detail_with_fetcher(&service, &mut detail, &mock_fetcher).await;
+
+    let resp = get_authed(&app, &format!("/entries/{adele_id}"), &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html =
+        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("https://en.wikipedia.org/wiki/Adele"));
+    assert!(html.contains("https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"));
+    assert!(html.contains("src=\"https://upload.wikimedia.org/wikipedia/commons/adele.jpg\""));
+    assert!(html.contains("Adele Laurie Blue Adkins is an English singer-songwriter."));
+}

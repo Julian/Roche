@@ -841,6 +841,32 @@ article.reader-article {
 
 /* --- Entry Detail Page (Great parity) --- */
 
+.entry-hero {
+  display: grid;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 1.35rem;
+  align-items: start;
+  margin-bottom: 1.25rem;
+}
+
+.entry-hero-main {
+  min-width: 0;
+}
+
+.entry-hero-main > h2:first-child {
+  margin-top: 0;
+}
+
+.entry-artwork {
+  width: 8.5rem;
+  max-height: 12.5rem;
+  height: auto;
+  object-fit: cover;
+  border: 1px solid var(--rule);
+  background: var(--paper-deep);
+  display: block;
+}
+
 dl.facts {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -1165,7 +1191,8 @@ footer.colophon {
   html { font-size: 16px; }
   body { padding: 1.75rem 1.1rem 6.5rem; }
   td.score, th.score { display: none; }
-  .album-sleeve {
+  .album-sleeve,
+  .entry-hero {
     grid-template-columns: 1fr;
   }
   .diary-row {
