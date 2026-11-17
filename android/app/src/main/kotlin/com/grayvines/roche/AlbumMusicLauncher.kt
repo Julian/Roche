@@ -3,6 +3,7 @@ package com.grayvines.roche
 import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.content.pm.verify.domain.DomainVerificationManager
@@ -74,7 +75,12 @@ internal fun selectMusicUrlResolution(
     val uniqueByPackage = LinkedHashMap<String, MusicUrlCandidate>()
     for (candidate in candidates) {
         val pkg = candidate.packageName
-        if (pkg.isBlank() || pkg == selfPackageName || pkg in browserPackages) {
+        val excluded =
+            pkg.isBlank() ||
+                pkg == selfPackageName ||
+                pkg in browserPackages ||
+                isNonMusicVideoPackage(pkg)
+        if (excluded) {
             continue
         }
         val existing = uniqueByPackage[pkg]
@@ -131,6 +137,8 @@ internal fun toMusicUrlCandidate(
 ): MusicUrlCandidate? {
     val activityInfo = info.activityInfo ?: return null
     val pkg = activityInfo.packageName.orEmpty()
+    val isVideoCategory = activityInfo.applicationInfo?.category == ApplicationInfo.CATEGORY_VIDEO
+    if (isVideoCategory || isNonMusicVideoPackage(pkg)) return null
     val userState = runCatching { dvm?.getDomainVerificationUserState(pkg) }.getOrNull()
     if (userState?.isLinkHandlingAllowed == false) return null
     return MusicUrlCandidate(
@@ -146,10 +154,28 @@ internal fun isHostUserSelected(
     host: String,
 ): Boolean {
     if (userState == null || host.isBlank()) return false
-    val hostStates = userState.hostToStateMap
-    val wildcardHost = "*.${host.substringAfter('.', missingDelimiterValue = "")}"
+    return isHostDomainSelected(userState.hostToStateMap, host)
+}
+
+internal fun isHostDomainSelected(
+    hostStates: Map<String, Int>,
+    host: String,
+): Boolean {
+    if (host.isBlank()) return false
+    val parentDomain = host.substringAfter('.', missingDelimiterValue = "")
+    val wildcardHost =
+        parentDomain.takeIf { it.isNotBlank() && it != SHARED_VIDEO_PARENT_DOMAIN }?.let { "*.$it" }
     return hostStates[host] == DomainVerificationUserState.DOMAIN_STATE_SELECTED ||
-        hostStates[wildcardHost] == DomainVerificationUserState.DOMAIN_STATE_SELECTED
+        wildcardHost != null &&
+            hostStates[wildcardHost] == DomainVerificationUserState.DOMAIN_STATE_SELECTED
+}
+
+internal fun isNonMusicVideoPackage(packageName: String): Boolean {
+    val clean = packageName.trim()
+    return clean in NON_MUSIC_VIDEO_PACKAGES ||
+        NON_MUSIC_VIDEO_PACKAGE_PREFIXES.any { prefix ->
+            clean == prefix || clean.startsWith("$prefix.")
+        }
 }
 
 internal fun queryBrowserPackages(packageManager: PackageManager): Set<String> {
@@ -239,6 +265,28 @@ internal fun buildAlbumSearchIntent(
 }
 
 private const val BROWSER_PROBE_URL = "https://example.invalid"
+private const val SHARED_VIDEO_PARENT_DOMAIN = "youtube.com"
+
+private val NON_MUSIC_VIDEO_PACKAGES =
+    setOf(
+        "com.google.android.youtube",
+        "com.google.android.youtube.tv",
+        "app.revanced.android.youtube",
+        "app.rvx.android.youtube",
+        "com.vanced.android.youtube",
+        "com.github.libretube",
+        "com.futo.platformplayer",
+    )
+
+private val NON_MUSIC_VIDEO_PACKAGE_PREFIXES =
+    listOf(
+        "org.schabi.newpipe",
+        "org.polymorphicshade.tubular",
+        "org.polymorphicshade.newpipe",
+        "InfinityLoop1309.NewPipeEnhanced",
+        "org.bravenewpipe",
+        "free.rm.skytube",
+    )
 
 private val PLATFORM_PROBE_URLS =
     listOf(

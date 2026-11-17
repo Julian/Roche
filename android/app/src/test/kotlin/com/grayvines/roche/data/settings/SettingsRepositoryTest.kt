@@ -2,12 +2,15 @@
 
 package com.grayvines.roche.data.settings
 
+import android.content.pm.verify.domain.DomainVerificationUserState
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
 import com.grayvines.roche.MusicUrlCandidate
 import com.grayvines.roche.MusicUrlResolution
 import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.candidateStreamingUrls
+import com.grayvines.roche.isHostDomainSelected
+import com.grayvines.roche.isNonMusicVideoPackage
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -454,6 +457,50 @@ class SettingsRepositoryTest {
                 browserPackages = browsers,
             ),
         )
+
+        val metrolistMatch =
+            MusicUrlCandidate(
+                packageName = "com.metrolist.music",
+                activityName = "com.metrolist.music.MainActivity",
+                url = "https://music.youtube.com/playlist?list=OLAK5uy_1",
+                isUserSelectedForHost = false,
+            )
+        val newPipeSelected =
+            MusicUrlCandidate(
+                packageName = "org.schabi.newpipe",
+                activityName = "org.schabi.newpipe.RouterActivity",
+                url = "https://music.youtube.com/playlist?list=OLAK5uy_1",
+                isUserSelectedForHost = true,
+            )
+        val mainYoutubeVideoApp =
+            MusicUrlCandidate(
+                packageName = "com.google.android.youtube",
+                activityName = "com.google.android.youtube.UrlActivity",
+                url = "https://music.youtube.com/playlist?list=OLAK5uy_1",
+                isUserSelectedForHost = true,
+            )
+        assertEquals(
+            MusicUrlResolution.SingleTarget(metrolistMatch),
+            selectMusicUrlResolution(
+                candidates = listOf(newPipeSelected, mainYoutubeVideoApp, metrolistMatch),
+                selfPackageName = "com.grayvines.roche",
+                browserPackages = browsers,
+            ),
+        )
+        assertTrue(isNonMusicVideoPackage("org.schabi.newpipe"))
+        assertTrue(isNonMusicVideoPackage("org.schabi.newpipe.debug"))
+        assertTrue(isNonMusicVideoPackage("com.google.android.youtube"))
+        assertTrue(isNonMusicVideoPackage("app.revanced.android.youtube"))
+        assertFalse(isNonMusicVideoPackage("com.metrolist.music"))
+        assertFalse(isNonMusicVideoPackage("com.google.android.apps.youtube.music"))
+        assertFalse(isNonMusicVideoPackage("app.revanced.android.apps.youtube.music"))
+
+        val selected = DomainVerificationUserState.DOMAIN_STATE_SELECTED
+        assertFalse(isHostDomainSelected(mapOf("*.youtube.com" to selected), "music.youtube.com"))
+        assertTrue(
+            isHostDomainSelected(mapOf("music.youtube.com" to selected), "music.youtube.com")
+        )
+        assertTrue(isHostDomainSelected(mapOf("*.spotify.com" to selected), "open.spotify.com"))
     }
 
     @Test
