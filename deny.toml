@@ -3,6 +3,9 @@ ignore = [
     # sqlx-sqlite 0.8.6 pins libsqlite3-sys ^0.30.0 (0.30.1); roche-server only opens its own
     # local database and WAL files, never untrusted database/WAL file pairs.
     "RUSTSEC-2026-0459",
+    # chrono was marked unmaintained upstream (not a vulnerability); feed-rs 3.0.0 unconditionally
+    # depends on chrono in its public Feed/Entry API, so no transitive upgrade path exists yet.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
