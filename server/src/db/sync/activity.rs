@@ -6,11 +6,13 @@ use sqlx::SqliteConnection;
 use super::SyncRepo;
 use crate::db::{ActivityAction, ActivityEntityType};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SyncTombstone {
     pub entity_type: ActivityEntityType,
     pub natural_key: String,
     pub deleted_at: DateTime<Utc>,
+    #[serde(default)]
+    pub hlc: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,15 +23,6 @@ pub struct ActivityEntry {
     pub action: ActivityAction,
     pub timestamp: DateTime<Utc>,
 }
-
-#[derive(Debug, Clone, Copy)]
-pub(in crate::db::sync) enum OutgoingSince {
-    All,
-    Inclusive(DateTime<Utc>),
-    StrictlyAfter(DateTime<Utc>),
-}
-
-pub(in crate::db::sync) const OUTGOING_SYNC_ROW_CAP: usize = 100_000;
 
 impl SyncRepo<'_> {
     pub async fn record_activity(
@@ -76,6 +69,35 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
+    pub async fn record_tombstone_with_hlc(
+        conn: &mut SqliteConnection,
+        entity_type: ActivityEntityType,
+        natural_key: &str,
+        deleted_at: DateTime<Utc>,
+        hlc: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at, hlc)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(entity_type, natural_key) DO UPDATE SET
+                 deleted_at = CASE
+                     WHEN excluded.hlc > sync_tombstones.hlc THEN excluded.deleted_at
+                     ELSE sync_tombstones.deleted_at
+                 END,
+                 hlc = CASE
+                     WHEN excluded.hlc > sync_tombstones.hlc THEN excluded.hlc
+                     ELSE sync_tombstones.hlc
+                 END",
+        )
+        .bind(entity_type)
+        .bind(natural_key)
+        .bind(deleted_at)
+        .bind(hlc)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
     pub async fn clear_tombstone(
         conn: &mut SqliteConnection,
         entity_type: ActivityEntityType,
@@ -95,72 +117,29 @@ impl SyncRepo<'_> {
         &self,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<SyncTombstone>> {
-        let mode = since.map_or(OutgoingSince::All, OutgoingSince::Inclusive);
-        let (rows, _) = self.list_tombstones_bounded(mode).await?;
-        Ok(rows)
-    }
-
-    pub(in crate::db::sync) async fn list_tombstones_bounded(
-        &self,
-        since: OutgoingSince,
-    ) -> Result<(Vec<SyncTombstone>, Option<DateTime<Utc>>)> {
-        let fetch_limit =
-            i64::try_from(OUTGOING_SYNC_ROW_CAP.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut rows: Vec<SyncTombstone> = match since {
-            OutgoingSince::All => {
-                sqlx::query_as!(
-                    SyncTombstone,
-                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
-                            natural_key,
-                            deleted_at AS \"deleted_at: DateTime<Utc>\"
+        let rows = match since {
+            None => {
+                sqlx::query_as::<_, SyncTombstone>(
+                    "SELECT entity_type, natural_key, deleted_at, hlc
                      FROM sync_tombstones
-                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
-                     LIMIT ?",
-                    fetch_limit,
+                     ORDER BY sync_seq ASC",
                 )
                 .fetch_all(self.pool)
                 .await?
             }
-            OutgoingSince::Inclusive(ts) => {
-                sqlx::query_as!(
-                    SyncTombstone,
-                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
-                            natural_key,
-                            deleted_at AS \"deleted_at: DateTime<Utc>\"
+            Some(ts) => {
+                sqlx::query_as::<_, SyncTombstone>(
+                    "SELECT entity_type, natural_key, deleted_at, hlc
                      FROM sync_tombstones
                      WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
-                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
-                     LIMIT ?",
-                    ts as _,
-                    fetch_limit,
+                     ORDER BY sync_seq ASC",
                 )
-                .fetch_all(self.pool)
-                .await?
-            }
-            OutgoingSince::StrictlyAfter(ts) => {
-                sqlx::query_as!(
-                    SyncTombstone,
-                    "SELECT entity_type AS \"entity_type: ActivityEntityType\",
-                            natural_key,
-                            deleted_at AS \"deleted_at: DateTime<Utc>\"
-                     FROM sync_tombstones
-                     WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', ?)
-                     ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) ASC, entity_type ASC, natural_key ASC
-                     LIMIT ?",
-                    ts as _,
-                    fetch_limit,
-                )
+                .bind(ts)
                 .fetch_all(self.pool)
                 .await?
             }
         };
-        let trunc_ts = if rows.len() > OUTGOING_SYNC_ROW_CAP {
-            rows.truncate(OUTGOING_SYNC_ROW_CAP);
-            rows.last().map(|r| r.deleted_at)
-        } else {
-            None
-        };
-        Ok((rows, trunc_ts))
+        Ok(rows)
     }
 
     pub async fn list_activity(&self) -> Result<Vec<ActivityEntry>> {
@@ -212,20 +191,40 @@ impl SyncRepo<'_> {
 
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
+        let mut tx = self.pool.begin().await?;
+        let pruned_max_seq: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(sync_seq) FROM sync_tombstones
+             WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
+        )
+        .bind(cutoff)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+
+        if let Some(seq) = pruned_max_seq {
+            sqlx::query(
+                "UPDATE sync_clock SET min_retained_seq = MAX(min_retained_seq, ?) WHERE id = 1",
+            )
+            .bind(seq)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let result = sqlx::query!(
             "DELETE FROM activity_log
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', timestamp) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
             cutoff as _,
         )
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await?;
         let _ = sqlx::query!(
             "DELETE FROM sync_tombstones
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
             cutoff as _,
         )
-        .execute(self.pool)
+        .execute(&mut *tx)
         .await;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }

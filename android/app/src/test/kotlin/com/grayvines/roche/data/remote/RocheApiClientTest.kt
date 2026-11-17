@@ -1,8 +1,11 @@
 package com.grayvines.roche.data.remote
 
+import com.grayvines.roche.data.SyncCollectionEntryDto
+import com.grayvines.roche.data.SyncEntryContentDto
+import com.grayvines.roche.data.SyncEntryRecordDto
+import com.grayvines.roche.data.SyncEntryStateDto
+import com.grayvines.roche.data.SyncFeedSourceDto
 import com.grayvines.roche.data.SyncTombstoneDto
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.model.ContentType
 import java.io.File
 import java.io.IOException
@@ -920,62 +923,92 @@ private suspend fun verifyBlankLocationRedirectError(
 private val TEST_JSON_BYTES = """{"ok":true}""".toByteArray()
 
 internal fun verifyPeerSyncWireRoundTrip() {
-    val payload =
-        buildPeerSyncRequestPayload(
-            PeerSyncRequestDto(
-                peerId = "android-1",
-                deviceName = "Pixel",
-                feeds =
-                    listOf(
-                        FeedEntity(
-                            id = "f-pod",
-                            title = "Pod",
-                            url = "https://pod.example.com/rss",
-                            siteUrl = null,
-                            feedType = "podcast",
-                        )
-                    ),
-                items =
-                    listOf(
-                        PeerSyncItemPayload(
-                            id = "i-unread",
-                            feedId = "f-pod",
-                            feedUrl = "https://pod.example.com/rss",
-                            title = "Ep 1",
-                            url = "https://pod.example.com/1",
-                            author = null,
-                            publishedAt = null,
-                            createdAt = "2026-06-01T00:00:00Z",
-                            summary = null,
-                            contentHtml = null,
-                            thumbnailUrl = null,
-                            contentType = "podcast",
-                            status = "unread",
-                            isFavorite = false,
-                            readAt = null,
-                            readProgress = 0.0,
-                            interactionUpdatedAt = null,
-                            tagNames = listOf("audio"),
-                            duration = 125L,
-                        )
-                    ),
-                tags = listOf(TagEntity(id = "t-audio", name = "audio")),
-                tombstones = listOf(SyncTombstoneDto("tag", "old", "2026-06-01T00:00:00Z")),
-            )
-        )
-    assertTrue(payload.contains(""""feed_type":"podcast""""))
-    assertTrue(payload.contains(""""read_at":null"""))
+    val payload = buildPeerSyncRequestPayload(buildSamplePeerSyncRequest())
+    assertTrue(payload.contains(""""since_seq":42"""))
+    assertTrue(payload.contains(""""source_type":"podcast""""))
+    assertTrue(payload.contains(""""inbox_state":"unread""""))
     val resp =
         parsePeerSyncResponseJson(
-            """{"server_peer_id":"server","sync_timestamp":"2026-06-01T00:00:00Z",""" +
+            """{"server_peer_id":"server","sync_seq":43,"server_hlc":"001780000001000-0000-server",""" +
+                """"sync_timestamp":"2026-06-01T00:00:00Z","reset_required":true,""" +
                 """"active_peers":[{"peer_id":""},{"peer_id":"server","device_name":"Srv"}],""" +
-                """"feeds":[{"id":""},{"id":"f-pod","title":"Pod","url":"https://pod.example.com/rss"}],""" +
-                """"items":[],"tags":[{"id":""},{"id":"t-audio","name":"audio"}],"tombstones":[]}"""
+                """"entries":[{"id":"f-pod","kind":"podcast","title":"Pod","hlc":"001780000001000-0000-server"}],""" +
+                """"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],""" +
+                """"tombstones":[{"entity_type":"","natural_key":"x"},{"entity_type":"tag","natural_key":"old"}]}"""
         )
+    assertEquals(43L, resp.syncSeq)
+    assertEquals("001780000001000-0000-server", resp.serverHlc)
+    assertTrue(resp.resetRequired)
     assertEquals(listOf("server"), resp.activePeers.map { it.peerId })
-    assertEquals(listOf("f-pod"), resp.feeds.map { it.id })
-    assertEquals(listOf("t-audio"), resp.tags.map { it.id })
+    assertEquals(listOf("f-pod"), resp.entries.map { it.id })
+    assertEquals(listOf("old"), resp.tombstones.map { it.naturalKey })
 }
+
+private fun buildSamplePeerSyncRequest(): PeerSyncRequestDto =
+    PeerSyncRequestDto(
+        peerId = "android-1",
+        deviceName = "Pixel",
+        sinceSeq = 42L,
+        clientHlc = "001780000000000-0001-android-1",
+        entries = buildSampleSyncEntries(),
+        collectionEntries =
+            listOf(
+                SyncCollectionEntryDto(
+                    collectionId = "f-pod",
+                    entryId = "i-unread",
+                    addedAt = "2026-06-01T00:00:00Z",
+                    hlc = "001780000000000-0002-android-1",
+                )
+            ),
+        tombstones =
+            listOf(
+                SyncTombstoneDto(
+                    entityType = "tag",
+                    naturalKey = "old",
+                    deletedAt = "2026-06-01T00:00:00Z",
+                    hlc = "001780000000000-0003-android-1",
+                )
+            ),
+    )
+
+private fun buildSampleSyncEntries(): List<SyncEntryRecordDto> =
+    listOf(
+        SyncEntryRecordDto(
+            id = "f-pod",
+            kind = "podcast",
+            title = "Pod",
+            url = "https://pod.example.com/rss",
+            hlc = "001780000000000-0001-android-1",
+            feedSource =
+                SyncFeedSourceDto(
+                    feedUrl = "https://pod.example.com/rss",
+                    sourceType = "podcast",
+                    feedTitle = "Pod",
+                    hlc = "001780000000000-0001-android-1",
+                ),
+        ),
+        SyncEntryRecordDto(
+            id = "i-unread",
+            kind = "podcast_episode",
+            title = "Ep 1",
+            url = "https://pod.example.com/1",
+            createdAt = "2026-06-01T00:00:00Z",
+            hlc = "001780000000000-0002-android-1",
+            content =
+                SyncEntryContentDto(
+                    contentType = "audio",
+                    audioUrl = "https://pod.example.com/1.mp3",
+                    duration = 125L,
+                ),
+            state =
+                SyncEntryStateDto(
+                    inboxState = "unread",
+                    readAt = null,
+                    progress = 0.25,
+                    hlc = "001780000000000-0002-android-1",
+                ),
+        ),
+    )
 
 internal suspend fun verifyCustomStreamToFileOverride(
     tempDir: File,

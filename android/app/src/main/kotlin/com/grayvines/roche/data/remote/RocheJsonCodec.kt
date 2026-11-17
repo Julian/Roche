@@ -3,17 +3,14 @@
 package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerCatalogEntryPayload
-import com.grayvines.roche.data.PeerCollectionEntryPayload
-import com.grayvines.roche.data.PeerCollectionGeneratorPayload
-import com.grayvines.roche.data.PeerCollectionSpecPayload
-import com.grayvines.roche.data.PeerComparisonPayload
-import com.grayvines.roche.data.PeerConsumptionLogPayload
 import com.grayvines.roche.data.PeerNodeDto
+import com.grayvines.roche.data.SyncCollectionEntryDto
+import com.grayvines.roche.data.SyncCollectionGeneratorDto
+import com.grayvines.roche.data.SyncComparisonDto
+import com.grayvines.roche.data.SyncConsumptionLogDto
+import com.grayvines.roche.data.SyncEntryRecordDto
 import com.grayvines.roche.data.SyncTombstoneDto
 import com.grayvines.roche.data.inferFeedTypeWireValue
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.TagEntity
 import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
 import java.util.Locale
 import kotlinx.serialization.SerialName
@@ -282,83 +279,6 @@ internal data class HealthDiscoveryWireResponse(
 )
 
 @Serializable
-internal data class PeerSyncWireFeed(
-    val id: String,
-    @SerialName("feed_type") val feedType: String,
-    val url: String,
-    val title: String? = null,
-    val description: String? = null,
-    val language: String? = null,
-    @SerialName("poll_interval") val pollInterval: Int,
-    @SerialName("last_polled") val lastPolled: String? = null,
-    @SerialName("last_polled_by") val lastPolledBy: String? = null,
-    @SerialName("last_error") val lastError: String? = null,
-    @SerialName("last_error_by") val lastErrorBy: String? = null,
-    @SerialName("is_active") val isActive: Boolean,
-)
-
-@Serializable
-internal data class PeerSyncWireItem(
-    val id: String,
-    @SerialName("feed_id") val feedId: String? = null,
-    @SerialName("feed_url") val feedUrl: String? = null,
-    val title: String,
-    val url: String,
-    val author: String? = null,
-    @SerialName("published_at") val publishedAt: String? = null,
-    @SerialName("created_at") val createdAt: String? = null,
-    val summary: String? = null,
-    @SerialName("content_html") val contentHtml: String? = null,
-    @SerialName("thumbnail_url") val thumbnailUrl: String? = null,
-    @SerialName("audio_url") val audioUrl: String? = null,
-    val duration: Long? = null,
-    @SerialName("content_type") val contentType: String,
-    val status: String,
-    @SerialName("is_favorite") val isFavorite: Boolean,
-    @SerialName("read_at") val readAt: JsonElement,
-    @SerialName("read_progress") val readProgress: Double,
-    @SerialName("interaction_updated_at") val interactionUpdatedAt: String? = null,
-    @SerialName("tag_names") val tagNames: List<String>,
-)
-
-@Serializable
-internal data class PeerSyncWireTag(
-    val id: String,
-    val name: String,
-    val color: String? = null,
-)
-
-@Serializable
-internal data class PeerSyncWireTombstone(
-    @SerialName("entity_type") val entityType: String,
-    @SerialName("natural_key") val naturalKey: String,
-    @SerialName("deleted_at") val deletedAt: String,
-)
-
-@Serializable
-internal data class PeerSyncWireRequest(
-    @SerialName("peer_id") val peerId: String,
-    @SerialName("device_name") val deviceName: String? = null,
-    @SerialName("network_tier") val networkTier: String,
-    val weight: Double? = null,
-    @SerialName("updated_after") val updatedAfter: String? = null,
-    @SerialName("after_item_id") val afterItemId: String? = null,
-    val feeds: List<PeerSyncWireFeed>,
-    val items: List<PeerSyncWireItem>,
-    val tags: List<PeerSyncWireTag>,
-    val tombstones: List<PeerSyncWireTombstone>,
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    @SerialName("catalog_entries") val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
-    @SerialName("collection_entries")
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
-    @SerialName("collection_generators")
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    @SerialName("consumption_log")
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
-)
-
-@Serializable
 internal data class WirePeerNodeDto(
     @SerialName("peer_id") val peerId: String = "",
     @SerialName("device_name") val deviceName: String = "",
@@ -377,39 +297,40 @@ internal data class WirePeerNodeDto(
 }
 
 @Serializable
-internal data class WireTombstoneResponseDto(
-    @SerialName("entity_type") val entityType: String = "",
-    @SerialName("natural_key") val naturalKey: String = "",
-    @SerialName("deleted_at") val deletedAt: String = "",
-) {
-    fun toSyncTombstoneDto(): SyncTombstoneDto =
-        SyncTombstoneDto(
-            entityType = entityType.nullIfBlank().orEmpty(),
-            naturalKey = naturalKey.nullIfBlank().orEmpty(),
-            deletedAt = deletedAt.nullIfBlank().orEmpty(),
-        )
-}
+internal data class PeerSyncWireRequest(
+    @SerialName("peer_id") val peerId: String,
+    @SerialName("device_name") val deviceName: String? = null,
+    @SerialName("network_tier") val networkTier: String,
+    val weight: Double? = null,
+    @SerialName("since_seq") val sinceSeq: Long = 0L,
+    @SerialName("client_hlc") val clientHlc: String? = null,
+    val entries: List<SyncEntryRecordDto> = emptyList(),
+    @SerialName("collection_entries")
+    val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
+    @SerialName("collection_generators")
+    val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
+    @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    val comparisons: List<SyncComparisonDto> = emptyList(),
+    val tombstones: List<SyncTombstoneDto> = emptyList(),
+)
 
 @Serializable
 internal data class PeerSyncWireResponse(
     @SerialName("server_peer_id") val serverPeerId: String? = null,
+    @SerialName("sync_seq") val syncSeq: Long = 0L,
+    @SerialName("server_hlc") val serverHlc: String = "",
     @SerialName("sync_timestamp") val syncTimestamp: String = "",
     @SerialName("has_more") val hasMore: Boolean = false,
-    @SerialName("next_after_item_id") val nextAfterItemId: String? = null,
+    @SerialName("reset_required") val resetRequired: Boolean = false,
     @SerialName("active_peers") val activePeers: List<WirePeerNodeDto> = emptyList(),
-    val feeds: List<WireFeedDto> = emptyList(),
-    val items: List<WireItemDto> = emptyList(),
-    val tags: List<WireTagDto> = emptyList(),
-    val tombstones: List<WireTombstoneResponseDto> = emptyList(),
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    @SerialName("catalog_entries") val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
+    val entries: List<SyncEntryRecordDto> = emptyList(),
     @SerialName("collection_entries")
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
+    val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
     @SerialName("collection_generators")
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    @SerialName("consumption_log")
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
+    val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
+    @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    val comparisons: List<SyncComparisonDto> = emptyList(),
+    val tombstones: List<SyncTombstoneDto> = emptyList(),
 )
 
 internal fun buildPairDevicePayload(code: String, deviceName: String): String =
@@ -566,73 +487,15 @@ internal fun buildPeerSyncRequestPayload(request: PeerSyncRequestDto): String =
             deviceName = request.deviceName.nullIfBlank(),
             networkTier = request.networkTier,
             weight = request.weight,
-            updatedAfter = request.updatedAfter.nullIfBlank(),
-            afterItemId = request.afterItemId.nullIfBlank(),
-            feeds = request.feeds.map { toPeerWireFeed(it) },
-            items = request.items.map { toPeerWireItem(it) },
-            tags = request.tags.map { toPeerWireTag(it) },
-            tombstones = request.tombstones.map { toPeerWireTombstone(it) },
-            collections = request.collections,
-            catalogEntries = request.catalogEntries,
+            sinceSeq = request.sinceSeq,
+            clientHlc = request.clientHlc.nullIfBlank(),
+            entries = request.entries,
             collectionEntries = request.collectionEntries,
             collectionGenerators = request.collectionGenerators,
             consumptionLog = request.consumptionLog,
             comparisons = request.comparisons,
+            tombstones = request.tombstones,
         ),
-    )
-
-internal fun toPeerWireFeed(feed: FeedEntity): PeerSyncWireFeed =
-    PeerSyncWireFeed(
-        id = feed.id,
-        feedType = feed.feedType.trim().lowercase().ifBlank { DEFAULT_FEED_TYPE },
-        url = feed.url,
-        title = feed.title.nullIfBlank(),
-        description = feed.description.nullIfBlank(),
-        language = feed.language.nullIfBlank(),
-        pollInterval = feed.pollInterval,
-        lastPolled = feed.lastPolled.nullIfBlank(),
-        lastPolledBy = feed.lastPolledBy.nullIfBlank(),
-        lastError = feed.lastError.nullIfBlank(),
-        lastErrorBy = feed.lastErrorBy.nullIfBlank(),
-        isActive = feed.isActive,
-    )
-
-internal fun toPeerWireItem(item: PeerSyncItemPayload): PeerSyncWireItem =
-    PeerSyncWireItem(
-        id = item.id,
-        feedId = item.feedId.nullIfBlank(),
-        feedUrl = item.feedUrl.nullIfBlank(),
-        title = item.title,
-        url = item.url,
-        author = item.author.nullIfBlank(),
-        publishedAt = item.publishedAt.nullIfBlank(),
-        createdAt = item.createdAt.nullIfBlank(),
-        summary = item.summary.nullIfBlank(),
-        contentHtml = item.contentHtml.nullIfBlank(),
-        thumbnailUrl = item.thumbnailUrl.nullIfBlank(),
-        audioUrl = item.audioUrl.nullIfBlank(),
-        duration = item.duration?.takeIf { it > 0L },
-        contentType = item.contentType,
-        status = item.status,
-        isFavorite = item.isFavorite,
-        readAt = item.readAt?.let { JsonPrimitive(it) } ?: JsonNull,
-        readProgress = item.readProgress,
-        interactionUpdatedAt = item.interactionUpdatedAt.nullIfBlank(),
-        tagNames = item.tagNames,
-    )
-
-internal fun toPeerWireTag(tag: TagEntity): PeerSyncWireTag =
-    PeerSyncWireTag(
-        id = tag.id,
-        name = tag.name,
-        color = tag.color.nullIfBlank(),
-    )
-
-internal fun toPeerWireTombstone(tomb: SyncTombstoneDto): PeerSyncWireTombstone =
-    PeerSyncWireTombstone(
-        entityType = tomb.entityType,
-        naturalKey = tomb.naturalKey,
-        deletedAt = tomb.deletedAt,
     )
 
 internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto {
@@ -655,23 +518,21 @@ internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto {
             )
     return PeerSyncResponseDto(
         serverPeerId = serverPeerId,
+        syncSeq = wire.syncSeq,
+        serverHlc = wire.serverHlc.nullIfBlank().orEmpty(),
         syncTimestamp = wire.syncTimestamp.nullIfBlank().orEmpty(),
-        activePeers = wire.activePeers.map { it.toPeerNodeDto() }.filter { it.peerId.isNotBlank() },
-        feeds = wire.feeds.map { it.toRemoteFeedDto() }.filter { it.id.isNotBlank() },
-        items = wire.items.map { it.toRemoteItemDto() }.filter { it.id.isNotBlank() },
-        tags = wire.tags.map { it.toRemoteTagDto() }.filter { it.id.isNotBlank() },
-        tombstones =
-            wire.tombstones
-                .map { it.toSyncTombstoneDto() }
-                .filter { it.entityType.isNotBlank() && it.naturalKey.isNotBlank() },
         hasMore = wire.hasMore,
-        nextAfterItemId = wire.nextAfterItemId.nullIfBlank(),
-        collections = wire.collections,
-        catalogEntries = wire.catalogEntries,
+        resetRequired = wire.resetRequired,
+        activePeers = wire.activePeers.map { it.toPeerNodeDto() }.filter { it.peerId.isNotBlank() },
+        entries = wire.entries,
         collectionEntries = wire.collectionEntries,
         collectionGenerators = wire.collectionGenerators,
         consumptionLog = wire.consumptionLog,
         comparisons = wire.comparisons,
+        tombstones =
+            wire.tombstones.filter {
+                it.entityType.isNotBlank() && it.naturalKey.isNotBlank()
+            },
     )
 }
 
@@ -721,6 +582,11 @@ internal fun parseHealthDiscoveryJson(
 internal fun formatWireDuration(duration: JsonPrimitive?): String? {
     val raw = duration?.contentOrNull?.nullIfBlank() ?: return null
     val seconds = raw.toLongOrNull() ?: return raw
+    return formatDurationSecondsLabel(seconds)
+}
+
+internal fun formatDurationSecondsLabel(seconds: Long): String? {
+    if (seconds <= 0L) return null
     val minutes = seconds / SECONDS_PER_MINUTE
     val remSeconds = seconds % SECONDS_PER_MINUTE
     return "%d:%02d".format(Locale.US, minutes, remSeconds)

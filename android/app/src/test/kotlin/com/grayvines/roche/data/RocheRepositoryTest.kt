@@ -1,19 +1,24 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("TooManyFunctions", "LongMethod")
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
-import com.grayvines.roche.data.local.ItemTagEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
+import com.grayvines.roche.data.local.ItemTagRow
 import com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS
 import com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS
-import com.grayvines.roche.data.local.PendingMutationEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
-import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.buildFts5MatchQuery
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.local.insertItemTag
+import com.grayvines.roche.data.local.upsertFeed
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -302,33 +307,26 @@ class RocheRepositoryTest {
         }
 
     @Test
-    fun `syncWithServer replaces demo seed rows populates item tags and strips html in reader`() =
+    fun `syncWithServer populates feed items tags and preserves html entities in reader`() =
         runTest {
-            seedTestDatabase()
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
-
+            val hlc = "001780000001000-0000-server"
             val syncClient = RocheApiClient { request ->
-                when (request.url) {
-                    "https://100.64.0.12:8080/api/v1/feeds" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"feeds":[{"id":"f-live","title":"Live RSS","url":"https://example.com/rss","feed_type":"rss","unread_count":1}]}""",
-                        )
-                    "https://100.64.0.12:8080/api/v1/tags" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body = """{"tags":[{"id":"t-live","name":"rust","unread_count":1}]}""",
-                        )
-                    "https://100.64.0.12:8080/api/v1/items?per_page=200" ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"items":[{"id":"i-live-1","feed_id":"f-live","feed_title":"Live RSS","title":"Synced Post","url":"https://example.com/1","summary":"<p>Summary &amp; intro</p>","content_html":"<p>First para &lt;b&gt; &amp; details.</p><p>Second <em>italic</em> para with &amp;lt;tag&amp;gt;.</p>","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","tag_names":["rust"]}]}""",
-                        )
-                    else -> HttpResponse(statusCode = 404, body = "{}")
+                if (request.url == "https://100.64.0.12:8080/api/v1/sync/peer") {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],""" +
+                                """"entries":[{"id":"f-live","kind":"feed","title":"Live RSS","url":"https://example.com","hlc":"$hlc","feed_source":{"feed_url":"https://example.com/rss","source_type":"rss","feed_title":"Live RSS","last_polled_at":"2099-01-01T00:00:00Z","hlc":"$hlc"}},""" +
+                                """{"id":"t-live","kind":"collection","title":"rust","hlc":"$hlc","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}},""" +
+                                """{"id":"i-live-1","kind":"article","title":"Synced Post","url":"https://example.com/1","summary":"<p>Summary &amp; intro</p>","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"<p>First para &lt;b&gt; &amp; details.</p><p>Second <em>italic</em> para with &amp;lt;tag&amp;gt;.</p>"},"state":{"inbox_state":"unread","hlc":"$hlc"}}],""" +
+                                """"collection_entries":[{"collection_id":"f-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"},{"collection_id":"t-live","entry_id":"i-live-1","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"}],""" +
+                                """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
                 }
             }
             val syncedRepo =
@@ -349,7 +347,7 @@ class RocheRepositoryTest {
         }
 
     @Test
-    fun `saveUrlOrFeed subscribes feed without saving raw xml item and toggleTag reconciles server tag id`() =
+    fun `saveUrlOrFeed subscribes feed without saving raw xml item and toggleTag records tombstone`() =
         runTest {
             seedTestDatabase()
             settings.update {
@@ -358,23 +356,14 @@ class RocheRepositoryTest {
             val requests = mutableListOf<String>()
             val liveClient = RocheApiClient { request ->
                 requests.add("${request.method} ${request.url}")
-                when {
-                    request.method == "POST" && request.url.endsWith("/api/v1/feeds") ->
-                        HttpResponse(
-                            statusCode = 201,
-                            body =
-                                """{"id":"feed-srv-1","title":"Rust Blog","url":"https://blog.rust-lang.org/feed.xml","feed_type":"rss","unread_count":0}""",
-                        )
-                    request.method == "POST" && request.url.endsWith("/api/v1/items/item-2/tags") ->
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"id":"item-2","tags":[{"id":"tag-srv-77","name":"ebpf","unread_count":1}]}""",
-                        )
-                    request.method == "DELETE" &&
-                        request.url.endsWith("/api/v1/items/item-2/tags/tag-srv-77") ->
-                        HttpResponse(statusCode = 204, body = "")
-                    else -> HttpResponse(statusCode = 404, body = "{}")
+                if (request.method == "POST" && request.url.endsWith("/api/v1/feeds")) {
+                    HttpResponse(
+                        statusCode = 201,
+                        body =
+                            """{"id":"feed-srv-1","title":"Rust Blog","url":"https://blog.rust-lang.org/feed.xml","feed_type":"rss","unread_count":0}""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "{}")
                 }
             }
             val liveRepo =
@@ -391,12 +380,17 @@ class RocheRepositoryTest {
             assertFalse(requests.any { it.endsWith("/api/v1/items/save") })
 
             liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "ebpf")
+            assertTrue(database.dao().getTagNamesForItem("item-2").contains("ebpf"))
             liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "ebpf")
-            assertTrue(
-                requests.contains(
-                    "DELETE https://100.64.0.12:8080/api/v1/items/item-2/tags/tag-srv-77"
-                )
-            )
+            assertFalse(database.dao().getTagNamesForItem("item-2").contains("ebpf"))
+            val tagTombstone =
+                database
+                    .dao()
+                    .getTombstone(
+                        COLLECTION_ENTRY_ENTITY,
+                        collectionEntryNaturalKey(deterministicTagId("ebpf"), "item-2"),
+                    )
+            assertTrue(tagTombstone?.isLocalDirty == true)
         }
 
     @Test
@@ -405,52 +399,42 @@ class RocheRepositoryTest {
         settings.update {
             it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
         }
-        val requests = mutableListOf<Pair<String, String?>>()
+        val syncBodies = mutableListOf<String>()
+        var seq = 0L
         val liveClient = RocheApiClient { request ->
-            requests.add("${request.method} ${request.url}" to request.body)
-            when {
-                request.method == "PATCH" && request.url.endsWith("/api/v1/items/item-1") ->
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"id":"item-1","title":"Paper","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.85,"created_at":"2026-03-29T10:00:00Z"}""",
-                    )
-                request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"tags":[{"id":"srv-sqlite-uuid","name":"sqlite","unread_count":2}]}""",
-                    )
-                request.method == "DELETE" &&
-                    request.url.endsWith("/api/v1/items/item-2/tags/srv-sqlite-uuid") ->
-                    HttpResponse(statusCode = 204, body = "")
-                else -> HttpResponse(statusCode = 404, body = "{}")
+            if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                syncBodies.add(request.body.orEmpty())
+                seq += 1L
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"server_peer_id":"server","sync_seq":$seq,"server_hlc":"00178000000${seq}000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                )
+            } else {
+                HttpResponse(statusCode = 404, body = "{}")
             }
         }
         val liveRepo =
-            RocheRepository(database = database, apiClient = liveClient, settings = settings)
+            RocheRepository(
+                database = database,
+                apiClient = liveClient,
+                settings = settings,
+                networkTierProvider = { NetworkTier.OFFLINE },
+            )
 
         liveRepo.updateReadProgress(itemId = "item-1", progress = 0.85)
         val updatedItem = repository.snapshot.first().entries.first { it.id == "item-1" }
         assertEquals(0.85, updatedItem.readProgress)
-        assertTrue(
-            requests.any { (endpoint, body) ->
-                endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
-                    body == """{"read_progress":0.85}"""
-            }
-        )
+        liveRepo.syncWithServer().getOrThrow()
+        assertTrue(syncBodies.last().contains(""""progress":0.85"""))
 
         // Marking read records an ISO readAt timestamp and toggling clears it back to null
-        assertReadTimestampSync(liveRepo, requests)
+        assertReadTimestampSync(liveRepo, syncBodies)
 
-        // Removing a tag whose local ID starts with "tag-" resolves the server UUID first
+        // Removing an existing tag records a collection_entry tombstone and pushes it on sync
         liveRepo.toggleTagOnItem(itemId = "item-2", tagName = "sqlite")
-        assertTrue(
-            requests.any { (endpoint, _) ->
-                endpoint ==
-                    "DELETE https://100.64.0.12:8080/api/v1/items/item-2/tags/srv-sqlite-uuid"
-            }
-        )
+        liveRepo.syncWithServer().getOrThrow()
+        assertTrue(syncBodies.last().contains(""""natural_key":"tag-sqlite\u0000item-2""""))
     }
 
     @Test
@@ -473,23 +457,28 @@ class RocheRepositoryTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
-            val pushedRequests = mutableListOf<Pair<String, String?>>()
-            val syncClient = buildTwoWaySyncMockClient(pushedRequests)
+            val pushedBodies = mutableListOf<String>()
+            val syncClient = buildTwoWaySyncMockClient(pushedBodies)
             val syncedRepo =
-                RocheRepository(database = database, apiClient = syncClient, settings = settings)
+                RocheRepository(
+                    database = database,
+                    apiClient = syncClient,
+                    settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
+                )
 
             val count = syncedRepo.syncWithServer().getOrThrow()
-            assertEquals(2, count)
-            assertTwoWaySyncPushedRequests(pushedRequests)
+            assertEquals(7, count)
+            assertTwoWaySyncPushedRequests(pushedBodies)
 
-            val entries = syncedRepo.snapshot.first().entries.associateBy { it.id }
-            val item1 = entries.getValue("item-1")
+            val entries = syncedRepo.snapshot.first().entries
+            val item1 = entries.first { it.id == "item-1" }
             assertTrue(item1.isArchived)
             assertFalse(item1.isFavorite)
             assertEquals(0.9, item1.readProgress)
             assertEquals(listOf("llm-inference", "rust"), item1.tags)
 
-            val savedItem = entries.getValue("srv-saved-99")
+            val savedItem = entries.first { it.url == "https://example.com/offline-note" }
             assertEquals("Offline Note", savedItem.title)
             assertEquals(listOf("crdt"), savedItem.tags)
         }
@@ -527,8 +516,7 @@ class RocheRepositoryTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
-            val addedTagRequests = mutableListOf<String>()
-            val liveClient = buildInFlightTagMockClient(addedTagRequests)
+            val liveClient = RocheApiClient { HttpResponse(statusCode = 404, body = "{}") }
             val dao = database.dao()
             val localEntity =
                 createSavedItemEntity(
@@ -537,13 +525,12 @@ class RocheRepositoryTest {
                     hostTitle = "example.com",
                     type = ContentType.ARTICLE,
                 )
-            dao.upsertItem(localEntity)
-            attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = listOf("initial"))
-            dao.upsertPendingMutation(
-                com.grayvines.roche.data.local.PendingMutationEntity(
-                    entityId = localEntity.id,
-                    isLocalItem = true,
-                )
+            dao.upsertItem(localEntity, markDirty = true)
+            attachTagsLocally(
+                dao = dao,
+                itemId = localEntity.id,
+                tagNames = listOf("initial"),
+                markDirty = true,
             )
             val liveRepo =
                 RocheRepository(database = database, apiClient = liveClient, settings = settings)
@@ -551,21 +538,32 @@ class RocheRepositoryTest {
 
             finalizeOnlineSavedItem(
                 dao = dao,
-                apiClient = liveClient,
-                settings = settings,
                 localEntity = localEntity,
                 remoteSaved =
                     com.grayvines.roche.data.remote.parseItemJson(
                         """{"id":"srv-item-77","title":"In-Flight Entry","url":"https://example.com/in-flight","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["initial"]}"""
                     ),
-                tags = listOf("initial"),
+                initialTags = listOf("initial"),
             )
 
             val entry = liveRepo.snapshot.first().entries.first { it.id == "srv-item-77" }
             assertEquals(listOf("added-in-flight", "initial"), entry.tags)
+            assertTrue(dao.getEntryById("srv-item-77")?.isLocalDirty == true)
+            val outgoing =
+                buildPeerSyncRequest(
+                    dao = dao,
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "peer-android",
+                            deviceName = "Pixel",
+                            sinceSeq = 5L,
+                        ),
+                )
+            assertTrue(outgoing.entries.any { it.id == "srv-item-77" })
             assertTrue(
-                addedTagRequests.any {
-                    it.contains("/api/v1/items/srv-item-77/tags") && it.contains("added-in-flight")
+                outgoing.collectionEntries.any {
+                    it.entryId == "srv-item-77" &&
+                        it.collectionId == deterministicTagId("added-in-flight")
                 }
             )
         }
@@ -644,12 +642,14 @@ class RocheRepositoryTest {
             val itemCacheDir = File(File(cacheDir, "items"), "item-1").apply { mkdirs() }
             File(itemCacheDir, "media-paper-1").writeBytes(byteArrayOf(1, 2, 3))
             val requests = mutableListOf<String>()
+            val syncBodies = mutableListOf<String>()
             val managedRepo =
                 RocheRepository(
                     database = database,
-                    apiClient = buildFeedAndItemManagementMockClient(requests),
+                    apiClient = buildFeedAndItemManagementMockClient(requests, syncBodies),
                     settings = settings,
                     cacheDir = cacheDir,
+                    networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
             val refreshedTitle = managedRepo.refreshFeed("feed-arxiv-cs-lg").getOrThrow()
@@ -660,26 +660,25 @@ class RocheRepositoryTest {
             settings.update { it.copy(bearerToken = "") }
             assertTrue(managedRepo.deleteItem("item-1").getOrThrow().isNotBlank())
             assertFalse(itemCacheDir.exists())
-            assertEquals(
-                DELETED_STATUS_TOMBSTONE,
-                database.dao().getPendingMutation("item-1")?.dirtyStatus,
-            )
+            val item1NatKey =
+                itemNaturalKey(
+                    "https://export.arxiv.org/api/query?search_query=cat:cs.LG",
+                    "https://arxiv.org/abs/2603.11842",
+                )
+            assertTrue(database.dao().getTombstone("item", item1NatKey)?.isLocalDirty == true)
             // Mutating a deleted item is a safe no-op and does not overwrite tombstone
             assertEquals(null, managedRepo.setArchiveState("item-1", archived = true))
             managedRepo.restoreStatus("item-1", ItemStatus.UNREAD)
             managedRepo.updateReadProgress("item-1", 0.5)
             managedRepo.toggleTagOnItem("item-1", "tag-1")
-            assertEquals(
-                DELETED_STATUS_TOMBSTONE,
-                database.dao().getPendingMutation("item-1")?.dirtyStatus,
-            )
+            assertTrue(database.dao().getTombstone("item", item1NatKey)?.isLocalDirty == true)
 
-            // Syncing back online pushes DELETE /api/v1/items/item-1 and does not resurrect item-1
+            // Syncing back online pushes item tombstone via peer sync and does not resurrect item-1
             settings.update { it.copy(bearerToken = "tok-live") }
             managedRepo.syncWithServer().getOrThrow()
-            assertTrue(requests.contains("DELETE https://100.64.0.12:8080/api/v1/items/item-1"))
+            assertTrue(syncBodies.last().contains("https://arxiv.org/abs/2603.11842"))
             assertFalse(managedRepo.snapshot.first().entries.any { it.id == "item-1" })
-            assertEquals(null, database.dao().getPendingMutation("item-1"))
+            assertEquals(false, database.dao().getTombstone("item", item1NatKey)?.isLocalDirty)
 
             // Delete remote feed purges feed AND its remaining local items (item-fresh)
             assertEquals("arXiv cs.LG", managedRepo.deleteFeed("feed-arxiv-cs-lg").getOrThrow())
@@ -734,14 +733,14 @@ class RocheRepositoryTest {
             val lanEntry = pass1Snapshot.entries.first { it.id == "lan-item-1" }
             assertEquals(listOf("homelab"), lanEntry.tags)
             assertTrue(pass1Snapshot.entries.any { it.id == "item-pub-2002" && it.isFavorite })
-            assertEquals(true, database.dao().getPendingMutation("item-pub-2002")?.dirtyFavorite)
+            assertEquals(true, database.dao().getEntryById("item-pub-2002")?.isLocalDirty)
 
-            // Second pass (delta sync) sends the previously overflowed mutation and still keeps LAN
+            // Second pass (delta sync) sends the previously overflowed entry and still keeps LAN
             // data
             syncedRepo.syncWithServer().getOrThrow()
             assertEquals(2, peerSyncBodies.size)
             assertTrue(peerSyncBodies[1].contains("item-pub-2002"))
-            assertNull(database.dao().getPendingMutation("item-pub-2002"))
+            assertEquals(false, database.dao().getEntryById("item-pub-2002")?.isLocalDirty)
             assertTrue(
                 syncedRepo.snapshot.first().feeds.any { it.url == "http://192.168.1.50/rss.xml" }
             )
@@ -755,31 +754,29 @@ class RocheRepositoryTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
-            var patchAvailable = false
-            val patchBodies = mutableListOf<String>()
+            var syncAvailable = false
+            val syncBodies = mutableListOf<String>()
             val renameRepo =
                 RocheRepository(
                     database = database,
                     apiClient =
                         buildRenameFeedSyncMockClient(
-                            isPatchAvailable = { patchAvailable },
-                            patchBodies = patchBodies,
+                            isSyncAvailable = { syncAvailable },
+                            syncBodies = syncBodies,
                         ),
                     settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
             renameRepo.renameFeed("feed-arxiv-cs-lg", "  Custom ML Papers  ")
-            assertEquals(
-                MutationAction.RENAME_FEED,
-                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.dirtyStatus,
-            )
+            assertTrue(database.dao().getFeedSourceById("feed-arxiv-cs-lg")?.isLocalDirty == true)
             assertEquals(
                 "Custom ML Papers",
-                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.titleOverride,
+                database.dao().getFeedById("feed-arxiv-cs-lg")?.title,
             )
 
-            // Sync while PATCH still fails: stale server title must NOT clobber uncommitted rename
-            renameRepo.syncWithServer().getOrThrow()
+            // Sync while server returns 503 fails cleanly; stale server HLC must NOT clobber rename
+            assertTrue(renameRepo.syncWithServer().isFailure)
             val afterOfflineSync = renameRepo.snapshot.first()
             assertEquals(
                 "Custom ML Papers",
@@ -790,15 +787,27 @@ class RocheRepositoryTest {
                 afterOfflineSync.entries.first { it.id == "item-1" }.feedTitle,
             )
 
-            // Server recovers: pending rename replays via PATCH and clears mutation
-            patchAvailable = true
+            // Server recovers: pending rename pushes via /api/v1/sync/peer, wins HLC over stale
+            // server title, and clears dirty flag
+            syncAvailable = true
             renameRepo.syncWithServer().getOrThrow()
-            assertTrue(patchBodies.contains("""{"title":"Custom ML Papers"}"""))
-            assertNull(database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+            assertTrue(syncBodies.single().contains("Custom ML Papers"))
+            assertEquals(
+                false,
+                database.dao().getFeedSourceById("feed-arxiv-cs-lg")?.isLocalDirty,
+            )
+            assertEquals(
+                "Custom ML Papers",
+                renameRepo.snapshot.first().feeds.first { it.id == "feed-arxiv-cs-lg" }.title,
+            )
 
             renameRepo.renameFeed("feed-arxiv-cs-lg", "Online Direct Title")
-            assertTrue(patchBodies.contains("""{"title":"Online Direct Title"}"""))
-            assertNull(database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+            renameRepo.syncWithServer().getOrThrow()
+            assertTrue(syncBodies.last().contains("Online Direct Title"))
+            assertEquals(
+                false,
+                database.dao().getFeedSourceById("feed-arxiv-cs-lg")?.isLocalDirty,
+            )
         }
 
     @Test
@@ -810,7 +819,7 @@ class RocheRepositoryTest {
             database
                 .dao()
                 .upsertItem(
-                    ItemEntity(
+                    InboxItemRow(
                         id = "item-audio-broken",
                         feedId = null,
                         feedTitle = "Podcast",
@@ -866,17 +875,16 @@ class RocheRepositoryTest {
                 runBlocking { cancellingRepo.syncWithServer() }
             }
             assertThrows(CancellationException::class.java) {
-                runBlocking { cancellingRepo.setArchiveState("item-1", archived = true) }
+                runBlocking { cancellingRepo.refreshFeed("feed-arxiv-cs-lg") }
             }
             assertThrows(CancellationException::class.java) {
                 runBlocking { cancellingRepo.toggleOfflineCache("item-5") }
             }
-            assertNull(database.dao().getPendingMutation("item-1"))
-            assertNull(database.dao().getPendingMutation("item-5"))
+            assertEquals(false, database.dao().getItemStateById("item-5")?.isCachedOffline)
         }
 
     @Test
-    internal fun `reconcileSnapshotDiff applies targeted diffs chunks deletes and skips 0-change writes`() =
+    internal fun `reconcilePeerSyncResponse applies targeted HLC updates tombstones and truncates oversized summaries`() =
         runTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
@@ -887,6 +895,7 @@ class RocheRepositoryTest {
                     database = database,
                     apiClient = buildTargetedDiffSyncMockClient { syncRound },
                     settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
                 )
 
             // Round 1: initial snapshot with i-keep (oversized summary), i-edit, i-drop, 2 tags
@@ -895,13 +904,18 @@ class RocheRepositoryTest {
                 setOf("keep", "drop"),
                 diffRepo.snapshot.first().tags.map { it.name }.toSet(),
             )
+            assertEquals(
+                MAX_SQLITE_SUMMARY_CHARS,
+                database.dao().getEntryById("i-keep")?.summary?.length,
+            )
 
-            // Round 2: 0-change sync preserves all rows identically
+            // Round 2: 0-change delta sync preserves all rows identically
+            syncRound = 2
             diffRepo.syncWithServer().getOrThrow()
             assertEquals(3, diffRepo.snapshot.first().entries.size)
 
-            // Round 3: insert i-new, update i-edit, delete i-drop and drop tag
-            syncRound = 2
+            // Round 3: insert i-new, update i-edit, tombstone i-drop and drop tag
+            syncRound = 3
             assertEquals(3, diffRepo.syncWithServer().getOrThrow())
             val afterDiff = diffRepo.snapshot.first()
             val byId = afterDiff.entries.associateBy { it.id }
@@ -910,8 +924,6 @@ class RocheRepositoryTest {
             assertTrue(byId.getValue("i-edit").isFavorite)
             assertEquals(listOf("keep"), byId.getValue("i-new").tags)
             assertEquals(listOf("keep"), afterDiff.tags.map { it.name })
-
-            verifyDaoDiffSkipsZeroChangeAndChunksDeletes(database.dao())
         }
 
     @Test
@@ -923,7 +935,7 @@ class RocheRepositoryTest {
                 it.copy(
                     serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-paginated",
-                    lastPeerSyncCursor = "2026-06-01T00:00:00Z",
+                    lastPeerSyncCursor = "10",
                 )
             }
             val peerSyncBodies = mutableListOf<String>()
@@ -938,17 +950,13 @@ class RocheRepositoryTest {
 
             assertEquals(EXPECTED_PAGINATED_ITEM_COUNT, totalSynced)
             assertEquals(EXPECTED_CONTINUATION_REQUESTS, peerSyncBodies.size)
-            assertTrue(peerSyncBodies[0].contains(""""updated_after":"2026-06-01T00:00:00Z""""))
-            assertFalse(peerSyncBodies[0].contains("after_item_id"))
-            assertTrue(peerSyncBodies[1].contains(""""updated_after":"2026-06-01T01:00:00Z""""))
-            assertTrue(peerSyncBodies[1].contains(""""after_item_id":"item-page-1""""))
-            assertTrue(peerSyncBodies[1].contains(""""items":[]"""))
-            assertTrue(peerSyncBodies[1].contains(""""feeds":[]"""))
-            assertTrue(peerSyncBodies[2].contains(""""updated_after":"2026-06-01T01:00:00Z""""))
-            assertTrue(peerSyncBodies[2].contains(""""after_item_id":"item-page-2""""))
-            assertTrue(peerSyncBodies[2].contains(""""items":[]"""))
+            assertTrue(peerSyncBodies[0].contains(""""since_seq":10"""))
+            assertTrue(peerSyncBodies[1].contains(""""since_seq":11"""))
+            assertFalse(peerSyncBodies[1].contains(""""entries":"""))
+            assertTrue(peerSyncBodies[2].contains(""""since_seq":12"""))
+            assertFalse(peerSyncBodies[2].contains(""""entries":"""))
             assertEquals(
-                "2026-06-01T03:00:00Z",
+                "15",
                 settings.settings.first().lastPeerSyncCursor,
             )
             assertEquals(
@@ -964,18 +972,18 @@ class RocheRepositoryTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-bg")
             }
-            val patchStarted = CountDownLatch(1)
-            val allowPatchFinish = CountDownLatch(1)
+            val syncStarted = CountDownLatch(1)
+            val allowSyncFinish = CountDownLatch(1)
             val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
                 val slowApiClient = RocheApiClient { request ->
-                    if (request.method == "PATCH" && request.url.endsWith("/api/v1/items/item-2")) {
-                        patchStarted.countDown()
-                        allowPatchFinish.await(5, TimeUnit.SECONDS)
+                    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                        syncStarted.countDown()
+                        allowSyncFinish.await(5, TimeUnit.SECONDS)
                         HttpResponse(
                             statusCode = 200,
                             body =
-                                """{"id":"item-2","title":"Async Star","url":"https://example.com/2","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-04-01T10:00:00Z"}""",
+                                """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
                         )
                     } else {
                         HttpResponse(statusCode = 200, body = "{}")
@@ -986,22 +994,20 @@ class RocheRepositoryTest {
                         database = database,
                         apiClient = slowApiClient,
                         settings = settings,
+                        networkTierProvider = { NetworkTier.WIFI },
                         backgroundScope = bgScope,
                     )
 
-                // item-2 starts unstarred; toggleStar returns immediately before PATCH completes
+                // item-2 starts unstarred; toggleStar returns immediately before peer sync finishes
                 assertTrue(asyncRepo.toggleStar("item-2"))
                 assertEquals(true, database.dao().getItemStateById("item-2")?.isFavorite)
-                assertEquals(
-                    true,
-                    database.dao().getPendingMutation("item-2")?.dirtyFavorite,
-                )
-                assertTrue(patchStarted.await(5, TimeUnit.SECONDS))
+                assertEquals(true, database.dao().getEntryStateById("item-2")?.isLocalDirty)
+                assertTrue(syncStarted.await(5, TimeUnit.SECONDS))
 
-                // Release slow HTTP PATCH and deterministically join background mutation jobs
-                allowPatchFinish.countDown()
+                // Release slow peer sync and deterministically join background jobs
+                allowSyncFinish.countDown()
                 bgScope.coroutineContext[Job]?.children?.toList()?.forEach { it.join() }
-                assertNull(database.dao().getPendingMutation("item-2"))
+                assertEquals(false, database.dao().getEntryStateById("item-2")?.isLocalDirty)
             } finally {
                 bgScope.coroutineContext[Job]?.cancelAndJoin()
             }
@@ -1045,7 +1051,7 @@ class RocheRepositoryTest {
             assertTrue(snippet?.contains("NeedleInHaystackToken99") == true)
 
             assertEquals(
-                """{title feedTitle author url summary contentText contentHtml} : ("hello"* "world"* "v2"*)""",
+                """{title creatorsJson url summary contentText contentHtml fallbackFeedTitle} : ("hello"* "world"* "v2"*)""",
                 buildFts5MatchQuery("  \"hello\" -world: (v2)* "),
             )
             assertNull(buildFts5MatchQuery("--- () *** \"\""))
@@ -1104,35 +1110,34 @@ class RocheRepositoryTest {
         }
 
     @Test
-    internal fun `syncWithServer rejects backwards syncTimestamp cursor regression on clock skew`() =
-        runTest {
-            settings.update {
-                it.copy(
-                    serverUrl = "https://100.64.0.12:8080",
-                    bearerToken = "tok-skew",
-                    lastPeerSyncCursor = "2026-06-10T12:00:00Z",
-                )
-            }
-            val skewedClient = RocheApiClient { request ->
-                if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"server_peer_id":"server","sync_timestamp":"2026-06-09T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
-                    )
-                } else {
-                    HttpResponse(statusCode = 404, body = "{}")
-                }
-            }
-            val skewedRepo =
-                RocheRepository(database = database, apiClient = skewedClient, settings = settings)
-            skewedRepo.syncWithServer().getOrThrow()
-
-            assertEquals("2026-06-10T12:00:00Z", settings.settings.first().lastPeerSyncCursor)
+    internal fun `syncWithServer rejects backwards sync_seq cursor regression`() = runTest {
+        settings.update {
+            it.copy(
+                serverUrl = "https://100.64.0.12:8080",
+                bearerToken = "tok-skew",
+                lastPeerSyncCursor = "50",
+            )
         }
+        val skewedClient = RocheApiClient { request ->
+            if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"server_peer_id":"server","sync_seq":40,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-09T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                )
+            } else {
+                HttpResponse(statusCode = 404, body = "{}")
+            }
+        }
+        val skewedRepo =
+            RocheRepository(database = database, apiClient = skewedClient, settings = settings)
+        skewedRepo.syncWithServer().getOrThrow()
+
+        assertEquals("50", settings.settings.first().lastPeerSyncCursor)
+    }
 
     @Test
-    internal fun `catalog mutation with backgroundScope triggers coalesced syncWithServer and bounds mutex cache`() =
+    internal fun `catalog mutation with backgroundScope triggers coalesced syncWithServer`() =
         runTest {
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-cat-bg")
@@ -1148,7 +1153,7 @@ class RocheRepositoryTest {
                         HttpResponse(
                             statusCode = 200,
                             body =
-                                """{"server_peer_id":"server","sync_timestamp":"2026-07-01T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
+                                """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-07-01T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
                         )
                     } else {
                         HttpResponse(statusCode = 404, body = "{}")
@@ -1172,10 +1177,6 @@ class RocheRepositoryTest {
                     null,
                 )
                 assertTrue(syncedLatch.await(5, TimeUnit.SECONDS))
-
-                val dispatcher = BackgroundMutationDispatcher()
-                repeat(300) { idx -> dispatcher.dispatchOrRun("item-$idx") {} }
-                assertTrue(dispatcher.cachedMutexCountForTest() <= 256)
             } finally {
                 bgScope.coroutineContext[Job]?.cancelAndJoin()
             }
@@ -1198,8 +1199,8 @@ class RocheRepositoryTest {
                         contentHtml = "<p>Body text</p>",
                     )
             dao.upsertItem(baseItem)
-            dao.upsertTag(TagEntity(id = "tag-sys", name = "systems"))
-            dao.insertItemTag(ItemTagEntity(itemId = uuidId, tagId = "tag-sys"))
+            dao.upsertTag(TagRow(id = "tag-sys", name = "systems"))
+            dao.insertItemTag(ItemTagRow(itemId = uuidId, tagId = "tag-sys"))
 
             assertNull(buildFts5MatchQuery("\u0000"))
             assertNull(buildFts5MatchQuery("  \u0000  "))
@@ -1231,7 +1232,7 @@ class RocheRepositoryTest {
             val feedUrl = "https://archived.example.com/rss.xml"
             val feedId = deterministicFeedId(feedUrl)
             dao.upsertFeed(
-                FeedEntity(
+                FeedRow(
                     id = feedId,
                     title = "OldArchivedTitle33",
                     url = feedUrl,
@@ -1324,7 +1325,7 @@ private const val EXPECTED_PAGINATED_ITEM_COUNT = 4
 
 private suspend fun seedPaginatedDeltaInitialState(dao: RocheDao, feedId: String) {
     dao.upsertFeed(
-        FeedEntity(
+        FeedRow(
             id = feedId,
             title = "Systems Feed",
             url = "https://blog.example.com/rss.xml",
@@ -1334,7 +1335,7 @@ private suspend fun seedPaginatedDeltaInitialState(dao: RocheDao, feedId: String
         )
     )
     dao.upsertItem(
-        ItemEntity(
+        InboxItemRow(
             id = "item-page-0",
             feedId = feedId,
             feedUrl = "https://blog.example.com/rss.xml",
@@ -1360,9 +1361,9 @@ private suspend fun seedPaginatedDeltaInitialState(dao: RocheDao, feedId: String
 
 private data class DeltaPageFixture(
     val itemId: String,
-    val nextCursor: String,
+    val nextSeq: Long,
     val hasMore: Boolean,
-    val nextAfterItemId: String?,
+    val syncTs: String,
 )
 
 private fun buildPaginatedDeltaSyncMockClient(
@@ -1374,64 +1375,78 @@ private fun buildPaginatedDeltaSyncMockClient(
         peerSyncBodies.add(body)
         val page =
             when {
-                body.contains(""""updated_after":"2026-06-01T00:00:00Z"""") ->
-                    DeltaPageFixture("item-page-1", "2026-06-01T01:00:00Z", true, "item-page-1")
-                body.contains(""""after_item_id":"item-page-1"""") ->
-                    DeltaPageFixture("item-page-2", "2026-06-01T01:00:00Z", true, "item-page-2")
-                else -> DeltaPageFixture("item-page-3", "2026-06-01T03:00:00Z", false, null)
+                body.contains(""""since_seq":10""") ->
+                    DeltaPageFixture("item-page-1", 11L, true, "2026-06-01T01:00:00Z")
+                body.contains(""""since_seq":11""") ->
+                    DeltaPageFixture("item-page-2", 12L, true, "2026-06-01T02:00:00Z")
+                else -> DeltaPageFixture("item-page-3", 15L, false, "2026-06-01T03:00:00Z")
             }
-        val nextAfterJson =
-            page.nextAfterItemId?.let { """"next_after_item_id":"$it",""" }.orEmpty()
+        val hlc = "0017800000${page.nextSeq}000-0000-server"
         HttpResponse(
             statusCode = 200,
             body =
-                """{"server_peer_id":"server","sync_timestamp":"${page.nextCursor}","has_more":${page.hasMore},""" +
-                    nextAfterJson +
-                    """"active_peers":[{"peer_id":"server","device_name":"Server","network_tier":"wired","weight":1.0,"last_seen_at":"${page.nextCursor}"}],""" +
-                    """"feeds":[{"id":"$feedId","title":"Systems Feed","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2099-01-01T00:00:00Z","is_active":true,"unread_count":4}],""" +
-                    """"items":[{"id":"${page.itemId}","feed_id":"$feedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Systems Feed","title":"Post ${page.itemId}","url":"https://blog.example.com/${page.itemId}","content_type":"article","status":"unread","is_favorite":false,"created_at":"${page.nextCursor}","tag_names":[]}],""" +
-                    """"tags":[],"tombstones":[]}""",
+                """{"server_peer_id":"server","sync_seq":${page.nextSeq},"server_hlc":"$hlc","sync_timestamp":"${page.syncTs}","has_more":${page.hasMore},""" +
+                    """"active_peers":[{"peer_id":"server","device_name":"Server","network_tier":"wired","weight":1.0,"last_seen_at":"${page.syncTs}"}],""" +
+                    """"entries":[{"id":"$feedId","kind":"feed","title":"Systems Feed","url":"https://blog.example.com","hlc":"$hlc","feed_source":{"feed_url":"https://blog.example.com/rss.xml","source_type":"rss","feed_title":"Systems Feed","poll_interval":30,"last_polled_at":"2099-01-01T00:00:00Z","is_active":true,"hlc":"$hlc"}},""" +
+                    """{"id":"${page.itemId}","kind":"article","title":"Post ${page.itemId}","url":"https://blog.example.com/${page.itemId}","created_at":"${page.syncTs}","hlc":"$hlc","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc"}}],""" +
+                    """"collection_entries":[{"collection_id":"$feedId","entry_id":"${page.itemId}","added_at":"${page.syncTs}","hlc":"$hlc"}],""" +
+                    """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
         )
     } else {
         HttpResponse(statusCode = 404, body = "{}")
     }
 }
 
-internal fun buildFeedAndItemManagementMockClient(requests: MutableList<String>): RocheApiClient =
-    RocheApiClient { request ->
-        requests.add("${request.method} ${request.url}")
-        when {
-            request.method == "POST" &&
-                request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg/refresh") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}""",
-                )
-            request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}]}""",
-                )
-            request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
-                HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-            request.method == "GET" && request.url.contains("/api/v1/items") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"created_at":"2026-03-29T10:00:00Z"},{"id":"item-fresh","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Fresh Polled Paper","url":"https://arxiv.org/abs/2604.00001","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z"}]}""",
-                )
-            request.method == "DELETE" && request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg") ->
-                HttpResponse(
-                    statusCode = 404,
-                    body = """{"title":"Not Found","detail":"missing"}""",
-                )
-            request.method == "DELETE" && request.url.endsWith("/api/v1/items/item-1") ->
-                HttpResponse(statusCode = 204, body = "")
-            else -> HttpResponse(statusCode = 404, body = "{}")
+internal fun buildFeedAndItemManagementMockClient(
+    requests: MutableList<String>,
+    syncBodies: MutableList<String>,
+): RocheApiClient = RocheApiClient { request ->
+    requests.add("${request.method} ${request.url}")
+    when {
+        request.method == "POST" &&
+            request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg/refresh") -> {
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":2}""",
+            )
+        }
+        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
+            val body = request.body.orEmpty()
+            syncBodies.add(body)
+            val deletedItem1 =
+                body.contains("https://arxiv.org/abs/2603.11842") &&
+                    body.contains(""""tombstones":[{"entity_type":"item"""")
+            val hlc = "001780000001000-0000-server"
+            val entriesJson =
+                if (deletedItem1) {
+                    """[{"id":"item-fresh","kind":"paper","title":"Fresh Polled Paper","url":"https://arxiv.org/abs/2604.00001","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"paper"},"state":{"inbox_state":"unread","hlc":"$hlc"}}]"""
+                } else {
+                    """[{"id":"item-1","kind":"paper","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","created_at":"2026-03-29T10:00:00Z","hlc":"000000000001000-0000-server","content":{"content_type":"paper"},"state":{"inbox_state":"unread","hlc":"000000000001000-0000-server"}},{"id":"item-fresh","kind":"paper","title":"Fresh Polled Paper","url":"https://arxiv.org/abs/2604.00001","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"paper"},"state":{"inbox_state":"unread","hlc":"$hlc"}}]"""
+                }
+            val membershipsJson =
+                if (deletedItem1) {
+                    """[{"collection_id":"feed-arxiv-cs-lg","entry_id":"item-fresh","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"}]"""
+                } else {
+                    """[{"collection_id":"feed-arxiv-cs-lg","entry_id":"item-1","added_at":"2026-03-29T10:00:00Z","hlc":"000000000001000-0000-server"},{"collection_id":"feed-arxiv-cs-lg","entry_id":"item-fresh","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc"}]"""
+                }
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],"entries":$entriesJson,"collection_entries":$membershipsJson,"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+            )
+        }
+        request.method == "DELETE" && request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg") -> {
+            HttpResponse(
+                statusCode = 404,
+                body = """{"title":"Not Found","detail":"missing"}""",
+            )
+        }
+        else -> {
+            HttpResponse(statusCode = 404, body = "{}")
         }
     }
+}
 
 internal fun buildOfflineCacheMockClient(
     pdfBytes: ByteArray,
@@ -1454,160 +1469,75 @@ internal fun buildOfflineCacheMockClient(
             HttpResponse(statusCode = 200, body = "", bodyBytes = pdfBytes)
         "https://100.64.0.12:8080/api/v1/media/thumb-item-5" ->
             HttpResponse(statusCode = 200, body = "", bodyBytes = thumbBytes)
-        "https://100.64.0.12:8080/api/v1/feeds" ->
-            HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
-        "https://100.64.0.12:8080/api/v1/tags" ->
-            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-        "https://100.64.0.12:8080/api/v1/items?per_page=200" ->
+        "https://100.64.0.12:8080/api/v1/sync/peer" ->
             HttpResponse(
                 statusCode = 200,
                 body =
-                    """{"items":[{"id":"item-5","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-27T10:00:00Z"}]}""",
+                    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],"entries":[{"id":"item-5","kind":"paper","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","created_at":"2026-03-27T10:00:00Z","hlc":"001780000001000-0000-server","content":{"content_type":"paper"},"state":{"inbox_state":"unread","hlc":"001780000001000-0000-server"}}],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
             )
         else -> HttpResponse(statusCode = 404, body = "{}")
     }
 }
 
-internal fun buildInFlightTagMockClient(addedTagRequests: MutableList<String>): RocheApiClient =
+internal fun assertTwoWaySyncPushedRequests(pushedBodies: List<String>) {
+    val body = pushedBodies.single()
+    assertTrue(body.contains("https://example.com/offline-note"))
+    assertTrue(body.contains(""""inbox_state":"dismissed""""))
+    assertTrue(body.contains(""""progress":0.9"""))
+    assertTrue(body.contains(""""title":"rust""""))
+    assertTrue(body.contains(""""title":"crdt""""))
+    assertTrue(body.contains(""""natural_key":"$STARRED_COLLECTION_ID\u0000item-1""""))
+    assertTrue(body.contains(""""natural_key":"tag-systems\u0000item-1""""))
+}
+
+internal fun buildTwoWaySyncMockClient(pushedBodies: MutableList<String>): RocheApiClient =
     RocheApiClient { request ->
-        if (request.method == "POST" && request.url.endsWith("/tags")) {
-            addedTagRequests.add("${request.url}:${request.body}")
+        if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+            pushedBodies.add(request.body.orEmpty())
+            val staleHlc = "000000000001000-0000-server"
             HttpResponse(
                 statusCode = 200,
                 body =
-                    """{"id":"srv-item-77","tags":[{"id":"srv-tag-added","name":"added-in-flight","unread_count":1}]}""",
+                    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],""" +
+                        """"entries":[{"id":"item-1","kind":"paper","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","created_at":"2026-03-29T10:00:00Z","hlc":"$staleHlc","content":{"content_type":"paper"},"state":{"inbox_state":"unread","progress":0.35,"hlc":"$staleHlc"}}],""" +
+                        """"collection_entries":[{"collection_id":"$STARRED_COLLECTION_ID","entry_id":"item-1","added_at":"2026-03-29T10:00:00Z","hlc":"$staleHlc"},{"collection_id":"tag-systems","entry_id":"item-1","added_at":"2026-03-29T10:00:00Z","hlc":"$staleHlc"}],""" +
+                        """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
             )
         } else {
             HttpResponse(statusCode = 404, body = "{}")
         }
     }
 
-internal fun assertTwoWaySyncPushedRequests(pushedRequests: List<Pair<String, String?>>) {
-    assertTrue(
-        pushedRequests.any { (req, body) ->
-            req == "POST https://100.64.0.12:8080/api/v1/items/save" &&
-                body?.contains("https://example.com/offline-note") == true
-        }
-    )
-    assertTrue(
-        pushedRequests.any { (req, body) ->
-            req == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
-                body == """{"status":"archived","is_favorite":false,"read_progress":0.9}"""
-        }
-    )
-    assertTrue(
-        pushedRequests.any { (req, body) ->
-            req == "POST https://100.64.0.12:8080/api/v1/items/item-1/tags" &&
-                body == """{"name":"rust"}"""
-        }
-    )
-    assertTrue(
-        pushedRequests.any { (req, _) ->
-            req == "DELETE https://100.64.0.12:8080/api/v1/items/item-1/tags/srv-tag-systems"
-        }
-    )
-}
-
-internal fun buildTwoWaySyncMockClient(
-    pushedRequests: MutableList<Pair<String, String?>>
-): RocheApiClient = RocheApiClient { request ->
-    pushedRequests.add("${request.method} ${request.url}" to request.body)
-    if (request.method == "GET") {
-        handleTwoWaySyncReadRequest(request.url)
-    } else {
-        handleTwoWaySyncWriteRequest(request.method, request.url)
-    }
-}
-
-internal fun handleTwoWaySyncWriteRequest(method: String, url: String): HttpResponse =
-    when {
-        method == "POST" && url.endsWith("/api/v1/items/save") ->
-            HttpResponse(
-                statusCode = 201,
-                body =
-                    """{"id":"srv-saved-99","title":"Offline Note","url":"https://example.com/offline-note","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["crdt"]}""",
-            )
-        method == "PATCH" && url.endsWith("/api/v1/items/item-1") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"id":"item-1","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"archived","is_favorite":false,"read_progress":0.9,"created_at":"2026-03-29T10:00:00Z"}""",
-            )
-        method == "POST" && url.endsWith("/api/v1/items/item-1/tags") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"id":"item-1","tags":[{"id":"srv-tag-rust","name":"rust","unread_count":0}]}""",
-            )
-        method == "DELETE" && url.endsWith("/api/v1/items/item-1/tags/srv-tag-systems") ->
-            HttpResponse(statusCode = 204, body = "")
-        else -> HttpResponse(statusCode = 404, body = "{}")
-    }
-
-internal fun handleTwoWaySyncReadRequest(url: String): HttpResponse =
-    when {
-        url.endsWith("/api/v1/feeds") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":0}]}""",
-            )
-        url.endsWith("/api/v1/tags") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"tags":[{"id":"srv-tag-llm","name":"llm-inference","unread_count":0},{"id":"srv-tag-systems","name":"systems","unread_count":0},{"id":"srv-tag-rust","name":"rust","unread_count":0},{"id":"srv-tag-crdt","name":"crdt","unread_count":1}]}""",
-            )
-        url.contains("/api/v1/items") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"read_progress":0.35,"created_at":"2026-03-29T10:00:00Z","tag_names":["llm-inference","systems"]}]}""",
-            )
-        else -> HttpResponse(statusCode = 404, body = "{}")
-    }
-
 internal suspend fun assertReadTimestampSync(
     liveRepo: RocheRepository,
-    requests: List<Pair<String, String?>>,
+    syncBodies: List<String>,
 ) {
     liveRepo.setReadState(itemId = "item-1", isRead = true)
     val readItem = liveRepo.snapshot.first().entries.first { it.id == "item-1" }
     assertTrue(readItem.isRead)
     assertTrue(!readItem.readAt.isNullOrBlank())
-    assertTrue(
-        requests.any { (endpoint, body) ->
-            endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
-                body == """{"read_at":"${readItem.readAt}"}"""
-        }
-    )
+    liveRepo.syncWithServer().getOrThrow()
+    assertTrue(syncBodies.last().contains(""""read_at":"${readItem.readAt}""""))
 
     assertFalse(liveRepo.toggleReadState(itemId = "item-1"))
     val unreadItem = liveRepo.snapshot.first().entries.first { it.id == "item-1" }
     assertFalse(unreadItem.isRead)
     assertEquals(null, unreadItem.readAt)
-    assertTrue(
-        requests.any { (endpoint, body) ->
-            endpoint == "PATCH https://100.64.0.12:8080/api/v1/items/item-1" &&
-                body == """{"read_at":null}"""
-        }
-    )
+    liveRepo.syncWithServer().getOrThrow()
+    assertFalse(syncBodies.last().contains(""""read_at":"${readItem.readAt}""""))
 }
 
 private fun buildLongHtmlSyncMockClient(longHtml: String): RocheApiClient =
     RocheApiClient { request ->
-        when {
-            request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
-                HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
-            request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
-                HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-            request.method == "GET" && request.url.contains("/api/v1/items") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"items":[{"id":"item-long-essay","title":"Ten Thousand Words","url":"https://example.com/long-essay","summary":"Short 320-char excerpt.","content_html":"$longHtml","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z"}]}""",
-                )
-            else -> HttpResponse(statusCode = 404, body = "{}")
+        if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+            val hlc = "001780000001000-0000-server"
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],"entries":[{"id":"item-long-essay","kind":"article","title":"Ten Thousand Words","url":"https://example.com/long-essay","summary":"Short 320-char excerpt.","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"$longHtml"},"state":{"inbox_state":"unread","hlc":"$hlc"}}],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+            )
+        } else {
+            HttpResponse(statusCode = 404, body = "{}")
         }
     }
 
@@ -1617,7 +1547,7 @@ private suspend fun seedLanFeedAndOverflowDataset(database: RocheDatabase) {
     val pubFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
     dao.upsertFeeds(
         listOf(
-            FeedEntity(
+            FeedRow(
                 id = lanFeedId,
                 title = "Homelab LAN RSS",
                 url = "http://192.168.1.50/rss.xml",
@@ -1625,7 +1555,7 @@ private suspend fun seedLanFeedAndOverflowDataset(database: RocheDatabase) {
                 feedType = "rss",
                 lastPolled = "2099-01-01T00:00:00Z",
             ),
-            FeedEntity(
+            FeedRow(
                 id = pubFeedId,
                 title = "Public Blog",
                 url = "https://blog.example.com/rss.xml",
@@ -1636,7 +1566,7 @@ private suspend fun seedLanFeedAndOverflowDataset(database: RocheDatabase) {
         )
     )
     dao.upsertItem(
-        ItemEntity(
+        InboxItemRow(
             id = "lan-item-1",
             feedId = lanFeedId,
             feedUrl = "http://192.168.1.50/rss.xml",
@@ -1671,7 +1601,7 @@ private suspend fun seedOverflowPublicItems(
             val padded = idx.toString().padStart(4, '0')
             val isOverflowTarget = idx == 2_002
             val ts = if (isOverflowTarget) "2025-01-01T00:00:00Z" else "2026-05-02T12:00:00Z"
-            ItemEntity(
+            InboxItemRow(
                 id = "item-pub-$padded",
                 feedId = pubFeedId,
                 feedUrl = "https://blog.example.com/rss.xml",
@@ -1695,9 +1625,6 @@ private suspend fun seedOverflowPublicItems(
             )
         }
     dao.upsertItems(bulkItems)
-    dao.upsertPendingMutation(
-        PendingMutationEntity(entityId = "item-pub-2002", dirtyFavorite = true)
-    )
 }
 
 private fun buildLanAndOverflowPeerSyncMockClient(
@@ -1707,20 +1634,21 @@ private fun buildLanAndOverflowPeerSyncMockClient(
         val body = request.body.orEmpty()
         peerSyncBodies.add(body)
         val pubFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
-        val isDelta = body.contains(""""updated_after"""")
-        val itemsJson =
+        val isDelta = body.contains(""""since_seq":""")
+        val seq = if (isDelta) 2 else 1
+        val hlc = "00178000000${seq}000-0000-server"
+        val entriesJson =
             if (isDelta) {
-                """[{"id":"item-pub-2002","feed_id":"$pubFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Public Blog","title":"Public Post 2002","url":"https://blog.example.com/post-2002","content_type":"article","status":"unread","is_favorite":true,"created_at":"2025-01-01T00:00:00Z","tag_names":[]}]"""
+                """[{"id":"item-pub-2002","kind":"article","title":"Public Post 2002","url":"https://blog.example.com/post-2002","created_at":"2025-01-01T00:00:00Z","hlc":"$hlc","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc"}}]"""
             } else {
-                """[{"id":"item-pub-0001","feed_id":"$pubFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Public Blog","title":"Public Post 0001","url":"https://blog.example.com/post-0001","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-05-02T12:00:00Z","tag_names":[]}]"""
+                """[{"id":"$pubFeedId","kind":"feed","title":"Public Blog","url":"https://blog.example.com","hlc":"$hlc","feed_source":{"feed_url":"https://blog.example.com/rss.xml","source_type":"rss","feed_title":"Public Blog","poll_interval":30,"last_polled_at":"2099-01-01T00:00:00Z","is_active":true,"hlc":"$hlc"}},{"id":"item-pub-0001","kind":"article","title":"Public Post 0001","url":"https://blog.example.com/post-0001","created_at":"2026-05-02T12:00:00Z","hlc":"$hlc","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc"}}]"""
             }
         HttpResponse(
             statusCode = 200,
             body =
-                """{"server_peer_id":"server","sync_timestamp":"2026-05-03T00:00:00Z",""" +
+                """{"server_peer_id":"server","sync_seq":$seq,"server_hlc":"$hlc","sync_timestamp":"2026-05-03T00:00:00Z",""" +
                     """"active_peers":[{"peer_id":"server","device_name":"Server","network_tier":"wired","weight":1.0,"last_seen_at":"2026-05-03T00:00:00Z"}],""" +
-                    """"feeds":[{"id":"$pubFeedId","title":"Public Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2099-01-01T00:00:00Z","is_active":true,"unread_count":1}],""" +
-                    """"items":$itemsJson,"tags":[],"tombstones":[]}""",
+                    """"entries":$entriesJson,"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
         )
     } else {
         HttpResponse(statusCode = 404, body = "{}")
@@ -1728,36 +1656,27 @@ private fun buildLanAndOverflowPeerSyncMockClient(
 }
 
 private fun buildRenameFeedSyncMockClient(
-    isPatchAvailable: () -> Boolean,
-    patchBodies: MutableList<String>,
+    isSyncAvailable: () -> Boolean,
+    syncBodies: MutableList<String>,
 ): RocheApiClient = RocheApiClient { request ->
-    when {
-        request.method == "PATCH" && request.url.endsWith("/api/v1/feeds/feed-arxiv-cs-lg") ->
-            if (isPatchAvailable()) {
-                patchBodies.add(request.body.orEmpty())
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"id":"feed-arxiv-cs-lg","title":"Custom ML Papers","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":1}""",
-                )
-            } else {
-                HttpResponse(statusCode = 503, body = """{"title":"Unavailable"}""")
-            }
-        request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
+    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+        if (isSyncAvailable()) {
+            val body = request.body.orEmpty()
+            syncBodies.add(body)
+            val seq = syncBodies.size
+            val staleHlc = "000000000001000-0000-server"
             HttpResponse(
                 statusCode = 200,
                 body =
-                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","feed_type":"arxiv","unread_count":1}]}""",
+                    """{"server_peer_id":"server","sync_seq":$seq,"server_hlc":"00178000000${seq}000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],""" +
+                        """"entries":[{"id":"feed-arxiv-cs-lg","kind":"feed","title":"arXiv cs.LG","url":"https://arxiv.org/list/cs.LG/recent","hlc":"$staleHlc","feed_source":{"feed_url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG","source_type":"arxiv","feed_title":"arXiv cs.LG","hlc":"$staleHlc"}}],""" +
+                        """"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
             )
-        request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
-            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-        request.method == "GET" && request.url.contains("/api/v1/items") ->
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"items":[{"id":"item-1","feed_id":"feed-arxiv-cs-lg","feed_title":"arXiv cs.LG","title":"Speculative Decoding","url":"https://arxiv.org/abs/2603.11842","content_type":"paper","status":"unread","is_favorite":true,"created_at":"2026-03-29T10:00:00Z"}]}""",
-            )
-        else -> HttpResponse(statusCode = 404, body = "{}")
+        } else {
+            HttpResponse(statusCode = 503, body = """{"title":"Unavailable"}""")
+        }
+    } else {
+        HttpResponse(statusCode = 404, body = "{}")
     }
 }
 
@@ -1782,181 +1701,40 @@ private fun buildFailingAudioCacheMockClient(): RocheApiClient = RocheApiClient 
 internal fun buildTargetedDiffSyncMockClient(roundProvider: () -> Int): RocheApiClient {
     val oversizedSummary = "s".repeat(17_000)
     return RocheApiClient { request ->
-        val round = roundProvider()
-        when {
-            request.url.endsWith("/api/v1/feeds") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        """{"feeds":[{"id":"f-1","title":"Feed","url":"https://example.com/rss","feed_type":"rss","unread_count":2}]}""",
-                )
-            request.url.endsWith("/api/v1/tags") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body =
-                        if (round == 1) {
-                            """{"tags":[{"id":"t-keep","name":"keep","unread_count":1},{"id":"t-drop","name":"drop","unread_count":1}]}"""
-                        } else {
-                            """{"tags":[{"id":"t-keep","name":"keep","unread_count":2}]}"""
-                        },
-                )
-            request.url.contains("/api/v1/items") ->
-                HttpResponse(
-                    statusCode = 200,
-                    body = buildTargetedDiffItemsJson(round, oversizedSummary),
-                )
-            else -> HttpResponse(statusCode = 404, body = "{}")
+        if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+            val round = roundProvider()
+            HttpResponse(
+                statusCode = 200,
+                body = buildTargetedDiffPeerSyncJson(round, oversizedSummary),
+            )
+        } else {
+            HttpResponse(statusCode = 404, body = "{}")
         }
     }
 }
 
-internal fun buildTargetedDiffItemsJson(round: Int, oversizedSummary: String): String =
-    if (round == 1) {
-        """{"items":[""" +
-            """{"id":"i-keep","feed_id":"f-1","feed_title":"Feed","title":"Keep","url":"https://example.com/keep","summary":"$oversizedSummary","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","tag_names":["keep"]},""" +
-            """{"id":"i-edit","feed_id":"f-1","feed_title":"Feed","title":"Original","url":"https://example.com/edit","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T09:00:00Z","tag_names":[]},""" +
-            """{"id":"i-drop","feed_id":"f-1","feed_title":"Feed","title":"Drop","url":"https://example.com/drop","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T08:00:00Z","tag_names":["drop"]}]}"""
-    } else {
-        """{"items":[""" +
-            """{"id":"i-keep","feed_id":"f-1","feed_title":"Feed","title":"Keep","url":"https://example.com/keep","summary":"$oversizedSummary","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T10:00:00Z","tag_names":["keep"]},""" +
-            """{"id":"i-edit","feed_id":"f-1","feed_title":"Feed","title":"Edited Title","url":"https://example.com/edit","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-04-01T09:00:00Z","tag_names":[]},""" +
-            """{"id":"i-new","feed_id":"f-1","feed_title":"Feed","title":"New","url":"https://example.com/new","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T11:00:00Z","tag_names":["keep"]}]}"""
-    }
-
-internal suspend fun verifyDaoDiffSkipsZeroChangeAndChunksDeletes(baseDao: RocheDao) {
-    val spy = RecordingRocheDao(baseDao)
-    val feeds = baseDao.getAllFeeds()
-    val tags = baseDao.getAllTags()
-    val itemsWithOversizedSummary =
-        baseDao.getAllItems().map { item ->
-            if (item.id == "i-keep") item.copy(summary = "s".repeat(17_000)) else item
-        }
-    val itemTags = baseDao.getAllItemTags()
-
-    // 0-change reconcile (even when input summary exceeds 16384 chars) performs 0 writes/deletes
-    spy.resetCounts()
-    spy.reconcileSnapshotDiff(feeds, tags, itemsWithOversizedSummary, itemTags)
-    assertEquals(0, spy.totalWriteAndDeleteCalls)
-    assertEquals(0, spy.fullClearCalls)
-
-    // Seed 505 transient items, then reconcile back to the 3 surviving items -> 2 delete chunks
-    val transientItems =
-        (1..505).map { idx ->
-            itemsWithOversizedSummary
-                .first()
-                .copy(
-                    id = "temp-$idx",
-                    url = "https://example.com/temp-$idx",
-                )
-        }
-    baseDao.upsertItems(transientItems)
-    spy.resetCounts()
-    spy.reconcileSnapshotDiff(feeds, tags, itemsWithOversizedSummary, itemTags)
-    assertEquals(listOf(500, 5), spy.deletedItemChunks.map { it.size })
-    assertTrue(spy.upsertedItemIds.isEmpty())
-    assertEquals(0, spy.fullClearCalls)
-}
-
-internal class RecordingRocheDao(private val delegate: RocheDao) : RocheDao by delegate {
-    val upsertedFeedIds = mutableListOf<String>()
-    val upsertedTagIds = mutableListOf<String>()
-    val upsertedItemIds = mutableListOf<String>()
-    val insertedItemTags = mutableListOf<ItemTagEntity>()
-    val deletedItemChunks = mutableListOf<List<String>>()
-    val deletedFeedChunks = mutableListOf<List<String>>()
-    val deletedTagChunks = mutableListOf<List<String>>()
-    val deletedItemTags = mutableListOf<ItemTagEntity>()
-    var fullClearCalls = 0
-
-    val totalWriteAndDeleteCalls: Int
-        get() =
-            upsertedFeedIds.size +
-                upsertedTagIds.size +
-                upsertedItemIds.size +
-                insertedItemTags.size +
-                deletedItemChunks.size +
-                deletedFeedChunks.size +
-                deletedTagChunks.size +
-                deletedItemTags.size
-
-    fun resetCounts() {
-        upsertedFeedIds.clear()
-        upsertedTagIds.clear()
-        upsertedItemIds.clear()
-        insertedItemTags.clear()
-        deletedItemChunks.clear()
-        deletedFeedChunks.clear()
-        deletedTagChunks.clear()
-        deletedItemTags.clear()
-        fullClearCalls = 0
-    }
-
-    override suspend fun reconcileSnapshotDiff(
-        feeds: List<FeedEntity>,
-        tags: List<TagEntity>,
-        items: List<ItemEntity>,
-        itemTags: List<ItemTagEntity>,
-    ) {
-        super.reconcileSnapshotDiff(feeds, tags, items, itemTags)
-    }
-
-    override suspend fun upsertFeeds(feeds: List<FeedEntity>) {
-        upsertedFeedIds += feeds.map { it.id }
-        delegate.upsertFeeds(feeds)
-    }
-
-    override suspend fun upsertTags(tags: List<TagEntity>) {
-        upsertedTagIds += tags.map { it.id }
-        delegate.upsertTags(tags)
-    }
-
-    override suspend fun upsertItems(items: List<ItemEntity>) {
-        upsertedItemIds += items.map { it.id }
-        delegate.upsertItems(items)
-    }
-
-    override suspend fun insertItemTags(itemTags: List<ItemTagEntity>) {
-        insertedItemTags += itemTags
-        delegate.insertItemTags(itemTags)
-    }
-
-    override suspend fun deleteItemsByIds(ids: List<String>) {
-        deletedItemChunks += ids
-        delegate.deleteItemsByIds(ids)
-    }
-
-    override suspend fun deleteFeedsByIds(ids: List<String>) {
-        deletedFeedChunks += ids
-        delegate.deleteFeedsByIds(ids)
-    }
-
-    override suspend fun deleteTagsByIds(ids: List<String>) {
-        deletedTagChunks += ids
-        delegate.deleteTagsByIds(ids)
-    }
-
-    override suspend fun deleteItemTag(itemId: String, tagId: String) {
-        deletedItemTags += ItemTagEntity(itemId = itemId, tagId = tagId)
-        delegate.deleteItemTag(itemId, tagId)
-    }
-
-    override suspend fun clearAllItems() {
-        fullClearCalls++
-        delegate.clearAllItems()
-    }
-
-    override suspend fun clearAllFeeds() {
-        fullClearCalls++
-        delegate.clearAllFeeds()
-    }
-
-    override suspend fun clearAllTags() {
-        fullClearCalls++
-        delegate.clearAllTags()
-    }
-
-    override suspend fun clearAllItemTags() {
-        fullClearCalls++
-        delegate.clearAllItemTags()
+private fun buildTargetedDiffPeerSyncJson(round: Int, oversizedSummary: String): String {
+    val hlc1 = "001780000001000-0000-server"
+    val hlc3 = "001780000003000-0000-server"
+    return when (round) {
+        1 ->
+            """{"server_peer_id":"server","sync_seq":1,"server_hlc":"$hlc1","sync_timestamp":"2026-04-01T10:00:00Z","active_peers":[],""" +
+                """"entries":[{"id":"f-1","kind":"feed","title":"Feed","url":"https://example.com","hlc":"$hlc1","feed_source":{"feed_url":"https://example.com/rss","source_type":"rss","feed_title":"Feed","last_polled_at":"2099-01-01T00:00:00Z","hlc":"$hlc1"}},""" +
+                """{"id":"t-keep","kind":"collection","title":"keep","hlc":"$hlc1","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}},""" +
+                """{"id":"t-drop","kind":"collection","title":"drop","hlc":"$hlc1","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}},""" +
+                """{"id":"i-keep","kind":"article","title":"Keep","url":"https://example.com/keep","summary":"$oversizedSummary","created_at":"2026-04-01T10:00:00Z","hlc":"$hlc1","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc1"}},""" +
+                """{"id":"i-edit","kind":"article","title":"Original","url":"https://example.com/edit","created_at":"2026-04-01T09:00:00Z","hlc":"$hlc1","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc1"}},""" +
+                """{"id":"i-drop","kind":"article","title":"Drop","url":"https://example.com/drop","created_at":"2026-04-01T08:00:00Z","hlc":"$hlc1","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc1"}}],""" +
+                """"collection_entries":[{"collection_id":"f-1","entry_id":"i-keep","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc1"},{"collection_id":"t-keep","entry_id":"i-keep","added_at":"2026-04-01T10:00:00Z","hlc":"$hlc1"},{"collection_id":"f-1","entry_id":"i-edit","added_at":"2026-04-01T09:00:00Z","hlc":"$hlc1"},{"collection_id":"f-1","entry_id":"i-drop","added_at":"2026-04-01T08:00:00Z","hlc":"$hlc1"},{"collection_id":"t-drop","entry_id":"i-drop","added_at":"2026-04-01T08:00:00Z","hlc":"$hlc1"}],""" +
+                """"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}"""
+        2 ->
+            """{"server_peer_id":"server","sync_seq":2,"server_hlc":"001780000002000-0000-server","sync_timestamp":"2026-04-01T10:30:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}"""
+        else ->
+            """{"server_peer_id":"server","sync_seq":3,"server_hlc":"$hlc3","sync_timestamp":"2026-04-01T11:00:00Z","active_peers":[],""" +
+                """"entries":[{"id":"i-edit","kind":"article","title":"Edited Title","url":"https://example.com/edit","created_at":"2026-04-01T09:00:00Z","hlc":"$hlc3","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc3"}},""" +
+                """{"id":"i-new","kind":"article","title":"New","url":"https://example.com/new","created_at":"2026-04-01T11:00:00Z","hlc":"$hlc3","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"$hlc3"}}],""" +
+                """"collection_entries":[{"collection_id":"$STARRED_COLLECTION_ID","entry_id":"i-edit","added_at":"2026-04-01T11:00:00Z","hlc":"$hlc3"},{"collection_id":"f-1","entry_id":"i-new","added_at":"2026-04-01T11:00:00Z","hlc":"$hlc3"},{"collection_id":"t-keep","entry_id":"i-new","added_at":"2026-04-01T11:00:00Z","hlc":"$hlc3"}],""" +
+                """"collection_generators":[],"consumption_log":[],"comparisons":[],""" +
+                """"tombstones":[{"entity_type":"item","natural_key":"https://example.com/rss\u0000https://example.com/drop","deleted_at":"2026-04-01T11:00:00Z","hlc":"$hlc3"},{"entity_type":"tag","natural_key":"drop","deleted_at":"2026-04-01T11:00:00Z","hlc":"$hlc3"}]}"""
     }
 }

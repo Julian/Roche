@@ -318,12 +318,12 @@ internal fun parseOdesliLinksPayload(rawJson: String): Map<String, String> {
     return out
 }
 
-private fun odesliSeedUrl(album: CollectionDrawSnapshot): String? {
+internal fun odesliSeedUrl(album: CollectionDrawSnapshot): String? {
     val candidates = album.candidateStreamingUrls()
     return candidates.firstOrNull { !it.contains("youtube.com") } ?: candidates.firstOrNull()
 }
 
-private fun shouldQueryOdesli(album: CollectionDrawSnapshot): Boolean =
+internal fun shouldQueryOdesli(album: CollectionDrawSnapshot): Boolean =
     album.appleMusicId.isNullOrBlank() ||
         album.tidalId.isNullOrBlank() ||
         album.deezerId.isNullOrBlank() ||

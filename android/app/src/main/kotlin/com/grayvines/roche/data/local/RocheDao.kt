@@ -1,4 +1,4 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("TooManyFunctions", "StringLiteralDuplication")
 
 package com.grayvines.roche.data.local
 
@@ -8,485 +8,182 @@ import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
 import androidx.room3.Update
-import com.grayvines.roche.data.MAX_SQLITE_HTML_CHARS
-import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
-import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
-import com.grayvines.roche.model.ContentType
-import com.grayvines.roche.model.formatArticleMinutes
 import kotlinx.coroutines.flow.Flow
+
+private const val FEED_ID_SUBQUERY =
+    "(SELECT ce_f.collectionId FROM collection_entries ce_f " +
+        "LEFT JOIN collection_specs cs_f ON cs_f.collectionId = ce_f.collectionId " +
+        "WHERE ce_f.entryId = e.id " +
+        "AND ce_f.collectionId NOT IN (" +
+        "'533b1315-6e2e-57d3-ba85-dc88531c5a0b', '3864ff37-5ed3-5256-9380-f85ff8054f1c'" +
+        ") " +
+        "AND (EXISTS (SELECT 1 FROM feed_sources fs_x WHERE fs_x.collectionId = ce_f.collectionId) " +
+        "OR cs_f.collectionId IS NULL OR cs_f.role = 'feed') " +
+        "ORDER BY ce_f.addedAt ASC, ce_f.collectionId ASC LIMIT 1)"
+
+private const val FEED_URL_SUBQUERY =
+    "(SELECT fs_f.feedUrl FROM collection_entries ce_f " +
+        "INNER JOIN feed_sources fs_f ON fs_f.collectionId = ce_f.collectionId " +
+        "WHERE ce_f.entryId = e.id " +
+        "ORDER BY ce_f.addedAt ASC, ce_f.collectionId ASC LIMIT 1)"
+
+private const val FEED_TITLE_EXPR =
+    "COALESCE((" +
+        "SELECT COALESCE(NULLIF(fe.title, ''), NULLIF(fs_f.feedTitle, ''), fs_f.feedUrl) " +
+        "FROM collection_entries ce_f " +
+        "INNER JOIN feed_sources fs_f ON fs_f.collectionId = ce_f.collectionId " +
+        "INNER JOIN entries fe ON fe.id = fs_f.collectionId " +
+        "WHERE ce_f.entryId = e.id " +
+        "ORDER BY ce_f.addedAt ASC, ce_f.collectionId ASC LIMIT 1" +
+        "), NULLIF(ec.fallbackFeedTitle, ''), 'Saved Link')"
+
+private const val AUTHOR_SUBQUERY =
+    "(SELECT GROUP_CONCAT(value, ', ') FROM json_each(" +
+        "CASE WHEN json_valid(e.creatorsJson) THEN e.creatorsJson ELSE '[]' END))"
+
+private const val IS_FAVORITE_EXPR =
+    "EXISTS (SELECT 1 FROM collection_entries ce_fav " +
+        "WHERE ce_fav.collectionId = '533b1315-6e2e-57d3-ba85-dc88531c5a0b' " +
+        "AND ce_fav.entryId = e.id)"
+
+private const val STATUS_EXPR =
+    "CASE WHEN es.inboxState = 'dismissed' THEN 'archived' ELSE 'unread' END"
+
+private const val INBOX_FROM_WHERE =
+    "FROM entries e " +
+        "INNER JOIN entry_state es ON es.entryId = e.id " +
+        "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+        "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed')"
+
+private const val INBOX_SELECT_LIST_PREFIX =
+    "SELECT e.id AS id, " +
+        "$FEED_ID_SUBQUERY AS feedId, " +
+        "$FEED_TITLE_EXPR AS feedTitle, " +
+        "e.title AS title, " +
+        "COALESCE(e.url, '') AS url, " +
+        "$AUTHOR_SUBQUERY AS author, " +
+        "SUBSTR(e.summary, 1, 1024) AS summary, " +
+        "SUBSTR(ec.contentText, 1, 2048) AS contentText, " +
+        "SUBSTR(ec.contentHtml, 1, 2048) AS contentHtml, " +
+        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$STATUS_EXPR AS status, " +
+        "$IS_FAVORITE_EXPR AS isFavorite, " +
+        "es.isCachedOffline AS isCachedOffline, " +
+        "e.publishedAt AS publishedAt, " +
+        "e.createdAt AS createdAt, " +
+        "es.progress AS readProgress, " +
+        "ec.thumbnailMediaId AS thumbnailMediaId, " +
+        "ec.duration AS duration, " +
+        "es.readAt AS readAt, " +
+        "e.thumbnailUrl AS thumbnailUrl, " +
+        "$FEED_URL_SUBQUERY AS feedUrl, " +
+        "es.interactionUpdatedAt AS interactionUpdatedAt, " +
+        "ec.audioUrl AS audioUrl " +
+        INBOX_FROM_WHERE
+
+private const val INBOX_SELECT_FULL_PREFIX =
+    "SELECT e.id AS id, " +
+        "$FEED_ID_SUBQUERY AS feedId, " +
+        "$FEED_TITLE_EXPR AS feedTitle, " +
+        "e.title AS title, " +
+        "COALESCE(e.url, '') AS url, " +
+        "$AUTHOR_SUBQUERY AS author, " +
+        "SUBSTR(e.summary, 1, 16384) AS summary, " +
+        "SUBSTR(ec.contentText, 1, 262144) AS contentText, " +
+        "SUBSTR(ec.contentHtml, 1, 512000) AS contentHtml, " +
+        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$STATUS_EXPR AS status, " +
+        "$IS_FAVORITE_EXPR AS isFavorite, " +
+        "es.isCachedOffline AS isCachedOffline, " +
+        "e.publishedAt AS publishedAt, " +
+        "e.createdAt AS createdAt, " +
+        "es.progress AS readProgress, " +
+        "ec.thumbnailMediaId AS thumbnailMediaId, " +
+        "ec.duration AS duration, " +
+        "es.readAt AS readAt, " +
+        "e.thumbnailUrl AS thumbnailUrl, " +
+        "$FEED_URL_SUBQUERY AS feedUrl, " +
+        "es.interactionUpdatedAt AS interactionUpdatedAt, " +
+        "ec.audioUrl AS audioUrl " +
+        INBOX_FROM_WHERE
+
+private const val INBOX_SELECT_SEARCH_PREFIX =
+    "SELECT e.id AS id, " +
+        "$FEED_ID_SUBQUERY AS feedId, " +
+        "$FEED_TITLE_EXPR AS feedTitle, " +
+        "e.title AS title, " +
+        "COALESCE(e.url, '') AS url, " +
+        "$AUTHOR_SUBQUERY AS author, " +
+        "SUBSTR(e.summary, 1, 16384) AS summary, " +
+        "SUBSTR(ec.contentText, 1, 65536) AS contentText, " +
+        "SUBSTR(ec.contentHtml, 1, 65536) AS contentHtml, " +
+        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$STATUS_EXPR AS status, " +
+        "$IS_FAVORITE_EXPR AS isFavorite, " +
+        "es.isCachedOffline AS isCachedOffline, " +
+        "e.publishedAt AS publishedAt, " +
+        "e.createdAt AS createdAt, " +
+        "es.progress AS readProgress, " +
+        "ec.thumbnailMediaId AS thumbnailMediaId, " +
+        "ec.duration AS duration, " +
+        "es.readAt AS readAt, " +
+        "e.thumbnailUrl AS thumbnailUrl, " +
+        "$FEED_URL_SUBQUERY AS feedUrl, " +
+        "es.interactionUpdatedAt AS interactionUpdatedAt, " +
+        "ec.audioUrl AS audioUrl " +
+        INBOX_FROM_WHERE
+
+private const val FEED_ROW_SELECT =
+    "SELECT fs.collectionId AS id, " +
+        "COALESCE(NULLIF(e.title, ''), NULLIF(fs.feedTitle, ''), fs.feedUrl) AS title, " +
+        "fs.feedUrl AS url, " +
+        "fs.siteUrl AS siteUrl, " +
+        "fs.sourceType AS feedType, " +
+        "e.summary AS description, " +
+        "fs.language AS language, " +
+        "fs.pollInterval AS pollInterval, " +
+        "fs.lastPolledAt AS lastPolled, " +
+        "fs.lastPolledBy AS lastPolledBy, " +
+        "fs.lastError AS lastError, " +
+        "fs.lastErrorBy AS lastErrorBy, " +
+        "fs.isActive AS isActive, " +
+        "fs.autoDownloadEpisodes AS autoDownloadEpisodes, " +
+        "fs.customPlaybackSpeed AS customPlaybackSpeed, " +
+        "fs.hlc AS hlc, " +
+        "(fs.isLocalDirty OR e.isLocalDirty) AS isLocalDirty " +
+        "FROM feed_sources fs " +
+        "INNER JOIN entries e ON e.id = fs.collectionId " +
+        "WHERE e.mergedIntoId IS NULL"
 
 @Dao
 interface RocheDao {
-    @Query("SELECT * FROM feeds ORDER BY title COLLATE NOCASE ASC, title ASC")
-    fun observeFeeds(): Flow<List<FeedEntity>>
+    // --- Reactive UI Observers ---
 
-    @Query("SELECT * FROM items ORDER BY COALESCE(publishedAt, createdAt) DESC")
-    fun observeItems(): Flow<List<ItemEntity>>
+    @Query("$FEED_ROW_SELECT ORDER BY title COLLATE NOCASE ASC, title ASC")
+    fun observeFeeds(): Flow<List<FeedRow>>
 
-    @Query("SELECT * FROM tags ORDER BY name COLLATE NOCASE ASC, name ASC")
-    fun observeTags(): Flow<List<TagEntity>>
-
-    @Query("SELECT * FROM item_tags") fun observeItemTags(): Flow<List<ItemTagEntity>>
-
-    @Query("SELECT COUNT(*) FROM items") suspend fun countItems(): Int
-
-    @Query("SELECT * FROM feeds") suspend fun getAllFeeds(): List<FeedEntity>
-
-    @Query("SELECT * FROM feeds WHERE id = :id LIMIT 1")
-    suspend fun getFeedById(id: String): FeedEntity?
-
-    @Query("SELECT * FROM feeds WHERE url = :url LIMIT 1")
-    suspend fun getFeedByUrl(url: String): FeedEntity?
-
-    @Query("DELETE FROM feeds WHERE id = :id") suspend fun deleteFeedById(id: String)
-
-    @Query("UPDATE feeds SET title = :title WHERE id = :feedId")
-    suspend fun updateFeedTitle(feedId: String, title: String)
-
-    @Query("UPDATE feeds SET isActive = :isActive WHERE id = :feedId")
-    suspend fun updateFeedActive(feedId: String, isActive: Boolean)
-
-    @Query("UPDATE feeds SET autoDownloadEpisodes = :enabled WHERE id = :feedId")
-    suspend fun updateFeedAutoDownload(feedId: String, enabled: Boolean)
-
-    @Query("UPDATE feeds SET customPlaybackSpeed = :speed WHERE id = :feedId")
-    suspend fun updateFeedPlaybackSpeed(feedId: String, speed: Float?)
-
-    @Query("UPDATE items SET feedTitle = :title WHERE feedId = :feedId")
-    suspend fun updateItemsFeedTitle(feedId: String, title: String)
-
-    @Query("SELECT id FROM items WHERE feedId = :feedId AND status != 'archived'")
-    suspend fun getUnarchivedItemIdsForFeed(feedId: String): List<String>
-
-    @Query("SELECT id FROM items WHERE feedId = :feedId")
-    suspend fun getItemIdsForFeed(feedId: String): List<String>
+    @Query("$INBOX_SELECT_LIST_PREFIX ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC")
+    fun observeItems(): Flow<List<InboxItemRow>>
 
     @Query(
-        "SELECT id FROM items WHERE feedId IN (:feedIds) AND status != 'archived' " +
-            "AND (readAt IS NULL OR readAt = '') AND isCachedOffline = 0 " +
-            "AND (LOWER(contentType) = 'audio' OR (audioUrl IS NOT NULL AND audioUrl != ''))"
+        "SELECT e.id AS id, e.title AS name, cs.color AS color " +
+            "FROM collection_specs cs " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL " +
+            "ORDER BY e.title COLLATE NOCASE ASC, e.title ASC"
     )
-    suspend fun getUncachedUnreadAudioItemIds(feedIds: List<String>): List<String>
-
-    @Query("SELECT * FROM items WHERE id IN (:ids)")
-    suspend fun getPreviewItemsByIds(ids: List<String>): List<ItemEntity>
-
-    @Query("SELECT * FROM sync_tombstones") suspend fun getAllTombstones(): List<TombstoneEntity>
+    fun observeTags(): Flow<List<TagRow>>
 
     @Query(
-        "SELECT * FROM sync_tombstones WHERE entityType = :entityType AND naturalKey = :naturalKey LIMIT 1"
+        "SELECT ce.entryId AS itemId, ce.collectionId AS tagId " +
+            "FROM collection_entries ce " +
+            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL"
     )
-    suspend fun getTombstone(entityType: String, naturalKey: String): TombstoneEntity?
+    fun observeItemTags(): Flow<List<ItemTagRow>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertTombstone(tombstone: TombstoneEntity)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertTombstones(tombstones: List<TombstoneEntity>)
-
-    @Query(
-        "DELETE FROM sync_tombstones WHERE entityType = :entityType AND naturalKey = :naturalKey"
-    )
-    suspend fun deleteTombstone(entityType: String, naturalKey: String)
-
-    @Query("DELETE FROM sync_tombstones") suspend fun clearAllTombstones()
-
-    @Query("SELECT * FROM tags") suspend fun getAllTags(): List<TagEntity>
-
-    @Query("SELECT * FROM item_tags") suspend fun getAllItemTags(): List<ItemTagEntity>
-
-    @Query(
-        "SELECT t.name FROM tags t INNER JOIN item_tags it ON t.id = it.tagId " +
-            "WHERE it.itemId = :itemId ORDER BY t.name COLLATE NOCASE ASC, t.name ASC"
-    )
-    suspend fun getTagNamesForItem(itemId: String): List<String>
-
-    @Query("UPDATE OR IGNORE item_tags SET tagId = :newTagId WHERE tagId = :oldTagId")
-    suspend fun migrateItemTagIds(oldTagId: String, newTagId: String)
-
-    @Query("SELECT * FROM pending_mutations")
-    suspend fun getAllPendingMutations(): List<PendingMutationEntity>
-
-    @Query("SELECT * FROM pending_mutations WHERE entityId = :entityId LIMIT 1")
-    suspend fun getPendingMutation(entityId: String): PendingMutationEntity?
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertPendingMutation(mutation: PendingMutationEntity)
-
-    @Query("DELETE FROM pending_mutations WHERE entityId = :entityId")
-    suspend fun deletePendingMutation(entityId: String)
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
-            "WHERE items.feedId = :feedId " +
-            "OR (items.feedUrl IS NOT NULL AND LOWER(items.feedUrl) = LOWER(:feedUrl))"
-    )
-    suspend fun getItemsForFeed(feedId: String, feedUrl: String): List<ItemEntity>
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId"
-    )
-    suspend fun getAllItems(): List<ItemEntity>
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 262144) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 512000) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
-            "WHERE items.id = :id LIMIT 1"
-    )
-    suspend fun getItemById(id: String): ItemEntity?
-
-    @Query(
-        "SELECT id, status, isFavorite, isCachedOffline, contentType, readAt, readProgress, audioUrl " +
-            "FROM items WHERE id = :id LIMIT 1"
-    )
-    suspend fun getItemStateById(id: String): ItemStateRow?
-
-    @Query(
-        "SELECT id, status, isFavorite, isCachedOffline, contentType, readAt, readProgress, audioUrl " +
-            "FROM items WHERE status != 'archived'"
-    )
-    suspend fun getUnarchivedItemStates(): List<ItemStateRow>
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
-            "WHERE items.rowid IN (" +
-            "SELECT rowid FROM items_fts WHERE items_fts MATCH :tokenMatchQuery" +
-            ") " +
-            "OR items.id IN (" +
-            "SELECT ic2.itemId FROM item_contents ic2 " +
-            "INNER JOIN item_contents_fts ON ic2.rowid = item_contents_fts.rowid " +
-            "WHERE item_contents_fts MATCH :tokenMatchQuery" +
-            ") " +
-            "OR EXISTS (" +
-            "SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId " +
-            "WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\\'" +
-            ") " +
-            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
-    )
-    suspend fun searchSingleTokenFullItems(
-        tokenMatchQuery: String,
-        likePattern: String,
-    ): List<ItemEntity>
-
-    @Query(
-        "SELECT items.id FROM items " +
-            "INNER JOIN items_fts ON items.rowid = items_fts.rowid " +
-            "WHERE items_fts MATCH :tokenMatchQuery " +
-            "UNION " +
-            "SELECT ic.itemId FROM item_contents ic " +
-            "INNER JOIN item_contents_fts ON ic.rowid = item_contents_fts.rowid " +
-            "WHERE item_contents_fts MATCH :tokenMatchQuery"
-    )
-    suspend fun matchItemIdsForFtsToken(tokenMatchQuery: String): List<String>
-
-    @Query(
-        "SELECT DISTINCT it.itemId FROM item_tags it " +
-            "INNER JOIN tags t ON t.id = it.tagId " +
-            "WHERE t.name LIKE :likePattern ESCAPE '\\'"
-    )
-    suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
-            "WHERE items.id IN (:ids) " +
-            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
-    )
-    suspend fun getSearchItemsByIdsChunk(ids: List<String>): List<ItemEntity>
-
-    @Transaction
-    suspend fun searchFullItemsByTokens(
-        tokenQueries: List<String>,
-        likePattern: String,
-    ): List<ItemEntity> =
-        when (tokenQueries.size) {
-            0 -> searchItemsByTagOnly(likePattern)
-            1 -> searchSingleTokenFullItems(tokenQueries.single(), likePattern)
-            else -> executeMultiTokenSearch(tokenQueries, likePattern)
-        }
-
-    @Query(
-        "SELECT items.id, items.feedId, items.feedTitle, items.title, items.url, items.author, " +
-            "SUBSTR(COALESCE(ic.summary, items.summary), 1, 16384) AS summary, " +
-            "SUBSTR(COALESCE(ic.contentText, items.contentText), 1, 65536) AS contentText, " +
-            "SUBSTR(COALESCE(ic.contentHtml, items.contentHtml), 1, 65536) AS contentHtml, " +
-            "items.contentType, items.status, items.isFavorite, items.isCachedOffline, " +
-            "items.publishedAt, items.createdAt, items.readProgress, items.thumbnailMediaId, " +
-            "items.duration, items.readAt, items.thumbnailUrl, items.feedUrl, " +
-            "items.interactionUpdatedAt, items.audioUrl " +
-            "FROM items LEFT JOIN item_contents ic ON items.id = ic.itemId " +
-            "WHERE EXISTS (" +
-            "SELECT 1 FROM item_tags it INNER JOIN tags t ON t.id = it.tagId " +
-            "WHERE it.itemId = items.id AND t.name LIKE :likePattern ESCAPE '\\'" +
-            ") " +
-            "ORDER BY COALESCE(items.publishedAt, items.createdAt) DESC"
-    )
-    suspend fun searchItemsByTagOnly(likePattern: String): List<ItemEntity>
-
-    @Query("DELETE FROM items WHERE id = :id") suspend fun deleteItemById(id: String)
-
-    @Query("DELETE FROM tags WHERE id = :id") suspend fun deleteTagById(id: String)
-
-    @Query("DELETE FROM item_tags WHERE itemId = :itemId")
-    suspend fun deleteItemTagsForItem(itemId: String)
-
-    @Query("DELETE FROM feeds WHERE id IN (:ids)")
-    suspend fun deleteRawFeedsByIds(ids: List<String>)
-
-    @Transaction
-    suspend fun deleteFeedsByIds(ids: List<String>) {
-        if (ids.isEmpty()) return
-        ids.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteRawFeedsByIds(chunk) }
-    }
-
-    @Query("DELETE FROM tags WHERE id IN (:ids)") suspend fun deleteTagsByIds(ids: List<String>)
-
-    @Query("DELETE FROM items WHERE id IN (:ids)")
-    suspend fun deleteRawItemsByIds(ids: List<String>)
-
-    @Transaction
-    suspend fun deleteItemsByIds(ids: List<String>) {
-        if (ids.isEmpty()) return
-        ids.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteRawItemsByIds(chunk) }
-    }
-
-    @Query("DELETE FROM item_tags") suspend fun clearAllItemTags()
-
-    @Query("DELETE FROM items") suspend fun clearAllItems()
-
-    @Query("DELETE FROM feeds") suspend fun clearAllFeeds()
-
-    @Query("DELETE FROM tags") suspend fun clearAllTags()
-
-    @Transaction
-    suspend fun reconcileSnapshotDiff(
-        feeds: List<FeedEntity>,
-        tags: List<TagEntity>,
-        items: List<ItemEntity>,
-        itemTags: List<ItemTagEntity>,
-    ) = executeReconcileSnapshotDiff(feeds, tags, items, itemTags)
-
-    @Transaction
-    suspend fun replaceSnapshotAtomically(
-        feeds: List<FeedEntity>,
-        tags: List<TagEntity>,
-        items: List<ItemEntity>,
-        itemTags: List<ItemTagEntity>,
-    ) {
-        reconcileSnapshotDiff(
-            feeds = feeds,
-            tags = tags,
-            items = items,
-            itemTags = itemTags,
-        )
-    }
-
-    @Query("SELECT * FROM tags WHERE LOWER(name) = LOWER(:name) LIMIT 1")
-    suspend fun getTagByName(name: String): TagEntity?
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertFeeds(feeds: List<FeedEntity>)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertFeed(feed: FeedEntity)
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertRawItemsIgnore(items: List<ItemEntity>): List<Long>
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertRawItemIgnore(item: ItemEntity): Long
-
-    @Update suspend fun updateRawItems(items: List<ItemEntity>)
-
-    @Update suspend fun updateRawItem(item: ItemEntity)
-
-    @Transaction
-    suspend fun insertRawItems(items: List<ItemEntity>) {
-        if (items.isEmpty()) return
-        val rowIds = insertRawItemsIgnore(items)
-        val existing = items.filterIndexed { index, _ -> rowIds[index] == -1L }
-        if (existing.isNotEmpty()) {
-            updateRawItems(existing)
-        }
-    }
-
-    @Transaction
-    suspend fun insertRawItem(item: ItemEntity) {
-        if (insertRawItemIgnore(item) == -1L) {
-            updateRawItem(item)
-        }
-    }
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertItemContentsIgnore(contents: List<ItemContentEntity>): List<Long>
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertItemContentIgnore(content: ItemContentEntity): Long
-
-    @Update suspend fun updateItemContents(contents: List<ItemContentEntity>)
-
-    @Update suspend fun updateItemContent(content: ItemContentEntity)
-
-    @Transaction
-    suspend fun upsertItemContents(contents: List<ItemContentEntity>) {
-        if (contents.isEmpty()) return
-        val rowIds = insertItemContentsIgnore(contents)
-        val existing = contents.filterIndexed { index, _ -> rowIds[index] == -1L }
-        if (existing.isNotEmpty()) {
-            updateItemContents(existing)
-        }
-    }
-
-    @Transaction
-    suspend fun upsertItemContent(content: ItemContentEntity) {
-        if (insertItemContentIgnore(content) == -1L) {
-            updateItemContent(content)
-        }
-    }
-
-    @Query("DELETE FROM item_contents WHERE itemId IN (:itemIds)")
-    suspend fun deleteItemContentsByIds(itemIds: List<String>)
-
-    @Query("DELETE FROM item_contents WHERE itemId = :itemId")
-    suspend fun deleteItemContentById(itemId: String)
-
-    @Transaction
-    suspend fun executeInTransaction(block: suspend () -> Unit) {
-        block()
-    }
-
-    @Transaction suspend fun upsertItems(items: List<ItemEntity>) = executeUpsertItems(items)
-
-    @Transaction
-    suspend fun upsertItem(item: ItemEntity) {
-        val bounded = truncateItemForStorage(item)
-        insertRawItem(truncateItemForInlinePreview(bounded))
-        if (hasExtendedItemContent(bounded)) {
-            upsertItemContent(toItemContentEntity(bounded))
-        } else {
-            deleteItemContentById(bounded.id)
-        }
-    }
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertTags(tags: List<TagEntity>)
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertTag(tag: TagEntity)
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertItemTag(itemTag: ItemTagEntity)
-
-    @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun insertItemTags(itemTags: List<ItemTagEntity>)
-
-    @Query("DELETE FROM item_tags WHERE itemId = :itemId AND tagId = :tagId")
-    suspend fun deleteItemTag(itemId: String, tagId: String)
-
-    @Query("SELECT COUNT(*) FROM item_tags WHERE itemId = :itemId AND tagId = :tagId")
-    suspend fun hasItemTag(itemId: String, tagId: String): Int
-
-    @Query(
-        "UPDATE items SET status = :status, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
-    )
-    suspend fun updateItemStatus(
-        itemId: String,
-        status: String,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query(
-        "UPDATE items SET isFavorite = :isFavorite, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
-    )
-    suspend fun updateItemFavorite(
-        itemId: String,
-        isFavorite: Boolean,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query("UPDATE items SET isCachedOffline = :isCachedOffline WHERE id = :itemId")
-    suspend fun updateItemCachedOffline(itemId: String, isCachedOffline: Boolean)
-
-    @Query(
-        "UPDATE items SET readProgress = :progress, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
-    )
-    suspend fun updateReadProgress(
-        itemId: String,
-        progress: Double,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query(
-        "UPDATE items SET readAt = :readAt, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
-    )
-    suspend fun updateItemReadAt(
-        itemId: String,
-        readAt: String?,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query(
-        "UPDATE items SET status = :status, readAt = :readAt, interactionUpdatedAt = :updatedAt WHERE id = :itemId"
-    )
-    suspend fun updateItemStatusAndReadAt(
-        itemId: String,
-        status: String,
-        readAt: String?,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query("UPDATE items SET interactionUpdatedAt = :updatedAt WHERE id = :itemId")
-    suspend fun updateItemInteractionTimestamp(
-        itemId: String,
-        updatedAt: String =
-            java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString(),
-    )
-
-    @Query("UPDATE items SET interactionUpdatedAt = :updatedAt WHERE id IN (:itemIds)")
-    suspend fun updateItemsInteractionAt(itemIds: List<String>, updatedAt: String)
-
-    @Query("SELECT * FROM catalog_entries")
-    fun observeCatalogEntries(): Flow<List<CatalogEntryEntity>>
+    @Query("SELECT * FROM entries") fun observeEntries(): Flow<List<EntryEntity>>
 
     @Query("SELECT * FROM entry_identifiers")
     fun observeEntryIdentifiers(): Flow<List<EntryIdentifierEntity>>
@@ -506,28 +203,385 @@ interface RocheDao {
     @Query("SELECT * FROM comparisons ORDER BY ts ASC")
     fun observeComparisons(): Flow<List<ComparisonEntity>>
 
-    @Query("SELECT * FROM catalog_entries")
-    suspend fun getAllCatalogEntries(): List<CatalogEntryEntity>
+    // --- Core Entries (`entries` + FTS-safe upserts) ---
 
-    @Query("SELECT * FROM catalog_entries WHERE id = :id LIMIT 1")
-    suspend fun getCatalogEntryById(id: String): CatalogEntryEntity?
+    @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertCatalogEntry(entry: CatalogEntryEntity)
+    @Query("SELECT * FROM entries WHERE id = :id LIMIT 1")
+    suspend fun getEntryById(id: String): EntryEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertCatalogEntries(entries: List<CatalogEntryEntity>)
+    @Query("SELECT * FROM entries WHERE isLocalDirty = 1")
+    suspend fun getDirtyEntries(): List<EntryEntity>
 
-    @Query("UPDATE catalog_entries SET isLocalDirty = 0 WHERE id IN (:ids)")
-    suspend fun clearCatalogEntriesDirty(ids: List<String>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntryIgnore(entry: EntryEntity): Long
 
-    @Query("UPDATE catalog_entries SET isLocalDirty = 1 WHERE id IN (:ids)")
-    suspend fun markCatalogEntriesDirty(ids: List<String>)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntriesIgnore(entries: List<EntryEntity>): List<Long>
+
+    @Update suspend fun updateEntry(entry: EntryEntity)
+
+    @Update suspend fun updateEntries(entries: List<EntryEntity>)
+
+    @Transaction
+    suspend fun upsertEntry(entry: EntryEntity) {
+        if (insertEntryIgnore(entry) == -1L) {
+            updateEntry(entry)
+        }
+    }
+
+    @Transaction
+    suspend fun upsertEntries(entries: List<EntryEntity>) {
+        if (entries.isEmpty()) return
+        val deduped = entries.associateBy { it.id }.values.toList()
+        val rowIds = insertEntriesIgnore(deduped)
+        val existing = deduped.filterIndexed { index, _ -> rowIds[index] == -1L }
+        if (existing.isNotEmpty()) {
+            updateEntries(existing)
+        }
+    }
+
+    @Query("DELETE FROM entries WHERE id = :id") suspend fun deleteRawEntryById(id: String)
+
+    @Query("DELETE FROM entries WHERE id IN (:ids)")
+    suspend fun deleteRawEntriesByIds(ids: List<String>)
+
+    @Query("UPDATE entries SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
+    suspend fun clearEntryDirtyIfSameHlc(id: String, expectedHlc: String)
+
+    @Query("UPDATE entries SET isLocalDirty = 1 WHERE id IN (:ids)")
+    suspend fun markEntriesDirty(ids: List<String>)
 
     @Query(
-        "UPDATE catalog_entries SET isLocalDirty = 0 WHERE id = :id AND updatedAt = :expectedUpdatedAt"
+        "UPDATE collection_entries SET isLocalDirty = 1 " +
+            "WHERE entryId IN (:ids) OR collectionId IN (:ids)"
     )
-    suspend fun clearEntryDirtyIfSameTs(id: String, expectedUpdatedAt: String)
+    suspend fun markMembershipsDirtyForEntries(ids: List<String>)
+
+    // --- Satellite `entry_content` (FTS-safe upserts) ---
+
+    @Query("SELECT * FROM entry_content")
+    suspend fun getAllEntryContents(): List<EntryContentEntity>
+
+    @Query("SELECT * FROM entry_content WHERE entryId = :entryId LIMIT 1")
+    suspend fun getEntryContentById(entryId: String): EntryContentEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntryContentIgnore(content: EntryContentEntity): Long
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEntryContentsIgnore(contents: List<EntryContentEntity>): List<Long>
+
+    @Update suspend fun updateEntryContent(content: EntryContentEntity)
+
+    @Update suspend fun updateEntryContents(contents: List<EntryContentEntity>)
+
+    @Transaction
+    suspend fun upsertEntryContent(content: EntryContentEntity) {
+        if (insertEntryContentIgnore(content) == -1L) {
+            updateEntryContent(content)
+        }
+    }
+
+    @Transaction
+    suspend fun upsertEntryContents(contents: List<EntryContentEntity>) {
+        if (contents.isEmpty()) return
+        val deduped = contents.associateBy { it.entryId }.values.toList()
+        val rowIds = insertEntryContentsIgnore(deduped)
+        val existing = deduped.filterIndexed { index, _ -> rowIds[index] == -1L }
+        if (existing.isNotEmpty()) {
+            updateEntryContents(existing)
+        }
+    }
+
+    @Query("DELETE FROM entry_content WHERE entryId = :entryId")
+    suspend fun deleteEntryContentById(entryId: String)
+
+    @Query(
+        "UPDATE entry_content SET fallbackFeedTitle = NULL " +
+            "WHERE entryId IN (SELECT entryId FROM collection_entries WHERE collectionId = :feedId)"
+    )
+    suspend fun clearFallbackFeedTitleForFeed(feedId: String)
+
+    // --- Satellite `entry_state` ---
+
+    @Query("SELECT * FROM entry_state") suspend fun getAllEntryStates(): List<EntryStateEntity>
+
+    @Query("SELECT * FROM entry_state WHERE isLocalDirty = 1")
+    suspend fun getDirtyEntryStates(): List<EntryStateEntity>
+
+    @Query("SELECT * FROM entry_state WHERE entryId = :entryId LIMIT 1")
+    suspend fun getEntryStateById(entryId: String): EntryStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertEntryState(state: EntryStateEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertEntryStates(states: List<EntryStateEntity>)
+
+    @Query("DELETE FROM entry_state WHERE entryId = :entryId")
+    suspend fun deleteEntryStateById(entryId: String)
+
+    @Query("UPDATE entry_state SET isCachedOffline = :isCachedOffline WHERE entryId = :itemId")
+    suspend fun updateItemCachedOffline(itemId: String, isCachedOffline: Boolean)
+
+    @Query("UPDATE entry_state SET isLocalDirty = 0 WHERE entryId = :id AND hlc = :expectedHlc")
+    suspend fun clearEntryStateDirtyIfSameHlc(id: String, expectedHlc: String)
+
+    // --- Inbox Projections & Search ---
+
+    @Query(
+        "SELECT COUNT(*) FROM entries e " +
+            "INNER JOIN entry_state es ON es.entryId = e.id " +
+            "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed')"
+    )
+    suspend fun countItems(): Int
+
+    @Query("$INBOX_SELECT_FULL_PREFIX AND e.id = :id LIMIT 1")
+    suspend fun getItemById(id: String): InboxItemRow?
+
+    @Query(INBOX_SELECT_FULL_PREFIX) suspend fun getAllItems(): List<InboxItemRow>
+
+    @Query("$INBOX_SELECT_LIST_PREFIX AND e.id IN (:ids)")
+    suspend fun getPreviewItemsByIds(ids: List<String>): List<InboxItemRow>
+
+    @Query(
+        "$INBOX_SELECT_FULL_PREFIX AND (" +
+            "EXISTS (SELECT 1 FROM collection_entries ce_m " +
+            "WHERE ce_m.entryId = e.id AND ce_m.collectionId = :feedId) " +
+            "OR EXISTS (SELECT 1 FROM collection_entries ce_u " +
+            "INNER JOIN feed_sources fs_u ON fs_u.collectionId = ce_u.collectionId " +
+            "WHERE ce_u.entryId = e.id AND LOWER(fs_u.feedUrl) = LOWER(:feedUrl)))"
+    )
+    suspend fun getItemsForFeed(feedId: String, feedUrl: String): List<InboxItemRow>
+
+    @Query(
+        "SELECT e.id AS id, " +
+            "$STATUS_EXPR AS status, " +
+            "$IS_FAVORITE_EXPR AS isFavorite, " +
+            "es.isCachedOffline AS isCachedOffline, " +
+            "COALESCE(ec.contentType, 'article') AS contentType, " +
+            "es.readAt AS readAt, " +
+            "es.progress AS readProgress, " +
+            "ec.audioUrl AS audioUrl " +
+            "$INBOX_FROM_WHERE AND e.id = :id LIMIT 1"
+    )
+    suspend fun getItemStateById(id: String): ItemStateRow?
+
+    @Query(
+        "SELECT e.id AS id, " +
+            "$STATUS_EXPR AS status, " +
+            "$IS_FAVORITE_EXPR AS isFavorite, " +
+            "es.isCachedOffline AS isCachedOffline, " +
+            "COALESCE(ec.contentType, 'article') AS contentType, " +
+            "es.readAt AS readAt, " +
+            "es.progress AS readProgress, " +
+            "ec.audioUrl AS audioUrl " +
+            "FROM entries e " +
+            "INNER JOIN entry_state es ON es.entryId = e.id " +
+            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+            "WHERE e.mergedIntoId IS NULL AND es.inboxState = 'unread'"
+    )
+    suspend fun getUnarchivedItemStates(): List<ItemStateRow>
+
+    @Query(
+        "SELECT ce.entryId FROM collection_entries ce " +
+            "INNER JOIN entry_state es ON es.entryId = ce.entryId " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "WHERE ce.collectionId = :feedId AND e.mergedIntoId IS NULL " +
+            "AND es.inboxState = 'unread'"
+    )
+    suspend fun getUnarchivedItemIdsForFeed(feedId: String): List<String>
+
+    @Query("SELECT entryId FROM collection_entries WHERE collectionId = :feedId")
+    suspend fun getItemIdsForFeed(feedId: String): List<String>
+
+    @Query(
+        "SELECT e.id FROM entries e " +
+            "INNER JOIN entry_state es ON es.entryId = e.id " +
+            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+            "WHERE e.mergedIntoId IS NULL AND es.inboxState = 'unread' " +
+            "AND (es.readAt IS NULL OR es.readAt = '') AND es.isCachedOffline = 0 " +
+            "AND (LOWER(COALESCE(ec.contentType, '')) = 'audio' " +
+            "OR (ec.audioUrl IS NOT NULL AND ec.audioUrl != '')) " +
+            "AND EXISTS (SELECT 1 FROM collection_entries ce " +
+            "WHERE ce.entryId = e.id AND ce.collectionId IN (:feedIds))"
+    )
+    suspend fun getUncachedUnreadAudioItemIds(feedIds: List<String>): List<String>
+
+    @Query(
+        "$INBOX_SELECT_SEARCH_PREFIX AND (" +
+            "e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH :tokenMatchQuery) " +
+            "OR e.id IN (SELECT ec2.entryId FROM entry_content ec2 " +
+            "INNER JOIN entry_content_fts ON ec2.rowid = entry_content_fts.rowid " +
+            "WHERE entry_content_fts MATCH :tokenMatchQuery) " +
+            "OR EXISTS (SELECT 1 FROM collection_entries ce_ft " +
+            "INNER JOIN feed_sources fs_ft ON fs_ft.collectionId = ce_ft.collectionId " +
+            "INNER JOIN entries fe_ft ON fe_ft.id = fs_ft.collectionId " +
+            "INNER JOIN entries_fts ON fe_ft.rowid = entries_fts.rowid " +
+            "WHERE ce_ft.entryId = e.id AND entries_fts MATCH :tokenMatchQuery) " +
+            "OR EXISTS (SELECT 1 FROM collection_entries ce_tg " +
+            "INNER JOIN collection_specs cs_tg ON cs_tg.collectionId = ce_tg.collectionId " +
+            "INNER JOIN entries te_tg ON te_tg.id = cs_tg.collectionId " +
+            "WHERE ce_tg.entryId = e.id AND cs_tg.role = 'tag' AND te_tg.mergedIntoId IS NULL " +
+            "AND te_tg.title LIKE :likePattern ESCAPE '\\')" +
+            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+    )
+    suspend fun searchSingleTokenFullItems(
+        tokenMatchQuery: String,
+        likePattern: String,
+    ): List<InboxItemRow>
+
+    @Query(
+        "SELECT e.id FROM entries e " +
+            "INNER JOIN entry_state es ON es.entryId = e.id " +
+            "INNER JOIN entries_fts ON e.rowid = entries_fts.rowid " +
+            "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed') " +
+            "AND entries_fts MATCH :tokenMatchQuery " +
+            "UNION " +
+            "SELECT ec.entryId FROM entry_content ec " +
+            "INNER JOIN entry_state es2 ON es2.entryId = ec.entryId " +
+            "INNER JOIN entries e2 ON e2.id = ec.entryId " +
+            "INNER JOIN entry_content_fts ON ec.rowid = entry_content_fts.rowid " +
+            "WHERE e2.mergedIntoId IS NULL AND es2.inboxState IN ('unread', 'dismissed') " +
+            "AND entry_content_fts MATCH :tokenMatchQuery " +
+            "UNION " +
+            "SELECT ce.entryId FROM collection_entries ce " +
+            "INNER JOIN entry_state es3 ON es3.entryId = ce.entryId " +
+            "INNER JOIN entries e3 ON e3.id = ce.entryId " +
+            "INNER JOIN feed_sources fs ON fs.collectionId = ce.collectionId " +
+            "INNER JOIN entries fe ON fe.id = fs.collectionId " +
+            "INNER JOIN entries_fts ON fe.rowid = entries_fts.rowid " +
+            "WHERE e3.mergedIntoId IS NULL AND es3.inboxState IN ('unread', 'dismissed') " +
+            "AND entries_fts MATCH :tokenMatchQuery"
+    )
+    suspend fun matchItemIdsForFtsToken(tokenMatchQuery: String): List<String>
+
+    @Query(
+        "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
+            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "INNER JOIN entries te ON te.id = cs.collectionId " +
+            "INNER JOIN entry_state es ON es.entryId = ce.entryId " +
+            "INNER JOIN entries ie ON ie.id = ce.entryId " +
+            "WHERE cs.role = 'tag' AND te.mergedIntoId IS NULL AND ie.mergedIntoId IS NULL " +
+            "AND es.inboxState IN ('unread', 'dismissed') " +
+            "AND te.title LIKE :likePattern ESCAPE '\\'"
+    )
+    suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
+
+    @Query(
+        "$INBOX_SELECT_SEARCH_PREFIX AND e.id IN (:ids) " +
+            "ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+    )
+    suspend fun getSearchItemsByIdsChunk(ids: List<String>): List<InboxItemRow>
+
+    @Query(
+        "$INBOX_SELECT_SEARCH_PREFIX AND EXISTS (" +
+            "SELECT 1 FROM collection_entries ce_tg " +
+            "INNER JOIN collection_specs cs_tg ON cs_tg.collectionId = ce_tg.collectionId " +
+            "INNER JOIN entries te_tg ON te_tg.id = cs_tg.collectionId " +
+            "WHERE ce_tg.entryId = e.id AND cs_tg.role = 'tag' AND te_tg.mergedIntoId IS NULL " +
+            "AND te_tg.title LIKE :likePattern ESCAPE '\\'" +
+            ") ORDER BY COALESCE(e.publishedAt, e.createdAt) DESC"
+    )
+    suspend fun searchItemsByTagOnly(likePattern: String): List<InboxItemRow>
+
+    @Transaction
+    suspend fun searchFullItemsByTokens(
+        tokenQueries: List<String>,
+        likePattern: String,
+    ): List<InboxItemRow> =
+        when (tokenQueries.size) {
+            0 -> searchItemsByTagOnly(likePattern)
+            1 -> searchSingleTokenFullItems(tokenQueries.single(), likePattern)
+            else -> executeMultiTokenSearch(tokenQueries, likePattern)
+        }
+
+    // --- Feeds (`feed_sources` + `entries` + `collection_specs`) ---
+
+    @Query("SELECT * FROM feed_sources") suspend fun getAllFeedSources(): List<FeedSourceEntity>
+
+    @Query("SELECT * FROM feed_sources WHERE isLocalDirty = 1")
+    suspend fun getDirtyFeedSources(): List<FeedSourceEntity>
+
+    @Query("SELECT * FROM feed_sources WHERE collectionId = :id LIMIT 1")
+    suspend fun getFeedSourceById(id: String): FeedSourceEntity?
+
+    @Query("SELECT * FROM feed_sources WHERE LOWER(feedUrl) = LOWER(:url) LIMIT 1")
+    suspend fun getFeedSourceByUrl(url: String): FeedSourceEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertFeedSource(source: FeedSourceEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertFeedSources(sources: List<FeedSourceEntity>)
+
+    @Query("DELETE FROM feed_sources WHERE collectionId = :id")
+    suspend fun deleteFeedSourceById(id: String)
+
+    @Query(
+        "UPDATE feed_sources SET isLocalDirty = 0 WHERE collectionId = :id AND hlc = :expectedHlc"
+    )
+    suspend fun clearFeedSourceDirtyIfSameHlc(id: String, expectedHlc: String)
+
+    @Query(FEED_ROW_SELECT) suspend fun getAllFeeds(): List<FeedRow>
+
+    @Query("$FEED_ROW_SELECT AND fs.collectionId = :id LIMIT 1")
+    suspend fun getFeedById(id: String): FeedRow?
+
+    @Query("$FEED_ROW_SELECT AND LOWER(fs.feedUrl) = LOWER(:url) LIMIT 1")
+    suspend fun getFeedByUrl(url: String): FeedRow?
+
+    @Query("UPDATE feed_sources SET autoDownloadEpisodes = :enabled WHERE collectionId = :feedId")
+    suspend fun updateFeedAutoDownload(feedId: String, enabled: Boolean)
+
+    @Query("UPDATE feed_sources SET customPlaybackSpeed = :speed WHERE collectionId = :feedId")
+    suspend fun updateFeedPlaybackSpeed(feedId: String, speed: Float?)
+
+    // --- Tags (`collection_specs.role = 'tag'`) ---
+
+    @Query(
+        "SELECT e.id AS id, e.title AS name, cs.color AS color " +
+            "FROM collection_specs cs " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL"
+    )
+    suspend fun getAllTags(): List<TagRow>
+
+    @Query(
+        "SELECT e.id AS id, e.title AS name, cs.color AS color " +
+            "FROM collection_specs cs " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL " +
+            "AND LOWER(e.title) = LOWER(:name) LIMIT 1"
+    )
+    suspend fun getTagByName(name: String): TagRow?
+
+    @Query(
+        "SELECT ce.entryId AS itemId, ce.collectionId AS tagId " +
+            "FROM collection_entries ce " +
+            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE cs.role = 'tag' AND e.mergedIntoId IS NULL"
+    )
+    suspend fun getAllItemTags(): List<ItemTagRow>
+
+    @Query(
+        "SELECT e.title FROM collection_entries ce " +
+            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "INNER JOIN entries e ON e.id = cs.collectionId " +
+            "WHERE ce.entryId = :itemId AND cs.role = 'tag' AND e.mergedIntoId IS NULL " +
+            "ORDER BY e.title COLLATE NOCASE ASC, e.title ASC"
+    )
+    suspend fun getTagNamesForItem(itemId: String): List<String>
+
+    @Query(
+        "SELECT COUNT(*) FROM collection_entries " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId"
+    )
+    suspend fun hasCollectionMembership(collectionId: String, entryId: String): Int
+
+    // --- Entry Identifiers ---
 
     @Query("SELECT * FROM entry_identifiers")
     suspend fun getAllEntryIdentifiers(): List<EntryIdentifierEntity>
@@ -552,7 +606,12 @@ interface RocheDao {
     @Query("UPDATE entry_identifiers SET entryId = :newEntryId WHERE entryId = :oldEntryId")
     suspend fun repointIdentifiersToEntry(oldEntryId: String, newEntryId: String)
 
-    @Query("SELECT * FROM collection_specs ORDER BY title COLLATE NOCASE ASC")
+    @Query("DELETE FROM entry_identifiers WHERE entryId = :entryId")
+    suspend fun deleteIdentifiersForEntry(entryId: String)
+
+    // --- Collection Specs, Entries & Generators ---
+
+    @Query("SELECT * FROM collection_specs")
     suspend fun getAllCollectionSpecs(): List<CollectionSpecEntity>
 
     @Query("SELECT * FROM collection_specs WHERE collectionId = :id LIMIT 1")
@@ -567,26 +626,26 @@ interface RocheDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertCollectionSpecs(specs: List<CollectionSpecEntity>)
 
-    @Query("UPDATE collection_specs SET isLocalDirty = 0 WHERE collectionId IN (:ids)")
-    suspend fun clearCollectionSpecsDirty(ids: List<String>)
-
-    @Query("UPDATE collection_specs SET isLocalDirty = 1 WHERE collectionId IN (:ids)")
-    suspend fun markCollectionSpecsDirty(ids: List<String>)
-
-    @Query(
-        "UPDATE collection_specs SET isLocalDirty = 0 " +
-            "WHERE collectionId = :id AND updatedAt = :expectedUpdatedAt"
-    )
-    suspend fun clearSpecDirtyIfSameTs(id: String, expectedUpdatedAt: String)
+    @Query("DELETE FROM collection_specs WHERE collectionId = :collectionId")
+    suspend fun deleteCollectionSpec(collectionId: String)
 
     @Query("SELECT * FROM collection_entries")
     suspend fun getAllCollectionEntries(): List<CollectionEntryEntity>
+
+    @Query("SELECT * FROM collection_entries WHERE isLocalDirty = 1")
+    suspend fun getDirtyCollectionEntries(): List<CollectionEntryEntity>
 
     @Query(
         "SELECT * FROM collection_entries WHERE collectionId = :collectionId " +
             "ORDER BY COALESCE(position, 1e12) ASC, addedAt ASC"
     )
     suspend fun getCollectionMemberships(collectionId: String): List<CollectionEntryEntity>
+
+    @Query(
+        "SELECT * FROM collection_entries " +
+            "WHERE collectionId = :collectionId AND entryId = :entryId LIMIT 1"
+    )
+    suspend fun getCollectionEntry(collectionId: String, entryId: String): CollectionEntryEntity?
 
     @Query("SELECT * FROM collection_entries WHERE entryId = :entryId")
     suspend fun getCollectionEntriesForEntry(entryId: String): List<CollectionEntryEntity>
@@ -606,11 +665,18 @@ interface RocheDao {
     )
     suspend fun deleteCollectionEntry(collectionId: String, entryId: String)
 
+    @Query("DELETE FROM collection_entries WHERE entryId = :dupId OR collectionId = :dupId")
+    suspend fun deleteMergedDupMemberships(dupId: String)
+
     @Query(
         "UPDATE collection_entries SET isLocalDirty = 0 " +
-            "WHERE collectionId = :collectionId AND entryId = :entryId"
+            "WHERE collectionId = :collectionId AND entryId = :entryId AND hlc = :expectedHlc"
     )
-    suspend fun clearCollectionEntryDirty(collectionId: String, entryId: String)
+    suspend fun clearMemberDirtyIfSameHlc(
+        collectionId: String,
+        entryId: String,
+        expectedHlc: String,
+    )
 
     @Query(
         "UPDATE collection_entries SET isLocalDirty = 1 " +
@@ -618,19 +684,11 @@ interface RocheDao {
     )
     suspend fun markCollectionEntryDirty(collectionId: String, entryId: String)
 
-    @Query(
-        "UPDATE collection_entries SET isLocalDirty = 0 " +
-            "WHERE collectionId = :collectionId AND entryId = :entryId " +
-            "AND addedAt = :expectedAddedAt"
-    )
-    suspend fun clearMemberDirtyIfSameTs(
-        collectionId: String,
-        entryId: String,
-        expectedAddedAt: String,
-    )
-
     @Query("SELECT * FROM collection_generators")
     suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
+
+    @Query("SELECT * FROM collection_generators WHERE isLocalDirty = 1")
+    suspend fun getDirtyCollectionGenerators(): List<CollectionGeneratorEntity>
 
     @Query("SELECT * FROM collection_generators WHERE collectionId = :collectionId LIMIT 1")
     suspend fun getCollectionGenerator(collectionId: String): CollectionGeneratorEntity?
@@ -641,29 +699,19 @@ interface RocheDao {
     @Query("DELETE FROM collection_generators WHERE collectionId = :collectionId")
     suspend fun deleteCollectionGenerator(collectionId: String)
 
-    @Query("DELETE FROM collection_specs WHERE collectionId = :collectionId")
-    suspend fun deleteCollectionSpec(collectionId: String)
-
-    @Query("DELETE FROM entry_identifiers WHERE entryId = :entryId")
-    suspend fun deleteIdentifiersForEntry(entryId: String)
-
-    @Query("DELETE FROM catalog_entries WHERE id = :id")
-    suspend fun deleteCatalogEntryById(id: String)
-
-    @Query("UPDATE collection_generators SET isLocalDirty = 0 WHERE collectionId = :collectionId")
-    suspend fun clearCollectionGeneratorDirty(collectionId: String)
-
     @Query(
         "UPDATE collection_generators SET isLocalDirty = 0 " +
-            "WHERE collectionId = :collectionId AND updatedAt = :expectedUpdatedAt"
+            "WHERE collectionId = :collectionId AND hlc = :expectedHlc"
     )
-    suspend fun clearGeneratorDirtyIfSameTs(
-        collectionId: String,
-        expectedUpdatedAt: String,
-    )
+    suspend fun clearGeneratorDirtyIfSameHlc(collectionId: String, expectedHlc: String)
+
+    // --- Consumption Log & Comparisons ---
 
     @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
     suspend fun getAllConsumptionLogs(): List<ConsumptionLogEntity>
+
+    @Query("SELECT * FROM consumption_log WHERE isLocalDirty = 1")
+    suspend fun getDirtyConsumptionLogs(): List<ConsumptionLogEntity>
 
     @Query("SELECT * FROM consumption_log WHERE entryId = :entryId ORDER BY ts DESC")
     suspend fun getConsumptionLogsForEntry(entryId: String): List<ConsumptionLogEntity>
@@ -695,11 +743,11 @@ interface RocheDao {
     @Query("UPDATE consumption_log SET entryId = :canonicalId WHERE entryId = :dupId")
     suspend fun repointConsumptionLogsToEntry(dupId: String, canonicalId: String)
 
-    @Query("DELETE FROM collection_entries WHERE entryId = :dupId OR collectionId = :dupId")
-    suspend fun deleteMergedDupMemberships(dupId: String)
-
     @Query("SELECT * FROM comparisons ORDER BY ts ASC")
     suspend fun getAllComparisons(): List<ComparisonEntity>
+
+    @Query("SELECT * FROM comparisons WHERE isLocalDirty = 1")
+    suspend fun getDirtyComparisons(): List<ComparisonEntity>
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertComparisonIgnore(comparison: ComparisonEntity)
@@ -713,15 +761,43 @@ interface RocheDao {
     @Query("UPDATE comparisons SET isLocalDirty = 1 WHERE id IN (:ids)")
     suspend fun markComparisonsDirty(ids: List<String>)
 
-    @Query(
-        "UPDATE comparisons SET scopeCollectionId = :canonicalId WHERE scopeCollectionId = :dupId"
-    )
-    suspend fun repointComparisonScope(dupId: String, canonicalId: String)
-
-    @Query("UPDATE comparisons SET orderingJson = :orderingJson WHERE id = :id")
-    suspend fun updateComparisonOrdering(id: String, orderingJson: String)
-
     @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
+
+    // --- Tombstones & Local Sync Flags ---
+
+    @Query("SELECT * FROM sync_tombstones") suspend fun getAllTombstones(): List<TombstoneEntity>
+
+    @Query("SELECT * FROM sync_tombstones WHERE isLocalDirty = 1")
+    suspend fun getDirtyTombstones(): List<TombstoneEntity>
+
+    @Query(
+        "SELECT * FROM sync_tombstones " +
+            "WHERE entityType = :entityType AND naturalKey = :naturalKey LIMIT 1"
+    )
+    suspend fun getTombstone(entityType: String, naturalKey: String): TombstoneEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTombstone(tombstone: TombstoneEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTombstones(tombstones: List<TombstoneEntity>)
+
+    @Query(
+        "DELETE FROM sync_tombstones WHERE entityType = :entityType AND naturalKey = :naturalKey"
+    )
+    suspend fun deleteTombstone(entityType: String, naturalKey: String)
+
+    @Query(
+        "UPDATE sync_tombstones SET isLocalDirty = 0 " +
+            "WHERE entityType = :entityType AND naturalKey = :naturalKey AND hlc = :expectedHlc"
+    )
+    suspend fun clearTombstoneDirtyIfSameHlc(
+        entityType: String,
+        naturalKey: String,
+        expectedHlc: String,
+    )
+
+    @Query("DELETE FROM sync_tombstones") suspend fun clearAllTombstones()
 
     @Query("SELECT flagValue FROM local_sync_flags WHERE flagKey = :key LIMIT 1")
     suspend fun getLocalSyncFlag(key: String): String?
@@ -731,258 +807,23 @@ interface RocheDao {
 
     @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
     suspend fun deleteLocalSyncFlag(key: String)
-}
 
-internal const val SQLITE_DELETE_CHUNK_SIZE = 500
-internal const val LIST_PREVIEW_SUMMARY_CHARS = 1_024
-internal const val LIST_PREVIEW_TEXT_CHARS = 2_048
-internal const val LIST_PREVIEW_HTML_CHARS = 2_048
+    // --- Catalog History Check ---
 
-internal fun truncateItemForStorage(item: ItemEntity): ItemEntity {
-    val boundedSummary = item.summary?.take(MAX_SQLITE_SUMMARY_CHARS)
-    val boundedText = item.contentText?.take(MAX_SQLITE_TEXT_CHARS)
-    val boundedHtml = item.contentHtml?.take(MAX_SQLITE_HTML_CHARS)
-    val resolvedDuration =
-        resolveStoredArticleDuration(item, boundedSummary, boundedText, boundedHtml)
-    val unchanged =
-        boundedSummary == item.summary &&
-            boundedText == item.contentText &&
-            boundedHtml == item.contentHtml &&
-            resolvedDuration == item.duration
-    return if (unchanged) {
-        item
-    } else {
-        item.copy(
-            summary = boundedSummary,
-            contentText = boundedText,
-            contentHtml = boundedHtml,
-            duration = resolvedDuration,
-        )
-    }
-}
-
-private val SYNTHETIC_ARTICLE_DURATION_REGEX = Regex("""^\d+m$""")
-
-private fun resolveStoredArticleDuration(
-    item: ItemEntity,
-    boundedSummary: String?,
-    boundedText: String?,
-    boundedHtml: String?,
-): String? {
-    if (ContentType.fromWireValue(item.contentType) != ContentType.ARTICLE) {
-        return item.duration
-    }
-    val existing = item.duration?.trim()?.takeIf { it.isNotEmpty() }
-    val hasExplicitUpstreamDuration =
-        existing != null && !SYNTHETIC_ARTICLE_DURATION_REGEX.matches(existing)
-    if (hasExplicitUpstreamDuration) {
-        return item.duration
-    }
-    if (!hasExtendedItemContent(item)) {
-        return null
-    }
-    val textSource = boundedText ?: boundedHtml ?: boundedSummary.orEmpty()
-    return if (textSource.isNotBlank()) formatArticleMinutes(textSource) else null
-}
-
-internal fun hasExtendedItemContent(item: ItemEntity): Boolean =
-    item.summary.orEmpty().length > LIST_PREVIEW_SUMMARY_CHARS ||
-        item.contentText.orEmpty().length > LIST_PREVIEW_TEXT_CHARS ||
-        item.contentHtml.orEmpty().length > LIST_PREVIEW_HTML_CHARS
-
-internal fun truncateItemForInlinePreview(item: ItemEntity): ItemEntity =
-    if (!hasExtendedItemContent(item)) {
-        item
-    } else {
-        item.copy(
-            summary = item.summary?.take(LIST_PREVIEW_SUMMARY_CHARS),
-            contentText = item.contentText?.take(LIST_PREVIEW_TEXT_CHARS),
-            contentHtml = item.contentHtml?.take(LIST_PREVIEW_HTML_CHARS),
-        )
-    }
-
-internal fun toItemContentEntity(item: ItemEntity): ItemContentEntity =
-    ItemContentEntity(
-        itemId = item.id,
-        summary = item.summary,
-        contentText = item.contentText,
-        contentHtml = item.contentHtml,
+    @Query(
+        "SELECT CASE WHEN " +
+            "EXISTS (SELECT 1 FROM consumption_log WHERE entryId = :entryId) " +
+            "OR EXISTS (SELECT 1 FROM comparisons WHERE orderingJson LIKE :quotedPattern) " +
+            "OR EXISTS (SELECT 1 FROM collection_entries ce " +
+            "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
+            "WHERE ce.entryId = :entryId AND cs.role IN ('list', 'want')) " +
+            "OR EXISTS (SELECT 1 FROM collection_generators WHERE currentEntryId = :entryId) " +
+            "THEN 1 ELSE 0 END"
     )
+    suspend fun hasCatalogHistoryRaw(entryId: String, quotedPattern: String): Int
 
-internal const val MAX_FTS_QUERY_TOKENS = 16
-private const val FTS_SEARCHABLE_COLUMNS_PREFIX =
-    "{title feedTitle author url summary contentText contentHtml} : "
-
-internal fun extractFtsTokenQueries(rawQuery: String): List<String> {
-    val sanitized = rawQuery.replace("\u0000", "").trim()
-    if (sanitized.isBlank()) return emptyList()
-    val tokens = ArrayList<String>()
-    val current = StringBuilder()
-    var hasCoreAlphaNum = false
-    var index = 0
-    while (index < sanitized.length) {
-        val cp = sanitized.codePointAt(index)
-        if (isFtsTokenCodePoint(cp)) {
-            current.appendCodePoint(cp)
-            hasCoreAlphaNum = hasCoreAlphaNum || isCoreFtsAlphaNum(cp)
-        } else {
-            flushFtsToken(current, hasCoreAlphaNum, tokens)
-            hasCoreAlphaNum = false
-        }
-        index += Character.charCount(cp)
-    }
-    flushFtsToken(current, hasCoreAlphaNum, tokens)
-    return tokens.take(MAX_FTS_QUERY_TOKENS).map { token ->
-        val escaped = token.replace("\"", "\"\"")
-        "\"$escaped\"*"
-    }
-}
-
-internal fun buildFts5MatchQuery(rawQuery: String): String? {
-    val tokenQueries = extractFtsTokenQueries(rawQuery)
-    return if (tokenQueries.isEmpty()) {
-        null
-    } else {
-        "$FTS_SEARCHABLE_COLUMNS_PREFIX(${tokenQueries.joinToString(separator = " ")})"
-    }
-}
-
-private fun flushFtsToken(
-    current: StringBuilder,
-    hasCoreAlphaNum: Boolean,
-    tokens: MutableList<String>,
-) {
-    if (current.isNotEmpty()) {
-        if (hasCoreAlphaNum) {
-            tokens.add(current.toString())
-        }
-        current.setLength(0)
-    }
-}
-
-private fun isCoreFtsAlphaNum(cp: Int): Boolean =
-    Character.isLetterOrDigit(cp) ||
-        when (Character.getType(cp).toByte()) {
-            Character.LETTER_NUMBER,
-            Character.OTHER_NUMBER -> true
-            else -> false
-        }
-
-private fun isFtsTokenCodePoint(cp: Int): Boolean =
-    isCoreFtsAlphaNum(cp) ||
-        when (Character.getType(cp).toByte()) {
-            Character.NON_SPACING_MARK,
-            Character.COMBINING_SPACING_MARK,
-            Character.ENCLOSING_MARK -> true
-            else -> false
-        }
-
-internal fun buildSqlContainsPattern(rawQuery: String): String {
-    val sanitized = rawQuery.replace("\u0000", "").trim()
-    val escaped =
-        buildString(sanitized.length + 2) {
-            append('%')
-            for (ch in sanitized) {
-                if (ch == '\\' || ch == '%' || ch == '_') {
-                    append('\\')
-                }
-                append(ch)
-            }
-            append('%')
-        }
-    return escaped
-}
-
-internal suspend fun deleteRemovedIdsInChunks(
-    existingIds: Set<String>,
-    targetIds: Set<String>,
-    deleteChunk: suspend (List<String>) -> Unit,
-) {
-    val removedIds = existingIds - targetIds
-    if (removedIds.isEmpty()) return
-    removedIds.chunked(SQLITE_DELETE_CHUNK_SIZE).forEach { chunk -> deleteChunk(chunk) }
-}
-
-internal fun <T> collectChangedEntities(
-    existingById: Map<String, T>,
-    targetById: Map<String, T>,
-): List<T> = targetById.mapNotNull { (id, target) -> target.takeIf { existingById[id] != it } }
-
-internal suspend fun RocheDao.executeMultiTokenSearch(
-    tokenQueries: List<String>,
-    likePattern: String,
-): List<ItemEntity> {
-    val orderedTokens = tokenQueries.distinct().sortedByDescending { it.length }
-    val matchedIds = matchItemIdsForFtsToken(orderedTokens.first()).toMutableSet()
-    for (index in 1 until orderedTokens.size) {
-        if (matchedIds.isEmpty()) break
-        matchedIds.retainAll(matchItemIdsForFtsToken(orderedTokens[index]).toHashSet())
-    }
-    matchedIds.addAll(matchItemIdsByTagLike(likePattern))
-    if (matchedIds.isEmpty()) return emptyList()
-    val chunks = matchedIds.chunked(SQLITE_DELETE_CHUNK_SIZE)
-    return if (chunks.size == 1) {
-        getSearchItemsByIdsChunk(chunks.single())
-    } else {
-        chunks
-            .flatMap { chunk -> getSearchItemsByIdsChunk(chunk) }
-            .sortedByDescending { it.publishedAt ?: it.createdAt }
-    }
-}
-
-internal suspend fun RocheDao.executeUpsertItems(items: List<ItemEntity>) {
-    if (items.isEmpty()) return
-    val bounded = items.associateBy { it.id }.values.map(::truncateItemForStorage)
-    insertRawItems(bounded.map(::truncateItemForInlinePreview))
-    val (extended, inlineOnly) = bounded.partition(::hasExtendedItemContent)
-    if (extended.isNotEmpty()) {
-        upsertItemContents(extended.map(::toItemContentEntity))
-    }
-    if (inlineOnly.isNotEmpty()) {
-        inlineOnly
-            .map { it.id }
-            .chunked(SQLITE_DELETE_CHUNK_SIZE)
-            .forEach { chunk -> deleteItemContentsByIds(chunk) }
-    }
-}
-
-internal suspend fun RocheDao.executeReconcileSnapshotDiff(
-    feeds: List<FeedEntity>,
-    tags: List<TagEntity>,
-    items: List<ItemEntity>,
-    itemTags: List<ItemTagEntity>,
-) {
-    val existingFeedsById = getAllFeeds().associateBy { it.id }
-    val existingTagsById = getAllTags().associateBy { it.id }
-    val existingItemsById = getAllItems().associateBy { it.id }
-    val existingItemTags = getAllItemTags().toSet()
-
-    val targetFeedsById = feeds.associateBy { it.id }
-    val targetTagsById = tags.associateBy { it.id }
-    val targetItemsById = items.map(::truncateItemForStorage).associateBy { it.id }
-    val targetItemTags = itemTags.toSet()
-
-    (existingItemTags - targetItemTags).forEach { removed ->
-        deleteItemTag(itemId = removed.itemId, tagId = removed.tagId)
-    }
-    deleteRemovedIdsInChunks(existingItemsById.keys, targetItemsById.keys, ::deleteItemsByIds)
-    deleteRemovedIdsInChunks(existingFeedsById.keys, targetFeedsById.keys, ::deleteFeedsByIds)
-    deleteRemovedIdsInChunks(existingTagsById.keys, targetTagsById.keys, ::deleteTagsByIds)
-
-    val changedFeeds = collectChangedEntities(existingFeedsById, targetFeedsById)
-    if (changedFeeds.isNotEmpty()) {
-        upsertFeeds(changedFeeds)
-    }
-    val changedTags = collectChangedEntities(existingTagsById, targetTagsById)
-    if (changedTags.isNotEmpty()) {
-        upsertTags(changedTags)
-    }
-    val changedItems = collectChangedEntities(existingItemsById, targetItemsById)
-    if (changedItems.isNotEmpty()) {
-        upsertItems(changedItems)
-    }
-    val addedItemTags = (targetItemTags - existingItemTags).toList()
-    if (addedItemTags.isNotEmpty()) {
-        insertItemTags(addedItemTags)
+    @Transaction
+    suspend fun executeInTransaction(block: suspend () -> Unit) {
+        block()
     }
 }

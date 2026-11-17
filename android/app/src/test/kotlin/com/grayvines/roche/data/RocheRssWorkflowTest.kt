@@ -4,9 +4,11 @@ package com.grayvines.roche.data
 
 import androidx.lifecycle.viewModelScope
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
-import com.grayvines.roche.data.local.PendingMutationEntity
+import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
+import com.grayvines.roche.data.local.updateFeedActiveGraph
+import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -98,16 +100,15 @@ class RocheRssWorkflowTest {
             assertEquals(listOf("Item A"), (parsedBlocks[4] as ArticleBlock.ListBlock).itemsHtml)
             assertEquals("Plain snippet", extractInboxSnippet("  Plain\nsnippet  "))
 
-            // 3. Batch archive updates Room and calls /api/v1/items/archive-batch
+            // 3. Batch archive updates Room entry_state to dismissed and marks dirty for peer sync
             val archivedCount =
                 batchRepo.archiveEntriesBatch(
                     entryIds = listOf("item-1", "item-2"),
                     allUnread = false,
                 )
             assertEquals(2, archivedCount)
-            assertTrue(
-                requests.contains("POST https://100.64.0.12:8080/api/v1/items/archive-batch")
-            )
+            assertEquals("dismissed", database.dao().getEntryStateById("item-1")?.inboxState)
+            assertTrue(database.dao().getEntryStateById("item-1")?.isLocalDirty == true)
             val afterBatch = batchRepo.snapshot.first().entries.associateBy { it.id }
             assertTrue(afterBatch.getValue("item-1").isArchived)
             assertTrue(afterBatch.getValue("item-2").isArchived)
@@ -117,8 +118,9 @@ class RocheRssWorkflowTest {
             assertTrue(exportedXml.contains("<opml version=\"2.0\">"))
             assertTrue(exportedXml.contains("arXiv cs.LG"))
 
-            // 5. importOpml posts to server and triggers sync
+            // 5. importOpml posts to server and triggers peer sync
             assertEquals(3, batchRepo.importOpml("<opml version=\"2.0\"/>").getOrThrow())
+            assertTrue(requests.contains("POST https://100.64.0.12:8080/api/v1/sync/peer"))
         }
 
     @Test
@@ -290,7 +292,7 @@ class RocheRssWorkflowTest {
             )
         val vm = MainViewModel(repository = batchRepo, settingsRepository = settings)
 
-        // Local-only unpushed item is archived locally without sending local UUID to server
+        // Local-only unpushed item is archived locally in entry_state and marked dirty
         val localEntity =
             createSavedItemEntity(
                 url = "https://example.com/local-only",
@@ -298,21 +300,13 @@ class RocheRssWorkflowTest {
                 hostTitle = "example.com",
                 type = ContentType.ARTICLE,
             )
-        database.dao().upsertItem(localEntity)
-        database
-            .dao()
-            .upsertPendingMutation(
-                PendingMutationEntity(
-                    entityId = localEntity.id,
-                    isLocalItem = true,
-                )
-            )
+        database.dao().upsertItem(localEntity, markDirty = true)
         assertEquals(1, batchRepo.archiveEntriesBatch(listOf(localEntity.id)))
-        assertFalse(requests.any { it.endsWith("/api/v1/items/archive-batch") })
         assertEquals(
-            "archived",
-            database.dao().getPendingMutation(localEntity.id)?.dirtyStatus,
+            "dismissed",
+            database.dao().getEntryStateById(localEntity.id)?.inboxState,
         )
+        assertTrue(database.dao().getEntryStateById(localEntity.id)?.isLocalDirty == true)
 
         // ViewModel importOpml updates statusBanner with imported count
         try {
@@ -371,7 +365,7 @@ class RocheRssWorkflowTest {
 
         val now = java.time.Instant.parse("2026-06-01T12:00:00Z")
         val blockedFeed =
-            com.grayvines.roche.data.local.FeedEntity(
+            FeedRow(
                 id = feedId1,
                 title = "Blocked on Server",
                 url = "https://protected.example.com/rss.xml",
@@ -559,16 +553,17 @@ class RocheRssWorkflowTest {
             currentTier = NetworkTier.WIFI
             assertEquals(0, peerRepo.pollDueFeedsOnDeviceNow().getOrThrow())
 
-            // 4. Subsequent peer sync sends updated_after cursor, omits unchanged items outbound,
-            // and preserves unchanged local items + tags when server returns a delta items payload
-            assertEquals("2026-06-01T12:01:00Z", settings.settings.first().lastPeerSyncCursor)
+            // 4. Subsequent peer sync sends since_seq cursor, omits unchanged items outbound,
+            // and preserves unchanged local items + tags when server returns a delta entries
+            // payload
+            assertEquals("2", settings.settings.first().lastPeerSyncCursor)
             peerSyncBodies.clear()
             val afterDeltaCount = peerRepo.syncWithServer().getOrThrow()
             assertEquals(3, afterDeltaCount)
             assertEquals(1, peerSyncBodies.size)
             assertTrue(
-                peerSyncBodies[0].contains(""""updated_after":"2026-06-01T12:01:00Z""""),
-                "Second sync must include updated_after watermark cursor",
+                peerSyncBodies[0].contains(""""since_seq":2"""),
+                "Second sync must include since_seq watermark cursor",
             )
             assertFalse(
                 peerSyncBodies[0].contains("https://blog.example.com/post-1"),
@@ -586,65 +581,76 @@ class RocheRssWorkflowTest {
         runTest {
             verifyRoomMigrationsPreserveData(tempDir)
             val peerSyncBodies = mutableListOf<String>()
-            val fallbackClient = buildOversizedPeerSyncFallbackClient(peerSyncBodies)
+            val pagedClient = buildPaginatedAndResetPeerSyncClient(peerSyncBodies)
             settings.update {
                 it.copy(
                     serverUrl = "https://100.64.0.12:8080",
                     bearerToken = "tok-peer",
                     peerId = "android-peer-1",
+                    lastPeerSyncCursor = "999",
                 )
             }
             val repo =
                 RocheRepository(
                     database = database,
-                    apiClient = fallbackClient,
+                    apiClient = pagedClient,
                     settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
                 )
             val count = repo.syncWithServer().getOrThrow()
-            assertTrue(count >= 1)
-            assertEquals("2026-06-01T12:01:00Z", settings.settings.first().lastPeerSyncCursor)
-            assertTrue(peerSyncBodies.last().contains(""""updated_after""""))
+            assertEquals(2, count)
+            assertEquals("20", settings.settings.first().lastPeerSyncCursor)
+            assertEquals(3, peerSyncBodies.size)
+            assertTrue(peerSyncBodies[0].contains(""""since_seq":999"""))
+            assertFalse(peerSyncBodies[1].contains(""""since_seq":"""))
+            assertTrue(peerSyncBodies[2].contains(""""since_seq":10"""))
         }
 
     @Test
     fun `offline toggleFeedArchive persists pending feed mutation and resubscribing unarchives feed`() =
         runTest {
             seedDatabase()
-            val patchedFeeds = mutableListOf<String>()
-            var failPatch = true
-            val client = buildOfflineFeedArchiveMockClient(patchedFeeds) { failPatch }
+            val peerSyncBodies = mutableListOf<String>()
+            var failSync = true
+            val client = buildOfflineFeedArchiveMockClient(peerSyncBodies) { failSync }
             settings.update {
                 it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
             }
-            val repo = RocheRepository(database = database, apiClient = client, settings = settings)
+            val repo =
+                RocheRepository(
+                    database = database,
+                    apiClient = client,
+                    settings = settings,
+                    networkTierProvider = { NetworkTier.OFFLINE },
+                )
 
-            // 1. Archive feed while PATCH fails (offline) -> queues pending feed mutation
+            // 1. Archive feed while offline -> marks feed_sources dirty locally
             val (title, isArchived) = repo.toggleFeedArchive("feed-arxiv-cs-lg").getOrThrow()
             assertEquals("arXiv cs.LG", title)
             assertTrue(isArchived)
             assertFalse(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
-            assertEquals(
-                FEED_ARCHIVED_STATUS_MUTATION,
-                database.dao().getPendingMutation("feed-arxiv-cs-lg")?.dirtyStatus,
-            )
+            assertTrue(database.dao().getFeedSourceById("feed-arxiv-cs-lg")!!.isLocalDirty)
 
-            // 2. Sync while PATCH still fails must preserve local archived state even if server
-            // returns is_active: true
-            repo.syncWithServer().getOrThrow()
+            // 2. Sync while server unreachable fails cleanly and preserves local archived state
+            assertTrue(repo.syncWithServer().isFailure)
             assertFalse(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
 
-            // 3. Sync when back online pushes the pending PATCH and clears the mutation
-            failPatch = false
+            // 3. Sync when back online pushes feed_source is_active:false with newer HLC
+            // and preserves local archived state even if server returns stale HLC is_active:true
+            failSync = false
             repo.syncWithServer().getOrThrow()
-            assertEquals(1, patchedFeeds.size)
-            assertTrue(patchedFeeds.single().contains(""""is_active":false"""))
-            assertEquals(null, database.dao().getPendingMutation("feed-arxiv-cs-lg"))
+            assertEquals(1, peerSyncBodies.size)
+            assertTrue(peerSyncBodies.single().contains(""""is_active":false"""))
+            assertFalse(database.dao().getFeedById("feed-arxiv-cs-lg")!!.isActive)
+            assertFalse(database.dao().getFeedSourceById("feed-arxiv-cs-lg")!!.isLocalDirty)
 
             // 4. Re-subscribing to the archived feed URL unarchives it in place
-            database.dao().updateFeedActive("feed-arxiv-cs-lg", false)
+            database
+                .dao()
+                .updateFeedActiveGraph("feed-arxiv-cs-lg", isActive = false, markDirty = false)
             val saved =
                 repo.saveUrlOrFeed(
-                    inputUrl = "https://export.arxiv.org/rss/cs.LG",
+                    inputUrl = "https://export.arxiv.org/api/query?search_query=cat:cs.LG",
                     titleOverride = null,
                     tagCsv = "",
                 )
@@ -763,7 +769,8 @@ class RocheRssWorkflowTest {
                             title = "Longform Essay $idx",
                             url = url,
                             contentHtml = largeHtml,
-                        )
+                        ),
+                        markDirty = true,
                     )
             }
             settings.update {
@@ -794,7 +801,8 @@ class RocheRssWorkflowTest {
 }
 
 private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>): RocheApiClient {
-    val storedItemJsons = mutableListOf<String>()
+    val storedEntryJsons = mutableListOf<String>()
+    var nextSeq = 0L
     return RocheApiClient { request ->
         if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
             val body = request.body.orEmpty()
@@ -802,17 +810,18 @@ private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>):
                 HttpResponse(statusCode = 413, body = "length limit exceeded")
             } else {
                 receivedBodies.add(body)
+                nextSeq += 1L
                 val parsedObj =
                     kotlinx.serialization.json.Json.parseToJsonElement(body)
                         as kotlinx.serialization.json.JsonObject
-                val incomingItems = parsedObj["items"] as? kotlinx.serialization.json.JsonArray
-                incomingItems?.forEach { storedItemJsons.add(it.toString()) }
-                val isDelta = parsedObj.containsKey("updated_after")
-                val respItems = if (isDelta) "[]" else "[${storedItemJsons.joinToString(",")}]"
+                val incomingEntries = parsedObj["entries"] as? kotlinx.serialization.json.JsonArray
+                incomingEntries?.forEach { storedEntryJsons.add(it.toString()) }
+                val isDelta = parsedObj.containsKey("since_seq")
+                val respEntries = if (isDelta) "[]" else "[${storedEntryJsons.joinToString(",")}]"
                 HttpResponse(
                     statusCode = 200,
                     body =
-                        """{"server_peer_id":"server","sync_timestamp":"2026-11-16T20:00:00Z","active_peers":[],"feeds":[],"items":$respItems,"tags":[],"tombstones":[]}""",
+                        """{"server_peer_id":"server","sync_seq":$nextSeq,"server_hlc":"00179492000000$nextSeq-0000-server","sync_timestamp":"2026-11-16T20:00:00Z","active_peers":[],"entries":$respEntries,"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
                 )
             }
         } else {
@@ -822,46 +831,34 @@ private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>):
 }
 
 private fun buildOfflineFeedArchiveMockClient(
-    patchedFeeds: MutableList<String>,
-    shouldFailPatch: () -> Boolean,
+    peerSyncBodies: MutableList<String>,
+    shouldFailSync: () -> Boolean,
 ): RocheApiClient = RocheApiClient { request ->
-    when {
-        request.method == "PATCH" && request.url.contains("/api/v1/feeds/") -> {
-            if (shouldFailPatch()) {
-                throw java.io.IOException("Offline")
-            }
-            patchedFeeds.add("${request.url}:${request.body}")
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/rss/cs.LG","feed_type":"arxiv","is_active":false,"unread_count":1}""",
-            )
+    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+        if (shouldFailSync()) {
+            throw java.io.IOException("Offline")
         }
-        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
-            HttpResponse(statusCode = 404, body = "{}")
-        }
-        request.method == "GET" && request.url.endsWith("/api/v1/feeds") -> {
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"feeds":[{"id":"feed-arxiv-cs-lg","title":"arXiv cs.LG","url":"https://export.arxiv.org/rss/cs.LG","feed_type":"arxiv","is_active":true,"unread_count":1}]}""",
-            )
-        }
-        request.method == "GET" && request.url.endsWith("/api/v1/tags") -> {
-            HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-        }
-        request.method == "GET" && request.url.contains("/api/v1/items") -> {
-            HttpResponse(statusCode = 200, body = """{"items":[]}""")
-        }
-        else -> {
-            HttpResponse(statusCode = 404, body = "{}")
-        }
+        val body = request.body.orEmpty()
+        peerSyncBodies.add(body)
+        HttpResponse(
+            statusCode = 200,
+            body =
+                """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000000000-0001-server",""" +
+                    """"sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],""" +
+                    """"entries":[{"id":"feed-arxiv-cs-lg","kind":"feed","title":"arXiv cs.LG",""" +
+                    """"url":"https://export.arxiv.org/list/cs.LG/recent","hlc":"000000000000001-0000-server",""" +
+                    """"feed_source":{"feed_url":"https://export.arxiv.org/api/query?search_query=cat:cs.LG",""" +
+                    """"source_type":"arxiv","feed_title":"arXiv cs.LG","is_active":true,"hlc":"000000000000001-0000-server"}}],""" +
+                    """"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+        )
+    } else {
+        HttpResponse(statusCode = 404, body = "{}")
     }
 }
 
 private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
     val driver = BundledSQLiteDriver()
-    val dbFile = File(tempDir, "migrated_v1_to_v4.db")
+    val dbFile = File(tempDir, "migrated_v1_to_v10.db")
     driver.open(dbFile.absolutePath).use { conn ->
         conn
             .prepare(
@@ -895,67 +892,65 @@ private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
         RocheDatabase.MIGRATION_2_3.migrate(conn)
         RocheDatabase.MIGRATION_3_4.migrate(conn)
         RocheDatabase.MIGRATION_4_5.migrate(conn)
-        conn.prepare("SELECT COUNT(*) FROM items WHERE id = 'i-1'").use { stmt ->
+        RocheDatabase.MIGRATION_5_6.migrate(conn)
+        RocheDatabase.MIGRATION_6_7.migrate(conn)
+        RocheDatabase.MIGRATION_7_8.migrate(conn)
+        RocheDatabase.MIGRATION_8_9.migrate(conn)
+        RocheDatabase.MIGRATION_9_10.migrate(conn)
+        conn.prepare("SELECT COUNT(*) FROM entries WHERE id = 'i-1'").use { stmt ->
             assertTrue(stmt.step())
             assertEquals(1L, stmt.getLong(0))
         }
         conn
-            .prepare("SELECT autoDownloadEpisodes, customPlaybackSpeed FROM feeds WHERE id = 'f-1'")
+            .prepare(
+                "SELECT autoDownloadEpisodes, customPlaybackSpeed FROM feed_sources WHERE collectionId = 'f-1'"
+            )
             .use { stmt ->
                 assertTrue(stmt.step())
                 assertEquals(0L, stmt.getLong(0))
                 assertTrue(stmt.isNull(1))
             }
-        conn.prepare("SELECT audioUrl FROM items WHERE id = 'i-1'").use { stmt ->
+        conn.prepare("SELECT audioUrl FROM entry_content WHERE entryId = 'i-1'").use { stmt ->
             assertTrue(stmt.step())
             assertTrue(stmt.isNull(0))
         }
     }
 }
 
-private fun buildOversizedPeerSyncFallbackClient(
+private fun buildPaginatedAndResetPeerSyncClient(
     peerSyncBodies: MutableList<String>
 ): RocheApiClient = RocheApiClient { request ->
-    when {
-        request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") -> {
-            val body = request.body.orEmpty()
-            peerSyncBodies.add(body)
-            if (!body.contains(""""updated_after"""")) {
-                throw java.io.IOException("Response exceeds maximum allowed size of 67108864 bytes")
+    if (request.method == "POST" && request.url.endsWith("/api/v1/sync/peer")) {
+        val body = request.body.orEmpty()
+        peerSyncBodies.add(body)
+        val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
+        val item1Id =
+            deterministicItemId(
+                "https://blog.example.com/rss.xml",
+                "https://blog.example.com/post-1",
+            )
+        val item2Id =
+            deterministicItemId(
+                "https://blog.example.com/rss.xml",
+                "https://blog.example.com/post-2",
+            )
+        val respBody =
+            when {
+                body.contains(""""since_seq":999""") ->
+                    """{"server_peer_id":"server","sync_seq":20,"server_hlc":"001780000020000-0000-server","sync_timestamp":"2026-06-01T12:01:00Z","reset_required":true,"active_peers":[]}"""
+                body.contains(""""since_seq":10""") ->
+                    """{"server_peer_id":"server","sync_seq":20,"server_hlc":"001780000020000-0000-server","sync_timestamp":"2026-06-01T12:01:00Z","has_more":false,"active_peers":[],""" +
+                        """"entries":[{"id":"$item2Id","kind":"article","title":"Post 2","url":"https://blog.example.com/post-2","created_at":"2026-06-01T12:01:00Z","hlc":"001780000020000-0000-server","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"001780000020000-0000-server"}}],""" +
+                        """"collection_entries":[{"collection_id":"$feedId","entry_id":"$item2Id","added_at":"2026-06-01T12:01:00Z","hlc":"001780000020000-0000-server"}],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}"""
+                else ->
+                    """{"server_peer_id":"server","sync_seq":10,"server_hlc":"001780000010000-0000-server","sync_timestamp":"2026-06-01T12:00:00Z","has_more":true,"active_peers":[],""" +
+                        """"entries":[{"id":"$feedId","kind":"feed","title":"Systems Engineering Blog","url":"https://blog.example.com","hlc":"001780000010000-0000-server","feed_source":{"feed_url":"https://blog.example.com/rss.xml","source_type":"rss","feed_title":"Systems Engineering Blog","is_active":true,"hlc":"001780000010000-0000-server"}},""" +
+                        """{"id":"$item1Id","kind":"article","title":"Post 1","url":"https://blog.example.com/post-1","created_at":"2026-06-01T12:00:00Z","hlc":"001780000010000-0000-server","content":{"content_type":"article"},"state":{"inbox_state":"unread","hlc":"001780000010000-0000-server"}}],""" +
+                        """"collection_entries":[{"collection_id":"$feedId","entry_id":"$item1Id","added_at":"2026-06-01T12:00:00Z","hlc":"001780000010000-0000-server"}],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}"""
             }
-            mockPeerSyncResponse(body, mutableListOf())
-        }
-        request.method == "GET" && request.url.endsWith("/api/v1/feeds") -> {
-            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"feeds":[{"id":"$feedId","title":"Systems Engineering Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","unread_count":1}]}""",
-            )
-        }
-        request.method == "GET" && request.url.endsWith("/api/v1/tags") -> {
-            val tagId = deterministicTagId("distributed")
-            HttpResponse(
-                statusCode = 200,
-                body = """{"tags":[{"id":"$tagId","name":"distributed","unread_count":0}]}""",
-            )
-        }
-        request.method == "GET" && request.url.contains("/api/v1/items") -> {
-            val feedId = deterministicFeedId("https://blog.example.com/rss.xml")
-            val itemId =
-                deterministicItemId(
-                    "https://blog.example.com/rss.xml",
-                    "https://blog.example.com/post-1",
-                )
-            HttpResponse(
-                statusCode = 200,
-                body =
-                    """{"items":[{"id":"$itemId","feed_id":"$feedId","feed_title":"Systems Engineering Blog","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","content_type":"article","status":"unread","is_favorite":true,"created_at":"2026-06-01T12:00:00Z","tag_names":["distributed"]}]}""",
-            )
-        }
-        else -> {
-            HttpResponse(statusCode = 404, body = "{}")
-        }
+        HttpResponse(statusCode = 200, body = respBody)
+    } else {
+        HttpResponse(statusCode = 404, body = "{}")
     }
 }
 
@@ -969,16 +964,14 @@ internal fun buildBatchAndOpmlMockClient(requests: MutableList<String>): RocheAp
                     body =
                         """{"id":"item-5","title":"Deterministic Simulation Testing","url":"https://arxiv.org/abs/2603.09910","content_html":"<h2>Section 1</h2><pre><code>fn main() &lt;T&gt; {}</code></pre><p>Body text</p>","content_type":"paper","status":"unread","is_favorite":false,"created_at":"2026-03-27T10:00:00Z"}""",
                 )
-            request.method == "POST" && request.url.endsWith("/api/v1/items/archive-batch") ->
-                HttpResponse(statusCode = 200, body = """{"archived_count":2}""")
             request.method == "POST" && request.url.endsWith("/api/v1/import/opml") ->
                 HttpResponse(statusCode = 200, body = """{"imported_count":3,"feeds":[]}""")
-            request.method == "GET" && request.url.endsWith("/api/v1/feeds") ->
-                HttpResponse(statusCode = 200, body = """{"feeds":[]}""")
-            request.method == "GET" && request.url.endsWith("/api/v1/tags") ->
-                HttpResponse(statusCode = 200, body = """{"tags":[]}""")
-            request.method == "GET" && request.url.contains("/api/v1/items") ->
-                HttpResponse(statusCode = 200, body = """{"items":[]}""")
+            request.method == "POST" && request.url.endsWith("/api/v1/sync/peer") ->
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000000000-0001-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
+                )
             else -> HttpResponse(statusCode = 404, body = "{}")
         }
     }
@@ -1045,33 +1038,48 @@ private fun mockPeerSyncResponse(
         )
     val blogFeedId = deterministicFeedId("https://blog.example.com/rss.xml")
     val protectedFeedId = deterministicFeedId("https://protected.example.com/feed.xml")
+    val tagId = deterministicTagId("distributed")
+    val isDeltaRequest = body.contains(""""since_seq":""")
     val hasRescued =
-        body.contains("https://protected.example.com/rescued-article") ||
-            body.contains(""""updated_after"""")
-    val isDeltaRequest = body.contains(""""updated_after"""")
-    val post1Json =
-        """{"id":"$post1Id","feed_id":"$blogFeedId","feed_url":"https://blog.example.com/rss.xml","feed_title":"Systems Engineering Blog","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","summary":"Full article with","content_html":"<p>Full article with <img src=\"https://blog.example.com/images/diagram.png\"></p>","thumbnail_url":"https://blog.example.com/images/diagram.png","content_type":"article","status":"unread","is_favorite":true,"read_at":"2026-06-01T12:00:00Z","created_at":"2026-06-01T12:00:00Z","tag_names":["distributed"]}"""
-    val rescuedJson =
-        """{"id":"$rescuedId","feed_id":"$protectedFeedId","feed_url":"https://protected.example.com/feed.xml","feed_title":"Protected Feed","title":"Rescued by Android","url":"https://protected.example.com/rescued-article","summary":"Fetched via phone Wi-Fi","content_html":"<p>Fetched via phone Wi-Fi</p>","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-06-01T12:01:00Z","tag_names":[]}"""
-    val itemsJson =
-        when {
-            isDeltaRequest -> "[$rescuedJson]"
-            hasRescued -> "[$post1Json,$rescuedJson]"
-            else -> "[$post1Json]"
-        }
-    val protectedFeedState =
+        body.contains("https://protected.example.com/rescued-article") || isDeltaRequest
+    val syncSeq = if (isDeltaRequest) 2 else 1
+    val hlc = "00178000000${syncSeq}000-0000-server"
+    val blogFeedEntry =
+        """{"id":"$blogFeedId","kind":"feed","title":"Systems Engineering Blog","url":"https://blog.example.com","hlc":"$hlc","feed_source":{"feed_url":"https://blog.example.com/rss.xml","source_type":"rss","feed_title":"Systems Engineering Blog","poll_interval":30,"is_active":true,"last_polled_at":"2026-06-01T12:00:00Z","last_polled_by":"android-peer-1","hlc":"$hlc"}}"""
+    val protectedFeedEntry =
         if (hasRescued) {
-            """{"id":"$protectedFeedId","title":"Protected Feed","url":"https://protected.example.com/feed.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T12:01:00Z","last_polled_by":"android-peer-1","last_error":null,"last_error_by":null,"is_active":true,"unread_count":1}"""
+            """{"id":"$protectedFeedId","kind":"feed","title":"Protected Feed","url":"https://protected.example.com","hlc":"$hlc","feed_source":{"feed_url":"https://protected.example.com/feed.xml","source_type":"rss","feed_title":"Protected Feed","poll_interval":30,"is_active":true,"last_polled_at":"2026-06-01T12:01:00Z","last_polled_by":"android-peer-1","last_error":null,"last_error_by":null,"hlc":"$hlc"}}"""
         } else {
-            """{"id":"$protectedFeedId","title":"Protected Feed","url":"https://protected.example.com/feed.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T11:59:00Z","last_polled_by":"server","last_error":"HTTP 403 Forbidden","last_error_by":"server","is_active":true,"unread_count":0}"""
+            """{"id":"$protectedFeedId","kind":"feed","title":"Protected Feed","url":"https://protected.example.com","hlc":"$hlc","feed_source":{"feed_url":"https://protected.example.com/feed.xml","source_type":"rss","feed_title":"Protected Feed","poll_interval":30,"is_active":true,"last_polled_at":"2026-06-01T11:59:00Z","last_polled_by":"server","last_error":"HTTP 403 Forbidden","last_error_by":"server","hlc":"$hlc"}}"""
+        }
+    val tagEntry =
+        """{"id":"$tagId","kind":"collection","title":"distributed","hlc":"$hlc","collection_spec":{"mode":"manual","role":"tag","show_in_lists":false}}"""
+    val post1Entry =
+        """{"id":"$post1Id","kind":"article","title":"Post 1: Consensus","url":"https://blog.example.com/post-1","summary":"Full article with","thumbnail_url":"https://blog.example.com/images/diagram.png","created_at":"2026-06-01T12:00:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"<p>Full article with <img src=\"https://blog.example.com/images/diagram.png\"></p>"},"state":{"inbox_state":"unread","read_at":"2026-06-01T12:00:00Z","progress":0.0,"hlc":"$hlc"}}"""
+    val rescuedEntry =
+        """{"id":"$rescuedId","kind":"article","title":"Rescued by Android","url":"https://protected.example.com/rescued-article","summary":"Fetched via phone Wi-Fi","created_at":"2026-06-01T12:01:00Z","hlc":"$hlc","content":{"content_type":"article","content_html":"<p>Fetched via phone Wi-Fi</p>"},"state":{"inbox_state":"unread","progress":0.0,"hlc":"$hlc"}}"""
+    val entriesJson =
+        when {
+            isDeltaRequest -> "[$protectedFeedEntry,$rescuedEntry]"
+            hasRescued -> "[$blogFeedEntry,$protectedFeedEntry,$tagEntry,$post1Entry,$rescuedEntry]"
+            else -> "[$blogFeedEntry,$protectedFeedEntry,$tagEntry,$post1Entry]"
+        }
+    val post1Memberships =
+        """{"collection_id":"$blogFeedId","entry_id":"$post1Id","added_at":"2026-06-01T12:00:00Z","hlc":"$hlc"},{"collection_id":"$STARRED_COLLECTION_ID","entry_id":"$post1Id","added_at":"2026-06-01T12:00:00Z","hlc":"$hlc"},{"collection_id":"$tagId","entry_id":"$post1Id","added_at":"2026-06-01T12:00:00Z","hlc":"$hlc"}"""
+    val rescuedMembership =
+        """{"collection_id":"$protectedFeedId","entry_id":"$rescuedId","added_at":"2026-06-01T12:01:00Z","hlc":"$hlc"}"""
+    val membershipsJson =
+        when {
+            isDeltaRequest -> "[$rescuedMembership]"
+            hasRescued -> "[$post1Memberships,$rescuedMembership]"
+            else -> "[$post1Memberships]"
         }
     return HttpResponse(
         statusCode = 200,
         body =
-            """{"server_peer_id":"server","sync_timestamp":"2026-06-01T12:01:00Z",""" +
+            """{"server_peer_id":"server","sync_seq":$syncSeq,"server_hlc":"$hlc","sync_timestamp":"2026-06-01T12:01:00Z",""" +
                 """"active_peers":[{"peer_id":"server","device_name":"Headless","network_tier":"wired","weight":1.0,"last_seen_at":"2026-06-01T12:01:00Z"},""" +
                 """{"peer_id":"android-peer-1","device_name":"Pixel 10 Pro","network_tier":"wifi","weight":0.6,"last_seen_at":"2026-06-01T12:01:00Z"}],""" +
-                """"feeds":[{"id":"$blogFeedId","title":"Systems Engineering Blog","url":"https://blog.example.com/rss.xml","feed_type":"rss","poll_interval":30,"last_polled":"2026-06-01T12:00:00Z","last_polled_by":"android-peer-1","is_active":true,"unread_count":0},$protectedFeedState],""" +
-                """"items":$itemsJson,"tags":[{"id":"${deterministicTagId("distributed")}","name":"distributed","unread_count":0}],"tombstones":[]}""",
+                """"entries":$entriesJson,"collection_entries":$membershipsJson,"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
     )
 }

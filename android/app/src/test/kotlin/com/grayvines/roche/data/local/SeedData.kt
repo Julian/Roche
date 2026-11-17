@@ -35,23 +35,23 @@ object SeedData {
     private const val ITEM_5 = "item-5"
     private const val ITEM_6 = "item-6"
 
-    val feeds: List<FeedEntity> =
+    val feeds: List<FeedRow> =
         listOf(
-            FeedEntity(
+            FeedRow(
                 id = FEED_ARXIV_LG,
                 title = TITLE_ARXIV_LG,
                 url = "https://export.arxiv.org/api/query?search_query=cat:cs.LG",
                 siteUrl = "https://arxiv.org/list/cs.LG/recent",
                 feedType = TYPE_ARXIV,
             ),
-            FeedEntity(
+            FeedRow(
                 id = FEED_LWN,
                 title = TITLE_LWN,
                 url = "https://lwn.net/headlines/rss",
                 siteUrl = "https://lwn.net",
                 feedType = TYPE_RSS,
             ),
-            FeedEntity(
+            FeedRow(
                 id = FEED_OXIDE,
                 title = TITLE_OXIDE,
                 url =
@@ -59,14 +59,14 @@ object SeedData {
                 siteUrl = "https://oxide.computer",
                 feedType = "youtube",
             ),
-            FeedEntity(
+            FeedRow(
                 id = FEED_DANLUU,
                 title = TITLE_DANLUU,
                 url = "https://danluu.com/atom.xml",
                 siteUrl = "https://danluu.com",
                 feedType = TYPE_RSS,
             ),
-            FeedEntity(
+            FeedRow(
                 id = FEED_ARXIV_SYS,
                 title = TITLE_ARXIV_SYS,
                 url = "https://export.arxiv.org/api/query?search_query=cat:cs.DC",
@@ -75,18 +75,18 @@ object SeedData {
             ),
         )
 
-    val tags: List<TagEntity> =
+    val tags: List<TagRow> =
         listOf(
-            TagEntity(id = TAG_LLM, name = "llm-inference"),
-            TagEntity(id = TAG_SYSTEMS, name = "systems"),
-            TagEntity(id = TAG_STORAGE, name = "storage"),
-            TagEntity(id = TAG_SQLITE, name = "sqlite"),
-            TagEntity(id = TAG_COMPILERS, name = "compilers"),
+            TagRow(id = TAG_LLM, name = "llm-inference"),
+            TagRow(id = TAG_SYSTEMS, name = "systems"),
+            TagRow(id = TAG_STORAGE, name = "storage"),
+            TagRow(id = TAG_SQLITE, name = "sqlite"),
+            TagRow(id = TAG_COMPILERS, name = "compilers"),
         )
 
-    val items: List<ItemEntity> =
+    val items: List<InboxItemRow> =
         listOf(
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_1,
                 feedId = FEED_ARXIV_LG,
                 feedTitle = TITLE_ARXIV_LG,
@@ -108,7 +108,7 @@ object SeedData {
                 thumbnailMediaId = "media-paper-1",
                 duration = "14p",
             ),
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_2,
                 feedId = FEED_LWN,
                 feedTitle = TITLE_LWN,
@@ -131,7 +131,7 @@ object SeedData {
                 thumbnailMediaId = null,
                 duration = null,
             ),
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_3,
                 feedId = FEED_OXIDE,
                 feedTitle = TITLE_OXIDE,
@@ -153,7 +153,7 @@ object SeedData {
                 thumbnailMediaId = "media-video-1",
                 duration = "28:14",
             ),
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_4,
                 feedId = FEED_DANLUU,
                 feedTitle = TITLE_DANLUU,
@@ -175,7 +175,7 @@ object SeedData {
                 thumbnailMediaId = null,
                 duration = null,
             ),
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_5,
                 feedId = FEED_ARXIV_SYS,
                 feedTitle = TITLE_ARXIV_SYS,
@@ -197,7 +197,7 @@ object SeedData {
                 thumbnailMediaId = "media-paper-2",
                 duration = "12p",
             ),
-            ItemEntity(
+            InboxItemRow(
                 id = ITEM_6,
                 feedId = FEED_LWN,
                 feedTitle = TITLE_LWN,
@@ -221,15 +221,15 @@ object SeedData {
             ),
         )
 
-    val itemTags: List<ItemTagEntity> =
+    val itemTags: List<ItemTagRow> =
         listOf(
-            ItemTagEntity(itemId = ITEM_1, tagId = TAG_LLM),
-            ItemTagEntity(itemId = ITEM_1, tagId = TAG_SYSTEMS),
-            ItemTagEntity(itemId = ITEM_2, tagId = TAG_SQLITE),
-            ItemTagEntity(itemId = ITEM_2, tagId = TAG_STORAGE),
-            ItemTagEntity(itemId = ITEM_3, tagId = TAG_SYSTEMS),
-            ItemTagEntity(itemId = ITEM_4, tagId = TAG_SQLITE),
-            ItemTagEntity(itemId = ITEM_5, tagId = TAG_STORAGE),
-            ItemTagEntity(itemId = ITEM_5, tagId = TAG_SYSTEMS),
+            ItemTagRow(itemId = ITEM_1, tagId = TAG_LLM),
+            ItemTagRow(itemId = ITEM_1, tagId = TAG_SYSTEMS),
+            ItemTagRow(itemId = ITEM_2, tagId = TAG_SQLITE),
+            ItemTagRow(itemId = ITEM_2, tagId = TAG_STORAGE),
+            ItemTagRow(itemId = ITEM_3, tagId = TAG_SYSTEMS),
+            ItemTagRow(itemId = ITEM_4, tagId = TAG_SQLITE),
+            ItemTagRow(itemId = ITEM_5, tagId = TAG_STORAGE),
+            ItemTagRow(itemId = ITEM_5, tagId = TAG_SYSTEMS),
         )
 }

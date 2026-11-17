@@ -99,6 +99,28 @@ internal data class RankedCollectionParityVector(
 )
 
 @Serializable
+internal data class HlcStepVector(
+    @SerialName("node_id") val nodeId: String,
+    @SerialName("initial_hlc") val initialHlc: String? = null,
+    val op: String,
+    @SerialName("remote_hlc") val remoteHlc: String? = null,
+    @SerialName("now_ms") val nowMs: Long,
+    val expected: String,
+)
+
+@Serializable
+internal data class HlcTotalOrderVector(
+    val unsorted: List<String>,
+    @SerialName("expected_sorted") val expectedSorted: List<String>,
+)
+
+@Serializable
+internal data class HlcVectorsFixture(
+    @SerialName("sequence_steps") val sequenceSteps: List<HlcStepVector>,
+    @SerialName("total_order") val totalOrder: HlcTotalOrderVector,
+)
+
+@Serializable
 internal data class CrossStackGoldenVectors(
     @SerialName("canonical_urls") val canonicalUrls: List<CanonicalUrlVector>,
     @SerialName("entity_ids") val entityIds: List<EntityIdVector>,
@@ -113,6 +135,7 @@ internal data class CrossStackGoldenVectors(
     @SerialName("dynamic_collection_rules") val dynamicCollectionRules: List<DynamicRuleVector>,
     @SerialName("ranked_collection_parity")
     val rankedCollectionParity: List<RankedCollectionParityVector>,
+    @SerialName("hlc_vectors") val hlcVectors: HlcVectorsFixture,
 )
 
 class CrossStackVectorsTest {
@@ -293,6 +316,31 @@ class CrossStackVectorsTest {
                 "ranked_collection_parity tiers mismatch for ${vector.name}",
             )
         }
+    }
+
+    @Test
+    fun `hlc clock ticks witnesses and total order match Rust golden vectors`() {
+        val vectors = loadGoldenVectors().hlcVectors
+        assertTrue(vectors.sequenceSteps.isNotEmpty())
+        vectors.sequenceSteps.forEach { step ->
+            val clock = HlcClock(rawNodeId = step.nodeId, initial = step.initialHlc)
+            val actual =
+                when (step.op) {
+                    "tick" -> clock.tick(step.nowMs).encode()
+                    "witness" -> clock.witnessStr(step.remoteHlc, step.nowMs).encode()
+                    else -> error("Unknown HLC vector op: ${step.op}")
+                }
+            assertEquals(step.expected, actual, "hlc_vectors step mismatch for $step")
+        }
+
+        val lexSorted = vectors.totalOrder.unsorted.sorted()
+        assertEquals(vectors.totalOrder.expectedSorted, lexSorted)
+        val parsedSorted =
+            vectors.totalOrder.unsorted
+                .map { checkNotNull(HlcTimestamp.parse(it)) }
+                .sorted()
+                .map { it.encode() }
+        assertEquals(vectors.totalOrder.expectedSorted, parsedSorted)
     }
 }
 

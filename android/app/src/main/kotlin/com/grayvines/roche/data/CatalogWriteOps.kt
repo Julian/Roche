@@ -2,17 +2,13 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.CatalogEntryEntity
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDao
-import com.grayvines.roche.data.local.SQLITE_DELETE_CHUNK_SIZE
 import com.grayvines.roche.data.local.TombstoneEntity
-import com.grayvines.roche.model.ContentType
 import java.time.Instant
 
 internal const val COLLECTION_ENTRY_ENTITY = "collection_entry"
@@ -38,7 +34,7 @@ internal suspend fun attachIdentifiersInDao(
     nowIso: String = nowUtcIso(),
 ): Boolean {
     val resolvedId = followMergedIdInDao(dao, entryId) ?: return false
-    val entry = dao.getCatalogEntryById(resolvedId) ?: return false
+    val entry = dao.getEntryById(resolvedId) ?: return false
     val kind = EntryKind.fromWireValue(entry.kind)
     val existingPairs =
         dao.getIdentifiersForEntry(resolvedId).map { it.scheme to it.value }.toHashSet()
@@ -59,131 +55,45 @@ internal suspend fun attachIdentifiersInDao(
     dao.insertEntryIdentifiersIgnore(newRows)
     val attached = dao.getIdentifiersForEntry(resolvedId).size > existingPairs.size
     if (attached) {
-        dao.upsertCatalogEntry(entry.copy(updatedAt = nowIso, isLocalDirty = true))
+        val hlc = nextLocalHlc(dao)
+        dao.upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true))
     }
     return attached
 }
 
-internal suspend fun materializeFeedsForIds(
+internal suspend fun logFeedItemConsumedInDao(
     dao: RocheDao,
-    referencedIds: Set<String>,
-    nowIso: String,
-) {
-    if (referencedIds.isEmpty()) return
-    val existingEntryIds = dao.getAllCatalogEntries().map { it.id }.toHashSet()
-    val missingIds = referencedIds.filter { it.isNotBlank() && it !in existingEntryIds }.toSet()
-    if (missingIds.isEmpty()) return
-
-    val feedsById = dao.getAllFeeds().associateBy { it.id }
-    val itemsById =
-        missingIds
-            .chunked(SQLITE_DELETE_CHUNK_SIZE)
-            .flatMap { chunk -> dao.getPreviewItemsByIds(chunk) }
-            .associateBy { it.id }
-    for (missingId in missingIds) {
-        val item = itemsById[missingId]
-        if (item != null) {
-            materializeFeedItemInDao(
-                dao = dao,
-                item = item,
-                feed = item.feedId?.let { feedsById[it] },
-                logConsumed = false,
-                markDirty = false,
-                nowIso = nowIso,
-            )
-        } else {
-            feedsById[missingId]?.let { feed ->
-                materializeParentFeedInDao(
-                    dao = dao,
-                    feed = feed,
-                    isAudio = feed.feedType.equals("podcast", ignoreCase = true),
-                    nowIso = nowIso,
-                )
-            }
-        }
-    }
-}
-
-@Suppress("LongParameterList")
-internal suspend fun materializeFeedItemInDao(
-    dao: RocheDao,
-    item: ItemEntity,
-    feed: FeedEntity?,
-    logConsumed: Boolean,
-    markDirty: Boolean,
+    itemId: String,
     nowIso: String,
 ): String {
-    val contentType = ContentType.fromWireValue(item.contentType)
-    val isAudio = contentType == ContentType.AUDIO || !item.audioUrl.isNullOrBlank()
-    val needsPrivateSync = logConsumed && !isSyncablePublicUrl(item.url)
-    val resolvedItemId =
-        upsertEntryInDao(
-            dao = dao,
-            input = buildFeedItemUpsertInput(item, contentType, isAudio),
-            nowIso = nowIso,
-            markDirty = markDirty || needsPrivateSync,
-        )
-    val parentId = feed?.let {
-        materializeParentFeedInDao(
-            dao = dao,
-            feed = it,
-            isAudio = isAudio,
-            nowIso = nowIso,
-            markDirty = logConsumed && !isSyncablePublicUrl(it.url),
-        )
+    val resolvedId = followMergedIdInDao(dao, itemId) ?: itemId
+    val itemEntry = dao.getEntryById(resolvedId)
+    if (itemEntry != null && !isSyncablePublicUrl(itemEntry.url.orEmpty())) {
+        val hlc = nextLocalHlc(dao)
+        dao.upsertEntry(itemEntry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true))
     }
-    if (parentId != null) {
-        dao.upsertCollectionEntry(
-            CollectionEntryEntity(
-                collectionId = parentId,
-                entryId = resolvedItemId,
-                position = null,
-                addedAt = nowIso,
-                isLocalDirty = false,
-            )
-        )
-    }
-    if (logConsumed) {
-        ensureConsumedOnceInDao(dao, resolvedItemId, nowIso)
-        parentId?.let { ensureConsumedOnceInDao(dao, it, nowIso) }
-    }
-    return resolvedItemId
-}
+    ensureConsumedOnceInDao(dao, resolvedId, nowIso)
 
-private suspend fun materializeParentFeedInDao(
-    dao: RocheDao,
-    feed: FeedEntity,
-    isAudio: Boolean,
-    nowIso: String,
-    markDirty: Boolean = false,
-): String? {
-    if (feed.feedType.equals("arxiv", ignoreCase = true)) return null
-    val parentKind =
-        when {
-            feed.feedType.equals("youtube", ignoreCase = true) -> EntryKind.CHANNEL
-            isAudio || feed.feedType.equals("podcast", ignoreCase = true) -> EntryKind.PODCAST
-            else -> EntryKind.PUBLICATION
-        }
-    val cleanFeedUrl = feed.url.trim().takeIf { it.isNotEmpty() }?.let(::canonicalizeSyncUrl)
-    val idents = buildList {
-        if (!cleanFeedUrl.isNullOrBlank()) {
-            add(EntryIdentifierDto("feed_url", cleanFeedUrl))
+    val feedSourcesById = dao.getAllFeedSources().associateBy { it.collectionId }
+    val parentFeedIds =
+        dao.getCollectionEntriesForEntry(resolvedId)
+            .map { it.collectionId }
+            .filter { it in feedSourcesById }
+    for (parentId in parentFeedIds) {
+        val parentEntry = dao.getEntryById(parentId) ?: continue
+        val parentKind = EntryKind.fromWireValue(parentEntry.kind)
+        if (parentKind != EntryKind.COLLECTION) {
+            val feedUrl = feedSourcesById[parentId]?.feedUrl.orEmpty()
+            if (!isSyncablePublicUrl(feedUrl)) {
+                val hlc = nextLocalHlc(dao)
+                dao.upsertEntry(
+                    parentEntry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
+                )
+            }
+            ensureConsumedOnceInDao(dao, parentId, nowIso)
         }
     }
-    return upsertEntryInDao(
-        dao = dao,
-        input =
-            UpsertCatalogEntryInput(
-                id = feed.id,
-                kind = parentKind,
-                title = feed.title.ifBlank { feed.url },
-                url = feed.siteUrl ?: feed.url,
-                summary = feed.description,
-                identifiers = idents,
-            ),
-        nowIso = nowIso,
-        markDirty = markDirty,
-    )
+    return resolvedId
 }
 
 private suspend fun ensureConsumedOnceInDao(dao: RocheDao, entryId: String, nowIso: String) {
@@ -217,17 +127,25 @@ internal suspend fun upsertEntryInDao(
         if (input.kind == EntryKind.ALBUM) stripAlbumEditionSuffix(cleanTitle) else cleanTitle
     val cleanIdentifiers = normalizeEntryIdentifiers(input)
     val resolvedId = resolveEntryIdInDao(dao, input, normalizedTitle, cleanIdentifiers)
-    val existing = dao.getCatalogEntryById(resolvedId)
+    val existing = dao.getEntryById(resolvedId)
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(dao)
+        } else {
+            existing?.hlc?.takeIf { it.isNotBlank() }
+                ?: HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
     val entity =
-        mergeCatalogEntryEntity(
+        mergeEntryEntity(
             resolvedId = resolvedId,
             normalizedTitle = normalizedTitle,
             input = input,
             existing = existing,
             nowIso = nowIso,
+            hlc = hlc,
             markDirty = markDirty,
         )
-    dao.upsertCatalogEntry(entity)
+    dao.upsertEntry(entity)
     if (cleanIdentifiers.isNotEmpty()) {
         dao.insertEntryIdentifiersIgnore(
             cleanIdentifiers.map { EntryIdentifierEntity(it.scheme, it.value, resolvedId) }
@@ -278,7 +196,7 @@ private suspend fun findEntryIdByIdentifiers(
         val resolved = followMergedIdInDao(dao, found) ?: found
         val isCompatible =
             if (ident.scheme == "url" || ident.scheme == "feed_url") {
-                dao.getCatalogEntryById(resolved)?.let {
+                dao.getEntryById(resolved)?.let {
                     EntryKind.fromWireValue(it.kind) == expectedKind
                 } != false
             } else {
@@ -299,7 +217,7 @@ private suspend fun synthesizeArtistsInDao(
     markDirty: Boolean,
 ) {
     val allArtists =
-        dao.getAllCatalogEntries().filter {
+        dao.getAllEntries().filter {
             it.mergedIntoId.isNullOrBlank() && EntryKind.fromWireValue(it.kind) == EntryKind.ARTIST
         }
     for (rawArtist in creators) {
@@ -307,12 +225,19 @@ private suspend fun synthesizeArtistsInDao(
         if (clean.isEmpty()) continue
         val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
         val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty)
+        val hlc =
+            if (markDirty) {
+                nextLocalHlc(dao)
+            } else {
+                HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            }
         dao.upsertCollectionEntry(
             CollectionEntryEntity(
                 collectionId = artistId,
                 entryId = childEntryId,
                 position = null,
                 addedAt = nowIso,
+                hlc = hlc,
                 isLocalDirty = markDirty,
             )
         )
@@ -330,13 +255,20 @@ private suspend fun ensureSynthesizedArtist(
     if (mergedTarget != null) {
         return mergedTarget
     }
-    dao.upsertCatalogEntry(
-        CatalogEntryEntity(
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(dao)
+        } else {
+            HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
+    dao.upsertEntry(
+        EntryEntity(
             id = detId,
             kind = EntryKind.ARTIST.wireValue,
             title = cleanArtistName,
             createdAt = nowIso,
             updatedAt = nowIso,
+            hlc = hlc,
             isLocalDirty = markDirty,
         )
     )
@@ -349,7 +281,7 @@ private suspend fun findAlbumByTitleArtist(
     creators: List<String>,
 ): String? {
     val primaryCreator = creators.map { it.trim() }.firstOrNull { it.isNotEmpty() } ?: return null
-    return dao.getAllCatalogEntries()
+    return dao.getAllEntries()
         .firstOrNull { cand ->
             cand.mergedIntoId.isNullOrBlank() &&
                 EntryKind.fromWireValue(cand.kind) == EntryKind.ALBUM &&
@@ -379,6 +311,12 @@ internal suspend fun appendConsumptionInDao(
     val logId =
         explicitLogId?.trim()?.takeIf { it.isNotEmpty() }
             ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(dao)
+        } else {
+            HlcTimestamp.fromIsoOrEpoch(tsIso, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
             id = logId,
@@ -387,6 +325,7 @@ internal suspend fun appendConsumptionInDao(
             status = status.wireValue,
             notes = notes?.trim()?.takeIf { it.isNotEmpty() },
             createdAt = nowIso,
+            hlc = hlc,
             isLocalDirty = markDirty,
         )
     )
@@ -404,7 +343,7 @@ private suspend fun engageParentArtistsInDao(
     nowIso: String,
     markDirty: Boolean,
 ) {
-    val entry = dao.getCatalogEntryById(entryId) ?: return
+    val entry = dao.getEntryById(entryId) ?: return
     val kind = EntryKind.fromWireValue(entry.kind)
     if (kind != EntryKind.ALBUM && kind != EntryKind.SONG) return
     val creators = decodeCreatorsJson(entry.creatorsJson)
@@ -413,7 +352,7 @@ private suspend fun engageParentArtistsInDao(
     }
     val parentIds = dao.getCollectionEntriesForEntry(entryId).map { it.collectionId }
     for (pid in parentIds) {
-        val parent = dao.getCatalogEntryById(pid) ?: continue
+        val parent = dao.getEntryById(pid) ?: continue
         val isActiveArtist =
             parent.mergedIntoId.isNullOrBlank() &&
                 EntryKind.fromWireValue(parent.kind) == EntryKind.ARTIST
@@ -436,6 +375,12 @@ private suspend fun engageSingleArtistInDao(
         }
     if (alreadyLogged) return
     val logId = deterministicAutoLogId(artistId)
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(dao)
+        } else {
+            HlcTimestamp.fromIsoOrEpoch(tsIso, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
             id = logId,
@@ -444,6 +389,7 @@ private suspend fun engageSingleArtistInDao(
             status = ConsumptionStatus.CONSUMED.wireValue,
             notes = null,
             createdAt = nowIso,
+            hlc = hlc,
             isLocalDirty = markDirty,
         )
     )
@@ -458,12 +404,15 @@ private suspend fun removeFromWantQueuesInDao(dao: RocheDao, entryId: String, no
             CollectionRole.fromWireValue(spec.role) == CollectionRole.WANT ||
                 spec.collectionId == UP_NEXT_COLLECTION_ID
         if (isWant) {
+            val hlc = nextLocalHlc(dao)
             dao.deleteCollectionEntry(spec.collectionId, entryId)
             dao.upsertTombstone(
                 TombstoneEntity(
                     entityType = COLLECTION_ENTRY_ENTITY,
                     naturalKey = collectionEntryNaturalKey(spec.collectionId, entryId),
                     deletedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = true,
                 )
             )
         }
@@ -477,7 +426,7 @@ internal suspend fun followMergedIdInDao(dao: RocheDao, entryId: String): String
     var result: String? = null
     var keepWalking = true
     while (keepWalking && visited.add(current)) {
-        val row = dao.getCatalogEntryById(current)
+        val row = dao.getEntryById(current)
         if (row == null) {
             keepWalking = false
         } else {
@@ -504,45 +453,53 @@ internal suspend fun ensureWantCollectionInDao(
         explicit?.removePrefix("want:")?.lowercase()?.replace('-', '_') ?: kind.systemListSlug
     val baseSlug = EntryKind.fromFlexibleAlias(rawBase)?.systemListSlug ?: rawBase
     val wantSlug = "want:$baseSlug"
+    val title = "Want: ${kind.systemListTitle}"
     val existing =
         explicit?.let { dao.getCollectionSpecById(it) ?: dao.getCollectionSpecBySlug(it) }
             ?: dao.getCollectionSpecBySlug(wantSlug)
     if (existing != null) {
-        if (dao.getCatalogEntryById(existing.collectionId) == null) {
-            dao.upsertCatalogEntry(buildCollectionCatalogEntry(existing))
+        if (dao.getEntryById(existing.collectionId) == null) {
+            val hlc = nextLocalHlc(dao)
+            dao.upsertEntry(
+                EntryEntity(
+                    id = existing.collectionId,
+                    kind = EntryKind.COLLECTION.wireValue,
+                    title = title,
+                    createdAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = true,
+                )
+            )
         }
         return existing
     }
 
     val id = systemCollectionUuid(wantSlug)
+    val hlc = nextLocalHlc(dao)
     val spec =
         CollectionSpecEntity(
             collectionId = id,
-            title = "Want: ${kind.systemListTitle}",
             slug = wantSlug,
             mode = CollectionMode.MANUAL.wireValue,
             role = CollectionRole.WANT.wireValue,
             showInLists = false,
+        )
+    dao.upsertEntry(
+        EntryEntity(
+            id = id,
+            kind = EntryKind.COLLECTION.wireValue,
+            title = title,
             createdAt = nowIso,
             updatedAt = nowIso,
+            hlc = hlc,
             isLocalDirty = true,
         )
+    )
     dao.upsertCollectionSpec(spec)
-    dao.upsertCatalogEntry(buildCollectionCatalogEntry(spec))
     dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", wantSlug, id))
     return spec
 }
-
-internal fun buildCollectionCatalogEntry(spec: CollectionSpecEntity): CatalogEntryEntity =
-    CatalogEntryEntity(
-        id = spec.collectionId,
-        kind = EntryKind.COLLECTION.wireValue,
-        title = spec.title,
-        summary = spec.summary,
-        createdAt = spec.createdAt,
-        updatedAt = spec.updatedAt,
-        isLocalDirty = false,
-    )
 
 @Suppress("LongParameterList")
 internal suspend fun addCollectionMemberInDao(
@@ -553,26 +510,34 @@ internal suspend fun addCollectionMemberInDao(
     nowIso: String,
     markDirty: Boolean,
 ) {
+    val specTitle = dao.getEntryById(spec.collectionId)?.title ?: spec.slug ?: spec.collectionId
     val mode = CollectionMode.fromWireValue(spec.mode)
     require(mode == CollectionMode.MANUAL) {
-        "Cannot manually modify entries of ${mode.wireValue} collection '${spec.title}'"
+        "Cannot manually modify entries of ${mode.wireValue} collection '$specTitle'"
     }
     require(spec.collectionId != entryId) { "A collection cannot contain itself" }
     val childrenByParent =
         dao.getAllCollectionEntries().groupBy({ it.collectionId }, { it.entryId })
     require(!wouldIntroduceCycleInGraph(childrenByParent, spec.collectionId, entryId)) {
-        "Adding '$entryId' to '${spec.title}' would create a collection cycle"
+        "Adding '$entryId' to '$specTitle' would create a collection cycle"
     }
     dao.deleteTombstone(
         COLLECTION_ENTRY_ENTITY,
         collectionEntryNaturalKey(spec.collectionId, entryId),
     )
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(dao)
+        } else {
+            HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
     dao.upsertCollectionEntry(
         CollectionEntryEntity(
             collectionId = spec.collectionId,
             entryId = entryId,
             position = position,
             addedAt = nowIso,
+            hlc = hlc,
             isLocalDirty = markDirty,
         )
     )
@@ -602,39 +567,6 @@ internal fun wouldIntroduceCycleInGraph(
         }
     }
     return hasCycle
-}
-
-private fun buildFeedItemUpsertInput(
-    item: ItemEntity,
-    contentType: ContentType,
-    isAudio: Boolean,
-): UpsertCatalogEntryInput {
-    val entryKind =
-        when {
-            isAudio -> EntryKind.PODCAST_EPISODE
-            contentType == ContentType.PDF -> EntryKind.PAPER
-            contentType == ContentType.VIDEO -> EntryKind.VIDEO
-            else -> EntryKind.ARTICLE
-        }
-    val creators = item.author?.trim()?.takeIf { it.isNotEmpty() }?.let(::listOf).orEmpty()
-    val canonicalUrl = item.url.trim().takeIf { it.isNotEmpty() }?.let(::canonicalizeSyncUrl)
-    val identifiers = buildList {
-        if (!canonicalUrl.isNullOrBlank()) {
-            add(EntryIdentifierDto("url", canonicalUrl))
-        }
-    }
-    return UpsertCatalogEntryInput(
-        id = item.id,
-        kind = entryKind,
-        title = item.title,
-        creators = creators,
-        url = item.url.takeIf { it.isNotBlank() },
-        publishedAt = item.publishedAt,
-        releaseYear = extractYearPrefix(item.publishedAt),
-        summary = item.summary,
-        thumbnailUrl = item.thumbnailUrl,
-        identifiers = identifiers,
-    )
 }
 
 private fun normalizeEntryIdentifiers(input: UpsertCatalogEntryInput): List<EntryIdentifierDto> {
@@ -670,14 +602,15 @@ private fun cleanSingleIdentifier(
 }
 
 @Suppress("LongParameterList")
-private fun mergeCatalogEntryEntity(
+private fun mergeEntryEntity(
     resolvedId: String,
     normalizedTitle: String,
     input: UpsertCatalogEntryInput,
-    existing: CatalogEntryEntity?,
+    existing: EntryEntity?,
     nowIso: String,
+    hlc: String,
     markDirty: Boolean,
-): CatalogEntryEntity {
+): EntryEntity {
     val mergedCreators =
         if (input.creators.isNotEmpty()) {
             encodeCreatorsJson(input.creators)
@@ -690,7 +623,7 @@ private fun mergeCatalogEntryEntity(
         } else {
             existing?.metadataJson ?: "{}"
         }
-    return CatalogEntryEntity(
+    return EntryEntity(
         id = resolvedId,
         kind = existing?.kind ?: input.kind.wireValue,
         title = nonBlankOrKeep(normalizedTitle, existing?.title) ?: normalizedTitle,
@@ -704,6 +637,7 @@ private fun mergeCatalogEntryEntity(
         mergedIntoId = null,
         createdAt = existing?.createdAt ?: nowIso,
         updatedAt = nowIso,
+        hlc = hlc,
         isLocalDirty = markDirty || existing?.isLocalDirty == true,
     )
 }

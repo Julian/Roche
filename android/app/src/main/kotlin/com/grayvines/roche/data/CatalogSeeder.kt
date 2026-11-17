@@ -1,9 +1,10 @@
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.CatalogEntryEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
+import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.deleteEntryCascade
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -24,23 +25,36 @@ internal class CatalogSeeder(private val dao: RocheDao) {
     private suspend fun seedSystemSpecs() {
         pruneLegacyPlaceholder()
         val existingSpecs = dao.getAllCollectionSpecs().associateBy { it.collectionId }
-        val existingEntryIds = dao.getAllCatalogEntries().map { it.id }.toHashSet()
+        val existingEntryIds = dao.getAllEntries().map { it.id }.toHashSet()
+        val seedHlc = HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
+
         val specsToInsert = ArrayList<CollectionSpecEntity>()
+        val entriesToInsert = ArrayList<EntryEntity>()
         val identsToInsert = ArrayList<EntryIdentifierEntity>()
 
-        collectManualSystemSpecs(existingSpecs, specsToInsert, identsToInsert)
-        collectDynamicSystemSpecs(existingSpecs, specsToInsert, identsToInsert)
-        val missingCollectionEntries =
-            (existingSpecs.values + specsToInsert)
-                .filter { it.collectionId !in existingEntryIds }
-                .map(::buildCollectionCatalogEntry)
+        collectManualSystemSpecs(
+            existingSpecs = existingSpecs,
+            existingEntryIds = existingEntryIds,
+            seedHlc = seedHlc,
+            specsToInsert = specsToInsert,
+            entriesToInsert = entriesToInsert,
+            identsToInsert = identsToInsert,
+        )
+        collectDynamicSystemSpecs(
+            existingSpecs = existingSpecs,
+            existingEntryIds = existingEntryIds,
+            seedHlc = seedHlc,
+            specsToInsert = specsToInsert,
+            entriesToInsert = entriesToInsert,
+            identsToInsert = identsToInsert,
+        )
 
         dao.executeInTransaction {
+            if (entriesToInsert.isNotEmpty()) {
+                dao.upsertEntries(entriesToInsert)
+            }
             if (specsToInsert.isNotEmpty()) {
                 dao.upsertCollectionSpecs(specsToInsert)
-            }
-            if (missingCollectionEntries.isNotEmpty()) {
-                dao.upsertCatalogEntries(missingCollectionEntries)
             }
             if (identsToInsert.isNotEmpty()) {
                 dao.insertEntryIdentifiersIgnore(identsToInsert)
@@ -56,10 +70,7 @@ internal class CatalogSeeder(private val dao: RocheDao) {
             memberCount == 0 && (gen == null || !gen.enabled && gen.currentEntryId.isNullOrBlank())
         dao.executeInTransaction {
             if (isUnused) {
-                dao.deleteCollectionGenerator(LEGACY_PLACEHOLDER_COLLECTION_ID)
-                dao.deleteCollectionSpec(LEGACY_PLACEHOLDER_COLLECTION_ID)
-                dao.deleteIdentifiersForEntry(LEGACY_PLACEHOLDER_COLLECTION_ID)
-                dao.deleteCatalogEntryById(LEGACY_PLACEHOLDER_COLLECTION_ID)
+                dao.deleteEntryCascade(LEGACY_PLACEHOLDER_COLLECTION_ID)
             } else if (CollectionRole.fromWireValue(legacySpec.role) == CollectionRole.SYSTEM) {
                 dao.upsertCollectionSpec(
                     legacySpec.copy(
@@ -71,9 +82,13 @@ internal class CatalogSeeder(private val dao: RocheDao) {
         }
     }
 
+    @Suppress("LongParameterList")
     private fun collectManualSystemSpecs(
         existingSpecs: Map<String, CollectionSpecEntity>,
+        existingEntryIds: Set<String>,
+        seedHlc: String,
         specsToInsert: MutableList<CollectionSpecEntity>,
+        entriesToInsert: MutableList<EntryEntity>,
         identsToInsert: MutableList<EntryIdentifierEntity>,
     ) {
         val manualSystems =
@@ -82,61 +97,67 @@ internal class CatalogSeeder(private val dao: RocheDao) {
                 Triple(UP_NEXT_COLLECTION_ID, "up_next", "Up Next"),
             )
         for ((id, slug, title) in manualSystems) {
-            if (id in existingSpecs) continue
-            specsToInsert.add(
-                CollectionSpecEntity(
-                    collectionId = id,
-                    title = title,
-                    slug = slug,
-                    mode = CollectionMode.MANUAL.wireValue,
-                    role = CollectionRole.SYSTEM.wireValue,
-                    showInLists = false,
-                    createdAt = SEED_EPOCH_ISO,
-                    updatedAt = SEED_EPOCH_ISO,
-                    isLocalDirty = false,
+            if (id !in existingEntryIds) {
+                entriesToInsert.add(buildSeededCollectionEntry(id, title, seedHlc))
+            }
+            if (id !in existingSpecs) {
+                specsToInsert.add(
+                    CollectionSpecEntity(
+                        collectionId = id,
+                        slug = slug,
+                        mode = CollectionMode.MANUAL.wireValue,
+                        role = CollectionRole.SYSTEM.wireValue,
+                        showInLists = false,
+                    )
                 )
-            )
-            identsToInsert.add(EntryIdentifierEntity("slug", slug, id))
+                identsToInsert.add(EntryIdentifierEntity("slug", slug, id))
+            }
         }
     }
 
+    @Suppress("LongParameterList")
     private fun collectDynamicSystemSpecs(
         existingSpecs: Map<String, CollectionSpecEntity>,
+        existingEntryIds: Set<String>,
+        seedHlc: String,
         specsToInsert: MutableList<CollectionSpecEntity>,
+        entriesToInsert: MutableList<EntryEntity>,
         identsToInsert: MutableList<EntryIdentifierEntity>,
     ) {
         for (kind in EntryKind.systemDynamicKinds) {
             val id = systemCollectionUuid(kind.systemListSlug)
-            if (id in existingSpecs) continue
-            specsToInsert.add(
-                CollectionSpecEntity(
-                    collectionId = id,
-                    title = kind.systemListTitle,
-                    slug = kind.systemListSlug,
-                    mode = CollectionMode.DYNAMIC.wireValue,
-                    role = CollectionRole.LIST.wireValue,
-                    ruleJson = """{"kind":"${kind.wireValue}","consumed":true}""",
-                    showInLists = true,
-                    createdAt = SEED_EPOCH_ISO,
-                    updatedAt = SEED_EPOCH_ISO,
-                    isLocalDirty = false,
+            if (id !in existingEntryIds) {
+                entriesToInsert.add(buildSeededCollectionEntry(id, kind.systemListTitle, seedHlc))
+            }
+            if (id !in existingSpecs) {
+                specsToInsert.add(
+                    CollectionSpecEntity(
+                        collectionId = id,
+                        slug = kind.systemListSlug,
+                        mode = CollectionMode.DYNAMIC.wireValue,
+                        role = CollectionRole.LIST.wireValue,
+                        ruleJson = """{"kind":"${kind.wireValue}","consumed":true}""",
+                        showInLists = true,
+                    )
                 )
-            )
-            identsToInsert.add(EntryIdentifierEntity("slug", kind.systemListSlug, id))
+                identsToInsert.add(EntryIdentifierEntity("slug", kind.systemListSlug, id))
+            }
         }
     }
 
-    private fun buildCollectionCatalogEntry(spec: CollectionSpecEntity): CatalogEntryEntity =
-        CatalogEntryEntity(
-            id = spec.collectionId,
+    private fun buildSeededCollectionEntry(
+        id: String,
+        title: String,
+        seedHlc: String,
+    ): EntryEntity =
+        EntryEntity(
+            id = id,
             kind = EntryKind.COLLECTION.wireValue,
-            title = spec.title,
-            creatorsJson = "[]",
-            summary = spec.summary,
-            metadataJson = "{}",
-            createdAt = spec.createdAt,
-            updatedAt = spec.updatedAt,
-            isLocalDirty = spec.isLocalDirty,
+            title = title,
+            createdAt = SEED_EPOCH_ISO,
+            updatedAt = SEED_EPOCH_ISO,
+            hlc = seedHlc,
+            isLocalDirty = false,
         )
 }
 

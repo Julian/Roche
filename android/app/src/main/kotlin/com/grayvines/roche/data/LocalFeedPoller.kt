@@ -2,9 +2,11 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.upsertFeed
+import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.model.ItemStatus
@@ -58,12 +60,13 @@ internal object LocalFeedPoller {
     suspend fun pollFeed(
         dao: RocheDao,
         apiClient: RocheApiClient,
-        feed: FeedEntity,
+        feed: FeedRow,
         localPeerId: String,
         nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
     ): Result<Int> {
         val nowIso = nowInstant.toString()
         val fetchUrl = canonicalizeFeedUrl(feed.url)
+        val syncableFeed = isSyncablePublicUrl(feed.url)
         val xmlResult = apiClient.fetchExternalFeedXml(fetchUrl)
         val xml = xmlResult.getOrElse { error ->
             dao.upsertFeed(
@@ -71,6 +74,7 @@ internal object LocalFeedPoller {
                     lastPolled = nowIso,
                     lastError = sanitizeFeedFetchError(error),
                     lastErrorBy = localPeerId,
+                    isLocalDirty = syncableFeed || feed.isLocalDirty,
                 )
             )
             return Result.failure(error)
@@ -84,16 +88,15 @@ internal object LocalFeedPoller {
                         lastPolled = nowIso,
                         lastError = "Feed XML parse failed",
                         lastErrorBy = localPeerId,
+                        isLocalDirty = syncableFeed || feed.isLocalDirty,
                     )
                 )
                 return Result.failure(error)
             }
 
-        val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId)
-        dao.upsertFeed(updatedFeed)
-        if (updatedFeed.title != feed.title) {
-            dao.updateItemsFeedTitle(updatedFeed.id, updatedFeed.title)
-        }
+        val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
+        val configChanged = updatedFeed.title != feed.title || updatedFeed.feedType != feed.feedType
+        dao.upsertFeed(updatedFeed, markDirty = configChanged && syncableFeed)
 
         val insertedOrUpdatedCount =
             upsertPolledItems(
@@ -101,6 +104,7 @@ internal object LocalFeedPoller {
                 feed = updatedFeed,
                 candidates = batch.items,
                 nowIso = nowIso,
+                markDirty = syncableFeed,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
     }
@@ -118,11 +122,12 @@ internal object LocalFeedPoller {
     }
 
     private fun buildUpdatedPolledFeed(
-        feed: FeedEntity,
+        feed: FeedRow,
         batch: ParsedFeedBatch,
         nowIso: String,
         localPeerId: String,
-    ): FeedEntity {
+        syncableFeed: Boolean,
+    ): FeedRow {
         val resolvedTitle =
             feed.title.takeIf {
                 it.isNotBlank() &&
@@ -147,14 +152,16 @@ internal object LocalFeedPoller {
             lastPolledBy = localPeerId,
             lastError = null,
             lastErrorBy = null,
+            isLocalDirty = syncableFeed || feed.isLocalDirty,
         )
     }
 
     private suspend fun upsertPolledItems(
         dao: RocheDao,
-        feed: FeedEntity,
+        feed: FeedRow,
         candidates: List<ParsedFeedCandidateItem>,
         nowIso: String,
+        markDirty: Boolean,
     ): Int {
         val existingItems = dao.getItemsForFeed(feedId = feed.id, feedUrl = feed.url)
         val tombstones =
@@ -178,11 +185,11 @@ internal object LocalFeedPoller {
             if (existing != null) {
                 val merged = mergePolledCandidate(existing, feed, candidate)
                 if (merged != existing) {
-                    dao.upsertItem(merged)
+                    dao.upsertItem(merged, markDirty = markDirty)
                 }
             } else {
                 val created = buildNewPolledItemEntity(detId, feed, candidate, cleanUrl, nowIso)
-                dao.upsertItem(created)
+                dao.upsertItem(created, markDirty = markDirty)
                 byNaturalUrl[canonicalUrlKey] = created
                 byId[detId] = created
                 newCount++
@@ -193,12 +200,12 @@ internal object LocalFeedPoller {
 
     private fun buildNewPolledItemEntity(
         detId: String,
-        feed: FeedEntity,
+        feed: FeedRow,
         candidate: ParsedFeedCandidateItem,
         cleanUrl: String,
         nowIso: String,
-    ): ItemEntity =
-        ItemEntity(
+    ): InboxItemRow =
+        InboxItemRow(
             id = detId,
             feedId = feed.id,
             feedUrl = feed.url,
@@ -225,10 +232,10 @@ internal object LocalFeedPoller {
         )
 
     private fun mergePolledCandidate(
-        existing: ItemEntity,
-        feed: FeedEntity,
+        existing: InboxItemRow,
+        feed: FeedRow,
         candidate: ParsedFeedCandidateItem,
-    ): ItemEntity {
+    ): InboxItemRow {
         val richerSummary =
             pickRicherString(existing.summary, candidate.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
         val richerText =

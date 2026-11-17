@@ -14,25 +14,22 @@ import androidx.sqlite.execSQL
 @Database(
     entities =
         [
-            FeedEntity::class,
-            ItemEntity::class,
-            ItemContentEntity::class,
-            ItemFtsEntity::class,
-            ItemContentFtsEntity::class,
-            TagEntity::class,
-            ItemTagEntity::class,
-            PendingMutationEntity::class,
-            TombstoneEntity::class,
-            CatalogEntryEntity::class,
+            EntryEntity::class,
+            EntryContentEntity::class,
+            EntryStateEntity::class,
+            EntryFtsEntity::class,
+            EntryContentFtsEntity::class,
             EntryIdentifierEntity::class,
+            FeedSourceEntity::class,
             CollectionSpecEntity::class,
             CollectionEntryEntity::class,
             CollectionGeneratorEntity::class,
             ConsumptionLogEntity::class,
             ComparisonEntity::class,
+            TombstoneEntity::class,
             LocalSyncFlagEntity::class,
         ],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class RocheDatabase : RoomDatabase() {
@@ -168,6 +165,13 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
+        internal val MIGRATION_9_10 =
+            object : Migration(9, 10) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    migrateUnifiedEntriesSchemaV10(connection)
+                }
+            }
+
         fun create(context: Context): RocheDatabase =
             Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
                 .setDriver(BundledSQLiteDriver())
@@ -187,6 +191,7 @@ abstract class RocheDatabase : RoomDatabase() {
                     MIGRATION_6_7,
                     MIGRATION_7_8,
                     MIGRATION_8_9,
+                    MIGRATION_9_10,
                 )
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()

@@ -423,5 +423,71 @@
       "expected_ids": ["id-2", "id-9", "id-5"],
       "expected_tiers": ["A", "A", "D"]
     }
-  ]
+  ],
+  "hlc_vectors": {
+    "sequence_steps": [
+      {
+        "node_id": "android-pixel",
+        "initial_hlc": null,
+        "op": "tick",
+        "remote_hlc": null,
+        "now_ms": 1794920000100,
+        "expected": "001794920000100-0000-android-pixel"
+      },
+      {
+        "node_id": "android-pixel",
+        "initial_hlc": "001794920000100-0000-android-pixel",
+        "op": "tick",
+        "remote_hlc": null,
+        "now_ms": 1794920000100,
+        "expected": "001794920000100-0001-android-pixel"
+      },
+      {
+        "node_id": "android-pixel",
+        "initial_hlc": "001794920000100-0001-android-pixel",
+        "op": "tick",
+        "remote_hlc": null,
+        "now_ms": 1794920000050,
+        "expected": "001794920000100-0002-android-pixel"
+      },
+      {
+        "node_id": "android-pixel",
+        "initial_hlc": "001794920000100-0002-android-pixel",
+        "op": "tick",
+        "remote_hlc": null,
+        "now_ms": 1794920000200,
+        "expected": "001794920000200-0000-android-pixel"
+      },
+      {
+        "node_id": "server",
+        "initial_hlc": "001794920000100-0005-server",
+        "op": "witness",
+        "remote_hlc": "001794920005000-0009-android-pixel",
+        "now_ms": 1794920000200,
+        "expected": "001794920005000-000a-server"
+      },
+      {
+        "node_id": "server",
+        "initial_hlc": "001794920005000-000c-server",
+        "op": "witness",
+        "remote_hlc": "001794920005000-000a-android-pixel",
+        "now_ms": 1794920005000,
+        "expected": "001794920005000-000d-server"
+      }
+    ],
+    "total_order": {
+      "unsorted": [
+        "001794920005000-000a-server",
+        "001794920005000-0009-z-peer",
+        "001794920005000-000a-android-pixel",
+        "001794919999999-ffff-server"
+      ],
+      "expected_sorted": [
+        "001794919999999-ffff-server",
+        "001794920005000-0009-z-peer",
+        "001794920005000-000a-android-pixel",
+        "001794920005000-000a-server"
+      ]
+    }
+  }
 }

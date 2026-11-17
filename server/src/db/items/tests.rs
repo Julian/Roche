@@ -432,15 +432,6 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
     assert_eq!(restored_read.status, ItemStatus::Unread);
     assert_eq!(restored_read.read_at, Some(custom_read_ts));
 
-    // Keyset `list_for_peer_sync` walks all 4 inbox items cleanly in 2-item pages
-    let (p1, more1, cur1) = items.list_for_peer_sync(None, None, 2).await.unwrap();
-    assert_eq!(p1.len(), 2);
-    assert!(more1);
-    let (p2, more2, _) =
-        items.list_for_peer_sync(cur1, Some(&p1.last().unwrap().id), 2).await.unwrap();
-    assert_eq!(p2.len(), 2);
-    assert!(!more2);
-
     // `AllUnread` / `Feed { unread_only: true }` archives items in Inbox even if `read_at` is set
     let before_archive_id = db.sync().latest_activity_id().await.unwrap();
     let scope =

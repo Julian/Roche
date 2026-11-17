@@ -40,12 +40,8 @@ const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
 const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
 const MAX_TAILSCALE_WEB_TOKENS_PER_USER: i64 = 3;
 
-const MAX_SYNC_FEEDS: usize = 2_000;
-const MAX_SYNC_TAGS: usize = 2_000;
-const MAX_SYNC_COLLECTIONS: usize = 5_000;
-const MAX_SYNC_ITEMS: usize = 5_000;
+const MAX_SYNC_ENTRIES: usize = 15_000;
 const MAX_SYNC_TOMBSTONES: usize = 10_000;
-const MAX_SYNC_CATALOG_ENTRIES: usize = 10_000;
 const MAX_SYNC_COLLECTION_ENTRIES: usize = 25_000;
 const MAX_SYNC_GENERATORS: usize = 64;
 const MAX_SYNC_CONSUMPTION_LOG: usize = 25_000;
@@ -388,12 +384,8 @@ impl<F: FeedFetcher> RocheService<F> {
         }
 
         for (field, len, limit) in [
-            ("feeds", req.feeds.len(), MAX_SYNC_FEEDS),
-            ("items", req.items.len(), MAX_SYNC_ITEMS),
-            ("tags", req.tags.len(), MAX_SYNC_TAGS),
+            ("entries", req.entries.len(), MAX_SYNC_ENTRIES),
             ("tombstones", req.tombstones.len(), MAX_SYNC_TOMBSTONES),
-            ("collections", req.collections.len(), MAX_SYNC_COLLECTIONS),
-            ("catalog_entries", req.catalog_entries.len(), MAX_SYNC_CATALOG_ENTRIES),
             ("collection_entries", req.collection_entries.len(), MAX_SYNC_COLLECTION_ENTRIES),
             ("collection_generators", req.collection_generators.len(), MAX_SYNC_GENERATORS),
             ("consumption_log", req.consumption_log.len(), MAX_SYNC_CONSUMPTION_LOG),
@@ -406,72 +398,104 @@ impl<F: FeedFetcher> RocheService<F> {
             }
         }
 
-        req.feeds.retain_mut(|f| {
-            if let Err(err) = SafeHttpClient::validate_url(&f.url) {
-                tracing::warn!(
-                    url = %f.url,
-                    error = %err,
-                    "Skipping non-public or disallowed feed URL in peer_sync"
-                );
-                return false;
-            }
-            match FeedSource::Url(f.url.clone()).into_feed_url(f.feed_type) {
-                Ok((resolved_type, validated_url)) => {
-                    f.feed_type = resolved_type;
-                    f.url = validated_url;
-                    true
-                }
-                Err(err) => {
+        let mut skipped_feed_ids = std::collections::HashSet::new();
+        req.entries.retain_mut(|entry| {
+            if let Some(ref mut fs) = entry.feed_source {
+                let Ok(parsed_feed_url) = Url::parse(fs.feed_url.trim()) else {
+                    if !entry.id.trim().is_empty() {
+                        skipped_feed_ids.insert(entry.id.trim().to_owned());
+                    }
+                    return false;
+                };
+                if let Err(err) = SafeHttpClient::validate_url(&parsed_feed_url) {
                     tracing::warn!(
-                        url = %f.url,
+                        url = %parsed_feed_url,
                         error = %err,
-                        "Skipping incompatible feed URL in peer_sync"
+                        "Skipping non-public or disallowed feed URL in peer_sync"
                     );
-                    false
+                    if !entry.id.trim().is_empty() {
+                        skipped_feed_ids.insert(entry.id.trim().to_owned());
+                    }
+                    skipped_feed_ids
+                        .insert(crate::db::deterministic_feed_id(parsed_feed_url.as_str()));
+                    return false;
+                }
+                match FeedSource::Url(parsed_feed_url).into_feed_url(fs.source_type) {
+                    Ok((resolved_type, validated_url)) => {
+                        fs.source_type = resolved_type;
+                        fs.feed_url = validated_url.to_string();
+                        return true;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            url = %fs.feed_url,
+                            error = %err,
+                            "Skipping incompatible feed URL in peer_sync"
+                        );
+                        if !entry.id.trim().is_empty() {
+                            skipped_feed_ids.insert(entry.id.trim().to_owned());
+                        }
+                        return false;
+                    }
                 }
             }
-        });
 
-        req.items.retain_mut(|item| {
-            if !is_valid_sync_item_url(&item.url) {
-                tracing::warn!(
-                    url = %item.url,
-                    "Skipping item with invalid permalink URL in peer_sync"
-                );
-                return false;
+            if let Some(raw_url) = entry.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let valid = Url::parse(raw_url).as_ref().is_ok_and(is_valid_sync_item_url);
+                if !valid {
+                    tracing::warn!(
+                        url = %raw_url,
+                        "Skipping or clearing invalid entry URL in peer_sync"
+                    );
+                    if entry.state.is_some() || entry.content.is_some() {
+                        return false;
+                    }
+                    entry.url = None;
+                }
             }
-            if let Some(ref feed_url) = item.feed_url
-                && !is_valid_sync_item_url(feed_url)
+
+            if let Some(ref mut ct) = entry.content
+                && ct
+                    .audio_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_some_and(|u| !Url::parse(u).as_ref().is_ok_and(is_valid_sync_item_url))
             {
                 tracing::warn!(
-                    url = %item.url,
-                    feed_url = %feed_url,
-                    "Skipping item with invalid feed_url in peer_sync"
+                    id = %entry.id,
+                    "Clearing invalid audio_url on synced entry in peer_sync"
                 );
-                return false;
+                ct.audio_url = None;
             }
-            if item
-                .audio_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_some_and(|u| !Url::parse(u).as_ref().is_ok_and(is_valid_sync_item_url))
-            {
+
+            if entry.thumbnail_url.as_deref().is_some_and(|u| u.trim().len() > MAX_SYNC_URL_LEN) {
                 tracing::warn!(
-                    url = %item.url,
-                    "Clearing invalid audio_url on synced item in peer_sync"
+                    id = %entry.id,
+                    "Clearing oversized thumbnail_url on synced entry in peer_sync"
                 );
-                item.audio_url = None;
-            }
-            if item.thumbnail_url.as_deref().is_some_and(|u| u.trim().len() > MAX_SYNC_URL_LEN) {
-                tracing::warn!(
-                    url = %item.url,
-                    "Clearing oversized thumbnail_url on synced item in peer_sync"
-                );
-                item.thumbnail_url = None;
+                entry.thumbnail_url = None;
             }
             true
         });
+
+        if !skipped_feed_ids.is_empty() {
+            let mut orphaned_feed_items = std::collections::HashSet::new();
+            for ce in &req.collection_entries {
+                if skipped_feed_ids.contains(ce.collection_id.trim()) {
+                    orphaned_feed_items.insert(ce.entry_id.trim().to_owned());
+                }
+            }
+            req.collection_entries.retain(|ce| !skipped_feed_ids.contains(ce.collection_id.trim()));
+            if !orphaned_feed_items.is_empty() {
+                let still_linked: std::collections::HashSet<&str> =
+                    req.collection_entries.iter().map(|ce| ce.entry_id.trim()).collect();
+                req.entries.retain(|e| {
+                    let id = e.id.trim();
+                    !orphaned_feed_items.contains(id) || still_linked.contains(id)
+                });
+            }
+        }
 
         let (response, mut inserted_candidates) = self.db.sync().merge_peer_state(&req).await?;
         inserted_candidates.retain(|(_, c)| SafeHttpClient::validate_url(&c.url).is_ok());

@@ -1051,37 +1051,89 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
     let auth = format!("Bearer {token}");
     let app = ApiRoutes::router_with_fetcher(&db, FakeFeedFetcher);
 
+    let hlc_1 = "001780315200000-0001-android-peer-1";
+    let hlc_2 = "001780315200000-0002-android-peer-1";
     let sync_payload = serde_json::json!({
         "peer_id": "android-peer-1",
         "device_name": "Pixel 9",
         "network_tier": "wifi",
-        "feeds": [{
-            "url": "https://blog.example.com/rss.xml",
-            "title": "Example Blog",
-            "feed_type": "rss",
-            "poll_interval": 30,
-            "last_polled": "2026-06-01T12:00:00Z",
-            "last_polled_by": "android-peer-1",
-            "is_active": true
-        }],
-        "items": [{
-            "feed_url": "https://blog.example.com/rss.xml",
-            "url": "https://blog.example.com/post-1",
-            "title": "Post 1 fetched on Android",
-            "content_html": "<p>Full body from phone</p>",
-            "summary": "Full body from phone",
-            "content_type": "article",
-            "status": "unread",
-            "is_favorite": true,
-            "read_progress": 0.9,
-            "read_at": "2026-06-01T12:05:00Z",
-            "interaction_updated_at": "2026-06-01T12:05:00Z",
-            "tag_names": ["distributed"]
-        }],
-        "tags": [{
-            "name": "distributed",
-            "color": "#10b981"
-        }],
+        "since_seq": 0,
+        "client_hlc": hlc_1,
+        "entries": [
+            {
+                "id": "local-feed-1",
+                "kind": "publication",
+                "title": "Example Blog",
+                "hlc": hlc_1,
+                "collection_spec": {
+                    "mode": "feed",
+                    "role": "feed",
+                    "show_in_lists": false
+                },
+                "feed_source": {
+                    "feed_url": "https://blog.example.com/rss.xml",
+                    "source_type": "rss",
+                    "feed_title": "Example Blog",
+                    "poll_interval": 30,
+                    "is_active": true,
+                    "last_polled_at": "2026-06-01T12:00:00Z",
+                    "last_polled_by": "android-peer-1",
+                    "hlc": hlc_1
+                }
+            },
+            {
+                "id": "local-tag-1",
+                "kind": "collection",
+                "title": "distributed",
+                "hlc": hlc_1,
+                "collection_spec": {
+                    "slug": "tag:distributed",
+                    "mode": "manual",
+                    "role": "tag",
+                    "show_in_lists": false,
+                    "color": "#10b981"
+                }
+            },
+            {
+                "id": "local-item-1",
+                "kind": "article",
+                "title": "Post 1 fetched on Android",
+                "url": "https://blog.example.com/post-1",
+                "summary": "Full body from phone",
+                "hlc": hlc_1,
+                "content": {
+                    "content_type": "article",
+                    "content_html": "<p>Full body from phone</p>"
+                },
+                "state": {
+                    "inbox_state": "unread",
+                    "read_at": "2026-06-01T12:05:00Z",
+                    "progress": 0.9,
+                    "interaction_updated_at": "2026-06-01T12:05:00Z",
+                    "hlc": hlc_1
+                }
+            }
+        ],
+        "collection_entries": [
+            {
+                "collection_id": "local-feed-1",
+                "entry_id": "local-item-1",
+                "added_at": "2026-06-01T12:00:00Z",
+                "hlc": hlc_1
+            },
+            {
+                "collection_id": crate::db::STARRED_COLLECTION_ID,
+                "entry_id": "local-item-1",
+                "added_at": "2026-06-01T12:05:00Z",
+                "hlc": hlc_1
+            },
+            {
+                "collection_id": "local-tag-1",
+                "entry_id": "local-item-1",
+                "added_at": "2026-06-01T12:05:00Z",
+                "hlc": hlc_1
+            }
+        ],
         "tombstones": []
     });
 
@@ -1098,13 +1150,10 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["server_peer_id"], "server");
     assert_eq!(body["has_more"], false);
-    assert_eq!(body["feeds"].as_array().unwrap().len(), 1);
-    assert_eq!(body["items"].as_array().unwrap().len(), 1);
-    assert_eq!(body["items"][0]["status"], "unread");
-    assert_eq!(body["items"][0]["read_at"], "2026-06-01T12:05:00Z");
-    assert_eq!(body["items"][0]["is_favorite"], true);
-    assert_eq!(body["tags"].as_array().unwrap().len(), 1);
-    assert_eq!(body["tags"][0]["color"], "#10b981");
+    assert!(body["sync_seq"].as_i64().unwrap() > 0);
+    assert_ne!(body["server_hlc"].as_str().unwrap(), "");
+    assert_eq!(body["entries"].as_array().unwrap().len(), 3);
+    assert_eq!(body["collection_entries"].as_array().unwrap().len(), 3);
     assert_eq!(body["active_peers"].as_array().unwrap().len(), 2);
 
     // Sending the exact same payload again must produce zero duplicates
@@ -1117,20 +1166,28 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
         .unwrap();
     let repeat_response = app.clone().oneshot(repeat_request).await.unwrap();
     assert_eq!(repeat_response.status(), StatusCode::OK);
-    let all_feeds = db.feeds().list().await.unwrap();
-    assert_eq!(all_feeds.len(), 1);
+    assert_eq!(db.feeds().list().await.unwrap().len(), 1);
     let all_items = db.items().list(None, None, Some(50)).await.unwrap();
     assert_eq!(all_items.len(), 1);
+    assert!(all_items[0].is_favorite);
+    assert_eq!(all_items[0].tag_names.0, vec!["distributed".to_string()]);
 
     // Skip non-public SSRF feed URLs in peer sync without failing the sync request
     let bad_payload = serde_json::json!({
         "peer_id": "android-peer-1",
         "device_name": "Pixel 9",
         "network_tier": "wifi",
-        "feeds": [{
-            "url": "http://127.0.0.1:8080/private.xml",
+        "entries": [{
+            "id": "ssrf-feed",
+            "kind": "publication",
             "title": "Internal",
-            "feed_type": "rss"
+            "hlc": hlc_2,
+            "collection_spec": {"mode": "feed", "role": "feed"},
+            "feed_source": {
+                "feed_url": "http://127.0.0.1:8080/private.xml",
+                "source_type": "rss",
+                "hlc": hlc_2
+            }
         }]
     });
     let ssrf_request = Request::builder()
@@ -1144,23 +1201,28 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
     assert_eq!(ssrf_response.status(), StatusCode::OK);
     assert_eq!(db.feeds().list().await.unwrap().len(), 1);
 
-    // Peer sync should propagate feed archival (is_active = false) and unarchival without losing reading history
+    // Propagate feed archival (is_active = false) via newer HLC without losing reading history
     let archive_sync_payload = serde_json::json!({
         "peer_id": "android-peer-1",
         "device_name": "Pixel 9",
         "network_tier": "wifi",
-        "feeds": [{
-            "url": "https://blog.example.com/rss.xml",
+        "entries": [{
+            "id": "local-feed-1",
+            "kind": "publication",
             "title": "Example Blog",
-            "feed_type": "rss",
-            "poll_interval": 30,
-            "last_polled": "2026-06-01T12:00:00Z",
-            "last_polled_by": "android-peer-1",
-            "is_active": false
-        }],
-        "items": [],
-        "tags": [],
-        "tombstones": []
+            "hlc": hlc_2,
+            "collection_spec": {"mode": "feed", "role": "feed"},
+            "feed_source": {
+                "feed_url": "https://blog.example.com/rss.xml",
+                "source_type": "rss",
+                "feed_title": "Example Blog",
+                "poll_interval": 30,
+                "is_active": false,
+                "last_polled_at": "2026-06-01T12:00:00Z",
+                "last_polled_by": "android-peer-1",
+                "hlc": hlc_2
+            }
+        }]
     });
     let archive_sync_request = Request::builder()
         .method("POST")
@@ -1171,12 +1233,9 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
         .unwrap();
     let archive_sync_response = app.clone().oneshot(archive_sync_request).await.unwrap();
     assert_eq!(archive_sync_response.status(), StatusCode::OK);
-    let archive_sync_body: serde_json::Value = serde_json::from_slice(
-        &to_bytes(archive_sync_response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
-    assert_eq!(archive_sync_body["feeds"][0]["is_active"], false);
-    let feed_id = archive_sync_body["feeds"][0]["id"].as_str().unwrap().to_string();
+    let feeds_now = db.feeds().list().await.unwrap();
+    assert!(!feeds_now[0].is_active);
+    let feed_id = feeds_now[0].id.clone();
 
     // Unarchive via POST /api/v1/feeds/{id}/unarchive and archive via POST /api/v1/feeds/{id}/archive
     let unarchive_request = Request::builder()
@@ -1206,7 +1265,6 @@ async fn peer_sync_endpoint_replicates_feeds_items_tags_and_tombstones() {
             .unwrap();
     assert_eq!(archived_feed["is_active"], false);
 
-    // Reading history on items remains untouched
     let preserved_items = db.items().list(None, Some(&feed_id), Some(50)).await.unwrap();
     assert_eq!(preserved_items.len(), 1);
     assert!(preserved_items[0].is_favorite);
@@ -1244,14 +1302,20 @@ async fn test_large_body_routes_accept_payloads_over_2_mib() {
     assert_eq!(opml_body["imported_count"], 1);
 
     let html_chunk = format!("<p>{}</p>", "a".repeat(40_000));
-    let items: Vec<serde_json::Value> = (0..60)
+    let entries: Vec<serde_json::Value> = (0..60)
         .map(|idx| {
             serde_json::json!({
+                "kind": "article",
                 "url": format!("https://example.com/large-sync-item-{idx}"),
                 "title": format!("Large Item {idx}"),
-                "content_html": html_chunk,
-                "content_type": "article",
-                "status": "unread"
+                "content": {
+                    "content_type": "article",
+                    "content_html": html_chunk
+                },
+                "state": {
+                    "inbox_state": "unread",
+                    "progress": 0.0
+                }
             })
         })
         .collect();
@@ -1259,7 +1323,7 @@ async fn test_large_body_routes_accept_payloads_over_2_mib() {
         "peer_id": "android-large-sync",
         "device_name": "Pixel 10",
         "network_tier": "wifi",
-        "items": items
+        "entries": entries
     })
     .to_string();
     assert!(large_sync_json.len() > 2 * 1024 * 1024);
@@ -1276,6 +1340,7 @@ async fn test_large_body_routes_accept_payloads_over_2_mib() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_peer_sync_skips_lan_feeds_and_accepts_non_standard_port_items() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let token = TokenManager::new(db.auth()).create("test-suite", 32).await.unwrap();
@@ -1286,43 +1351,78 @@ async fn test_peer_sync_skips_lan_feeds_and_accepts_non_standard_port_items() {
         "peer_id": "android-peer-1",
         "device_name": "Pixel 10",
         "network_tier": "wifi",
-        "feeds": [
+        "entries": [
             {
-                "url": "http://192.168.1.50/rss.xml",
+                "id": "lan-feed",
+                "kind": "publication",
                 "title": "Home Router Feed",
-                "feed_type": "rss"
+                "collection_spec": {"mode": "feed", "role": "feed"},
+                "feed_source": {
+                    "feed_url": "http://192.168.1.50/rss.xml",
+                    "source_type": "rss"
+                }
             },
             {
-                "url": "https://valid.example.com/rss.xml",
+                "id": "public-feed",
+                "kind": "publication",
                 "title": "Valid Public Feed",
-                "feed_type": "rss"
-            }
-        ],
-        "items": [
+                "collection_spec": {"mode": "feed", "role": "feed"},
+                "feed_source": {
+                    "feed_url": "https://valid.example.com/rss.xml",
+                    "source_type": "rss"
+                }
+            },
             {
+                "id": "lan-feed-item",
+                "kind": "article",
+                "url": "http://192.168.1.50/router-status",
+                "title": "Router Status",
+                "content": {"content_type": "article"},
+                "state": {"inbox_state": "unread"}
+            },
+            {
+                "id": "port-demo",
+                "kind": "article",
                 "url": "https://example.com:8443/demo",
                 "title": "Port 8443 Demo",
-                "content_type": "article",
-                "status": "unread"
+                "content": {"content_type": "article"},
+                "state": {"inbox_state": "unread"}
             },
             {
+                "id": "tailnet-item",
+                "kind": "article",
                 "url": "https://intranet.tailnet.ts.net:9443/internal-note",
                 "title": "Tailnet Non-Standard Port Item",
-                "content_type": "article",
-                "status": "unread"
+                "content": {"content_type": "article"},
+                "state": {"inbox_state": "unread"}
             },
             {
-                "feed_url": "https://valid.example.com/rss.xml",
+                "id": "valid-feed-item",
+                "kind": "article",
                 "url": "https://valid.example.com:8443/post-1",
                 "title": "Valid Feed Item With Port",
-                "content_type": "article",
-                "status": "unread"
+                "content": {"content_type": "article"},
+                "state": {"inbox_state": "unread"}
             },
             {
+                "id": "bad-creds",
+                "kind": "article",
                 "url": "https://user:secret@example.com/disallowed-creds",
                 "title": "Credentials In Permalink",
-                "content_type": "article",
-                "status": "unread"
+                "content": {"content_type": "article"},
+                "state": {"inbox_state": "unread"}
+            }
+        ],
+        "collection_entries": [
+            {
+                "collection_id": "lan-feed",
+                "entry_id": "lan-feed-item",
+                "added_at": "2026-06-01T12:00:00Z"
+            },
+            {
+                "collection_id": "public-feed",
+                "entry_id": "valid-feed-item",
+                "added_at": "2026-06-01T12:00:00Z"
             }
         ]
     });
@@ -1339,16 +1439,20 @@ async fn test_peer_sync_skips_lan_feeds_and_accepts_non_standard_port_items() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
 
-    let feeds = body["feeds"].as_array().unwrap();
+    let entries = body["entries"].as_array().unwrap();
+    let feeds: Vec<_> = entries.iter().filter(|e| !e["feed_source"].is_null()).collect();
     assert_eq!(feeds.len(), 1);
-    assert_eq!(feeds[0]["url"], "https://valid.example.com/rss.xml");
+    assert_eq!(feeds[0]["feed_source"]["feed_url"], "https://valid.example.com/rss.xml");
 
-    let items = body["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3);
-    let synced_urls: Vec<&str> = items.iter().map(|i| i["url"].as_str().unwrap()).collect();
-    assert!(synced_urls.contains(&"https://example.com:8443/demo"));
-    assert!(synced_urls.contains(&"https://intranet.tailnet.ts.net:9443/internal-note"));
-    assert!(synced_urls.contains(&"https://valid.example.com:8443/post-1"));
+    let inbox_urls: Vec<&str> = entries
+        .iter()
+        .filter(|e| !e["state"].is_null())
+        .map(|e| e["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(inbox_urls.len(), 3);
+    assert!(inbox_urls.contains(&"https://example.com:8443/demo"));
+    assert!(inbox_urls.contains(&"https://intranet.tailnet.ts.net:9443/internal-note"));
+    assert!(inbox_urls.contains(&"https://valid.example.com:8443/post-1"));
 }
 
 #[tokio::test]
@@ -1536,7 +1640,7 @@ async fn test_catalog_api_collection_generator_and_peer_sync_roundtrip() {
         "peer_id": "android-companion-1",
         "device_name": "Pixel",
         "network_tier": "wifi",
-        "catalog_entries": [{
+        "entries": [{
             "id": "",
             "kind": "album",
             "title": "Blue Train",

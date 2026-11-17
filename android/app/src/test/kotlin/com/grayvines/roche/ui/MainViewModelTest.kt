@@ -11,10 +11,15 @@ import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.generatorFor
-import com.grayvines.roche.data.local.FeedEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
-import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.TagRow
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.local.upsertTags
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -359,10 +364,10 @@ class MainViewModelTest {
                 )
             val mixedTags =
                 listOf(
-                    TagEntity(id = "t-sql", name = "SQLite"),
-                    TagEntity(id = "t-arx", name = "arXiv"),
-                    TagEntity(id = "t-dist", name = "Distributed"),
-                    TagEntity(id = "t-comp", name = "compilers"),
+                    TagRow(id = "t-sql", name = "SQLite"),
+                    TagRow(id = "t-arx", name = "arXiv"),
+                    TagRow(id = "t-dist", name = "Distributed"),
+                    TagRow(id = "t-comp", name = "compilers"),
                 )
             database.dao().upsertFeeds(mixedFeeds)
             database.dao().upsertTags(mixedTags)
@@ -642,7 +647,7 @@ class MainViewModelTest {
     internal fun `interleaved queue and audio autoplay skip non-audio articles and apply podcast speed`() =
         runTest {
             val podcastFeed =
-                FeedEntity(
+                FeedRow(
                     id = "f-podcast",
                     title = "Oxide and Friends",
                     url = "https://oxide.computer/podcasts/rss.xml",
@@ -2001,7 +2006,7 @@ class MainViewModelTest {
     }
 
     private fun testFeed(id: String, title: String) =
-        FeedEntity(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
+        FeedRow(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
 
     private fun testItem(
         id: String,
@@ -2009,7 +2014,7 @@ class MainViewModelTest {
         feedId: String = "f-1",
         status: String = "unread",
     ) =
-        com.grayvines.roche.data.local.ItemEntity(
+        InboxItemRow(
             id = id,
             feedId = feedId,
             feedTitle = "Test Feed",

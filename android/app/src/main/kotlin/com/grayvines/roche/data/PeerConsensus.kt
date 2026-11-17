@@ -2,7 +2,7 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.FeedEntity
+import com.grayvines.roche.data.local.FeedRow
 import java.net.IDN
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -15,6 +15,8 @@ import java.time.Instant
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.ln
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 
 internal const val SERVER_PEER_ID = "server"
 internal const val DEFAULT_POLL_INTERVAL_MINUTES = 30
@@ -65,10 +67,12 @@ data class PeerNodeDto(
     val lastSeenAt: String = "",
 )
 
+@Serializable
 data class SyncTombstoneDto(
-    val entityType: String,
-    val naturalKey: String,
-    val deletedAt: String,
+    @SerialName("entity_type") val entityType: String = "",
+    @SerialName("natural_key") val naturalKey: String = "",
+    @SerialName("deleted_at") val deletedAt: String = "",
+    val hlc: String = "",
 )
 
 /**
@@ -507,7 +511,7 @@ internal fun selectFeedPoller(
 
 internal fun isFeedDueOrRescueForPeer(
     localPeerId: String,
-    feed: FeedEntity,
+    feed: FeedRow,
     nowInstant: Instant,
 ): Boolean {
     if (!feed.isActive) return false
@@ -525,7 +529,7 @@ internal fun isFeedDueOrRescueForPeer(
 internal fun shouldPeerPollFeed(
     localPeerId: String,
     activePeers: List<PeerNodeDto>,
-    feed: FeedEntity,
+    feed: FeedRow,
     nowInstant: Instant = Instant.now(),
 ): Boolean {
     if (!isFeedDueOrRescueForPeer(localPeerId, feed, nowInstant)) return false

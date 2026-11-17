@@ -5,6 +5,10 @@ import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
+import com.grayvines.roche.data.local.insertItemTags
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.local.upsertTags
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository

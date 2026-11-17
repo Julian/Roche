@@ -2,12 +2,12 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.CatalogEntryEntity
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.ranking.EpRankingEngine
@@ -23,7 +23,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
 internal data class RawCatalogTables(
-    val entries: List<CatalogEntryEntity>,
+    val entries: List<EntryEntity>,
     val identifiers: List<EntryIdentifierEntity>,
     val specs: List<CollectionSpecEntity>,
     val memberships: List<CollectionEntryEntity>,
@@ -35,6 +35,7 @@ internal data class RawCatalogTables(
 internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
     val activeEntries =
         tables.entries.filter { it.mergedIntoId.isNullOrBlank() }.associateBy { it.id }
+    val titlesByEntryId = tables.entries.associate { it.id to it.title }
     val domainEntries = buildDomainEntries(activeEntries, tables.identifiers)
     val logsByEntryId = tables.logs.groupBy { it.entryId }
     val statusesByEntryId = logsByEntryId.mapValues { (_, list) ->
@@ -54,6 +55,7 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
         buildRankedCollections(
             RankedCollectionsInput(
                 specs = tables.specs,
+                titlesByEntryId = titlesByEntryId,
                 membershipsByCollection = membershipsByCollection,
                 generatorsByCollection = generatorsByCollection,
                 domainEntries = domainEntries,
@@ -72,6 +74,7 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
     val generatorStates =
         buildCollectionGeneratorStates(
             specs = tables.specs,
+            titlesByEntryId = titlesByEntryId,
             generatorsByCollection = generatorsByCollection,
             membershipsByCollection = membershipsByCollection,
             rawEntries = activeEntries,
@@ -90,8 +93,14 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
     )
 }
 
+internal fun resolveSpecTitle(
+    spec: CollectionSpecEntity,
+    titlesByEntryId: Map<String, String>,
+): String =
+    titlesByEntryId[spec.collectionId]?.takeIf { it.isNotBlank() } ?: spec.slug ?: spec.collectionId
+
 private fun buildDomainEntries(
-    activeEntries: Map<String, CatalogEntryEntity>,
+    activeEntries: Map<String, EntryEntity>,
     identifiers: List<EntryIdentifierEntity>,
 ): Map<String, CatalogEntryItem> {
     val identsByEntryId =
@@ -128,8 +137,10 @@ private data class RankedCollectionsBundle(
     val sortedWants: List<CatalogListSummary>,
 )
 
+@Suppress("LongParameterList")
 private data class RankedCollectionsInput(
     val specs: List<CollectionSpecEntity>,
+    val titlesByEntryId: Map<String, String>,
     val membershipsByCollection: Map<String, List<CollectionEntryEntity>>,
     val generatorsByCollection: Map<String, CollectionGeneratorEntity>,
     val domainEntries: Map<String, CatalogEntryItem>,
@@ -160,6 +171,7 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
         val summary =
             toCatalogListSummary(
                 spec = spec,
+                specTitle = resolveSpecTitle(spec, input.titlesByEntryId),
                 mode = mode,
                 role = role,
                 isWant = isWant,
@@ -220,6 +232,7 @@ private fun resolveAndRankSpec(
 @Suppress("LongParameterList")
 private fun toCatalogListSummary(
     spec: CollectionSpecEntity,
+    specTitle: String,
     mode: CollectionMode,
     role: CollectionRole,
     isWant: Boolean,
@@ -235,7 +248,7 @@ private fun toCatalogListSummary(
     return CatalogListSummary(
         collectionId = spec.collectionId,
         slug = spec.slug ?: spec.collectionId,
-        title = spec.title,
+        title = specTitle,
         mode = mode,
         role = role,
         entryCount = rankedSize,
@@ -540,9 +553,10 @@ private fun buildDiaryItems(
 @Suppress("LongParameterList")
 private fun buildCollectionGeneratorStates(
     specs: List<CollectionSpecEntity>,
+    titlesByEntryId: Map<String, String>,
     generatorsByCollection: Map<String, CollectionGeneratorEntity>,
     membershipsByCollection: Map<String, List<CollectionEntryEntity>>,
-    rawEntries: Map<String, CatalogEntryEntity>,
+    rawEntries: Map<String, EntryEntity>,
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
     abandonedIds: Set<String>,
@@ -553,10 +567,13 @@ private fun buildCollectionGeneratorStates(
                 CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST &&
                 spec.collectionId in generatorsByCollection
         }
-        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+        .sortedWith(
+            compareBy(String.CASE_INSENSITIVE_ORDER) { resolveSpecTitle(it, titlesByEntryId) }
+        )
         .map { spec ->
             buildSingleGeneratorState(
                 spec = spec,
+                specTitle = resolveSpecTitle(spec, titlesByEntryId),
                 gen = checkNotNull(generatorsByCollection[spec.collectionId]),
                 memberships = membershipsByCollection[spec.collectionId].orEmpty(),
                 rawEntries = rawEntries,
@@ -569,9 +586,10 @@ private fun buildCollectionGeneratorStates(
 @Suppress("LongParameterList")
 private fun buildSingleGeneratorState(
     spec: CollectionSpecEntity,
+    specTitle: String,
     gen: CollectionGeneratorEntity,
     memberships: List<CollectionEntryEntity>,
-    rawEntries: Map<String, CatalogEntryEntity>,
+    rawEntries: Map<String, EntryEntity>,
     domainEntries: Map<String, CatalogEntryItem>,
     consumedIds: Set<String>,
     abandonedIds: Set<String>,
@@ -593,6 +611,7 @@ private fun buildSingleGeneratorState(
         if (activeDomain != null && activeRaw != null) {
             toCollectionDrawSnapshot(
                 spec = spec,
+                specTitle = specTitle,
                 entry = activeDomain,
                 raw = activeRaw,
                 drawNumber = (completedCount + 1).coerceAtLeast(1),
@@ -605,7 +624,7 @@ private fun buildSingleGeneratorState(
     return CollectionGeneratorState(
         collectionId = spec.collectionId,
         collectionSlug = spec.slug ?: spec.collectionId,
-        collectionTitle = spec.title,
+        collectionTitle = specTitle,
         enabled = enabled,
         currentDraw = snapshot,
         consumedCount = consumedCount,
@@ -617,8 +636,9 @@ private fun buildSingleGeneratorState(
 @Suppress("LongParameterList")
 internal fun toCollectionDrawSnapshot(
     spec: CollectionSpecEntity,
+    specTitle: String,
     entry: CatalogEntryItem,
-    raw: CatalogEntryEntity,
+    raw: EntryEntity,
     drawNumber: Int,
     totalCount: Int,
     remainingCount: Int,
@@ -629,7 +649,7 @@ internal fun toCollectionDrawSnapshot(
     return CollectionDrawSnapshot(
         collectionId = spec.collectionId,
         collectionSlug = spec.slug ?: spec.collectionId,
-        collectionTitle = spec.title,
+        collectionTitle = specTitle,
         entryId = entry.id,
         kind = entry.kind,
         title = entry.title,
@@ -686,7 +706,7 @@ internal fun extractMetadataGenres(metadataJson: String): List<String> {
 }
 
 internal fun toDomainCatalogEntry(
-    raw: CatalogEntryEntity,
+    raw: EntryEntity,
     identifiers: List<EntryIdentifierDto>,
 ): CatalogEntryItem =
     CatalogEntryItem(

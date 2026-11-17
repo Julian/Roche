@@ -313,7 +313,51 @@ data class CollectionRankMeta(
 )
 
 @Serializable
-data class PeerCatalogEntryPayload(
+data class SyncEntryContentDto(
+    @SerialName("content_type") val contentType: String = "article",
+    @SerialName("content_html") val contentHtml: String? = null,
+    @SerialName("audio_url") val audioUrl: String? = null,
+    val duration: Long? = null,
+)
+
+@Serializable
+data class SyncEntryStateDto(
+    @SerialName("inbox_state") val inboxState: String = "none",
+    @SerialName("read_at") val readAt: String? = null,
+    val progress: Double = 0.0,
+    @SerialName("interaction_updated_at") val interactionUpdatedAt: String? = null,
+    val hlc: String = "",
+)
+
+@Serializable
+data class SyncCollectionSpecDto(
+    val slug: String? = null,
+    val mode: String = "manual",
+    val role: String = "list",
+    @SerialName("rule_json") val ruleJson: String? = null,
+    @SerialName("show_in_lists") val showInLists: Boolean = false,
+    val color: String? = null,
+)
+
+@Serializable
+@Suppress("LongParameterList")
+data class SyncFeedSourceDto(
+    @SerialName("feed_url") val feedUrl: String,
+    @SerialName("source_type") val sourceType: String = "rss",
+    @SerialName("feed_title") val feedTitle: String? = null,
+    val language: String? = null,
+    @SerialName("poll_interval") val pollInterval: Int = 30,
+    @SerialName("is_active") val isActive: Boolean = true,
+    @SerialName("last_polled_at") val lastPolledAt: String? = null,
+    @SerialName("last_polled_by") val lastPolledBy: String? = null,
+    @SerialName("last_error") val lastError: String? = null,
+    @SerialName("last_error_by") val lastErrorBy: String? = null,
+    val hlc: String = "",
+)
+
+@Serializable
+@Suppress("LongParameterList")
+data class SyncEntryRecordDto(
     val id: String = "",
     val kind: String,
     val title: String,
@@ -328,55 +372,49 @@ data class PeerCatalogEntryPayload(
     @SerialName("merged_into_id") val mergedIntoId: String? = null,
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
+    val hlc: String = "",
+    val content: SyncEntryContentDto? = null,
+    val state: SyncEntryStateDto? = null,
+    @SerialName("collection_spec") val collectionSpec: SyncCollectionSpecDto? = null,
+    @SerialName("feed_source") val feedSource: SyncFeedSourceDto? = null,
 )
 
 @Serializable
-data class PeerCollectionSpecPayload(
-    @SerialName("collection_id") val collectionId: String = "",
-    val title: String,
-    val summary: String? = null,
-    val slug: String? = null,
-    val mode: String = "manual",
-    val role: String = "list",
-    @SerialName("rule_json") val ruleJson: String? = null,
-    @SerialName("show_in_lists") val showInLists: Boolean = false,
-    val color: String? = null,
-    @SerialName("created_at") val createdAt: String? = null,
-    @SerialName("updated_at") val updatedAt: String? = null,
-)
-
-@Serializable
-data class PeerCollectionEntryPayload(
+data class SyncCollectionEntryDto(
     @SerialName("collection_id") val collectionId: String,
     @SerialName("entry_id") val entryId: String,
     val position: Double? = null,
     @SerialName("added_at") val addedAt: String,
+    val hlc: String = "",
 )
 
 @Serializable
-data class PeerCollectionGeneratorPayload(
+data class SyncCollectionGeneratorDto(
     @SerialName("collection_id") val collectionId: String,
     val enabled: Boolean,
     @SerialName("current_entry_id") val currentEntryId: String? = null,
     @SerialName("drawn_at") val drawnAt: String? = null,
     @SerialName("updated_at") val updatedAt: String,
+    val hlc: String = "",
 )
 
 @Serializable
-data class PeerConsumptionLogPayload(
+data class SyncConsumptionLogDto(
     val id: String = "",
     @SerialName("entry_id") val entryId: String,
     val ts: String,
     val status: String,
     val notes: String? = null,
     @SerialName("created_at") val createdAt: String? = null,
+    val hlc: String = "",
 )
 
 @Serializable
-data class PeerComparisonPayload(
+data class SyncComparisonDto(
     val id: String = "",
     val ts: String,
     @SerialName("scope_collection_id") val scopeCollectionId: String? = null,
     val ordering: List<List<String>>,
     @SerialName("created_at") val createdAt: String? = null,
+    val hlc: String = "",
 )

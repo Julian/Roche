@@ -1,7 +1,8 @@
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
 import com.grayvines.roche.data.remote.RocheApiClient
@@ -53,7 +54,7 @@ internal class OfflineCacheManager(
         runSuspendCatching {
             val detail = apiClient.fetchItemDetail(serverUrl, token, itemId)
             val latest = dao.getItemById(itemId) ?: return
-            dao.upsertItem(mergeHydratedItemDetail(latest, detail))
+            dao.upsertItem(mergeHydratedItemDetail(latest, detail), markDirty = false)
         }
     }
 
@@ -159,7 +160,7 @@ internal class OfflineCacheManager(
         token: String,
         itemId: String,
         attemptToken: Long,
-    ): ItemEntity? = runSuspendCatching {
+    ): InboxItemRow? = runSuspendCatching {
         if (!isCacheAttemptActive(itemId, attemptToken)) return null
         val detail = apiClient.fetchItemDetail(serverUrl, token, itemId)
         if (!isCacheAttemptActive(itemId, attemptToken)) return null
@@ -170,16 +171,21 @@ internal class OfflineCacheManager(
     private suspend fun applyHydratedDetail(
         itemId: String,
         detail: RemoteItemDto,
-    ): ItemEntity? {
+    ): InboxItemRow? {
         val current = dao.getItemById(itemId) ?: return null
         val hydrated = mergeHydratedItemDetail(current, detail)
-        dao.upsertItem(hydrated)
-        val removedTags =
-            parseTagCsv(dao.getPendingMutation(itemId)?.removedTagsCsv.orEmpty()).toSet()
+        dao.upsertItem(hydrated, markDirty = false)
+        val tombstones =
+            dao.getAllTombstones()
+                .filter { it.entityType.equals(COLLECTION_ENTRY_ENTITY, ignoreCase = true) }
+                .mapTo(HashSet()) { it.naturalKey }
         val allowedTags =
-            detail.tagNames.filter { rawTag -> normalizeTagName(rawTag) !in removedTags }
+            detail.tagNames.filter { rawTag ->
+                val tagId = deterministicTagId(normalizeTagName(rawTag))
+                collectionEntryNaturalKey(tagId, itemId) !in tombstones
+            }
         if (allowedTags.isNotEmpty()) {
-            attachTagsLocally(dao = dao, itemId = itemId, tagNames = allowedTags)
+            attachTagsLocally(dao = dao, itemId = itemId, tagNames = allowedTags, markDirty = false)
         }
         return hydrated
     }
@@ -312,14 +318,14 @@ internal class OfflineCacheManager(
     }
 }
 
-internal fun resolveOfflineAudioUrl(hydrated: ItemEntity?, latest: ItemEntity): String? =
+internal fun resolveOfflineAudioUrl(hydrated: InboxItemRow?, latest: InboxItemRow): String? =
     (hydrated?.audioUrl ?: latest.audioUrl)?.trim()?.takeIf { it.isNotBlank() }
         ?: latest.url.takeIf {
             latest.contentType.equals(CONTENT_TYPE_AUDIO, ignoreCase = true) ||
                 latest.contentType.equals("podcast", ignoreCase = true)
         }
 
-internal fun collectExternalImageUrls(hydrated: ItemEntity?, latest: ItemEntity): List<String> {
+internal fun collectExternalImageUrls(hydrated: InboxItemRow?, latest: InboxItemRow): List<String> {
     val htmlContent = hydrated?.contentHtml ?: latest.contentHtml
     val itemUrl = (hydrated?.url ?: latest.url).takeIf { it.isNotBlank() }
     val thumbUrl =
@@ -389,7 +395,7 @@ internal suspend fun copyCachedThumbnailBestEffort(
     }
 }
 
-internal fun mergeHydratedItemDetail(local: ItemEntity, detail: RemoteItemDto): ItemEntity =
+internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow =
     mergeRemoteItemIntoLocal(
         local = local,
         remote = detail,

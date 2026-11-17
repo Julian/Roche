@@ -5,13 +5,15 @@ package com.grayvines.roche.data
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.upsertFeed
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
-import com.grayvines.roche.data.remote.RemoteFeedDto
-import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.buildPeerSyncRequestPayload
 import com.grayvines.roche.data.remote.parsePeerSyncResponseJson
@@ -129,11 +131,12 @@ class RocheCatalogAndSyncTest {
                         RocheDatabase.MIGRATION_6_7,
                         RocheDatabase.MIGRATION_7_8,
                         RocheDatabase.MIGRATION_8_9,
+                        RocheDatabase.MIGRATION_9_10,
                     )
                     .build()
             try {
                 assertEquals(1, migratedDb.dao().getAllFeeds().size)
-                assertEquals(0, migratedDb.dao().getAllCatalogEntries().size)
+                assertEquals(0, migratedDb.dao().getAllItems().size)
             } finally {
                 migratedDb.close()
             }
@@ -234,21 +237,21 @@ class RocheCatalogAndSyncTest {
             val dao = database.dao()
             dao.upsertFeeds(
                 listOf(
-                    FeedEntity(
+                    FeedRow(
                         id = "feed-pod",
                         title = "Systems Radio",
                         url = "https://example.com/podcast.xml",
                         siteUrl = "https://example.com",
                         feedType = "podcast",
                     ),
-                    FeedEntity(
+                    FeedRow(
                         id = "feed-blog",
                         title = "Compiler Notes",
                         url = "https://example.com/blog.xml",
                         siteUrl = "https://example.com/blog",
                         feedType = "rss",
                     ),
-                    FeedEntity(
+                    FeedRow(
                         id = "feed-yt",
                         title = "Graphics Lab",
                         url = "https://www.youtube.com/feeds/videos.xml?channel_id=UC123",
@@ -259,7 +262,7 @@ class RocheCatalogAndSyncTest {
             )
             dao.upsertItems(
                 listOf(
-                    ItemEntity(
+                    InboxItemRow(
                         id = "ep-1",
                         feedId = "feed-pod",
                         feedTitle = "Systems Radio",
@@ -280,7 +283,7 @@ class RocheCatalogAndSyncTest {
                         isCachedOffline = false,
                         audioUrl = "https://example.com/ep42.mp3",
                     ),
-                    ItemEntity(
+                    InboxItemRow(
                         id = "art-read",
                         feedId = "feed-blog",
                         feedTitle = "Compiler Notes",
@@ -300,7 +303,7 @@ class RocheCatalogAndSyncTest {
                         duration = null,
                         isCachedOffline = false,
                     ),
-                    ItemEntity(
+                    InboxItemRow(
                         id = "art-skimmed",
                         feedId = "feed-blog",
                         feedTitle = "Compiler Notes",
@@ -320,7 +323,7 @@ class RocheCatalogAndSyncTest {
                         duration = null,
                         isCachedOffline = false,
                     ),
-                    ItemEntity(
+                    InboxItemRow(
                         id = "art-bulk",
                         feedId = "feed-blog",
                         feedTitle = "Compiler Notes",
@@ -340,7 +343,7 @@ class RocheCatalogAndSyncTest {
                         duration = null,
                         isCachedOffline = false,
                     ),
-                    ItemEntity(
+                    InboxItemRow(
                         id = "vid-1",
                         feedId = "feed-yt",
                         feedTitle = "Graphics Lab",
@@ -437,7 +440,12 @@ class RocheCatalogAndSyncTest {
             val built =
                 buildTrackedPeerSyncRequest(
                     dao = dao,
-                    config = PeerSyncRequestConfig(peerId = "peer-android", deviceName = "Pixel"),
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "peer-android",
+                            deviceName = "Pixel",
+                            sinceSeq = 0L,
+                        ),
                 )
             val wireJson = buildPeerSyncRequestPayload(built.request)
             assertTrue(wireJson.contains("Sci-Fi Essentials"))
@@ -452,66 +460,81 @@ class RocheCatalogAndSyncTest {
                     .build()
             try {
                 val peerCatalog = CatalogStore(peerDb.dao())
+                val serverHlc = "001780000001000-0000-server-1"
                 val simulatedServerResponse =
                     PeerSyncResponseDto(
                         serverPeerId = "server-1",
+                        syncSeq = 1L,
+                        serverHlc = serverHlc,
                         syncTimestamp = "2026-06-01T12:00:00Z",
                         activePeers = emptyList(),
-                        feeds =
-                            listOf(
-                                RemoteFeedDto(
-                                    id = "remote-feed-1",
-                                    title = "Server Essayists",
-                                    url = "https://essays.example.com/rss",
-                                    siteUrl = "https://essays.example.com",
-                                    feedType = "rss",
-                                    unreadCount = 0,
-                                )
-                            ),
-                        items =
-                            listOf(
-                                RemoteItemDto(
-                                    id = "remote-art-1",
-                                    feedId = "remote-feed-1",
-                                    feedTitle = "Server Essayists",
-                                    title = "Finished On Web Client",
-                                    url = "https://essays.example.com/1",
-                                    author = "Montaigne",
-                                    summary = null,
-                                    contentText = "Essay",
-                                    contentHtml = "<p>Essay</p>",
-                                    contentType = "article",
-                                    status = "archived",
-                                    isFavorite = false,
-                                    publishedAt = "2026-06-01T10:00:00Z",
-                                    createdAt = "2026-06-01T10:00:00Z",
-                                    readProgress = 1.0,
-                                    thumbnailMediaId = null,
-                                    duration = null,
-                                )
-                            ),
-                        tags = emptyList(),
-                        tombstones = emptyList(),
-                        collections = built.request.collections,
-                        catalogEntries = built.request.catalogEntries,
-                        collectionEntries = built.request.collectionEntries,
+                        entries =
+                            built.request.entries +
+                                listOf(
+                                    SyncEntryRecordDto(
+                                        id = "remote-feed-1",
+                                        kind = "feed",
+                                        title = "Server Essayists",
+                                        url = "https://essays.example.com",
+                                        hlc = serverHlc,
+                                        feedSource =
+                                            SyncFeedSourceDto(
+                                                feedUrl = "https://essays.example.com/rss",
+                                                sourceType = "rss",
+                                                feedTitle = "Server Essayists",
+                                                hlc = serverHlc,
+                                            ),
+                                    ),
+                                    SyncEntryRecordDto(
+                                        id = "remote-art-1",
+                                        kind = "article",
+                                        title = "Finished On Web Client",
+                                        creators = listOf("Montaigne"),
+                                        url = "https://essays.example.com/1",
+                                        publishedAt = "2026-06-01T10:00:00Z",
+                                        createdAt = "2026-06-01T10:00:00Z",
+                                        hlc = serverHlc,
+                                        content =
+                                            SyncEntryContentDto(
+                                                contentType = "article",
+                                                contentHtml = "<p>Essay</p>",
+                                            ),
+                                        state =
+                                            SyncEntryStateDto(
+                                                inboxState = "dismissed",
+                                                progress = 1.0,
+                                                hlc = serverHlc,
+                                            ),
+                                    ),
+                                ),
+                        collectionEntries =
+                            built.request.collectionEntries +
+                                SyncCollectionEntryDto(
+                                    collectionId = "remote-feed-1",
+                                    entryId = "remote-art-1",
+                                    addedAt = "2026-06-01T10:00:00Z",
+                                    hlc = serverHlc,
+                                ),
                         collectionGenerators = built.request.collectionGenerators,
                         consumptionLog =
                             built.request.consumptionLog +
-                                PeerConsumptionLogPayload(
+                                SyncConsumptionLogDto(
                                     id = "remote-log-1",
                                     entryId = "remote-art-1",
                                     ts = "2026-06-01T11:30:00Z",
                                     status = "consumed",
+                                    hlc = serverHlc,
                                 ),
                         comparisons = built.request.comparisons,
+                        tombstones = emptyList(),
                     )
 
                 // Verify response JSON codec round-trips catalog fields too
                 val respRaw =
-                    """{"server_peer_id":"server-1","sync_timestamp":"2026-06-01T12:00:00Z",""" +
-                        """"active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[],""" +
-                        """"comparisons":[{"id":"c1","ts":"2026-06-01T11:00:00Z",""" +
+                    """{"server_peer_id":"server-1","sync_seq":1,"server_hlc":"$serverHlc",""" +
+                        """"sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[],""" +
+                        """"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"tombstones":[],""" +
+                        """"comparisons":[{"id":"c1","ts":"2026-06-01T11:00:00Z","hlc":"$serverHlc",""" +
                         """"ordering":[["$bookA"],["$bookB"]]}]}"""
                 val parsedResp = parsePeerSyncResponseJson(respRaw)
                 assertEquals(1, parsedResp.comparisons.size)
@@ -519,11 +542,8 @@ class RocheCatalogAndSyncTest {
                 reconcilePeerSyncResponse(
                     dao = peerDb.dao(),
                     response = simulatedServerResponse,
-                    input =
-                        PeerSyncReconcileInput(
-                            preloaded = PeerSyncPreloadedState(emptyList(), emptyList()),
-                            catalogStore = peerCatalog,
-                        ),
+                    localPeerId = "peer-2",
+                    catalogStore = peerCatalog,
                 )
 
                 val peerSnap = peerCatalog.snapshot.first()
@@ -641,15 +661,13 @@ class RocheCatalogAndSyncTest {
             val mergeResponse =
                 PeerSyncResponseDto(
                     serverPeerId = "server-1",
+                    syncSeq = 5L,
+                    serverHlc = "099999999999999-0000-server-1",
                     syncTimestamp = "2026-07-01T12:00:00Z",
                     activePeers = emptyList(),
-                    feeds = emptyList(),
-                    items = emptyList(),
-                    tags = emptyList(),
-                    tombstones = emptyList(),
-                    catalogEntries =
+                    entries =
                         listOf(
-                            PeerCatalogEntryPayload(
+                            SyncEntryRecordDto(
                                 id = dupId,
                                 kind = "movie",
                                 title = "Blade Runner (US Theatrical)",
@@ -657,17 +675,15 @@ class RocheCatalogAndSyncTest {
                                 releaseYear = 1982,
                                 mergedIntoId = canonId,
                                 updatedAt = "2026-07-01T12:00:00Z",
+                                hlc = "099999999999999-0000-server-1",
                             )
                         ),
                 )
             reconcilePeerSyncResponse(
                 dao = database.dao(),
                 response = mergeResponse,
-                input =
-                    PeerSyncReconcileInput(
-                        preloaded = PeerSyncPreloadedState(emptyList(), emptyList()),
-                        catalogStore = catalog,
-                    ),
+                localPeerId = "peer-1",
+                catalogStore = catalog,
             )
 
             val snap = catalog.snapshot.first()
@@ -770,6 +786,7 @@ class RocheCatalogAndSyncTest {
                     .addMigrations(
                         RocheDatabase.MIGRATION_7_8,
                         RocheDatabase.MIGRATION_8_9,
+                        RocheDatabase.MIGRATION_9_10,
                     )
                     .build()
             try {
@@ -780,14 +797,14 @@ class RocheCatalogAndSyncTest {
                 assertEquals("spotify:album:4sW8Eql2e2kdRP1A1R1C9t", idents["spotify"])
                 assertEquals("mixedcaseslug", idents["slug"])
                 assertEquals(
-                    "1",
+                    null,
                     dao.getLocalSyncFlag(
                         com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
                     ),
                 )
 
-                // First syncWithServer after v7->v8 upgrade omits updated_after once to backfill
-                // catalog, then clears flag
+                // First syncWithServer after upgrade converts legacy ISO cursor to since_seq=0
+                // and advances to monotonic sync_seq
                 settings.update {
                     it.copy(
                         serverUrl = "https://100.64.0.12:8080",
@@ -802,7 +819,7 @@ class RocheCatalogAndSyncTest {
                         HttpResponse(
                             statusCode = 200,
                             body =
-                                """{"server_peer_id":"server","sync_timestamp":"2026-06-02T00:00:00Z","active_peers":[],"feeds":[],"items":[],"tags":[],"tombstones":[]}""",
+                                """{"server_peer_id":"server","sync_seq":7,"server_hlc":"001780000001000-0000-server","sync_timestamp":"2026-06-02T00:00:00Z","active_peers":[],"entries":[],"collection_entries":[],"collection_generators":[],"consumption_log":[],"comparisons":[],"tombstones":[]}""",
                         )
                     } else {
                         HttpResponse(statusCode = 404, body = "{}")
@@ -815,13 +832,8 @@ class RocheCatalogAndSyncTest {
                         settings = settings,
                     )
                 upgradedRepo.syncWithServer().getOrThrow()
-                assertFalse(syncBodies.single().contains("updated_after"))
-                assertEquals(
-                    null,
-                    dao.getLocalSyncFlag(
-                        com.grayvines.roche.data.local.FLAG_CATALOG_BACKFILL_NEEDED
-                    ),
-                )
+                assertFalse(syncBodies.single().contains("since_seq"))
+                assertEquals("7", settings.settings.first().lastPeerSyncCursor)
             } finally {
                 migratedDb.close()
             }
@@ -853,43 +865,46 @@ class RocheCatalogAndSyncTest {
                     dao = dao,
                     config = PeerSyncRequestConfig(peerId = "peer-android", deviceName = "Pixel"),
                 )
-            // Simulate concurrent user edit while sync request is in flight (newer updatedAt)
-            dao.upsertCatalogEntry(
-                dao.getCatalogEntryById(entryId)!!.copy(
+            // Simulate concurrent user edit while sync request is in flight (newer HLC)
+            val newerHlc = nextLocalHlc(dao, "peer-android")
+            dao.upsertEntry(
+                dao.getEntryById(entryId)!!.copy(
                     title = "Concurrent Newer Title",
                     updatedAt = "2099-01-01T00:00:00Z",
+                    hlc = newerHlc,
                     isLocalDirty = true,
                 )
             )
 
-            // Server responds with stale updatedAt on entry AND a deterministic auto-completion log
+            // Server responds with stale HLC on entry AND a deterministic auto-completion log
             // for the same entry (which already has a manual consumed log!)
             val autoLogId = deterministicAutoLogId(entryId)
+            val staleHlc = "000000000001000-0000-server-1"
             val serverResp =
                 PeerSyncResponseDto(
                     serverPeerId = "server-1",
+                    syncSeq = 2L,
+                    serverHlc = "001780000001000-0000-server-1",
                     syncTimestamp = "2026-08-01T00:00:00Z",
                     activePeers = emptyList(),
-                    feeds = emptyList(),
-                    items = emptyList(),
-                    tags = emptyList(),
-                    tombstones = emptyList(),
-                    catalogEntries =
+                    entries =
                         listOf(
-                            PeerCatalogEntryPayload(
+                            SyncEntryRecordDto(
                                 id = entryId,
                                 kind = "article",
                                 title = "Stale Server Title",
                                 updatedAt = "2020-01-01T00:00:00Z",
+                                hlc = staleHlc,
                             )
                         ),
                     consumptionLog =
                         listOf(
-                            PeerConsumptionLogPayload(
+                            SyncConsumptionLogDto(
                                 id = autoLogId,
                                 entryId = entryId,
                                 ts = "2026-08-01T00:00:00Z",
                                 status = "consumed",
+                                hlc = "001780000001000-0000-server-1",
                             )
                         ),
                 )
@@ -897,15 +912,12 @@ class RocheCatalogAndSyncTest {
             reconcilePeerSyncResponse(
                 dao = dao,
                 response = serverResp,
-                input =
-                    PeerSyncReconcileInput(
-                        preloaded = PeerSyncPreloadedState(emptyList(), emptyList()),
-                        sentCatalogBatch = built.sentCatalogBatch,
-                        catalogStore = repository.catalog,
-                    ),
+                localPeerId = "peer-android",
+                sentBatch = built,
+                catalogStore = repository.catalog,
             )
 
-            val afterEntry = dao.getCatalogEntryById(entryId)!!
+            val afterEntry = dao.getEntryById(entryId)!!
             assertEquals("Concurrent Newer Title", afterEntry.title)
             assertTrue(afterEntry.isLocalDirty)
             val logs = dao.getConsumptionLogsForEntry(entryId)
@@ -935,49 +947,56 @@ class RocheCatalogAndSyncTest {
                 )
             val remoteCollidingId = "remote-parent-list-uuid"
             val tsIso = "2026-08-05T10:00:00Z"
+            val remoteHlc = "001785924000000-0001-server-1"
             val resp =
                 PeerSyncResponseDto(
                     serverPeerId = "server-1",
+                    syncSeq = 3L,
+                    serverHlc = remoteHlc,
                     syncTimestamp = tsIso,
                     activePeers = emptyList(),
-                    feeds = emptyList(),
-                    items = emptyList(),
-                    tags = emptyList(),
-                    tombstones = emptyList(),
-                    collections =
+                    entries =
                         listOf(
-                            PeerCollectionSpecPayload(
-                                collectionId = remoteCollidingId,
+                            SyncEntryRecordDto(
+                                id = remoteCollidingId,
+                                kind = "collection",
                                 title = "Parent List",
-                                slug = "parent_list",
-                                mode = "manual",
-                                role = "list",
                                 updatedAt = tsIso,
+                                hlc = remoteHlc,
+                                collectionSpec =
+                                    SyncCollectionSpecDto(
+                                        slug = "parent_list",
+                                        mode = "manual",
+                                        role = "list",
+                                        showInLists = true,
+                                    ),
                             )
                         ),
                     collectionEntries =
                         listOf(
-                            PeerCollectionEntryPayload(
+                            SyncCollectionEntryDto(
                                 collectionId = remoteCollidingId,
                                 entryId = itemId,
                                 addedAt = tsIso,
+                                hlc = remoteHlc,
                             )
                         ),
                     comparisons =
                         listOf(
-                            PeerComparisonPayload(
+                            SyncComparisonDto(
                                 id = "stale-comp-id",
                                 ts = tsIso,
                                 scopeCollectionId = remoteCollidingId,
                                 ordering = listOf(listOf(itemId), listOf(item2Id)),
+                                hlc = remoteHlc,
                             )
                         ),
                 )
-            reconcileIncomingCatalogSync(
+            reconcilePeerSyncResponse(
                 dao = dao,
-                catalogStore = repository.catalog,
                 response = resp,
-                sentBatch = OutgoingCatalogSyncBatch(),
+                localPeerId = "peer-1",
+                catalogStore = repository.catalog,
             )
             assertTrue(dao.getCollectionMemberships(colA).any { it.entryId == itemId })
             val savedComp = dao.getAllComparisons().single()
@@ -994,7 +1013,7 @@ class RocheCatalogAndSyncTest {
             // LocalFeedPoller sanitizes upstream HTTP error detail and drops non-HTTP enclosure
             // URLs
             val errFeed =
-                FeedEntity(
+                FeedRow(
                     id = "f-err",
                     title = "Err Feed",
                     url = "https://feeds.example.com/rss.xml",
@@ -1067,7 +1086,10 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(RocheDatabase.MIGRATION_8_9)
+                    .addMigrations(
+                        RocheDatabase.MIGRATION_8_9,
+                        RocheDatabase.MIGRATION_9_10,
+                    )
                     .build()
             try {
                 val upgradedRepo =
@@ -1085,8 +1107,8 @@ class RocheCatalogAndSyncTest {
                 val syntaxEscapedHits =
                     upgradedRepo.searchDeepEntries("\"Intro: (DeepBackfilled)* -tail")
                 assertEquals(listOf("v8-deep"), syntaxEscapedHits.map { it.id })
-                // Cross-table multi-token search: "Extended" is in items.title,
-                // "DeepBackfilledToken77" is beyond inline preview in item_contents.contentText
+                // Cross-table multi-token search: "Extended" is in entries.title,
+                // "DeepBackfilledToken77" is beyond inline preview in entry_content.contentText
                 val crossTableHits =
                     upgradedRepo.searchDeepEntries("Extended DeepBackfilledToken77")
                 assertEquals(listOf("v8-deep"), crossTableHits.map { it.id })
@@ -1104,9 +1126,9 @@ class RocheCatalogAndSyncTest {
 
             // Verify external-content FTS5 schema, triggers, and SQLite FTS5 integrity-check
             driver.open(dbFile.absolutePath).use { conn ->
-                conn.execSQL("INSERT INTO `items_fts`(`items_fts`) VALUES('integrity-check')")
+                conn.execSQL("INSERT INTO `entries_fts`(`entries_fts`) VALUES('integrity-check')")
                 conn.execSQL(
-                    "INSERT INTO `item_contents_fts`(`item_contents_fts`) VALUES('integrity-check')"
+                    "INSERT INTO `entry_content_fts`(`entry_content_fts`) VALUES('integrity-check')"
                 )
                 conn
                     .prepare(
@@ -1116,6 +1138,115 @@ class RocheCatalogAndSyncTest {
                     .use { stmt ->
                         assertTrue(stmt.step())
                         assertEquals(8L, stmt.getLong(0))
+                    }
+            }
+        }
+
+    @Test
+    fun `Room MIGRATION_9_10 losslessly unifies v9 catalog_entries feeds items tags and pending_mutations`() =
+        runTest {
+            val dbFile = File(tempDir, "roche_v9_to_v10_lossless.db")
+            val driver = BundledSQLiteDriver()
+            val longBody = "Lead paragraph. " + "z".repeat(4_200) + " UnifiedV10Token42."
+            driver.open(dbFile.absolutePath).use { conn ->
+                createBaseV6TablesForMigrationTest(conn)
+                com.grayvines.roche.data.local.migrateCatalogSchemaV7(conn)
+                com.grayvines.roche.data.local.migrateCatalogAndSyncSchemaV8(conn)
+                RocheDatabase.MIGRATION_8_9.migrate(conn)
+                conn.execSQL(
+                    "INSERT INTO `feeds` (`id`, `title`, `url`, `siteUrl`, `feedType`, " +
+                        "`pollInterval`, `isActive`, `autoDownloadEpisodes`, `customPlaybackSpeed`) VALUES " +
+                        "('f-pod-v9', 'Old Pod Title', 'https://pod.example.com/rss.xml', " +
+                        "'https://pod.example.com', 'podcast', 45, 1, 1, 1.75)"
+                )
+                conn.execSQL(
+                    "INSERT INTO `tags` (`id`, `name`, `color`) VALUES " +
+                        "('t-sys', 'systems', '#ff6600')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `items` (`id`, `feedId`, `feedTitle`, `title`, `url`, `author`, " +
+                        "`summary`, `contentText`, `contentHtml`, `contentType`, `status`, " +
+                        "`isFavorite`, `isCachedOffline`, `publishedAt`, `createdAt`, `readProgress`, " +
+                        "`thumbnailMediaId`, `duration`, `audioUrl`) VALUES " +
+                        "('ep-v9', 'f-pod-v9', 'Old Pod Title', 'Episode 9', " +
+                        "'https://pod.example.com/ep9', 'Ada', 'Short summary', " +
+                        "'${longBody.take(2_048)}', '<p>Preview</p>', 'audio', 'unread', " +
+                        "0, 1, '2026-06-01T10:00:00Z', '2026-06-01T10:00:00Z', 0.2, " +
+                        "'thumb-9', '12:30', 'https://pod.example.com/ep9.mp3')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `item_contents` (`itemId`, `summary`, `contentText`, `contentHtml`) " +
+                        "VALUES ('ep-v9', 'Full summary', '$longBody', '<p>$longBody</p>')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `item_tags` (`itemId`, `tagId`) VALUES ('ep-v9', 't-sys')"
+                )
+                conn.execSQL(
+                    "INSERT INTO `catalog_entries` (`id`, `kind`, `title`, `creatorsJson`, " +
+                        "`releaseYear`, `metadataJson`, `createdAt`, `updatedAt`, `isLocalDirty`) VALUES " +
+                        "('mov-v9', 'movie', 'Stalker', '[\"Andrei Tarkovsky\"]', 1979, " +
+                        "'{}', '2026-05-01T00:00:00Z', '2026-05-02T00:00:00Z', 0)"
+                )
+                conn.execSQL(
+                    "INSERT INTO `pending_mutations` (`entityId`, `isLocalFeed`, `isLocalItem`, " +
+                        "`titleOverride`, `dirtyStatus`, `dirtyFavorite`, `dirtyReadProgress`, " +
+                        "`dirtyReadAt`, `addedTagsCsv`, `removedTagsCsv`) VALUES " +
+                        "('f-pod-v9', 0, 0, 'Renamed Pod V9', '__feed_archived__', NULL, NULL, NULL, '', ''), " +
+                        "('ep-v9', 0, 0, NULL, 'archived', 1, 0.85, '2026-06-02T12:00:00Z', 'rust', 'systems')"
+                )
+                conn.execSQL("PRAGMA user_version = 9")
+            }
+
+            val migratedDb =
+                Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
+                    .setDriver(BundledSQLiteDriver())
+                    .addMigrations(RocheDatabase.MIGRATION_9_10)
+                    .build()
+            try {
+                val dao = migratedDb.dao()
+                val feed = dao.getFeedById("f-pod-v9")!!
+                assertEquals("Renamed Pod V9", feed.title)
+                assertEquals("https://pod.example.com", feed.siteUrl)
+                assertFalse(feed.isActive)
+                assertTrue(feed.autoDownloadEpisodes)
+                assertEquals(1.75f, feed.customPlaybackSpeed)
+
+                val item = dao.getItemById("ep-v9")!!
+                assertEquals("archived", item.status)
+                assertTrue(item.isFavorite)
+                assertTrue(item.isCachedOffline)
+                assertEquals(0.85, item.readProgress, 1e-6)
+                assertEquals("thumb-9", item.thumbnailMediaId)
+                assertEquals("12:30", item.duration)
+                assertEquals("https://pod.example.com/ep9.mp3", item.audioUrl)
+                assertTrue(item.contentText?.contains("UnifiedV10Token42") == true)
+                assertEquals(listOf("rust"), dao.getTagNamesForItem("ep-v9"))
+                assertEquals("Stalker", dao.getEntryById("mov-v9")?.title)
+
+                val upgradedRepo =
+                    RocheRepository(
+                        database = migratedDb,
+                        apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                        settings = settings,
+                    )
+                assertEquals(
+                    listOf("ep-v9"),
+                    upgradedRepo.searchDeepEntries("UnifiedV10Token42").map { it.id },
+                )
+            } finally {
+                migratedDb.close()
+            }
+
+            driver.open(dbFile.absolutePath).use { conn ->
+                conn
+                    .prepare(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN " +
+                            "('feeds','items','item_contents','items_fts','item_contents_fts'," +
+                            "'tags','item_tags','pending_mutations','catalog_entries')"
+                    )
+                    .use { stmt ->
+                        assertTrue(stmt.step())
+                        assertEquals(0L, stmt.getLong(0))
                     }
             }
         }
@@ -1383,7 +1514,7 @@ class RocheCatalogAndSyncTest {
         runTest {
             val dao = database.dao()
             dao.upsertFeed(
-                FeedEntity(
+                FeedRow(
                     id = "feed-placeholder",
                     title = "blog.example.com",
                     url = "https://blog.example.com/rss.xml",
@@ -1392,7 +1523,7 @@ class RocheCatalogAndSyncTest {
                 )
             )
             dao.upsertItem(
-                ItemEntity(
+                InboxItemRow(
                     id = "older-item-1",
                     feedId = "feed-placeholder",
                     feedUrl = "https://blog.example.com/rss.xml",

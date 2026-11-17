@@ -9,9 +9,12 @@ import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.THUMBNAILS_SUBDIR
 import com.grayvines.roche.data.TestRocheEnv
 import com.grayvines.roche.data.collectInBackground
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
@@ -745,14 +748,14 @@ class RankBoardAndGate5UiLogicTest {
             .dao()
             .upsertFeeds(
                 listOf(
-                    FeedEntity(
+                    FeedRow(
                         id = "f-1",
                         title = "Systems Weekly",
                         url = "https://a.test/rss",
                         siteUrl = null,
                         feedType = "rss",
                     ),
-                    FeedEntity(
+                    FeedRow(
                         id = "f-2",
                         title = "Compiler Notes",
                         url = "https://b.test/rss",
@@ -801,7 +804,7 @@ class RankBoardAndGate5UiLogicTest {
         } as ImageBitmap
 
     private fun sampleItem(id: String, title: String, feedId: String = "f-1") =
-        ItemEntity(
+        InboxItemRow(
             id = id,
             feedId = feedId,
             feedTitle = "Feed",

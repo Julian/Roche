@@ -13,7 +13,6 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use fts::SearchTerm;
-pub(super) use mutations::set_favorite_membership_in_tx;
 
 use super::{ContentType, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
 

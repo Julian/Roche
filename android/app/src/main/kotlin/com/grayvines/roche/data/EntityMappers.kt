@@ -2,10 +2,13 @@
 
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
-import com.grayvines.roche.data.local.ItemTagEntity
-import com.grayvines.roche.data.local.TagEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
+import com.grayvines.roche.data.local.ItemTagRow
+import com.grayvines.roche.data.local.RocheDao
+import com.grayvines.roche.data.local.TagRow
+import com.grayvines.roche.data.local.insertItemTag
+import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.model.ContentType
@@ -18,7 +21,7 @@ import java.time.Instant
 
 internal class InboxEntryCache {
     private data class CachedEntry(
-        val entity: ItemEntity,
+        val entity: InboxItemRow,
         val tags: List<String>,
         val entry: InboxEntry,
     )
@@ -27,7 +30,7 @@ internal class InboxEntryCache {
 
     @Synchronized
     fun mapEntries(
-        items: List<ItemEntity>,
+        items: List<InboxItemRow>,
         tagNamesByItemId: Map<String, List<String>>,
     ): List<InboxEntry> {
         val previous = byId
@@ -52,10 +55,10 @@ internal class InboxEntryCache {
 
 @Suppress("LongMethod")
 internal fun buildSnapshot(
-    items: List<ItemEntity>,
-    feeds: List<FeedEntity>,
-    tags: List<TagEntity>,
-    itemTags: List<ItemTagEntity>,
+    items: List<InboxItemRow>,
+    feeds: List<FeedRow>,
+    tags: List<TagRow>,
+    itemTags: List<ItemTagRow>,
     activePeers: List<PeerNodeDto> = emptyList(),
     entryCache: InboxEntryCache? = null,
 ): RepositorySnapshot {
@@ -154,7 +157,7 @@ internal fun buildSnapshot(
     )
 }
 
-internal fun toInboxEntry(entity: ItemEntity, tags: List<String>): InboxEntry =
+internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry =
     InboxEntry(
         id = entity.id,
         feedId = entity.feedId,
@@ -183,8 +186,8 @@ internal fun toInboxEntry(entity: ItemEntity, tags: List<String>): InboxEntry =
 @Suppress("CyclomaticComplexMethod")
 internal fun toRemoteFeedEntity(
     remote: RemoteFeedDto,
-    existing: FeedEntity? = null,
-): FeedEntity {
+    existing: FeedRow? = null,
+): FeedRow {
     val useExistingPoll =
         existing != null &&
             existing.lastPolled != null &&
@@ -199,7 +202,7 @@ internal fun toRemoteFeedEntity(
         } else {
             remote.feedType
         }
-    return FeedEntity(
+    return FeedRow(
         id = remote.id,
         title = remote.title.ifBlank { existing?.title.orEmpty() },
         url = remote.url.ifBlank { existing?.url.orEmpty() },
@@ -215,67 +218,8 @@ internal fun toRemoteFeedEntity(
         isActive = remote.isActive,
         autoDownloadEpisodes = existing?.autoDownloadEpisodes ?: false,
         customPlaybackSpeed = existing?.customPlaybackSpeed,
-    )
-}
-
-internal fun toRemoteItemEntity(
-    remote: RemoteItemDto,
-    feedTitlesById: Map<String, String>,
-    isCachedOffline: Boolean,
-    existing: ItemEntity? = null,
-    feedUrlsById: Map<String, String> = emptyMap(),
-): ItemEntity {
-    val resolvedFeedId = remote.feedId ?: existing?.feedId
-    val resolvedFeedUrl =
-        remote.feedUrl ?: resolvedFeedId?.let { feedUrlsById[it] } ?: existing?.feedUrl
-    val richerSummary =
-        pickRicherString(existing?.summary, remote.summary)?.take(MAX_SQLITE_SUMMARY_CHARS)
-    val richerText =
-        remote.contentText?.takeIf { it.isNotBlank() }?.take(MAX_SQLITE_TEXT_CHARS)
-            ?: existing
-                ?.contentText
-                ?.takeIf { it.isNotBlank() && it != existing.summary }
-                ?.take(MAX_SQLITE_TEXT_CHARS)
-    val richerHtml =
-        pickRicherString(existing?.contentHtml, remote.contentHtml)?.take(MAX_SQLITE_HTML_CHARS)
-    val resolvedAudioUrl = remote.audioUrl.nonBlankOr(existing?.audioUrl)
-    val resolvedContentType =
-        if (!resolvedAudioUrl.isNullOrBlank()) {
-            ContentType.AUDIO.wireValue
-        } else {
-            remote.contentType.ifBlank { existing?.contentType ?: "article" }
-        }
-    return ItemEntity(
-        id = remote.id,
-        feedId = resolvedFeedId,
-        feedTitle = resolveRemoteFeedTitle(remote, feedTitlesById, existing, resolvedFeedId),
-        title = remote.title.ifBlank { existing?.title.orEmpty() },
-        url = remote.url.ifBlank { existing?.url.orEmpty() },
-        author = remote.author.nonBlankOr(existing?.author),
-        summary = richerSummary,
-        contentText = richerText,
-        contentHtml = richerHtml,
-        contentType = resolvedContentType,
-        status = remote.status,
-        isFavorite = remote.isFavorite,
-        isCachedOffline = isCachedOffline,
-        publishedAt = remote.publishedAt ?: existing?.publishedAt,
-        createdAt = remote.createdAt.ifBlank { existing?.createdAt.orEmpty() },
-        readProgress = remote.readProgress,
-        thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(existing?.thumbnailMediaId),
-        duration = remote.duration.nonBlankOr(existing?.duration),
-        readAt =
-            if (remote.status.equals("archived", ignoreCase = true)) {
-                remote.readAt.nonBlankOr(existing?.readAt)
-                    ?: remote.createdAt.ifBlank { Instant.now().toString() }
-            } else {
-                remote.readAt
-            },
-        thumbnailUrl = remote.thumbnailUrl.nonBlankOr(existing?.thumbnailUrl),
-        feedUrl = resolvedFeedUrl,
-        interactionUpdatedAt =
-            newerIsoTimestamp(remote.interactionUpdatedAt, existing?.interactionUpdatedAt),
-        audioUrl = resolvedAudioUrl,
+        hlc = existing?.hlc.orEmpty(),
+        isLocalDirty = false,
     )
 }
 
@@ -293,25 +237,14 @@ internal fun newerIsoTimestamp(first: String?, second: String?): String? {
     }
 }
 
-private fun resolveRemoteFeedTitle(
-    remote: RemoteItemDto,
-    feedTitlesById: Map<String, String>,
-    existing: ItemEntity?,
-    resolvedFeedId: String?,
-): String =
-    resolvedFeedId?.let { feedTitlesById[it] }?.takeIf { it.isNotBlank() }
-        ?: remote.feedTitle?.takeIf { it.isNotBlank() }
-        ?: existing?.feedTitle?.takeIf { it.isNotBlank() }
-        ?: DEFAULT_SAVED_HOST
-
 private fun String?.nonBlankOr(fallback: String?): String? =
     this?.takeIf { it.isNotBlank() } ?: fallback
 
 internal fun mergeRemoteItemIntoLocal(
-    local: ItemEntity,
+    local: InboxItemRow,
     remote: RemoteItemDto,
     adoptRemoteIdentity: Boolean,
-): ItemEntity =
+): InboxItemRow =
     local.copy(
         id = if (adoptRemoteIdentity) remote.id else local.id,
         title = remote.title.ifBlank { local.title },
@@ -352,9 +285,9 @@ internal fun mergeRemoteItemIntoLocal(
     )
 
 internal fun reconcileSavedItemEntity(
-    localEntity: ItemEntity,
+    localEntity: InboxItemRow,
     remoteSaved: RemoteItemDto,
-): ItemEntity =
+): InboxItemRow =
     mergeRemoteItemIntoLocal(
         local = localEntity,
         remote = remoteSaved,
@@ -366,9 +299,9 @@ internal fun createSavedItemEntity(
     title: String,
     hostTitle: String,
     type: ContentType,
-): ItemEntity {
+): InboxItemRow {
     val id = deterministicItemId(null, url)
-    return ItemEntity(
+    return InboxItemRow(
         id = id,
         feedId = null,
         feedTitle =
@@ -395,6 +328,28 @@ internal fun createSavedItemEntity(
         duration = null,
         audioUrl = if (type == ContentType.AUDIO) url else null,
     )
+}
+
+internal suspend fun attachTagsLocally(
+    dao: RocheDao,
+    itemId: String,
+    tagNames: List<String>,
+    markDirty: Boolean = false,
+) {
+    for (tagName in tagNames) {
+        val normalized = normalizeTagName(tagName)
+        if (normalized.isNotBlank()) {
+            val tag =
+                dao.getTagByName(normalized)
+                    ?: TagRow(id = deterministicTagId(normalized), name = normalized).also {
+                        dao.upsertTag(it, markDirty = markDirty)
+                    }
+            dao.insertItemTag(
+                ItemTagRow(itemId = itemId, tagId = tag.id),
+                markDirty = markDirty,
+            )
+        }
+    }
 }
 
 internal const val MAX_SQLITE_SUMMARY_CHARS = 16_384

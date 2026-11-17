@@ -57,13 +57,16 @@ pub(super) async fn maybe_auto_log_feed_completion_in_tx(
     }
 }
 
-pub async fn set_favorite_membership_in_tx(
+pub(super) async fn set_favorite_membership_in_tx(
     conn: &mut SqliteConnection,
     entry_id: &str,
     is_favorite: bool,
     now: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
+    let nat_key = crate::db::sync::collection_entry_natural_key(STARRED_COLLECTION_ID, entry_id);
     if is_favorite {
+        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::CollectionEntry, &nat_key)
+            .await?;
         sqlx::query!(
             "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
              VALUES (?, ?, ?)",
@@ -74,13 +77,22 @@ pub async fn set_favorite_membership_in_tx(
         .execute(&mut *conn)
         .await?;
     } else {
-        sqlx::query!(
+        let res = sqlx::query!(
             "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
             STARRED_COLLECTION_ID,
             entry_id,
         )
         .execute(&mut *conn)
         .await?;
+        if res.rows_affected() > 0 {
+            SyncRepo::record_tombstone(
+                &mut *conn,
+                ActivityEntityType::CollectionEntry,
+                &nat_key,
+                now,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -660,6 +672,21 @@ impl ItemRepo<'_> {
             sqlx::query!("DELETE FROM entry_content WHERE entry_id = ?", item_id)
                 .execute(&mut *conn)
                 .await?;
+            let detached_cols: Vec<String> = sqlx::query_scalar(
+                "SELECT collection_id FROM collection_entries
+                 WHERE entry_id = ?
+                   AND (
+                       collection_id IN (?, ?)
+                       OR collection_id IN (
+                           SELECT collection_id FROM collection_specs WHERE collection_role = 'tag'
+                       )
+                   )",
+            )
+            .bind(item_id)
+            .bind(STARRED_COLLECTION_ID)
+            .bind(UP_NEXT_COLLECTION_ID)
+            .fetch_all(&mut *conn)
+            .await?;
             sqlx::query!(
                 "DELETE FROM collection_entries
                  WHERE entry_id = ?
@@ -675,6 +702,16 @@ impl ItemRepo<'_> {
             )
             .execute(&mut *conn)
             .await?;
+            for col_id in detached_cols {
+                let nat_key = crate::db::sync::collection_entry_natural_key(&col_id, item_id);
+                SyncRepo::record_tombstone(
+                    &mut *conn,
+                    ActivityEntityType::CollectionEntry,
+                    &nat_key,
+                    now,
+                )
+                .await?;
+            }
             Ok(true)
         } else {
             let res = sqlx::query!("DELETE FROM entries WHERE id = ?", item_id)

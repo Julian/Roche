@@ -154,46 +154,6 @@ impl ItemRepo<'_> {
         Ok(ItemPage { items, page, per_page, has_more })
     }
 
-    /// Single keyset-paginated query for peer sync (both initial and delta sync), using
-    /// `idx_entries_updated_at_iso` without `OFFSET` scans.
-    /// Returns `(items, has_more, last_item_sqlite_iso_updated_at)`.
-    pub(crate) async fn list_for_peer_sync(
-        &self,
-        updated_after: Option<DateTime<Utc>>,
-        after_id: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<Item>, bool, Option<DateTime<Utc>>)> {
-        let cap = limit.max(1);
-        let fetch_limit = cap.saturating_add(1);
-        let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_LIST);
-        qb.push(" WHERE i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
-        Self::append_updated_after_where_clause(&mut qb, updated_after, after_id);
-        qb.push(" ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', i.updated_at) ASC, i.id ASC LIMIT ")
-            .push_bind(i64::try_from(fetch_limit).unwrap_or(i64::MAX));
-
-        let mut items = qb.build_query_as::<Item>().fetch_all(self.pool).await?;
-        let has_more = items.len() > cap;
-        items.truncate(cap);
-
-        let boundary_ts = if has_more && let Some(last_item) = items.last() {
-            let iso_str: Option<String> = sqlx::query_scalar!(
-                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) AS \"iso?: String\" FROM entries WHERE id = ?",
-                last_item.id,
-            )
-            .fetch_optional(self.pool)
-            .await?
-            .flatten();
-            iso_str
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-        } else {
-            None
-        };
-
-        Ok((items, has_more, boundary_ts))
-    }
-
     /// Appends a sargable `idx_entries_updated_at_iso` keyset predicate.
     fn append_updated_after_where_clause(
         qb: &mut QueryBuilder<Sqlite>,

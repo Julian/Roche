@@ -32,11 +32,15 @@ pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo, NewMediaSpec};
 pub use sync::{
-    ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier, PeerSyncRequest, PeerSyncResponse,
-    SERVER_PEER_ID, STARRED_COLLECTION_ID, SyncRepo, UP_NEXT_COLLECTION_ID,
+    ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, HlcClock, HlcTimestamp, NetworkTier,
+    PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID,
+    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
+    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
+    SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, UP_NEXT_COLLECTION_ID,
     canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
     compute_throughput_weight, deterministic_comparison_id, deterministic_consumption_log_id,
-    deterministic_system_collection_id, deterministic_title_entry_id, should_peer_poll_feed,
+    deterministic_feed_id, deterministic_system_collection_id, deterministic_title_entry_id,
+    should_peer_poll_feed,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
@@ -999,7 +1003,7 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(regular_tables.len(), 17, "Expected all 17 regular tables in schema");
+        assert_eq!(regular_tables.len(), 18, "Expected all 18 regular tables in schema");
         for tbl in &regular_tables {
             let trimmed_ddl = tbl.sql.trim().trim_end_matches(';').trim_end();
             assert!(

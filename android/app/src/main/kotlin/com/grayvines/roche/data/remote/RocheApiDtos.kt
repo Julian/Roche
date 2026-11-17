@@ -1,20 +1,18 @@
 package com.grayvines.roche.data.remote
 
 import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerCatalogEntryPayload
-import com.grayvines.roche.data.PeerCollectionEntryPayload
-import com.grayvines.roche.data.PeerCollectionGeneratorPayload
-import com.grayvines.roche.data.PeerCollectionSpecPayload
-import com.grayvines.roche.data.PeerComparisonPayload
-import com.grayvines.roche.data.PeerConsumptionLogPayload
 import com.grayvines.roche.data.PeerNodeDto
+import com.grayvines.roche.data.SyncCollectionEntryDto
+import com.grayvines.roche.data.SyncCollectionGeneratorDto
+import com.grayvines.roche.data.SyncComparisonDto
+import com.grayvines.roche.data.SyncConsumptionLogDto
+import com.grayvines.roche.data.SyncEntryRecordDto
 import com.grayvines.roche.data.SyncTombstoneDto
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.TagEntity
 
 class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
     Exception("$title ($statusCode): $detail")
 
+@Suppress("LongParameterList")
 data class RemoteFeedDto(
     val id: String,
     val title: String,
@@ -32,6 +30,7 @@ data class RemoteFeedDto(
     val isActive: Boolean = true,
 )
 
+@Suppress("LongParameterList")
 data class RemoteItemDto(
     val id: String,
     val feedId: String?,
@@ -65,64 +64,37 @@ data class RemoteTagDto(
     val color: String? = null,
 )
 
-data class PeerSyncItemPayload(
-    val id: String,
-    val feedId: String?,
-    val feedUrl: String?,
-    val title: String,
-    val url: String,
-    val author: String?,
-    val publishedAt: String?,
-    val createdAt: String?,
-    val summary: String?,
-    val contentHtml: String?,
-    val thumbnailUrl: String?,
-    val contentType: String,
-    val status: String,
-    val isFavorite: Boolean,
-    val readAt: String?,
-    val readProgress: Double,
-    val interactionUpdatedAt: String?,
-    val tagNames: List<String>,
-    val audioUrl: String? = null,
-    val duration: Long? = null,
-)
-
+@Suppress("LongParameterList")
 data class PeerSyncRequestDto(
     val peerId: String,
     val deviceName: String? = null,
     val networkTier: String = NetworkTier.WIFI.wireValue,
     val weight: Double? = null,
-    val updatedAfter: String? = null,
-    val afterItemId: String? = null,
-    val feeds: List<FeedEntity> = emptyList(),
-    val items: List<PeerSyncItemPayload> = emptyList(),
-    val tags: List<TagEntity> = emptyList(),
+    val sinceSeq: Long = 0L,
+    val clientHlc: String? = null,
+    val entries: List<SyncEntryRecordDto> = emptyList(),
+    val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
+    val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
+    val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    val comparisons: List<SyncComparisonDto> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
 )
 
+@Suppress("LongParameterList")
 data class PeerSyncResponseDto(
     val serverPeerId: String,
-    val syncTimestamp: String,
-    val activePeers: List<PeerNodeDto>,
-    val feeds: List<RemoteFeedDto>,
-    val items: List<RemoteItemDto>,
-    val tags: List<RemoteTagDto>,
-    val tombstones: List<SyncTombstoneDto>,
+    val syncSeq: Long = 0L,
+    val serverHlc: String = "",
+    val syncTimestamp: String = "",
     val hasMore: Boolean = false,
-    val nextAfterItemId: String? = null,
-    val collections: List<PeerCollectionSpecPayload> = emptyList(),
-    val catalogEntries: List<PeerCatalogEntryPayload> = emptyList(),
-    val collectionEntries: List<PeerCollectionEntryPayload> = emptyList(),
-    val collectionGenerators: List<PeerCollectionGeneratorPayload> = emptyList(),
-    val consumptionLog: List<PeerConsumptionLogPayload> = emptyList(),
-    val comparisons: List<PeerComparisonPayload> = emptyList(),
+    val resetRequired: Boolean = false,
+    val activePeers: List<PeerNodeDto> = emptyList(),
+    val entries: List<SyncEntryRecordDto> = emptyList(),
+    val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
+    val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
+    val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    val comparisons: List<SyncComparisonDto> = emptyList(),
+    val tombstones: List<SyncTombstoneDto> = emptyList(),
 )
 
 data class RemoteMediaDto(

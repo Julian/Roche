@@ -5,9 +5,8 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
+import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.ranking.EpRankingEngine
@@ -37,7 +36,7 @@ class CatalogStore(
     val snapshot: Flow<CatalogSnapshot> =
         combine(
                 combine(
-                    dao.observeCatalogEntries(),
+                    dao.observeEntries(),
                     dao.observeEntryIdentifiers(),
                     dao.observeCollectionSpecs(),
                     dao.observeCollectionEntries(),
@@ -83,6 +82,7 @@ class CatalogStore(
                         current?.drawnAt
                     }
                 drawnActiveId = activeId
+                val hlc = nextLocalHlc(dao)
                 dao.upsertCollectionGenerator(
                     CollectionGeneratorEntity(
                         collectionId = spec.collectionId,
@@ -90,6 +90,7 @@ class CatalogStore(
                         currentEntryId = activeId,
                         drawnAt = drawnAt,
                         updatedAt = nowIso,
+                        hlc = hlc,
                         isLocalDirty = true,
                     )
                 )
@@ -122,13 +123,14 @@ class CatalogStore(
             val spec =
                 resolveEligibleGeneratorSpec(collectionIdOrSlug)
                     ?: error("Collection '$collectionIdOrSlug' not found")
+            val specTitle = lookupSpecTitle(spec)
             val gen =
                 dao.getCollectionGenerator(spec.collectionId)
-                    ?: error("Generator not initialized for '${spec.title}'")
+                    ?: error("Generator not initialized for '$specTitle'")
             val verb = if (status == ConsumptionStatus.CONSUMED) "finish" else "abandon"
             val currentId =
                 gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
-                    ?: error("No active item to $verb in '${spec.title}'")
+                    ?: error("No active item to $verb in '$specTitle'")
             val nowIso = nowUtcIso()
             dao.executeInTransaction {
                 appendConsumptionInDao(
@@ -147,7 +149,7 @@ class CatalogStore(
             CollectionDrawStepResult(
                 entryId = currentId,
                 collectionId = spec.collectionId,
-                collectionTitle = spec.title,
+                collectionTitle = specTitle,
                 nextDraw = nextId?.let { resolveDrawSnapshot(spec.collectionId, it) },
             )
         }
@@ -288,9 +290,7 @@ class CatalogStore(
             val slug = if (role == CollectionRole.WANT) "want:$rawSlug" else rawSlug
             val existing = dao.getCollectionSpecBySlug(slug)
             if (existing != null) {
-                if (dao.getCatalogEntryById(existing.collectionId) == null) {
-                    dao.upsertCatalogEntry(buildCollectionCatalogEntry(existing))
-                }
+                ensureCollectionEntryRow(existing.collectionId, cleanTitle)
                 existing.collectionId
             } else {
                 val newId =
@@ -299,24 +299,7 @@ class CatalogStore(
                     } else {
                         systemCollectionUuid("custom:$slug")
                     }
-                val nowIso = nowUtcIso()
-                val newSpec =
-                    CollectionSpecEntity(
-                        collectionId = newId,
-                        title = cleanTitle,
-                        slug = slug,
-                        mode = CollectionMode.MANUAL.wireValue,
-                        role = role.wireValue,
-                        showInLists = role == CollectionRole.LIST,
-                        createdAt = nowIso,
-                        updatedAt = nowIso,
-                        isLocalDirty = true,
-                    )
-                dao.executeInTransaction {
-                    dao.upsertCollectionSpec(newSpec)
-                    dao.upsertCatalogEntry(buildCollectionCatalogEntry(newSpec))
-                    dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", slug, newId))
-                }
+                insertNewCustomCollectionInTx(newId, cleanTitle, slug, role)
                 created = true
                 newId
             }
@@ -325,6 +308,56 @@ class CatalogStore(
             onLocalMutation()
         }
         return id
+    }
+
+    private suspend fun ensureCollectionEntryRow(collectionId: String, cleanTitle: String) {
+        if (dao.getEntryById(collectionId) != null) return
+        val nowIso = nowUtcIso()
+        val hlc = nextLocalHlc(dao)
+        dao.upsertEntry(
+            EntryEntity(
+                id = collectionId,
+                kind = EntryKind.COLLECTION.wireValue,
+                title = cleanTitle,
+                createdAt = nowIso,
+                updatedAt = nowIso,
+                hlc = hlc,
+                isLocalDirty = true,
+            )
+        )
+    }
+
+    private suspend fun insertNewCustomCollectionInTx(
+        newId: String,
+        cleanTitle: String,
+        slug: String,
+        role: CollectionRole,
+    ) {
+        val nowIso = nowUtcIso()
+        val newSpec =
+            CollectionSpecEntity(
+                collectionId = newId,
+                slug = slug,
+                mode = CollectionMode.MANUAL.wireValue,
+                role = role.wireValue,
+                showInLists = role == CollectionRole.LIST,
+            )
+        dao.executeInTransaction {
+            val hlc = nextLocalHlc(dao)
+            dao.upsertEntry(
+                EntryEntity(
+                    id = newId,
+                    kind = EntryKind.COLLECTION.wireValue,
+                    title = cleanTitle,
+                    createdAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = true,
+                )
+            )
+            dao.upsertCollectionSpec(newSpec)
+            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", slug, newId))
+        }
     }
 
     suspend fun addCollectionEntry(
@@ -362,9 +395,10 @@ class CatalogStore(
             val spec =
                 resolveCollectionSpec(collectionIdOrSlug)
                     ?: error("Collection not found: $collectionIdOrSlug")
+            val specTitle = lookupSpecTitle(spec)
             val mode = CollectionMode.fromWireValue(spec.mode)
             require(mode == CollectionMode.MANUAL) {
-                "Cannot manually modify entries of ${mode.wireValue} collection '${spec.title}'"
+                "Cannot manually modify entries of ${mode.wireValue} collection '$specTitle'"
             }
             val resolvedEntry = followMergedId(entryId) ?: entryId.trim()
             val existing =
@@ -374,6 +408,7 @@ class CatalogStore(
             if (existing) {
                 val nowIso = nowUtcIso()
                 dao.executeInTransaction {
+                    val hlc = nextLocalHlc(dao)
                     dao.deleteCollectionEntry(spec.collectionId, resolvedEntry)
                     dao.upsertTombstone(
                         TombstoneEntity(
@@ -381,6 +416,8 @@ class CatalogStore(
                             naturalKey =
                                 collectionEntryNaturalKey(spec.collectionId, resolvedEntry),
                             deletedAt = nowIso,
+                            hlc = hlc,
+                            isLocalDirty = true,
                         )
                     )
                 }
@@ -413,16 +450,20 @@ class CatalogStore(
                     tsMillis = now.toEpochMilli(),
                     ordering = resolvedGroups,
                 )
-            dao.insertComparisonIgnore(
-                ComparisonEntity(
-                    id = id,
-                    ts = nowIso,
-                    scopeCollectionId = cleanScope,
-                    orderingJson = canonicalOrderingJson(resolvedGroups),
-                    createdAt = nowIso,
-                    isLocalDirty = true,
+            dao.executeInTransaction {
+                val hlc = nextLocalHlc(dao)
+                dao.insertComparisonIgnore(
+                    ComparisonEntity(
+                        id = id,
+                        ts = nowIso,
+                        scopeCollectionId = cleanScope,
+                        orderingJson = canonicalOrderingJson(resolvedGroups),
+                        createdAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = true,
+                    )
                 )
-            )
+            }
             id
         }
         onLocalMutation()
@@ -492,7 +533,7 @@ class CatalogStore(
                 CollectionRankMeta(
                     collectionId = spec.collectionId,
                     slug = spec.slug ?: spec.collectionId,
-                    title = spec.title,
+                    title = lookupSpecTitle(spec),
                     scopeCollectionId = spec.collectionId.takeIf { isPriorityScoped },
                 )
             }
@@ -501,7 +542,7 @@ class CatalogStore(
     suspend fun resolveEntrySystemListSlug(entryId: String): String? = mutationMutex.withLock {
         ensureSystemSeeded()
         val resolved = followMergedId(entryId) ?: entryId.trim()
-        dao.getCatalogEntryById(resolved)?.let { EntryKind.fromWireValue(it.kind).systemListSlug }
+        dao.getEntryById(resolved)?.let { EntryKind.fromWireValue(it.kind).systemListSlug }
     }
 
     suspend fun resolveEntrySettlement(
@@ -512,7 +553,7 @@ class CatalogStore(
         val resolved = followMergedId(entryId) ?: entryId
         val snap = buildCatalogSnapshot(loadRawCatalogTables())
         val preferredSpec = preferredCollectionIdOrSlug?.let { resolveCollectionSpec(it) }
-        val rawEntry = dao.getCatalogEntryById(resolved)
+        val rawEntry = dao.getEntryById(resolved)
         val fallbackSpec = rawEntry?.let {
             dao.getCollectionSpecBySlug(EntryKind.fromWireValue(it.kind).systemListSlug)
         }
@@ -525,7 +566,7 @@ class CatalogStore(
             RankSettlementSummary(
                 entryId = resolved,
                 title = match.entry.title,
-                collectionTitle = targetSpec.title,
+                collectionTitle = lookupSpecTitle(targetSpec),
                 rank = match.rank,
                 totalCount = rankedList.size,
                 tier = match.tier,
@@ -533,35 +574,19 @@ class CatalogStore(
         }
     }
 
-    suspend fun materializeFeedItemInCatalog(
-        item: ItemEntity,
-        feed: FeedEntity?,
-        logConsumed: Boolean,
-    ): String {
+    internal suspend fun logFeedItemCompletion(itemId: String): String {
         val resolvedId = mutationMutex.withLock {
             ensureSystemSeeded()
-            var id = ""
+            val nowIso = nowUtcIso()
+            var id = itemId
             dao.executeInTransaction {
-                id =
-                    materializeFeedItemInDao(
-                        dao = dao,
-                        item = item,
-                        feed = feed,
-                        logConsumed = logConsumed,
-                        markDirty = false,
-                        nowIso = nowUtcIso(),
-                    )
+                id = logFeedItemConsumedInDao(dao = dao, itemId = itemId, nowIso = nowIso)
+                advanceActiveDrawsLocked(id, ConsumptionStatus.CONSUMED, nowIso)
             }
             id
         }
-        if (logConsumed) {
-            onLocalMutation()
-        }
+        onLocalMutation()
         return resolvedId
-    }
-
-    internal suspend fun materializeReferencedFeeds(referencedIds: Set<String>, nowIso: String) {
-        materializeFeedsForIds(dao = dao, referencedIds = referencedIds, nowIso = nowIso)
     }
 
     internal fun notifyLocalMutation() {
@@ -574,6 +599,11 @@ class CatalogStore(
             block()
         }
     }
+
+    private suspend fun lookupSpecTitle(spec: CollectionSpecEntity): String =
+        dao.getEntryById(spec.collectionId)?.title?.takeIf { it.isNotBlank() }
+            ?: spec.slug
+            ?: spec.collectionId
 
     private suspend fun resolveEligibleGeneratorSpec(idOrSlug: String): CollectionSpecEntity? {
         val spec = resolveCollectionSpec(idOrSlug) ?: return null
@@ -610,6 +640,12 @@ class CatalogStore(
         markDirty: Boolean,
     ): String? {
         val nextId = if (enabled) drawRandomRemainingId(collectionId) else null
+        val hlc =
+            if (markDirty) {
+                nextLocalHlc(dao)
+            } else {
+                HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            }
         dao.upsertCollectionGenerator(
             CollectionGeneratorEntity(
                 collectionId = collectionId,
@@ -617,6 +653,7 @@ class CatalogStore(
                 currentEntryId = nextId,
                 drawnAt = nextId?.let { nowIso },
                 updatedAt = nowIso,
+                hlc = hlc,
                 isLocalDirty = markDirty,
             )
         )
@@ -627,10 +664,7 @@ class CatalogStore(
         val poolMembers = dao.getCollectionMemberships(collectionId).map { it.entryId }
         if (poolMembers.isEmpty()) return null
         val activeIds =
-            dao.getAllCatalogEntries()
-                .filter { it.mergedIntoId.isNullOrBlank() }
-                .map { it.id }
-                .toHashSet()
+            dao.getAllEntries().filter { it.mergedIntoId.isNullOrBlank() }.map { it.id }.toHashSet()
         val finishedIds =
             dao.getAllConsumptionLogs()
                 .filter {
@@ -677,7 +711,7 @@ class CatalogStore(
 
     internal suspend fun loadRawCatalogTables(): RawCatalogTables =
         RawCatalogTables(
-            entries = dao.getAllCatalogEntries(),
+            entries = dao.getAllEntries(),
             identifiers = dao.getAllEntryIdentifiers(),
             specs = dao.getAllCollectionSpecs(),
             memberships = dao.getAllCollectionEntries(),

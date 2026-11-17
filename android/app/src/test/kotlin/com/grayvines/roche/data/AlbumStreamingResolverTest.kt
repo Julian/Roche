@@ -221,24 +221,27 @@ private suspend fun assertResolvedSyncAndIdempotency(
     )
     assertEquals("https://en.wikipedia.org/wiki/In_the_Wee_Small_Hours", active.wikipediaUrl)
 
-    val outgoing = buildOutgoingCatalogSyncBatch(db.dao(), inclusiveSinceInstant = null)
-    val syncedEntry = checkNotNull(outgoing.catalogEntries.firstOrNull { it.id == active.entryId })
+    val outgoing =
+        buildPeerSyncRequest(
+            db.dao(),
+            PeerSyncRequestConfig(peerId = "test-peer", deviceName = "Test", sinceSeq = 0L),
+        )
+    val syncedEntry = checkNotNull(outgoing.entries.firstOrNull { it.id == active.entryId })
     val ytValues =
         syncedEntry.identifiers.filter { it.scheme == "youtube_music" }.map { it.value }.toSet()
     assertTrue("MPREb_persisted_1" in ytValues)
     val syncedSchemes = syncedEntry.identifiers.associate { it.scheme to it.value }
     assertEquals("In_the_Wee_Small_Hours", syncedSchemes["wikipedia"])
 
-    val rawClean =
-        checkNotNull(db.dao().getCatalogEntryById(active.entryId)).copy(isLocalDirty = false)
-    db.dao().upsertCatalogEntry(rawClean)
+    val rawClean = checkNotNull(db.dao().getEntryById(active.entryId)).copy(isLocalDirty = false)
+    db.dao().upsertEntry(rawClean)
     val attachedAgain =
         repo.catalog.attachEntryIdentifiers(
             active.entryId,
             mapOf("youtube_music" to "MPREb_persisted_1"),
         )
     assertFalse(attachedAgain)
-    assertFalse(checkNotNull(db.dao().getCatalogEntryById(active.entryId)).isLocalDirty)
+    assertFalse(checkNotNull(db.dao().getEntryById(active.entryId)).isLocalDirty)
 }
 
 private const val SAMPLE_ODESLI_JSON =

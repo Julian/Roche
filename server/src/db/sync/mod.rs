@@ -1,19 +1,20 @@
 mod activity;
-mod catalog_sync;
+mod hlc;
 mod hrw;
 mod identity;
-mod peer_merge;
+mod merge_in;
+mod merge_out;
+mod models;
 #[cfg(test)]
 mod tests;
 
 #[allow(unused_imports)]
 pub use activity::{ActivityEntry, SyncTombstone};
-#[allow(unused_imports)]
-pub use catalog_sync::{
-    PeerCatalogEntryRecord, PeerCollectionEntryRecord, PeerCollectionGeneratorRecord,
-    PeerCollectionSpecRecord, PeerComparisonRecord, PeerConsumptionLogRecord,
-};
 use chrono::{DateTime, SubsecRound, Utc};
+#[allow(unused_imports)]
+pub use hlc::{
+    HlcClock, HlcTimestamp, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc, sanitize_hlc_node_id,
+};
 #[allow(unused_imports)]
 pub use hrw::{
     DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier, PEER_LEASE_TTL_MINUTES, PeerNode, SERVER_PEER_ID,
@@ -30,9 +31,11 @@ pub use identity::{
     deterministic_title_entry_id, feed_natural_key, item_natural_key, tag_natural_key,
 };
 #[allow(unused_imports)]
-pub use peer_merge::{
-    InsertedItemCandidate, MAX_PEER_SYNC_OUTGOING_ITEMS, PeerFeedRecord, PeerItemRecord,
-    PeerSyncRequest, PeerSyncResponse, PeerTagRecord,
+pub use models::{
+    InsertedItemCandidate, MAX_PEER_SYNC_PAGE_BYTES, MAX_PEER_SYNC_PAGE_CHANGES,
+    MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, SyncCollectionEntryRecord,
+    SyncCollectionGeneratorRecord, SyncCollectionSpec, SyncComparisonRecord,
+    SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord, SyncEntryState, SyncFeedSource,
 };
 use sqlx::SqlitePool;
 

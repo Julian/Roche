@@ -8,9 +8,11 @@ import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.collectInBackground
-import com.grayvines.roche.data.local.FeedEntity
-import com.grayvines.roche.data.local.ItemEntity
+import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.upsertFeeds
+import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
@@ -149,9 +151,9 @@ class PodcastMedia3PlaybackTest {
 
     @Test
     fun `skipSilence propagates to backend and periodic ticks debounce HTTP PATCH`() = runTest {
-        val patchRequests = CopyOnWriteArrayList<HttpRequest>()
+        val syncRequests = CopyOnWriteArrayList<HttpRequest>()
         var fakeClockMs = 100_000L
-        withPlayerHarness(patchRequests, clockMs = { fakeClockMs }) {
+        withPlayerHarness(syncRequests, clockMs = { fakeClockMs }) {
             vm,
             controller,
             backend,
@@ -170,26 +172,29 @@ class PodcastMedia3PlaybackTest {
                     .allEntries
                     .first()
                     .readAt
-            patchRequests.clear()
+            drainJobs()
+            syncRequests.clear()
 
             backend.simulatedPositionMs = 30_000L
             controller.advanceSingleTick(tickCount = 5)
             drainJobs()
-            assertEquals(0, patchRequests.size)
+            assertEquals(0, syncRequests.size)
             assertEquals(initialReadAt, database.dao().getItemById("ep-1")?.readAt)
 
             backend.simulatedPositionMs = 90_000L
             controller.advanceSingleTick(tickCount = 15)
             drainJobs()
-            assertEquals(1, patchRequests.size)
-            assertFalse(patchRequests.single().body.orEmpty().contains("read_at"))
+            assertEquals(1, syncRequests.size)
+            assertTrue(
+                syncRequests.single().body.orEmpty().contains(""""read_at":"$initialReadAt"""")
+            )
             assertEquals(initialReadAt, database.dao().getItemById("ep-1")?.readAt)
 
             fakeClockMs += 15_000L
             backend.simulatedPositionMs = 180_000L
             controller.advanceSingleTick(tickCount = 30)
             drainJobs()
-            assertEquals(1, patchRequests.size)
+            assertEquals(1, syncRequests.size)
             assertEquals(0.3, database.dao().getItemById("ep-1")?.readProgress ?: 0.0, 1e-2)
         }
     }
@@ -205,7 +210,9 @@ class PodcastMedia3PlaybackTest {
             }
             settings.prewarm()
 
-            val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = PATCH_OK_BODY) }
+            val apiClient = RocheApiClient {
+                HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY)
+            }
             val backend = InspectableAudioBackend().apply { skipSilenceEnabled = true }
             val repo =
                 RocheRepository(
@@ -242,9 +249,9 @@ class PodcastMedia3PlaybackTest {
 
     @Test
     fun `crossing 98 percent auto-logs once and external pause coalesces read_at`() = runTest {
-        val patchRequests = CopyOnWriteArrayList<HttpRequest>()
+        val syncRequests = CopyOnWriteArrayList<HttpRequest>()
         var fakeClockMs = 100_000L
-        withPlayerHarness(patchRequests, clockMs = { fakeClockMs }) {
+        withPlayerHarness(syncRequests, clockMs = { fakeClockMs }) {
             _,
             controller,
             backend,
@@ -256,10 +263,10 @@ class PodcastMedia3PlaybackTest {
 
             val logsAfter98 = database.dao().getAllConsumptionLogs().filter { it.entryId == "ep-1" }
             assertEquals(1, logsAfter98.size)
-            val entryAfterFirst = database.dao().getCatalogEntryById("ep-1")
+            val entryAfterFirst = database.dao().getEntryById("ep-1")
             assertNotNull(entryAfterFirst)
             val sentinelUpdatedAt = "2026-01-01T00:00:00Z"
-            database.dao().upsertCatalogEntry(entryAfterFirst!!.copy(updatedAt = sentinelUpdatedAt))
+            database.dao().upsertEntry(entryAfterFirst!!.copy(updatedAt = sentinelUpdatedAt))
 
             fakeClockMs += 35_000L
             backend.simulatedPositionMs = 595_000L
@@ -268,16 +275,16 @@ class PodcastMedia3PlaybackTest {
             assertEquals(1, database.dao().getAllConsumptionLogs().count { it.entryId == "ep-1" })
             assertEquals(
                 sentinelUpdatedAt,
-                database.dao().getCatalogEntryById("ep-1")?.updatedAt,
+                database.dao().getEntryById("ep-1")?.updatedAt,
             )
 
-            patchRequests.clear()
+            syncRequests.clear()
             backend.emitExternalPlayState(false)
             drainJobs()
             assertFalse(controller.state.value.isPlaying)
-            assertEquals(1, patchRequests.size)
-            assertTrue(patchRequests.single().body.orEmpty().contains("read_progress"))
-            assertTrue(patchRequests.single().body.orEmpty().contains("read_at"))
+            assertEquals(1, syncRequests.size)
+            assertTrue(syncRequests.single().body.orEmpty().contains("\"progress\":"))
+            assertTrue(syncRequests.single().body.orEmpty().contains("\"read_at\":"))
         }
     }
 
@@ -343,7 +350,7 @@ class PodcastMedia3PlaybackTest {
     }
 
     private suspend fun kotlinx.coroutines.test.TestScope.withPlayerHarness(
-        patchRequests: CopyOnWriteArrayList<HttpRequest>,
+        syncRequests: CopyOnWriteArrayList<HttpRequest>,
         clockMs: () -> Long,
         block:
             suspend (
@@ -354,19 +361,20 @@ class PodcastMedia3PlaybackTest {
             ) -> Unit,
     ) {
         val apiClient = RocheApiClient { request ->
-            if (request.method == "PATCH") patchRequests.add(request)
-            HttpResponse(statusCode = 200, body = PATCH_OK_BODY)
+            if (request.url.endsWith("/api/v1/sync/peer")) syncRequests.add(request)
+            HttpResponse(statusCode = 200, body = PEER_SYNC_OK_BODY)
         }
         seedPodcastEpisode()
         val backend = InspectableAudioBackend()
+        val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         val repo =
             RocheRepository(
                 database = database,
                 apiClient = apiClient,
                 settings = settings,
                 cacheDir = File(tempDir, "cache"),
+                backgroundScope = playerScope,
             )
-        val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         val controller =
             createManagedPlayerController(
                 scope = playerScope,
@@ -395,10 +403,12 @@ class PodcastMedia3PlaybackTest {
             vm.uiState.first {
                 it.playerState.currentEntryId == "ep-1" &&
                     it.playerState.isPlaying &&
-                    !it.playerState.isBuffering
+                    !it.playerState.isBuffering &&
+                    !it.allEntries.first().readAt.isNullOrBlank()
             }
             controller.cancelAutoTickerForTest()
             drainJobs()
+            syncRequests.clear()
             block(vm, controller, backend, drainJobs)
         } finally {
             controller.releaseController()
@@ -421,12 +431,13 @@ class PodcastMedia3PlaybackTest {
             .dao()
             .upsertFeeds(
                 listOf(
-                    FeedEntity(
+                    FeedRow(
                         id = "f-pod",
                         title = "Deep Tech",
                         url = "https://pod.example.com/rss.xml",
                         siteUrl = "https://pod.example.com",
                         feedType = "podcast",
+                        lastPolled = "2099-01-01T00:00:00Z",
                     )
                 )
             )
@@ -434,7 +445,7 @@ class PodcastMedia3PlaybackTest {
             .dao()
             .upsertItems(
                 listOf(
-                    ItemEntity(
+                    InboxItemRow(
                         id = "ep-1",
                         feedId = "f-pod",
                         feedTitle = "Deep Tech",
@@ -651,8 +662,8 @@ private fun defaultPrimitiveReturn(returnType: Class<*>): Any? =
         else -> null
     }
 
-private const val PATCH_OK_BODY =
-    """{"id":"ep-1","title":"Ep 1","url":"https://pod.example.com/ep1","content_type":"audio","status":"unread","is_favorite":false,"read_progress":0.5,"created_at":"2026-06-01T12:00:00Z"}"""
+private const val PEER_SYNC_OK_BODY =
+    """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000000000-0001-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[]}"""
 
 private fun verifyAudioRedirectCacheAndRebind() {
     val publicAddr =

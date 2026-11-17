@@ -387,6 +387,9 @@ impl<'a> TagRepo<'a> {
         tag_id: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
+        let nat_key = crate::db::sync::collection_entry_natural_key(tag_id, item_id);
+        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::CollectionEntry, &nat_key)
+            .await?;
         let res = sqlx::query!(
             "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
              SELECT cs.collection_id, ?, ?
@@ -458,6 +461,9 @@ impl<'a> TagRepo<'a> {
         if res.rows_affected() == 0 {
             return Ok(false);
         }
+        let nat_key = crate::db::sync::collection_entry_natural_key(tag_id, item_id);
+        SyncRepo::record_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key, now)
+            .await?;
         sqlx::query!(
             "UPDATE entry_state SET interaction_updated_at = ?, updated_at = ? WHERE entry_id = ?",
             now as _,
