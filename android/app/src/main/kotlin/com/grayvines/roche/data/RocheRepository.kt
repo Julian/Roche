@@ -157,7 +157,7 @@ class RocheRepository(
 
     suspend fun prewarmCollectionDraw(draw: CollectionDrawSnapshot) {
         if (albumStreamingResolver == null || draw.kind != EntryKind.ALBUM) return
-        if (draw.hasYoutubePlaylistId && !draw.wikipediaUrl.isNullOrBlank()) return
+        if (draw.hasYoutubeAlbumBrowseId && !draw.wikipediaUrl.isNullOrBlank()) return
         val dedupKey = draw.entryId.ifBlank { "${draw.creator}|${draw.title}|${draw.spotifyId}" }
         if (!prewarmedAlbumKeys.add(dedupKey)) return
         resolveCollectionDrawStreaming(draw, includeWikipedia = draw.wikipediaUrl.isNullOrBlank())

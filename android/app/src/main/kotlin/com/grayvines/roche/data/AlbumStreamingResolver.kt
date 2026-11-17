@@ -61,7 +61,7 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         includeWikipedia: Boolean,
     ): Map<String, String> {
         val resolved = LinkedHashMap<String, String>()
-        if (!album.hasYoutubePlaylistId) {
+        if (!album.hasYoutubeAlbumBrowseId) {
             resolveStreamingPlatforms(album, resolved)
         }
         if (includeWikipedia && album.wikipediaUrl.isNullOrBlank()) {
@@ -74,20 +74,15 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         album: CollectionDrawSnapshot,
         resolved: MutableMap<String, String>,
     ) {
-        val seedUrl = album.candidateStreamingUrls().firstOrNull()
-        if (seedUrl != null) {
+        val seedUrl = odesliSeedUrl(album)
+        if (seedUrl != null && shouldQueryOdesli(album)) {
             resolved.putAll(fetchOdesliPlatformIds(seedUrl))
         }
         val currentYt = resolved[SCHEME_YT_MUSIC] ?: album.youtubeMusicId
-        if (!isPlaylistYoutubeId(currentYt)) {
-            val upgradedFromBrowse =
-                currentYt
-                    ?.trim()
-                    ?.takeIf { it.startsWith(YT_BROWSE_PREFIX) }
-                    ?.let { fetchInnertubePlaylistId(it) }
-            val resolvedYt = upgradedFromBrowse ?: searchInnertubeAlbumId(album)
-            if (!resolvedYt.isNullOrBlank()) {
-                resolved[SCHEME_YT_MUSIC] = resolvedYt
+        if (!isAlbumBrowseYoutubeId(currentYt)) {
+            val resolvedBrowse = searchInnertubeAlbumId(album)
+            if (!resolvedBrowse.isNullOrBlank()) {
+                resolved[SCHEME_YT_MUSIC] = resolvedBrowse
             }
         }
     }
@@ -120,18 +115,10 @@ class AlbumStreamingResolver(private val transport: HttpTransport) {
         collectInnertubeCandidates(root, candidates)
         val best = selectBestAlbumCandidate(candidates, album) ?: return null
         return when {
-            !best.playlistId.isNullOrBlank() -> stripYoutubePlaylistPrefix(best.playlistId)
-            !best.browseId.isNullOrBlank() && best.browseId.startsWith(YT_BROWSE_PREFIX) ->
-                fetchInnertubePlaylistId(best.browseId) ?: best.browseId
-            !best.browseId.isNullOrBlank() -> stripYoutubePlaylistPrefix(best.browseId)
+            !best.browseId.isNullOrBlank() -> sanitizeYoutubeMusicToken(best.browseId)
+            !best.playlistId.isNullOrBlank() -> sanitizeYoutubeMusicToken(best.playlistId)
             else -> null
         }
-    }
-
-    private suspend fun fetchInnertubePlaylistId(browseId: String): String? {
-        val payload = buildInnertubeBrowseBody(browseId)
-        val root = postInnertubeJson(INNERTUBE_BROWSE_URL, payload) ?: return null
-        return findFirstPlaylistId(root)
     }
 
     private suspend fun postInnertubeJson(url: String, body: String): JsonObject? {
@@ -191,45 +178,71 @@ internal fun parseOdesliLinksPayload(rawJson: String): Map<String, String> {
     return out
 }
 
+private fun odesliSeedUrl(album: CollectionDrawSnapshot): String? {
+    val candidates = album.candidateStreamingUrls()
+    return candidates.firstOrNull { !it.contains("youtube.com") } ?: candidates.firstOrNull()
+}
+
+private fun shouldQueryOdesli(album: CollectionDrawSnapshot): Boolean =
+    album.appleMusicId.isNullOrBlank() ||
+        album.tidalId.isNullOrBlank() ||
+        album.deezerId.isNullOrBlank() ||
+        album.amazonMusicId.isNullOrBlank()
+
 private fun extractOdesliYoutubeId(
     links: JsonObject,
     entities: JsonObject?,
 ): String? {
     val ytMusicUrl = extractPlatformUrl(links, "youtubeMusic")
     val ytUrl = extractPlatformUrl(links, "youtube")
-    val directPlaylist =
-        extractYoutubeIdFromUrl(ytMusicUrl, requirePlaylist = true)
-            ?: extractYoutubeIdFromUrl(ytUrl, requirePlaylist = true)
-            ?: extractPlaylistFromEntities(entities)
-    return directPlaylist ?: extractYoutubeIdFromUrl(ytMusicUrl, requirePlaylist = false)
+    val directBrowse =
+        extractYoutubeBrowseIdFromUrl(ytMusicUrl) ?: extractBrowseIdFromEntities(entities)
+    return directBrowse
+        ?: extractYoutubeIdFromUrl(ytMusicUrl)
+        ?: extractYoutubeIdFromUrl(ytUrl)
+        ?: extractPlaylistFromEntities(entities)
+}
+
+private fun extractBrowseIdFromEntities(entities: JsonObject?): String? {
+    if (entities == null) return null
+    return entities.values.firstNotNullOfOrNull { value ->
+        val rawId = ((value as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull?.trim()
+        rawId?.let(::sanitizeYoutubeMusicToken)?.takeIf { it.startsWith(YT_BROWSE_PREFIX) }
+    }
 }
 
 private fun extractPlaylistFromEntities(entities: JsonObject?): String? {
     if (entities == null) return null
     return entities.values.firstNotNullOfOrNull { value ->
         val rawId = ((value as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull?.trim()
-        rawId?.let(::stripYoutubePlaylistPrefix)?.takeIf(::isYoutubePlaylistToken)
+        rawId?.let(::sanitizeYoutubeMusicToken)?.takeIf(::isYoutubePlaylistToken)
     }
 }
 
-private fun extractYoutubeIdFromUrl(rawUrl: String?, requirePlaylist: Boolean): String? {
+private fun extractYoutubeBrowseIdFromUrl(rawUrl: String?): String? {
     val uri = rawUrl?.let { runCatching { URI(it) }.getOrNull() } ?: return null
-    val listParam = extractQueryParam(uri.rawQuery, "list")?.let(::stripYoutubePlaylistPrefix)
-    if (!listParam.isNullOrBlank()) {
-        return listParam
-    }
     val browseId =
         uri.path
             ?.substringAfter("/browse/", missingDelimiterValue = "")
             ?.trim('/')
-            ?.let(::stripYoutubePlaylistPrefix)
+            ?.let(::sanitizeYoutubeMusicToken)
             .orEmpty()
-    return when {
-        browseId.isEmpty() -> null
-        isYoutubePlaylistToken(browseId) -> browseId
-        !requirePlaylist && browseId.startsWith(YT_BROWSE_PREFIX) -> browseId
-        else -> null
+    return browseId.takeIf { it.startsWith(YT_BROWSE_PREFIX) }
+}
+
+private fun extractYoutubeIdFromUrl(rawUrl: String?): String? {
+    val uri = rawUrl?.let { runCatching { URI(it) }.getOrNull() } ?: return null
+    val browseId =
+        uri.path
+            ?.substringAfter("/browse/", missingDelimiterValue = "")
+            ?.trim('/')
+            ?.let(::sanitizeYoutubeMusicToken)
+            .orEmpty()
+    if (browseId.startsWith(YT_BROWSE_PREFIX) || isYoutubePlaylistToken(browseId)) {
+        return browseId
     }
+    val listParam = extractQueryParam(uri.rawQuery, "list")?.let(::sanitizeYoutubeMusicToken)
+    return listParam?.takeIf { it.isNotEmpty() }
 }
 
 private fun extractPlatformUrl(links: JsonObject, key: String): String? =
@@ -238,6 +251,7 @@ private fun extractPlatformUrl(links: JsonObject, key: String): String? =
         ?.let(::sanitizeHttpUrl)
 
 internal data class InnertubeAlbumCandidate(
+    val primaryTitle: String,
     val labelText: String,
     val playlistId: String?,
     val browseId: String?,
@@ -269,12 +283,14 @@ internal fun collectInnertubeCandidates(
 }
 
 private fun toAlbumCandidate(renderer: JsonObject): InnertubeAlbumCandidate? {
+    if (containsPageType(renderer, AUDIOBOOK_PAGE_TYPE)) return null
     val playlistId = findFirstPlaylistId(renderer)
     val browseId = findFirstAlbumBrowseId(renderer)
     if (playlistId == null && browseId == null) return null
     val labels = StringBuilder()
     collectRunsText(renderer, labels)
     return InnertubeAlbumCandidate(
+        primaryTitle = findFirstRunText(renderer).orEmpty(),
         labelText = labels.toString(),
         playlistId = playlistId,
         browseId = browseId,
@@ -288,21 +304,36 @@ internal fun selectBestAlbumCandidate(
     if (candidates.isEmpty()) return null
     val normTitle = normalizeMatchTokens(album.title)
     val normArtist = normalizeMatchTokens(album.creator)
-    return candidates.maxByOrNull { candidate ->
-        scoreAlbumCandidate(candidate, normTitle, normArtist)
+    val releaseYear = album.releaseDate.trim().take(YEAR_TOKEN_LEN)
+    val scored = candidates.map { candidate ->
+        candidate to scoreAlbumCandidate(candidate, normTitle, normArtist, releaseYear)
     }
+    val best = scored.maxByOrNull { it.second } ?: return null
+    val minRequired = if (normTitle.isNotEmpty()) TITLE_MATCH_SCORE else 1
+    return best.first.takeIf { best.second >= minRequired }
 }
 
 private fun scoreAlbumCandidate(
     candidate: InnertubeAlbumCandidate,
     normTitle: String,
     normArtist: String,
+    releaseYear: String,
 ): Int {
     val haystack = normalizeMatchTokens(candidate.labelText)
+    val normPrimary = normalizeMatchTokens(candidate.primaryTitle)
     var score = 0
-    if (normTitle.isNotEmpty() && normTitle in haystack) score += TITLE_MATCH_SCORE
+    if (normTitle.isNotEmpty()) {
+        if (normPrimary == normTitle) {
+            score += EXACT_TITLE_MATCH_SCORE
+        } else if (normTitle in haystack) {
+            score += TITLE_MATCH_SCORE
+        }
+    }
     if (normArtist.isNotEmpty() && normArtist in haystack) score += ARTIST_MATCH_SCORE
-    if (!candidate.playlistId.isNullOrBlank()) score += PLAYLIST_BONUS_SCORE
+    if (releaseYear.length == YEAR_TOKEN_LEN && releaseYear in haystack) {
+        score += YEAR_MATCH_SCORE
+    }
+    if (!candidate.browseId.isNullOrBlank()) score += BROWSE_ID_BONUS_SCORE
     return score
 }
 
@@ -313,8 +344,29 @@ internal fun findFirstPlaylistId(element: JsonElement): String? =
     findFirstJsonToken(element, "playlistId", ::isYoutubePlaylistToken)
 
 private fun findFirstAlbumBrowseId(element: JsonElement): String? =
-    findFirstJsonToken(element, "browseId") { token ->
-        token.startsWith(YT_BROWSE_PREFIX) || token.startsWith(YT_OLAK_PREFIX)
+    findFirstJsonToken(element, "browseId") { token -> token.startsWith(YT_BROWSE_PREFIX) }
+
+private fun containsPageType(element: JsonElement, targetPageType: String): Boolean =
+    findFirstJsonToken(element, "pageType") { it == targetPageType } != null
+
+private fun findFirstRunText(element: JsonElement): String? =
+    when (element) {
+        is JsonObject -> {
+            val runs = element["runs"] as? JsonArray
+            val fromRuns = runs?.firstNotNullOfOrNull { item ->
+                ((item as? JsonObject)?.get("text") as? JsonPrimitive)
+                    ?.contentOrNull
+                    ?.trim()
+                    ?.takeIf(String::isNotEmpty)
+            }
+            fromRuns ?: element.values.firstNotNullOfOrNull(::findFirstRunText)
+        }
+        is JsonArray -> {
+            element.firstNotNullOfOrNull(::findFirstRunText)
+        }
+        else -> {
+            null
+        }
     }
 
 private fun findFirstJsonToken(
@@ -368,9 +420,10 @@ private fun collectRunsText(element: JsonElement, out: StringBuilder) {
 private fun isYoutubePlaylistToken(token: String): Boolean =
     token.startsWith(YT_OLAK_PREFIX) || token.startsWith("PL")
 
-internal fun isPlaylistYoutubeId(rawId: String?): Boolean {
+internal fun isAlbumBrowseYoutubeId(rawId: String?): Boolean {
     val clean = rawId?.trim()?.takeIf(String::isNotEmpty) ?: return false
-    return buildYoutubeMusicAlbumUrl(clean).startsWith("$YT_MUSIC_ORIGIN_URL/playlist?list=")
+    return buildYoutubeMusicAlbumUrl(clean)
+        .startsWith("$YT_MUSIC_ORIGIN_URL/browse/$YT_BROWSE_PREFIX")
 }
 
 internal fun buildInnertubeSearchBody(query: String): String = buildJsonObject {
@@ -380,17 +433,11 @@ internal fun buildInnertubeSearchBody(query: String): String = buildJsonObject {
 }
     .toString()
 
-internal fun buildInnertubeBrowseBody(browseId: String): String = buildJsonObject {
-    putInnertubeContext()
-    put("browseId", browseId)
-}
-    .toString()
-
 private fun JsonObjectBuilder.putInnertubeContext() {
     putJsonObject("context") {
         putJsonObject("client") {
             put("clientName", "WEB_REMIX")
-            put("clientVersion", "1.20250101.01.00")
+            put("clientVersion", INNERTUBE_WEB_REMIX_VERSION)
             put("hl", "en")
             put("gl", "US")
         }
@@ -409,13 +456,17 @@ private const val YT_OLAK_PREFIX = "OLAK5uy_"
 private const val YT_MUSIC_ORIGIN_URL = "https://music.youtube.com"
 private const val ODESLI_ENDPOINT = "https://api.song.link/v1-alpha.1/links"
 private const val INNERTUBE_SEARCH_URL = "$YT_MUSIC_ORIGIN_URL/youtubei/v1/search?prettyPrint=false"
-private const val INNERTUBE_BROWSE_URL = "$YT_MUSIC_ORIGIN_URL/youtubei/v1/browse?prettyPrint=false"
-private const val INNERTUBE_ALBUMS_FILTER_PARAMS = "EgWKAQIgAWoKEAkQChADEAQQBQ=="
+private const val INNERTUBE_ALBUMS_FILTER_PARAMS = "EgWKAQIYAWoKEAkQChAFEAMQBA=="
+private const val INNERTUBE_WEB_REMIX_VERSION = "1.20260707.12.00"
+private const val AUDIOBOOK_PAGE_TYPE = "MUSIC_PAGE_TYPE_AUDIOBOOK"
 private const val HTTP_OK_START = 200
 private const val HTTP_OK_END = 299
+private const val EXACT_TITLE_MATCH_SCORE = 20
 private const val TITLE_MATCH_SCORE = 10
-private const val ARTIST_MATCH_SCORE = 6
-private const val PLAYLIST_BONUS_SCORE = 2
+private const val ARTIST_MATCH_SCORE = 8
+private const val YEAR_MATCH_SCORE = 4
+private const val BROWSE_ID_BONUS_SCORE = 4
+private const val YEAR_TOKEN_LEN = 4
 private val NON_ALNUM_REGEX = Regex("[^a-z0-9]+")
 private val ALBUM_RENDERER_KEYS =
     setOf("musicTwoRowItemRenderer", "musicCardShelfRenderer", "musicResponsiveListItemRenderer")

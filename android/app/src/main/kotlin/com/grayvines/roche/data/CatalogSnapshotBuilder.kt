@@ -663,8 +663,12 @@ private fun pickPreferredYoutubeMusicId(identifiers: List<EntryIdentifierDto>): 
             .map { it.value.trim() }
             .filter { it.isNotEmpty() }
     return values.firstOrNull {
-        buildYoutubeMusicAlbumUrl(it).startsWith("https://music.youtube.com/playlist?list=")
-    } ?: values.firstOrNull()
+        buildYoutubeMusicAlbumUrl(it).startsWith("https://music.youtube.com/browse/MPREb")
+    }
+        ?: values.firstOrNull {
+            buildYoutubeMusicAlbumUrl(it).startsWith("https://music.youtube.com/playlist?list=")
+        }
+        ?: values.firstOrNull()
 }
 
 internal fun extractMetadataGenres(metadataJson: String): List<String> {

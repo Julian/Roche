@@ -12,6 +12,7 @@ import android.provider.MediaStore
 import androidx.core.net.toUri
 import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.candidateStreamingUrls
+import com.grayvines.roche.data.hasYoutubeAlbumBrowseId
 
 internal data class MusicUrlCandidate(
     val packageName: String,
@@ -41,6 +42,32 @@ internal fun tryOpenDirectAlbumNow(
         )
     return launchStreamingResolution(context, album, resolution)
 }
+
+internal fun needsYoutubeAlbumBrowseUpgrade(
+    context: Context,
+    album: CollectionDrawSnapshot,
+): Boolean {
+    if (album.hasYoutubeAlbumBrowseId) return false
+    val candidates = queryStreamingUrlCandidates(context, album)
+    val resolution =
+        selectMusicUrlResolution(
+            candidates = candidates,
+            selfPackageName = context.packageName,
+            browserPackages = queryBrowserPackages(context.packageManager),
+        )
+    return usesYoutubePlaylistUrl(resolution)
+}
+
+internal fun usesYoutubePlaylistUrl(resolution: MusicUrlResolution): Boolean =
+    when (resolution) {
+        MusicUrlResolution.None -> false
+        is MusicUrlResolution.SingleTarget -> isYoutubeMusicPlaylistUrl(resolution.target.url)
+        is MusicUrlResolution.ChooserTargets ->
+            resolution.targets.any { isYoutubeMusicPlaylistUrl(it.url) }
+    }
+
+private fun isYoutubeMusicPlaylistUrl(url: String): Boolean =
+    url.startsWith(YT_MUSIC_PLAYLIST_URL_PREFIX)
 
 internal fun hasInstalledMusicApp(context: Context): Boolean {
     val candidates = queryUrlListCandidates(context, PLATFORM_PROBE_URLS)
@@ -223,8 +250,9 @@ internal fun launchStreamingResolution(
         }
     }
 
-internal fun buildExplicitViewIntent(target: MusicUrlCandidate): Intent =
-    Intent(Intent.ACTION_VIEW, target.url.toUri()).apply {
+internal fun buildExplicitViewIntent(target: MusicUrlCandidate): Intent {
+    val effectiveUrl = rewriteUrlForTargetPackage(target.packageName, target.url)
+    return Intent(Intent.ACTION_VIEW, effectiveUrl.toUri()).apply {
         addCategory(Intent.CATEGORY_BROWSABLE)
         if (target.activityName.isNotBlank()) {
             setClassName(target.packageName, target.activityName)
@@ -232,6 +260,20 @@ internal fun buildExplicitViewIntent(target: MusicUrlCandidate): Intent =
             setPackage(target.packageName)
         }
     }
+}
+
+internal fun rewriteUrlForTargetPackage(packageName: String, url: String): String {
+    val cleanPkg = packageName.trim()
+    val isMetrolist =
+        cleanPkg == METROLIST_PACKAGE ||
+            cleanPkg.startsWith("$METROLIST_PACKAGE.") ||
+            cleanPkg.startsWith(METROLIST_ALT_PACKAGE_PREFIX)
+    return if (isMetrolist && url.startsWith(YT_MUSIC_OLAK_PLAYLIST_PREFIX)) {
+        url.replaceFirst("https://music.youtube.com/", "https://www.youtube.com/")
+    } else {
+        url
+    }
+}
 
 internal fun tryLaunchMediaSearch(
     context: Context,
@@ -266,6 +308,10 @@ internal fun buildAlbumSearchIntent(
 
 private const val BROWSER_PROBE_URL = "https://example.invalid"
 private const val SHARED_VIDEO_PARENT_DOMAIN = "youtube.com"
+private const val YT_MUSIC_PLAYLIST_URL_PREFIX = "https://music.youtube.com/playlist?list="
+private const val YT_MUSIC_OLAK_PLAYLIST_PREFIX = "https://music.youtube.com/playlist?list=OLAK5uy_"
+private const val METROLIST_PACKAGE = "com.metrolist.music"
+private const val METROLIST_ALT_PACKAGE_PREFIX = "com.metrolist.android"
 
 private val NON_MUSIC_VIDEO_PACKAGES =
     setOf(

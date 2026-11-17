@@ -27,7 +27,7 @@ class AlbumStreamingResolverTest {
     @TempDir lateinit var tempDir: File
 
     @Test
-    fun `Odesli resolution extracts OLAK5uy playlist ID and cross-platform album links`() =
+    fun `Odesli resolution prefers MPREb album browse ID and cross-platform album links`() =
         runTest {
             val transport = HttpTransport { req ->
                 assertTrue(req.url.startsWith("https://api.song.link/v1-alpha.1/links?url="))
@@ -43,7 +43,7 @@ class AlbumStreamingResolverTest {
                 )
 
             val resolved = resolver.resolveStreamingIds(album)
-            assertEquals("OLAK5uy_sinatra_wee", resolved["youtube_music"])
+            assertEquals("MPREb_sinatra_123", resolved["youtube_music"])
             assertEquals(
                 "https://music.apple.com/us/album/in-the-wee-small-hours/1440858069",
                 resolved["apple_music"],
@@ -52,14 +52,14 @@ class AlbumStreamingResolverTest {
 
             val enriched = album.withResolvedStreamingIds(resolved)
             assertEquals(
-                "https://music.youtube.com/playlist?list=OLAK5uy_sinatra_wee",
+                "https://music.youtube.com/browse/MPREb_sinatra_123",
                 enriched.youtubeMusicUrl,
             )
             assertFalse(enriched.candidateStreamingUrls().any { "/search?" in it })
         }
 
     @Test
-    fun `Innertube search and browse fallback resolves OLAK5uy playlist ID when Odesli misses`() =
+    fun `Innertube album search upgrades stale OLAK5uy or missing ID to MPREb browse ID`() =
         runTest {
             val transport = HttpTransport { req ->
                 when {
@@ -67,11 +67,10 @@ class AlbumStreamingResolverTest {
                         HttpResponse(statusCode = 404, body = "{}")
                     }
                     req.url.startsWith("https://music.youtube.com/youtubei/v1/search") -> {
+                        val body = req.body.orEmpty()
+                        assertTrue(body.contains("EgWKAQIYAWoKEAkQChAFEAMQBA=="))
+                        assertTrue(body.contains("1.20260707.12.00"))
                         HttpResponse(statusCode = 200, body = SAMPLE_INNERTUBE_SEARCH_JSON)
-                    }
-                    req.url.startsWith("https://music.youtube.com/youtubei/v1/browse") -> {
-                        assertTrue(req.body.orEmpty().contains("MPREb_duke"))
-                        HttpResponse(statusCode = 200, body = SAMPLE_INNERTUBE_BROWSE_JSON)
                     }
                     else -> {
                         HttpResponse(statusCode = 500, body = "")
@@ -84,11 +83,12 @@ class AlbumStreamingResolverTest {
                     entryId = "entry-2",
                     title = "Ellington at Newport (Remastered)",
                     creator = "Duke Ellington",
+                    youtubeMusicId = "OLAK5uy_stale_playlist",
                     spotifyId = "0t41BkcZayaAsa0FdRelfz",
                 )
 
             val resolved = resolver.resolveStreamingIds(album)
-            assertEquals("OLAK5uy_duke_newport", resolved["youtube_music"])
+            assertEquals("MPREb_duke", resolved["youtube_music"])
         }
 
     @Test
@@ -155,13 +155,7 @@ class AlbumStreamingResolverTest {
                         scope = dataStoreScope,
                         produceFile = { File(tempDir, "streaming_resolve.preferences_pb") },
                     )
-                val transport = HttpTransport { req ->
-                    if (req.url.contains("wikipedia.org")) {
-                        HttpResponse(statusCode = 200, body = SAMPLE_WIKIPEDIA_SEARCH_JSON)
-                    } else {
-                        HttpResponse(statusCode = 200, body = SAMPLE_PERSIST_ODESLI_JSON)
-                    }
-                }
+                val transport = prewarmMockTransport()
                 val repo =
                     RocheRepository(
                         database = db,
@@ -179,7 +173,10 @@ class AlbumStreamingResolverTest {
                             creators = listOf("Frank Sinatra"),
                             releaseYear = 1955,
                             identifiers =
-                                listOf(EntryIdentifierDto("spotify", "3GmwKB1tgPZgXeRJZSm9WX")),
+                                listOf(
+                                    EntryIdentifierDto("spotify", "3GmwKB1tgPZgXeRJZSm9WX"),
+                                    EntryIdentifierDto("youtube_music", "OLAK5uy_old_playlist"),
+                                ),
                         ),
                         markDirty = false,
                     )
@@ -191,7 +188,7 @@ class AlbumStreamingResolverTest {
                 val updated =
                     repo.snapshot.first {
                         val cur = it.catalog.generatorFor(listId)?.currentDraw
-                        cur?.youtubeMusicId == "OLAK5uy_persisted_1" &&
+                        cur?.youtubeMusicId == "MPREb_persisted_1" &&
                             cur.wikipediaUrl ==
                                 "https://en.wikipedia.org/wiki/In_the_Wee_Small_Hours"
                     }
@@ -204,21 +201,32 @@ class AlbumStreamingResolverTest {
         }
 }
 
+private fun prewarmMockTransport(): HttpTransport = HttpTransport { req ->
+    when {
+        req.url.contains("wikipedia.org") ->
+            HttpResponse(statusCode = 200, body = SAMPLE_WIKIPEDIA_SEARCH_JSON)
+        req.url.contains("youtubei/v1/search") -> HttpResponse(statusCode = 200, body = "{}")
+        else -> HttpResponse(statusCode = 200, body = SAMPLE_PERSIST_ODESLI_JSON)
+    }
+}
+
 private suspend fun assertResolvedSyncAndIdempotency(
     db: RocheDatabase,
     repo: RocheRepository,
     active: CollectionDrawSnapshot,
 ) {
     assertEquals(
-        "https://music.youtube.com/playlist?list=OLAK5uy_persisted_1",
+        "https://music.youtube.com/browse/MPREb_persisted_1",
         active.youtubeMusicUrl,
     )
     assertEquals("https://en.wikipedia.org/wiki/In_the_Wee_Small_Hours", active.wikipediaUrl)
 
     val outgoing = buildOutgoingCatalogSyncBatch(db.dao(), inclusiveSinceInstant = null)
     val syncedEntry = checkNotNull(outgoing.catalogEntries.firstOrNull { it.id == active.entryId })
+    val ytValues =
+        syncedEntry.identifiers.filter { it.scheme == "youtube_music" }.map { it.value }.toSet()
+    assertTrue("MPREb_persisted_1" in ytValues)
     val syncedSchemes = syncedEntry.identifiers.associate { it.scheme to it.value }
-    assertEquals("OLAK5uy_persisted_1", syncedSchemes["youtube_music"])
     assertEquals("In_the_Wee_Small_Hours", syncedSchemes["wikipedia"])
 
     val rawClean =
@@ -227,7 +235,7 @@ private suspend fun assertResolvedSyncAndIdempotency(
     val attachedAgain =
         repo.catalog.attachEntryIdentifiers(
             active.entryId,
-            mapOf("youtube_music" to "OLAK5uy_persisted_1"),
+            mapOf("youtube_music" to "MPREb_persisted_1"),
         )
     assertFalse(attachedAgain)
     assertFalse(checkNotNull(db.dao().getCatalogEntryById(active.entryId)).isLocalDirty)
@@ -269,6 +277,12 @@ private const val SAMPLE_INNERTUBE_SEARCH_JSON =
                     {
                       "musicResponsiveListItemRenderer": {
                         "flexColumns": [{"runs": [{"text": "Ellington at Newport"}, {"text": "Duke Ellington"}]}],
+                        "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_audiobook", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_AUDIOBOOK"}}}}
+                      }
+                    },
+                    {
+                      "musicResponsiveListItemRenderer": {
+                        "flexColumns": [{"runs": [{"text": "Ellington at Newport"}, {"text": "Duke Ellington"}]}],
                         "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_duke"}}
                       }
                     }
@@ -283,20 +297,11 @@ private const val SAMPLE_INNERTUBE_SEARCH_JSON =
   }
 }"""
 
-private const val SAMPLE_INNERTUBE_BROWSE_JSON =
-    """{
-  "playButton": {
-    "watchPlaylistEndpoint": {
-      "playlistId": "OLAK5uy_duke_newport"
-    }
-  }
-}"""
-
 private const val SAMPLE_PERSIST_ODESLI_JSON =
     """{
   "linksByPlatform": {
     "youtubeMusic": {
-      "url": "https://music.youtube.com/playlist?list=OLAK5uy_persisted_1"
+      "url": "https://music.youtube.com/browse/MPREb_persisted_1"
     }
   }
 }"""

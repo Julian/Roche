@@ -57,10 +57,10 @@ data class CollectionDrawSnapshot(
                 ?: candidateStreamingUrls().firstOrNull()
 }
 
-internal val CollectionDrawSnapshot.hasYoutubePlaylistId: Boolean
+internal val CollectionDrawSnapshot.hasYoutubeAlbumBrowseId: Boolean
     get() =
         !youtubeMusicId.isNullOrBlank() &&
-            youtubeMusicUrl.startsWith("$YT_MUSIC_ORIGIN/playlist?list=")
+            youtubeMusicUrl.startsWith("$YT_MUSIC_ORIGIN/browse/$YT_MUSIC_BROWSE_PREFIX")
 
 internal fun CollectionDrawSnapshot.candidateStreamingUrls(): List<String> = buildList {
     if (!youtubeMusicId.isNullOrBlank()) {
@@ -118,7 +118,7 @@ internal fun buildYoutubeMusicAlbumUrl(rawIdOrUrl: String): String {
     if (http != null) {
         return normalizeYoutubeMusicHttpUrl(http)
     }
-    val normalizedId = stripYoutubePlaylistPrefix(trimmed)
+    val normalizedId = sanitizeYoutubeMusicToken(trimmed)
     return if (normalizedId.startsWith(YT_MUSIC_BROWSE_PREFIX)) {
         "$YT_MUSIC_ORIGIN/browse/${encodeQueryValue(normalizedId)}"
     } else {
@@ -128,21 +128,39 @@ internal fun buildYoutubeMusicAlbumUrl(rawIdOrUrl: String): String {
 
 private fun normalizeYoutubeMusicHttpUrl(httpUrl: String): String {
     val uri = runCatching { URI(httpUrl) }.getOrNull() ?: return httpUrl
-    val listParam = extractQueryParam(uri.rawQuery, "list")?.let(::stripYoutubePlaylistPrefix)
-    if (!listParam.isNullOrBlank()) {
-        return "$YT_MUSIC_ORIGIN/playlist?list=${encodeQueryValue(listParam)}"
-    }
     val browseSeg =
         uri.path
             ?.substringAfter("/browse/", missingDelimiterValue = "")
             ?.trim('/')
-            ?.let(::stripYoutubePlaylistPrefix)
-    return when {
-        browseSeg.isNullOrBlank() -> httpUrl
-        browseSeg.startsWith(YT_MUSIC_BROWSE_PREFIX) ->
-            "$YT_MUSIC_ORIGIN/browse/${encodeQueryValue(browseSeg)}"
-        else -> "$YT_MUSIC_ORIGIN/playlist?list=${encodeQueryValue(browseSeg)}"
+            ?.let(::sanitizeYoutubeMusicToken)
+    if (!browseSeg.isNullOrBlank() && browseSeg.startsWith(YT_MUSIC_BROWSE_PREFIX)) {
+        return "$YT_MUSIC_ORIGIN/browse/${encodeQueryValue(browseSeg)}"
     }
+    val listParam = extractQueryParam(uri.rawQuery, "list")?.let(::sanitizeYoutubeMusicToken)
+    if (!listParam.isNullOrBlank()) {
+        return "$YT_MUSIC_ORIGIN/playlist?list=${encodeQueryValue(listParam)}"
+    }
+    return if (!browseSeg.isNullOrBlank()) {
+        "$YT_MUSIC_ORIGIN/playlist?list=${encodeQueryValue(browseSeg)}"
+    } else {
+        httpUrl
+    }
+}
+
+internal fun sanitizeYoutubeMusicToken(raw: String): String {
+    val candidates =
+        raw.trim()
+            .split(YT_TOKEN_DELIMITER_REGEX)
+            .map { stripYoutubePlaylistPrefix(it.trim()) }
+            .filter { it.isNotEmpty() }
+    val valid = candidates.firstOrNull { token ->
+        token.matches(YT_VALID_TOKEN_REGEX) &&
+            (token.startsWith(YT_MUSIC_BROWSE_PREFIX) ||
+                token.startsWith(YT_OLAK_TOKEN_PREFIX) && token.length > YT_OLAK_PREFIX_LEN ||
+                token.startsWith(YT_PL_TOKEN_PREFIX) && token.length > YT_PL_PREFIX_LEN)
+    }
+    return valid
+        ?: stripYoutubePlaylistPrefix(raw.trim().substringBefore('&').substringBefore('?').trim())
 }
 
 internal fun stripYoutubePlaylistPrefix(id: String): String =
@@ -171,3 +189,9 @@ internal fun encodeQueryValue(raw: String): String =
 
 private const val YT_MUSIC_ORIGIN = "https://music.youtube.com"
 private const val YT_MUSIC_BROWSE_PREFIX = "MPREb"
+private const val YT_OLAK_TOKEN_PREFIX = "OLAK5uy_"
+private const val YT_OLAK_PREFIX_LEN = 8
+private const val YT_PL_TOKEN_PREFIX = "PL"
+private const val YT_PL_PREFIX_LEN = 2
+private val YT_TOKEN_DELIMITER_REGEX = Regex("[\\s&?]+")
+private val YT_VALID_TOKEN_REGEX = Regex("^[A-Za-z0-9_-]+$")

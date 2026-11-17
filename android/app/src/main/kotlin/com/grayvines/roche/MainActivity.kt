@@ -169,7 +169,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openMusicCollectionDraw(draw: CollectionDrawSnapshot) {
-        if (tryOpenDirectAlbumNow(this, draw)) {
+        if (!needsYoutubeAlbumBrowseUpgrade(this, draw) && tryOpenDirectAlbumNow(this, draw)) {
             return
         }
         if (!hasInstalledMusicApp(this)) {

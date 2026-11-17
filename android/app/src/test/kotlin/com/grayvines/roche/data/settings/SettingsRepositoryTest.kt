@@ -8,13 +8,16 @@ import androidx.datastore.preferences.core.edit
 import com.grayvines.roche.MusicUrlCandidate
 import com.grayvines.roche.MusicUrlResolution
 import com.grayvines.roche.data.CollectionDrawSnapshot
+import com.grayvines.roche.data.buildYoutubeMusicAlbumUrl
 import com.grayvines.roche.data.candidateStreamingUrls
 import com.grayvines.roche.isHostDomainSelected
 import com.grayvines.roche.isNonMusicVideoPackage
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.rewriteUrlForTargetPackage
 import com.grayvines.roche.selectMusicUrlResolution
+import com.grayvines.roche.usesYoutubePlaylistUrl
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.KeyGenerator
@@ -501,6 +504,42 @@ class SettingsRepositoryTest {
             isHostDomainSelected(mapOf("music.youtube.com" to selected), "music.youtube.com")
         )
         assertTrue(isHostDomainSelected(mapOf("*.spotify.com" to selected), "open.spotify.com"))
+
+        // Metrolist misroutes music.youtube.com/playlist?list=OLAK5uy_... to Album(OLAK5uy_...),
+        // which fails InnerTube browse; fallback OLAK5uy_ playlists rewrite to www.youtube.com,
+        // while MPREb_ album browse URLs stay on music.youtube.com.
+        assertEquals(
+            "https://www.youtube.com/playlist?list=OLAK5uy_1",
+            rewriteUrlForTargetPackage(
+                "com.metrolist.music",
+                "https://music.youtube.com/playlist?list=OLAK5uy_1",
+            ),
+        )
+        assertEquals(
+            "https://music.youtube.com/browse/MPREb_1",
+            rewriteUrlForTargetPackage(
+                "com.metrolist.music",
+                "https://music.youtube.com/browse/MPREb_1",
+            ),
+        )
+        assertEquals(
+            "https://music.youtube.com/playlist?list=OLAK5uy_1",
+            rewriteUrlForTargetPackage(
+                "com.google.android.apps.youtube.music",
+                "https://music.youtube.com/playlist?list=OLAK5uy_1",
+            ),
+        )
+        assertTrue(usesYoutubePlaylistUrl(MusicUrlResolution.SingleTarget(metrolistMatch)))
+        assertFalse(usesYoutubePlaylistUrl(MusicUrlResolution.SingleTarget(spotifyMatch)))
+
+        assertEquals(
+            "https://music.youtube.com/playlist?list=OLAK5uy_mB7Rr5lil8SH5pkUFQ2F_OspPGHGjyTxY",
+            buildYoutubeMusicAlbumUrl("OLAK5uy_ OLAK5uy_mB7Rr5lil8SH5pkUFQ2F_OspPGHGjyTxY"),
+        )
+        assertEquals(
+            "https://music.youtube.com/playlist?list=OLAK5uy_kJfpwpJMDx4NaYhPHnNQLZfBZkX7-qmmQ",
+            buildYoutubeMusicAlbumUrl("OLAK5uy_kJfpwpJMDx4NaYhPHnNQLZfBZkX7-qmmQ&feature=share"),
+        )
     }
 
     @Test
