@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.grayvines.roche.data.NetworkTier
 import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.RocheDatabase
@@ -42,8 +43,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -105,7 +108,7 @@ class MainViewModelTest {
 
     @Test
     fun `OpenAddSheet populates prefilled url and title and CloseAddSheet resets both`() = runTest {
-        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+        val collectJob = collectInBackground(viewModel.uiState)
 
         viewModel.dispatch(MainAction.OpenContextSheet("item-1"))
         viewModel.dispatch(
@@ -133,7 +136,7 @@ class MainViewModelTest {
     @Test
     fun `SaveUrlOrFeed saves entry with prefilled title and clears reader and add sheet state`() =
         runTest {
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
 
             viewModel.dispatch(MainAction.OpenReader("item-1"))
             viewModel.dispatch(
@@ -174,7 +177,7 @@ class MainViewModelTest {
     @Test
     fun `UpdateReadProgress persists clamped progress to repository`() = runTest {
         database.dao().upsertItems(SeedData.items)
-        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+        val collectJob = collectInBackground(viewModel.uiState)
 
         viewModel.dispatch(MainAction.UpdateReadProgress(entryId = "item-1", progress = 0.65))
 
@@ -206,7 +209,7 @@ class MainViewModelTest {
         runTest {
             database.dao().upsertFeeds(SeedData.feeds)
             database.dao().upsertItems(SeedData.items)
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
 
             // Select a feed and open reader + context sheet for item-1
             viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
@@ -282,7 +285,7 @@ class MainViewModelTest {
         runTest {
             database.dao().upsertFeeds(SeedData.feeds)
             database.dao().upsertItems(SeedData.items)
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
 
             viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
             viewModel.dispatch(MainAction.FilterByFeed("feed-arxiv-cs-lg"))
@@ -363,7 +366,7 @@ class MainViewModelTest {
                 )
             database.dao().upsertFeeds(mixedFeeds)
             database.dao().upsertTags(mixedTags)
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             val state =
                 viewModel.uiState.first {
                     it.feeds.size == mixedFeeds.size && it.tags.size == mixedTags.size
@@ -437,7 +440,7 @@ class MainViewModelTest {
             ),
         )
 
-        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+        val collectJob = collectInBackground(viewModel.uiState)
         viewModel.dispatch(MainAction.PollFeedsOnDeviceNow)
         val updated =
             viewModel.uiState.first {
@@ -461,7 +464,7 @@ class MainViewModelTest {
                         status = "unread",
                     )
                 )
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
 
             viewModel.dispatch(MainAction.SetReaderFontScale(1.15f))
             val scaled = viewModel.uiState.first { it.settings.readerFontScale == 1.15f }
@@ -515,7 +518,7 @@ class MainViewModelTest {
                         status = "unread",
                     )
                 )
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
 
             viewModel.dispatch(MainAction.OpenFeedContextSheet("f-archive"))
             viewModel.uiState.first { it.feedContextSheetId == "f-archive" }
@@ -602,7 +605,7 @@ class MainViewModelTest {
             assertTrue(viewModel.uiState.value.isInitialLoading)
             assertTrue(viewModel.uiState.value.visibleEntries.isEmpty())
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             val loadedState = viewModel.uiState.first { !it.isInitialLoading }
             assertFalse(loadedState.isInitialLoading)
             assertEquals(1, loadedState.visibleEntries.size)
@@ -671,7 +674,7 @@ class MainViewModelTest {
             database.dao().upsertFeeds(listOf(testFeed("f-1", "Systems Blog"), podcastFeed))
             database.dao().upsertItems(listOf(ep1, articleMid, ep2))
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 3 }
 
             // Queue: ep-1, art-mid, ep-2
@@ -792,7 +795,7 @@ class MainViewModelTest {
             database.dao().upsertFeeds(listOf(podcastFeed))
             database.dao().upsertItems(listOf(ep1, ep2))
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 2 }
             viewModel.dispatch(MainAction.AddToQueue("ep-a"))
             viewModel.dispatch(MainAction.AddToQueue("ep-b"))
@@ -886,7 +889,7 @@ class MainViewModelTest {
             database.dao().upsertFeeds(listOf(podcastFeed))
             database.dao().upsertItems(listOf(ep))
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 1 }
 
             playerBackend.failNextLoad = true
@@ -1022,7 +1025,7 @@ class MainViewModelTest {
                 )
             assertEquals(1, tierQueryCount)
 
-            val collectJob = backgroundScope.launch { localVm.uiState.collect() }
+            val collectJob = collectInBackground(localVm.uiState)
             val initial = localVm.uiState.first { !it.isInitialLoading }
             assertEquals(NetworkTier.CELLULAR, initial.localNetworkTier)
             assertEquals(1, tierQueryCount)
@@ -1179,7 +1182,7 @@ class MainViewModelTest {
             database.dao().upsertFeeds(listOf(activeFeed, archivedFeed))
             database.dao().upsertItems(listOf(episode, article))
 
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 2 && it.feeds.size == 2 }
 
             viewModel.dispatch(MainAction.AddToQueue("ep-stage-1"))
@@ -1191,6 +1194,7 @@ class MainViewModelTest {
             val beforeState =
                 viewModel.uiState.first {
                     it.playerState.currentEntryId == "ep-stage-1" &&
+                        !it.playerState.isBuffering &&
                         it.queueEntries.size == 2 &&
                         it.searchQuery == "Systems" &&
                         it.searchResults.size == 2 &&
@@ -1247,41 +1251,116 @@ class MainViewModelTest {
             // Seeking on a shared controller without DB mutation updates playerState.positionMs
             // while keeping visibleEntries and searchResults reference-identical (assertSame)
             val seekBackend = FakeAudioPlayerBackend()
-            val seekController =
-                PodcastPlayerController(scope = backgroundScope, backend = seekBackend)
+            val seekScope =
+                CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+            val seekController = PodcastPlayerController(scope = seekScope, backend = seekBackend)
             val seekVm =
                 MainViewModel(
                     repository = repository,
                     settingsRepository = settings,
                     sharedPlayerController = seekController,
                 )
-            val seekCollectJob = backgroundScope.launch { seekVm.uiState.collect() }
-            seekVm.dispatch(MainAction.UpdateSearchQuery("Systems"))
-            seekVm.awaitBackgroundUiWorkForTest()
-            val initialSeekState =
-                seekVm.uiState.first { !it.isInitialLoading && it.searchQuery == "Systems" }
-            seekController.playEntry(
-                entry = initialSeekState.allEntries.first { it.id == "ep-stage-1" },
-                sourceUriOrPath = "https://example.com/stage-1.mp3",
-                speed = 1.0f,
-                skipSilenceEnabled = false,
-            )
-            val seekBefore =
-                seekVm.uiState.first {
-                    it.playerState.currentEntryId == "ep-stage-1" && it.readerContent != null
-                }
-            seekController.cancelAutoTickerForTest()
-            seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
-            val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }
-            assertEquals(42_000L, afterSeek.playerState.positionMs)
-            assertSame(seekBefore.visibleEntries, afterSeek.visibleEntries)
-            assertSame(seekBefore.searchResults, afterSeek.searchResults)
-
-            seekController.releaseController()
-            seekCollectJob.cancel()
-            seekVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            val seekCollectJob = collectInBackground(seekVm.uiState)
+            try {
+                seekVm.dispatch(MainAction.UpdateSearchQuery("Systems"))
+                seekVm.awaitBackgroundUiWorkForTest()
+                val initialSeekState =
+                    seekVm.uiState.first { !it.isInitialLoading && it.searchQuery == "Systems" }
+                seekController.playEntry(
+                    entry = initialSeekState.allEntries.first { it.id == "ep-stage-1" },
+                    sourceUriOrPath = "https://example.com/stage-1.mp3",
+                    speed = 1.0f,
+                    skipSilenceEnabled = false,
+                )
+                seekController.cancelAutoTickerForTest()
+                val seekBefore =
+                    seekVm.uiState.first {
+                        it.playerState.currentEntryId == "ep-stage-1" &&
+                            !it.playerState.isBuffering &&
+                            it.readerContent != null
+                    }
+                seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
+                val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }
+                assertEquals(42_000L, afterSeek.playerState.positionMs)
+                assertSame(seekBefore.visibleEntries, afterSeek.visibleEntries)
+                assertSame(seekBefore.searchResults, afterSeek.searchResults)
+            } finally {
+                seekController.releaseController()
+                seekCollectJob.cancel()
+                seekVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+                seekScope.coroutineContext[Job]?.cancelAndJoin()
+            }
             viewModel.playerController.stopAndClear()
             collectJob.cancel()
+        }
+
+    @Test
+    internal fun `mergeBaseWithPlayerState preserves re-entrant onBuilt updates and concurrent emissions`() =
+        runTest {
+            val queuedEpisode =
+                com.grayvines.roche.data.toInboxEntry(
+                    testItem("ep-next", "Next Episode").copy(contentType = "audio"),
+                    emptyList(),
+                )
+            val baseFlow = MutableStateFlow(MainUiState())
+            val playerFlow = MutableStateFlow(PodcastPlayerState(currentEntryId = "ep-now"))
+            val mergeScope =
+                CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
+            try {
+                val mergedState =
+                    mergeBaseWithPlayerState(baseFlow, playerFlow) { built ->
+                            val hasNext = built.nextQueuedAudioEntryId != null
+                            if (playerFlow.value.hasNextQueuedAudio != hasNext) {
+                                playerFlow.value =
+                                    playerFlow.value.copy(hasNextQueuedAudio = hasNext)
+                            }
+                            Thread.yield()
+                        }
+                        .stateIn(
+                            scope = mergeScope,
+                            started = kotlinx.coroutines.flow.SharingStarted.Eagerly,
+                            initialValue = MainUiState(),
+                        )
+
+                baseFlow.value =
+                    MainUiState(
+                        allEntries = listOf(queuedEpisode),
+                        settings =
+                            com.grayvines.roche.data.settings.Settings(
+                                queueItemIds = listOf("ep-next")
+                            ),
+                    )
+                assertTrue(mergedState.value.playerState.hasNextQueuedAudio)
+
+                val rounds = 200L
+                for (round in 1L..rounds) {
+                    val barrier = java.util.concurrent.CyclicBarrier(2)
+                    val writerA =
+                        async(Dispatchers.Default) {
+                            barrier.await()
+                            baseFlow.value = baseFlow.value.copy(messageSequence = round)
+                        }
+                    val writerB =
+                        async(Dispatchers.IO) {
+                            barrier.await()
+                            playerFlow.value = playerFlow.value.copy(positionMs = round * 1_000L)
+                        }
+                    awaitAll(writerA, writerB)
+                    val current =
+                        kotlinx.coroutines.withContext(Dispatchers.Default) {
+                            kotlinx.coroutines.withTimeout(1_000L) {
+                                mergedState.first {
+                                    it.messageSequence == round &&
+                                        it.playerState.positionMs == round * 1_000L
+                                }
+                            }
+                        }
+                    assertEquals(round, current.messageSequence)
+                    assertEquals(round * 1_000L, current.playerState.positionMs)
+                }
+            } finally {
+                mergeScope.coroutineContext[Job]?.cancelAndJoin()
+            }
         }
 
     @Test
@@ -1333,7 +1412,7 @@ class MainViewModelTest {
                     )
                 val firstVm = ViewModelProvider(store1, factory)[MainViewModel::class.java]
                 vm1 = firstVm
-                val collect1 = backgroundScope.launch { firstVm.uiState.collect() }
+                val collect1 = collectInBackground(firstVm.uiState)
                 firstVm.uiState.first { it.allEntries.size == 2 }
 
                 firstVm.dispatch(MainAction.AddToQueue("ep-shared-1"))
@@ -1367,7 +1446,7 @@ class MainViewModelTest {
                 assertEquals("ep-shared-1", secondVm.uiState.value.playerState.currentEntryId)
                 assertTrue(secondVm.uiState.value.playerState.isPlaying)
 
-                val collect2 = backgroundScope.launch { secondVm.uiState.collect() }
+                val collect2 = collectInBackground(secondVm.uiState)
                 val liveState =
                     secondVm.uiState.first {
                         !it.isInitialLoading && it.activePlayerEntry?.id == "ep-shared-1"
@@ -1532,7 +1611,7 @@ class MainViewModelTest {
                     testItem(id = "item-fast-star", title = "Optimistic Star Target")
                         .copy(contentText = deepText, contentHtml = "<p>$deepText</p>")
                 )
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.visibleEntries.any { e -> e.id == "item-fast-star" } }
 
             // ToggleStar flips favorite immediately in uiState
@@ -1625,7 +1704,7 @@ class MainViewModelTest {
                         position = (idx + 1).toDouble(),
                     )
                 }
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             try {
                 assertTrue(viewModel.uiState.value.activeCollectionDraws.isEmpty())
 
@@ -1691,7 +1770,7 @@ class MainViewModelTest {
     @Test
     fun `want queue priority scope completion rank handoff custom list add and tie grouping work without races`() =
         runTest {
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             try {
                 // Seed one consumed movie so completing a Want movie has >= 2 items to rank
                 viewModel.dispatch(

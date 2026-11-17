@@ -103,7 +103,7 @@ class MainViewModel(
             ) { built ->
                 playerController.updateHasNextQueuedAudio(built.nextQueuedAudioEntryId != null)
                 playerController.updateSmartRewindEnabled(built.settings.smartRewindEnabled)
-                playerController.setSkipSilence(built.settings.skipSilenceEnabled)
+                playerController.syncSkipSilenceFromSettings(built.settings.skipSilenceEnabled)
             }
             .stateIn(
                 scope = viewModelScope,

@@ -1,15 +1,14 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
-import androidx.room3.Room
-import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.ConsumptionStatus
 import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.THUMBNAILS_SUBDIR
+import com.grayvines.roche.data.TestRocheEnv
+import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDatabase
@@ -27,17 +26,13 @@ import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -57,38 +52,30 @@ import org.junit.jupiter.api.io.TempDir
 class RankBoardAndGate5UiLogicTest {
     @TempDir lateinit var tempDir: File
 
-    private lateinit var dataStoreScope: CoroutineScope
-    private lateinit var database: RocheDatabase
-    private lateinit var settings: SettingsRepository
-    private lateinit var repository: RocheRepository
+    private lateinit var testEnv: TestRocheEnv
+    private val database: RocheDatabase
+        get() = testEnv.database
+
+    private val settings: SettingsRepository
+        get() = testEnv.settings
+
+    private val repository: RocheRepository
+        get() = testEnv.repository
+
     private lateinit var viewModel: MainViewModel
 
     @BeforeEach
     fun setUp() {
         Dispatchers.setMain(UnconfinedTestDispatcher())
-        database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
-        dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val dataStore =
-            PreferenceDataStoreFactory.create(
-                scope = dataStoreScope,
-                produceFile = { File(tempDir, "gate5_settings.preferences_pb") },
-            )
-        settings = SettingsRepository(dataStore)
-        val apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") }
-        repository =
-            RocheRepository(database = database, apiClient = apiClient, settings = settings)
+        testEnv = TestRocheEnv(tempDir, "gate5_settings.preferences_pb")
         viewModel = MainViewModel(repository = repository, settingsRepository = settings)
     }
 
     @AfterEach
     fun tearDown() {
         viewModel.playerController.releaseController()
-        runBlocking {
-            viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
-            dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
-        }
-        database.close()
+        runBlocking { viewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin() }
+        testEnv.close()
         Dispatchers.resetMain()
     }
 
@@ -211,7 +198,7 @@ class RankBoardAndGate5UiLogicTest {
                         sampleItem("i-other", "Gardening Notes"),
                     )
                 )
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 2 }
 
             viewModel.dispatch(MainAction.OpenSearch)
@@ -294,7 +281,7 @@ class RankBoardAndGate5UiLogicTest {
     @Test
     fun `ToggleArchive flushes liveReadProgress sequentially before archiving`() = runTest {
         database.dao().upsertItem(sampleItem("i-flush", "Reader Article"))
-        val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+        val collectJob = collectInBackground(viewModel.uiState)
         val loaded = viewModel.uiState.first { it.allEntries.any { e -> e.id == "i-flush" } }
         val target = loaded.allEntries.first { it.id == "i-flush" }
 
@@ -314,7 +301,7 @@ class RankBoardAndGate5UiLogicTest {
     @Test
     fun `logging item number 1 with rankAfterLog shows status banner instead of zero-comparison sheet`() =
         runTest {
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.dispatch(
                 MainAction.SubmitQuickLog(
                     kind = EntryKind.BOOK,
@@ -397,7 +384,7 @@ class RankBoardAndGate5UiLogicTest {
     fun `popActionForTopKey pops Reader back to Search and preserves searchQuery before Home`() =
         runTest {
             database.dao().upsertItem(sampleItem("entry-search-1", "Navigation 3 Deep Dive"))
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 1 }
 
             viewModel.dispatch(MainAction.SelectTab(AppTab.HOME))
@@ -472,7 +459,7 @@ class RankBoardAndGate5UiLogicTest {
     fun `OpenCompanionSection clears scoped inbox state and destination helpers preserve back lists`() =
         runTest {
             seedTwoScopedFeeds()
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 2 }
 
             viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
@@ -536,14 +523,17 @@ class RankBoardAndGate5UiLogicTest {
     fun `OpenReader forceArticleView and PlayAudioEntry transition cleanly between Player and Reader`() =
         runTest {
             seedAudioEpisode("ep-nav-1")
-            val collectJob = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 1 }
 
             viewModel.dispatch(MainAction.OpenReader("ep-nav-1"))
             val inPlayer =
                 viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-nav-1" && it.playerState.isFullscreenOpen
+                    it.playerState.currentEntryId == "ep-nav-1" &&
+                        !it.playerState.isBuffering &&
+                        it.playerState.isFullscreenOpen
                 }
+            viewModel.playerController.cancelAutoTickerForTest()
             assertNull(inPlayer.selectedReaderEntryId)
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.FullscreenPlayer("ep-nav-1")),
@@ -593,7 +583,7 @@ class RankBoardAndGate5UiLogicTest {
                     sampleItem("i-f1", "Systems Article", feedId = "f-1")
                         .copy(contentText = deepBody, contentHtml = "<p>$deepBody</p>")
                 )
-            val collectJob1 = backgroundScope.launch { viewModel.uiState.collect() }
+            val collectJob1 = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 2 }
 
             viewModel.dispatch(MainAction.SelectTab(AppTab.FEEDS))
@@ -645,7 +635,7 @@ class RankBoardAndGate5UiLogicTest {
                 deriveRocheBackStack(initialFrame),
             )
 
-            val collectJob = backgroundScope.launch { recreatedVm.uiState.collect() }
+            val collectJob = collectInBackground(recreatedVm.uiState)
             val hydrated =
                 recreatedVm.uiState.first {
                     !it.isInitialLoading &&
@@ -689,7 +679,7 @@ class RankBoardAndGate5UiLogicTest {
                     ),
             )
         try {
-            val collectJob = backgroundScope.launch { staleVm.uiState.collect() }
+            val collectJob = collectInBackground(staleVm.uiState)
             val reconciled =
                 staleVm.uiState.first {
                     !it.isInitialLoading &&

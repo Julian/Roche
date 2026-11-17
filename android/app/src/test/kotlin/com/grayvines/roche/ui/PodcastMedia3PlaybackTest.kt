@@ -7,6 +7,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedEntity
 import com.grayvines.roche.data.local.ItemEntity
 import com.grayvines.roche.data.local.RocheDatabase
@@ -27,10 +28,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.joinAll
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -224,7 +223,7 @@ class PodcastMedia3PlaybackTest {
                     playerBackend = backend,
                 )
             val vm = MainViewModel(repo, settings, sharedPlayerController = controller)
-            val collectJob = backgroundScope.launch { vm.uiState.collect() }
+            val collectJob = collectInBackground(vm.uiState)
             try {
                 assertFalse(vm.uiState.value.playerState.skipSilenceEnabled)
                 vm.uiState.first { !it.isInitialLoading && !it.playerState.skipSilenceEnabled }
@@ -389,7 +388,7 @@ class PodcastMedia3PlaybackTest {
                 activeJobs.joinAll()
             }
         }
-        val collectJob = backgroundScope.launch { vm.uiState.collect() }
+        val collectJob = collectInBackground(vm.uiState)
         try {
             vm.uiState.first { it.allEntries.size == 1 }
             vm.dispatch(MainAction.PlayAudioEntry("ep-1"))

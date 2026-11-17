@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 
@@ -1102,34 +1103,37 @@ internal fun mergeBaseWithPlayerState(
     playerFlow: StateFlow<PodcastPlayerState>,
     onBuilt: (MainUiState) -> Unit,
 ): Flow<MainUiState> = channelFlow {
+    val lock = Any()
     var latestBase: MainUiState? = null
     var latestPlayer: PodcastPlayerState = playerFlow.value
-    val sendMerged = {
-        val base = latestBase
-        if (base != null) {
-            val merged =
+
+    fun sendMerged(updateBase: MainUiState?, updatePlayer: PodcastPlayerState?) {
+        synchronized(lock) {
+            if (updateBase != null) latestBase = updateBase
+            if (updatePlayer != null) latestPlayer = updatePlayer
+            val base = latestBase ?: return
+            val player = latestPlayer
+            val hasNextQueuedAudio =
+                base.queueEntries.any { entry ->
+                    entry.contentType == ContentType.AUDIO && entry.id != player.currentEntryId
+                }
+            trySend(
                 base.copy(
                     playerState =
-                        latestPlayer.copy(
+                        player.copy(
+                            hasNextQueuedAudio = hasNextQueuedAudio,
                             smartRewindEnabled = base.settings.smartRewindEnabled,
                             skipSilenceEnabled = base.settings.skipSilenceEnabled,
                         )
                 )
-            onBuilt(merged)
-            trySend(merged)
+            )
         }
     }
-    launch {
-        baseFlow.collect { base ->
-            latestBase = base
-            sendMerged()
-        }
-    }
-    playerFlow.collect { player ->
-        latestPlayer = player
-        sendMerged()
-    }
+
+    launch { baseFlow.collect { base -> sendMerged(updateBase = base, updatePlayer = null) } }
+    playerFlow.collect { player -> sendMerged(updateBase = null, updatePlayer = player) }
 }
     .buffer(Channel.CONFLATED)
+    .onEach { merged -> onBuilt(merged) }
 
 internal const val SNACKBAR_TITLE_LIMIT = 36

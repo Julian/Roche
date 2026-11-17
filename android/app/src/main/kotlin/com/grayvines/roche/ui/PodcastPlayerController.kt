@@ -238,6 +238,7 @@ class PodcastPlayerController(
     @Volatile private var pendingResumeProgress: Double? = null
     @Volatile private var activeSourceUriOrPath: String = ""
     @Volatile private var backendFailed: Boolean = false
+    @Volatile private var skipSilenceSyncedOnce: Boolean = false
     @Volatile private var lastPersistedEntryId: String? = null
     @Volatile private var lastPersistedProgress: Double = -1.0
     private val uiErrorListeners = CopyOnWriteArraySet<(String) -> Unit>()
@@ -557,8 +558,15 @@ class PodcastPlayerController(
     }
 
     fun setSkipSilence(enabled: Boolean) {
+        skipSilenceSyncedOnce = true
         backend.setSkipSilence(enabled)
         _state.update { it.copy(skipSilenceEnabled = enabled) }
+    }
+
+    internal fun syncSkipSilenceFromSettings(enabled: Boolean) {
+        if (!skipSilenceSyncedOnce || _state.value.skipSilenceEnabled != enabled) {
+            setSkipSilence(enabled)
+        }
     }
 
     fun setSleepTimerMinutes(minutes: Int?) {
@@ -625,6 +633,7 @@ class PodcastPlayerController(
 
     fun releaseController() {
         stopAndClear()
+        skipSilenceSyncedOnce = false
         backend.bindExternalPlayStateListener(null)
         mediaSessionBridge.unbindCallbacks(this)
     }
