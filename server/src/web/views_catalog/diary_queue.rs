@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use axum::{
     Form,
@@ -24,6 +28,7 @@ use crate::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
             web_api_error_response,
         },
+        links::{load_artist_id_by_lower_name, render_creator_links},
     },
 };
 
@@ -44,6 +49,10 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
             return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
         }
     };
+
+    let diary_creators: Vec<String> =
+        entries.iter().flat_map(|e| e.entry.creators.iter().cloned()).collect();
+    let artist_links = load_artist_id_by_lower_name(&service, &diary_creators).await;
 
     // Group chronologically by YYYY-MM (newest first) while preserving order within each month
     let mut months: Vec<(String, Vec<&ConsumptionLogView>)> = Vec::new();
@@ -81,49 +90,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
     }
     body.push_str("</div>\n");
 
-    if months.is_empty() {
-        body.push_str("<p class=\"empty\">No diary entries match this filter.</p>\n");
-    } else {
-        for (month_heading, rows) in months {
-            let _ =
-                writeln!(body, "<section class=\"diary-month\">\n<h3>{}</h3>", esc(&month_heading));
-            for row in rows {
-                let _ = write!(
-                    body,
-                    "<div class=\"diary-row\">\
-                       <span class=\"date\">{}</span>\
-                       <span><a href=\"/entries/{}\">{}</a>",
-                    row.ts.format("%b %d"),
-                    esc(&urlencode(&row.entry.id)),
-                    esc(&row.entry.title),
-                );
-                if !row.entry.creators.is_empty() {
-                    let _ = write!(
-                        body,
-                        " <span style=\"color:var(--ink-soft)\">&mdash; {}</span>",
-                        esc(&row.entry.creators.join(", "))
-                    );
-                }
-                if row.status != ConsumptionStatus::Consumed {
-                    let _ = write!(
-                        body,
-                        " <span class=\"status-tag\">({})</span>",
-                        row.status.as_str()
-                    );
-                }
-                let _ = writeln!(
-                    body,
-                    "</span><span class=\"kind\">{}</span>",
-                    esc(row.entry.kind.display_label())
-                );
-                if let Some(notes) = row.notes.as_deref().filter(|s| !s.is_empty()) {
-                    let _ = writeln!(body, "<div class=\"notes\">{}</div>", esc(notes));
-                }
-                body.push_str("</div>\n");
-            }
-            body.push_str("</section>\n");
-        }
-    }
+    render_diary_months(&mut body, &months, &artist_links);
 
     let flash = FlashQuery { notice: q.notice, err: q.err };
     render_page(&PageShell {
@@ -134,6 +101,49 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
         body_html: &body,
     })
     .into_response()
+}
+
+fn render_diary_months(
+    out: &mut String,
+    months: &[(String, Vec<&ConsumptionLogView>)],
+    artist_links: &HashMap<String, String>,
+) {
+    if months.is_empty() {
+        out.push_str("<p class=\"empty\">No diary entries match this filter.</p>\n");
+        return;
+    }
+    for (month_heading, rows) in months {
+        let _ = writeln!(out, "<section class=\"diary-month\">\n<h3>{}</h3>", esc(month_heading));
+        for row in rows {
+            let _ = write!(
+                out,
+                "<div class=\"diary-row\">\
+                   <span class=\"date\">{}</span>\
+                   <span><a href=\"/entries/{}\">{}</a>",
+                row.ts.format("%b %d"),
+                esc(&urlencode(&row.entry.id)),
+                esc(&row.entry.title),
+            );
+            if !row.entry.creators.is_empty() {
+                out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+                render_creator_links(out, &row.entry.creators, artist_links, false);
+                out.push_str("</span>");
+            }
+            if row.status != ConsumptionStatus::Consumed {
+                let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
+            }
+            let _ = writeln!(
+                out,
+                "</span><span class=\"kind\">{}</span>",
+                esc(row.entry.kind.display_label())
+            );
+            if let Some(notes) = row.notes.as_deref().filter(|s| !s.is_empty()) {
+                let _ = writeln!(out, "<div class=\"notes\">{}</div>", esc(notes));
+            }
+            out.push_str("</div>\n");
+        }
+        out.push_str("</section>\n");
+    }
 }
 
 pub(in crate::web) async fn queue_get<F: FeedFetcher>(
@@ -160,6 +170,12 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         }
     }
 
+    let queue_creators: Vec<String> = ranked_queues
+        .values()
+        .flat_map(|v| v.rows.iter().flat_map(|r| r.entry.creators.iter().cloned()))
+        .collect();
+    let artist_links = load_artist_id_by_lower_name(&service, &queue_creators).await;
+
     let mut body = String::with_capacity(8_192);
     body.push_str(
         "<h2>Queue &amp; Quick Log</h2>\n\
@@ -172,7 +188,7 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         body.push_str("<p class=\"empty\">Your Want queues are empty. Use the form above to add a movie, book, album, paper, or game.</p>\n");
     } else {
         for (_, qview) in ranked_queues {
-            render_want_queue_section(&mut body, &qview, &session.csrf_token);
+            render_want_queue_section(&mut body, &qview, &artist_links, &session.csrf_token);
         }
     }
 
@@ -226,7 +242,12 @@ fn render_quick_log_panel(out: &mut String, csrf: &str) {
     );
 }
 
-fn render_want_queue_section(out: &mut String, qview: &RankedCollectionView, csrf: &str) {
+fn render_want_queue_section(
+    out: &mut String,
+    qview: &RankedCollectionView,
+    artist_links: &HashMap<String, String>,
+    csrf: &str,
+) {
     let q_slug = qview.collection.slug.as_deref().unwrap_or(&qview.collection.id);
     let base_slug = q_slug.strip_prefix("want:").unwrap_or(q_slug);
     let _ = write!(
@@ -245,11 +266,12 @@ fn render_want_queue_section(out: &mut String, qview: &RankedCollectionView, csr
     out.push_str("</div>\n<ol class=\"queue\">\n");
 
     for row in &qview.rows {
-        let by = if row.entry.creators.is_empty() {
-            String::new()
-        } else {
-            format!(" <span class=\"by\">&mdash; {}</span>", esc(&row.entry.creators.join(", ")))
-        };
+        let mut by = String::new();
+        if !row.entry.creators.is_empty() {
+            by.push_str(" <span class=\"by\">&mdash; ");
+            render_creator_links(&mut by, &row.entry.creators, artist_links, false);
+            by.push_str("</span>");
+        }
         let _ = writeln!(
             out,
             "<li><div class=\"queue-row\">\

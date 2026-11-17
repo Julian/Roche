@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt::Write as _, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use axum::{
     body::Bytes,
@@ -10,9 +14,10 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-        safe_external_href, urlencode, web_api_error_response,
+        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+        web_api_error_response,
     },
+    links::{load_artist_id_by_lower_name, render_creator_links, web_primary_open_url},
 };
 use crate::{
     db::{CatalogEntry, ClusterSelectFilter, CollectionRole, CollectionSummary},
@@ -188,14 +193,20 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
             &ranked_view,
         );
     } else {
+        let cluster_creators: Vec<String> =
+            cluster.iter().flat_map(|e| e.creators.iter().cloned()).collect();
+        let artist_links = load_artist_id_by_lower_name(&service, &cluster_creators).await;
         render_active_cluster_view(
             &mut body,
-            &slug,
-            &q,
-            effective_want,
-            &ranked_view.collection,
-            &cluster,
-            &session.csrf_token,
+            &ActiveClusterCtx {
+                slug: &slug,
+                q: &q,
+                is_want: effective_want,
+                collection_title: &ranked_view.collection.title,
+                cluster: &cluster,
+                artist_links: &artist_links,
+                csrf: &session.csrf_token,
+            },
         );
     }
 
@@ -277,17 +288,19 @@ fn render_settled_rank_view(
     out.push_str("<a class=\"btn btn-ghost\" href=\"/\">Home</a>\n</div>\n</div>\n");
 }
 
-fn render_active_cluster_view(
-    out: &mut String,
-    slug: &str,
-    q: &RankSessionQuery,
+struct ActiveClusterCtx<'a> {
+    slug: &'a str,
+    q: &'a RankSessionQuery,
     is_want: bool,
-    collection: &CollectionSummary,
-    cluster: &[CatalogEntry],
-    csrf: &str,
-) {
-    let round = q.round.unwrap_or(0);
-    let mode_label = if is_want { "Local Queue Priority" } else { "Global Quality" };
+    collection_title: &'a str,
+    cluster: &'a [CatalogEntry],
+    artist_links: &'a HashMap<String, String>,
+    csrf: &'a str,
+}
+
+fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
+    let round = ctx.q.round.unwrap_or(0);
+    let mode_label = if ctx.is_want { "Local Queue Priority" } else { "Global Quality" };
     let _ = writeln!(
         out,
         "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
@@ -295,16 +308,16 @@ fn render_active_cluster_view(
            <span class=\"badge\">{} &middot; Round {}</span>\
          </div>\n\
          <p class=\"lede\">Order from best (#1) to worst (#{}). Mark genuinely equal works with <strong>= Tie</strong>.</p>",
-        esc(&collection.title),
+        esc(ctx.collection_title),
         mode_label,
         round + 1,
-        cluster.len(),
+        ctx.cluster.len(),
     );
 
-    let default_groups: Vec<Vec<&str>> = cluster.iter().map(|e| vec![e.id.as_str()]).collect();
+    let default_groups: Vec<Vec<&str>> = ctx.cluster.iter().map(|e| vec![e.id.as_str()]).collect();
     let default_json = serde_json::to_string(&default_groups).unwrap_or_else(|_| "[]".to_owned());
-    let cluster_sig = cluster_signature(cluster);
-    let next_covered = append_covered_signature(q.covered.as_deref(), &cluster_sig);
+    let cluster_sig = cluster_signature(ctx.cluster);
+    let next_covered = append_covered_signature(ctx.q.covered.as_deref(), &cluster_sig);
 
     let _ = write!(
         out,
@@ -316,16 +329,16 @@ fn render_active_cluster_view(
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
            <input type=\"hidden\" name=\"ordering_json\" value=\"{ord_json}\">\n\
            <ul class=\"rank-board js-rank-list\">\n",
-        slug_enc = esc(&urlencode(slug)),
-        csrf = esc(csrf),
-        want = if is_want { "true" } else { "false" },
-        focus = esc(q.focus.as_deref().unwrap_or("")),
+        slug_enc = esc(&urlencode(ctx.slug)),
+        csrf = esc(ctx.csrf),
+        want = if ctx.is_want { "true" } else { "false" },
+        focus = esc(ctx.q.focus.as_deref().unwrap_or("")),
         covered = esc(&next_covered),
         ord_json = esc(&default_json),
     );
 
-    for (idx, item) in cluster.iter().enumerate() {
-        render_cluster_card(out, idx, item, cluster.len());
+    for (idx, item) in ctx.cluster.iter().enumerate() {
+        render_cluster_card(out, idx, item, ctx.cluster.len(), ctx.artist_links);
     }
 
     out.push_str(
@@ -349,25 +362,25 @@ fn render_active_cluster_view(
            <button type=\"submit\" class=\"btn btn-small btn-ghost\">Skip Cluster (s)</button>\n\
          </form>\n\
          <p class=\"rank-shortcuts\">Shortcuts: j/k select &middot; J/K move &middot; 1&ndash;{k} jump &middot; = tie &middot; t tie all &middot; s skip &middot; o open link &middot; Enter submit</p>\n",
-        slug_enc = esc(&urlencode(slug)),
-        want = if is_want { "true" } else { "false" },
-        focus = esc(q.focus.as_deref().unwrap_or("")),
+        slug_enc = esc(&urlencode(ctx.slug)),
+        want = if ctx.is_want { "true" } else { "false" },
+        focus = esc(ctx.q.focus.as_deref().unwrap_or("")),
         next_round = round + 1,
         covered = esc(&next_covered),
-        k = cluster.len(),
+        k = ctx.cluster.len(),
     );
 }
 
-fn render_cluster_card(out: &mut String, idx: usize, item: &CatalogEntry, cluster_len: usize) {
+fn render_cluster_card(
+    out: &mut String,
+    idx: usize,
+    item: &CatalogEntry,
+    cluster_len: usize,
+    artist_links: &HashMap<String, String>,
+) {
     let rank_num = idx + 1;
     let sel_cls = if idx == 0 { " is-selected" } else { "" };
-    let open_url = item
-        .primary_open_url()
-        .as_deref()
-        .and_then(safe_external_href)
-        .filter(|u| !u.starts_with("https://roche.local/"))
-        .unwrap_or("")
-        .to_owned();
+    let open_url = web_primary_open_url(item).unwrap_or_default();
 
     let _ = write!(
         out,
@@ -382,11 +395,9 @@ fn render_cluster_card(out: &mut String, idx: usize, item: &CatalogEntry, cluste
         title = esc(&item.title),
     );
     if !item.creators.is_empty() {
-        let _ = write!(
-            out,
-            " <span style=\"color:var(--ink-soft)\">&mdash; {}</span>",
-            esc(&item.creators.join(", "))
-        );
+        out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+        render_creator_links(out, &item.creators, artist_links, true);
+        out.push_str("</span>");
     }
     if let Some(yr) = item.release_year {
         let _ = write!(out, " <span style=\"color:var(--ink-faint)\">({yr})</span>");

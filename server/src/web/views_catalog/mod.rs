@@ -2,16 +2,12 @@ mod diary_queue;
 mod entry;
 mod lists;
 
-use std::{collections::HashMap, fmt::Write as _};
+use std::fmt::Write as _;
 
 use serde::Deserialize;
 
 use super::html::esc;
-use crate::{
-    db::{ConsumptionStatus, EntryKind},
-    scheduler::FeedFetcher,
-    service::RocheService,
-};
+use crate::db::{ConsumptionStatus, EntryKind};
 
 pub(super) use diary_queue::{
     diary_get, post_quick_log, post_want_complete, post_want_remove, queue_get,
@@ -94,13 +90,6 @@ pub(super) struct QuickLogForm {
 pub(super) struct WantCompleteForm {
     #[serde(default)]
     pub rank_after: Option<String>,
-}
-
-pub(super) async fn load_artist_id_by_lower_name<F: FeedFetcher>(
-    service: &RocheService<F>,
-    creator_names: &[String],
-) -> HashMap<String, String> {
-    service.catalog().find_artist_ids_by_names(creator_names).await.unwrap_or_default()
 }
 
 pub(super) fn render_kind_options(selected: EntryKind) -> String {

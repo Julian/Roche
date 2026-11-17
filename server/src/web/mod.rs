@@ -1,5 +1,6 @@
 mod auth;
 mod html;
+mod links;
 #[cfg(test)]
 mod tests;
 mod views_catalog;

@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 
 use axum::{
     Form,
@@ -13,6 +13,7 @@ use super::{
         FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
         safe_external_href, urlencode, web_api_error_response,
     },
+    links::{collect_web_external_links, load_artist_id_by_lower_name, render_creator_links},
     views_reader::render_audio_play_button,
 };
 use crate::{
@@ -71,9 +72,17 @@ async fn render_home_inner<F: FeedFetcher>(
     let recent_diary = service.catalog().list_diary(None, None, 8).await?;
     let collections = service.catalog().list_collections(true, false).await?;
 
+    let mut home_creators: Vec<String> = active_generators
+        .iter()
+        .filter_map(|g| g.current_entry.as_ref())
+        .flat_map(|e| e.creators.iter().cloned())
+        .collect();
+    home_creators.extend(recent_diary.iter().flat_map(|d| d.entry.creators.iter().cloned()));
+    let artist_links = load_artist_id_by_lower_name(service, &home_creators).await;
+
     let mut body = String::with_capacity(8_192);
     for gen_state in &active_generators {
-        render_collection_draw_section(&mut body, gen_state, &session.csrf_token);
+        render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
     }
     render_in_progress_section(&mut body, &unread_page.items);
 
@@ -92,7 +101,7 @@ async fn render_home_inner<F: FeedFetcher>(
     }
 
     render_unread_summary_section(&mut body, &unread_page.items, sync_status.unread_items_count);
-    render_recent_diary_section(&mut body, &recent_diary);
+    render_recent_diary_section(&mut body, &recent_diary, &artist_links);
 
     Ok(render_page(&PageShell {
         title: "Roche",
@@ -107,6 +116,7 @@ async fn render_home_inner<F: FeedFetcher>(
 pub(in crate::web) fn render_collection_draw_section(
     out: &mut String,
     state: &CollectionGeneratorState,
+    artist_links: &HashMap<String, String>,
     csrf: &str,
 ) {
     let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
@@ -165,23 +175,16 @@ pub(in crate::web) fn render_collection_draw_section(
     );
 
     if !entry.creators.is_empty() || entry.release_year.is_some() {
-        let creator_line = entry.creators.join(", ");
-        match (creator_line.is_empty(), entry.release_year) {
-            (false, Some(yr)) => {
-                let _ = writeln!(
-                    out,
-                    "<div class=\"album-artist\">{} ({yr})</div>",
-                    esc(&creator_line)
-                );
+        out.push_str("<div class=\"album-artist\">");
+        render_creator_links(out, &entry.creators, artist_links, false);
+        if let Some(yr) = entry.release_year {
+            if entry.creators.is_empty() {
+                let _ = write!(out, "{yr}");
+            } else {
+                let _ = write!(out, " ({yr})");
             }
-            (false, None) => {
-                let _ = writeln!(out, "<div class=\"album-artist\">{}</div>", esc(&creator_line));
-            }
-            (true, Some(yr)) => {
-                let _ = writeln!(out, "<div class=\"album-artist\">{yr}</div>");
-            }
-            (true, None) => {}
         }
+        out.push_str("</div>\n");
     }
 
     let genres = extract_entry_tags(entry);
@@ -189,20 +192,20 @@ pub(in crate::web) fn render_collection_draw_section(
         let _ = writeln!(out, "<div class=\"album-genres\">{}</div>", esc(&genres.join(" · ")));
     }
 
-    out.push_str("<div class=\"album-actions\">\n");
-    for ident in entry.sorted_external_identifiers() {
-        if let Some(ext_url) = ident.external_url()
-            && let Some(safe_href) = safe_external_href(&ext_url)
-        {
+    let ext_links = collect_web_external_links(entry, None);
+    if !ext_links.is_empty() {
+        out.push_str("<div class=\"album-actions\">\n");
+        for link in ext_links {
             let _ = writeln!(
                 out,
-                "<a class=\"btn btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{} &#8599;</a>",
-                esc(safe_href),
-                esc(ident.label())
+                "<a class=\"btn btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{}<span>{}</span></a>",
+                esc(&link.href),
+                link.icon.svg(),
+                esc(&link.label)
             );
         }
+        out.push_str("</div>\n");
     }
-    out.push_str("</div>\n");
 
     render_draw_mutation_forms(out, &list_key_enc, csrf);
     out.push_str("</div>\n</section>\n");
@@ -232,12 +235,7 @@ fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) 
              </div>\n\
              <button type=\"submit\" class=\"btn\">Abandon &amp; Draw Next</button>\n\
            </form>\n\
-         </details>\n\
-         <form method=\"post\" action=\"/web/lists/{list}/generator/toggle\" style=\"margin-top:0.55rem\">\n\
-           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-           <input type=\"hidden\" name=\"enabled\" value=\"false\">\n\
-           <button type=\"submit\" class=\"link-btn\">Pause draw</button>\n\
-         </form>\n",
+         </details>\n",
         list = esc(list_key_enc),
         csrf = esc(csrf),
     );
@@ -342,7 +340,11 @@ fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread:
     out.push_str("</ul>\n");
 }
 
-fn render_recent_diary_section(out: &mut String, diary: &[ConsumptionLogView]) {
+fn render_recent_diary_section(
+    out: &mut String,
+    diary: &[ConsumptionLogView],
+    artist_links: &HashMap<String, String>,
+) {
     out.push_str(
         "<div class=\"section-head\"><h3>Recent Diary</h3>\
          <a class=\"section-action\" href=\"/diary\">Full Diary &rarr;</a></div>\n",
@@ -365,11 +367,9 @@ fn render_recent_diary_section(out: &mut String, diary: &[ConsumptionLogView]) {
             esc(&row.entry.title),
         );
         if !row.entry.creators.is_empty() {
-            let _ = write!(
-                out,
-                " <span style=\"color:var(--ink-soft)\">&mdash; {}</span>",
-                esc(&row.entry.creators.join(", "))
-            );
+            out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+            render_creator_links(out, &row.entry.creators, artist_links, false);
+            out.push_str("</span>");
         }
         if row.status != ConsumptionStatus::Consumed {
             let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());

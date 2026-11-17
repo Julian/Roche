@@ -6,10 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{
-    EntryAddToListForm, EntryLogForm, EntryMergeForm, load_artist_id_by_lower_name,
-    parse_consumption_status,
-};
+use super::{EntryAddToListForm, EntryLogForm, EntryMergeForm, parse_consumption_status};
 use crate::{
     db::{
         CatalogEntry, CollectionMode, CollectionRole, CollectionSummary, ConsumptionStatus,
@@ -21,9 +18,10 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-            safe_external_href, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+            web_api_error_response,
         },
+        links::{collect_web_external_links, load_artist_id_by_lower_name, render_creator_links},
     },
 };
 
@@ -145,21 +143,7 @@ fn render_entry_detail_body(
     let _ = writeln!(out, "<dt>Kind</dt><dd>{}</dd>", esc(entry.kind.display_label()));
     if !entry.creators.is_empty() {
         out.push_str("<dt>By</dt><dd>");
-        for (idx, creator) in entry.creators.iter().enumerate() {
-            if idx > 0 {
-                out.push_str(", ");
-            }
-            if let Some(aid) = artist_links.get(&creator.to_lowercase()) {
-                let _ = write!(
-                    out,
-                    "<a href=\"/entries/{}\">{}</a>",
-                    esc(&urlencode(aid)),
-                    esc(creator)
-                );
-            } else {
-                let _ = write!(out, "{}", esc(creator));
-            }
-        }
+        render_creator_links(out, &entry.creators, artist_links, false);
         out.push_str("</dd>\n");
     }
     if let Some(yr) = entry.release_year {
@@ -211,33 +195,18 @@ fn render_entry_detail_body(
 }
 
 fn render_entry_external_links(out: &mut String, entry: &CatalogEntry) {
-    let mut links: Vec<(String, String)> = Vec::new();
-    let mut seen_urls = std::collections::HashSet::new();
-    if let Some(u) = entry.url.as_deref().and_then(safe_external_href)
-        && !u.starts_with("https://roche.local/")
-        && seen_urls.insert(u.to_owned())
-    {
-        links.push(("Open Source".to_owned(), u.to_owned()));
-    }
-    for ident in entry.sorted_external_identifiers() {
-        if let Some(ext_url) = ident.external_url()
-            && let Some(safe_href) = safe_external_href(&ext_url)
-            && !safe_href.starts_with("https://roche.local/")
-            && seen_urls.insert(safe_href.to_owned())
-        {
-            links.push((ident.label().to_owned(), safe_href.to_owned()));
-        }
-    }
+    let links = collect_web_external_links(entry, Some("Open Source"));
     if links.is_empty() {
         return;
     }
     out.push_str("<ul class=\"external-links\">\n");
-    for (label, href) in links {
+    for link in links {
         let _ = writeln!(
             out,
-            "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a></li>",
-            esc(&href),
-            esc(&label)
+            "<li><a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}<span>{}</span></a></li>",
+            esc(&link.href),
+            link.icon.svg(),
+            esc(&link.label)
         );
     }
     out.push_str("</ul>\n");

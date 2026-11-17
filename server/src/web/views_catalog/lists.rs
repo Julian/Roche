@@ -7,8 +7,8 @@ use axum::{
 };
 
 use super::{
-    AddListEntryForm, CreateListForm, ListPageQuery, load_artist_id_by_lower_name, parse_csv_list,
-    parse_optional_year, render_kind_options,
+    AddListEntryForm, CreateListForm, ListPageQuery, parse_csv_list, parse_optional_year,
+    render_kind_options,
 };
 use crate::{
     db::{
@@ -24,6 +24,7 @@ use crate::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
             web_api_error_response,
         },
+        links::{load_artist_id_by_lower_name, render_creator_links},
         views_home::render_collection_draw_section,
     },
 };
@@ -151,12 +152,6 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
     let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
     let start_idx = (page_num - 1) * LIST_PAGE_SIZE;
     let end_idx = (page_num * LIST_PAGE_SIZE).min(total_rows);
-    let page_creators: Vec<String> = view.rows[start_idx..end_idx]
-        .iter()
-        .flat_map(|r| r.entry.creators.iter().cloned())
-        .collect();
-    let artist_links = load_artist_id_by_lower_name(&service, &page_creators).await;
-
     let gen_state = if view.collection.mode == CollectionMode::Manual
         && view.collection.role == CollectionRole::List
     {
@@ -164,6 +159,15 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
     } else {
         None
     };
+
+    let mut page_creators: Vec<String> = view.rows[start_idx..end_idx]
+        .iter()
+        .flat_map(|r| r.entry.creators.iter().cloned())
+        .collect();
+    if let Some(drawn) = gen_state.as_ref().and_then(|gs| gs.current_entry.as_ref()) {
+        page_creators.extend(drawn.creators.iter().cloned());
+    }
+    let artist_links = load_artist_id_by_lower_name(&service, &page_creators).await;
 
     let mut body = String::with_capacity(12_288);
     render_ranked_list_body(
@@ -250,7 +254,7 @@ fn render_ranked_list_body(
     if let Some(gs) = gen_state
         && gs.enabled
     {
-        render_collection_draw_section(out, gs, csrf);
+        render_collection_draw_section(out, gs, artist_links, csrf);
     }
 
     if is_manual_list {
@@ -414,21 +418,7 @@ fn render_creators_span(
         return;
     }
     out.push_str("<span class=\"by\">");
-    for (idx, creator) in creators.iter().enumerate() {
-        if idx > 0 {
-            out.push_str(", ");
-        }
-        if let Some(artist_id) = artist_links.get(&creator.to_lowercase()) {
-            let _ = write!(
-                out,
-                "<a href=\"/entries/{}\">{}</a>",
-                esc(&urlencode(artist_id)),
-                esc(creator)
-            );
-        } else {
-            let _ = write!(out, "{}", esc(creator));
-        }
-    }
+    render_creator_links(out, creators, artist_links, false);
     out.push_str("</span>");
 }
 

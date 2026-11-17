@@ -898,3 +898,204 @@ async fn test_web_csp_and_sanitized_reader_image_privacy_attributes() {
     assert!(html.contains("loading=\"lazy\""));
     assert!(!html.contains("unsafe-url"));
 }
+
+fn ident(scheme: &str, value: &str) -> crate::db::EntryIdentifier {
+    crate::db::EntryIdentifier { scheme: scheme.to_owned(), value: value.to_owned() }
+}
+
+#[tokio::test]
+async fn test_web_music_links_only_show_wikipedia_and_spotify_with_lucide_icons() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let pool = db
+        .catalog()
+        .create_manual_collection(
+            "Album Draw",
+            Some("album_draw"),
+            crate::db::CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let album1 = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "21".to_owned(),
+            creators: vec!["Adele".to_owned()],
+            parent_collection_id: Some(pool.id.clone()),
+            parent_position: Some(1.0),
+            identifiers: vec![
+                ident("wikipedia", "21_(Adele_album)"),
+                ident("spotify", "spotify:album:5duyQokC4FMcWPYTV9Gpf9"),
+                ident("youtube_music", "OLAK5uy_lT9WWb7WZ6MOzwNkItv6Azu835h17W_L0"),
+                ident("apple_music", "1544491232"),
+                ident("tidal", "165813921"),
+                ident("deezer", "746059"),
+                ident("qobuz", "0634904052065"),
+                ident("amazon_music", "B08QDQMVJ1"),
+                ident("musicbrainz_release", "8ef859e3-3204-4b23-85c7-0f3202d8a812"),
+                ident("discogs", "2666996"),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let toggle = post_form(
+        &app,
+        "/web/lists/album_draw/generator/toggle",
+        &cookie,
+        &[("_csrf", &csrf), ("enabled", "true")],
+    )
+    .await;
+    assert_eq!(toggle.status(), StatusCode::SEE_OTHER);
+
+    let artists = db.catalog().find_artist_ids_by_names(&["Adele".to_owned()]).await.unwrap();
+    let adele_id = artists.get("adele").expect("synthesized artist entry for Adele");
+    let expected_artist_link = format!("<a href=\"/entries/{adele_id}\">Adele</a>");
+
+    for path in ["/", "/lists/album_draw", &format!("/entries/{}", album1.id)] {
+        let resp = get_authed(&app, path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html =
+            String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+                .unwrap();
+
+        assert!(html.contains(&expected_artist_link), "missing artist link on {path}");
+        assert!(html.contains("https://en.wikipedia.org/wiki/21_(Adele_album)"));
+        assert!(html.contains("https://open.spotify.com/album/5duyQokC4FMcWPYTV9Gpf9"));
+        assert!(html.contains("<svg class=\"icon\""));
+        assert!(html.contains("<span>Wikipedia</span>"));
+        assert!(html.contains("<span>Spotify</span>"));
+        assert!(!html.contains(">Pause draw<"), "draw card must not show Pause draw on {path}");
+        if path == "/" {
+            assert!(!html.contains("/generator/toggle"));
+        } else if path == "/lists/album_draw" {
+            assert!(html.contains(">Pause Draw</button>"));
+        }
+
+        for unwanted in [
+            "YouTube Music",
+            "Apple Music",
+            "Tidal",
+            "Deezer",
+            "Qobuz",
+            "Amazon Music",
+            "MusicBrainz",
+            "Discogs",
+            "music.apple.com",
+            "tidal.com",
+            "deezer.com",
+            "open.qobuz.com",
+            "music.youtube.com",
+            "music.amazon.com",
+        ] {
+            assert!(!html.contains(unwanted), "unexpected '{unwanted}' rendered on {path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_web_unused_music_suppression_spotify_dedup_and_non_music_icons() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let album1 = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "21".to_owned(),
+            identifiers: vec![ident("wikipedia", "21_(Adele_album)")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let album2 = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Tidal Only Album".to_owned(),
+            identifiers: vec![ident("apple_music", "999999"), ident("tidal", "888888")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let a2_resp = get_authed(&app, &format!("/entries/{}", album2.id), &cookie).await;
+    let a2_html =
+        String::from_utf8(to_bytes(a2_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(!a2_html.contains("external-links"));
+    assert!(!a2_html.contains("music.apple.com"));
+    assert!(!a2_html.contains("tidal.com"));
+
+    db.catalog()
+        .log_consumption(&album1.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&album2.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    let rank_resp = get_authed(&app, "/rank/albums", &cookie).await;
+    let rank_html =
+        String::from_utf8(to_bytes(rank_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(rank_html.contains("data-open-url=\"https://en.wikipedia.org/wiki/21_(Adele_album)\""));
+    assert!(!rank_html.contains("music.apple.com"));
+    assert!(!rank_html.contains("tidal.com"));
+
+    // Quick-logging a Spotify URL deduplicates cleanly into a single Spotify link
+    let ql_resp = post_form(
+        &app,
+        "/web/log",
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("kind", "album"),
+            ("action", "want"),
+            ("title", "The Dark Side of the Moon"),
+            ("identifier", "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv?si=abc123"),
+        ],
+    )
+    .await;
+    assert_eq!(ql_resp.status(), StatusCode::SEE_OTHER);
+    let dsotm = db
+        .catalog()
+        .search_entries(Some("The Dark Side of the Moon"), Some(EntryKind::Album), 5)
+        .await
+        .unwrap();
+    let dsotm_resp = get_authed(&app, &format!("/entries/{}", dsotm[0].id), &cookie).await;
+    let dsotm_html =
+        String::from_utf8(to_bytes(dsotm_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(dsotm_html.contains("https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"));
+    assert!(dsotm_html.contains("<span>Spotify</span>"));
+    assert!(!dsotm_html.contains("Open Source"));
+
+    // Non-music entries still show their non-music external identifiers with Lucide icons
+    let movie = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Stalker".to_owned(),
+            identifiers: vec![
+                ident("wikipedia", "Stalker_(1979_film)"),
+                ident("imdb", "tt0079944"),
+            ],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let movie_resp = get_authed(&app, &format!("/entries/{}", movie.id), &cookie).await;
+    let movie_html =
+        String::from_utf8(to_bytes(movie_resp.into_body(), 256 * 1024).await.unwrap().to_vec())
+            .unwrap();
+    assert!(movie_html.contains("<span>Wikipedia</span>"));
+    assert!(movie_html.contains("<span>IMDb</span>"));
+    assert!(movie_html.contains("<svg class=\"icon\""));
+}
