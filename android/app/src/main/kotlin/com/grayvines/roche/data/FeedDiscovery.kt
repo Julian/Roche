@@ -1,8 +1,7 @@
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDao
-import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.enrichEntryMetadataIfPresent
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.moveFileAtomically
 import com.grayvines.roche.model.ContentType
@@ -48,16 +47,9 @@ internal suspend fun discoverFeedFromUrl(
 ): Result<DiscoveredFeedResult> =
     withContext(Dispatchers.Default) {
         runSuspendCatching {
-            val normalizedUrl = normalizeUserSubmittedUrl(rawInputUrl)
+            val normalizedUrl = canonicalizeFeedUrl(normalizeUserSubmittedUrl(rawInputUrl))
             check(normalizedUrl.isNotBlank()) { "Enter a valid site or feed URL" }
-            if (isLikelyFeedUrl(normalizedUrl)) {
-                DiscoveredFeedResult(
-                    feedUrl = canonicalizeFeedUrl(normalizedUrl),
-                    siteTitle = null,
-                )
-            } else {
-                probeSiteForRssFeed(apiClient, normalizedUrl)
-            }
+            probeSiteForRssFeed(apiClient, normalizedUrl)
         }
     }
 
@@ -67,6 +59,9 @@ private suspend fun probeSiteForRssFeed(
 ): DiscoveredFeedResult {
     val pageBody =
         apiClient.fetchExternalFeedXml(siteUrl).getOrElse { error ->
+            if (isLikelyFeedUrl(siteUrl)) {
+                return DiscoveredFeedResult(feedUrl = siteUrl, siteTitle = null)
+            }
             throw IllegalArgumentException(
                 error.message ?: "Could not reach ${extractHostTitle(siteUrl)}",
                 error,
@@ -213,22 +208,17 @@ private suspend fun enrichArxivItemOnDevice(
                 ?.items
                 ?.firstOrNull()
         } ?: return
-    val existing = dao.getItemById(itemId) ?: return
-    val nextTitle =
-        if (hasUserTitleOverride) {
-            existing.title
-        } else {
-            candidate.title.replace(WHITESPACE_SPLIT_REGEX, " ").trim().ifBlank { existing.title }
+    val cleanTitle =
+        candidate.title.replace(WHITESPACE_SPLIT_REGEX, " ").trim().takeIf {
+            it.isNotEmpty()
         }
-    dao.upsertItem(
-        existing.copy(
-            title = nextTitle,
-            author = existing.author?.takeIf { it.isNotBlank() } ?: candidate.author,
-            summary = existing.summary?.takeIf { it.isNotBlank() } ?: candidate.summary,
-            publishedAt = existing.publishedAt ?: candidate.publishedAt,
-            inboxState = "none",
-        ),
-        markDirty = true,
+    dao.enrichEntryMetadataIfPresent(
+        itemId = itemId,
+        title = cleanTitle,
+        hasUserTitleOverride = hasUserTitleOverride,
+        author = candidate.author,
+        summary = candidate.summary,
+        publishedAt = candidate.publishedAt,
     )
 }
 
@@ -278,24 +268,14 @@ private suspend fun applyWebPageSnapshotToItem(
     snapshot: ExtractedWebPageSnapshot,
     hasUserTitleOverride: Boolean,
 ) {
-    val existing: InboxItemRow = dao.getItemById(itemId) ?: return
-    val resolvedTitle =
-        if (hasUserTitleOverride) {
-            existing.title
-        } else {
-            snapshot.title?.takeIf { it.isNotBlank() } ?: existing.title
-        }
-    dao.upsertItem(
-        existing.copy(
-            title = resolvedTitle,
-            author = existing.author?.takeIf { it.isNotBlank() } ?: snapshot.author,
-            summary = existing.summary?.takeIf { it.isNotBlank() } ?: snapshot.summary,
-            contentHtml = existing.contentHtml?.takeIf { it.isNotBlank() } ?: snapshot.contentHtml,
-            thumbnailUrl =
-                existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: snapshot.thumbnailUrl,
-            inboxState = "none",
-        ),
-        markDirty = isSyncableItemUrl(existing.url),
+    dao.enrichEntryMetadataIfPresent(
+        itemId = itemId,
+        title = snapshot.title,
+        hasUserTitleOverride = hasUserTitleOverride,
+        author = snapshot.author,
+        summary = snapshot.summary,
+        thumbnailUrl = snapshot.thumbnailUrl,
+        contentHtml = snapshot.contentHtml,
     )
 }
 

@@ -291,6 +291,7 @@ private suspend fun applyEntryTombstone(
     deletedAt: String,
     tombHlc: String,
 ) {
+    if (rawKey in PROTECTED_SYSTEM_COLLECTION_IDS) return
     val existing = dao.getEntryById(rawKey)
     if (existing != null) {
         if (existing.hlc > tombHlc) return
@@ -673,16 +674,12 @@ private suspend fun mergeIncomingSpecInDao(
     resolvedKind: EntryKind,
 ) {
     val existing = dao.getCollectionSpecById(targetId)
+    val cleanColor = specDto.color?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.color
+    if (mergeProtectedSystemSpecInDao(dao, targetId, cleanColor)) return
     if (existing != null && isProtectedSpec(existing)) return
     val role = CollectionRole.fromWireValue(specDto.role)
     val mode = CollectionMode.fromWireValue(specDto.mode)
-    if (
-        role == CollectionRole.SYSTEM &&
-            targetId != STARRED_COLLECTION_ID &&
-            targetId != UP_NEXT_COLLECTION_ID
-    ) {
-        return
-    }
+    if (role == CollectionRole.SYSTEM && targetId != UP_NEXT_COLLECTION_ID) return
     val cleanSlug =
         if (role == CollectionRole.TAG) {
             val entryTitle = dao.getEntryById(targetId)?.title.orEmpty()
@@ -698,7 +695,7 @@ private suspend fun mergeIncomingSpecInDao(
             role = role.wireValue,
             ruleJson = specDto.ruleJson ?: existing?.ruleJson,
             showInLists = specDto.showInLists,
-            color = specDto.color?.trim()?.takeIf { it.isNotEmpty() } ?: existing?.color,
+            color = cleanColor,
         )
     )
     if (role == CollectionRole.TAG) {
@@ -709,6 +706,29 @@ private suspend fun mergeIncomingSpecInDao(
     } else if (!cleanSlug.isNullOrEmpty() && resolvedKind == EntryKind.COLLECTION) {
         dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", cleanSlug, targetId))
     }
+}
+
+private suspend fun mergeProtectedSystemSpecInDao(
+    dao: RocheDao,
+    targetId: String,
+    cleanColor: String?,
+): Boolean {
+    if (targetId != STARRED_COLLECTION_ID && targetId != WANT_TO_READ_COLLECTION_ID) return false
+    val isStarred = targetId == STARRED_COLLECTION_ID
+    val slug = if (isStarred) "starred" else WANT_TO_READ_SLUG
+    dao.upsertCollectionSpec(
+        CollectionSpecEntity(
+            collectionId = targetId,
+            slug = slug,
+            mode = CollectionMode.MANUAL.wireValue,
+            role = if (isStarred) CollectionRole.LIST.wireValue else CollectionRole.WANT.wireValue,
+            ruleJson = null,
+            showInLists = isStarred,
+            color = cleanColor,
+        )
+    )
+    dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", slug, targetId))
+    return true
 }
 
 private suspend fun mergeIncomingFeedSourceInDao(
@@ -1005,7 +1025,8 @@ internal fun shouldIncomingWinHlc(
 }
 
 internal fun isProtectedSpec(spec: CollectionSpecEntity): Boolean =
-    CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
+    spec.collectionId in PROTECTED_SYSTEM_COLLECTION_IDS ||
+        CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
         CollectionMode.fromWireValue(spec.mode) == CollectionMode.DYNAMIC
 
 private fun buildMergeRedirectMap(entries: Collection<EntryEntity>): Map<String, String> =

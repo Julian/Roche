@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -683,6 +684,7 @@ class RocheRepository(
         tagCsv: String = "",
         forcedContentType: ContentType? = null,
         pdfInputStream: InputStream? = null,
+        awaitPdfCacheCopy: Boolean = false,
     ): SaveUrlResult =
         withContext(Dispatchers.Default) {
             val normalizedUrl = normalizeUserSubmittedUrl(inputUrl)
@@ -707,26 +709,48 @@ class RocheRepository(
                     type = inferredType,
                     inboxState = "none",
                 )
-            persistWantToReadItemLocally(localEntity, normalizedUrl, tags)
+            val persisted =
+                persistWantToReadItemLocally(
+                    localEntity = localEntity,
+                    normalizedUrl = normalizedUrl,
+                    cleanTitleOverride = cleanTitleOverride,
+                    tags = tags,
+                )
+            val remainingPdfStream =
+                if (awaitPdfCacheCopy && pdfInputStream != null) {
+                    copySharedPdfStreamToCache(dao, cacheDir, persisted.id, pdfInputStream)
+                    null
+                } else {
+                    pdfInputStream
+                }
             launchWantToReadEnrichment(
-                itemId = localEntity.id,
+                itemId = persisted.id,
                 url = normalizedUrl,
                 hasUserTitleOverride = cleanTitleOverride != null,
-                pdfInputStream = pdfInputStream,
+                pdfInputStream = remainingPdfStream,
             )
-            SaveUrlResult(title = localEntity.title, kind = SavedResourceKind.ITEM)
+            SaveUrlResult(title = persisted.title, kind = SavedResourceKind.ITEM)
         }
 
     private suspend fun persistWantToReadItemLocally(
         localEntity: InboxItemRow,
         normalizedUrl: String,
+        cleanTitleOverride: String?,
         tags: List<String>,
-    ) {
+    ): InboxItemRow {
         val nodeId = currentLocalPeerId()
         val isSyncable = isSyncableItemUrl(normalizedUrl)
+        var targetEntity = localEntity
         dao.executeInTransaction {
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(dao, nodeId)
+            val existingItem = findExistingItemForSavedUrl(localEntity.id, normalizedUrl)
+            targetEntity =
+                if (existingItem != null) {
+                    mergeExistingItemOnResave(existingItem, cleanTitleOverride)
+                } else {
+                    localEntity
+                }
             dao.ensureWantToReadSpecExists(markDirty = isSyncable, nodeId = nodeId)
             if (isSyncable) {
                 dao.getEntryById(WANT_TO_READ_COLLECTION_ID)?.let { wantCol ->
@@ -738,13 +762,13 @@ class RocheRepository(
             dao.deleteTombstone("item", itemNaturalKey(null, normalizedUrl))
             dao.deleteTombstone(
                 COLLECTION_ENTRY_ENTITY,
-                collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, localEntity.id),
+                collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, targetEntity.id),
             )
-            dao.upsertItem(localEntity, markDirty = isSyncable, hlcOverride = hlc)
+            dao.upsertItem(targetEntity, markDirty = isSyncable, hlcOverride = hlc)
             dao.upsertCollectionEntry(
                 CollectionEntryEntity(
                     collectionId = WANT_TO_READ_COLLECTION_ID,
-                    entryId = localEntity.id,
+                    entryId = targetEntity.id,
                     position = null,
                     addedAt = nowIso,
                     hlc = hlc,
@@ -753,11 +777,38 @@ class RocheRepository(
             )
             attachTagsLocally(
                 dao = dao,
-                itemId = localEntity.id,
+                itemId = targetEntity.id,
                 tagNames = tags,
                 markDirty = isSyncable,
             )
         }
+        return targetEntity
+    }
+
+    private suspend fun findExistingItemForSavedUrl(
+        candidateId: String,
+        normalizedUrl: String,
+    ): InboxItemRow? {
+        val byId = dao.getItemById(candidateId)
+        if (byId != null) return byId
+        val canonUrl = canonicalizeSyncUrl(normalizedUrl)
+        val ownerId =
+            canonUrl.takeIf { it.isNotEmpty() }?.let { dao.getEntryIdByIdentifier("url", it) }
+        val resolvedId = ownerId?.let { catalog.followMergedId(it) ?: it }
+        return resolvedId?.let { dao.getItemById(it) }
+    }
+
+    private fun mergeExistingItemOnResave(
+        existing: InboxItemRow,
+        cleanTitleOverride: String?,
+    ): InboxItemRow {
+        val resetReadAt =
+            if (existing.inboxState.equals("none", ignoreCase = true)) null else existing.readAt
+        return existing.copy(
+            title = cleanTitleOverride ?: existing.title,
+            readAt = resetReadAt,
+            interactionUpdatedAt = nowUtcIso(),
+        )
     }
 
     private suspend fun launchWantToReadEnrichment(
@@ -768,7 +819,7 @@ class RocheRepository(
     ) {
         val scope = backgroundScope
         if (scope != null) {
-            scope.launch(Dispatchers.IO) {
+            scope.launch {
                 if (pdfInputStream != null) {
                     copySharedPdfStreamToCache(dao, cacheDir, itemId, pdfInputStream)
                 }
@@ -798,16 +849,15 @@ class RocheRepository(
         withContext(Dispatchers.Default) {
             runSuspendCatching {
                 val discovered = discoverFeedFromUrl(apiClient, inputUrl).getOrThrow()
-                val effectiveTitle =
-                    titleOverride?.trim()?.takeIf { it.isNotBlank() } ?: discovered.siteTitle
                 val subscribedTitle =
                     subscribeFeedBestEffort(
                         dao = dao,
                         apiClient = apiClient,
                         settings = settings,
                         url = discovered.feedUrl,
-                        titleOverride = effectiveTitle,
+                        titleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() },
                         prefetchedBatch = discovered.prefetchedBatch,
+                        discoveredSiteTitle = discovered.siteTitle,
                     )
                 triggerBackgroundSync()
                 SaveUrlResult(title = subscribedTitle, kind = SavedResourceKind.FEED)
@@ -820,7 +870,7 @@ class RocheRepository(
         titleOverride: String? = null,
         onComplete: (Result<SaveUrlResult>) -> Unit = {},
     ) {
-        val scope = backgroundScope ?: CoroutineScope(Dispatchers.IO)
+        val scope = backgroundScope ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope.launch {
             val result =
                 discoverAndSubscribeFeed(inputUrl = inputUrl, titleOverride = titleOverride)
@@ -917,24 +967,26 @@ class RocheRepository(
                     val currentSettings = settings.settings.first()
                     val currentTier = networkTierProvider.currentNetworkTier()
                     if (currentSettings.serverUrl.isBlank()) {
-                        if (currentTier != NetworkTier.OFFLINE) {
+                        check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
+                        val pollOutcome =
                             pollCooperativeFeedsOnDevice(
                                 dao = dao,
                                 apiClient = apiClient,
                                 localPeerId = currentSettings.peerId,
                                 activePeers = emptyList(),
                             )
+                        offlineCacheManager.autoDownloadNewEpisodes()
+                        pollOutcome.polledFeedsCount
+                    } else {
+                        check(currentSettings.bearerToken.isNotBlank()) {
+                            "Pair device in Settings before syncing"
                         }
-                        error("Configure Server URL in Settings")
+                        val syncedCount =
+                            peerSyncCoordinator(currentTier).syncAndCooperativePoll(currentSettings)
+                                ?: error("Peer sync endpoint unavailable on server")
+                        offlineCacheManager.autoDownloadNewEpisodes()
+                        syncedCount
                     }
-                    check(currentSettings.bearerToken.isNotBlank()) {
-                        "Pair device in Settings before syncing"
-                    }
-                    val syncedCount =
-                        peerSyncCoordinator(currentTier).syncAndCooperativePoll(currentSettings)
-                            ?: error("Peer sync endpoint unavailable on server")
-                    offlineCacheManager.autoDownloadNewEpisodes()
-                    syncedCount
                 }
             }
         }

@@ -292,14 +292,16 @@ class RocheRssWorkflowTest {
             )
         val vm = MainViewModel(repository = batchRepo, settingsRepository = settings)
 
-        // Local-only unpushed item is archived locally in entry_state and marked dirty
+        // Local-only unpushed feed item is archived locally in entry_state and marked dirty
+        batchRepo.catalog.ensureSystemSeeded()
         val localEntity =
             createSavedItemEntity(
-                url = "https://example.com/local-only",
-                title = "Local Unpushed",
-                hostTitle = "example.com",
-                type = ContentType.ARTICLE,
-            )
+                    url = "https://example.com/local-only",
+                    title = "Local Unpushed",
+                    hostTitle = "example.com",
+                    type = ContentType.ARTICLE,
+                )
+                .copy(feedId = "feed-arxiv-cs-lg")
         database.dao().upsertItem(localEntity, markDirty = true)
         assertEquals(1, batchRepo.archiveEntriesBatch(listOf(localEntity.id)))
         assertEquals(
@@ -842,7 +844,18 @@ class RocheRssWorkflowTest {
             )
             testScheduler.advanceUntilIdle()
 
-            val snap = wantRepo.snapshot.first { s -> s.entries.size == 2 }
+            val snap =
+                wantRepo.snapshot.first { s ->
+                    s.entries.size == 2 &&
+                        s.entries.any {
+                            it.url == "https://essays.example.com/storage" &&
+                                it.title == "Log-Structured Merge Trees"
+                        } &&
+                        s.entries.any {
+                            it.url == "https://papers.example.com/lsm.pdf" && it.isCachedOffline
+                        }
+                }
+            assertEquals(WANT_TO_READ_COLLECTION_ID, systemCollectionUuid(WANT_TO_READ_SLUG))
             val enrichedArticle =
                 snap.entries.first { it.url == "https://essays.example.com/storage" }
             assertEquals("Log-Structured Merge Trees", enrichedArticle.title)
@@ -896,6 +909,72 @@ class RocheRssWorkflowTest {
                     .first { it.collectionId == STARRED_COLLECTION_ID }
                     .entryCount,
             )
+
+            // Re-saving an existing URL preserves enriched contentHtml and Starred membership
+            wantRepo.toggleStar(enrichedArticle.id, targetFavorite = true)
+            wantRepo.addUrlToWantToRead(
+                inputUrl = "https://essays.example.com/storage",
+                titleOverride = null,
+                tagCsv = "consensus",
+            )
+            testScheduler.advanceUntilIdle()
+            val afterResave =
+                wantRepo.snapshot.first { s ->
+                    "consensus" in s.entries.first { it.id == enrichedArticle.id }.tags
+                }
+            val resavedArticle = afterResave.entries.first { it.id == enrichedArticle.id }
+            assertTrue(resavedArticle.isFavorite)
+            assertTrue(resavedArticle.contentHtml.orEmpty().contains("Full article body text."))
+
+            // Archiving a non-feed Want-to-Read item removes it from want:read; restoring re-adds
+            wantRepo.setArchiveStateWithSnapshot(enrichedArticle.id, archived = true)
+            val afterArchive =
+                wantRepo.snapshot.first { s ->
+                    s.entries.first { it.id == enrichedArticle.id }.isArchived
+                }
+            assertEquals(
+                1,
+                afterArchive.catalog.wantQueues.first { it.slug == WANT_TO_READ_SLUG }.entryCount,
+            )
+            wantRepo.setArchiveStateWithSnapshot(enrichedArticle.id, archived = false)
+            val afterRestore =
+                wantRepo.snapshot.first { s ->
+                    !s.entries.first { it.id == enrichedArticle.id }.isArchived
+                }
+            assertEquals(
+                2,
+                afterRestore.catalog.wantQueues.first { it.slug == WANT_TO_READ_SLUG }.entryCount,
+            )
+
+            // Local-only PDFs (localpdf://) never leak stubs or memberships to PeerSyncOut
+            wantRepo.addUrlToWantToRead(
+                inputUrl = "localpdf://12345678-1234-1234-1234-1234567890ab/private-doc.pdf",
+                titleOverride = "Private Local PDF",
+                forcedContentType = ContentType.PDF,
+                pdfInputStream = pdfBytes.inputStream(),
+            )
+            testScheduler.advanceUntilIdle()
+            val localPdfItem =
+                wantRepo.snapshot
+                    .first { s -> s.entries.any { it.title == "Private Local PDF" } }
+                    .entries
+                    .first { it.title == "Private Local PDF" }
+            wantRepo.toggleStar(localPdfItem.id, targetFavorite = true)
+            val outgoing =
+                buildTrackedPeerSyncRequest(
+                    dao = database.dao(),
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "peer-android",
+                            deviceName = "Pixel",
+                            sinceSeq = 0L,
+                        ),
+                )
+            assertTrue(outgoing.request.entries.none { it.id == localPdfItem.id })
+            assertTrue(outgoing.request.collectionEntries.none { it.entryId == localPdfItem.id })
+
+            // Standalone pull-to-refresh (blank serverUrl) succeeds cleanly without server error
+            assertTrue(wantRepo.syncWithServer().isSuccess)
         }
 
     @Test

@@ -49,6 +49,7 @@ impl CatalogRepo<'_> {
              WHERE e.merged_into_id IS NULL
                AND cs.mode = 'manual'
                AND cs.collection_role = 'list'
+               AND cg.collection_id != '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
                AND cg.enabled = 1
              ORDER BY LOWER(e.title) ASC, cg.collection_id ASC"
         } else {
@@ -60,6 +61,7 @@ impl CatalogRepo<'_> {
              WHERE e.merged_into_id IS NULL
                AND cs.mode = 'manual'
                AND cs.collection_role = 'list'
+               AND cg.collection_id != '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
              ORDER BY cg.enabled DESC, LOWER(e.title) ASC, cg.collection_id ASC"
         };
         let rows: Vec<RawGeneratorRow> = sqlx::query_as(sql).fetch_all(self.pool).await?;
@@ -213,9 +215,12 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
     ) -> CatalogResult<RawCollectionRow> {
         let col = self.lookup_collection_row(slug_or_id, false).await?;
-        if col.mode != CollectionMode::Manual || col.collection_role != CollectionRole::List {
+        if col.id == crate::db::STARRED_COLLECTION_ID
+            || col.mode != CollectionMode::Manual
+            || col.collection_role != CollectionRole::List
+        {
             return Err(CatalogError::InvalidInput(format!(
-                "Collection '{}' cannot use a generator (must be a manual list)",
+                "Collection '{}' cannot use a generator (must be a custom manual list)",
                 col.title
             )));
         }

@@ -446,6 +446,7 @@ sealed interface MainAction {
         val addToWant: Boolean,
         val rankAfterLog: Boolean,
         val targetCollectionId: String? = null,
+        val addToListOnly: Boolean = false,
     ) : Mutation
 
     data class CreateCustomCatalogList(val title: String) : Mutation

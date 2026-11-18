@@ -8,7 +8,7 @@ use super::{
     SyncRepo,
     activity::SyncTombstone,
     hrw::SERVER_PEER_ID,
-    identity::{STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID},
+    identity::UP_NEXT_COLLECTION_ID,
     models::{
         MAX_PEER_SYNC_PAGE_BYTES, MAX_SYNC_INLINE_HTML_BYTES, PeerSyncResponse,
         SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
@@ -559,10 +559,7 @@ fn collect_missing_referenced_entry_ids(
     let mut missing = HashSet::new();
     let mut push_ref = |id: &str| {
         let trimmed = id.trim();
-        if !trimmed.is_empty()
-            && trimmed != STARRED_COLLECTION_ID
-            && trimmed != UP_NEXT_COLLECTION_ID
-            && !present_ids.contains(trimmed)
+        if !trimmed.is_empty() && trimmed != UP_NEXT_COLLECTION_ID && !present_ids.contains(trimmed)
         {
             missing.insert(trimmed.to_owned());
         }

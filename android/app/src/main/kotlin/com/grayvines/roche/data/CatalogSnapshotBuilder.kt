@@ -180,10 +180,13 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
         if (role == CollectionRole.FEED || role == CollectionRole.TAG) continue
         val mode = CollectionMode.fromWireValue(spec.mode)
         val isWant = role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
-        val genEntity = input.generatorsByCollection[spec.collectionId]
+        val effectiveGen =
+            input.generatorsByCollection[spec.collectionId]?.takeIf {
+                spec.collectionId != STARRED_COLLECTION_ID
+            }
         val rawMemberships = input.membershipsByCollection[spec.collectionId].orEmpty()
         val ranked =
-            resolveAndRankSpec(input, spec, mode, isWant, genEntity != null, rawMemberships)
+            resolveAndRankSpec(input, spec, mode, isWant, effectiveGen != null, rawMemberships)
         entriesByCollectionId[spec.collectionId] = ranked
         val summary =
             toCatalogListSummary(
@@ -193,7 +196,7 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
                 role = role,
                 isWant = isWant,
                 rankedSize = ranked.size,
-                genEntity = genEntity,
+                genEntity = effectiveGen,
                 rawMemberships = rawMemberships,
                 domainEntries = input.domainEntries,
                 consumedIds = input.consumedIds,
@@ -307,7 +310,6 @@ private fun rankSpecEntries(
 private fun sortListSummaries(summaries: List<CatalogListSummary>): List<CatalogListSummary> =
     summaries.sortedWith(
         compareByDescending<CatalogListSummary> { it.entryCount > 0 || it.generatorEnabled }
-            .thenByDescending { it.collectionId == STARRED_COLLECTION_ID && it.entryCount > 0 }
             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
     )
 

@@ -8,7 +8,7 @@ use super::{
     sync::{deterministic_tag_id, tag_natural_key},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Tag {
     pub id: String,
     pub name: String,
@@ -70,42 +70,62 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Tag>> {
-        Ok(sqlx::query_as!(
-            Tag,
+        Ok(sqlx::query_as::<_, Tag>(
             "SELECT e.id,
                     e.title AS name,
-                    cs.color AS \"color: HexColor\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
+                    cs.color,
+                    e.created_at,
                     (SELECT COUNT(*)
                      FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
+                     LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
                      JOIN entries ie ON ie.id = ce.entry_id
                      WHERE ce.collection_id = e.id
                        AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
+                       AND (
+                           es.inbox_state = 'unread'
+                           OR (
+                               COALESCE(es.inbox_state, 'none') = 'none'
+                               AND es.read_at IS NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM collection_entries ce_wtr
+                                   WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
+                                     AND ce_wtr.entry_id = ie.id
+                               )
+                           )
+                       )) AS unread_count
              FROM entries e
              JOIN collection_specs cs ON cs.collection_id = e.id
              WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL AND e.id = ?",
-            id,
         )
+        .bind(id)
         .fetch_optional(self.pool)
         .await?)
     }
 
     pub async fn list(&self) -> Result<Vec<Tag>> {
-        Ok(sqlx::query_as!(
-            Tag,
+        Ok(sqlx::query_as::<_, Tag>(
             "SELECT e.id,
                     e.title AS name,
-                    cs.color AS \"color: HexColor\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
+                    cs.color,
+                    e.created_at,
                     (SELECT COUNT(*)
                      FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
+                     LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
                      JOIN entries ie ON ie.id = ce.entry_id
                      WHERE ce.collection_id = e.id
                        AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
+                       AND (
+                           es.inbox_state = 'unread'
+                           OR (
+                               COALESCE(es.inbox_state, 'none') = 'none'
+                               AND es.read_at IS NULL
+                               AND EXISTS (
+                                   SELECT 1 FROM collection_entries ce_wtr
+                                   WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
+                                     AND ce_wtr.entry_id = ie.id
+                               )
+                           )
+                       )) AS unread_count
              FROM entries e
              JOIN collection_specs cs ON cs.collection_id = e.id
              WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL

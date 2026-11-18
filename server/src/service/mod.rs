@@ -4,7 +4,10 @@ pub use catalog::CatalogService;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -137,7 +140,26 @@ pub struct SyncStatus {
     pub unread_items_count: i64,
     pub archived_items_count: i64,
     pub latest_activity_id: i64,
+    pub is_refreshing: bool,
+    pub active_refresh_count: usize,
     pub timestamp: DateTime<Utc>,
+}
+
+struct ActiveRefreshGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActiveRefreshGuard {
+    fn acquire(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter: Arc::clone(counter) }
+    }
+}
+
+impl Drop for ActiveRefreshGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +179,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     media_store: MediaStore,
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
+    active_refreshes: Arc<AtomicUsize>,
     pairing_limiter: Arc<PairingRateLimiter>,
     tailscale_web_sessions: Arc<Mutex<HashMap<String, String>>>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
@@ -171,6 +194,7 @@ impl<F> Clone for RocheService<F> {
             media_store: self.media_store.clone(),
             ytdlp_worker: self.ytdlp_worker.clone(),
             download_semaphore: Arc::clone(&self.download_semaphore),
+            active_refreshes: Arc::clone(&self.active_refreshes),
             pairing_limiter: Arc::clone(&self.pairing_limiter),
             tailscale_web_sessions: Arc::clone(&self.tailscale_web_sessions),
             node_identity: self.node_identity.clone(),
@@ -192,10 +216,21 @@ impl<F: FeedFetcher> RocheService<F> {
             media_store,
             ytdlp_worker,
             download_semaphore,
+            active_refreshes: Arc::new(AtomicUsize::new(0)),
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
             tailscale_web_sessions: Arc::new(Mutex::new(HashMap::new())),
             node_identity: None,
         }
+    }
+
+    #[must_use]
+    pub fn active_refresh_count(&self) -> usize {
+        self.active_refreshes.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn is_refreshing(&self) -> bool {
+        self.active_refresh_count() > 0
     }
 
     #[must_use]
@@ -306,6 +341,7 @@ impl<F: FeedFetcher> RocheService<F> {
             self.db.clone(),
             Arc::clone(&self.fetcher),
         )
+        .with_active_counter(Arc::clone(&self.active_refreshes))
         .with_media(
             self.media_store.clone(),
             self.ytdlp_worker.clone(),
@@ -348,12 +384,15 @@ impl<F: FeedFetcher> RocheService<F> {
         let archived_items_count = self.db.items().count_by_status(ItemStatus::Archived).await?;
         let latest_activity_id = self.db.sync().latest_activity_id().await?;
 
+        let active_refresh_count = self.active_refresh_count();
         Ok(SyncStatus {
             status: "ok",
             feeds_count: feeds.len(),
             unread_items_count,
             archived_items_count,
             latest_activity_id,
+            is_refreshing: active_refresh_count > 0,
+            active_refresh_count,
             timestamp: SyncRepo::now_utc(),
         })
     }
@@ -677,9 +716,12 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         title: Option<&str>,
         description: Option<&str>,
     ) -> Result<Feed, ApiError> {
-        let (resolved_type, validated_url) = source
+        let (initial_type, validated_url) = source
             .into_feed_url(feed_type)
             .map_err(|e| ApiError::bad_request(format!("Invalid feed URL: {e}")))?;
+
+        let (resolved_type, final_url) =
+            self.discover_feed_url_if_needed(initial_type, validated_url).await?;
 
         let feed = self
             .service
@@ -687,7 +729,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
             .feeds()
             .create_with_interval(
                 resolved_type,
-                &validated_url,
+                &final_url,
                 title.map(str::trim).filter(|t| !t.is_empty()),
                 description.map(str::trim).filter(|d| !d.is_empty()),
                 self.service.config.feeds.default_poll_interval,
@@ -695,6 +737,102 @@ impl<F: FeedFetcher> FeedService<'_, F> {
             .await?;
 
         Ok(feed)
+    }
+
+    async fn discover_feed_url_if_needed(
+        &self,
+        initial_type: FeedType,
+        validated_url: Url,
+    ) -> Result<(FeedType, Url), ApiError> {
+        if validated_url.as_str().contains("youtube.com/feeds/videos.xml")
+            || crate::feeds::ArxivParser::is_arxiv_host(validated_url.host_str())
+        {
+            return Ok((initial_type, validated_url));
+        }
+
+        let probe_type = match initial_type {
+            FeedType::Youtube => FeedType::Rss,
+            other => other,
+        };
+
+        let mut html_candidate = if let Ok(Ok(raw_body)) = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.service.fetcher.fetch_feed(&validated_url),
+        )
+        .await
+        {
+            let body_clone = raw_body.clone();
+            let parsed_ok = tokio::task::spawn_blocking(move || {
+                FeedIngester::parse_feed_content(probe_type, &body_clone).is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if parsed_ok {
+                return Ok((initial_type, validated_url));
+            }
+            Some(raw_body)
+        } else {
+            None
+        };
+
+        if html_candidate.is_none()
+            && let Ok(Ok(Some(fetched_html))) = tokio::time::timeout(
+                Duration::from_secs(8),
+                self.service.fetcher.fetch_html(&validated_url),
+            )
+            .await
+        {
+            html_candidate = Some(fetched_html);
+        }
+
+        let Some(raw_html) = html_candidate else {
+            return Ok((initial_type, validated_url));
+        };
+
+        let base_clone = validated_url.clone();
+        let html_for_disc = raw_html.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            HtmlSanitizer::discover_feed_candidates(&html_for_disc, &base_clone)
+        })
+        .await
+        .unwrap_or_default();
+
+        for cand in candidates {
+            if cand.as_str().contains("youtube.com/feeds/videos.xml") {
+                return Ok((FeedType::Youtube, cand));
+            }
+            if let Ok(Ok(cand_body)) =
+                tokio::time::timeout(Duration::from_secs(6), self.service.fetcher.fetch_feed(&cand))
+                    .await
+            {
+                let cand_parse_type = match initial_type {
+                    FeedType::Podcast => FeedType::Podcast,
+                    _ => FeedType::Rss,
+                };
+                let ok = tokio::task::spawn_blocking(move || {
+                    FeedIngester::parse_feed_content(cand_parse_type, &cand_body).is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                if ok {
+                    let final_type = match initial_type {
+                        FeedType::Podcast => FeedType::Podcast,
+                        _ => FeedType::Rss,
+                    };
+                    return Ok((final_type, cand));
+                }
+            }
+        }
+
+        let lower_prefix =
+            raw_html.trim_start().get(..256).unwrap_or(&raw_html).to_ascii_lowercase();
+        if lower_prefix.contains("<!doctype html") || lower_prefix.contains("<html") {
+            return Err(ApiError::bad_request(format!(
+                "No RSS or Atom feed found at {validated_url}"
+            )));
+        }
+
+        Ok((initial_type, validated_url))
     }
 
     pub async fn update(
@@ -761,6 +899,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
     }
 
     pub async fn refresh(&self, id: &str) -> Result<Feed, ApiError> {
+        let _guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
         let feed = self.get(id).await?;
         let ctx = self.service.media_ingest_context();
 
@@ -774,6 +913,19 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         }
 
         self.get(id).await
+    }
+
+    pub async fn refresh_all_in_background(&self) -> Result<usize, ApiError> {
+        let active_feeds: Vec<Feed> =
+            self.list().await?.into_iter().filter(|f| f.is_active).collect();
+        let count = active_feeds.len();
+        if !active_feeds.is_empty() {
+            let service_bg = self.service.clone();
+            tokio::spawn(async move {
+                service_bg.feeds().poll_feeds_concurrently(active_feeds).await;
+            });
+        }
+        Ok(count)
     }
 
     pub async fn import_opml(&self, opml_str: String) -> Result<Vec<Feed>, ApiError> {
@@ -794,12 +946,14 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         for feed in feeds {
             let service_clone = self.service.clone();
             let p_sem = Arc::clone(&poll_sem);
+            let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
             join_set.spawn(async move {
+                let _task_guard = refresh_guard;
                 let Ok(_permit) = p_sem.acquire_owned().await else {
                     return;
                 };
                 let ctx = service_clone.media_ingest_context();
-                let _ = FeedIngester::poll_and_record(&ctx, &feed, "opml_import").await;
+                let _ = FeedIngester::poll_and_record(&ctx, &feed, "background_refresh").await;
             });
         }
         while join_set.join_next().await.is_some() {}
@@ -844,55 +998,13 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         SafeHttpClient::validate_url(url)
             .map_err(|e| ApiError::bad_request(format!("Invalid item URL: {e}")))?;
 
-        let content_type = classify_url(url);
+        let arxiv_id = crate::feeds::ArxivParser::extract_arxiv_id(url.as_str());
+        let content_type = if arxiv_id.is_some() { ContentType::Paper } else { classify_url(url) };
         let explicit_title = title.map(str::trim).filter(|t| !t.is_empty());
-
-        let should_fetch_html = content_type == ContentType::Article
-            || (explicit_title.is_none()
-                && !matches!(content_type, ContentType::Pdf | ContentType::Audio));
-        let snapshot = if should_fetch_html {
-            match tokio::time::timeout(
-                Duration::from_secs(10),
-                self.service.fetcher.fetch_html(url),
-            )
-            .await
-            {
-                Ok(Ok(Some(raw_html))) => {
-                    let base_url = url.clone();
-                    tokio::task::spawn_blocking(move || {
-                        HtmlSanitizer::extract_snapshot_with_base(&raw_html, Some(&base_url))
-                    })
-                    .await
-                    .ok()
-                }
-                Ok(Ok(None)) => None,
-                Ok(Err(e)) => {
-                    tracing::warn!(url = %url, error = %e, "Failed to fetch HTML snapshot on save");
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!(url = %url, "Timed out fetching HTML snapshot on save");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let resolved_title = explicit_title
-            .or_else(|| snapshot.as_ref().and_then(|s| s.title.as_deref()))
-            .unwrap_or_else(|| url.as_str());
-        let summary = snapshot.as_ref().and_then(|s| s.summary.as_deref());
+        let has_explicit_title = explicit_title.is_some();
+        let initial_title = explicit_title.unwrap_or_else(|| url.as_str());
         let yt_thumb_fallback = crate::feeds::youtube::YouTubeParser::extract_video_id(url)
             .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
-        let thumbnail_url = snapshot
-            .as_ref()
-            .and_then(|s| s.thumbnail_url.as_deref())
-            .or(yt_thumb_fallback.as_deref());
-        let content_html = (content_type == ContentType::Article)
-            .then(|| snapshot.as_ref().map(|s| s.content_html.as_str()))
-            .flatten()
-            .filter(|html| !html.trim().is_empty());
         let audio_url = (content_type == ContentType::Audio).then(|| url.as_str());
 
         let (item, _) = self
@@ -901,10 +1013,10 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             .items()
             .save_manual_input_with_tags(&ManualItemInput {
                 url,
-                title: resolved_title,
-                summary,
-                content_html,
-                thumbnail_url,
+                title: initial_title,
+                summary: None,
+                content_html: None,
+                thumbnail_url: yt_thumb_fallback.as_deref(),
                 audio_url,
                 duration: None,
                 content_type,
@@ -915,14 +1027,112 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         let service_clone = self.service.clone();
         let item_id = item.id.clone();
         let item_url = url.clone();
+        let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
 
-        let ingest_handle = tokio::spawn(async move {
-            let ctx = service_clone.media_ingest_context();
-            FeedIngester::ingest_item_media(&ctx, &item_id, content_type, &item_url).await;
+        tokio::spawn(async move {
+            let _guard = refresh_guard;
+            Self::enrich_and_ingest_saved_item(
+                &service_clone,
+                &item_id,
+                &item_url,
+                content_type,
+                arxiv_id.as_deref(),
+                has_explicit_title,
+            )
+            .await;
         });
-        let _ = tokio::time::timeout(Duration::from_secs(2), ingest_handle).await;
 
         self.get(&item.id).await
+    }
+
+    async fn enrich_and_ingest_saved_item(
+        service: &RocheService<F>,
+        item_id: &str,
+        item_url: &Url,
+        content_type: ContentType,
+        arxiv_id: Option<&str>,
+        has_explicit_title: bool,
+    ) {
+        if let Some(aid) = arxiv_id
+            && let Ok(api_url) = SafeHttpClient::parse_url(&format!(
+                "https://export.arxiv.org/api/query?id_list={aid}"
+            ))
+            && let Ok(Ok(xml)) =
+                tokio::time::timeout(Duration::from_secs(10), service.fetcher.fetch_feed(&api_url))
+                    .await
+            && let Ok(Ok(parsed)) =
+                tokio::task::spawn_blocking(move || crate::feeds::ArxivParser::parse(&xml)).await
+            && let Some(paper) = parsed.items.into_iter().next()
+        {
+            let clean_title = paper.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let author_csv = (!paper.authors.is_empty()).then(|| paper.authors.join(", "));
+            let clean_summary = HtmlSanitizer::plain_text_truncate(
+                &paper.summary,
+                crate::content::fetcher::MAX_SUMMARY_CHARS,
+            );
+            let _ = service
+                .db
+                .items()
+                .apply_background_enrichment(
+                    item_id,
+                    (!clean_title.is_empty()).then_some(clean_title.as_str()),
+                    author_csv.as_deref(),
+                    paper.published_at,
+                    (!clean_summary.is_empty()).then_some(clean_summary.as_str()),
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        let should_fetch_html = arxiv_id.is_none()
+            && (content_type == ContentType::Article
+                || (!has_explicit_title
+                    && !matches!(content_type, ContentType::Pdf | ContentType::Audio)));
+        if should_fetch_html {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                service.fetcher.fetch_html(item_url),
+            )
+            .await
+            {
+                Ok(Ok(Some(raw_html))) => {
+                    let base_url = item_url.clone();
+                    if let Ok(snapshot) = tokio::task::spawn_blocking(move || {
+                        HtmlSanitizer::extract_snapshot_with_base(&raw_html, Some(&base_url))
+                    })
+                    .await
+                    {
+                        let body_html = (content_type == ContentType::Article)
+                            .then_some(snapshot.content_html.as_str())
+                            .filter(|h| !h.trim().is_empty());
+                        let _ = service
+                            .db
+                            .items()
+                            .apply_background_enrichment(
+                                item_id,
+                                snapshot.title.as_deref(),
+                                snapshot.author.as_deref(),
+                                None,
+                                snapshot.summary.as_deref(),
+                                snapshot.thumbnail_url.as_deref(),
+                                body_html,
+                            )
+                            .await;
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(url = %item_url, error = %e, "Failed to fetch HTML snapshot in background");
+                }
+                Err(_) => {
+                    tracing::warn!(url = %item_url, "Timed out fetching HTML snapshot in background");
+                }
+            }
+        }
+
+        let ctx = service.media_ingest_context();
+        FeedIngester::ingest_item_media(&ctx, item_id, content_type, item_url).await;
     }
 
     pub async fn update(

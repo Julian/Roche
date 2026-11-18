@@ -135,13 +135,16 @@ private fun prepareOutgoingSlices(
         snap.feedSourcesById.values
             .filterNot { isSyncablePublicUrl(it.feedUrl) }
             .mapTo(HashSet()) { it.collectionId }
-    val catalogRefIds = collectCatalogHistoryIds(snap)
-    val unsyncedInboxOnlyIds = collectUnsyncedInboxOnlyIds(snap, unsyncedFeedIds, catalogRefIds)
+    val localOnlyPdfIds = collectLocalOnlyPdfIds(snap)
+    val catalogRefIds = collectCatalogHistoryIds(snap) - localOnlyPdfIds
+    val unsyncedInboxOnlyIds =
+        collectUnsyncedInboxOnlyIds(snap, unsyncedFeedIds, catalogRefIds) + localOnlyPdfIds
     val sentMemberships =
         selectOutgoingMemberships(snap, unsyncedFeedIds, unsyncedInboxOnlyIds, isInitial)
             .take(MAX_SYNC_COLLECTION_ENTRIES)
     val sentLogs = selectOutgoingLogs(snap.logs, unsyncedInboxOnlyIds, isInitial)
-    val sentComparisons = selectOutgoingComparisons(snap.comparisons, isInitial)
+    val sentComparisons =
+        selectOutgoingComparisons(snap.comparisons, unsyncedInboxOnlyIds, isInitial)
     val sentGenerators = selectOutgoingGenerators(snap, isInitial)
     val sentTombstones = selectOutgoingTombstones(snap.tombstones, isInitial)
     val outgoingChildRefs =
@@ -173,18 +176,22 @@ private fun prepareOutgoingSlices(
     )
 }
 
+private fun collectLocalOnlyPdfIds(snap: OutgoingGraphSnapshot): Set<String> =
+    snap.entries
+        .filter { it.url?.startsWith("localpdf://", ignoreCase = true) == true }
+        .mapTo(HashSet()) { it.id }
+
 private fun resolveOutgoingChildRefs(
     isInitial: Boolean,
     sentMemberships: List<CollectionEntryEntity>,
     sentGenerators: List<CollectionGeneratorEntity>,
     sentLogs: List<ConsumptionLogEntity>,
     sentComparisons: List<ComparisonEntity>,
-): Set<String> =
-    if (isInitial) {
+): Set<String> {
+    val refs =
         collectReferencedIdsFromSlices(sentMemberships, sentGenerators, sentLogs, sentComparisons)
-    } else {
-        sentMemberships.mapTo(HashSet()) { it.collectionId }
-    }
+    return if (isInitial) refs else refs - PROTECTED_SYSTEM_COLLECTION_IDS
+}
 
 private data class PartitionedOutgoingEntries(
     val budgetEntries: List<EntryEntity>,
@@ -241,10 +248,16 @@ private fun selectOutgoingLogs(
 
 private fun selectOutgoingComparisons(
     comparisons: List<ComparisonEntity>,
+    unsyncedInboxOnlyIds: Set<String>,
     isInitial: Boolean,
 ): List<ComparisonEntity> =
     comparisons
-        .filter { isInitial || it.isLocalDirty }
+        .filter { comp ->
+            (isInitial || comp.isLocalDirty) &&
+                decodeComparisonOrdering(comp.orderingJson)?.flatten()?.none {
+                    it.trim() in unsyncedInboxOnlyIds
+                } != false
+        }
         .sortedWith(compareByDescending<ComparisonEntity> { it.isLocalDirty }.thenBy { it.hlc })
         .take(MAX_SYNC_COMPARISONS)
 
@@ -338,7 +351,8 @@ private fun selectOutgoingGenerators(
     snap.generators.filter { gen ->
         val spec = snap.specsById[gen.collectionId]
         val isManualList =
-            spec != null &&
+            gen.collectionId != STARRED_COLLECTION_ID &&
+                spec != null &&
                 CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
                 CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
         val includeOnInitial = isInitial && (gen.enabled || !gen.currentEntryId.isNullOrBlank())
@@ -421,6 +435,9 @@ private fun isEntryEligibleForPush(
             (CollectionRole.fromWireValue(spec.role) == CollectionRole.SYSTEM ||
                 CollectionMode.fromWireValue(spec.mode) == CollectionMode.DYNAMIC)
     if (isSeededSystemOrDynamic) return false
+    if (entry.id in PROTECTED_SYSTEM_COLLECTION_IDS) {
+        return entry.id in config.forcedEntryIds || isAnyPartDirty(entry, snap)
+    }
     if (entry.id in unsyncedFeedIds && entry.id !in catalogRefIds) return false
 
     return isInitial ||
@@ -631,11 +648,15 @@ private fun assembleTrackedBatch(
             comparisons = toWireComparisonDtos(sentComparisons),
             tombstones = toWireTombstoneDtos(sentTombstones),
         )
+    val wireStateIds = wireEntries.filter { it.state != null }.mapTo(HashSet()) { it.id }
     return TrackedOutgoingSyncBatch(
         request = request,
         sentEntryHlcById = budgetEntries.associate { it.id to it.hlc },
         sentStateHlcById =
-            budgetEntries.mapNotNull { e -> snap.statesById[e.id]?.let { e.id to it.hlc } }.toMap(),
+            budgetEntries
+                .filter { it.id in wireStateIds }
+                .mapNotNull { e -> snap.statesById[e.id]?.let { e.id to it.hlc } }
+                .toMap(),
         sentFeedSourceHlcById =
             budgetEntries
                 .filter { it.id !in unsyncedFeedIds }

@@ -1,6 +1,9 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -83,6 +86,7 @@ impl FeedFetcher for HttpFeedFetcher {
 
 struct InFlightGuard {
     in_flight: Arc<Mutex<HashSet<String>>>,
+    active_counter: Option<Arc<AtomicUsize>>,
     feed_id: String,
 }
 
@@ -90,6 +94,9 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.in_flight.lock() {
             set.remove(&self.feed_id);
+        }
+        if let Some(ref counter) = self.active_counter {
+            counter.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -102,6 +109,7 @@ pub struct PollScheduler<F = HttpFeedFetcher> {
     download_semaphore: Arc<Semaphore>,
     semaphore: Arc<Semaphore>,
     in_flight: Arc<Mutex<HashSet<String>>>,
+    active_counter: Option<Arc<AtomicUsize>>,
     measured_weight: Arc<Mutex<f64>>,
 }
 
@@ -116,8 +124,15 @@ impl<F: FeedFetcher> PollScheduler<F> {
             download_semaphore: Arc::new(Semaphore::new(2)),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            active_counter: None,
             measured_weight: Arc::new(Mutex::new(DEFAULT_ONLINE_PEER_WEIGHT)),
         }
+    }
+
+    #[must_use]
+    pub fn with_active_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
+        self.active_counter = Some(counter);
+        self
     }
 
     #[must_use]
@@ -198,11 +213,16 @@ impl<F: FeedFetcher> PollScheduler<F> {
         let download_semaphore = Arc::clone(&self.download_semaphore);
         let semaphore = Arc::clone(&self.semaphore);
         let in_flight = Arc::clone(&self.in_flight);
+        let active_counter = self.active_counter.clone();
         let measured_weight = Arc::clone(&self.measured_weight);
         let batch_progress = Arc::clone(batch_progress);
 
+        if let Some(ref counter) = active_counter {
+            counter.fetch_add(1, Ordering::AcqRel);
+        }
+
         tokio::spawn(async move {
-            let _guard = InFlightGuard { in_flight, feed_id: feed.id.clone() };
+            let _guard = InFlightGuard { in_flight, active_counter, feed_id: feed.id.clone() };
             let poll_res = {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return;
@@ -507,7 +527,7 @@ impl FeedIngester {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn parse_feed_content(feed_type: FeedType, content: &str) -> Result<PollBatch> {
+    pub(crate) fn parse_feed_content(feed_type: FeedType, content: &str) -> Result<PollBatch> {
         match feed_type {
             FeedType::Rss | FeedType::Podcast => {
                 let (rss_feed, items) = RssParser::parse(content)?;

@@ -15,10 +15,16 @@ private const val FEED_ID_SUBQUERY =
         "LEFT JOIN collection_specs cs_f ON cs_f.collectionId = ce_f.collectionId " +
         "WHERE ce_f.entryId = e.id " +
         "AND ce_f.collectionId NOT IN (" +
-        "'533b1315-6e2e-57d3-ba85-dc88531c5a0b', '3864ff37-5ed3-5256-9380-f85ff8054f1c'" +
+        "'533b1315-6e2e-57d3-ba85-dc88531c5a0b', " +
+        "'3864ff37-5ed3-5256-9380-f85ff8054f1c', " +
+        "'2ef71101-a716-5331-9515-cb7b5ce8b3c3'" +
         ") " +
         "AND (EXISTS (SELECT 1 FROM feed_sources fs_x WHERE fs_x.collectionId = ce_f.collectionId) " +
-        "OR cs_f.collectionId IS NULL OR cs_f.role = 'feed') " +
+        "OR cs_f.role = 'feed' " +
+        "OR (cs_f.collectionId IS NULL AND NOT EXISTS (" +
+        "SELECT 1 FROM entries e_f WHERE e_f.id = ce_f.collectionId " +
+        "AND e_f.kind NOT IN ('publication', 'podcast', 'channel', 'collection')" +
+        "))) " +
         "ORDER BY ce_f.addedAt ASC, ce_f.collectionId ASC LIMIT 1)"
 
 private const val FEED_URL_SUBQUERY =
@@ -47,7 +53,12 @@ private const val IS_FAVORITE_EXPR =
         "AND ce_fav.entryId = e.id)"
 
 private const val STATUS_EXPR =
-    "CASE WHEN es.inboxState = 'dismissed' THEN 'archived' ELSE 'unread' END"
+    "CASE WHEN es.inboxState = 'dismissed' " +
+        "OR (es.inboxState = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
+        "SELECT 1 FROM collection_entries ce_wtr " +
+        "WHERE ce_wtr.collectionId = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' " +
+        "AND ce_wtr.entryId = e.id)) " +
+        "THEN 'archived' ELSE 'unread' END"
 
 private const val INBOX_FROM_WHERE =
     "FROM entries e " +

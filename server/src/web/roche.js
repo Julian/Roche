@@ -257,6 +257,12 @@
       if (nextNav && curNav) {
         curNav.replaceChildren(...Array.from(nextNav.childNodes));
       }
+      const nextRefresh = doc.getElementById("roche-refresh-banner");
+      const curRefresh = document.getElementById("roche-refresh-banner");
+      if (nextRefresh && curRefresh) {
+        curRefresh.hidden = nextRefresh.hidden;
+        curRefresh.setAttribute("data-active", nextRefresh.getAttribute("data-active") || "0");
+      }
       document.title = doc.title;
       const dest = finalUrl || fallbackUrl;
       if (dest) {
@@ -803,10 +809,92 @@
     });
   };
 
+  /* --- 5. Background Refresh Status Indicator --- */
+  let refreshPollTimer = null;
+
+  const initRefreshBanner = () => {
+    const banner = document.getElementById("roche-refresh-banner");
+    if (!banner) return;
+    const label = banner.querySelector(".js-refresh-label");
+
+    const scheduleCheck = (delayMs) => {
+      if (refreshPollTimer) clearTimeout(refreshPollTimer);
+      refreshPollTimer = setTimeout(async () => {
+        refreshPollTimer = null;
+        try {
+          const resp = await fetch("/web/refresh-status", {
+            headers: { Accept: "application/json" },
+            credentials: "same-origin",
+          });
+          if (!resp.ok) return;
+          const data = await resp.json();
+          if (data?.is_refreshing) {
+            banner.hidden = false;
+            banner.setAttribute("data-active", "1");
+            if (label && Number.isFinite(data.active_refresh_count) && data.active_refresh_count > 1) {
+              label.textContent = `Refreshing ${data.active_refresh_count} sources in background…`;
+            } else if (label) {
+              label.textContent = "Refreshing feeds & metadata in background…";
+            }
+            scheduleCheck(1500);
+          } else {
+            const wasActive = banner.getAttribute("data-active") === "1" || !banner.hidden;
+            banner.hidden = true;
+            banner.setAttribute("data-active", "0");
+            if (
+              wasActive &&
+              !document.activeElement?.matches?.("input, textarea, select") &&
+              ["/", "/inbox", "/feeds", "/queue"].includes(window.location.pathname)
+            ) {
+              const curUrl = `${window.location.pathname}${window.location.search}`;
+              const r = await fetch(curUrl, { credentials: "same-origin" });
+              if (r.ok) {
+                const html = await r.text();
+                const doc = new DOMParser().parseFromString(html, "text/html");
+                const nextMain = doc.getElementById("roche-main");
+                const curMain = document.getElementById("roche-main");
+                if (nextMain && curMain) {
+                  curMain.replaceChildren(...Array.from(nextMain.childNodes));
+                  initReaderProgress();
+                  initRankBoard();
+                  initOpmlFileHelper();
+                }
+              }
+            }
+          }
+        } catch {
+          // Ignore transient status poll errors.
+        }
+      }, delayMs);
+    };
+
+    if (banner.getAttribute("data-active") === "1" || !banner.hidden) {
+      scheduleCheck(1200);
+    }
+  };
+
+  document.addEventListener("submit", (ev) => {
+    const form = ev.target;
+    const action = form?.getAttribute?.("action") || "";
+    if (
+      action.includes("/refresh") ||
+      action === "/web/feeds/create" ||
+      action === "/web/feeds/opml" ||
+      action === "/web/items/save"
+    ) {
+      const banner = document.getElementById("roche-refresh-banner");
+      if (banner) {
+        banner.hidden = false;
+        banner.setAttribute("data-active", "1");
+      }
+    }
+  });
+
   const initPageWidgets = () => {
     initReaderProgress();
     initRankBoard();
     initOpmlFileHelper();
+    initRefreshBanner();
   };
 
   if (document.readyState === "loading") {

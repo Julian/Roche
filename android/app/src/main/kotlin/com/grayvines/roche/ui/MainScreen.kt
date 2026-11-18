@@ -9,7 +9,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,11 +19,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -46,10 +43,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
@@ -61,7 +55,6 @@ import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon
-import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.UndoOrStatusSnackbar
@@ -329,57 +322,20 @@ internal fun MainDestinationScaffold(
         ) {
             content()
             if (state.isSyncing) {
-                GlobalSyncActivityBanner(
-                    showPill = showBottomBar,
-                    modifier = Modifier.align(Alignment.TopCenter),
-                )
+                GlobalSyncActivityBanner(modifier = Modifier.align(Alignment.TopCenter))
             }
         }
     }
 }
 
 @Composable
-private fun GlobalSyncActivityBanner(
-    showPill: Boolean,
-    modifier: Modifier = Modifier,
-) {
+private fun GlobalSyncActivityBanner(modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
-    val pillShape = RoundedCornerShape(14.dp)
-    Column(
-        modifier = modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        LinearProgressIndicator(
-            color = colors.accentBlue,
-            trackColor = Color.Transparent,
-            modifier = Modifier.fillMaxWidth().height(2.dp).testTag("global_sync_indicator"),
-        )
-        if (showPill) {
-            Row(
-                modifier =
-                    Modifier.padding(top = 8.dp)
-                        .background(colors.surfaceElevated, pillShape)
-                        .border(1.dp, colors.border, pillShape)
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                        .testTag("global_sync_pill"),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                RefreshIcon(
-                    tint = colors.accentBlue,
-                    size = 13.dp,
-                    isSpinning = true,
-                )
-                Text(
-                    text = "Refreshing…",
-                    color = colors.textSecondary,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-        }
-    }
+    LinearProgressIndicator(
+        color = colors.accentBlue,
+        trackColor = Color.Transparent,
+        modifier = modifier.fillMaxWidth().height(2.dp).testTag("global_sync_indicator"),
+    )
 }
 
 @Composable
@@ -818,6 +774,7 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 listState = scrollStates.lazyListState("starred"),
+                onOpenExternalUrl = onOpenExternalUrl,
             )
         AppTab.FEEDS ->
             FeedsAndTagsTabContent(

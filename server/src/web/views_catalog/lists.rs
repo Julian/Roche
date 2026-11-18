@@ -102,6 +102,7 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -298,6 +299,7 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -439,6 +441,13 @@ fn render_ranked_table_row(
     render_creators_span(out, &row.entry.creators, artist_links);
     if let Some(yr) = row.entry.release_year {
         let _ = write!(out, "<span class=\"year\">({yr})</span>");
+    }
+    if row.entry.kind.is_reader_openable() && row.entry.url.is_some() {
+        let _ = write!(
+            out,
+            " <a class=\"badge\" style=\"margin-left:0.4rem\" href=\"/reader/{id}\">Read &rarr;</a>",
+            id = esc(&urlencode(&row.entry.id)),
+        );
     }
     let _ = write!(
         out,

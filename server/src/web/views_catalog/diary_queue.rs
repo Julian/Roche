@@ -98,6 +98,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
         active: NavSection::Diary,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -197,6 +198,7 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         active: NavSection::Queue,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -272,11 +274,20 @@ fn render_want_queue_section(
             render_creator_links(&mut by, &row.entry.creators, artist_links, false);
             by.push_str("</span>");
         }
+        let read_btn = if row.entry.kind.is_reader_openable() && row.entry.url.is_some() {
+            format!(
+                "<a class=\"btn btn-small\" href=\"/reader/{}\">Read</a>",
+                esc(&urlencode(&row.entry.id))
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
             "<li><div class=\"queue-row\">\
                <span><a href=\"/entries/{id}\">{title}</a>{by}</span>\
                <span class=\"inbox-controls\">\
+                 {read_btn}\
                  <form method=\"post\" action=\"/web/want/{q}/complete/{id}\" class=\"inline-form\">\
                    <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
                    <input type=\"hidden\" name=\"rank_after\" value=\"1\">\

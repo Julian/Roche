@@ -11,7 +11,7 @@ use crate::db::{ContentType, Item};
 
 pub(super) use feeds::{
     export_opml_get, feeds_get, post_feed_create, post_feed_delete, post_feed_opml,
-    post_feed_refresh, post_feed_toggle_active,
+    post_feed_refresh, post_feed_refresh_all, post_feed_toggle_active, refresh_status_get,
 };
 pub(super) use inbox::{
     inbox_get, post_item_archive, post_item_archive_batch, post_item_save, post_item_star,
@@ -41,6 +41,8 @@ pub(super) struct SaveUrlForm {
     pub title: Option<String>,
     #[serde(default)]
     pub tags: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

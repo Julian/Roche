@@ -182,10 +182,13 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(unauth.headers().get(header::LOCATION).unwrap(), "/login");
 
     let (cookie, csrf) = login_browser(&db, &app).await;
-    for path in ["/inbox", "/starred", "/feeds", "/lists", "/diary", "/queue", "/rank"] {
+    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue", "/rank"] {
         let resp = get_authed(&app, path, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {path}");
     }
+    let starred_redir = get_authed(&app, "/starred", &cookie).await;
+    assert_eq!(starred_redir.status(), StatusCode::SEE_OTHER);
+    assert_eq!(starred_redir.headers().get(header::LOCATION).unwrap(), "/lists/starred");
 
     let missing_csrf = post_form(&app, "/web/lists/create", &cookie, &[("title", "My List")]).await;
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
@@ -1310,4 +1313,184 @@ async fn test_artist_detail_enrichment_persists_links_portrait_and_bio() {
     assert!(html.contains("https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"));
     assert!(html.contains("src=\"https://upload.wikimedia.org/wikipedia/commons/adele.jpg\""));
     assert!(html.contains("Adele Laurie Blue Adkins is an English singer-songwriter."));
+}
+
+struct DiscoveryWebFetcher;
+
+impl crate::scheduler::FeedFetcher for DiscoveryWebFetcher {
+    fn fetch_feed(&self, url: &Url) -> impl std::future::Future<Output = anyhow::Result<String>> {
+        let res = match url.as_str() {
+            "https://danluu.com/" => Ok(r#"<!doctype html><html><head><title>Dan Luu</title>
+                   <link rel="alternate" type="application/atom+xml" href="/atom.xml">
+                   </head><body><p>Essays</p></body></html>"#
+                .to_owned()),
+            "https://danluu.com/atom.xml" => Ok(r#"<?xml version="1.0" encoding="utf-8"?>
+                   <feed xmlns="http://www.w3.org/2005/Atom">
+                     <title>Dan Luu</title>
+                     <entry>
+                       <id>https://danluu.com/latency-mitigations/</id>
+                       <title>Latency Mitigations</title>
+                       <link href="https://danluu.com/latency-mitigations/"/>
+                     </entry>
+                   </feed>"#
+                .to_owned()),
+            "https://www.youtube.com/@Computerphile" => Ok(r#"<!doctype html><html><head>
+                   <meta itemprop="channelId" content="UC9-y-6csu5WGm29I7JiwpnA">
+                   </head><body></body></html>"#
+                .to_owned()),
+            other => Err(anyhow::anyhow!("unexpected fetch_feed url: {other}")),
+        };
+        std::future::ready(res)
+    }
+
+    fn fetch_html(
+        &self,
+        url: &Url,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> {
+        let res = if url.as_str() == "https://essays.example.com/lsm" {
+            Ok(Some(
+                r#"<!doctype html><html><head><title>LSM Compaction</title>
+                   <meta name="author" content="Pat O'Neil">
+                   <meta name="description" content="Write amplification tradeoffs.">
+                   </head><body><p>Full saved essay text.</p></body></html>"#
+                    .to_owned(),
+            ))
+        } else {
+            Ok(None)
+        };
+        std::future::ready(res)
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discovery() {
+    assert_eq!(
+        crate::db::deterministic_system_collection_id("want:read"),
+        crate::db::WANT_TO_READ_COLLECTION_ID
+    );
+
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let service = RocheService::new(db.clone(), DiscoveryWebFetcher, Config::default());
+    let app = crate::api::ApiRoutes::router_with_service(service.clone());
+    let (cookie, csrf) = login_browser(&db, &app).await;
+    let resp_html = async |resp: axum::response::Response| -> String {
+        String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap()
+    };
+
+    // 1. Save standalone URL from Home -> lands in Want to Read (`inbox_state = 'none'`), NOT Feed Inbox
+    let save_resp = post_form(
+        &app,
+        "/web/items/save",
+        &cookie,
+        &[("_csrf", &csrf), ("url", "essays.example.com/lsm"), ("return_to", "/")],
+    )
+    .await;
+    assert_eq!(save_resp.status(), StatusCode::SEE_OTHER);
+
+    for _ in 0..30 {
+        if !service.is_refreshing() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let home_html = resp_html(get_authed(&app, "/", &cookie).await).await;
+    assert!(home_html.contains("Want to Read (1)"));
+    assert!(home_html.contains("LSM Compaction"));
+    assert!(home_html.contains("Feed Inbox (0)"));
+
+    let inbox_html = resp_html(get_authed(&app, "/inbox", &cookie).await).await;
+    assert!(!inbox_html.contains("Save URL to Inbox"));
+    assert!(!inbox_html.contains("LSM Compaction"));
+
+    let queue_html = resp_html(get_authed(&app, "/queue", &cookie).await).await;
+    assert!(queue_html.contains("Want to Read (1)"));
+    assert!(queue_html.contains("LSM Compaction"));
+    assert!(queue_html.contains(">Read</a>"));
+
+    let wtr_items = db
+        .items()
+        .list_filtered(&crate::db::ItemFilter {
+            collection_id: Some(crate::db::WANT_TO_READ_COLLECTION_ID.to_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(wtr_items.len(), 1);
+    let saved_id = wtr_items[0].id.clone();
+    assert_eq!(wtr_items[0].author.as_deref(), Some("Pat O'Neil"));
+
+    // Media attached to a `want:read` item (`inbox_state = 'none'`) must NEVER be treated as orphaned!
+    db.media()
+        .create(&saved_id, crate::db::MediaType::Pdf, "pdfs/lsm.pdf", Some(2048), None)
+        .await
+        .unwrap();
+    assert!(db.media().find_orphaned().await.unwrap().is_empty());
+
+    // 2. Star the item -> `/lists` and `/lists/starred` treat Starred as a normal manual list (no Enable Draw)
+    let star_resp = post_form(
+        &app,
+        &format!("/web/items/{saved_id}/star"),
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", "/lists/starred")],
+    )
+    .await;
+    assert_eq!(star_resp.status(), StatusCode::SEE_OTHER);
+
+    let lists_html = resp_html(get_authed(&app, "/lists", &cookie).await).await;
+    assert!(lists_html.contains("/lists/starred"));
+
+    let starred_list_html = resp_html(get_authed(&app, "/lists/starred", &cookie).await).await;
+    assert!(starred_list_html.contains("LSM Compaction"));
+    assert!(starred_list_html.contains("Read &rarr;"));
+    assert!(!starred_list_html.contains("Enable Draw"));
+
+    // 3. Homepage & YouTube `@handle` RSS autodiscovery on `/web/feeds/create`
+    let sub_blog = post_form(
+        &app,
+        "/web/feeds/create",
+        &cookie,
+        &[("_csrf", &csrf), ("url", "danluu.com"), ("feed_type", "rss")],
+    )
+    .await;
+    assert_eq!(sub_blog.status(), StatusCode::SEE_OTHER);
+
+    let sub_yt = post_form(
+        &app,
+        "/web/feeds/create",
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("url", "https://www.youtube.com/@Computerphile"),
+            ("feed_type", "rss"),
+        ],
+    )
+    .await;
+    assert_eq!(sub_yt.status(), StatusCode::SEE_OTHER);
+
+    let feeds = db.feeds().list().await.unwrap();
+    assert!(feeds.iter().any(|f| f.url.as_str() == "https://danluu.com/atom.xml"));
+    assert!(feeds.iter().any(|f| {
+        f.feed_type == FeedType::Youtube
+            && f.url.as_str()
+                == "https://www.youtube.com/feeds/videos.xml?channel_id=UC9-y-6csu5WGm29I7JiwpnA"
+    }));
+
+    // 4. Non-blocking background refresh endpoint + JSON status route
+    let refresh_all = post_form(
+        &app,
+        "/web/feeds/refresh-all",
+        &cookie,
+        &[("_csrf", &csrf), ("return_to", "/inbox")],
+    )
+    .await;
+    assert_eq!(refresh_all.status(), StatusCode::SEE_OTHER);
+
+    let status_resp = get_authed(&app, "/web/refresh-status", &cookie).await;
+    assert_eq!(status_resp.status(), StatusCode::OK);
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(status_resp.into_body(), 16 * 1024).await.unwrap())
+            .unwrap();
+    assert!(status_json["is_refreshing"].is_boolean());
 }

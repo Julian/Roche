@@ -105,8 +105,15 @@ fun extractSharedContentFromIntent(
     displayNameResolver: (Uri) -> String? = { null },
 ): SharedContentPayload? {
     val current = intent ?: return null
-    val clipItem = current.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)
-    val streamUriObj = readParcelableUriExtra(current, Intent.EXTRA_STREAM) ?: clipItem?.uri
+    val clipItems =
+        current.clipData?.let { clip -> (0 until clip.itemCount).map(clip::getItemAt) }.orEmpty()
+    val firstClipUri = clipItems.firstNotNullOfOrNull { it.uri }
+    val bestClipText =
+        clipItems
+            .mapNotNull { it.text?.toString()?.takeIf(String::isNotBlank) }
+            .firstOrNull { findFirstHttpUrl(it) != null }
+            ?: clipItems.firstNotNullOfOrNull { it.text?.toString()?.takeIf(String::isNotBlank) }
+    val streamUriObj = readParcelableUriExtra(current, Intent.EXTRA_STREAM) ?: firstClipUri
     val originatingUriObj = readParcelableUriExtra(current, EXTRA_ORIGINATING_URI)
     val displayName = streamUriObj?.let(displayNameResolver)
     return extractSharedContent(
@@ -116,8 +123,8 @@ fun extractSharedContentFromIntent(
         extraHtmlText = current.getStringExtra(Intent.EXTRA_HTML_TEXT),
         extraSubject = current.getStringExtra(Intent.EXTRA_SUBJECT),
         extraTitle = current.getCharSequenceExtra(Intent.EXTRA_TITLE)?.toString(),
-        clipText = clipItem?.text?.toString(),
-        clipUri = clipItem?.uri?.toString(),
+        clipText = bestClipText,
+        clipUri = firstClipUri?.toString(),
         originatingUri = originatingUriObj?.toString(),
         dataUri = current.dataString,
         streamUri = streamUriObj?.toString(),

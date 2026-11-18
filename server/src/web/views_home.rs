@@ -65,8 +65,31 @@ async fn render_home_inner<F: FeedFetcher>(
         .query()
         .with_filter(ItemFilter {
             status: Some(ItemStatusFilter::Unread),
+            inbox_only: Some(true),
             include_content: Some(false),
             per_page: Some(12),
+            ..ItemFilter::default()
+        })
+        .list_page()
+        .await?;
+    let active_readable_page = service
+        .items()
+        .query()
+        .with_filter(ItemFilter {
+            status: Some(ItemStatusFilter::Unread),
+            include_content: Some(false),
+            per_page: Some(20),
+            ..ItemFilter::default()
+        })
+        .list_page()
+        .await?;
+    let want_to_read_page = service
+        .items()
+        .query()
+        .with_filter(ItemFilter {
+            collection_id: Some(crate::db::WANT_TO_READ_COLLECTION_ID.to_owned()),
+            include_content: Some(false),
+            per_page: Some(8),
             ..ItemFilter::default()
         })
         .list_page()
@@ -83,23 +106,37 @@ async fn render_home_inner<F: FeedFetcher>(
     home_creators.extend(recent_diary.iter().flat_map(|d| d.entry.creators.iter().cloned()));
     let artist_links = load_artist_id_by_lower_name(service, &home_creators).await;
 
-    let mut body = String::with_capacity(8_192);
+    let mut body = String::with_capacity(10_240);
+    render_home_quick_actions_bar(&mut body, &session.csrf_token);
     for gen_state in &active_generators {
         render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
     }
-    render_in_progress_section(&mut body, &unread_page.items);
-
-    let want_total: usize = collections
+    render_in_progress_section(&mut body, &active_readable_page.items);
+    let wtr_total = collections
         .iter()
-        .filter(|c| c.role == crate::db::CollectionRole::Want)
+        .find(|c| c.id == crate::db::WANT_TO_READ_COLLECTION_ID)
+        .map_or(want_to_read_page.items.len(), |c| c.member_count);
+    render_want_to_read_section(
+        &mut body,
+        &want_to_read_page.items,
+        wtr_total,
+        &session.csrf_token,
+    );
+
+    let other_want_total: usize = collections
+        .iter()
+        .filter(|c| {
+            c.role == crate::db::CollectionRole::Want
+                && c.id != crate::db::WANT_TO_READ_COLLECTION_ID
+        })
         .map(|c| c.member_count)
         .sum();
-    if want_total > 0 {
+    if other_want_total > 0 {
         let _ = writeln!(
             body,
-            "<div class=\"section-head\"><h3>Up Next Queue ({want_total})</h3>\
+            "<div class=\"section-head\"><h3>Up Next Queues ({other_want_total})</h3>\
              <a class=\"section-action\" href=\"/queue\">Manage Queues &rarr;</a></div>\n\
-             <p class=\"meta\">You have <em>{want_total}</em> queued works across your Want lists.</p>"
+             <p class=\"meta\">You have <em>{other_want_total}</em> queued movies, books, albums, or games in your Want lists.</p>"
         );
     }
 
@@ -111,6 +148,7 @@ async fn render_home_inner<F: FeedFetcher>(
         active: NavSection::Home,
         csrf_token: &session.csrf_token,
         flash,
+        is_refreshing: sync_status.is_refreshing,
         body_html: &body,
     })
     .into_response())
@@ -287,15 +325,82 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     out.push_str("</ul>\n");
 }
 
-fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64) {
+fn render_home_quick_actions_bar(out: &mut String, csrf: &str) {
+    let _ = write!(
+        out,
+        "<div class=\"quick-save-bar\">\n\
+           <form method=\"post\" action=\"/web/items/save\" class=\"quick-save-form\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
+             <input type=\"text\" name=\"url\" required placeholder=\"Save article, PDF, arXiv, or video URL to Want to Read...\" aria-label=\"URL to save to Want to Read\">\n\
+             <button type=\"submit\" class=\"btn btn-primary btn-small\">+ Want to Read</button>\n\
+           </form>\n\
+           <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
+             <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>\n\
+           </form>\n\
+         </div>\n",
+        csrf = esc(csrf),
+    );
+}
+
+fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: usize, csrf: &str) {
     let _ = writeln!(
         out,
-        "<div class=\"section-head\"><h3>Unread Inbox ({total_unread})</h3>\
-         <a class=\"section-action\" href=\"/inbox\">Open Inbox &rarr;</a></div>"
+        "<div class=\"section-head\"><h3>Want to Read ({total_count})</h3>\
+         <a class=\"section-action\" href=\"/queue\">Full Queue &rarr;</a></div>"
     );
     if items.is_empty() {
         out.push_str(
-            "<p class=\"empty\">Inbox clear. <a href=\"/feeds\">Manage feeds</a> or save a URL in <a href=\"/inbox\">Inbox</a>.</p>\n",
+            "<p class=\"empty\">Your reading list is clear. Paste a link or PDF URL above, or share from Android to save for later.</p>\n",
+        );
+        return;
+    }
+
+    out.push_str("<ul class=\"inbox-list\">\n");
+    for item in items.iter().take(6) {
+        let _ = write!(
+            out,
+            "<li class=\"inbox-row\"><div class=\"inbox-main\">\
+             <div class=\"inbox-title\"><a href=\"/reader/{id}\">{title}</a></div>\
+             <div class=\"item-byline\"><span class=\"badge\">{ctype:?}</span>",
+            id = esc(&urlencode(&item.id)),
+            title = esc(&item.title),
+            ctype = item.content_type,
+        );
+        if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
+            let _ = write!(out, "<span>{}</span>", esc(author));
+        }
+        for tag_name in &item.tag_names.0 {
+            let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
+        }
+        out.push_str("</div></div><div class=\"inbox-controls\">");
+        render_audio_play_button(out, item);
+        let _ = write!(
+            out,
+            "<form method=\"post\" action=\"/web/items/{id}/finish\" class=\"inline-form\">\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+               <input type=\"hidden\" name=\"return_to\" value=\"/\">\
+               <button type=\"submit\" class=\"btn btn-small btn-ghost\">&#10003; Done</button>\
+             </form>",
+            id = esc(&urlencode(&item.id)),
+            csrf = esc(csrf),
+        );
+        out.push_str("</div></li>\n");
+    }
+    out.push_str("</ul>\n");
+}
+
+fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64) {
+    let _ = writeln!(
+        out,
+        "<div class=\"section-head\"><h3>Feed Inbox ({total_unread})</h3>\
+         <a class=\"section-action\" href=\"/inbox\">Open Feed Inbox &rarr;</a></div>"
+    );
+    if items.is_empty() {
+        out.push_str(
+            "<p class=\"empty\">Feed Inbox clear. <a href=\"/feeds\">Manage subscribed feeds</a>.</p>\n",
         );
         return;
     }

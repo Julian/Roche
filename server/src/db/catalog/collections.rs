@@ -216,29 +216,45 @@ impl CatalogRepo<'_> {
             return self.summarize_collection_row(existing).await;
         }
 
-        let base_slug = if let Ok(kind) = EntryKind::parse_flexible(trimmed) {
-            kind.default_list_slug()
+        let (want_slug, pretty_label) = if let Ok(kind) = EntryKind::parse_flexible(trimmed) {
+            let slug = kind
+                .default_want_slug()
                 .ok_or_else(|| {
                     CatalogError::InvalidInput(format!(
                         "Kind '{}' does not have a default want queue",
                         kind.as_str()
                     ))
                 })?
-                .to_owned()
+                .to_owned();
+            let label = if slug == crate::db::WANT_TO_READ_SLUG {
+                crate::db::WANT_TO_READ_TITLE.to_owned()
+            } else {
+                format!("Want: {}", kind.display_label())
+            };
+            (slug, label)
         } else {
-            trimmed.strip_prefix("want:").unwrap_or(trimmed).to_ascii_lowercase().replace('-', "_")
+            let base_slug = trimmed
+                .strip_prefix("want:")
+                .unwrap_or(trimmed)
+                .to_ascii_lowercase()
+                .replace('-', "_");
+            if base_slug == "read" || base_slug == "articles" || base_slug == "papers" {
+                (crate::db::WANT_TO_READ_SLUG.to_owned(), crate::db::WANT_TO_READ_TITLE.to_owned())
+            } else {
+                let slug = format!("want:{base_slug}");
+                let label = EntryKind::parse_flexible(&base_slug).map_or_else(
+                    |_| format!("Want: {base_slug}"),
+                    |k| format!("Want: {}", k.display_label()),
+                );
+                (slug, label)
+            }
         };
 
-        let want_slug = format!("want:{base_slug}");
         if let Ok(existing) = self.lookup_collection_row(&want_slug, false).await {
             return self.summarize_collection_row(existing).await;
         }
 
         let id = deterministic_system_collection_id(&want_slug);
-        let pretty_label = EntryKind::parse_flexible(&base_slug).map_or_else(
-            |_| format!("Want: {base_slug}"),
-            |k| format!("Want: {}", k.display_label()),
-        );
         let now = SyncRepo::now_utc();
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query!(
@@ -414,7 +430,7 @@ impl CatalogRepo<'_> {
             Some(explicit) => explicit.to_owned(),
             None => entry
                 .kind
-                .default_list_slug()
+                .default_want_slug()
                 .ok_or_else(|| {
                     CatalogError::InvalidInput(format!(
                         "Specify a target want queue for kind '{}'",

@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite};
 
 use super::{
-    ITEM_SELECT_FULL, ITEM_SELECT_LIST, ITEM_SELECT_METADATA_ONLY, Item, ItemFilter, ItemPage,
-    ItemRepo,
+    IS_FEED_INBOX_ITEM_SQL, IS_LIVE_ITEM_SQL, ITEM_SELECT_FULL, ITEM_SELECT_LIST,
+    ITEM_SELECT_METADATA_ONLY, Item, ItemFilter, ItemPage, ItemRepo,
 };
 use crate::db::{
     InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder, sync::STARRED_COLLECTION_ID,
@@ -15,7 +15,8 @@ impl ItemRepo<'_> {
         let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_FULL);
         qb.push(" WHERE i.id = ")
             .push_bind(id)
-            .push(" AND i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
+            .push(" AND i.merged_into_id IS NULL AND ")
+            .push(IS_LIVE_ITEM_SQL);
         Ok(qb.build_query_as::<Item>().fetch_optional(self.pool).await?)
     }
 
@@ -26,7 +27,12 @@ impl ItemRepo<'_> {
         limit: Option<usize>,
     ) -> Result<Vec<Item>> {
         let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_LIST);
-        qb.push(" WHERE i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
+        qb.push(" WHERE i.merged_into_id IS NULL AND ");
+        if status.is_some() || feed_id.is_some() {
+            qb.push("es.inbox_state IN ('unread', 'dismissed')");
+        } else {
+            qb.push(IS_LIVE_ITEM_SQL);
+        }
         if let Some(s) = status {
             qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
         }
@@ -50,6 +56,7 @@ impl ItemRepo<'_> {
         Ok(self.list_filtered_page(filter).await?.items)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn list_filtered_page(&self, filter: &ItemFilter) -> Result<ItemPage> {
         let trimmed_search = filter.search.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let search_terms = trimmed_search.map_or_default(ItemFilter::tokenize_search_terms);
@@ -68,10 +75,30 @@ impl ItemRepo<'_> {
             .push_bind(fts_match.clone())
             .push(") fts ON fts.fts_rowid = i.rowid");
         }
-        qb.push(" WHERE i.merged_into_id IS NULL AND es.inbox_state IN ('unread', 'dismissed')");
+        qb.push(" WHERE i.merged_into_id IS NULL AND ");
+        if filter.inbox_only == Some(true) {
+            qb.push(IS_FEED_INBOX_ITEM_SQL);
+        } else {
+            qb.push(IS_LIVE_ITEM_SQL);
+        }
 
         if let Some(s) = filter.status.and_then(ItemStatusFilter::into_status) {
-            qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
+            if filter.inbox_only == Some(true) {
+                qb.push(" AND es.inbox_state = ").push_bind(InboxState::from(s));
+            } else {
+                match s {
+                    ItemStatus::Unread => {
+                        qb.push(
+                            " AND (es.inbox_state = 'unread' OR (COALESCE(es.inbox_state, 'none') = 'none' AND (es.read_at IS NULL OR EXISTS (SELECT 1 FROM collection_entries ce_wtr_u WHERE ce_wtr_u.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' AND ce_wtr_u.entry_id = i.id))))",
+                        );
+                    }
+                    ItemStatus::Archived => {
+                        qb.push(
+                            " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM collection_entries ce_wtr_a WHERE ce_wtr_a.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' AND ce_wtr_a.entry_id = i.id)))",
+                        );
+                    }
+                }
+            }
         }
         if let Some(is_read) = filter.is_read {
             if is_read {
@@ -87,6 +114,13 @@ impl ItemRepo<'_> {
             .push_bind(f)
             .push(")");
         }
+        if let Some(col_id) = &filter.collection_id {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM collection_entries ce_cf WHERE ce_cf.entry_id = i.id AND ce_cf.collection_id = ",
+            )
+            .push_bind(col_id)
+            .push(")");
+        }
         if let Some(t) = &filter.tag_id {
             qb.push(
                 " AND EXISTS (SELECT 1 FROM collection_entries ce_tf WHERE ce_tf.entry_id = i.id AND ce_tf.collection_id = ",
@@ -95,7 +129,10 @@ impl ItemRepo<'_> {
             .push(")");
         }
         if let Some(ct) = filter.content_type {
-            qb.push(" AND COALESCE(ec.content_type, 'article') = ").push_bind(ct);
+            qb.push(
+                " AND COALESCE(ec.content_type, CASE i.kind WHEN 'video' THEN 'video' WHEN 'paper' THEN 'paper' WHEN 'podcast_episode' THEN 'audio' ELSE 'article' END) = ",
+            )
+            .push_bind(ct);
         }
         if let Some(fav) = filter.is_favorite {
             if fav {
@@ -186,24 +223,35 @@ impl ItemRepo<'_> {
 
     pub async fn count_by_status(&self, status: ItemStatus) -> Result<i64> {
         let inbox_state = InboxState::from(status);
-        Ok(sqlx::query_scalar!(
-            "SELECT COUNT(*) AS \"count!: i64\"
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*)
              FROM entry_state es
              JOIN entries e ON e.id = es.entry_id
-             WHERE e.merged_into_id IS NULL AND es.inbox_state = ?",
-            inbox_state as _,
+             WHERE e.merged_into_id IS NULL
+               AND es.inbox_state = ?
+               AND EXISTS (
+                   SELECT 1 FROM collection_entries ce_f
+                   JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+                   WHERE ce_f.entry_id = e.id
+               )",
         )
+        .bind(inbox_state)
         .fetch_one(self.pool)
         .await?)
     }
 
     pub async fn count_unread(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar!(
-            "SELECT COUNT(*) AS \"count!: i64\"
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*)
              FROM entry_state es
              JOIN entries e ON e.id = es.entry_id
              WHERE e.merged_into_id IS NULL
-               AND es.inbox_state = 'unread'",
+               AND es.inbox_state = 'unread'
+               AND EXISTS (
+                   SELECT 1 FROM collection_entries ce_f
+                   JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+                   WHERE ce_f.entry_id = e.id
+               )",
         )
         .fetch_one(self.pool)
         .await?)

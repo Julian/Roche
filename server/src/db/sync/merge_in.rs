@@ -423,7 +423,7 @@ impl SyncRepo<'_> {
                     }
                     for (iid, _) in candidates {
                         if ItemRepo::delete_inbox_item_preserving_history_in_tx(
-                            &mut *conn, &iid, now,
+                            &mut *conn, &iid, true, now,
                         )
                         .await?
                         {
@@ -533,6 +533,19 @@ impl SyncRepo<'_> {
                     .await?;
                 }
                 ActivityEntityType::Entry => {
+                    if super::is_protected_system_collection_id(key) {
+                        continue;
+                    }
+                    let protected_spec: Option<i64> = sqlx::query_scalar(
+                        "SELECT 1 FROM collection_specs
+                         WHERE collection_id = ? AND (mode = 'dynamic' OR collection_role = 'system')",
+                    )
+                    .bind(key)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    if protected_spec.is_some() {
+                        continue;
+                    }
                     let existing_hlc: Option<String> =
                         sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
                             .bind(key)
@@ -632,6 +645,22 @@ impl SyncRepo<'_> {
                         )
                         .await?;
                     }
+                    CollectionRole::System
+                        if cs.mode == CollectionMode::Manual
+                            && (rec.id.trim() == super::STARRED_COLLECTION_ID
+                                || cs
+                                    .slug
+                                    .as_deref()
+                                    .is_some_and(|s| s.trim().eq_ignore_ascii_case("starred"))) =>
+                    {
+                        let mut upgraded = cs.clone();
+                        upgraded.role = CollectionRole::List;
+                        upgraded.show_in_lists = true;
+                        Self::merge_single_collection_entry_in_tx(
+                            tx, prep, &upgraded, id_remap, peer_id, now,
+                        )
+                        .await?;
+                    }
                     CollectionRole::Feed
                     | CollectionRole::System
                     | CollectionRole::List
@@ -643,9 +672,16 @@ impl SyncRepo<'_> {
         // Map entry_id -> candidate parent feed_id from incoming `collection_entries`
         let mut incoming_parent_feed: HashMap<&str, &str> = HashMap::new();
         for ce in incoming_memberships {
-            incoming_parent_feed
-                .entry(ce.entry_id.trim())
-                .or_insert_with(|| ce.collection_id.trim());
+            let cid = ce.collection_id.trim();
+            let eid = ce.entry_id.trim();
+            if cid.is_empty() || eid.is_empty() || super::is_protected_system_collection_id(cid) {
+                continue;
+            }
+            if feed_url_by_id.contains_key(cid) {
+                incoming_parent_feed.insert(eid, cid);
+            } else {
+                incoming_parent_feed.entry(eid).or_insert(cid);
+            }
         }
 
         // Pass 1b: Regular Catalog Works & Inbox Items
@@ -1083,6 +1119,7 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn merge_single_collection_entry_in_tx(
         tx: &mut SqliteConnection,
         prep: &PreparedSyncEntry,
@@ -1101,7 +1138,7 @@ impl SyncRepo<'_> {
         let requested_id = if !rec.id.trim().is_empty() {
             rec.id.trim().to_owned()
         } else if let Some(ref s) = slug_opt {
-            if s.starts_with("want:") {
+            if s == "starred" || s == "up_next" || s.starts_with("want:") {
                 deterministic_system_collection_id(s)
             } else {
                 deterministic_system_collection_id(&format!("custom:{s}"))
@@ -1166,23 +1203,33 @@ impl SyncRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
+        let (effective_slug, effective_role, effective_show_in_lists) =
+            if target_id == super::STARRED_COLLECTION_ID {
+                (Some("starred".to_owned()), CollectionRole::List, true)
+            } else if target_id == super::WANT_TO_READ_COLLECTION_ID {
+                (Some(super::WANT_TO_READ_SLUG.to_owned()), CollectionRole::Want, false)
+            } else {
+                (slug_opt, cs.role, cs.show_in_lists)
+            };
+
         sqlx::query(
             "INSERT INTO collection_specs
              (collection_id, slug, mode, collection_role, rule_json, show_in_lists, color)
              VALUES (?, ?, 'manual', ?, NULL, ?, ?)
              ON CONFLICT(collection_id) DO UPDATE SET
+                 collection_role = excluded.collection_role,
                  show_in_lists = excluded.show_in_lists,
                  color = COALESCE(excluded.color, collection_specs.color)",
         )
         .bind(&target_id)
-        .bind(&slug_opt)
-        .bind(cs.role)
-        .bind(cs.show_in_lists)
+        .bind(&effective_slug)
+        .bind(effective_role)
+        .bind(effective_show_in_lists)
         .bind(clean_color)
         .execute(&mut *tx)
         .await?;
 
-        if let Some(s) = slug_opt {
+        if let Some(s) = effective_slug {
             sqlx::query(
                 "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
                  VALUES ('slug', ?, ?)",
@@ -1369,6 +1416,7 @@ impl SyncRepo<'_> {
             |existing_id| Some(existing_id.clone()),
         );
 
+        let was_created_new = pre_matched_id.is_none();
         let target_id = if let Some(existing_id) = pre_matched_id {
             Self::merge_into_existing_entry_row_in_tx(
                 tx,
@@ -1562,7 +1610,9 @@ impl SyncRepo<'_> {
             }
         }
 
-        if was_new_inbox_item && let Some(ref parsed_u) = prep.parsed_url {
+        if (was_new_inbox_item || (was_created_new && rec.content.is_some()))
+            && let Some(ref parsed_u) = prep.parsed_url
+        {
             return Ok(Some((
                 target_id,
                 PollItemCandidate {
@@ -2072,7 +2122,9 @@ impl SyncRepo<'_> {
             .bind(&col_id)
             .fetch_optional(&mut *tx)
             .await?;
-            if !matches!(spec_ok, Some((CollectionMode::Manual, CollectionRole::List))) {
+            if col_id == super::STARRED_COLLECTION_ID
+                || !matches!(spec_ok, Some((CollectionMode::Manual, CollectionRole::List)))
+            {
                 continue;
             }
 

@@ -20,6 +20,7 @@ import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.remote.readBoundedText
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.CompanionSubTab
+import com.grayvines.roche.ui.LocalOfflineCacheDir
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
@@ -65,7 +66,9 @@ class MainActivity : ComponentActivity() {
             handleIncomingShareIntent(intent)
             viewModel.triggerStartupSyncIfConfigured()
         }
-        val thumbnailLoader = (application as RocheApp).graph.thumbnailLoader
+        val appGraph = (application as RocheApp).graph
+        val thumbnailLoader = appGraph.thumbnailLoader
+        val offlineCacheDir = appGraph.offlineCacheDir
 
         setContent {
             val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -77,7 +80,10 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
-            CompositionLocalProvider(LocalThumbnailLoader provides thumbnailLoader) {
+            CompositionLocalProvider(
+                LocalThumbnailLoader provides thumbnailLoader,
+                LocalOfflineCacheDir provides offlineCacheDir,
+            ) {
                 RocheTheme(
                     themeMode = state.settings.themeMode,
                     headlineFont = state.settings.headlineFont,
@@ -115,31 +121,14 @@ class MainActivity : ComponentActivity() {
             currentIntent.removeExtra(PodcastPlaybackService.EXTRA_OPEN_FULLSCREEN_PLAYER)
             currentIntent.action = Intent.ACTION_MAIN
             viewModel.dispatch(MainAction.OpenFullscreenPlayer)
-            return
-        }
-        val payload =
-            extractSharedLink(
-                action = currentIntent.action,
-                mimeType = currentIntent.type,
-                extraText = currentIntent.getStringExtra(Intent.EXTRA_TEXT),
-                extraSubject = currentIntent.getStringExtra(Intent.EXTRA_SUBJECT),
-                extraTitle = currentIntent.getStringExtra(Intent.EXTRA_TITLE),
-            )
-        if (payload != null) {
-            currentIntent.removeExtra(Intent.EXTRA_TEXT)
-            currentIntent.removeExtra(Intent.EXTRA_SUBJECT)
-            currentIntent.removeExtra(Intent.EXTRA_TITLE)
-            currentIntent.action = Intent.ACTION_MAIN
-            viewModel.dispatch(
-                MainAction.OpenAddSheet(
-                    prefilledUrl = payload.url,
-                    prefilledTitle = payload.title.orEmpty(),
-                )
-            )
         }
     }
 
     private fun shareEntryViaSystemSheet(entry: InboxEntry) {
+        if (entry.url.startsWith("localpdf://", ignoreCase = true)) {
+            viewModel.showStatusMessage("Local PDF has no public web URL to share")
+            return
+        }
         runCatching {
             val sendIntent =
                 Intent(Intent.ACTION_SEND).apply {

@@ -76,7 +76,6 @@ pub(super) enum NavSection {
     Home,
     Inbox,
     Feeds,
-    Starred,
     Lists,
     Rank,
     Diary,
@@ -95,18 +94,18 @@ pub(super) struct PageShell<'a> {
     pub active: NavSection,
     pub csrf_token: &'a str,
     pub flash: &'a FlashQuery,
+    pub is_refreshing: bool,
     pub body_html: &'a str,
 }
 
-const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
+const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
     (NavSection::Home, "/", "Home"),
     (NavSection::Inbox, "/inbox", "Inbox"),
     (NavSection::Feeds, "/feeds", "Feeds"),
-    (NavSection::Starred, "/starred", "Starred"),
     (NavSection::Lists, "/lists", "Lists"),
-    (NavSection::Rank, "/rank", "Rank"),
-    (NavSection::Diary, "/diary", "Diary"),
     (NavSection::Queue, "/queue", "Queue"),
+    (NavSection::Diary, "/diary", "Diary"),
+    (NavSection::Rank, "/rank", "Rank"),
 ];
 
 pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
@@ -147,7 +146,17 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
         let _ = write!(out, "<a href=\"{href}\"{cls}>{label}</a>");
     }
 
-    out.push_str("</nav>\n</header>\n<main id=\"roche-main\">\n");
+    let refresh_hidden = if shell.is_refreshing { "" } else { " hidden" };
+    let refresh_active = if shell.is_refreshing { "1" } else { "0" };
+    let _ = write!(
+        out,
+        "</nav>\n\
+         <div id=\"roche-refresh-banner\" class=\"refresh-banner\" data-active=\"{refresh_active}\" role=\"status\" aria-live=\"polite\"{refresh_hidden}>\n\
+           <span class=\"refresh-spinner\" aria-hidden=\"true\">&#8635;</span>\n\
+           <span class=\"js-refresh-label\">Refreshing feeds &amp; metadata in background&hellip;</span>\n\
+         </div>\n\
+         </header>\n<main id=\"roche-main\">\n",
+    );
 
     if let Some(msg) = shell.flash.err.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let _ = writeln!(out, "<div class=\"notice notice-error\">{}</div>", esc(msg));
@@ -172,7 +181,7 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
              </div>\n\
              <audio id=\"roche-audio\" controls preload=\"metadata\"></audio>\n\
              <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\">1x</button>\n\
-             <a id=\"roche-player-link\" href=\"/inbox\" class=\"btn btn-small\">Notes</a>\n\
+             <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\">Notes</a>\n\
              <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\">&times;</button>\n\
            </div>\n\
          </div>\n\
@@ -280,6 +289,7 @@ pub(super) fn render_error_page(
                 active: NavSection::None,
                 csrf_token: csrf,
                 flash: &FlashQuery::default(),
+                is_refreshing: false,
                 body_html: &body,
             })
         },

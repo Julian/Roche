@@ -148,6 +148,12 @@ fun ReaderView(
     val listState = rememberLazyListState()
     val parsedState =
         rememberParsedArticleBlocks(htmlBody = resolveReaderHtmlBody(entry), baseUrl = entry.url)
+    val pdfSession =
+        rememberCachedPdfSession(
+            entryId = entry.id,
+            isCachedOffline = entry.isCachedOffline,
+            url = entry.url,
+        )
     val awaitingBlankHydration = isHydrating && entry.contentHtml.isNullOrBlank()
     val awaitingContent = isHydrating || parsedState.isParsing
 
@@ -176,6 +182,7 @@ fun ReaderView(
         ReaderArticleBody(
             entry = entry,
             parsedState = parsedState,
+            pdfSession = pdfSession,
             isHydrating = awaitingBlankHydration,
             listState = listState,
             onSelectTag = { onAction(MainAction.FilterByTag(it)) },
@@ -656,6 +663,7 @@ internal fun CompactStarAndArchiveButtons(
 internal fun ReaderArticleBody(
     entry: InboxEntry,
     parsedState: ParsedArticleBlocksState,
+    pdfSession: PdfRendererSession? = null,
     isHydrating: Boolean,
     listState: LazyListState,
     onSelectTag: (String) -> Unit,
@@ -663,6 +671,7 @@ internal fun ReaderArticleBody(
 ) {
     val colors = LocalRocheColors.current
     val linkStyles = rememberReaderLinkStyles()
+    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
     val plainParagraphs =
         remember(entry.contentText, entry.summary) {
             (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
@@ -687,20 +696,23 @@ internal fun ReaderArticleBody(
         readerArticleBodyContentItems(
             entry = entry,
             parsedState = parsedState,
+            pdfSession = pdfSession,
             isHydrating = isHydrating,
             plainParagraphs = plainParagraphs,
             mutedColor = colors.textMuted,
             linkStyles = linkStyles,
             onOpenExternalUrl = onOpenExternalUrl,
         )
-        item(key = "reader_footer") {
-            Column {
-                Spacer(modifier = Modifier.height(6.dp))
-                HeaderActionButton(
-                    label = "Open Original Link ↗",
-                    onClick = { onOpenExternalUrl(entry.url) },
-                )
-                Spacer(modifier = Modifier.height(16.dp))
+        if (!isLocalPdfUrl && entry.url.isNotBlank()) {
+            item(key = "reader_footer") {
+                Column {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    HeaderActionButton(
+                        label = "Open Original Link ↗",
+                        onClick = { onOpenExternalUrl(entry.url) },
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
             }
         }
     }
@@ -710,12 +722,14 @@ internal fun ReaderArticleBody(
 private fun LazyListScope.readerArticleBodyContentItems(
     entry: InboxEntry,
     parsedState: ParsedArticleBlocksState,
+    pdfSession: PdfRendererSession?,
     isHydrating: Boolean,
     plainParagraphs: List<String>,
     mutedColor: androidx.compose.ui.graphics.Color,
     linkStyles: androidx.compose.ui.text.TextLinkStyles,
     onOpenExternalUrl: (String) -> Unit,
 ) {
+    val hasPdfPages = pdfSession != null && pdfSession.pageCount > 0
     if (parsedState.blocks.isNotEmpty()) {
         itemsIndexed(items = parsedState.blocks, key = { idx, _ -> "block_$idx" }) { _, block ->
             SelectionContainer {
@@ -727,21 +741,26 @@ private fun LazyListScope.readerArticleBodyContentItems(
                 )
             }
         }
-    } else if (parsedState.isParsing || isHydrating && plainParagraphs.isEmpty()) {
-        item(key = "reader_loading") {
-            Text(text = "Loading full article…", color = mutedColor, fontSize = 14.sp)
-        }
     } else if (plainParagraphs.isNotEmpty()) {
         itemsIndexed(items = plainParagraphs, key = { idx, _ -> "plain_$idx" }) { _, paragraph ->
             SelectionContainer { ReaderPlainParagraphItem(paragraph = paragraph) }
         }
-    } else {
+    } else if (!hasPdfPages && (parsedState.isParsing || isHydrating)) {
+        item(key = "reader_loading") {
+            Text(text = "Loading full article…", color = mutedColor, fontSize = 14.sp)
+        }
+    } else if (!hasPdfPages) {
         item(key = "reader_empty") {
             Text(
                 text = "Full article text is not cached locally for this item.",
                 color = mutedColor,
                 fontSize = 14.sp,
             )
+        }
+    }
+    if (pdfSession != null && pdfSession.pageCount > 0) {
+        items(count = pdfSession.pageCount, key = { idx -> "pdf_page_$idx" }) { idx ->
+            PdfPageCardItem(session = pdfSession, pageIndex = idx)
         }
     }
 }

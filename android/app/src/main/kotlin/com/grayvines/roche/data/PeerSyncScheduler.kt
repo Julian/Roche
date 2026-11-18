@@ -201,7 +201,9 @@ class PeerSyncJobService : JobService() {
 
 object PeerSyncScheduler {
     internal const val PEER_SYNC_JOB_ID = 4107
+    internal const val PEER_SYNC_IMMEDIATE_JOB_ID = 4108
     internal const val PERIODIC_SYNC_INTERVAL_MS = 30L * 60L * 1000L
+    private const val IMMEDIATE_SYNC_DEADLINE_MS = 30_000L
     private const val EXTRA_LEGACY_REQUIRES_VPN = "requires_vpn"
     private const val EXTRA_NETWORK_ANY_CONFIGURED = "network_any_configured"
     private const val EXTRA_TAILNET_SERVER_HINT = "tailnet_server_hint"
@@ -259,6 +261,28 @@ object PeerSyncScheduler {
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setPersisted(true)
                     .setRequiresBatteryNotLow(true)
+                    .setExtras(extras)
+                    .build()
+            scheduler.schedule(jobInfo)
+        }
+    }
+
+    fun scheduleImmediateSync(context: Context, serverUrl: String = "") {
+        runCatching {
+            val appContext = context.applicationContext
+            val scheduler = appContext.getSystemService(JobScheduler::class.java) ?: return
+            val tailnetServerHint = requiresVpnForServerUrl(serverUrl)
+            val serviceComponent = ComponentName(appContext, PeerSyncJobService::class.java)
+            val extras =
+                PersistableBundle().apply {
+                    putBoolean(EXTRA_NETWORK_ANY_CONFIGURED, true)
+                    putBoolean(EXTRA_TAILNET_SERVER_HINT, tailnetServerHint)
+                }
+            val jobInfo =
+                JobInfo.Builder(PEER_SYNC_IMMEDIATE_JOB_ID, serviceComponent)
+                    .setMinimumLatency(0L)
+                    .setOverrideDeadline(IMMEDIATE_SYNC_DEADLINE_MS)
+                    .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setExtras(extras)
                     .build()
             scheduler.schedule(jobInfo)

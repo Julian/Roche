@@ -37,10 +37,11 @@ pub use sync::{
     SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
     SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
     SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, UP_NEXT_COLLECTION_ID,
-    canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
-    compute_throughput_weight, deterministic_comparison_id, deterministic_consumption_log_id,
-    deterministic_feed_id, deterministic_system_collection_id, deterministic_title_entry_id,
-    should_peer_poll_feed,
+    WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WANT_TO_READ_TITLE, canonical_ordering_json,
+    canonicalize_sync_url, collection_entry_natural_key, compute_throughput_weight,
+    deterministic_comparison_id, deterministic_consumption_log_id, deterministic_feed_id,
+    deterministic_system_collection_id, deterministic_title_entry_id,
+    is_protected_system_collection_id, should_peer_poll_feed,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{

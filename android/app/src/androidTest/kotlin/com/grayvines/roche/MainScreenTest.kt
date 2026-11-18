@@ -287,7 +287,7 @@ class MainScreenTest {
 
         uiState = uiState.copy(isSyncing = true)
         composeRule.onNodeWithTag("global_sync_indicator").assertExists()
-        composeRule.onNodeWithTag("global_sync_pill").assertExists()
+        composeRule.onNodeWithTag("global_sync_pill").assertDoesNotExist()
         uiState = uiState.copy(isSyncing = false)
 
         composeRule.onNodeWithTag("search_fab").performClick()

@@ -263,7 +263,19 @@ class MainViewModelTest {
             assertFalse(viewModel.uiState.value.isSyncing)
             assertNull(viewModel.uiState.value.statusBanner)
 
-            // SyncNow sets statusBanner and resets isSyncing to false in finally block
+            // Standalone SyncNow (blank serverUrl) polls local feeds without error and resets
+            // isSyncing
+            viewModel.dispatch(MainAction.SyncNow)
+            val afterStandaloneSync =
+                viewModel.uiState.first { !it.isSyncing && it.statusBanner != null }
+            assertFalse(afterStandaloneSync.isSyncing)
+            assertEquals("Feeds are up to date", afterStandaloneSync.statusBanner)
+
+            // SyncNow with configured serverUrl but missing pairing token reports Sync offline and
+            // resets isSyncing to false in finally block
+            viewModel.dispatch(MainAction.DismissMessages)
+            viewModel.uiState.first { it.statusBanner == null }
+            settings.update { it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "") }
             viewModel.dispatch(MainAction.SyncNow)
             val afterSync =
                 viewModel.uiState.first {

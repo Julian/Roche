@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.isLikelyFeedUrl
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.data.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -52,6 +53,7 @@ import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import java.net.URI
 import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -230,11 +232,14 @@ private fun ContextSheetActionsList(
         label = if (isInQueue) "Remove from Queue" else "Add to Queue",
         onClick = { onAction(MainAction.ToggleQueueMembership(entry.id)) },
     )
+    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
     ContextActionItem(
         label = readToggleLabel,
         onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
     )
-    ContextActionItem(label = "Share…", onClick = onShare)
+    if (!isLocalPdfUrl) {
+        ContextActionItem(label = "Share…", onClick = onShare)
+    }
     ContextActionItem(
         label = offlineLabel,
         onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
@@ -245,7 +250,9 @@ private fun ContextSheetActionsList(
             onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
         )
     }
-    ContextActionItem(label = "Open Original URL", onClick = onOpenExternalUrl)
+    if (!isLocalPdfUrl && entry.url.isNotBlank()) {
+        ContextActionItem(label = "Open Original URL", onClick = onOpenExternalUrl)
+    }
     ContextActionItem(
         label = "Delete Entry",
         textColor = LocalRocheColors.current.accentIndianRed,
@@ -608,7 +615,7 @@ fun AddUrlOrFeedBottomSheet(
 private fun resolveInitialAddMode(initialUrl: String, defaultMode: AddSheetMode): AddSheetMode =
     if (isLikelyFeedUrl(initialUrl)) AddSheetMode.SUBSCRIBE_FEED else defaultMode
 
-@Suppress("LongParameterList")
+@Suppress("LongParameterList", "LongMethod")
 @Composable
 private fun AddSheetFormBody(
     mode: AddSheetMode,
@@ -652,6 +659,14 @@ private fun AddSheetFormBody(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        if (!isFeedMode && isBareHomepageCandidate(url)) {
+            FilterChipPill(
+                label = "Site homepage? Switch to Subscribe Feed →",
+                selected = false,
+                onClick = { onModeChange(AddSheetMode.SUBSCRIBE_FEED) },
+                modifier = Modifier.testTag("add_sheet_homepage_hint"),
+            )
+        }
         OutlinedTextField(
             value = title,
             onValueChange = onTitleChange,
@@ -700,6 +715,17 @@ private fun AddSheetModeSelectorRow(
             modifier = Modifier.testTag("add_mode_subscribe_feed"),
         )
     }
+}
+
+private fun isBareHomepageCandidate(rawInput: String): Boolean {
+    val trimmed = rawInput.trim()
+    if (trimmed.isEmpty() || isLikelyFeedUrl(trimmed)) return false
+    val normalized = normalizeUserSubmittedUrl(trimmed)
+    val parsed = runCatching { URI.create(normalized) }.getOrNull() ?: return false
+    val host = parsed.host.orEmpty()
+    val hasValidHost = '.' in host && !host.startsWith('.') && !host.endsWith('.')
+    val isRootPath = parsed.path.isNullOrEmpty() || parsed.path == "/"
+    return hasValidHost && isRootPath && parsed.query.isNullOrEmpty()
 }
 
 private const val SPEED_EPSILON = 0.02f

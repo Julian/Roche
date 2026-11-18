@@ -52,6 +52,7 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         status: Some(status_filter),
         feed_id: clean_feed.map(ToOwned::to_owned),
         tag_id: clean_tag.map(ToOwned::to_owned),
+        inbox_only: Some(true),
         content_type,
         include_content: Some(false),
         search: clean_search.map(ToOwned::to_owned),
@@ -76,15 +77,22 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
     let return_url = build_inbox_href(&nav_ctx);
 
     let mut body = String::with_capacity(8_192);
-    body.push_str("<h2>Inbox</h2>\n");
-    render_inbox_filter_bar(&mut body, &nav_ctx);
-    render_inbox_save_and_batch_controls(
-        &mut body,
-        &session.csrf_token,
-        &nav_ctx,
-        &page.items,
-        &return_url,
+    let _ = writeln!(
+        body,
+        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:0.75rem\">\
+           <h2>Feed Inbox</h2>\
+           <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+             <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
+             <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>\
+           </form>\
+         </div>\n\
+         <p class=\"lede\">Read-only chronological stream from your subscribed feeds. Save standalone links or PDFs to <a href=\"/\">Want to Read</a>.</p>",
+        csrf = esc(&session.csrf_token),
+        ret = esc(&return_url),
     );
+    render_inbox_filter_bar(&mut body, &nav_ctx);
+    render_inbox_batch_controls(&mut body, &session.csrf_token, &nav_ctx, &page.items, &return_url);
     render_item_rows(&mut body, &page.items, &session.csrf_token, &return_url);
 
     if page_num > 1 || page.has_more {
@@ -107,6 +115,7 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         active: NavSection::Inbox,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -182,78 +191,61 @@ fn render_inbox_filter_bar(out: &mut String, p: &InboxNavParams<'_>) {
     );
 }
 
-fn render_inbox_save_and_batch_controls(
+fn render_inbox_batch_controls(
     out: &mut String,
     csrf: &str,
     p: &InboxNavParams<'_>,
     items: &[Item],
     return_to: &str,
 ) {
-    let _ = write!(
-        out,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem\">\n\
-           <details class=\"editorial-panel\" style=\"margin:0;flex:1;min-width:16rem\">\n\
-             <summary>+ Save URL to Inbox</summary>\n\
-             <form method=\"post\" action=\"/web/items/save\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-               <div class=\"form-grid\">\n\
-                 <div class=\"field\"><label for=\"save-url\">URL</label>\
-                   <input id=\"save-url\" name=\"url\" type=\"url\" required placeholder=\"https://...\"></div>\n\
-                 <div class=\"field\"><label for=\"save-title\">Title (optional)</label>\
-                   <input id=\"save-title\" name=\"title\" type=\"text\" placeholder=\"Auto-extracted if blank\"></div>\n\
-                 <div class=\"field\"><label for=\"save-tags\">Tags (comma-separated)</label>\
-                   <input id=\"save-tags\" name=\"tags\" type=\"text\" placeholder=\"systems, ml\"></div>\n\
-               </div>\n\
-               <button type=\"submit\" class=\"btn btn-primary\">Save Item</button>\n\
-             </form>\n\
-           </details>\n",
-        csrf = esc(csrf),
-    );
-
     let has_narrowing = p.kind.is_some() || p.tag.is_some() || p.q.is_some();
     let unread_ids: Vec<&str> =
         items.iter().filter(|i| i.status == ItemStatus::Unread).map(|i| i.id.as_str()).collect();
-    if p.status != "archived" && !unread_ids.is_empty() {
-        if has_narrowing {
-            let joined = unread_ids.join(",");
-            let _ = write!(
-                out,
-                "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-                   <input type=\"hidden\" name=\"ids\" value=\"{ids}\">\n\
-                   <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-                   <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Shown Unread ({n})</button>\n\
-                 </form>\n",
-                csrf = esc(csrf),
-                ids = esc(&joined),
-                ret = esc(return_to),
-                n = unread_ids.len(),
-            );
-        } else if let Some(fid) = p.feed {
-            let _ = write!(
-                out,
-                "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-                   <input type=\"hidden\" name=\"feed_id\" value=\"{feed}\">\n\
-                   <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-                   <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread</button>\n\
-                 </form>\n",
-                csrf = esc(csrf),
-                feed = esc(fid),
-                ret = esc(return_to),
-            );
-        } else {
-            let _ = write!(
-                out,
-                "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-                   <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-                   <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>\n\
-                 </form>\n",
-                csrf = esc(csrf),
-                ret = esc(return_to),
-            );
-        }
+    if p.status == "archived" || unread_ids.is_empty() {
+        return;
+    }
+    out.push_str(
+        "<div style=\"display:flex;justify-content:flex-end;align-items:baseline;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem\">\n",
+    );
+    if has_narrowing {
+        let joined = unread_ids.join(",");
+        let _ = write!(
+            out,
+            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <input type=\"hidden\" name=\"ids\" value=\"{ids}\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Shown Unread ({n})</button>\n\
+             </form>\n",
+            csrf = esc(csrf),
+            ids = esc(&joined),
+            ret = esc(return_to),
+            n = unread_ids.len(),
+        );
+    } else if let Some(fid) = p.feed {
+        let _ = write!(
+            out,
+            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <input type=\"hidden\" name=\"feed_id\" value=\"{feed}\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread</button>\n\
+             </form>\n",
+            csrf = esc(csrf),
+            feed = esc(fid),
+            ret = esc(return_to),
+        );
+    } else {
+        let _ = write!(
+            out,
+            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
+               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>\n\
+             </form>\n",
+            csrf = esc(csrf),
+            ret = esc(return_to),
+        );
     }
     out.push_str("</div>\n");
 }
@@ -339,38 +331,16 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
 }
 
 pub(in crate::web) async fn starred_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
-    Extension(session): Extension<WebSession>,
+    State(_service): State<Arc<RocheService<F>>>,
     Query(flash): Query<FlashQuery>,
 ) -> Response {
-    let filter = ItemFilter {
-        status: Some(ItemStatusFilter::All),
-        is_favorite: Some(true),
-        include_content: Some(false),
-        per_page: Some(100),
-        ..ItemFilter::default()
-    };
-    let page = match service.items().query().with_filter(filter).list_page().await {
-        Ok(p) => p,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
-
-    let mut body = String::with_capacity(4_096);
-    let _ = writeln!(
-        body,
-        "<h2>Starred</h2>\n<p class=\"lede\">{} starred items across your feeds and saved links.</p>",
-        page.items.len()
-    );
-    render_item_rows(&mut body, &page.items, &session.csrf_token, "/starred");
-
-    render_page(&PageShell {
-        title: "Starred",
-        active: NavSection::Starred,
-        csrf_token: &session.csrf_token,
-        flash: &flash,
-        body_html: &body,
-    })
-    .into_response()
+    if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
+        redirect_see_other(&format!("/lists/starred?err={}", urlencode(err)))
+    } else if let Some(notice) = flash.notice.as_deref().filter(|s| !s.is_empty()) {
+        redirect_see_other(&format!("/lists/starred?notice={}", urlencode(notice)))
+    } else {
+        redirect_see_other("/lists/starred")
+    }
 }
 
 pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
@@ -378,19 +348,43 @@ pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
     Extension(session): Extension<WebSession>,
     Form(form): Form<SaveUrlForm>,
 ) -> Response {
-    let Ok(parsed_url) = Url::parse(form.url.trim()) else {
-        return redirect_see_other("/inbox?err=Please+enter+a+valid+http(s)+URL");
+    let raw_trimmed = form.url.trim();
+    let normalized = if !raw_trimmed.contains("://")
+        && raw_trimmed.contains('.')
+        && !raw_trimmed.chars().any(char::is_whitespace)
+    {
+        format!("https://{raw_trimmed}")
+    } else {
+        raw_trimmed.to_owned()
+    };
+    let fallback_err_dest = safe_local_redirect(form.return_to.as_deref(), "/");
+    let Ok(parsed_url) = Url::parse(&normalized) else {
+        let sep = if fallback_err_dest.contains('?') { '&' } else { '?' };
+        return redirect_see_other(&format!(
+            "{fallback_err_dest}{sep}err=Please+enter+a+valid+http(s)+URL"
+        ));
     };
     let tags: Vec<String> = form.tags.as_deref().map_or_default(|s| {
         s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(ToOwned::to_owned).collect()
     });
 
     match service.items().save(&parsed_url, form.title.as_deref(), &tags).await {
-        Ok(saved) => redirect_see_other(&format!(
-            "/reader/{}?notice={}",
-            urlencode(&saved.item.id),
-            urlencode("Saved to Inbox")
-        )),
+        Ok(saved) => {
+            if let Some(ret) = form.return_to.as_deref().filter(|s| !s.trim().is_empty()) {
+                let base = safe_local_redirect(Some(ret), "/");
+                let sep = if base.contains('?') { '&' } else { '?' };
+                redirect_see_other(&format!(
+                    "{base}{sep}notice={}",
+                    urlencode("Added to Want to Read")
+                ))
+            } else {
+                redirect_see_other(&format!(
+                    "/reader/{}?notice={}",
+                    urlencode(&saved.item.id),
+                    urlencode("Added to Want to Read")
+                ))
+            }
+        }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
 }

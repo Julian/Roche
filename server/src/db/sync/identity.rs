@@ -56,6 +56,20 @@ pub fn deterministic_item_id(feed_url: Option<&str>, item_url: &str) -> String {
 
 pub const STARRED_COLLECTION_ID: &str = "533b1315-6e2e-57d3-ba85-dc88531c5a0b";
 pub const UP_NEXT_COLLECTION_ID: &str = "3864ff37-5ed3-5256-9380-f85ff8054f1c";
+pub const WANT_TO_READ_SLUG: &str = "want:read";
+pub const WANT_TO_READ_TITLE: &str = "Want to Read";
+pub const WANT_TO_READ_COLLECTION_ID: &str = "2ef71101-a716-5331-9515-cb7b5ce8b3c3";
+
+#[must_use]
+pub fn is_protected_system_collection_id(id: &str) -> bool {
+    matches!(
+        id.trim(),
+        STARRED_COLLECTION_ID
+            | UP_NEXT_COLLECTION_ID
+            | WANT_TO_READ_COLLECTION_ID
+            | "9eb44de7-bdfb-5bea-85d1-be913c542d8b"
+    )
+}
 
 #[must_use]
 pub fn deterministic_tag_id(name: &str) -> String {

@@ -609,11 +609,11 @@ class CatalogStore(
 
     private suspend fun resolveEligibleGeneratorSpec(idOrSlug: String): CollectionSpecEntity? {
         val spec = resolveCollectionSpec(idOrSlug) ?: return null
-        val isManualList =
-            CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
-                (CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST ||
-                    spec.collectionId == STARRED_COLLECTION_ID)
-        return spec.takeIf { isManualList }
+        val isCustomManualList =
+            spec.collectionId != STARRED_COLLECTION_ID &&
+                CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
+                CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
+        return spec.takeIf { isCustomManualList }
     }
 
     private suspend fun advanceActiveDrawsLocked(

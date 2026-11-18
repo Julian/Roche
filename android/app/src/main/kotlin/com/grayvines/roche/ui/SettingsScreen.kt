@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
+import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -341,6 +342,13 @@ internal fun NavigationSummaryCardSection(
                 BottomTabIcon(tab = AppTab.HOME, tint = colors.accentBlue, size = 18.dp)
             }
             unpinnedTabs.forEach { unpinnedTab ->
+                val totalStarred =
+                    (state.starredEntries.map { it.id } +
+                            state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID]
+                                .orEmpty()
+                                .map { it.entry.id })
+                        .distinct()
+                        .size
                 val unpinnedSubtitle =
                     when (unpinnedTab) {
                         AppTab.HOME -> "Quick access to your unpinned Home widgets"
@@ -350,7 +358,7 @@ internal fun NavigationSummaryCardSection(
                         AppTab.OFFLINE ->
                             "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
                         AppTab.STARRED ->
-                            "Quick access to your unpinned tab (${state.starredEntries.size} starred)"
+                            "Quick access to your unpinned tab ($totalStarred starred)"
                         AppTab.LISTS ->
                             "Lists, Diary, Want Queues & rankings (${state.catalog.consumedCount} logged)"
                         else -> "Quick access to your unpinned tab"

@@ -19,6 +19,7 @@ import com.grayvines.roche.data.collectionEntryNaturalKey
 import com.grayvines.roche.data.encodeCreatorsJson
 import com.grayvines.roche.data.extractArxivIdentifier
 import com.grayvines.roche.data.extractYearPrefix
+import com.grayvines.roche.data.isSyncableItemUrl
 import com.grayvines.roche.data.nextLocalHlc
 import com.grayvines.roche.data.normalizeTagName
 import com.grayvines.roche.data.nowUtcIso
@@ -662,6 +663,113 @@ internal suspend fun RocheDao.removeItemTag(
     }
 }
 
+@Suppress("LongParameterList")
+internal suspend fun RocheDao.enrichEntryMetadataIfPresent(
+    itemId: String,
+    title: String?,
+    hasUserTitleOverride: Boolean,
+    author: String? = null,
+    summary: String? = null,
+    publishedAt: String? = null,
+    thumbnailUrl: String? = null,
+    contentHtml: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
+    executeInTransaction {
+        val existingEntry = getEntryById(itemId)
+        val existingContent = getEntryContentById(itemId)
+        if (existingEntry != null && existingContent != null) {
+            val nowIso = nowUtcIso()
+            val markDirty = existingEntry.url?.let(::isSyncableItemUrl) == true
+            val hlc = if (markDirty) nextLocalHlc(this, nodeId) else existingEntry.hlc
+            val nextSummary =
+                existingEntry.summary?.takeIf { it.isNotBlank() }
+                    ?: summary?.take(MAX_SQLITE_SUMMARY_CHARS)
+            upsertEntry(
+                buildEnrichedEntryRow(
+                    existing = existingEntry,
+                    title = title,
+                    hasUserTitleOverride = hasUserTitleOverride,
+                    author = author,
+                    summary = nextSummary,
+                    publishedAt = publishedAt,
+                    thumbnailUrl = thumbnailUrl,
+                    nowIso = nowIso,
+                    hlc = hlc,
+                    markDirty = markDirty,
+                )
+            )
+            val nextHtml =
+                existingContent.contentHtml?.takeIf { it.isNotBlank() }
+                    ?: contentHtml?.take(MAX_SQLITE_HTML_CHARS)
+            val nextDuration = resolveEnrichedDuration(existingContent, nextHtml, nextSummary)
+            if (
+                nextHtml != existingContent.contentHtml || nextDuration != existingContent.duration
+            ) {
+                upsertEntryContent(
+                    existingContent.copy(contentHtml = nextHtml, duration = nextDuration)
+                )
+            }
+        }
+    }
+}
+
+@Suppress("LongParameterList")
+private fun buildEnrichedEntryRow(
+    existing: EntryEntity,
+    title: String?,
+    hasUserTitleOverride: Boolean,
+    author: String?,
+    summary: String?,
+    publishedAt: String?,
+    thumbnailUrl: String?,
+    nowIso: String,
+    hlc: String,
+    markDirty: Boolean,
+): EntryEntity {
+    val nextTitle =
+        if (hasUserTitleOverride) {
+            existing.title
+        } else {
+            title?.trim()?.takeIf { it.isNotEmpty() } ?: existing.title
+        }
+    val nextCreators =
+        if (existing.creatorsJson != "[]" && existing.creatorsJson.isNotBlank()) {
+            existing.creatorsJson
+        } else {
+            author?.trim()?.takeIf { it.isNotEmpty() }?.let { encodeCreatorsJson(listOf(it)) }
+                ?: existing.creatorsJson
+        }
+    val nextPub = existing.publishedAt ?: publishedAt
+    val nextThumb = existing.thumbnailUrl?.takeIf { it.isNotBlank() } ?: thumbnailUrl
+    return existing.copy(
+        title = nextTitle,
+        creatorsJson = nextCreators,
+        publishedAt = nextPub,
+        releaseYear = existing.releaseYear ?: extractYearPrefix(nextPub),
+        summary = summary,
+        thumbnailUrl = nextThumb,
+        updatedAt = if (markDirty) nowIso else existing.updatedAt,
+        hlc = hlc,
+        isLocalDirty = markDirty || existing.isLocalDirty,
+    )
+}
+
+private fun resolveEnrichedDuration(
+    existingContent: EntryContentEntity,
+    nextHtml: String?,
+    nextSummary: String?,
+): String? {
+    if (existingContent.duration != null) return existingContent.duration
+    val isArticle = ContentType.fromWireValue(existingContent.contentType) == ContentType.ARTICLE
+    val hasExtended =
+        nextHtml.orEmpty().length > LIST_PREVIEW_HTML_CHARS ||
+            nextSummary.orEmpty().length > LIST_PREVIEW_SUMMARY_CHARS
+    if (!isArticle || !hasExtended) return null
+    val src = existingContent.contentText ?: nextHtml ?: nextSummary.orEmpty()
+    return src.takeIf { it.isNotBlank() }?.let(::formatArticleMinutes)
+}
+
 internal suspend fun RocheDao.setItemStatusAndReadAt(
     itemId: String,
     status: String,
@@ -673,23 +781,72 @@ internal suspend fun RocheDao.setItemStatusAndReadAt(
         if (existing != null) {
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
+            val isNonFeed = existing.inboxState.equals("none", ignoreCase = true)
+            val isArchived = status.equals("archived", ignoreCase = true)
             val inboxState =
                 when {
-                    existing.inboxState.equals("none", ignoreCase = true) -> "none"
-                    status.equals("archived", ignoreCase = true) -> "dismissed"
+                    isNonFeed -> "none"
+                    isArchived -> "dismissed"
                     else -> "unread"
                 }
+            val effectiveReadAt =
+                if (isNonFeed && isArchived) readAt ?: existing.readAt ?: nowIso else readAt
             upsertEntryState(
                 existing.copy(
                     inboxState = inboxState,
-                    readAt = readAt,
+                    readAt = effectiveReadAt,
                     interactionUpdatedAt = nowIso,
                     updatedAt = nowIso,
                     hlc = hlc,
-                    isLocalDirty = true,
+                    isLocalDirty =
+                        getEntryById(itemId)?.url?.let(::isSyncableItemUrl) != false ||
+                            existing.isLocalDirty,
                 )
             )
+            if (isNonFeed) {
+                syncNonFeedWantArchive(itemId, isArchived, nowIso, hlc, nodeId)
+            }
         }
+    }
+}
+
+private suspend fun RocheDao.syncNonFeedWantArchive(
+    itemId: String,
+    isArchived: Boolean,
+    nowIso: String,
+    hlc: String,
+    nodeId: String,
+) {
+    val isSyncable = getEntryById(itemId)?.url?.let(::isSyncableItemUrl) != false
+    val natKey = collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, itemId)
+    if (isArchived) {
+        if (hasCollectionMembership(WANT_TO_READ_COLLECTION_ID, itemId) > 0) {
+            deleteCollectionEntry(WANT_TO_READ_COLLECTION_ID, itemId)
+            if (isSyncable) {
+                upsertTombstone(
+                    TombstoneEntity(
+                        entityType = COLLECTION_ENTRY_ENTITY,
+                        naturalKey = natKey,
+                        deletedAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = true,
+                    )
+                )
+            }
+        }
+    } else {
+        ensureWantToReadSpecExists(markDirty = isSyncable, nodeId = nodeId)
+        deleteTombstone(COLLECTION_ENTRY_ENTITY, natKey)
+        upsertCollectionEntry(
+            CollectionEntryEntity(
+                collectionId = WANT_TO_READ_COLLECTION_ID,
+                entryId = itemId,
+                position = null,
+                addedAt = nowIso,
+                hlc = hlc,
+                isLocalDirty = isSyncable,
+            )
+        )
     }
 }
 
@@ -748,8 +905,9 @@ internal suspend fun RocheDao.setItemFavorite(
 ) {
     executeInTransaction {
         ensureStarredSpecExists()
-        val existingState = getEntryStateById(itemId)
-        if (existingState != null) {
+        val entry = getEntryById(itemId)
+        if (entry != null) {
+            val isSyncable = entry.url?.startsWith("localpdf://", ignoreCase = true) != true
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             val natKey = collectionEntryNaturalKey(STARRED_COLLECTION_ID, itemId)
@@ -762,29 +920,33 @@ internal suspend fun RocheDao.setItemFavorite(
                         position = null,
                         addedAt = nowIso,
                         hlc = hlc,
-                        isLocalDirty = true,
+                        isLocalDirty = isSyncable,
                     )
                 )
             } else {
                 deleteCollectionEntry(STARRED_COLLECTION_ID, itemId)
-                upsertTombstone(
-                    TombstoneEntity(
-                        entityType = COLLECTION_ENTRY_ENTITY,
-                        naturalKey = natKey,
-                        deletedAt = nowIso,
+                if (isSyncable) {
+                    upsertTombstone(
+                        TombstoneEntity(
+                            entityType = COLLECTION_ENTRY_ENTITY,
+                            naturalKey = natKey,
+                            deletedAt = nowIso,
+                            hlc = hlc,
+                            isLocalDirty = true,
+                        )
+                    )
+                }
+            }
+            getEntryStateById(itemId)?.let { existingState ->
+                upsertEntryState(
+                    existingState.copy(
+                        interactionUpdatedAt = nowIso,
+                        updatedAt = nowIso,
                         hlc = hlc,
-                        isLocalDirty = true,
+                        isLocalDirty = isSyncable || existingState.isLocalDirty,
                     )
                 )
             }
-            upsertEntryState(
-                existingState.copy(
-                    interactionUpdatedAt = nowIso,
-                    updatedAt = nowIso,
-                    hlc = hlc,
-                    isLocalDirty = true,
-                )
-            )
         }
     }
 }
@@ -858,37 +1020,46 @@ internal suspend fun RocheDao.deleteEntryCascade(entryId: String) {
 internal suspend fun RocheDao.deleteItemPreservingHistory(
     itemId: String,
     recordTombstones: Boolean = true,
+    detachWantQueues: Boolean = true,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): Boolean {
     val entry = getEntryById(itemId) ?: return false
+    val isSyncable = entry.url?.startsWith("localpdf://", ignoreCase = true) != true
+    val emitTombstones = recordTombstones && isSyncable
     val nowIso = nowUtcIso()
     val hlc = nextLocalHlc(this, nodeId)
+    if (detachWantQueues) {
+        detachWantMembershipsForItem(itemId, nowIso, hlc, emitTombstones)
+    }
     if (entryHasCatalogHistory(itemId)) {
-        upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = recordTombstones))
+        upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = emitTombstones))
         val prevState = getEntryStateById(itemId)
+        val keepReadable = hasReadableListMembership(itemId)
         upsertEntryState(
             EntryStateEntity(
                 entryId = itemId,
                 inboxState = "none",
                 readAt = null,
-                progress = 0.0,
+                progress = if (keepReadable) prevState?.progress ?: 0.0 else 0.0,
                 interactionUpdatedAt = nowIso,
                 updatedAt = nowIso,
-                isCachedOffline = false,
+                isCachedOffline = keepReadable && prevState?.isCachedOffline == true,
                 hlc = hlc,
-                isLocalDirty = recordTombstones || prevState?.isLocalDirty == true,
+                isLocalDirty = emitTombstones || prevState?.isLocalDirty == true,
             )
         )
-        deleteEntryContentById(itemId)
-        detachInboxOnlyMemberships(itemId, nowIso, hlc, recordTombstones)
+        if (!keepReadable) {
+            deleteEntryContentById(itemId)
+        }
+        detachInboxOnlyMemberships(itemId, nowIso, hlc, emitTombstones, detachTags = !keepReadable)
     } else {
-        detachInboxOnlyMemberships(itemId, nowIso, hlc, recordTombstones)
+        detachInboxOnlyMemberships(itemId, nowIso, hlc, emitTombstones, detachTags = true)
         deleteEntryCascade(itemId)
     }
     return true
 }
 
-private suspend fun RocheDao.detachInboxOnlyMemberships(
+private suspend fun RocheDao.detachWantMembershipsForItem(
     itemId: String,
     nowIso: String,
     hlc: String,
@@ -896,12 +1067,44 @@ private suspend fun RocheDao.detachInboxOnlyMemberships(
 ) {
     val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
     for (mem in getCollectionEntriesForEntry(itemId)) {
+        val shouldDetach =
+            mem.collectionId == STARRED_COLLECTION_ID || specsById[mem.collectionId]?.role == "want"
+        if (shouldDetach) {
+            deleteCollectionEntry(mem.collectionId, itemId)
+            if (recordTombstones) {
+                upsertTombstone(
+                    TombstoneEntity(
+                        entityType = COLLECTION_ENTRY_ENTITY,
+                        naturalKey = collectionEntryNaturalKey(mem.collectionId, itemId),
+                        deletedAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = true,
+                    )
+                )
+            }
+        }
+    }
+}
+
+private suspend fun RocheDao.hasReadableListMembership(itemId: String): Boolean {
+    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
+    return getCollectionEntriesForEntry(itemId).any { mem ->
         val role = specsById[mem.collectionId]?.role
-        val isInboxScoped =
-            mem.collectionId == STARRED_COLLECTION_ID ||
-                mem.collectionId == UP_NEXT_COLLECTION_ID ||
-                role == "tag" ||
-                role == "want"
+        role == "list" || role == "want"
+    }
+}
+
+private suspend fun RocheDao.detachInboxOnlyMemberships(
+    itemId: String,
+    nowIso: String,
+    hlc: String,
+    recordTombstones: Boolean,
+    detachTags: Boolean,
+) {
+    val specsById = getAllCollectionSpecs().associateBy { it.collectionId }
+    for (mem in getCollectionEntriesForEntry(itemId)) {
+        val role = specsById[mem.collectionId]?.role
+        val isInboxScoped = mem.collectionId == UP_NEXT_COLLECTION_ID || detachTags && role == "tag"
         if (isInboxScoped) {
             deleteCollectionEntry(mem.collectionId, itemId)
             if (recordTombstones) {
@@ -929,17 +1132,16 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
     val feedMembers = getCollectionMemberships(feedId).map { it.entryId }
     for (entryId in feedMembers) {
         val otherMemberships = getCollectionEntriesForEntry(entryId)
-        val keepInInbox = otherMemberships.any { other ->
-            other.collectionId != feedId &&
-                (other.collectionId == STARRED_COLLECTION_ID || other.collectionId in allSources)
+        val keepInAnotherFeed = otherMemberships.any { other ->
+            other.collectionId != feedId && other.collectionId in allSources
         }
-        if (keepInInbox) {
-            deleteCollectionEntry(feedId, entryId)
-        } else {
+        deleteCollectionEntry(feedId, entryId)
+        if (!keepInAnotherFeed) {
             evictedItemIds.add(entryId)
             deleteItemPreservingHistory(
                 itemId = entryId,
                 recordTombstones = recordTombstones,
+                detachWantQueues = false,
                 nodeId = nodeId,
             )
         }

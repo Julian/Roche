@@ -227,6 +227,22 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         }
     }
 
+    internal fun reconcileOptimisticStars(persistedById: Map<String, Boolean>) {
+        val currentOpt = vm.transientState.value.optimisticFavorites
+        if (currentOpt.isEmpty()) return
+        val settledIds =
+            synchronized(inFlightStarCounts) {
+                currentOpt.keys.filter { id ->
+                    inFlightStarCounts[id] ?: 0 == 0 && persistedById[id] == currentOpt[id]
+                }
+            }
+        if (settledIds.isNotEmpty()) {
+            vm.transientState.update { current ->
+                current.copy(optimisticFavorites = current.optimisticFavorites - settledIds.toSet())
+            }
+        }
+    }
+
     private suspend fun performToggleReadState(entryId: String) {
         val isRead = vm.repository.toggleReadState(entryId)
         vm.transientState.update {
@@ -277,7 +293,13 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         }
         val previousStatus = snapshot?.previousStatus ?: entry.status
         val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
-        val label = if (targetArchived) "Archived" else "Restored to Unread"
+        val label =
+            when {
+                !entry.inFeedInbox && targetArchived -> "Removed from Want to Read"
+                !entry.inFeedInbox -> "Restored to Want to Read"
+                targetArchived -> "Archived"
+                else -> "Restored to Unread"
+            }
         vm.transientState.update { current ->
             val nextReaderId =
                 if (current.selectedReaderEntryId == entry.id) {
@@ -410,7 +432,6 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         if (vm.repository.hasBackgroundScope) {
             vm.transientState.update {
                 it.copy(
-                    activeTab = AppTab.FEEDS,
                     statusBanner = "Finding RSS feed for $hostLabel…",
                     messageSequence = it.messageSequence + 1,
                 )
@@ -421,9 +442,14 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             ) { result ->
                 result
                     .onSuccess { saved ->
-                        vm.showStatusMessage(
-                            "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\""
-                        )
+                        vm.transientState.update {
+                            it.copy(
+                                activeTab = AppTab.FEEDS,
+                                statusBanner =
+                                    "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                                messageSequence = it.messageSequence + 1,
+                            )
+                        }
                     }
                     .onFailure { err ->
                         vm.showStatusMessage(err.message ?: "Could not subscribe to feed")

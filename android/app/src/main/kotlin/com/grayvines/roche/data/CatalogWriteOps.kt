@@ -331,6 +331,19 @@ internal suspend fun appendConsumptionInDao(
     )
     if (status == ConsumptionStatus.CONSUMED) {
         removeFromWantQueuesInDao(dao, entryId, nowIso)
+        dao.getEntryStateById(entryId)?.let { st ->
+            if (st.readAt == null) {
+                dao.upsertEntryState(
+                    st.copy(
+                        readAt = tsIso,
+                        interactionUpdatedAt = nowIso,
+                        updatedAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = markDirty || st.isLocalDirty,
+                    )
+                )
+            }
+        }
         engageParentArtistsInDao(dao, entryId, tsIso, nowIso, markDirty)
     }
     return logId
@@ -399,17 +412,18 @@ private suspend fun removeFromWantQueuesInDao(dao: RocheDao, entryId: String, no
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val memberships = dao.getCollectionEntriesForEntry(entryId)
     for (mem in memberships) {
-        val spec = specsById[mem.collectionId] ?: continue
+        val spec = specsById[mem.collectionId]
         val isWant =
-            CollectionRole.fromWireValue(spec.role) == CollectionRole.WANT ||
-                spec.collectionId == UP_NEXT_COLLECTION_ID
+            mem.collectionId == UP_NEXT_COLLECTION_ID ||
+                mem.collectionId == WANT_TO_READ_COLLECTION_ID ||
+                spec?.let { CollectionRole.fromWireValue(it.role) == CollectionRole.WANT } == true
         if (isWant) {
             val hlc = nextLocalHlc(dao)
-            dao.deleteCollectionEntry(spec.collectionId, entryId)
+            dao.deleteCollectionEntry(mem.collectionId, entryId)
             dao.upsertTombstone(
                 TombstoneEntity(
                     entityType = COLLECTION_ENTRY_ENTITY,
-                    naturalKey = collectionEntryNaturalKey(spec.collectionId, entryId),
+                    naturalKey = collectionEntryNaturalKey(mem.collectionId, entryId),
                     deletedAt = nowIso,
                     hlc = hlc,
                     isLocalDirty = true,
@@ -451,9 +465,17 @@ internal suspend fun ensureWantCollectionInDao(
     val explicit = targetQueueIdOrSlug?.trim()?.takeIf { it.isNotEmpty() }
     val rawBase =
         explicit?.removePrefix("want:")?.lowercase()?.replace('-', '_') ?: kind.systemListSlug
-    val baseSlug = EntryKind.fromFlexibleAlias(rawBase)?.systemListSlug ?: rawBase
-    val wantSlug = "want:$baseSlug"
-    val title = "Want: ${kind.systemListTitle}"
+    val isWantToRead =
+        explicit == null && (kind == EntryKind.ARTICLE || kind == EntryKind.PAPER) ||
+            rawBase in setOf("read", "articles", "papers")
+    val baseSlug =
+        if (isWantToRead) {
+            "read"
+        } else {
+            EntryKind.fromFlexibleAlias(rawBase)?.systemListSlug ?: rawBase
+        }
+    val wantSlug = if (isWantToRead) WANT_TO_READ_SLUG else "want:$baseSlug"
+    val title = if (isWantToRead) WANT_TO_READ_TITLE else "Want: ${kind.systemListTitle}"
     val existing =
         explicit?.let { dao.getCollectionSpecById(it) ?: dao.getCollectionSpecBySlug(it) }
             ?: dao.getCollectionSpecBySlug(wantSlug)

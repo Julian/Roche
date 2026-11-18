@@ -33,7 +33,15 @@ impl FeedSource {
         {
             return Ok(Self::YouTubeChannelId(channel_id));
         }
-        let url = SafeHttpClient::parse_url(trimmed)?;
+        let normalized_url_str = if !trimmed.contains("://")
+            && trimmed.contains('.')
+            && !trimmed.chars().any(char::is_whitespace)
+        {
+            std::borrow::Cow::Owned(format!("https://{trimmed}"))
+        } else {
+            std::borrow::Cow::Borrowed(trimmed)
+        };
+        let url = SafeHttpClient::parse_url(&normalized_url_str)?;
         Ok(Self::Url(url))
     }
 

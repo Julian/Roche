@@ -4,6 +4,7 @@ package com.grayvines.roche.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -46,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.RankedCatalogEntry
 import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.model.ContentType
@@ -64,30 +66,77 @@ import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
+private sealed interface StarredDisplayRow {
+    val stableKey: String
+
+    data class ReaderRow(val entry: InboxEntry) : StarredDisplayRow {
+        override val stableKey: String = entry.id
+    }
+
+    data class CatalogRow(val item: RankedCatalogEntry) : StarredDisplayRow {
+        override val stableKey: String = "cat_${item.entry.id}"
+    }
+}
+
+private fun buildOrderedStarredRows(state: MainUiState): List<StarredDisplayRow> {
+    val readerById = state.starredEntries.associateBy { it.id }
+    val catalogRanked = state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty()
+    val seenIds = HashSet<String>(readerById.size + catalogRanked.size)
+    return buildList {
+        for (catItem in catalogRanked) {
+            val id = catItem.entry.id
+            if (seenIds.add(id)) {
+                val readerEntry = readerById[id]
+                if (readerEntry != null) {
+                    add(StarredDisplayRow.ReaderRow(readerEntry))
+                } else {
+                    add(StarredDisplayRow.CatalogRow(catItem))
+                }
+            }
+        }
+        for (readerEntry in state.starredEntries) {
+            if (seenIds.add(readerEntry.id)) {
+                add(StarredDisplayRow.ReaderRow(readerEntry))
+            }
+        }
+    }
+}
+
+private fun matchesStarredTypeFilter(row: StarredDisplayRow, filter: ContentType?): Boolean {
+    if (filter == null) return true
+    return when (row) {
+        is StarredDisplayRow.ReaderRow -> row.entry.contentType == filter
+        is StarredDisplayRow.CatalogRow ->
+            when (row.item.entry.kind) {
+                EntryKind.PODCAST_EPISODE,
+                EntryKind.PODCAST -> filter == ContentType.AUDIO
+                EntryKind.ARTICLE -> filter == ContentType.ARTICLE
+                EntryKind.PAPER -> filter == ContentType.PDF
+                EntryKind.VIDEO,
+                EntryKind.CHANNEL -> filter == ContentType.VIDEO
+                else -> false
+            }
+    }
+}
+
 @Composable
 fun StarredTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    onOpenExternalUrl: (String) -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
-    val allStarred = state.starredEntries
-    val readerIds = remember(allStarred) { allStarred.mapTo(HashSet()) { it.id } }
-    val extraCatalogStarred =
-        remember(state.catalog, readerIds) {
-            state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().filter {
-                it.entry.id !in readerIds
-            }
+    val orderedRows =
+        remember(state.starredEntries, state.catalog.entriesByCollectionId) {
+            buildOrderedStarredRows(state)
         }
-    val starredEntries =
-        remember(allStarred, selectedTypeFilter) {
-            val filter = selectedTypeFilter
-            if (filter == null) allStarred else allStarred.filter { it.contentType == filter }
+    val visibleRows =
+        remember(orderedRows, selectedTypeFilter) {
+            orderedRows.filter { matchesStarredTypeFilter(it, selectedTypeFilter) }
         }
-    val visibleCatalogItems = if (selectedTypeFilter == null) extraCatalogStarred else emptyList()
-    val totalCount = allStarred.size + extraCatalogStarred.size
-    val visibleCount = starredEntries.size + visibleCatalogItems.size
+    val totalCount = orderedRows.size
 
     Column(modifier = Modifier.fillMaxSize()) {
         StarredListHeaderBar(
@@ -107,14 +156,14 @@ fun StarredTabContent(
             onRefresh = { onAction(MainAction.SyncNow) },
             modifier = Modifier.fillMaxSize().testTag("starred_pull_to_refresh"),
         ) {
-            if (visibleCount == 0) {
+            if (visibleRows.isEmpty()) {
                 StarredEmptyPlaceholder()
             } else {
                 StarredEntriesList(
-                    starredEntries = starredEntries,
-                    catalogStarred = visibleCatalogItems,
+                    rows = visibleRows,
                     state = state,
                     onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
                     listState = listState,
                 )
             }
@@ -185,47 +234,71 @@ private fun StarredListHeaderBar(
     }
 }
 
+@Suppress("LongMethod")
 @Composable
 private fun StarredEntriesList(
-    starredEntries: List<InboxEntry>,
-    catalogStarred: List<RankedCatalogEntry>,
+    rows: List<StarredDisplayRow>,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
     listState: LazyListState,
 ) {
     val colors = LocalRocheColors.current
+    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().testTag("starred_list"),
         contentPadding = PaddingValues(bottom = 88.dp),
     ) {
-        items(items = starredEntries, key = { it.id }) { entry ->
-            InboxEntryRowItem(
-                entry = entry,
-                ultraDense = state.settings.ultraDenseRows,
-                swipeToArchiveEnabled = state.settings.swipeToArchive,
-                isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
-                onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
-                onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-                onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
-                onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-            )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-        }
-        items(items = catalogStarred, key = { "cat_${it.entry.id}" }) { catItem ->
-            StarredCatalogEntryRow(
-                item = catItem,
-                onUnstar = {
-                    onAction(MainAction.RemoveWantEntry(STARRED_COLLECTION_ID, catItem.entry.id))
-                },
-                onRank = {
-                    onAction(
-                        MainAction.StartRankingSession(STARRED_COLLECTION_ID, catItem.entry.id)
+        items(items = rows, key = { it.stableKey }) { row ->
+            when (row) {
+                is StarredDisplayRow.ReaderRow -> {
+                    val entry = row.entry
+                    InboxEntryRowItem(
+                        entry = entry,
+                        ultraDense = state.settings.ultraDenseRows,
+                        swipeToArchiveEnabled = state.settings.swipeToArchive,
+                        isPlayingAudio = entry.id == state.playerState.currentEntryId,
+                        isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
+                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                        onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                        onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                        onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+                        onDownloadOffline = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                     )
-                },
-            )
+                }
+                is StarredDisplayRow.CatalogRow -> {
+                    val catItem = row.item
+                    val extUrl = catItem.entry.url?.takeIf { it.isNotBlank() }
+                    val onOpen: (() -> Unit)? =
+                        when {
+                            catItem.entry.id in readableIds -> {
+                                { onAction(MainAction.OpenReader(catItem.entry.id)) }
+                            }
+                            extUrl != null -> {
+                                { onOpenExternalUrl(extUrl) }
+                            }
+                            else -> null
+                        }
+                    StarredCatalogEntryRow(
+                        item = catItem,
+                        onOpen = onOpen,
+                        onUnstar = {
+                            onAction(
+                                MainAction.RemoveWantEntry(STARRED_COLLECTION_ID, catItem.entry.id)
+                            )
+                        },
+                        onRank = {
+                            onAction(
+                                MainAction.StartRankingSession(
+                                    STARRED_COLLECTION_ID,
+                                    catItem.entry.id,
+                                )
+                            )
+                        },
+                    )
+                }
+            }
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
     }
@@ -234,6 +307,7 @@ private fun StarredEntriesList(
 @Composable
 private fun StarredCatalogEntryRow(
     item: RankedCatalogEntry,
+    onOpen: (() -> Unit)?,
     onUnstar: () -> Unit,
     onRank: () -> Unit,
 ) {
@@ -244,9 +318,11 @@ private fun StarredCatalogEntryRow(
         } else {
             FontFamily.SansSerif
         }
+    val clickMod = if (onOpen != null) Modifier.clickable(onClick = onOpen) else Modifier
     Row(
         modifier =
             Modifier.fillMaxWidth()
+                .then(clickMod)
                 .padding(horizontal = 12.dp, vertical = 11.dp)
                 .testTag("starred_catalog_row_${item.entry.id}"),
         verticalAlignment = Alignment.CenterVertically,

@@ -594,13 +594,24 @@ fun OfflineTabContent(
     val colors = LocalRocheColors.current
     val offlineEntries = state.offlineEntries
 
+    val subtitle =
+        if (state.isSyncing) {
+            "${offlineEntries.size} cached · Refreshing…"
+        } else {
+            "${offlineEntries.size} cached"
+        }
+
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(title = "Offline Vault", subtitle = "${offlineEntries.size} cached") {
+        RocheTopHeader(title = "Offline Vault", subtitle = subtitle) {
             RocheIconActionButton(
                 contentDescription = "Sync",
                 onClick = { onAction(MainAction.SyncNow) },
             ) {
-                RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+                RefreshIcon(
+                    tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
+                    size = 17.dp,
+                    isSpinning = state.isSyncing,
+                )
             }
         }
         HorizontalDivider(color = colors.border, thickness = 1.dp)

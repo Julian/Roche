@@ -51,6 +51,7 @@ internal class CatalogSeeder(private val dao: RocheDao) {
             identsToInsert = identsToInsert,
         )
 
+        val wasEmptyDatabase = existingEntryIds.isEmpty()
         dao.executeInTransaction {
             if (entriesToInsert.isNotEmpty()) {
                 dao.upsertEntries(entriesToInsert)
@@ -61,8 +62,13 @@ internal class CatalogSeeder(private val dao: RocheDao) {
             if (identsToInsert.isNotEmpty()) {
                 dao.insertEntryIdentifiersIgnore(identsToInsert)
             }
+            if (wasEmptyDatabase) {
+                dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_MIGRATED_MANUAL_WANT_READ, "1"))
+            }
         }
-        migrateManualInboxOnce()
+        if (!wasEmptyDatabase) {
+            migrateManualInboxOnce()
+        }
     }
 
     private suspend fun pruneLegacyPlaceholder() {
@@ -197,10 +203,7 @@ internal class CatalogSeeder(private val dao: RocheDao) {
     private fun isImplicitFeedMembership(
         collectionId: String,
         specsById: Map<String, CollectionSpecEntity>,
-    ): Boolean =
-        collectionId != STARRED_COLLECTION_ID &&
-            collectionId != UP_NEXT_COLLECTION_ID &&
-            specsById[collectionId] == null
+    ): Boolean = collectionId !in PROTECTED_SYSTEM_COLLECTION_IDS && specsById[collectionId] == null
 
     private suspend fun promoteManualToWantRead(
         manualStates: List<com.grayvines.roche.data.local.EntryStateEntity>

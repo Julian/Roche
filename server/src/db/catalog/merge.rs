@@ -76,6 +76,7 @@ impl CatalogRepo<'_> {
             (None, None) => {}
             (Some((dup_mode, dup_role)), _)
                 if dup_mode != CollectionMode::Manual
+                    || crate::db::is_protected_system_collection_id(dup_resolved)
                     || matches!(
                         dup_role,
                         CollectionRole::System | CollectionRole::Feed | CollectionRole::Tag

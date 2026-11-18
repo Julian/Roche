@@ -331,7 +331,10 @@ internal const val STARRED_COLLECTION_ID = "533b1315-6e2e-57d3-ba85-dc88531c5a0b
 internal const val UP_NEXT_COLLECTION_ID = "3864ff37-5ed3-5256-9380-f85ff8054f1c"
 const val WANT_TO_READ_SLUG = "want:read"
 const val WANT_TO_READ_TITLE = "Want to Read"
-val WANT_TO_READ_COLLECTION_ID: String = systemCollectionUuid(WANT_TO_READ_SLUG)
+const val WANT_TO_READ_COLLECTION_ID = "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+
+internal val PROTECTED_SYSTEM_COLLECTION_IDS =
+    setOf(STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID)
 
 internal fun tagNaturalKey(name: String): String = name.trim().lowercase()
 

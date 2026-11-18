@@ -9,7 +9,7 @@ use super::{
 };
 use crate::media::MediaStore;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
 pub struct Media {
     pub id: String,
@@ -220,16 +220,15 @@ impl<'a> MediaRepo<'a> {
         .await?)
     }
 
-    /// Lists downloaded media files belonging to items in `feed_id` that will NOT remain in Inbox
-    /// after deleting `feed_id` (i.e. items that are neither starred nor cross-posted in another feed).
+    /// Lists downloaded media files belonging to items in `feed_id` that will NOT remain readable
+    /// after deleting `feed_id` (i.e. items that are neither saved in a `list`/`want` collection
+    /// such as `Starred` or `Want to Read`, nor cross-posted in another subscribed feed).
     pub async fn list_exclusively_owned_by_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        let starred_id = super::STARRED_COLLECTION_ID;
-        Ok(sqlx::query_as!(
-            Media,
+        Ok(sqlx::query_as::<_, Media>(
             "SELECT m.id,
                     m.entry_id AS item_id,
-                    m.media_type AS \"media_type: MediaType\",
-                    m.local_path AS \"path!: String\",
+                    m.media_type,
+                    m.local_path AS path,
                     m.file_size,
                     m.duration
              FROM entry_media m
@@ -240,20 +239,20 @@ impl<'a> MediaRepo<'a> {
                )
                AND NOT EXISTS (
                    SELECT 1 FROM collection_entries ce2
+                   LEFT JOIN collection_specs cs2 ON cs2.collection_id = ce2.collection_id
                    WHERE ce2.entry_id = m.entry_id
                      AND ce2.collection_id != ?
                      AND (
-                         ce2.collection_id = ?
+                         cs2.collection_role IN ('list', 'want')
                          OR EXISTS (
                              SELECT 1 FROM feed_sources fs2
                              WHERE fs2.collection_id = ce2.collection_id
                          )
                      )
                )",
-            feed_id,
-            feed_id,
-            starred_id,
         )
+        .bind(feed_id)
+        .bind(feed_id)
         .fetch_all(self.pool)
         .await?)
     }
@@ -294,21 +293,31 @@ impl<'a> MediaRepo<'a> {
     }
 
     pub async fn find_orphaned(&self) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as!(
-            Media,
+        Ok(sqlx::query_as::<_, Media>(
             "SELECT m.id,
                     m.entry_id AS item_id,
-                    m.media_type AS \"media_type: MediaType\",
-                    m.local_path AS \"path!: String\",
+                    m.media_type,
+                    m.local_path AS path,
                     m.file_size,
                     m.duration
              FROM entry_media m
              WHERE m.local_path IS NOT NULL
                AND (
                    m.entry_id NOT IN (SELECT id FROM entries WHERE merged_into_id IS NULL)
-                   OR EXISTS (
-                       SELECT 1 FROM entry_state es
-                       WHERE es.entry_id = m.entry_id AND es.inbox_state = 'none'
+                   OR (
+                       NOT EXISTS (
+                           SELECT 1 FROM entry_state es
+                           WHERE es.entry_id = m.entry_id AND es.inbox_state IN ('unread', 'dismissed')
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM entry_content ec
+                           WHERE ec.entry_id = m.entry_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM collection_entries ce
+                           JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+                           WHERE ce.entry_id = m.entry_id AND cs.collection_role IN ('list', 'want')
+                       )
                    )
                )",
         )

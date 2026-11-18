@@ -52,6 +52,7 @@ import com.grayvines.roche.data.CollectionRole
 import com.grayvines.roche.data.ConsumptionStatus
 import com.grayvines.roche.data.DiaryEntryItem
 import com.grayvines.roche.data.RankedCatalogEntry
+import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.HeadlineFont
@@ -106,8 +107,11 @@ fun MediaCompanionScreen(
                     )
                 CompanionSubTab.DIARY ->
                     DiaryHistoryPane(
+                        state = state,
                         diaryEntries = state.catalog.diaryEntries,
                         listState = listState,
+                        onAction = onAction,
+                        onOpenExternalUrl = onOpenExternalUrl,
                         onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
                     )
                 CompanionSubTab.WANT ->
@@ -550,31 +554,7 @@ private fun ActiveListToolbarButtons(
             )
         }
         if (canEditManualList) {
-            HeaderActionButton(
-                label = "+ Add",
-                onClick = {
-                    onAction(
-                        MainAction.OpenQuickLogSheet(
-                            defaultToWant = false,
-                            targetCollectionId = list.collectionId,
-                            targetCollectionTitle = list.title,
-                        )
-                    )
-                },
-                modifier = Modifier.testTag("companion_add_list_entry_btn"),
-            )
-            HeaderActionButton(
-                label = if (list.generatorEnabled) "Pause Draw" else "Enable Draw",
-                onClick = {
-                    onAction(
-                        MainAction.SetCollectionGeneratorEnabled(
-                            collectionIdOrSlug = list.collectionId,
-                            enabled = !list.generatorEnabled,
-                        )
-                    )
-                },
-                modifier = Modifier.testTag("companion_toggle_draw_btn"),
-            )
+            ManualListEditButtons(list = list, onAction = onAction)
         }
         if (canRank) {
             HeaderActionButton(
@@ -584,6 +564,40 @@ private fun ActiveListToolbarButtons(
                 modifier = Modifier.testTag("companion_rank_list_btn"),
             )
         }
+    }
+}
+
+@Composable
+private fun ManualListEditButtons(
+    list: CatalogListSummary,
+    onAction: (MainAction) -> Unit,
+) {
+    HeaderActionButton(
+        label = "+ Add",
+        onClick = {
+            onAction(
+                MainAction.OpenQuickLogSheet(
+                    defaultToWant = false,
+                    targetCollectionId = list.collectionId,
+                    targetCollectionTitle = list.title,
+                )
+            )
+        },
+        modifier = Modifier.testTag("companion_add_list_entry_btn"),
+    )
+    if (list.collectionId != STARRED_COLLECTION_ID) {
+        HeaderActionButton(
+            label = if (list.generatorEnabled) "Pause Draw" else "Enable Draw",
+            onClick = {
+                onAction(
+                    MainAction.SetCollectionGeneratorEnabled(
+                        collectionIdOrSlug = list.collectionId,
+                        enabled = !list.generatorEnabled,
+                    )
+                )
+            },
+            modifier = Modifier.testTag("companion_toggle_draw_btn"),
+        )
     }
 }
 
@@ -713,10 +727,14 @@ private fun ScoreBarRow(scoreOutOfTen: Double) {
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun DiaryHistoryPane(
+    state: MainUiState,
     diaryEntries: List<DiaryEntryItem>,
     listState: LazyListState,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
     onOpenQuickLog: () -> Unit,
 ) {
     if (diaryEntries.isEmpty()) {
@@ -729,6 +747,15 @@ private fun DiaryHistoryPane(
         )
         return
     }
+    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
+    val catalogUrlsById =
+        remember(state.catalog.entriesByCollectionId) {
+            buildMap {
+                state.catalog.entriesByCollectionId.values.flatten().forEach { item ->
+                    item.entry.url?.takeIf { it.isNotBlank() }?.let { put(item.entry.id, it) }
+                }
+            }
+        }
     val grouped = remember(diaryEntries) { diaryEntries.groupBy { it.monthKey } }
     LazyColumn(
         state = listState,
@@ -741,7 +768,18 @@ private fun DiaryHistoryPane(
                 RocheSectionHeader(label = monthKey)
             }
             items(itemsInMonth, key = { it.id }) { diary ->
-                DiaryLogCard(diary = diary)
+                val extUrl = catalogUrlsById[diary.entryId]
+                val onOpen: (() -> Unit)? =
+                    when {
+                        diary.entryId in readableIds -> {
+                            { onAction(MainAction.OpenReader(diary.entryId)) }
+                        }
+                        extUrl != null -> {
+                            { onOpenExternalUrl(extUrl) }
+                        }
+                        else -> null
+                    }
+                DiaryLogCard(diary = diary, onOpen = onOpen)
             }
         }
         item { Spacer(modifier = Modifier.height(72.dp)) }
@@ -749,11 +787,22 @@ private fun DiaryHistoryPane(
 }
 
 @Composable
-private fun DiaryLogCard(diary: DiaryEntryItem) {
+private fun DiaryLogCard(
+    diary: DiaryEntryItem,
+    onOpen: (() -> Unit)? = null,
+) {
     val colors = LocalRocheColors.current
+    val rowMod =
+        if (onOpen != null) {
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        } else {
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)
+        }
     RocheSurfaceCard {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = rowMod,
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             DiaryLogHeaderRow(diary = diary)

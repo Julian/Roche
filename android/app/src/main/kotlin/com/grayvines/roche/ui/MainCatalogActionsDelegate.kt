@@ -321,15 +321,16 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 creators = creators,
                 releaseYear = action.releaseYear,
             )
-        return if (action.addToWant) {
-            vm.repository.catalog.wantEntry(input)
-        } else {
-            val loggedId = vm.repository.catalog.logEntry(input, action.status, action.notes)
-            if (targetListId != null) {
-                vm.repository.catalog.addCollectionEntry(targetListId, loggedId)
+        val savedId =
+            when {
+                action.addToListOnly -> vm.repository.catalog.upsertEntry(input)
+                action.addToWant -> vm.repository.catalog.wantEntry(input)
+                else -> vm.repository.catalog.logEntry(input, action.status, action.notes)
             }
-            loggedId
+        if (targetListId != null) {
+            vm.repository.catalog.addCollectionEntry(targetListId, savedId)
         }
+        return savedId
     }
 
     private suspend fun handleQuickLogSaved(
@@ -338,14 +339,16 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         targetListId: String?,
         entryId: String,
     ) {
+        val listLabel = vm.transientState.value.quickLogTargetCollectionTitle
         vm.transientState.update {
             it.copy(
                 isQuickLogSheetOpen = false,
                 quickLogTargetCollectionId = null,
                 quickLogTargetCollectionTitle = null,
+                optimisticFavorites = it.optimisticFavorites - entryId,
             )
         }
-        if (!action.addToWant && action.rankAfterLog) {
+        if (!action.addToWant && !action.addToListOnly && action.rankAfterLog) {
             val rankTarget = targetListId ?: action.kind.systemListSlug
             if (!openRankSessionForCollection(rankTarget, entryId)) {
                 vm.showStatusMessage(
@@ -353,7 +356,13 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 )
             }
         } else {
-            val verb = if (action.addToWant) "Added to Want Queue" else "Logged to Diary"
+            val verb =
+                when {
+                    action.addToListOnly -> "Added to ${listLabel ?: "list"}"
+                    action.addToWant && listLabel != null -> "Added to Want Queue & $listLabel"
+                    action.addToWant -> "Added to Want Queue"
+                    else -> "Logged to Diary"
+                }
             vm.showStatusMessage("$verb · $cleanTitle")
         }
     }
@@ -403,7 +412,12 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         runSuspendCatching {
             vm.repository.catalog.removeCollectionEntry(collectionId, entryId)
         }
-            .onSuccess { vm.showStatusMessage("Removed from $label") }
+            .onSuccess {
+                vm.transientState.update { cur ->
+                    cur.copy(optimisticFavorites = cur.optimisticFavorites - entryId)
+                }
+                vm.showStatusMessage("Removed from $label")
+            }
             .onFailure { err ->
                 vm.showStatusMessage("Could not remove (${err.message ?: "error"})")
             }

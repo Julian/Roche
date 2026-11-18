@@ -128,7 +128,19 @@ class MainViewModel(
         playerController.setUiErrorListener(uiErrorListener)
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()
+        observeSettledStars()
         restoredNavState?.let(::restoreNavigationSideEffects)
+    }
+
+    private fun observeSettledStars() {
+        viewModelScope.launch {
+            repository.snapshot
+                .map { snap -> snap.entries.associate { it.id to it.isFavorite } }
+                .distinctUntilChanged()
+                .collect { persistedById ->
+                    inboxReaderDelegate.reconcileOptimisticStars(persistedById)
+                }
+        }
     }
 
     private fun observeActiveCollectionDraws() {

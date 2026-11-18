@@ -12,6 +12,7 @@ pub struct HtmlSanitizer;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedSnapshot {
     pub title: Option<String>,
+    pub author: Option<String>,
     pub summary: Option<String>,
     pub content_html: String,
     pub thumbnail_url: Option<String>,
@@ -211,7 +212,7 @@ impl HtmlSanitizer {
             .add_tag_attributes("meta", &["name", "property", "content"]);
         let normalized_meta_html = meta_builder.clean(raw_html).to_string();
 
-        let (title, meta_desc, meta_image) =
+        let (title, author, meta_desc, meta_image) =
             Self::parse_title_and_meta(&normalized_meta_html, base_url);
         let raw_image = Self::extract_first_image_url_with_base(raw_html, base_url);
         let content_html = Self::clean_with_base(raw_html, base_url);
@@ -232,7 +233,7 @@ impl HtmlSanitizer {
                 (!fallback.is_empty()).then_some(fallback)
             });
 
-        ExtractedSnapshot { title, summary, content_html, thumbnail_url }
+        ExtractedSnapshot { title, author, summary, content_html, thumbnail_url }
     }
 
     /// Scans HTML for the first valid raster `<img src="...">` URL (resolving relative URLs against `base_url`),
@@ -359,12 +360,13 @@ impl HtmlSanitizer {
     fn parse_title_and_meta(
         normalized_html: &str,
         base_url: Option<&Url>,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
         let mut reader = Reader::from_str(normalized_html);
         reader.config_mut().check_end_names = false;
 
         let mut title: Option<String> = None;
         let mut og_title: Option<String> = None;
+        let mut meta_author: Option<String> = None;
         let mut meta_desc: Option<String> = None;
         let mut meta_image: Option<String> = None;
         let mut in_title = false;
@@ -383,6 +385,7 @@ impl HtmlSanitizer {
                             &tag,
                             base_url,
                             &mut og_title,
+                            &mut meta_author,
                             &mut meta_desc,
                             &mut meta_image,
                         );
@@ -393,6 +396,7 @@ impl HtmlSanitizer {
                         &tag,
                         base_url,
                         &mut og_title,
+                        &mut meta_author,
                         &mut meta_desc,
                         &mut meta_image,
                     );
@@ -422,7 +426,7 @@ impl HtmlSanitizer {
             }
         }
 
-        (title.or(og_title), meta_desc, meta_image)
+        (title.or(og_title), meta_author, meta_desc, meta_image)
     }
 
     fn extract_first_paragraph(clean_body_html: &str) -> Option<String> {
@@ -475,6 +479,7 @@ impl HtmlSanitizer {
         tag: &quick_xml::events::BytesStart<'_>,
         base_url: Option<&Url>,
         og_title: &mut Option<String>,
+        meta_author: &mut Option<String>,
         meta_desc: &mut Option<String>,
         meta_image: &mut Option<String>,
     ) {
@@ -506,11 +511,221 @@ impl HtmlSanitizer {
             *meta_desc = Some(content);
         } else if og_title.is_none() && name.eq_ignore_ascii_case("og:title") {
             *og_title = Some(content);
+        } else if meta_author.is_none()
+            && (name.eq_ignore_ascii_case("author")
+                || name.eq_ignore_ascii_case("article:author")
+                || name.eq_ignore_ascii_case("dc.creator")
+                || name.eq_ignore_ascii_case("byl"))
+            && !content.starts_with("http://")
+            && !content.starts_with("https://")
+        {
+            *meta_author = Some(content);
         } else if meta_image.is_none()
             && (name.eq_ignore_ascii_case("og:image") || name.eq_ignore_ascii_case("twitter:image"))
             && let Some(valid_url) = Self::resolve_and_validate_thumbnail_url(&content, base_url)
         {
             *meta_image = Some(valid_url);
+        }
+    }
+
+    /// Discovers candidate RSS/Atom/`YouTube` feed URLs from an HTML document, ordered by confidence:
+    /// 1. `<link rel="alternate" type="application/rss+xml|application/atom+xml|..." href="...">`
+    /// 2. `YouTube` `<meta itemprop="channelId" content="UC...">` or canonical `/channel/UC...` link
+    /// 3. `<a href="...">` links pointing to feed paths (`/feed`, `/rss.xml`, `/atom.xml`, `/index.xml`)
+    /// 4. Standard origin feed paths (`/feed.xml`, `/rss.xml`, `/atom.xml`, `/index.xml`, `/feed`, `/rss`)
+    ///
+    /// Every candidate is validated through [`SafeHttpClient::validate_url`] to prevent SSRF.
+    #[must_use]
+    pub fn discover_feed_candidates(raw_html: &str, base_url: &Url) -> Vec<Url> {
+        let mut disc_builder = ammonia::Builder::new();
+        disc_builder
+            .tags(HashSet::from(["link", "meta", "a"]))
+            .clean_content_tags(HashSet::from([
+                "script", "style", "svg", "noscript", "template", "math",
+            ]))
+            .add_tag_attributes("link", &["rel", "type", "href"])
+            .add_tag_attributes("meta", &["itemprop", "property", "name", "content"])
+            .add_tag_attributes("a", &["href"]);
+        let normalized_html = disc_builder.clean(raw_html).to_string();
+
+        let mut alt_links = Vec::new();
+        let mut yt_links = Vec::new();
+        let mut anchor_links = Vec::new();
+
+        let mut reader = Reader::from_str(&normalized_html);
+        reader.config_mut().check_end_names = false;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(tag) | Event::Empty(tag)) => {
+                    let name = tag.name();
+                    let name_bytes = name.as_ref();
+                    if name_bytes.eq_ignore_ascii_case("link") {
+                        Self::collect_link_feed_candidate(
+                            &tag,
+                            base_url,
+                            &mut alt_links,
+                            &mut yt_links,
+                        );
+                    } else if name_bytes.eq_ignore_ascii_case("meta") {
+                        Self::collect_meta_youtube_candidate(&tag, &mut yt_links);
+                    } else if name_bytes.eq_ignore_ascii_case("a") {
+                        Self::collect_anchor_feed_candidate(&tag, base_url, &mut anchor_links);
+                    }
+                }
+                Ok(Event::Eof) | Err(_) => break,
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push_valid = |u: Url| {
+            if SafeHttpClient::validate_url(&u).is_ok() && seen.insert(u.as_str().to_owned()) {
+                out.push(u);
+            }
+        };
+
+        for u in yt_links.into_iter().chain(alt_links).chain(anchor_links) {
+            push_valid(u);
+        }
+
+        if !crate::feeds::YouTubeParser::is_youtube_host(base_url.host_str()) {
+            for rel_path in ["/feed.xml", "/rss.xml", "/atom.xml", "/index.xml", "/feed", "/rss"] {
+                if let Ok(u) = base_url.join(rel_path) {
+                    push_valid(u);
+                }
+            }
+        }
+
+        out.truncate(8);
+        out
+    }
+
+    fn collect_link_feed_candidate(
+        tag: &quick_xml::events::BytesStart<'_>,
+        base_url: &Url,
+        alt_links: &mut Vec<Url>,
+        yt_links: &mut Vec<Url>,
+    ) {
+        let mut rel: Option<String> = None;
+        let mut mime: Option<String> = None;
+        let mut href: Option<String> = None;
+        for attr in tag.attributes().with_checks(false).flatten() {
+            let key = attr.key.as_ref();
+            let val = attr
+                .normalized_value(XmlVersion::default())
+                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+            if key.eq_ignore_ascii_case("rel") {
+                rel = Some(val);
+            } else if key.eq_ignore_ascii_case("type") {
+                mime = Some(val);
+            } else if key.eq_ignore_ascii_case("href") {
+                href = Some(val);
+            }
+        }
+        let Some(raw_href) = href.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let Ok(resolved) = base_url.join(&raw_href) else {
+            return;
+        };
+
+        if let Some(cid) = crate::feeds::YouTubeParser::extract_channel_id(resolved.as_str())
+            && let Ok(yt_url) = crate::feeds::YouTubeParser::feed_url_for_channel_id(&cid)
+        {
+            yt_links.push(yt_url);
+            return;
+        }
+
+        let is_alt = rel
+            .as_deref()
+            .is_some_and(|r| r.split_whitespace().any(|tok| tok.eq_ignore_ascii_case("alternate")));
+        if !is_alt {
+            return;
+        }
+        let mime_lower = mime.unwrap_or_default().to_ascii_lowercase();
+        let is_feed_mime = mime_lower.contains("rss")
+            || mime_lower.contains("atom")
+            || mime_lower.contains("rdf")
+            || mime_lower == "application/xml"
+            || mime_lower == "text/xml";
+        let path_lower = resolved.path().to_ascii_lowercase();
+        if is_feed_mime
+            && !mime_lower.contains("oembed")
+            && !mime_lower.contains("opensearch")
+            && !path_lower.contains("/comments/feed")
+        {
+            alt_links.push(resolved);
+        }
+    }
+
+    fn collect_meta_youtube_candidate(
+        tag: &quick_xml::events::BytesStart<'_>,
+        yt_links: &mut Vec<Url>,
+    ) {
+        let mut key_name: Option<String> = None;
+        let mut content: Option<String> = None;
+        for attr in tag.attributes().with_checks(false).flatten() {
+            let key = attr.key.as_ref();
+            let val = attr
+                .normalized_value(XmlVersion::default())
+                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+            if key.eq_ignore_ascii_case("itemprop")
+                || key.eq_ignore_ascii_case("property")
+                || key.eq_ignore_ascii_case("name")
+            {
+                key_name = Some(val);
+            } else if key.eq_ignore_ascii_case("content") {
+                content = Some(val);
+            }
+        }
+        let Some(k) = key_name else { return };
+        let Some(c) = content else { return };
+        if (k.eq_ignore_ascii_case("channelId") || k.eq_ignore_ascii_case("og:url"))
+            && let Some(cid) = crate::feeds::YouTubeParser::extract_channel_id(c.trim())
+            && let Ok(yt_url) = crate::feeds::YouTubeParser::feed_url_for_channel_id(&cid)
+        {
+            yt_links.push(yt_url);
+        }
+    }
+
+    fn collect_anchor_feed_candidate(
+        tag: &quick_xml::events::BytesStart<'_>,
+        base_url: &Url,
+        anchor_links: &mut Vec<Url>,
+    ) {
+        let mut href: Option<String> = None;
+        for attr in tag.attributes().with_checks(false).flatten() {
+            if attr.key.as_ref().eq_ignore_ascii_case("href") {
+                href = Some(
+                    attr.normalized_value(XmlVersion::default())
+                        .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into),
+                );
+                break;
+            }
+        }
+        let Some(raw_href) = href.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()) else {
+            return;
+        };
+        let Ok(resolved) = base_url.join(&raw_href) else {
+            return;
+        };
+        let path = resolved.path().to_ascii_lowercase();
+        let trimmed_path = path.trim_end_matches('/');
+        let has_rss_ext = std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rss"));
+        let looks_like_feed = has_rss_ext
+            || path.ends_with("/rss.xml")
+            || path.ends_with("/atom.xml")
+            || path.ends_with("/feed.xml")
+            || path.ends_with("/index.xml")
+            || trimmed_path.ends_with("/feed")
+            || trimmed_path.ends_with("/rss")
+            || trimmed_path.ends_with("/atom");
+        if looks_like_feed && !path.contains("/comments/feed") {
+            anchor_links.push(resolved);
         }
     }
 }

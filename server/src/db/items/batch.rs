@@ -75,14 +75,19 @@ impl ItemRepo<'_> {
             }
             ArchiveBatchScope::AllUnread => {
                 let max_batch = i64::try_from(MAX_BATCH_IDS).unwrap_or(5_000);
-                sqlx::query_scalar!(
+                sqlx::query_scalar(
                     "SELECT es.entry_id FROM entry_state es
                      JOIN entries e ON e.id = es.entry_id
                      WHERE e.merged_into_id IS NULL
                        AND es.inbox_state = 'unread'
+                       AND EXISTS (
+                           SELECT 1 FROM collection_entries ce
+                           JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+                           WHERE ce.entry_id = es.entry_id
+                       )
                      LIMIT ?",
-                    max_batch,
                 )
+                .bind(max_batch)
                 .fetch_all(self.pool)
                 .await?
             }

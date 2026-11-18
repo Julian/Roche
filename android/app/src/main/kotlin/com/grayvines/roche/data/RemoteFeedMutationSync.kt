@@ -81,12 +81,14 @@ internal suspend fun subscribeFeedBestEffort(
     url: String,
     titleOverride: String?,
     prefetchedBatch: ParsedFeedBatch? = null,
+    discoveredSiteTitle: String? = null,
 ): String {
     val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
     val canonicalUrl = canonicalizeFeedUrl(url)
     val fallbackTitle =
         cleanTitleOverride
             ?: prefetchedBatch?.title?.trim()?.takeIf { it.isNotEmpty() }
+            ?: discoveredSiteTitle?.trim()?.takeIf { it.isNotEmpty() }
             ?: extractHostTitle(url)
     val currentSettings = settings.settings.first()
     val nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
@@ -129,7 +131,7 @@ internal suspend fun subscribeFeedBestEffort(
         markDirty = remoteFeed == null && isPublic,
         hlcOverride = hlc,
     )
-    if (remoteFeed == null) {
+    if (remoteFeed == null || prefetchedBatch != null) {
         LocalFeedPoller.pollFeed(
             dao = dao,
             apiClient = apiClient,
@@ -228,9 +230,7 @@ internal suspend fun deleteFeedFromServerOrLocal(
                 if (problem != null && problem.statusCode != HTTP_NOT_FOUND) throw error
             }
     }
-    for (itemId in dao.getItemIdsForFeed(feedId)) {
-        offlineCacheManager.evictCachedItemFiles(itemId)
-    }
+    val evictedIds = ArrayList<String>()
     dao.executeInTransaction {
         if (existing != null) {
             val hlc = nextLocalHlc(dao, nodeId)
@@ -244,11 +244,18 @@ internal suspend fun deleteFeedFromServerOrLocal(
                 )
             )
         }
-        dao.deleteFeedPreservingHistory(
-            feedId = feedId,
-            recordTombstones = !isLocalOnly,
-            nodeId = nodeId,
+        evictedIds.addAll(
+            dao.deleteFeedPreservingHistory(
+                feedId = feedId,
+                recordTombstones = !isLocalOnly,
+                nodeId = nodeId,
+            )
         )
+    }
+    for (itemId in evictedIds) {
+        if (dao.getEntryContentById(itemId) == null) {
+            offlineCacheManager.evictCachedItemFiles(itemId)
+        }
     }
     return existing?.title ?: feedId
 }

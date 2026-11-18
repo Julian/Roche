@@ -41,14 +41,23 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
         _ => None,
     };
 
+    let active_nav = if detail.item.in_want_to_read {
+        NavSection::Queue
+    } else if detail.item.feed_id.is_none() && detail.item.is_favorite {
+        NavSection::Lists
+    } else {
+        NavSection::Inbox
+    };
+
     let mut body = String::with_capacity(12_288);
     render_reader_article(&mut body, &detail, rank_slug.as_deref(), &session.csrf_token);
 
     render_page(&PageShell {
         title: &detail.item.title,
-        active: NavSection::Inbox,
+        active: active_nav,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -116,22 +125,29 @@ fn render_reader_article(
         ret = esc(&reader_path),
     );
 
-    let (arch_action, arch_label) = if item.status == ItemStatus::Unread {
-        ("archive", "Archive")
+    let (arch_action, arch_label, arch_return) = if item.feed_id.is_some() {
+        if item.status == ItemStatus::Unread {
+            ("archive", "Archive", "/inbox")
+        } else {
+            ("unarchive", "Move to Inbox", "/inbox")
+        }
+    } else if item.in_want_to_read {
+        ("archive", "Remove from Want to Read", "/queue")
     } else {
-        ("unarchive", "Move to Inbox")
+        ("unarchive", "+ Want to Read", reader_path.as_str())
     };
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/web/items/{id}/{arch_action}\" class=\"inline-form js-reader-archive-form\">\
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"progress\" value=\"{prog:.4}\">\
-           <input type=\"hidden\" name=\"return_to\" value=\"/inbox\">\
+           <input type=\"hidden\" name=\"return_to\" value=\"{arch_ret}\">\
            <button type=\"submit\" class=\"btn btn-small\">{arch_label}</button>\
          </form>",
         id = esc(&urlencode(&item.id)),
         csrf = esc(csrf),
         prog = item.read_progress.clamp(0.0, 1.0),
+        arch_ret = esc(arch_return),
     );
 
     let star_label = if item.is_favorite { "&#9733; Starred" } else { "&#9734; Star" };
@@ -289,9 +305,11 @@ pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
     Path(id): Path<String>,
     Form(form): Form<FinishItemForm>,
 ) -> Response {
-    if let Err(err) = service.items().get(&id).await {
-        return web_api_error_response(&err, Some(&session.csrf_token));
-    }
+    let existing = match service.items().get(&id).await {
+        Ok(d) => d,
+        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
+    };
+    let default_return = if existing.item.feed_id.is_some() { "/inbox" } else { "/queue" };
     let logged = match service
         .catalog()
         .log_consumption(&id, ConsumptionStatus::Consumed, form.notes.as_deref(), None)
@@ -322,7 +340,7 @@ pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
             urlencode("Marked finished & logged to Diary")
         ))
     } else {
-        let base = safe_local_redirect(form.return_to.as_deref(), "/inbox");
+        let base = safe_local_redirect(form.return_to.as_deref(), default_return);
         let sep = if base.contains('?') { '&' } else { '?' };
         redirect_see_other(&format!(
             "{base}{sep}notice={}",

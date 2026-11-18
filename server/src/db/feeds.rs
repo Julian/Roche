@@ -8,8 +8,8 @@ use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
     ItemRepo, MediaRepo, SyncRepo,
     sync::{
-        SERVER_PEER_ID, STARRED_COLLECTION_ID, canonicalize_sync_url, deterministic_feed_id,
-        deterministic_item_id, feed_natural_key, item_natural_key,
+        SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id, deterministic_item_id,
+        feed_natural_key, item_natural_key,
     },
 };
 use crate::feeds::{OpmlOutline, arxiv::ArxivParser};
@@ -697,42 +697,34 @@ impl<'a> FeedRepo<'a> {
         feed_id: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        let member_rows = sqlx::query!(
+        let member_rows: Vec<(String, bool)> = sqlx::query_as(
             "SELECT ce.entry_id,
                     EXISTS (
                         SELECT 1 FROM collection_entries ce2
+                        JOIN feed_sources fs2 ON fs2.collection_id = ce2.collection_id
                         WHERE ce2.entry_id = ce.entry_id
                           AND ce2.collection_id != ?
-                          AND (
-                              ce2.collection_id = ?
-                              OR EXISTS (
-                                  SELECT 1 FROM feed_sources fs2
-                                  WHERE fs2.collection_id = ce2.collection_id
-                              )
-                          )
-                    ) AS \"keep_in_inbox!: bool\"
+                    ) AS keep_in_inbox
              FROM collection_entries ce
              WHERE ce.collection_id = ?",
-            feed_id,
-            STARRED_COLLECTION_ID,
-            feed_id,
         )
+        .bind(feed_id)
+        .bind(feed_id)
         .fetch_all(&mut *conn)
         .await?;
 
-        for row in member_rows {
-            let entry_id = row.entry_id;
-            if row.keep_in_inbox {
-                sqlx::query!(
+        for (entry_id, keep_in_inbox) in member_rows {
+            if keep_in_inbox {
+                sqlx::query(
                     "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
-                    feed_id,
-                    entry_id,
                 )
+                .bind(feed_id)
+                .bind(&entry_id)
                 .execute(&mut *conn)
                 .await?;
             } else {
                 let _ = ItemRepo::delete_inbox_item_preserving_history_in_tx(
-                    &mut *conn, &entry_id, now,
+                    &mut *conn, &entry_id, false, now,
                 )
                 .await?;
             }

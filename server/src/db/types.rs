@@ -276,6 +276,31 @@ impl EntryKind {
     }
 
     #[must_use]
+    pub const fn default_want_slug(self) -> Option<&'static str> {
+        match self {
+            Self::Article | Self::Paper => Some("want:read"),
+            Self::Movie => Some("want:movies"),
+            Self::Tv => Some("want:tv"),
+            Self::Artist => Some("want:artists"),
+            Self::Album => Some("want:albums"),
+            Self::Song => Some("want:songs"),
+            Self::Book => Some("want:books"),
+            Self::Podcast => Some("want:podcasts"),
+            Self::PodcastEpisode => Some("want:podcast_episodes"),
+            Self::Game => Some("want:games"),
+            Self::Video => Some("want:videos"),
+            Self::Channel => Some("want:channels"),
+            Self::Publication => Some("want:publications"),
+            Self::Collection => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_reader_openable(self) -> bool {
+        matches!(self, Self::Article | Self::Paper | Self::Video | Self::PodcastEpisode)
+    }
+
+    #[must_use]
     pub const fn parent_kind(self) -> Option<Self> {
         match self {
             Self::Song => Some(Self::Album),

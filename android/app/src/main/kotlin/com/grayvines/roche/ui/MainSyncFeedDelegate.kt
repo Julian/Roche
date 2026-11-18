@@ -267,6 +267,10 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 feedback = ConfigSaveFeedback.SILENT,
             )
         )
+        if (normalizeServerUrl(action.serverUrl).isBlank()) {
+            vm.showStatusMessage("Configure Server URL in Settings")
+            return
+        }
         performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
         vm.refreshLocalNetworkTier()
     }
@@ -363,11 +367,18 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
         vm.refreshLocalNetworkTier()
         if (!vm.tryAcquireSyncLock()) return
         try {
+            val hasServer = vm.settingsRepository.settings.first().serverUrl.isNotBlank()
             val syncResult = vm.repository.syncWithServer()
             vm.refreshLocalNetworkTier()
             syncResult
                 .onSuccess { count ->
-                    vm.showStatusMessage("Synced $count entries from server")
+                    val message =
+                        when {
+                            hasServer -> "Synced $count entries from server"
+                            count == 0 -> "Feeds are up to date"
+                            else -> "Refreshed $count ${if (count == 1) "feed" else "feeds"}"
+                        }
+                    vm.showStatusMessage(message)
                 }
                 .onFailure { error ->
                     if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {

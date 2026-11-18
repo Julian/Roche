@@ -70,9 +70,11 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
             post(views_reader::post_item_tag_remove::<F>),
         )
         .route("/web/feeds/create", post(views_reader::post_feed_create::<F>))
+        .route("/web/feeds/refresh-all", post(views_reader::post_feed_refresh_all::<F>))
         .route("/web/feeds/{id}/refresh", post(views_reader::post_feed_refresh::<F>))
         .route("/web/feeds/{id}/toggle-active", post(views_reader::post_feed_toggle_active::<F>))
         .route("/web/feeds/{id}/delete", post(views_reader::post_feed_delete::<F>))
+        .route("/web/refresh-status", get(views_reader::refresh_status_get::<F>))
         // Catalog Lists, Entries, Diary, Want Queues & Ranking
         .route("/lists", get(views_catalog::lists_get::<F>))
         .route("/web/lists/create", post(views_catalog::post_list_create::<F>))

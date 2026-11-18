@@ -14,7 +14,30 @@ mod tests;
 #[allow(unused_imports)]
 pub use fts::SearchTerm;
 
-use super::{ContentType, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
+use super::{ContentType, InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
+
+pub const IS_LIVE_ITEM_SQL: &str = "(
+    es.inbox_state IN ('unread', 'dismissed')
+    OR ec.entry_id IS NOT NULL
+    OR (
+        i.kind IN ('article', 'paper', 'video', 'podcast_episode')
+        AND EXISTS (
+            SELECT 1 FROM collection_entries ce_li
+            JOIN collection_specs cs_li ON cs_li.collection_id = ce_li.collection_id
+            WHERE ce_li.entry_id = i.id
+              AND cs_li.collection_role IN ('want', 'list')
+        )
+    )
+)";
+
+pub const IS_FEED_INBOX_ITEM_SQL: &str = "(
+    es.inbox_state IN ('unread', 'dismissed')
+    AND EXISTS (
+        SELECT 1 FROM collection_entries ce_fi
+        JOIN feed_sources fs_fi ON fs_fi.collection_id = ce_fi.collection_id
+        WHERE ce_fi.entry_id = i.id
+    )
+)";
 
 macro_rules! item_select_sql {
     ($content_html_expr:literal) => {
@@ -52,8 +75,29 @@ macro_rules! item_select_sql {
         WHERE m.entry_id = i.id AND m.media_type = 'audio' AND m.remote_url IS NOT NULL
         ORDER BY m.created_at DESC
         LIMIT 1) AS audio_url,
-       COALESCE(ec.content_type, 'article') AS content_type,
-       CASE es.inbox_state WHEN 'dismissed' THEN 'archived' ELSE 'unread' END AS status,
+       COALESCE(ec.content_type, CASE i.kind
+           WHEN 'video' THEN 'video'
+           WHEN 'paper' THEN 'paper'
+           WHEN 'podcast_episode' THEN 'audio'
+           ELSE 'article'
+       END) AS content_type,
+       CASE
+           WHEN es.inbox_state = 'dismissed' THEN 'archived'
+           WHEN COALESCE(es.inbox_state, 'none') = 'none'
+                AND es.read_at IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM collection_entries ce_wtr_s
+                    WHERE ce_wtr_s.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
+                      AND ce_wtr_s.entry_id = i.id
+                ) THEN 'archived'
+           ELSE 'unread'
+       END AS status,
+       COALESCE(es.inbox_state, 'none') AS inbox_state,
+       EXISTS (
+           SELECT 1 FROM collection_entries ce_wtr
+           WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
+             AND ce_wtr.entry_id = i.id
+       ) AS in_want_to_read,
        EXISTS (
            SELECT 1 FROM collection_entries ce_fav
            WHERE ce_fav.collection_id = '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
@@ -85,7 +129,7 @@ macro_rules! item_select_sql {
            )
        ), '[]') AS tag_names
 FROM entries i
-JOIN entry_state es ON es.entry_id = i.id
+LEFT JOIN entry_state es ON es.entry_id = i.id
 LEFT JOIN entry_content ec ON ec.entry_id = i.id"
         )
     };
@@ -129,6 +173,10 @@ pub struct Item {
     pub audio_url: Option<String>,
     pub content_type: ContentType,
     pub status: ItemStatus,
+    #[serde(default)]
+    pub inbox_state: InboxState,
+    #[serde(default)]
+    pub in_want_to_read: bool,
     pub is_favorite: bool,
     pub read_at: Option<DateTime<Utc>>,
     pub read_progress: f64,
@@ -206,6 +254,10 @@ pub struct ItemFilter {
     pub status: Option<ItemStatusFilter>,
     pub feed_id: Option<String>,
     pub tag_id: Option<String>,
+    #[serde(default)]
+    pub collection_id: Option<String>,
+    #[serde(default)]
+    pub inbox_only: Option<bool>,
     pub content_type: Option<ContentType>,
     pub is_favorite: Option<bool>,
     pub is_read: Option<bool>,

@@ -84,6 +84,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()

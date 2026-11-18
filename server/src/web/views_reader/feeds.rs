@@ -1,13 +1,13 @@
 use std::{fmt::Write as _, sync::Arc};
 
 use axum::{
-    Form,
+    Form, Json,
     extract::{Extension, Path, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-use super::{CreateFeedForm, FeedToggleForm, ImportOpmlForm};
+use super::{CreateFeedForm, FeedToggleForm, ImportOpmlForm, ItemReturnForm};
 use crate::{
     db::{Feed, FeedType},
     feeds::FeedSource,
@@ -16,8 +16,8 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
-            web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
+            safe_local_redirect, urlencode, web_api_error_response,
         },
     },
 };
@@ -37,10 +37,18 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
         body,
         "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
            <h2>Feeds</h2>\
-           <a class=\"btn btn-small\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\
+           <div style=\"display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap\">\
+             <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+               <input type=\"hidden\" name=\"return_to\" value=\"/feeds\">\
+               <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh All</button>\
+             </form>\
+             <a class=\"btn btn-small btn-ghost\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\
+           </div>\
          </div>\n\
-         <p class=\"lede\">{} subscribed sources (RSS/Atom, Podcasts, YouTube channels, arXiv).</p>",
-        feeds.len()
+         <p class=\"lede\">{} subscribed sources (RSS/Atom, Podcasts, YouTube channels, arXiv). Paste a site homepage or YouTube channel to autodiscover its feed.</p>",
+        feeds.len(),
+        csrf = esc(&session.csrf_token),
     );
 
     let _ = write!(
@@ -50,8 +58,8 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
            <form method=\"post\" action=\"/web/feeds/create\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
              <div class=\"form-grid\">\n\
-               <div class=\"field\"><label for=\"feed-url\">Feed URL or YouTube Channel ID</label>\
-                 <input id=\"feed-url\" name=\"url\" type=\"text\" required placeholder=\"https://example.com/feed.xml or UC...\"></div>\n\
+               <div class=\"field\"><label for=\"feed-url\">Site Homepage, Feed URL, or YouTube Channel</label>\
+                 <input id=\"feed-url\" name=\"url\" type=\"text\" required placeholder=\"https://danluu.com, https://example.com/feed.xml, or UC...\"></div>\n\
                <div class=\"field\"><label for=\"feed-title\">Custom Title (optional)</label>\
                  <input id=\"feed-title\" name=\"title\" type=\"text\" placeholder=\"Leave blank to use feed title\"></div>\n\
                <div class=\"field\"><label for=\"feed-type\">Source Kind</label>\
@@ -90,6 +98,7 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
         active: NavSection::Feeds,
         csrf_token: &session.csrf_token,
         flash: &flash,
+        is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
     .into_response()
@@ -238,10 +247,47 @@ pub(in crate::web) async fn post_feed_refresh<F: FeedFetcher>(
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
 ) -> Response {
-    match service.feeds().refresh(&id).await {
-        Ok(_) => redirect_see_other(&format!("/feeds?notice={}", urlencode("Refreshed feed"))),
+    if let Err(err) = service.feeds().get(&id).await {
+        return web_api_error_response(&err, Some(&session.csrf_token));
+    }
+    let service_bg = Arc::clone(&service);
+    tokio::spawn(async move {
+        let _ = service_bg.feeds().refresh(&id).await;
+    });
+    redirect_see_other(&format!("/feeds?notice={}", urlencode("Refreshing feed in background…")))
+}
+
+pub(in crate::web) async fn post_feed_refresh_all<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Form(form): Form<ItemReturnForm>,
+) -> Response {
+    let base = safe_local_redirect(form.return_to.as_deref(), "/feeds");
+    match service.feeds().refresh_all_in_background().await {
+        Ok(count) => {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            let msg = if count == 0 {
+                "No active feeds to refresh".to_owned()
+            } else {
+                format!("Refreshing {count} feeds in background…")
+            };
+            redirect_see_other(&format!("{base}{sep}notice={}", urlencode(&msg)))
+        }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
+}
+
+pub(in crate::web) async fn refresh_status_get<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+) -> Response {
+    let active_count = service.active_refresh_count();
+    let unread = service.sync_status().await.map_or(0, |s| s.unread_items_count);
+    Json(serde_json::json!({
+        "is_refreshing": active_count > 0,
+        "active_refresh_count": active_count,
+        "unread_items_count": unread,
+    }))
+    .into_response()
 }
 
 pub(in crate::web) async fn post_feed_toggle_active<F: FeedFetcher>(

@@ -581,7 +581,8 @@ async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
     let service = RocheService::new(db, FakeFeedFetcher, config);
     let app = ApiRoutes::router_with_service(service);
 
-    // 1. Save article without explicit title -> extracts <title>, meta summary, and sanitized HTML
+    // 1. Save article without explicit title -> returns immediately in Want to Read (`inbox_state = "none"`)
+    //    and enriches `<title>`, meta summary, and sanitized HTML in the background
     let article_request = Request::builder()
         .method("POST")
         .uri("/api/v1/items/save")
@@ -591,9 +592,30 @@ async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
         .unwrap();
     let article_response = app.clone().oneshot(article_request).await.unwrap();
     assert_eq!(article_response.status(), StatusCode::CREATED);
-    let article_body: serde_json::Value =
+    let initial_article_body: serde_json::Value =
         serde_json::from_slice(&to_bytes(article_response.into_body(), usize::MAX).await.unwrap())
             .unwrap();
+    assert_eq!(initial_article_body["in_want_to_read"], true);
+    assert_eq!(initial_article_body["inbox_state"], "none");
+    let article_id = initial_article_body["id"].as_str().unwrap().to_string();
+
+    let mut article_body = initial_article_body;
+    for _ in 0..40 {
+        if article_body["title"] == "Fetched Page Title" && article_body["content_html"].is_string()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let get_req = Request::builder()
+            .uri(format!("/api/v1/items/{article_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let get_res = app.clone().oneshot(get_req).await.unwrap();
+        article_body =
+            serde_json::from_slice(&to_bytes(get_res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+    }
     assert_eq!(article_body["title"], "Fetched Page Title");
     assert_eq!(article_body["summary"], "Extracted meta summary");
     assert_eq!(article_body["content_type"], "article");
@@ -601,7 +623,7 @@ async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
     assert!(content_html.contains("<p>Full article body.</p>"));
     assert!(!content_html.contains("<script>"));
 
-    // 2. Save arXiv abstract URL -> classifies as "paper", downloads PDF, and attaches media
+    // 2. Save arXiv abstract URL -> classifies as "paper", returns immediately, and downloads PDF in background
     let arxiv_request = Request::builder()
         .method("POST")
         .uri("/api/v1/items/save")
@@ -611,10 +633,27 @@ async fn test_save_article_snapshot_and_arxiv_pdf_ingestion() {
         .unwrap();
     let arxiv_response = app.clone().oneshot(arxiv_request).await.unwrap();
     assert_eq!(arxiv_response.status(), StatusCode::CREATED);
-    let arxiv_body: serde_json::Value =
+    let mut arxiv_body: serde_json::Value =
         serde_json::from_slice(&to_bytes(arxiv_response.into_body(), usize::MAX).await.unwrap())
             .unwrap();
     assert_eq!(arxiv_body["content_type"], "paper");
+    assert_eq!(arxiv_body["in_want_to_read"], true);
+    let arxiv_id = arxiv_body["id"].as_str().unwrap().to_string();
+    for _ in 0..40 {
+        if arxiv_body["media"].as_array().is_some_and(|m| !m.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let get_req = Request::builder()
+            .uri(format!("/api/v1/items/{arxiv_id}"))
+            .header(header::AUTHORIZATION, &auth)
+            .body(Body::empty())
+            .unwrap();
+        let get_res = app.clone().oneshot(get_req).await.unwrap();
+        arxiv_body =
+            serde_json::from_slice(&to_bytes(get_res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+    }
     assert_eq!(arxiv_body["media"].as_array().unwrap().len(), 1);
     assert_eq!(arxiv_body["media"][0]["media_type"], "pdf");
     let pdf_media_id = arxiv_body["media"][0]["id"].as_str().unwrap().to_string();
@@ -975,7 +1014,7 @@ async fn test_incremental_sync_changes_pagination_and_updated_after() {
         &to_bytes(batch_archive_response.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(batch_archive_body["archived_count"], 2);
+    assert_eq!(batch_archive_body["archived_count"], 1);
 }
 
 #[tokio::test]

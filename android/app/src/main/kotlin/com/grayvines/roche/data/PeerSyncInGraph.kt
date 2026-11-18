@@ -366,7 +366,8 @@ private suspend fun mergeIncomingGeneratorsInDao(
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
     val remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects)
-    val candidateIds = (localByColId.keys + remoteByColId.keys).distinct()
+    val candidateIds =
+        (localByColId.keys + remoteByColId.keys).distinct().filter { it != STARRED_COLLECTION_ID }
     for (colId in candidateIds) {
         val merged =
             reconcileSingleGeneratorInDao(
@@ -395,7 +396,8 @@ private fun indexEligibleRemoteGenerators(
             val resolvedColId = followMergedInMap(rawColId, redirects)
             val spec = specsById[resolvedColId]
             val isManualList =
-                spec != null &&
+                resolvedColId != STARRED_COLLECTION_ID &&
+                    spec != null &&
                     CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
                     CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
             if (isManualList) {

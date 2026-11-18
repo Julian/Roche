@@ -183,6 +183,12 @@ internal fun QuickLogBottomSheet(
     }
 }
 
+private const val DEFAULT_LIST_LABEL = "List"
+
+private fun formatAddToListLabel(targetCollectionTitle: String?): String =
+    "Add to ${targetCollectionTitle ?: DEFAULT_LIST_LABEL}"
+
+@Suppress("LongMethod")
 @Composable
 private fun QuickLogSheetBody(
     defaultToWant: Boolean,
@@ -190,6 +196,11 @@ private fun QuickLogSheetBody(
     targetCollectionTitle: String?,
     onAction: (MainAction) -> Unit,
 ) {
+    val hasTargetList = !targetCollectionId.isNullOrBlank()
+    var addToListOnly by
+        rememberSaveable(defaultToWant, hasTargetList) {
+            mutableStateOf(hasTargetList && !defaultToWant)
+        }
     var addToWant by rememberSaveable(defaultToWant) { mutableStateOf(defaultToWant) }
     var kind by rememberSaveable { mutableStateOf(EntryKind.MOVIE) }
     var status by rememberSaveable { mutableStateOf(ConsumptionStatus.CONSUMED) }
@@ -209,11 +220,16 @@ private fun QuickLogSheetBody(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         QuickLogSelectorsSection(
+            addToListOnly = addToListOnly,
             addToWant = addToWant,
+            hasTargetList = hasTargetList,
             targetCollectionTitle = targetCollectionTitle,
             selectedKind = kind,
             selectedStatus = status,
-            onSelectWantMode = { addToWant = it },
+            onSelectMode = { listOnly, want ->
+                addToListOnly = listOnly
+                addToWant = want
+            },
             onSelectKind = { kind = it },
             onSelectStatus = { status = it },
         )
@@ -225,8 +241,14 @@ private fun QuickLogSheetBody(
             onCreatorsChange = { creators = it },
             onYearChange = { yearText = it.filter(Char::isDigit).take(MAX_YEAR_DIGITS) },
         )
-        if (!addToWant) {
-            QuickLogDiaryOptions(notes, kind, status, rankAfterLog, { notes = it }) {
+        if (!addToWant && !addToListOnly) {
+            QuickLogDiaryOptions(
+                notes,
+                targetCollectionTitle ?: kind.systemListTitle,
+                status,
+                rankAfterLog,
+                { notes = it },
+            ) {
                 rankAfterLog = it
             }
         }
@@ -239,10 +261,17 @@ private fun QuickLogSheetBody(
                 status = status,
                 notes = notes,
                 addToWant = addToWant,
+                addToListOnly = addToListOnly,
                 rankAfterLog = rankAfterLog,
                 targetCollectionId = targetCollectionId,
             )
-        QuickLogFooterRow(addToWant, { onAction(MainAction.CloseQuickLogSheet) }) {
+        val submitLabel =
+            when {
+                addToListOnly -> formatAddToListLabel(targetCollectionTitle)
+                addToWant -> "Add to Want"
+                else -> "Save Log"
+            }
+        QuickLogFooterRow(submitLabel, { onAction(MainAction.CloseQuickLogSheet) }) {
             onAction(submitAction)
         }
         Spacer(modifier = Modifier.height(14.dp))
@@ -258,6 +287,7 @@ private fun buildQuickLogAction(
     status: ConsumptionStatus,
     notes: String,
     addToWant: Boolean,
+    addToListOnly: Boolean,
     rankAfterLog: Boolean,
     targetCollectionId: String?,
 ): MainAction =
@@ -269,18 +299,21 @@ private fun buildQuickLogAction(
         status = status,
         notes = notes,
         addToWant = addToWant,
-        rankAfterLog = rankAfterLog && status == ConsumptionStatus.CONSUMED,
+        rankAfterLog = rankAfterLog && !addToListOnly && status == ConsumptionStatus.CONSUMED,
         targetCollectionId = targetCollectionId,
+        addToListOnly = addToListOnly,
     )
 
 @Suppress("LongParameterList")
 @Composable
 private fun QuickLogSelectorsSection(
+    addToListOnly: Boolean,
     addToWant: Boolean,
+    hasTargetList: Boolean,
     targetCollectionTitle: String?,
     selectedKind: EntryKind,
     selectedStatus: ConsumptionStatus,
-    onSelectWantMode: (Boolean) -> Unit,
+    onSelectMode: (listOnly: Boolean, want: Boolean) -> Unit,
     onSelectKind: (EntryKind) -> Unit,
     onSelectStatus: (ConsumptionStatus) -> Unit,
 ) {
@@ -288,6 +321,9 @@ private fun QuickLogSelectorsSection(
     val loggableKinds = remember { QUICK_LOG_KINDS }
     val heading =
         when {
+            addToListOnly -> formatAddToListLabel(targetCollectionTitle)
+            addToWant && !targetCollectionTitle.isNullOrBlank() ->
+                "Want & Add to $targetCollectionTitle"
             addToWant -> "Add to Want Queue"
             !targetCollectionTitle.isNullOrBlank() -> "Log & Add to $targetCollectionTitle"
             else -> "Log to Diary"
@@ -299,18 +335,13 @@ private fun QuickLogSelectorsSection(
         fontSize = 19.sp,
         fontWeight = FontWeight.SemiBold,
     )
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FilterChipPill(
-            label = "Log Diary",
-            selected = !addToWant,
-            onClick = { onSelectWantMode(false) },
-        )
-        FilterChipPill(
-            label = "Want Queue",
-            selected = addToWant,
-            onClick = { onSelectWantMode(true) },
-        )
-    }
+    QuickLogModeChipsRow(
+        hasTargetList = hasTargetList,
+        targetCollectionTitle = targetCollectionTitle,
+        addToListOnly = addToListOnly,
+        addToWant = addToWant,
+        onSelectMode = onSelectMode,
+    )
     Row(
         modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -323,7 +354,7 @@ private fun QuickLogSelectorsSection(
             )
         }
     }
-    if (!addToWant) {
+    if (!addToWant && !addToListOnly) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ConsumptionStatus.entries.forEach { status ->
                 FilterChipPill(
@@ -332,6 +363,49 @@ private fun QuickLogSelectorsSection(
                     onClick = { onSelectStatus(status) },
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun QuickLogModeChipsRow(
+    hasTargetList: Boolean,
+    targetCollectionTitle: String?,
+    addToListOnly: Boolean,
+    addToWant: Boolean,
+    onSelectMode: (listOnly: Boolean, want: Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (hasTargetList) {
+            FilterChipPill(
+                label = formatAddToListLabel(targetCollectionTitle),
+                selected = addToListOnly,
+                onClick = { onSelectMode(true, false) },
+            )
+            FilterChipPill(
+                label = "Log & Add",
+                selected = !addToListOnly && !addToWant,
+                onClick = { onSelectMode(false, false) },
+            )
+            FilterChipPill(
+                label = "Want & Add",
+                selected = !addToListOnly && addToWant,
+                onClick = { onSelectMode(false, true) },
+            )
+        } else {
+            FilterChipPill(
+                label = "Log Diary",
+                selected = !addToWant,
+                onClick = { onSelectMode(false, false) },
+            )
+            FilterChipPill(
+                label = "Want Queue",
+                selected = addToWant,
+                onClick = { onSelectMode(false, true) },
+            )
         }
     }
 }
@@ -379,7 +453,7 @@ private fun QuickLogMetadataFields(
 @Composable
 private fun QuickLogDiaryOptions(
     notes: String,
-    selectedKind: EntryKind,
+    rankTargetTitle: String,
     selectedStatus: ConsumptionStatus,
     rankAfterLog: Boolean,
     onNotesChange: (String) -> Unit,
@@ -396,7 +470,7 @@ private fun QuickLogDiaryOptions(
     if (selectedStatus == ConsumptionStatus.CONSUMED) {
         SettingToggleRow(
             title = "Rank immediately after logging",
-            subtitle = "Compare against entries in ${selectedKind.systemListTitle}",
+            subtitle = "Compare against entries in $rankTargetTitle",
             checked = rankAfterLog,
             onCheckedChange = onRankToggle,
         )
@@ -405,7 +479,7 @@ private fun QuickLogDiaryOptions(
 
 @Composable
 private fun QuickLogFooterRow(
-    addToWant: Boolean,
+    submitLabel: String,
     onCancel: () -> Unit,
     onSubmit: () -> Unit,
 ) {
@@ -416,7 +490,7 @@ private fun QuickLogFooterRow(
         HeaderActionButton(label = "Cancel", onClick = onCancel)
         Spacer(modifier = Modifier.size(8.dp))
         HeaderActionButton(
-            label = if (addToWant) "Add to Want" else "Save Log",
+            label = submitLabel,
             style = RocheButtonStyle.PRIMARY,
             onClick = onSubmit,
             modifier = Modifier.testTag("quick_log_submit_btn"),

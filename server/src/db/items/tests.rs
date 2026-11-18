@@ -382,8 +382,8 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
     let read_new = items.get(&item_new.id).await.unwrap().unwrap();
     assert_eq!(read_new.status, ItemStatus::Unread);
     assert_eq!(read_new.read_at, Some(custom_read_ts));
-    // `count_unread` aligns with `inbox_state = 'unread'` even when `read_at` is set
-    assert_eq!(items.count_unread().await.unwrap(), 4);
+    // `count_unread` counts Feed Inbox unread items (`inbox_state = 'unread'`), excluding manual `want:read` items
+    assert_eq!(items.count_unread().await.unwrap(), 3);
 
     let unread_only = items
         .list_filtered(&ItemFilter { is_read: Some(false), ..Default::default() })
@@ -438,8 +438,10 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
         ArchiveBatchScope::from_request(&["   ".to_string()], Some(&feed.id), true).unwrap();
     let archived = items.archive_batch(&scope).await.unwrap();
     assert_eq!(archived, 3);
-    assert_eq!(items.count_by_status(ItemStatus::Unread).await.unwrap(), 1);
+    assert_eq!(items.count_by_status(ItemStatus::Unread).await.unwrap(), 0);
     assert_eq!(items.count_by_status(ItemStatus::Archived).await.unwrap(), 3);
+    let still_in_wtr = items.get(&huge_item.id).await.unwrap().unwrap();
+    assert!(still_in_wtr.in_want_to_read);
 
     let archive_changes = db.sync().list_changes_since(before_archive_id, 10).await.unwrap();
     assert_eq!(archive_changes.len(), 3);
