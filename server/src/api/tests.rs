@@ -1739,3 +1739,29 @@ async fn test_catalog_api_collection_generator_and_peer_sync_roundtrip() {
     assert_eq!(rows[1]["entry"]["id"], second_album_id);
     assert_eq!(rows[1]["tier"], "D");
 }
+
+#[tokio::test]
+async fn test_oversized_payload_returns_rfc9457_problem_details_413() {
+    let (app, auth) = setup_app().await;
+
+    // Protected route body limit is 64 KiB; send 70 KiB JSON payload
+    let big_title = "a".repeat(70 * 1024);
+    let body = serde_json::json!({
+        "url": "https://example.com/feed.xml",
+        "title": big_title,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/feeds")
+        .header(header::AUTHORIZATION, &auth)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/problem+json");
+    let problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(problem["type"], "urn:roche:problem:payload-too-large");
+    assert_eq!(problem["status"], 413);
+}

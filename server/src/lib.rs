@@ -39,9 +39,12 @@ impl RocheServer {
 
         Self::maybe_issue_bootstrap_code(&roche_service, bootstrap_canonical_url.as_deref()).await;
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         let poll_scheduler = roche_service.poll_scheduler();
+        let sched_shutdown = shutdown_rx.clone();
         let scheduler_handle = tokio::spawn(async move {
-            if let Err(e) = poll_scheduler.run().await {
+            if let Err(e) = poll_scheduler.run_until_shutdown(sched_shutdown).await {
                 tracing::error!(error = %e, "PollScheduler terminated with error");
             }
         });
@@ -50,10 +53,11 @@ impl RocheServer {
         let prune_after = cfg.sync.op_log_prune_after;
         let media_dir = cfg.storage.media_dir.clone();
         let download_dir = cfg.media.download_dir.clone();
+        let worker_shutdown = shutdown_rx.clone();
         let worker_handle = tokio::spawn(async move {
             let worker_mgr = workers::WorkerManager::new(worker_db, prune_after, media_dir)
                 .with_download_dir(download_dir);
-            if let Err(e) = worker_mgr.run_all().await {
+            if let Err(e) = worker_mgr.run_all_until_shutdown(worker_shutdown).await {
                 tracing::error!(error = %e, "WorkerManager terminated with error");
             }
         });
@@ -63,12 +67,20 @@ impl RocheServer {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         tracing::info!(addr = %addr, "Roche server listening");
+        let signal_tx = shutdown_tx.clone();
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(Self::shutdown_signal())
+            .with_graceful_shutdown(async move {
+                Self::shutdown_signal().await;
+                let _ = signal_tx.send(true);
+            })
             .await?;
 
-        scheduler_handle.abort();
-        worker_handle.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let _ = scheduler_handle.await;
+            let _ = worker_handle.await;
+        })
+        .await;
         Ok(())
     }
 
@@ -130,8 +142,8 @@ impl RocheServer {
         roche_service: &service::RocheService<F>,
         canonical_url: Option<&str>,
     ) {
-        if roche_service.auth().count_devices().await.unwrap_or(0) == 0 {
-            match roche_service.auth().issue_pairing_code().await {
+        match roche_service.auth().count_devices().await {
+            Ok(0) => match roche_service.auth().issue_pairing_code().await {
                 Ok(code) => {
                     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
                         if let Some(url) = canonical_url {
@@ -147,9 +159,18 @@ impl RocheServer {
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to generate bootstrap device pairing code");
                 }
+            },
+            Ok(_) => {
+                tracing::info!(
+                    "Paired devices exist; run `roche pair` to generate a new pairing code"
+                );
             }
-        } else {
-            tracing::info!("Paired devices exist; run `roche pair` to generate a new pairing code");
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to count paired devices; skipping bootstrap pairing code generation"
+                );
+            }
         }
     }
 

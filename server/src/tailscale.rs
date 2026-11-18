@@ -397,15 +397,21 @@ fn proxy_matches_upstream(proxy: &str, upstream_host: &str, port: u16) -> bool {
         return clean == format!("http://localhost:{port}")
             || clean == format!("http://[::1]:{port}");
     }
+    if host == "::1" {
+        return clean == format!("http://localhost:{port}");
+    }
     false
 }
 
-fn format_target_arg(upstream_host: &str, port: u16) -> String {
+fn format_target_arg(upstream_host: &str, port: u16) -> Result<String> {
     let host = serve_upstream_host(upstream_host);
+    if host.starts_with('-') {
+        anyhow::bail!("Invalid Tailscale upstream host (cannot start with '-'): {host}");
+    }
     if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
+        Ok(format!("[{host}]:{port}"))
     } else {
-        format!("{host}:{port}")
+        Ok(format!("{host}:{port}"))
     }
 }
 
@@ -512,7 +518,7 @@ pub async fn configure_node_https(
     port: u16,
     https_port: u16,
 ) -> Result<()> {
-    let target_arg = format_target_arg(upstream_host, port);
+    let target_arg = format_target_arg(upstream_host, port)?;
     let https_arg = format!("--https={https_port}");
     let output = run_tailscale_cmd(
         tailscale_bin,
@@ -535,13 +541,16 @@ pub async fn advertise_service(cfg: &TailscaleConfig, port: u16) -> Result<Optio
     advertise_service_with_target(cfg, "127.0.0.1", port).await
 }
 
-/// Resolves the local TCP upstream host that `tailscale serve` should proxy to for a given
-/// `listen_host` (mapping wildcard/loopback binds to `127.0.0.1`, and preserving explicit interface IPs).
+/// Resolves the local TCP upstream host that `tailscale serve` should proxy to for `listen_host`.
+///
+/// Maps wildcard/IPv4 loopback binds to `127.0.0.1` while preserving IPv6 loopback (`::1`) and
+/// explicit interface IPs.
 #[must_use]
 pub fn serve_upstream_host(listen_host: &str) -> &str {
     let trimmed = listen_host.trim();
     match trimmed {
-        "" | "0.0.0.0" | "::" | "[::]" | "127.0.0.1" | "localhost" | "::1" | "[::1]" => "127.0.0.1",
+        "" | "0.0.0.0" | "::" | "[::]" | "127.0.0.1" | "localhost" => "127.0.0.1",
+        "::1" | "[::1]" => "::1",
         other => other,
     }
 }
@@ -563,7 +572,7 @@ pub async fn advertise_service_with_target(
         anyhow::bail!("Invalid Tailscale service name: {svc}");
     }
 
-    let target_arg = format_target_arg(upstream_host, port);
+    let target_arg = format_target_arg(upstream_host, port)?;
     let service_arg = format!("--service={svc}");
     let output = run_tailscale_cmd(
         &cfg.tailscale_bin,
@@ -602,12 +611,16 @@ pub async fn discover_on_tailnet(
     probe_candidates(&candidates).await
 }
 
-async fn is_roche_health_reachable(base_url: &str) -> bool {
-    let Ok(client) = reqwest::Client::builder()
+fn build_probe_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-    else {
+        .ok()
+}
+
+async fn is_roche_health_reachable(base_url: &str) -> bool {
+    let Some(client) = build_probe_client() else {
         return false;
     };
     probe_single(&client, base_url.trim_end_matches('/')).await.is_some()
@@ -615,11 +628,7 @@ async fn is_roche_health_reachable(base_url: &str) -> bool {
 
 /// Probes a list of candidate base URLs with bounded concurrency and returns verified Roche servers.
 pub async fn probe_candidates(candidates: &[String]) -> Vec<DiscoveredServer> {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(PROBE_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
+    let Some(client) = build_probe_client() else {
         return Vec::new();
     };
 
@@ -683,30 +692,30 @@ async fn probe_single(client: &reqwest::Client, base_url: &str) -> Option<Discov
     })
 }
 
-async fn run_tailscale_status(tailscale_bin: &Path) -> Result<String> {
-    let output = run_tailscale_cmd(tailscale_bin, &["status", "--json"], STATUS_TIMEOUT)
+async fn run_tailscale_json(tailscale_bin: &Path, args: &[&str], label: &str) -> Result<String> {
+    let output = run_tailscale_cmd(tailscale_bin, args, STATUS_TIMEOUT)
         .await
-        .context("Timed out querying `tailscale status --json`")?
-        .context("Failed to execute `tailscale status --json`")?;
+        .with_context(|| format!("Timed out querying `{label}`"))?
+        .with_context(|| format!("Failed to execute `{label}`"))?;
 
     if !output.status.success() {
-        anyhow::bail!("tailscale status exited with {}", output.status);
+        anyhow::bail!("{label} exited with {}", output.status);
     }
 
-    String::from_utf8(output.stdout).context("Invalid UTF-8 in tailscale status output")
+    String::from_utf8(output.stdout).with_context(|| format!("Invalid UTF-8 in {label} output"))
+}
+
+async fn run_tailscale_status(tailscale_bin: &Path) -> Result<String> {
+    run_tailscale_json(tailscale_bin, &["status", "--json"], "tailscale status --json").await
 }
 
 async fn run_tailscale_serve_status(tailscale_bin: &Path) -> Result<String> {
-    let output = run_tailscale_cmd(tailscale_bin, &["serve", "status", "--json"], STATUS_TIMEOUT)
-        .await
-        .context("Timed out querying `tailscale serve status --json`")?
-        .context("Failed to execute `tailscale serve status --json`")?;
-
-    if !output.status.success() {
-        anyhow::bail!("tailscale serve status exited with {}", output.status);
-    }
-
-    String::from_utf8(output.stdout).context("Invalid UTF-8 in tailscale serve status output")
+    run_tailscale_json(
+        tailscale_bin,
+        &["serve", "status", "--json"],
+        "tailscale serve status --json",
+    )
+    .await
 }
 
 async fn run_tailscale_cmd(
@@ -984,5 +993,22 @@ mod tests {
         assert!(identity.magic_dns_suffix.is_none());
         // No cleartext IP fallback is emitted when DNS names are invalid
         assert_eq!(identity.candidate_urls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_serve_upstream_host_preserves_ipv6_loopback_and_rejects_flag_injection() {
+        assert_eq!(serve_upstream_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(serve_upstream_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(serve_upstream_host("::"), "127.0.0.1");
+        assert_eq!(serve_upstream_host("::1"), "::1");
+        assert_eq!(serve_upstream_host("[::1]"), "::1");
+
+        assert_eq!(format_target_arg("::1", 8080).unwrap(), "[::1]:8080");
+        assert_eq!(format_target_arg("[::1]", 8080).unwrap(), "[::1]:8080");
+        assert_eq!(format_target_arg("127.0.0.1", 8080).unwrap(), "127.0.0.1:8080");
+        assert!(format_target_arg("--flag-injection", 8080).is_err());
+
+        assert!(proxy_matches_upstream("http://[::1]:8080", "::1", 8080));
+        assert!(!proxy_matches_upstream("http://127.0.0.1:8080", "::1", 8080));
     }
 }

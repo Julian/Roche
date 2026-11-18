@@ -41,6 +41,18 @@ impl MediaStore {
         &self.base_dir
     }
 
+    /// Resolves `download_dir` inside `base_dir`, falling back to `<base_dir>/downloads`
+    /// if the configured path escapes `base_dir`.
+    #[must_use]
+    pub fn resolve_download_dir(&self, download_dir: &Path) -> PathBuf {
+        let normalized = Self::normalize_lexical(download_dir);
+        if normalized.starts_with(&self.base_dir) {
+            normalized
+        } else {
+            self.base_dir.join("downloads")
+        }
+    }
+
     /// Converts a path inside `base_dir` to a normalized forward-slash relative path for database storage.
     pub fn relative_path(&self, candidate: &Path) -> Result<String> {
         let safe_path = self.validate_path(candidate)?;
@@ -48,6 +60,15 @@ impl MediaStore {
             .strip_prefix(&self.base_dir)
             .map_err(|_| anyhow::anyhow!("Media path is outside configured media_dir"))?;
         Ok(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// Async wrapper for [`Self::relative_path`] that offloads blocking filesystem metadata checks.
+    pub async fn relative_path_async(&self, candidate: &Path) -> Result<String> {
+        let store = self.clone();
+        let cand = candidate.to_path_buf();
+        tokio::task::spawn_blocking(move || store.relative_path(&cand))
+            .await
+            .map_err(|e| anyhow::anyhow!("Media relative path task failed: {e}"))?
     }
 
     /// Validates that `candidate` resolves inside `self.base_dir` with no parent-directory (`..`)
@@ -94,7 +115,7 @@ impl MediaStore {
         Ok(norm_cand)
     }
 
-    async fn validate_path_async(&self, candidate: &Path) -> Result<PathBuf> {
+    pub async fn validate_path_async(&self, candidate: &Path) -> Result<PathBuf> {
         let store = self.clone();
         let cand = candidate.to_path_buf();
         tokio::task::spawn_blocking(move || store.validate_path(&cand))
@@ -238,19 +259,25 @@ impl MediaStore {
         let dirs =
             [self.base_dir.clone(), self.base_dir.join("pdfs"), self.base_dir.join("thumbnails")];
         for dir in dirs {
-            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            let Ok(safe_dir) = self.validate_path_async(&dir).await else {
+                continue;
+            };
+            let Ok(mut entries) = tokio::fs::read_dir(&safe_dir).await else {
                 continue;
             };
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if !entry.file_name().to_string_lossy().starts_with(".tmp-") {
                     continue;
                 }
+                let Ok(ft) = entry.file_type().await else {
+                    continue;
+                };
+                if ft.is_symlink() || !ft.is_file() {
+                    continue;
+                }
                 let Ok(meta) = entry.metadata().await else {
                     continue;
                 };
-                if !meta.is_file() {
-                    continue;
-                }
                 let is_stale = meta
                     .modified()
                     .ok()
@@ -272,12 +299,7 @@ impl MediaStore {
         registered_item_ids: &std::collections::HashSet<String>,
         min_age: std::time::Duration,
     ) -> Result<usize> {
-        let normalized_dl = Self::normalize_lexical(download_dir);
-        let base_downloads = if normalized_dl.starts_with(&self.base_dir) {
-            normalized_dl
-        } else {
-            self.base_dir.join("downloads")
-        };
+        let base_downloads = self.resolve_download_dir(download_dir);
         let Ok(safe_downloads) = self.validate_path_async(&base_downloads).await else {
             return Ok(0);
         };
@@ -432,5 +454,40 @@ mod tests {
         assert!(!stale_tmp.exists());
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[test]
+    fn test_resolve_download_dir_enforces_containment() {
+        let store = MediaStore::new("/var/lib/roche/media");
+        assert_eq!(
+            store.resolve_download_dir(Path::new("/var/lib/roche/media/custom-dl")),
+            PathBuf::from("/var/lib/roche/media/custom-dl")
+        );
+        assert_eq!(
+            store.resolve_download_dir(Path::new("/tmp/outside-downloads")),
+            PathBuf::from("/var/lib/roche/media/downloads")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cleanup_stale_temp_files_skips_symlinked_subdir() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-media-sym-{}", uuid::Uuid::new_v4()));
+        let outside_dir =
+            std::env::temp_dir().join(format!("roche-media-outside-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        tokio::fs::create_dir_all(&outside_dir).await.unwrap();
+        let outside_tmp = outside_dir.join(".tmp-1234-secret.pdf");
+        tokio::fs::write(&outside_tmp, b"keep").await.unwrap();
+        std::os::unix::fs::symlink(&outside_dir, temp_dir.join("pdfs")).unwrap();
+
+        let store = MediaStore::new(&temp_dir);
+        let removed = store.cleanup_stale_temp_files(std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(removed, 0);
+        assert!(outside_tmp.exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 }

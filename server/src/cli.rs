@@ -828,7 +828,7 @@ async fn run_draw_cmd(db: &Db, action: DrawCommand) -> anyhow::Result<()> {
                 anyhow::bail!("No external URL available for '{}'.", active.title);
             };
             open_system_browser(&url)?;
-            println!("Opened {url}");
+            println!("Opened {}", sanitize_terminal_text(&url));
         }
         DrawCommand::Finish { collection, notes, no_rank } => {
             run_draw_finish_cmd(db, &catalog, collection.as_deref(), notes.as_deref(), no_rank)

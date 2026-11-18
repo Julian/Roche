@@ -41,14 +41,26 @@ impl WorkerManager {
         Ok(())
     }
 
-    pub async fn run_all(&self) -> Result<()> {
+    pub async fn run_all_until_shutdown(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
-            interval.tick().await;
-            if let Err(e) = self.run_once().await {
-                tracing::error!(error = %e, "WorkerManager maintenance pass failed");
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.run_once().await {
+                        tracing::error!(error = %e, "WorkerManager maintenance pass failed");
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     pub async fn run_once(&self) -> Result<()> {

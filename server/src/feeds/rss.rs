@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use quick_xml::{Reader, XmlVersion, escape::unescape, events::Event};
+use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
@@ -439,17 +439,10 @@ impl RssParser {
                     }
                 }
                 Ok(Event::Text(text)) if active_text_tag.is_some() => {
-                    let decoded =
-                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
-                    text_buf.push_str(&decoded);
+                    text_buf.push_str(&crate::content::xml_util::decode_text(&text));
                 }
                 Ok(Event::GeneralRef(entity)) if active_text_tag.is_some() => {
-                    let raw_entity = format!("&{};", entity.as_ref());
-                    if let Ok(decoded) = unescape(&raw_entity) {
-                        text_buf.push_str(&decoded);
-                    } else {
-                        text_buf.push_str(&raw_entity);
-                    }
+                    text_buf.push_str(&crate::content::xml_util::decode_entity(&entity));
                 }
                 Ok(Event::CData(cdata)) if active_text_tag.is_some() => {
                     text_buf.push_str(cdata.as_ref());
@@ -615,18 +608,7 @@ impl RssParser {
     }
 
     fn extract_attr(tag: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
-        for attr in tag.attributes().with_checks(false).flatten() {
-            if attr.key.as_ref().eq_ignore_ascii_case(name) {
-                let val = attr
-                    .normalized_value(XmlVersion::default())
-                    .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
-                let trimmed = val.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_owned());
-                }
-            }
-        }
-        None
+        crate::content::xml_util::find_non_empty_attr(tag, name)
     }
 
     fn inspect_enclosure_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<Url> {

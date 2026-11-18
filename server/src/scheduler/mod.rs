@@ -101,6 +101,52 @@ impl Drop for InFlightGuard {
     }
 }
 
+struct BatchProgressGuard {
+    batch_progress: Arc<Mutex<(usize, usize, usize)>>,
+    batch_total: usize,
+    batch_started_at: Instant,
+    measured_weight: Arc<Mutex<f64>>,
+    recorded: bool,
+}
+
+impl BatchProgressGuard {
+    fn record_outcome(&mut self, parsed_entries: Option<usize>) -> Option<f64> {
+        if self.recorded {
+            return None;
+        }
+        self.recorded = true;
+        let maybe_summary = self.batch_progress.lock().ok().and_then(|mut prog| {
+            prog.0 += 1;
+            if let Some(entries) = parsed_entries {
+                prog.1 += 1;
+                prog.2 += entries;
+            }
+            (prog.0 == self.batch_total && prog.1 > 0).then_some((prog.1, prog.2))
+        });
+
+        maybe_summary.map(|(succeeded_feeds, batch_items)| {
+            let elapsed_secs = self.batch_started_at.elapsed().as_secs_f64();
+            let mut sample_weight =
+                compute_throughput_weight(succeeded_feeds, batch_items, elapsed_secs);
+            if succeeded_feeds < 2 {
+                sample_weight = sample_weight.max(DEFAULT_ONLINE_PEER_WEIGHT);
+            }
+            self.measured_weight.lock().map_or(sample_weight, |mut w| {
+                *w = sample_weight.mul_add(0.6, *w * 0.4).clamp(0.2, 10.0);
+                *w
+            })
+        })
+    }
+}
+
+impl Drop for BatchProgressGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            let _ = self.record_outcome(None);
+        }
+    }
+}
+
 pub struct PollScheduler<F = HttpFeedFetcher> {
     db: Db,
     fetcher: Arc<F>,
@@ -111,6 +157,7 @@ pub struct PollScheduler<F = HttpFeedFetcher> {
     in_flight: Arc<Mutex<HashSet<String>>>,
     active_counter: Option<Arc<AtomicUsize>>,
     measured_weight: Arc<Mutex<f64>>,
+    tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl<F: FeedFetcher> PollScheduler<F> {
@@ -126,6 +173,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             active_counter: None,
             measured_weight: Arc::new(Mutex::new(DEFAULT_ONLINE_PEER_WEIGHT)),
+            tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -148,17 +196,48 @@ impl<F: FeedFetcher> PollScheduler<F> {
         self
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run_until_shutdown(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
-            interval.tick().await;
-            if let Err(e) = self.check_and_poll().await {
-                tracing::error!(error = %e, "Scheduler check_and_poll failed");
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(e) = self.check_and_poll().await {
+                        tracing::error!(error = %e, "Scheduler check_and_poll failed");
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
             }
+        }
+        self.shutdown_tasks(Duration::from_secs(10)).await;
+        Ok(())
+    }
+
+    async fn reap_finished_tasks(&self) {
+        let mut tasks = self.tasks.lock().await;
+        while tasks.try_join_next().is_some() {}
+    }
+
+    pub async fn shutdown_tasks(&self, grace_period: Duration) {
+        let mut tasks = self.tasks.lock().await;
+        let drained = tokio::time::timeout(grace_period, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
         }
     }
 
     pub async fn check_and_poll(&self) -> Result<()> {
+        self.reap_finished_tasks().await;
         let now = SyncRepo::now_utc();
         let current_weight = self.measured_weight.lock().map_or(DEFAULT_ONLINE_PEER_WEIGHT, |w| *w);
         let _ = self
@@ -192,8 +271,15 @@ impl<F: FeedFetcher> PollScheduler<F> {
 
         let batch_started_at = Instant::now();
         let batch_progress = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let mut tasks = self.tasks.lock().await;
         for feed in due_feeds {
-            self.spawn_feed_poll_task(feed, batch_total, batch_started_at, &batch_progress);
+            self.spawn_feed_poll_task(
+                &mut tasks,
+                feed,
+                batch_total,
+                batch_started_at,
+                &batch_progress,
+            );
         }
 
         Ok(())
@@ -201,6 +287,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
 
     fn spawn_feed_poll_task(
         &self,
+        tasks: &mut tokio::task::JoinSet<()>,
         feed: Feed,
         batch_total: usize,
         batch_started_at: Instant,
@@ -221,8 +308,17 @@ impl<F: FeedFetcher> PollScheduler<F> {
             counter.fetch_add(1, Ordering::AcqRel);
         }
 
-        tokio::spawn(async move {
-            let _guard = InFlightGuard { in_flight, active_counter, feed_id: feed.id.clone() };
+        tasks.spawn(async move {
+            let in_flight_guard =
+                InFlightGuard { in_flight, active_counter, feed_id: feed.id.clone() };
+            let mut progress_guard = BatchProgressGuard {
+                batch_progress,
+                batch_total,
+                batch_started_at,
+                measured_weight,
+                recorded: false,
+            };
+
             let poll_res = {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return;
@@ -237,37 +333,24 @@ impl<F: FeedFetcher> PollScheduler<F> {
                 .await
             };
 
-            let maybe_batch_summary = batch_progress.lock().ok().and_then(|mut prog| {
-                prog.0 += 1;
-                if let Ok(ref outcome) = poll_res {
-                    prog.1 += 1;
-                    prog.2 += outcome.parsed_entries;
-                }
-                (prog.0 == batch_total && prog.1 > 0).then_some((prog.1, prog.2))
-            });
-
-            if let Some((succeeded_feeds, batch_items)) = maybe_batch_summary {
-                let elapsed_secs = batch_started_at.elapsed().as_secs_f64();
-                let mut sample_weight =
-                    compute_throughput_weight(succeeded_feeds, batch_items, elapsed_secs);
-                if succeeded_feeds < 2 {
-                    sample_weight = sample_weight.max(DEFAULT_ONLINE_PEER_WEIGHT);
-                }
-                let updated_weight = measured_weight.lock().map_or(sample_weight, |mut w| {
-                    *w = sample_weight.mul_add(0.6, *w * 0.4).clamp(0.2, 10.0);
-                    *w
-                });
+            let updated_weight =
+                progress_guard.record_outcome(poll_res.as_ref().ok().map(|o| o.parsed_entries));
+            if let Some(weight) = updated_weight {
                 let _ = db
                     .sync()
                     .upsert_peer_node(
                         SERVER_PEER_ID,
                         "Roche Headless Peer",
                         NetworkTier::Wifi,
-                        updated_weight,
+                        weight,
                         SyncRepo::now_utc(),
                     )
                     .await;
             }
+
+            // Release the in-flight lock and active-poll metric before potentially long-running
+            // media downloads (e.g. yt-dlp) so subsequent polls are not blocked.
+            drop(in_flight_guard);
 
             if let Ok(outcome) = poll_res
                 && let Some(ref store) = media_store
@@ -544,13 +627,6 @@ impl FeedIngester {
                             (content_type == ContentType::Audio).then(|| url.as_str().to_owned())
                         });
                         let duration = item.duration;
-                        let raw_img = item
-                            .content_html
-                            .as_deref()
-                            .or(Some(item.description.as_str()))
-                            .and_then(|raw| {
-                                HtmlSanitizer::extract_first_image_url_with_base(raw, Some(&url))
-                            });
                         let clean_desc =
                             HtmlSanitizer::clean_with_base(&item.description, Some(&url));
                         let content_html = item
@@ -561,14 +637,16 @@ impl FeedIngester {
                             .or_else(|| Some(clean_desc.clone()));
                         let thumbnail_url = item
                             .thumbnail_url
-                            .or(raw_img)
                             .or_else(|| {
-                                content_html.as_deref().and_then(|html| {
-                                    HtmlSanitizer::extract_first_image_url_with_base(
-                                        html,
-                                        Some(&url),
-                                    )
-                                })
+                                item.content_html
+                                    .as_deref()
+                                    .or(Some(item.description.as_str()))
+                                    .and_then(|raw| {
+                                        HtmlSanitizer::extract_first_image_url_with_base(
+                                            raw,
+                                            Some(&url),
+                                        )
+                                    })
                             })
                             .or_else(|| {
                                 YouTubeParser::extract_video_id(&url).map(|vid| {
@@ -615,12 +693,8 @@ impl FeedIngester {
                             &clean_desc,
                             MAX_SUMMARY_CHARS,
                         );
-                        let thumbnail_url = video
-                            .watch_url
-                            .query_pairs()
-                            .find(|(k, _)| k == "v")
-                            .filter(|(_, v)| !v.is_empty())
-                            .map(|(_, v)| format!("https://i.ytimg.com/vi/{v}/hqdefault.jpg"));
+                        let thumbnail_url = YouTubeParser::extract_video_id(&video.watch_url)
+                            .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
                         PollItemCandidate {
                             title: video.title,
                             url: video.watch_url,
@@ -927,5 +1001,46 @@ mod tests {
         }
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_batch_progress_guard_advances_on_drop_and_scheduler_shuts_down_gracefully() {
+        let batch_progress = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let measured_weight = Arc::new(Mutex::new(DEFAULT_ONLINE_PEER_WEIGHT));
+        let started_at = Instant::now();
+
+        let mut g1 = BatchProgressGuard {
+            batch_progress: Arc::clone(&batch_progress),
+            batch_total: 2,
+            batch_started_at: started_at,
+            measured_weight: Arc::clone(&measured_weight),
+            recorded: false,
+        };
+        assert!(g1.record_outcome(Some(5)).is_none());
+
+        {
+            let _early_exit_guard = BatchProgressGuard {
+                batch_progress: Arc::clone(&batch_progress),
+                batch_total: 2,
+                batch_started_at: started_at,
+                measured_weight: Arc::clone(&measured_weight),
+                recorded: false,
+            };
+            // Dropped without calling record_outcome (simulating early return / panic)
+        }
+
+        let (completed, succeeded, items) = *batch_progress.lock().unwrap();
+        assert_eq!(completed, 2);
+        assert_eq!(succeeded, 1);
+        assert_eq!(items, 5);
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let fetcher = Arc::new(StaticFetcher { xml: String::new() });
+        let scheduler = PollScheduler::with_arc_fetcher(db, fetcher);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move { scheduler.run_until_shutdown(rx).await });
+        tx.send(true).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
+        assert!(res.is_ok());
     }
 }

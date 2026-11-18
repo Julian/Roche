@@ -112,103 +112,76 @@ impl ApiError {
         Self::BadGateway(message.into())
     }
 
+    fn problem(
+        status: StatusCode,
+        problem_type: &str,
+        title: &str,
+        detail: impl Into<String>,
+    ) -> (StatusCode, ProblemDetails) {
+        (status, ProblemDetails::new(status, problem_type, title, detail))
+    }
+
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn to_problem_details(&self) -> (StatusCode, ProblemDetails) {
         match self {
-            Self::BadRequest(detail) => (
+            Self::BadRequest(detail) => Self::problem(
                 StatusCode::BAD_REQUEST,
-                ProblemDetails::new(
-                    StatusCode::BAD_REQUEST,
-                    "urn:roche:problem:bad-request",
-                    "Bad Request",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:bad-request",
+                "Bad Request",
+                detail.clone(),
             ),
-            Self::Unauthorized(detail) => (
+            Self::Unauthorized(detail) => Self::problem(
                 StatusCode::UNAUTHORIZED,
-                ProblemDetails::new(
-                    StatusCode::UNAUTHORIZED,
-                    "urn:roche:problem:unauthorized",
-                    "Unauthorized",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:unauthorized",
+                "Unauthorized",
+                detail.clone(),
             ),
-            Self::NotFound(detail) => (
+            Self::NotFound(detail) => Self::problem(
                 StatusCode::NOT_FOUND,
-                ProblemDetails::new(
-                    StatusCode::NOT_FOUND,
-                    "urn:roche:problem:not-found",
-                    "Not Found",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:not-found",
+                "Not Found",
+                detail.clone(),
             ),
-            Self::Conflict(detail) => (
+            Self::Conflict(detail) => Self::problem(
                 StatusCode::CONFLICT,
-                ProblemDetails::new(
-                    StatusCode::CONFLICT,
-                    "urn:roche:problem:conflict",
-                    "Conflict",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:conflict",
+                "Conflict",
+                detail.clone(),
             ),
-            Self::MethodNotAllowed(detail) => (
+            Self::MethodNotAllowed(detail) => Self::problem(
                 StatusCode::METHOD_NOT_ALLOWED,
-                ProblemDetails::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "urn:roche:problem:method-not-allowed",
-                    "Method Not Allowed",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:method-not-allowed",
+                "Method Not Allowed",
+                detail.clone(),
             ),
-            Self::PayloadTooLarge(detail) => (
+            Self::PayloadTooLarge(detail) => Self::problem(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                ProblemDetails::new(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "urn:roche:problem:payload-too-large",
-                    "Payload Too Large",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:payload-too-large",
+                "Payload Too Large",
+                detail.clone(),
             ),
-            Self::UnsupportedMediaType(detail) => (
+            Self::UnsupportedMediaType(detail) => Self::problem(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                ProblemDetails::new(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "urn:roche:problem:unsupported-media-type",
-                    "Unsupported Media Type",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:unsupported-media-type",
+                "Unsupported Media Type",
+                detail.clone(),
             ),
-            Self::TooManyRequests(detail) => (
+            Self::TooManyRequests(detail) => Self::problem(
                 StatusCode::TOO_MANY_REQUESTS,
-                ProblemDetails::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "urn:roche:problem:too-many-requests",
-                    "Too Many Requests",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:too-many-requests",
+                "Too Many Requests",
+                detail.clone(),
             ),
-            Self::BadGateway(detail) => (
+            Self::BadGateway(detail) => Self::problem(
                 StatusCode::BAD_GATEWAY,
-                ProblemDetails::new(
-                    StatusCode::BAD_GATEWAY,
-                    "urn:roche:problem:bad-gateway",
-                    "Bad Gateway",
-                    detail.clone(),
-                ),
+                "urn:roche:problem:bad-gateway",
+                "Bad Gateway",
+                detail.clone(),
             ),
             Self::Database(sqlx_err) => Self::classify_sqlx_error(sqlx_err),
             Self::Internal(err) => {
                 if let Some(conflict) = err.downcast_ref::<crate::db::ConflictError>() {
-                    return (
-                        StatusCode::CONFLICT,
-                        ProblemDetails::new(
-                            StatusCode::CONFLICT,
-                            "urn:roche:problem:conflict",
-                            "Conflict",
-                            conflict.0.clone(),
-                        ),
-                    );
+                    return Self::Conflict(conflict.0.clone()).to_problem_details();
                 }
                 if let Some(cat_err) = err.downcast_ref::<crate::db::CatalogError>() {
                     return Self::classify_catalog_error(cat_err);
@@ -217,59 +190,36 @@ impl ApiError {
                     return Self::classify_sqlx_error(sqlx_err);
                 }
                 tracing::error!(error = %err, "Internal server error");
-                (
+                Self::problem(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    ProblemDetails::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "urn:roche:problem:internal-error",
-                        "Internal Server Error",
-                        "An unexpected internal error occurred",
-                    ),
+                    "urn:roche:problem:internal-error",
+                    "Internal Server Error",
+                    "An unexpected internal error occurred",
                 )
             }
         }
     }
 
+    fn map_non_db_catalog_error(err: &crate::db::CatalogError) -> Option<Self> {
+        match err {
+            crate::db::CatalogError::Db(_) => None,
+            crate::db::CatalogError::NotFound(msg) => Some(Self::NotFound(msg.clone())),
+            crate::db::CatalogError::Conflict(msg) => Some(Self::Conflict(msg.clone())),
+            crate::db::CatalogError::AmbiguousLookup { .. } => {
+                Some(Self::Conflict(err.to_string()))
+            }
+            crate::db::CatalogError::ImmutableCollection { .. }
+            | crate::db::CatalogError::InvalidInput(_) => Some(Self::BadRequest(err.to_string())),
+        }
+    }
+
     fn classify_catalog_error(err: &crate::db::CatalogError) -> (StatusCode, ProblemDetails) {
+        if let Some(mapped) = Self::map_non_db_catalog_error(err) {
+            return mapped.to_problem_details();
+        }
         match err {
             crate::db::CatalogError::Db(db_err) => Self::classify_sqlx_error(db_err),
-            crate::db::CatalogError::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                ProblemDetails::new(
-                    StatusCode::NOT_FOUND,
-                    "urn:roche:problem:not-found",
-                    "Not Found",
-                    msg.clone(),
-                ),
-            ),
-            crate::db::CatalogError::Conflict(msg) => (
-                StatusCode::CONFLICT,
-                ProblemDetails::new(
-                    StatusCode::CONFLICT,
-                    "urn:roche:problem:conflict",
-                    "Conflict",
-                    msg.clone(),
-                ),
-            ),
-            crate::db::CatalogError::AmbiguousLookup { .. } => (
-                StatusCode::CONFLICT,
-                ProblemDetails::new(
-                    StatusCode::CONFLICT,
-                    "urn:roche:problem:conflict",
-                    "Conflict",
-                    err.to_string(),
-                ),
-            ),
-            crate::db::CatalogError::ImmutableCollection { .. }
-            | crate::db::CatalogError::InvalidInput(_) => (
-                StatusCode::BAD_REQUEST,
-                ProblemDetails::new(
-                    StatusCode::BAD_REQUEST,
-                    "urn:roche:problem:bad-request",
-                    "Bad Request",
-                    err.to_string(),
-                ),
-            ),
+            _ => unreachable!("handled by map_non_db_catalog_error"),
         }
     }
 
@@ -278,25 +228,19 @@ impl ApiError {
             && (db_err.is_unique_violation()
                 || db_err.message().contains("UNIQUE constraint failed"))
         {
-            return (
+            return Self::problem(
                 StatusCode::CONFLICT,
-                ProblemDetails::new(
-                    StatusCode::CONFLICT,
-                    "urn:roche:problem:conflict",
-                    "Conflict",
-                    "A resource with the same unique identifier already exists",
-                ),
+                "urn:roche:problem:conflict",
+                "Conflict",
+                "A resource with the same unique identifier already exists",
             );
         }
         tracing::error!(error = %sqlx_err, "Database error");
-        (
+        Self::problem(
             StatusCode::INTERNAL_SERVER_ERROR,
-            ProblemDetails::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "urn:roche:problem:internal-error",
-                "Internal Server Error",
-                "An unexpected database error occurred",
-            ),
+            "urn:roche:problem:internal-error",
+            "Internal Server Error",
+            "An unexpected database error occurred",
         )
     }
 }
@@ -339,13 +283,12 @@ impl From<PathRejection> for ApiError {
 
 impl From<crate::db::CatalogError> for ApiError {
     fn from(err: crate::db::CatalogError) -> Self {
+        if let Some(mapped) = Self::map_non_db_catalog_error(&err) {
+            return mapped;
+        }
         match err {
             crate::db::CatalogError::Db(db_err) => Self::Database(db_err),
-            crate::db::CatalogError::NotFound(msg) => Self::NotFound(msg),
-            crate::db::CatalogError::Conflict(msg) => Self::Conflict(msg),
-            crate::db::CatalogError::AmbiguousLookup { .. } => Self::Conflict(err.to_string()),
-            crate::db::CatalogError::ImmutableCollection { .. }
-            | crate::db::CatalogError::InvalidInput(_) => Self::BadRequest(err.to_string()),
+            _ => unreachable!("handled by map_non_db_catalog_error"),
         }
     }
 }

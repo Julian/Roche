@@ -122,19 +122,13 @@ impl YtDlpWorker {
         url: &Url,
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         Self::validate_item_id(item_id)?;
-        let item_dir = self.item_download_dir(item_id)?;
+        let item_dir = self.item_download_dir(item_id).await?;
         let args =
             Self::build_args_with_limit(item_id, url, &item_dir, self.config.max_video_size_mb)?;
 
         MediaStore::ensure_private_dir(self.media_store.base_dir()).await?;
         MediaStore::ensure_private_dir(&item_dir).await?;
-        let verified_dir = match self.media_store.validate_path(&item_dir) {
-            Ok(dir) => dir,
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&item_dir).await;
-                return Err(e);
-            }
-        };
+        let verified_dir = self.media_store.validate_path_async(&item_dir).await?;
 
         let result = self.spawn_and_register(media_repo, item_id, &verified_dir, &args).await;
         if result.is_err() {
@@ -182,7 +176,7 @@ impl YtDlpWorker {
         item_dir: &Path,
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         Self::validate_item_id(item_id)?;
-        let verified_dir = self.media_store.validate_path(item_dir)?;
+        let verified_dir = self.media_store.validate_path_async(item_dir).await?;
 
         let info_path = verified_dir.join("video.info.json");
         let info = tokio::fs::read(&info_path).await.map_or_else(
@@ -244,9 +238,11 @@ impl YtDlpWorker {
             MediaStore::tighten_private_file_if_exists(thumb_path).await;
         }
 
-        let video_rel = self.media_store.relative_path(&video_path)?;
+        let video_rel = self.media_store.relative_path_async(&video_path).await?;
         let thumb_rel_and_size = match thumbnail_file {
-            Some((thumb_path, size)) => Some((self.media_store.relative_path(&thumb_path)?, size)),
+            Some((thumb_path, size)) => {
+                Some((self.media_store.relative_path_async(&thumb_path).await?, size))
+            }
             None => None,
         };
 
@@ -269,15 +265,10 @@ impl YtDlpWorker {
         Ok((registered, metadata))
     }
 
-    fn item_download_dir(&self, item_id: &str) -> Result<PathBuf> {
-        let normalized_download_dir = MediaStore::normalize_lexical(&self.config.download_dir);
-        let base_downloads = if normalized_download_dir.starts_with(self.media_store.base_dir()) {
-            normalized_download_dir
-        } else {
-            self.media_store.base_dir().join("downloads")
-        };
+    async fn item_download_dir(&self, item_id: &str) -> Result<PathBuf> {
+        let base_downloads = self.media_store.resolve_download_dir(&self.config.download_dir);
         let candidate = base_downloads.join(item_id);
-        self.media_store.validate_path(&candidate)
+        self.media_store.validate_path_async(&candidate).await
     }
 
     fn validate_item_id(item_id: &str) -> Result<()> {
@@ -370,5 +361,42 @@ mod tests {
         assert!(!item_dir.join("video.info.json").exists());
 
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_download_for_item_does_not_delete_symlink_escape_target() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let watch_url = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+
+        let temp_base =
+            std::env::temp_dir().join(format!("roche-ytdlp-sym-{}", uuid::Uuid::new_v4()));
+        let outside_dir =
+            std::env::temp_dir().join(format!("roche-ytdlp-outside-{}", uuid::Uuid::new_v4()));
+        let sentinel = outside_dir.join("item-123").join("keep-me.txt");
+        tokio::fs::create_dir_all(sentinel.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&sentinel, b"do-not-delete").await.unwrap();
+
+        tokio::fs::create_dir_all(&temp_base).await.unwrap();
+        std::os::unix::fs::symlink(&outside_dir, temp_base.join("downloads")).unwrap();
+
+        let store = MediaStore::new(&temp_base);
+        let cfg = MediaConfig {
+            ytdlp_path: PathBuf::from("/usr/local/bin/yt-dlp"),
+            download_dir: temp_base.join("downloads"),
+            max_concurrent_downloads: 2,
+            max_video_size_mb: 500,
+        };
+        let worker = YtDlpWorker::new(cfg, store);
+
+        let err = worker.download_for_item(&db.media(), "item-123", &watch_url).await;
+        assert!(err.is_err());
+        assert!(
+            sentinel.exists(),
+            "validate_path failure must never delete outside symlink target"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_base).await;
+        let _ = tokio::fs::remove_dir_all(&outside_dir).await;
     }
 }

@@ -1,13 +1,13 @@
 use std::io::Cursor;
 
 use quick_xml::{
-    Reader, Writer, XmlVersion,
+    Reader, Writer,
     events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
 };
 use url::Url;
 
 use crate::{
-    content::fetcher::SafeHttpClient,
+    content::{fetcher::SafeHttpClient, xml_util},
     db::{Feed, FeedType},
 };
 
@@ -42,17 +42,13 @@ impl OpmlDocument {
                     let mut title = None;
                     let mut text = None;
 
-                    for attr in tag.attributes().with_checks(false).flatten() {
-                        let key = attr.key.as_ref();
-                        let Ok(val) = attr.normalized_value(XmlVersion::default()) else {
-                            continue;
-                        };
+                    for (key, val) in xml_util::iter_attrs(&tag) {
                         if key.eq_ignore_ascii_case("xmlurl") {
-                            xml_url = Some(val.into_owned());
+                            xml_url = Some(val);
                         } else if key.eq_ignore_ascii_case("title") {
-                            title = Some(val.into_owned());
+                            title = Some(val);
                         } else if key.eq_ignore_ascii_case("text") {
-                            text = Some(val.into_owned());
+                            text = Some(val);
                         }
                     }
 

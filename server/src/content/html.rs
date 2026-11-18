@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
-use quick_xml::{Reader, XmlVersion, escape::unescape, events::Event};
+use quick_xml::{Reader, events::Event};
 use url::Url;
 
-use super::http::SafeHttpClient;
+use super::{http::SafeHttpClient, xml_util};
 
 pub const MAX_SUMMARY_CHARS: usize = 320;
 
@@ -89,8 +89,7 @@ impl HtmlSanitizer {
                     }
                 }
                 Ok(Event::Text(text)) => {
-                    let decoded =
-                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
+                    let decoded = xml_util::decode_text(&text);
                     collected_chars = collected_chars.saturating_add(Self::push_collapsed_segment(
                         &mut collapsed,
                         &mut pending_space,
@@ -98,15 +97,12 @@ impl HtmlSanitizer {
                     ));
                 }
                 Ok(Event::GeneralRef(entity)) => {
-                    let raw = format!("&{};", entity.as_ref());
-                    if let Ok(decoded) = unescape(&raw) {
-                        collected_chars =
-                            collected_chars.saturating_add(Self::push_collapsed_segment(
-                                &mut collapsed,
-                                &mut pending_space,
-                                &decoded,
-                            ));
-                    }
+                    let decoded = xml_util::decode_entity(&entity);
+                    collected_chars = collected_chars.saturating_add(Self::push_collapsed_segment(
+                        &mut collapsed,
+                        &mut pending_space,
+                        &decoded,
+                    ));
                 }
                 Ok(Event::Eof) | Err(_) => break,
                 _ => {}
@@ -214,11 +210,9 @@ impl HtmlSanitizer {
 
         let (title, author, meta_desc, meta_image) =
             Self::parse_title_and_meta(&normalized_meta_html, base_url);
-        let raw_image = Self::extract_first_image_url_with_base(raw_html, base_url);
         let content_html = Self::clean_with_base(raw_html, base_url);
-        let thumbnail_url = meta_image
-            .or(raw_image)
-            .or_else(|| Self::extract_first_image_url_with_base(&content_html, base_url));
+        let thumbnail_url =
+            meta_image.or_else(|| Self::extract_first_image_url_with_base(raw_html, base_url));
         let summary = meta_desc
             .map(|desc| Self::plain_text_truncate(&desc, MAX_SUMMARY_CHARS))
             .filter(|s| !s.is_empty())
@@ -238,12 +232,28 @@ impl HtmlSanitizer {
 
     /// Scans HTML for the first valid raster `<img src="...">` URL (resolving relative URLs against `base_url`),
     /// skipping tracking pixels, inline emojis, footnote icons, and `.svg` images.
+    ///
+    /// Normalizes the input through `ammonia` (`html5ever`) first so `<script>`, `<style>`,
+    /// `<noscript>`, `<template>`, `<svg>`, and `<math>` contents cannot spoof thumbnails or break
+    /// XML parsing.
     #[must_use]
     pub fn extract_first_image_url_with_base(html: &str, base_url: Option<&Url>) -> Option<String> {
-        if !html.contains("<img") && !html.contains("<IMG") {
+        if !html.contains("<img")
+            && !html.contains("<IMG")
+            && !html.to_ascii_lowercase().contains("<img")
+        {
             return None;
         }
-        let mut reader = Reader::from_str(html);
+        let mut img_builder = ammonia::Builder::new();
+        img_builder
+            .tags(HashSet::from(["img"]))
+            .clean_content_tags(HashSet::from([
+                "script", "style", "svg", "noscript", "template", "math",
+            ]))
+            .add_tag_attributes("img", &["src", "width", "height", "class", "alt"]);
+        let normalized_html = img_builder.clean(html).to_string();
+
+        let mut reader = Reader::from_str(&normalized_html);
         reader.config_mut().check_end_names = false;
 
         loop {
@@ -319,11 +329,7 @@ impl HtmlSanitizer {
         let mut class_attr: Option<String> = None;
         let mut alt_attr: Option<String> = None;
 
-        for attr in tag.attributes().with_checks(false).flatten() {
-            let key = attr.key.as_ref();
-            let val = attr
-                .normalized_value(XmlVersion::default())
-                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+        for (key, val) in xml_util::iter_attrs(tag) {
             if key.eq_ignore_ascii_case("src") {
                 src = Some(val);
             } else if key.eq_ignore_ascii_case("width") {
@@ -402,15 +408,10 @@ impl HtmlSanitizer {
                     );
                 }
                 Ok(Event::Text(text)) if in_title => {
-                    let decoded =
-                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
-                    current_buf.push_str(&decoded);
+                    current_buf.push_str(&xml_util::decode_text(&text));
                 }
                 Ok(Event::GeneralRef(entity)) if in_title => {
-                    let raw = format!("&{};", entity.as_ref());
-                    if let Ok(decoded) = unescape(&raw) {
-                        current_buf.push_str(&decoded);
-                    }
+                    current_buf.push_str(&xml_util::decode_entity(&entity));
                 }
                 Ok(Event::End(tag))
                     if in_title && tag.name().as_ref().eq_ignore_ascii_case("title") =>
@@ -450,15 +451,10 @@ impl HtmlSanitizer {
                     current_buf.push(' ');
                 }
                 Ok(Event::Text(text)) if in_p => {
-                    let decoded =
-                        unescape(text.as_ref()).map_or_else(|_| text.to_string(), Into::into);
-                    current_buf.push_str(&decoded);
+                    current_buf.push_str(&xml_util::decode_text(&text));
                 }
                 Ok(Event::GeneralRef(entity)) if in_p => {
-                    let raw = format!("&{};", entity.as_ref());
-                    if let Ok(decoded) = unescape(&raw) {
-                        current_buf.push_str(&decoded);
-                    }
+                    current_buf.push_str(&xml_util::decode_entity(&entity));
                 }
                 Ok(Event::End(tag)) if in_p && tag.name().as_ref().eq_ignore_ascii_case("p") => {
                     in_p = false;
@@ -486,11 +482,7 @@ impl HtmlSanitizer {
         let mut attr_name: Option<String> = None;
         let mut attr_content: Option<String> = None;
 
-        for attr in tag.attributes().with_checks(false).flatten() {
-            let key = attr.key.as_ref();
-            let val = attr
-                .normalized_value(XmlVersion::default())
-                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+        for (key, val) in xml_util::iter_attrs(tag) {
             if key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("property") {
                 attr_name = Some(val);
             } else if key.eq_ignore_ascii_case("content") {
@@ -611,11 +603,7 @@ impl HtmlSanitizer {
         let mut rel: Option<String> = None;
         let mut mime: Option<String> = None;
         let mut href: Option<String> = None;
-        for attr in tag.attributes().with_checks(false).flatten() {
-            let key = attr.key.as_ref();
-            let val = attr
-                .normalized_value(XmlVersion::default())
-                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+        for (key, val) in xml_util::iter_attrs(tag) {
             if key.eq_ignore_ascii_case("rel") {
                 rel = Some(val);
             } else if key.eq_ignore_ascii_case("type") {
@@ -666,11 +654,7 @@ impl HtmlSanitizer {
     ) {
         let mut key_name: Option<String> = None;
         let mut content: Option<String> = None;
-        for attr in tag.attributes().with_checks(false).flatten() {
-            let key = attr.key.as_ref();
-            let val = attr
-                .normalized_value(XmlVersion::default())
-                .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into);
+        for (key, val) in xml_util::iter_attrs(tag) {
             if key.eq_ignore_ascii_case("itemprop")
                 || key.eq_ignore_ascii_case("property")
                 || key.eq_ignore_ascii_case("name")
@@ -695,16 +679,7 @@ impl HtmlSanitizer {
         base_url: &Url,
         anchor_links: &mut Vec<Url>,
     ) {
-        let mut href: Option<String> = None;
-        for attr in tag.attributes().with_checks(false).flatten() {
-            if attr.key.as_ref().eq_ignore_ascii_case("href") {
-                href = Some(
-                    attr.normalized_value(XmlVersion::default())
-                        .map_or_else(|_| attr.value.as_ref().to_owned(), Into::into),
-                );
-                break;
-            }
-        }
+        let href = xml_util::find_attr_ignore_ascii_case(tag, "href");
         let Some(raw_href) = href.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()) else {
             return;
         };

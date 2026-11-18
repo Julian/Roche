@@ -55,47 +55,53 @@ impl FeedSource {
                     "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
                 ),
             },
-            Self::Url(url) => match requested_type {
-                FeedType::Youtube => {
-                    if !url.as_str().contains("/feeds/videos.xml")
-                        && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
-                    {
-                        return Ok((
-                            FeedType::Youtube,
-                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
-                        ));
+            Self::Url(url) => {
+                let is_youtube_feed_url = YouTubeParser::is_youtube_host(url.host_str())
+                    && url.path() == "/feeds/videos.xml";
+                match requested_type {
+                    FeedType::Youtube => {
+                        if !is_youtube_feed_url
+                            && let Some(channel_id) =
+                                YouTubeParser::extract_channel_id(url.as_str())
+                        {
+                            return Ok((
+                                FeedType::Youtube,
+                                YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                            ));
+                        }
+                        if !YouTubeParser::is_youtube_host(url.host_str()) {
+                            anyhow::bail!("YouTube feed URL must point to youtube.com");
+                        }
+                        Ok((FeedType::Youtube, url))
                     }
-                    if !YouTubeParser::is_youtube_host(url.host_str()) {
-                        anyhow::bail!("YouTube feed URL must point to youtube.com");
-                    }
-                    Ok((FeedType::Youtube, url))
-                }
-                FeedType::Arxiv => {
-                    if !ArxivParser::is_arxiv_host(url.host_str()) {
-                        anyhow::bail!("arXiv feed URL must point to arxiv.org");
-                    }
-                    Self::validate_arxiv_feed_url(&url)?;
-                    Ok((FeedType::Arxiv, url))
-                }
-                FeedType::Rss | FeedType::Podcast => {
-                    if !url.as_str().contains("/feeds/videos.xml")
-                        && let Some(channel_id) = YouTubeParser::extract_channel_id(url.as_str())
-                    {
-                        return Ok((
-                            FeedType::Youtube,
-                            YouTubeParser::feed_url_for_channel_id(&channel_id)?,
-                        ));
-                    }
-                    if url.as_str().contains("youtube.com/feeds/videos.xml") {
-                        return Ok((FeedType::Youtube, url));
-                    }
-                    if ArxivParser::is_arxiv_host(url.host_str()) {
+                    FeedType::Arxiv => {
+                        if !ArxivParser::is_arxiv_host(url.host_str()) {
+                            anyhow::bail!("arXiv feed URL must point to arxiv.org");
+                        }
                         Self::validate_arxiv_feed_url(&url)?;
-                        return Ok((FeedType::Arxiv, url));
+                        Ok((FeedType::Arxiv, url))
                     }
-                    Ok((requested_type, url))
+                    FeedType::Rss | FeedType::Podcast => {
+                        if !is_youtube_feed_url
+                            && let Some(channel_id) =
+                                YouTubeParser::extract_channel_id(url.as_str())
+                        {
+                            return Ok((
+                                FeedType::Youtube,
+                                YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                            ));
+                        }
+                        if is_youtube_feed_url {
+                            return Ok((FeedType::Youtube, url));
+                        }
+                        if ArxivParser::is_arxiv_host(url.host_str()) {
+                            Self::validate_arxiv_feed_url(&url)?;
+                            return Ok((FeedType::Arxiv, url));
+                        }
+                        Ok((requested_type, url))
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -142,4 +148,26 @@ pub fn select_entry_link(links: &[feed_rs::model::Link]) -> Option<Url> {
 #[must_use]
 pub fn extract_entry_timestamp(entry: &feed_rs::model::Entry) -> Option<DateTime<Utc>> {
     entry.published.or(entry.updated).map(|dt| dt.with_timezone(&Utc).trunc_subsecs(0))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_feed_source_does_not_misclassify_substring_youtube_urls() {
+        let spoofed =
+            FeedSource::parse("https://example.com/rss?q=youtube.com/feeds/videos.xml").unwrap();
+        let (feed_type, url) = spoofed.into_feed_url(FeedType::Rss).unwrap();
+        assert_eq!(feed_type, FeedType::Rss);
+        assert_eq!(url.as_str(), "https://example.com/rss?q=youtube.com/feeds/videos.xml");
+
+        let real_yt = FeedSource::parse(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+        )
+        .unwrap();
+        let (yt_type, _) = real_yt.into_feed_url(FeedType::Rss).unwrap();
+        assert_eq!(yt_type, FeedType::Youtube);
+    }
 }

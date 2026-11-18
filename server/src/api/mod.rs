@@ -26,7 +26,6 @@ use tower_http::{
         CompressionLayer,
         predicate::{DefaultPredicate, NotForContentType, Predicate},
     },
-    limit::RequestBodyLimitLayer,
     trace::TraceLayer,
 };
 
@@ -44,12 +43,14 @@ impl ApiRoutes {
     pub fn router_with_service<F: FeedFetcher>(service: RocheService<F>) -> Router {
         let service = Arc::new(service);
 
-        let large_body_routes = Router::new()
+        let opml_routes = Router::new()
             .route("/api/v1/import/opml", post(feeds::import_opml::<F>))
+            .layer(DefaultBodyLimit::max(16 * 1024 * 1024));
+
+        let large_body_routes = Router::new()
             .route("/api/v1/sync/peer", post(sync::sync_peer::<F>))
             .route("/api/v1/catalog/batch", post(catalog::catalog_batch_apply::<F>))
-            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
-            .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024));
+            .layer(DefaultBodyLimit::max(64 * 1024 * 1024));
 
         let protected = Router::new()
             // Auth Devices
@@ -101,7 +102,7 @@ impl ApiRoutes {
             .route("/api/v1/sync/changes", get(sync::sync_changes::<F>))
             .merge(Self::catalog_routes::<F>())
             .layer(DefaultBodyLimit::max(64 * 1024))
-            .layer(RequestBodyLimitLayer::new(64 * 1024))
+            .merge(opml_routes)
             .merge(large_body_routes)
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&service),
@@ -111,8 +112,7 @@ impl ApiRoutes {
         let public_pair = Router::new()
             .route("/auth/pair", post(auth::auth_pair::<F>))
             .route("/api/v1/auth/pair", post(auth::auth_pair::<F>))
-            .layer(DefaultBodyLimit::max(16 * 1024))
-            .layer(RequestBodyLimitLayer::new(16 * 1024));
+            .layer(DefaultBodyLimit::max(16 * 1024));
 
         let compression = CompressionLayer::new().compress_when(
             DefaultPredicate::new()

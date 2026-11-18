@@ -79,6 +79,7 @@ impl SafeHttpClient {
         );
 
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(timeout)
             .dns_resolver(Arc::new(SafeDnsResolver))
             .redirect(Self::redirect_policy())
@@ -152,10 +153,12 @@ impl SafeHttpClient {
             // SIIT IPv4-translated (::ffff:0:0/96)
             // Discard-Only (100::/64)
             // ORCHIDv2 (2001:20::/28)
+            // 6to4 (2002::/16) — can embed private/loopback IPv4 addresses
             if (s[0] == 0x0064 && s[1] == 0xff9b)
                 || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
                 || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
                 || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
+                || s[0] == 0x2002
             {
                 return false;
             }

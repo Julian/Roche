@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use quick_xml::{Reader, escape::unescape, events::Event};
+use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::extract_entry_timestamp;
-use crate::content::fetcher::SafeHttpClient;
+use crate::content::{fetcher::SafeHttpClient, xml_util};
 
 #[derive(Debug, Clone)]
 pub struct YouTubeFeed {
@@ -162,7 +162,6 @@ impl YouTubeParser {
 
     fn extract_all_media_descriptions(xml: &str) -> HashMap<String, String> {
         let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(true);
         let mut map = HashMap::new();
         let mut current_video_id = None;
         let mut current_desc = None;
@@ -175,24 +174,25 @@ impl YouTubeParser {
                         current_desc = None;
                     }
                     "yt:videoId" => {
-                        if let Some(vid) = Self::read_element_text(&mut reader, tag.name().as_ref())
+                        if let Some(vid) =
+                            xml_util::read_element_text(&mut reader, tag.name().as_ref())
                         {
-                            current_video_id = Some(vid);
+                            current_video_id = Some(vid.trim().to_owned());
                         }
                     }
                     "id" if current_video_id.is_none() => {
                         if let Some(raw_id) =
-                            Self::read_element_text(&mut reader, tag.name().as_ref())
-                            && let Some(vid) = raw_id.strip_prefix("yt:video:")
+                            xml_util::read_element_text(&mut reader, tag.name().as_ref())
+                            && let Some(vid) = raw_id.trim().strip_prefix("yt:video:")
                         {
                             current_video_id = Some(vid.trim().to_string());
                         }
                     }
                     "media:description" => {
                         if let Some(desc) =
-                            Self::read_element_text(&mut reader, tag.name().as_ref())
+                            xml_util::read_element_text(&mut reader, tag.name().as_ref())
                         {
-                            current_desc = Some(desc);
+                            current_desc = Some(desc.trim().to_owned());
                         }
                     }
                     _ => {}
@@ -209,30 +209,6 @@ impl YouTubeParser {
             }
         }
         map
-    }
-
-    fn read_element_text(reader: &mut Reader<&[u8]>, end_tag: &str) -> Option<String> {
-        let mut out = String::new();
-        loop {
-            match reader.read_event() {
-                Ok(Event::Text(text)) => {
-                    let unescaped = unescape(text.as_ref()).ok()?;
-                    out.push_str(&unescaped);
-                }
-                Ok(Event::GeneralRef(entity)) => {
-                    let raw = format!("&{};", entity.as_ref());
-                    let unescaped = unescape(&raw).ok()?;
-                    out.push_str(&unescaped);
-                }
-                Ok(Event::CData(cdata)) => {
-                    out.push_str(cdata.as_ref());
-                }
-                Ok(Event::End(tag)) if tag.name().as_ref() == end_tag => break,
-                Ok(Event::Eof) | Err(_) => return None,
-                _ => {}
-            }
-        }
-        Some(out)
     }
 }
 
@@ -311,5 +287,32 @@ mod tests {
         assert_eq!(feed.items[1].watch_url.as_str(), "https://www.youtube.com/watch?v=secondVidId");
         assert_eq!(feed.items[1].description, "");
         assert_eq!(feed.items[1].published_at, None);
+    }
+
+    #[test]
+    fn test_extract_media_descriptions_tolerates_unknown_html_entities() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns:yt="http://www.youtube.com/xml/schemas/2015"
+              xmlns:media="http://search.yahoo.com/mrss/"
+              xmlns="http://www.w3.org/2005/Atom">
+         <entry>
+          <yt:videoId>vidWithEnt1</yt:videoId>
+          <media:description>Hello&nbsp;world &mdash; Rust &amp; Friends</media:description>
+         </entry>
+         <entry>
+          <yt:videoId>vidAfterEnt</yt:videoId>
+          <media:description>Second entry still parsed</media:description>
+         </entry>
+        </feed>"#;
+
+        let descriptions = YouTubeParser::extract_all_media_descriptions(xml);
+        assert_eq!(
+            descriptions.get("vidWithEnt1").map(String::as_str),
+            Some("Hello&nbsp;world &mdash; Rust & Friends")
+        );
+        assert_eq!(
+            descriptions.get("vidAfterEnt").map(String::as_str),
+            Some("Second entry still parsed")
+        );
     }
 }

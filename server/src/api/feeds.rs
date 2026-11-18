@@ -120,13 +120,17 @@ pub(super) async fn import_opml<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     ProblemString(body): ProblemString,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let opml_str = if body.trim_start().starts_with('{') {
-        serde_json::from_str::<OpmlImportRequest>(&body)
-            .map(|r| r.opml)
-            .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))?
-    } else {
-        body
-    };
+    let opml_str = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
+        if body.trim_start().starts_with('{') {
+            serde_json::from_str::<OpmlImportRequest>(&body)
+                .map(|r| r.opml)
+                .map_err(|e| ApiError::bad_request(format!("Invalid JSON payload: {e}")))
+        } else {
+            Ok(body)
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("OPML request decode task failed: {e}"))??;
 
     let imported = service.feeds().import_opml(opml_str).await?;
     Ok(Json(serde_json::json!({

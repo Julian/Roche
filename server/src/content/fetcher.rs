@@ -90,6 +90,8 @@ mod tests {
         assert!(SafeHttpClient::parse_url("http://[fc00::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[fe80::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[2001:db8::1]/").is_err());
+        assert!(SafeHttpClient::parse_url("http://[2002:7f00:0001::]/").is_err());
+        assert!(SafeHttpClient::parse_url("http://[2002:c0a8:0101::1]/").is_err());
     }
 
     #[test]
@@ -160,5 +162,18 @@ mod tests {
             Some(&base),
         );
         assert_eq!(root_rel.as_deref(), Some("https://blog.example.com/static/hero.webp"));
+
+        // Images inside <script>, <noscript>, <template>, <style>, <svg>, <math> must be ignored,
+        // and `<` inside <script> must not abort extraction of the real image below.
+        let tricky_html = r#"
+            <script>if (a < b) { const fake = '<img src="https://evil.example.com/script.jpg">'; }</script>
+            <noscript><img src="https://tracker.example.com/beacon.png"></noscript>
+            <template><img src="https://evil.example.com/template.png"></template>
+            <style>.x { content: "<img src='https://evil.example.com/style.png'>"; }</style>
+            <p><img src="https://blog.example.com/real-hero.jpg" width="800" height="600"></p>
+        "#;
+        let extracted_safe =
+            HtmlSanitizer::extract_first_image_url_with_base(tricky_html, Some(&base));
+        assert_eq!(extracted_safe.as_deref(), Some("https://blog.example.com/real-hero.jpg"));
     }
 }
