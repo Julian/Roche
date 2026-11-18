@@ -43,11 +43,8 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
     }
     val consumedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.CONSUMED)
     val abandonedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.ABANDONED)
-    val globalOrderings =
-        tables.comparisons
-            .filter { it.scopeCollectionId.isNullOrBlank() }
-            .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
-    val globalScores = EpRankingEngine.inferScores(domainEntries.keys.toList(), globalOrderings)
+    val (globalOrderings, globalScores) =
+        inferGlobalCatalogScores(domainEntries, tables.comparisons)
     val membershipsByCollection = groupSortedMemberships(tables.memberships)
     val generatorsByCollection = tables.generators.associateBy { it.collectionId }
 
@@ -91,6 +88,25 @@ internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
         generators = generatorStates,
         comparisonCount = tables.comparisons.size,
     )
+}
+
+private fun inferGlobalCatalogScores(
+    domainEntries: Map<String, CatalogEntryItem>,
+    comparisons: List<ComparisonEntity>,
+): Pair<List<List<List<String>>>, Map<String, EpRankingEngine.Score>> {
+    val globalOrderings =
+        comparisons
+            .filter { it.scopeCollectionId.isNullOrBlank() }
+            .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
+    val comparedIds =
+        globalOrderings
+            .asSequence()
+            .flatten()
+            .flatten()
+            .filter { it in domainEntries }
+            .distinct()
+            .toList()
+    return globalOrderings to EpRankingEngine.inferScores(comparedIds, globalOrderings)
 }
 
 internal fun resolveSpecTitle(
@@ -159,7 +175,8 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
     val wantSummaries = ArrayList<CatalogListSummary>()
 
     for (spec in input.specs) {
-        val role = CollectionRole.fromWireValue(spec.role)
+        val rawRole = CollectionRole.fromWireValue(spec.role)
+        val role = if (spec.collectionId == STARRED_COLLECTION_ID) CollectionRole.LIST else rawRole
         if (role == CollectionRole.FEED || role == CollectionRole.TAG) continue
         val mode = CollectionMode.fromWireValue(spec.mode)
         val isWant = role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
@@ -290,12 +307,17 @@ private fun rankSpecEntries(
 private fun sortListSummaries(summaries: List<CatalogListSummary>): List<CatalogListSummary> =
     summaries.sortedWith(
         compareByDescending<CatalogListSummary> { it.entryCount > 0 || it.generatorEnabled }
+            .thenByDescending { it.collectionId == STARRED_COLLECTION_ID && it.entryCount > 0 }
             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
     )
 
 private fun sortWantSummaries(summaries: List<CatalogListSummary>): List<CatalogListSummary> =
     summaries.sortedWith(
-        compareByDescending<CatalogListSummary> { it.entryCount }
+        compareByDescending<CatalogListSummary> {
+                it.collectionId == WANT_TO_READ_COLLECTION_ID && it.entryCount > 0
+            }
+            .thenByDescending { it.entryCount }
+            .thenByDescending { it.collectionId == WANT_TO_READ_COLLECTION_ID }
             .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
     )
 
@@ -309,10 +331,13 @@ private fun collectSummaryBucket(
     listSummaries: MutableList<CatalogListSummary>,
 ) {
     if (isWant) {
-        if (hasEntries || spec.collectionId == UP_NEXT_COLLECTION_ID) {
+        val isPinnedWant =
+            spec.collectionId == UP_NEXT_COLLECTION_ID ||
+                spec.collectionId == WANT_TO_READ_COLLECTION_ID
+        if (hasEntries || isPinnedWant) {
             wantSummaries.add(summary)
         }
-    } else if (spec.showInLists) {
+    } else if (spec.showInLists || spec.collectionId == STARRED_COLLECTION_ID) {
         listSummaries.add(summary)
     }
 }
@@ -564,7 +589,8 @@ private fun buildCollectionGeneratorStates(
     specs
         .filter { spec ->
             CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
-                CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST &&
+                (CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST ||
+                    spec.collectionId == STARRED_COLLECTION_ID) &&
                 spec.collectionId in generatorsByCollection
         }
         .sortedWith(

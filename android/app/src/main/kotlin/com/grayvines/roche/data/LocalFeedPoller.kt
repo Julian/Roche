@@ -6,7 +6,7 @@ import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.upsertFeed
-import com.grayvines.roche.data.local.upsertItem
+import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.model.ItemStatus
@@ -17,6 +17,8 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
@@ -57,41 +59,61 @@ internal fun canonicalizeFeedUrl(rawUrl: String): String {
 
 internal object LocalFeedPoller {
 
+    @Suppress("LongParameterList")
     suspend fun pollFeed(
         dao: RocheDao,
         apiClient: RocheApiClient,
         feed: FeedRow,
         localPeerId: String,
         nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
+        prefetchedBatch: ParsedFeedBatch? = null,
+    ): Result<Int> =
+        withContext(Dispatchers.Default) {
+            pollFeedInternal(dao, apiClient, feed, localPeerId, nowInstant, prefetchedBatch)
+        }
+
+    @Suppress("LongParameterList")
+    private suspend fun pollFeedInternal(
+        dao: RocheDao,
+        apiClient: RocheApiClient,
+        feed: FeedRow,
+        localPeerId: String,
+        nowInstant: Instant,
+        prefetchedBatch: ParsedFeedBatch?,
     ): Result<Int> {
         val nowIso = nowInstant.toString()
         val fetchUrl = canonicalizeFeedUrl(feed.url)
         val syncableFeed = isSyncablePublicUrl(feed.url)
-        val xmlResult = apiClient.fetchExternalFeedXml(fetchUrl)
-        val xml = xmlResult.getOrElse { error ->
-            dao.upsertFeed(
-                feed.copy(
-                    lastPolled = nowIso,
-                    lastError = sanitizeFeedFetchError(error),
-                    lastErrorBy = localPeerId,
-                    isLocalDirty = syncableFeed || feed.isLocalDirty,
-                )
-            )
-            return Result.failure(error)
-        }
-        val batch = runSuspendCatching {
-            parseFeedXml(xml = xml, feedUrl = fetchUrl, feedType = feed.feedType)
-        }
-            .getOrElse { error ->
-                dao.upsertFeed(
-                    feed.copy(
-                        lastPolled = nowIso,
-                        lastError = "Feed XML parse failed",
-                        lastErrorBy = localPeerId,
-                        isLocalDirty = syncableFeed || feed.isLocalDirty,
-                    )
-                )
-                return Result.failure(error)
+        val batch =
+            if (prefetchedBatch != null) {
+                prefetchedBatch
+            } else {
+                val xml =
+                    apiClient.fetchExternalFeedXml(fetchUrl).getOrElse { error ->
+                        dao.upsertFeed(
+                            feed.copy(
+                                lastPolled = nowIso,
+                                lastError = sanitizeFeedFetchError(error),
+                                lastErrorBy = localPeerId,
+                                isLocalDirty = syncableFeed || feed.isLocalDirty,
+                            )
+                        )
+                        return Result.failure(error)
+                    }
+                runSuspendCatching {
+                    parseFeedXml(xml = xml, feedUrl = fetchUrl, feedType = feed.feedType)
+                }
+                    .getOrElse { error ->
+                        dao.upsertFeed(
+                            feed.copy(
+                                lastPolled = nowIso,
+                                lastError = "Feed XML parse failed",
+                                lastErrorBy = localPeerId,
+                                isLocalDirty = syncableFeed || feed.isLocalDirty,
+                            )
+                        )
+                        return Result.failure(error)
+                    }
             }
 
         val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
@@ -173,6 +195,7 @@ internal object LocalFeedPoller {
         val byId = existingItems.associateBy { it.id }.toMutableMap()
 
         var newCount = 0
+        val toUpsert = ArrayList<InboxItemRow>()
         val validCandidates = candidates.filter { candidate ->
             val cleanUrl = candidate.url.trim()
             cleanUrl.isNotBlank() && itemNaturalKey(feed.url, cleanUrl) !in tombstones
@@ -185,15 +208,18 @@ internal object LocalFeedPoller {
             if (existing != null) {
                 val merged = mergePolledCandidate(existing, feed, candidate)
                 if (merged != existing) {
-                    dao.upsertItem(merged, markDirty = markDirty)
+                    toUpsert.add(merged)
                 }
             } else {
                 val created = buildNewPolledItemEntity(detId, feed, candidate, cleanUrl, nowIso)
-                dao.upsertItem(created, markDirty = markDirty)
+                toUpsert.add(created)
                 byNaturalUrl[canonicalUrlKey] = created
                 byId[detId] = created
                 newCount++
             }
+        }
+        if (toUpsert.isNotEmpty()) {
+            dao.upsertItems(toUpsert, markDirty = markDirty)
         }
         return newCount
     }

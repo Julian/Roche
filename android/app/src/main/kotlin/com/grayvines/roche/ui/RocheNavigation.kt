@@ -41,17 +41,17 @@ internal fun deriveRocheBackStack(
     activeFullscreenPlayerEntryId: String? =
         state.activePlayerEntry?.id?.takeIf { state.playerState.isFullscreenOpen },
 ): List<RocheNavKey> = buildList {
-    add(RocheNavKey.Tab(AppTab.INBOX))
+    add(RocheNavKey.Tab(AppTab.HOME))
     val isScopedInbox =
         state.activeTab == AppTab.INBOX &&
             (state.selectedFeedId != null || state.selectedTag != null)
     val originOrActiveTab =
         if (isScopedInbox) {
-            state.scopeOriginTab ?: AppTab.INBOX
+            state.scopeOriginTab ?: AppTab.HOME
         } else {
             state.activeTab
         }
-    if (originOrActiveTab != AppTab.INBOX) {
+    if (originOrActiveTab != AppTab.HOME) {
         add(RocheNavKey.Tab(originOrActiveTab))
     }
     if (isScopedInbox) {
@@ -80,8 +80,8 @@ internal fun popActionForTopKey(topKey: RocheNavKey): MainAction? =
         RocheNavKey.Search -> MainAction.CloseSearch
         is RocheNavKey.ScopedInbox -> MainAction.NavigateBackFromScope
         is RocheNavKey.Tab ->
-            if (topKey.tab != AppTab.INBOX) {
-                MainAction.SelectTab(AppTab.INBOX)
+            if (topKey.tab != AppTab.HOME) {
+                MainAction.SelectTab(AppTab.HOME)
             } else {
                 null
             }

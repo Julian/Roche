@@ -28,7 +28,7 @@ internal fun matchesScope(
         selectedTag != null ->
             !entry.isArchived && entry.tags.any { it.equals(selectedTag, ignoreCase = true) }
         selectedFeedId != null -> !entry.isArchived && entry.feedId == selectedFeedId
-        else -> matchesInboxFilter(entry, filter)
+        else -> entry.inFeedInbox && matchesInboxFilter(entry, filter)
     }
 
 internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean =

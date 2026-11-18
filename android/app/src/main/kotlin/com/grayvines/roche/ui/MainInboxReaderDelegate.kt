@@ -1,12 +1,14 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.SavedResourceKind
+import com.grayvines.roche.data.isLikelyFeedUrl
+import com.grayvines.roche.data.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
+import com.grayvines.roche.model.extractCleanDomain
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 
@@ -52,7 +54,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 true
             }
             is MainAction.SaveUrlOrFeed -> {
-                performSaveUrl(action.url, action.titleOverride, action.tagCsv)
+                performSaveUrl(action.url, action.titleOverride, action.tagCsv, action.mode)
                 true
             }
             is MainAction.DeleteEntry -> {
@@ -361,19 +363,21 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         }
     }
 
-    private suspend fun performSaveUrl(url: String, titleOverride: String?, tagCsv: String) {
-        if (url.isBlank()) return
-        val created =
-            vm.repository.saveUrlOrFeed(
-                inputUrl = url,
-                titleOverride = titleOverride,
-                tagCsv = tagCsv,
-            )
-        val (verb, nextTab) =
-            when (created.kind) {
-                SavedResourceKind.FEED -> "Subscribed" to AppTab.FEEDS
-                SavedResourceKind.ITEM -> "Saved" to AppTab.INBOX
-            }
+    private suspend fun performSaveUrl(
+        url: String,
+        titleOverride: String?,
+        tagCsv: String,
+        explicitMode: AddSheetMode?,
+    ) {
+        val cleanUrl = normalizeUserSubmittedUrl(url)
+        if (cleanUrl.isBlank()) return
+        val resolvedMode =
+            explicitMode
+                ?: if (isLikelyFeedUrl(cleanUrl)) {
+                    AddSheetMode.SUBSCRIBE_FEED
+                } else {
+                    AddSheetMode.WANT_TO_READ
+                }
         vm.cancelDeepSearch()
         vm.transientState.update {
             it.clearSearch()
@@ -383,12 +387,64 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                     prefilledShareTitle = "",
                     selectedReaderEntryId = null,
                     readerContent = null,
-                    activeTab = nextTab,
-                    activeFilter = InboxFilter.ALL,
                     undoEvent = null,
-                    statusBanner = "$verb \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                )
+        }
+        if (resolvedMode == AddSheetMode.SUBSCRIBE_FEED) {
+            performSubscribeFeedAction(cleanUrl, titleOverride)
+        } else {
+            val created =
+                vm.repository.addUrlToWantToRead(
+                    inputUrl = cleanUrl,
+                    titleOverride = titleOverride,
+                    tagCsv = tagCsv,
+                )
+            vm.showStatusMessage(
+                "Added to Want to Read · \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\""
+            )
+        }
+    }
+
+    private suspend fun performSubscribeFeedAction(url: String, titleOverride: String?) {
+        val hostLabel = extractCleanDomain(url).ifBlank { url }.take(SNACKBAR_TITLE_LIMIT)
+        if (vm.repository.hasBackgroundScope) {
+            vm.transientState.update {
+                it.copy(
+                    activeTab = AppTab.FEEDS,
+                    statusBanner = "Finding RSS feed for $hostLabel…",
                     messageSequence = it.messageSequence + 1,
                 )
+            }
+            vm.repository.subscribeFeedInBackground(
+                inputUrl = url,
+                titleOverride = titleOverride,
+            ) { result ->
+                result
+                    .onSuccess { saved ->
+                        vm.showStatusMessage(
+                            "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\""
+                        )
+                    }
+                    .onFailure { err ->
+                        vm.showStatusMessage(err.message ?: "Could not subscribe to feed")
+                    }
+            }
+        } else {
+            vm.repository
+                .discoverAndSubscribeFeed(inputUrl = url, titleOverride = titleOverride)
+                .onSuccess { saved ->
+                    vm.transientState.update {
+                        it.copy(
+                            activeTab = AppTab.FEEDS,
+                            statusBanner =
+                                "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"",
+                            messageSequence = it.messageSequence + 1,
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    vm.showStatusMessage(err.message ?: "Could not subscribe to feed")
+                }
         }
     }
 

@@ -78,29 +78,47 @@ enum class AppTab(val label: String) {
     FEEDS("Feeds"),
     LISTS("Lists"),
     QUEUE("Queue"),
-    STARRED("Starred"),
+    STARRED("Stars"),
     INBOX("Inbox"),
     OFFLINE("Offline"),
     SETTINGS("Settings");
 
     companion object {
-        const val SIDE_TAB_COUNT = 4
-        val sideTabCandidates: List<AppTab> =
-            listOf(HOME, FEEDS, LISTS, STARRED, QUEUE, OFFLINE, SETTINGS)
-        val defaultSideTabs: List<AppTab> = listOf(HOME, FEEDS, STARRED, SETTINGS)
+        const val BOTTOM_TAB_COUNT = 5
+        const val SIDE_TAB_COUNT = BOTTOM_TAB_COUNT
+        private const val LEGACY_OUTER_SLOT_COUNT = 4
+        private const val CENTER_SLOT_INDEX = 2
 
-        fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> {
-            val distinctValid = tabs.filter { it != INBOX && it in sideTabCandidates }.distinct()
-            if (distinctValid.size == SIDE_TAB_COUNT) return distinctValid
+        val bottomTabCandidates: List<AppTab> =
+            listOf(HOME, FEEDS, LISTS, STARRED, SETTINGS, QUEUE, OFFLINE, INBOX)
+        val sideTabCandidates: List<AppTab> = bottomTabCandidates
+
+        val defaultBottomTabs: List<AppTab> = listOf(HOME, FEEDS, LISTS, STARRED, SETTINGS)
+        val defaultSideTabs: List<AppTab> = defaultBottomTabs
+
+        fun normalizeBottomTabs(tabs: List<AppTab>): List<AppTab> {
+            val distinctValid = tabs.filter { it in bottomTabCandidates }.distinct()
+            if (distinctValid.size >= BOTTOM_TAB_COUNT) {
+                return distinctValid.take(BOTTOM_TAB_COUNT)
+            }
+            if (distinctValid.size == LEGACY_OUTER_SLOT_COUNT) {
+                val centerFill =
+                    (listOf(LISTS) + defaultBottomTabs + bottomTabCandidates).first {
+                        it !in distinctValid
+                    }
+                return distinctValid.toMutableList().apply { add(CENTER_SLOT_INDEX, centerFill) }
+            }
             val result = distinctValid.toMutableList()
-            for (fallback in defaultSideTabs + sideTabCandidates) {
-                if (result.size >= SIDE_TAB_COUNT) break
+            for (fallback in defaultBottomTabs + bottomTabCandidates) {
+                if (result.size >= BOTTOM_TAB_COUNT) break
                 if (fallback !in result) {
                     result.add(fallback)
                 }
             }
-            return result.take(SIDE_TAB_COUNT)
+            return result.take(BOTTOM_TAB_COUNT)
         }
+
+        fun normalizeSideTabs(tabs: List<AppTab>): List<AppTab> = normalizeBottomTabs(tabs)
     }
 }
 
@@ -172,6 +190,7 @@ data class InboxEntry(
     val readAt: String? = null,
     val thumbnailUrl: String? = null,
     val audioUrl: String? = null,
+    val inFeedInbox: Boolean = feedId != null,
 ) {
     val isRead: Boolean
         get() = !readAt.isNullOrBlank()

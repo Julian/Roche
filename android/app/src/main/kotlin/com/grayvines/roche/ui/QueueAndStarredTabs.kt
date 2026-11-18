@@ -22,8 +22,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +46,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.RankedCatalogEntry
+import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
@@ -52,6 +56,7 @@ import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RefreshIcon
+import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
@@ -68,48 +73,113 @@ fun StarredTabContent(
     val colors = LocalRocheColors.current
     var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
     val allStarred = state.starredEntries
+    val readerIds = remember(allStarred) { allStarred.mapTo(HashSet()) { it.id } }
+    val extraCatalogStarred =
+        remember(state.catalog, readerIds) {
+            state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().filter {
+                it.entry.id !in readerIds
+            }
+        }
     val starredEntries =
         remember(allStarred, selectedTypeFilter) {
             val filter = selectedTypeFilter
             if (filter == null) allStarred else allStarred.filter { it.contentType == filter }
         }
+    val visibleCatalogItems = if (selectedTypeFilter == null) extraCatalogStarred else emptyList()
+    val totalCount = allStarred.size + extraCatalogStarred.size
+    val visibleCount = starredEntries.size + visibleCatalogItems.size
 
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Starred",
-            subtitle = "${starredEntries.size} saved",
-        ) {
-            RocheIconActionButton(
-                contentDescription = "Sync",
-                onClick = { onAction(MainAction.SyncNow) },
-            ) {
-                RefreshIcon(tint = colors.textSecondary, size = 17.dp)
-            }
-        }
+        StarredListHeaderBar(
+            totalCount = totalCount,
+            isSyncing = state.isSyncing,
+            onAction = onAction,
+        )
         StarredTypeFilterStrip(
-            allCount = allStarred.size,
+            allCount = totalCount,
             selectedType = selectedTypeFilter,
             onSelectType = { selectedTypeFilter = it },
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (starredEntries.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "No starred entries yet. Tap ★ on any post to save it to Starred.",
-                    color = colors.textMuted,
-                    fontSize = 13.sp,
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("starred_pull_to_refresh"),
+        ) {
+            if (visibleCount == 0) {
+                StarredEmptyPlaceholder()
+            } else {
+                StarredEntriesList(
+                    starredEntries = starredEntries,
+                    catalogStarred = visibleCatalogItems,
+                    state = state,
+                    onAction = onAction,
+                    listState = listState,
                 )
             }
-        } else {
-            StarredEntriesList(
-                starredEntries = starredEntries,
-                state = state,
-                onAction = onAction,
-                listState = listState,
+        }
+    }
+}
+
+@Composable
+private fun StarredEmptyPlaceholder() {
+    val colors = LocalRocheColors.current
+    Box(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text =
+                "No entries in your Starred list yet. Tap ★ on any post or tap + Add to add items to Starred.",
+            color = colors.textMuted,
+            fontSize = 13.sp,
+        )
+    }
+}
+
+@Composable
+private fun StarredListHeaderBar(
+    totalCount: Int,
+    isSyncing: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val subtitle = if (isSyncing) "$totalCount in list · Refreshing…" else "$totalCount in list"
+    RocheTopHeader(
+        title = "Starred",
+        subtitle = subtitle,
+    ) {
+        HeaderActionButton(
+            label = "+ Add",
+            onClick = {
+                onAction(
+                    MainAction.OpenQuickLogSheet(
+                        defaultToWant = false,
+                        targetCollectionId = STARRED_COLLECTION_ID,
+                        targetCollectionTitle = "Starred",
+                    )
+                )
+            },
+            modifier = Modifier.testTag("starred_add_btn"),
+        )
+        if (totalCount >= 2) {
+            HeaderActionButton(
+                label = "Rank",
+                style = RocheButtonStyle.PRIMARY,
+                onClick = { onAction(MainAction.StartRankingSession(STARRED_COLLECTION_ID)) },
+                modifier = Modifier.testTag("starred_rank_btn"),
+            )
+        }
+        RocheIconActionButton(
+            contentDescription = "Sync",
+            onClick = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.testTag("starred_sync_btn"),
+        ) {
+            RefreshIcon(
+                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+                isSpinning = isSyncing,
             )
         }
     }
@@ -118,6 +188,7 @@ fun StarredTabContent(
 @Composable
 private fun StarredEntriesList(
     starredEntries: List<InboxEntry>,
+    catalogStarred: List<RankedCatalogEntry>,
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState,
@@ -143,6 +214,72 @@ private fun StarredEntriesList(
             )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
+        items(items = catalogStarred, key = { "cat_${it.entry.id}" }) { catItem ->
+            StarredCatalogEntryRow(
+                item = catItem,
+                onUnstar = {
+                    onAction(MainAction.RemoveWantEntry(STARRED_COLLECTION_ID, catItem.entry.id))
+                },
+                onRank = {
+                    onAction(
+                        MainAction.StartRankingSession(STARRED_COLLECTION_ID, catItem.entry.id)
+                    )
+                },
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+    }
+}
+
+@Composable
+private fun StarredCatalogEntryRow(
+    item: RankedCatalogEntry,
+    onUnstar: () -> Unit,
+    onRank: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 11.dp)
+                .testTag("starred_catalog_row_${item.entry.id}"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Unstar ${item.entry.title}",
+            onClick = onUnstar,
+            outlined = false,
+        ) {
+            StarIcon(tint = colors.accentEcru, isStarred = true, size = 17.dp)
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = item.entry.title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (item.entry.subtitleLine.isNotBlank()) {
+                Text(
+                    text = item.entry.subtitleLine,
+                    color = colors.textSecondary,
+                    fontSize = 11.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HeaderActionButton(label = "Rank", onClick = onRank)
     }
 }
 
@@ -235,20 +372,26 @@ fun QueueTabContent(
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (showHistory) {
-            ListeningHistoryListContent(
-                historyEntries = historyEntries,
-                state = state,
-                onAction = onAction,
-                listState = historyListState,
-            )
-        } else {
-            UpNextQueueListContent(
-                queueEntries = queueEntries,
-                state = state,
-                onAction = onAction,
-                listState = upNextListState,
-            )
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("queue_pull_to_refresh"),
+        ) {
+            if (showHistory) {
+                ListeningHistoryListContent(
+                    historyEntries = historyEntries,
+                    state = state,
+                    onAction = onAction,
+                    listState = historyListState,
+                )
+            } else {
+                UpNextQueueListContent(
+                    queueEntries = queueEntries,
+                    state = state,
+                    onAction = onAction,
+                    listState = upNextListState,
+                )
+            }
         }
     }
 }
@@ -294,7 +437,11 @@ private fun UpNextQueueListContent(
     val colors = LocalRocheColors.current
     if (queueEntries.isEmpty()) {
         Box(
-            modifier = Modifier.fillMaxSize().padding(32.dp).testTag("queue_empty_state"),
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(32.dp)
+                    .testTag("queue_empty_state"),
             contentAlignment = Alignment.Center,
         ) {
             Text(
@@ -340,7 +487,11 @@ private fun ListeningHistoryListContent(
     val colors = LocalRocheColors.current
     if (historyEntries.isEmpty()) {
         Box(
-            modifier = Modifier.fillMaxSize().padding(32.dp).testTag("listening_history_empty"),
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(32.dp)
+                    .testTag("listening_history_empty"),
             contentAlignment = Alignment.Center,
         ) {
             Text(

@@ -330,7 +330,13 @@ class MainViewModelTest {
             assertNull(afterUnread.allEntries.first { it.id == "item-1" }.readAt)
 
             assertEquals(
-                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                listOf(
+                    AppTab.HOME,
+                    AppTab.FEEDS,
+                    AppTab.LISTS,
+                    AppTab.STARRED,
+                    AppTab.SETTINGS,
+                ),
                 afterUnread.settings.bottomNavTabs,
             )
 
@@ -338,15 +344,27 @@ class MainViewModelTest {
             val afterNavUpdate =
                 viewModel.uiState.first { it.settings.bottomNavTabs[1] == AppTab.OFFLINE }
             assertEquals(
-                listOf(AppTab.HOME, AppTab.OFFLINE, AppTab.STARRED, AppTab.SETTINGS),
+                listOf(
+                    AppTab.HOME,
+                    AppTab.OFFLINE,
+                    AppTab.LISTS,
+                    AppTab.STARRED,
+                    AppTab.SETTINGS,
+                ),
                 afterNavUpdate.settings.bottomNavTabs,
             )
 
             viewModel.dispatch(MainAction.ResetBottomNavTabs)
             val afterNavReset =
-                viewModel.uiState.first { it.settings.bottomNavTabs == AppTab.defaultSideTabs }
+                viewModel.uiState.first { it.settings.bottomNavTabs == AppTab.defaultBottomTabs }
             assertEquals(
-                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                listOf(
+                    AppTab.HOME,
+                    AppTab.FEEDS,
+                    AppTab.LISTS,
+                    AppTab.STARRED,
+                    AppTab.SETTINGS,
+                ),
                 afterNavReset.settings.bottomNavTabs,
             )
             collectJob.cancel()
@@ -2004,6 +2022,122 @@ class MainViewModelTest {
             snapshots.value = null
         }
     }
+
+    @Test
+    fun `SaveUrlOrFeed closes add sheet immediately while slow network runs and separates Want to Read from Feed Inbox`() =
+        runTest {
+            val networkGate = CompletableDeferred<Unit>()
+            val slowClient = RocheApiClient { request ->
+                networkGate.await()
+                when (request.url) {
+                    "https://blog.example.com" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """<html><head><title>Systems Blog</title>""" +
+                                    """<link rel="alternate" type="application/rss+xml" href="/feed.xml">""" +
+                                    """</head><body>Welcome</body></html>""",
+                        )
+                    "https://blog.example.com/feed.xml" ->
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """<?xml version="1.0" encoding="UTF-8"?>""" +
+                                    """<rss version="2.0"><channel><title>Systems Blog</title>""" +
+                                    """<link>https://blog.example.com</link>""" +
+                                    """<item><title>Feed Post 1</title><link>https://blog.example.com/p1</link></item>""" +
+                                    """</channel></rss>""",
+                        )
+                    else -> HttpResponse(statusCode = 404, body = "")
+                }
+            }
+            val slowRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = slowClient,
+                    settings = settings,
+                )
+            val slowVm =
+                MainViewModel(
+                    repository = slowRepo,
+                    settingsRepository = settings,
+                    playerBackend = playerBackend,
+                    mediaSessionBridge = mediaSessionBridge,
+                )
+            try {
+                val collectJob = collectInBackground(slowVm.uiState)
+                assertEquals(AppTab.HOME, slowVm.uiState.value.activeTab)
+
+                slowVm.dispatch(
+                    MainAction.OpenAddSheet(
+                        prefilledUrl = "https://papers.example.com/consensus.pdf"
+                    )
+                )
+                assertTrue(slowVm.uiState.first { it.isAddSheetOpen }.isAddSheetOpen)
+
+                slowVm.dispatch(
+                    MainAction.SaveUrlOrFeed(
+                        url = "https://papers.example.com/consensus.pdf",
+                        titleOverride = "Consensus Paper",
+                        tagCsv = "distributed",
+                        mode = AddSheetMode.WANT_TO_READ,
+                    )
+                )
+
+                // Add sheet closes and item is persisted locally BEFORE networkGate completes!
+                val immediateState =
+                    slowVm.uiState.first {
+                        !it.isAddSheetOpen &&
+                            it.allEntries.any { e ->
+                                e.url == "https://papers.example.com/consensus.pdf"
+                            } &&
+                            it.catalog.wantQueues.any { q ->
+                                q.slug == "want:read" && q.entryCount == 1
+                            }
+                    }
+                assertFalse(immediateState.isAddSheetOpen)
+                val savedPdf =
+                    immediateState.allEntries.first {
+                        it.url == "https://papers.example.com/consensus.pdf"
+                    }
+                assertFalse(savedPdf.inFeedInbox)
+                assertTrue(immediateState.visibleEntries.none { it.id == savedPdf.id })
+                assertTrue(
+                    immediateState.catalog.wantQueues.any {
+                        it.slug == "want:read" && it.entryCount == 1
+                    }
+                )
+
+                // Subscribe Feed mode also dismisses sheet immediately while RSS autodiscovery is
+                // gated
+                slowVm.dispatch(MainAction.OpenAddSheet(prefilledUrl = "https://blog.example.com"))
+                assertTrue(slowVm.uiState.first { it.isAddSheetOpen }.isAddSheetOpen)
+                slowVm.dispatch(
+                    MainAction.SaveUrlOrFeed(
+                        url = "https://blog.example.com",
+                        titleOverride = null,
+                        tagCsv = "",
+                        mode = AddSheetMode.SUBSCRIBE_FEED,
+                    )
+                )
+                // While discovery is running in the background, isSyncing is true and sheet is
+                // closed!
+                val whileDiscovering = slowVm.uiState.first { !it.isAddSheetOpen }
+                assertFalse(whileDiscovering.isAddSheetOpen)
+
+                networkGate.complete(Unit)
+                val subscribedState =
+                    slowVm.uiState.first { state ->
+                        state.visibleEntries.any { it.url == "https://blog.example.com/p1" }
+                    }
+                assertTrue(subscribedState.visibleEntries.all { it.inFeedInbox })
+                assertTrue(subscribedState.visibleEntries.none { it.id == savedPdf.id })
+                collectJob.cancel()
+            } finally {
+                slowVm.playerController.releaseController()
+                slowVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
 
     private fun testFeed(id: String, title: String) =
         FeedRow(id, title, "https://example.com/$id.xml", "https://example.com", "rss")

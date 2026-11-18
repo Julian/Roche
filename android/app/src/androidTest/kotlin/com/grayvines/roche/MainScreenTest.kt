@@ -35,12 +35,14 @@ class MainScreenTest {
     fun rendersInboxHeaderPrimaryRowActionsAndFabs() {
         val sample = createSampleEntry()
         val tag = TagItem(id = "tag-1", name = "llm-inference", unreadCount = 1)
-        val unpinnedSettingsNav = listOf(AppTab.FEEDS, AppTab.STARRED, AppTab.HOME, AppTab.OFFLINE)
+        val unpinnedSettingsNav =
+            listOf(AppTab.HOME, AppTab.FEEDS, AppTab.INBOX, AppTab.STARRED, AppTab.OFFLINE)
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
                     state =
                         MainUiState(
+                            activeTab = AppTab.INBOX,
                             visibleEntries = listOf(sample),
                             allEntries = listOf(sample),
                             tags = listOf(tag),
@@ -69,7 +71,7 @@ class MainScreenTest {
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("search_fab").assertExists()
-        composeRule.onNodeWithTag("save_fab").assertExists()
+        composeRule.onNodeWithTag("save_fab").assertDoesNotExist()
 
         composeRule.onNodeWithTag("inbox_tag_filter_drawer").assertDoesNotExist()
         composeRule.onNodeWithTag("inbox_tag_filter_btn").performClick()
@@ -154,11 +156,12 @@ class MainScreenTest {
         composeRule.onNodeWithTag("settings_server_row").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_nav_row").performScrollTo().assertExists()
         composeRule
-            .onNodeWithText("Home · Feeds · [Inbox] · Starred · Settings")
+            .onNodeWithText("Home · Feeds · Lists · Stars · Settings")
             .performScrollTo()
             .assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_inbox").performScrollTo().assertExists()
         composeRule.onNodeWithTag("collection_draws_home_toggle").performScrollTo().assertExists()
         composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()
@@ -274,8 +277,18 @@ class MainScreenTest {
         composeRule.onNodeWithTag("home_screen").assertExists()
         composeRule.onNodeWithTag("home_widget_pulse").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_collection_draw").assertDoesNotExist()
-        composeRule.onNodeWithTag("home_widget_up_next").assertExists()
-        composeRule.onNodeWithTag("home_widget_sources").assertExists()
+        composeRule.onNodeWithTag("home_widget_inbox").assertExists()
+        composeRule.onNodeWithTag("home_open_inbox_btn").assertExists()
+        composeRule.onNodeWithTag("home_open_want_to_read_btn").assertExists()
+        composeRule.onNodeWithTag("home_widget_up_next").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_widget_sources").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("save_fab").assertExists()
+        composeRule.onNodeWithTag("global_sync_indicator").assertDoesNotExist()
+
+        uiState = uiState.copy(isSyncing = true)
+        composeRule.onNodeWithTag("global_sync_indicator").assertExists()
+        composeRule.onNodeWithTag("global_sync_pill").assertExists()
+        uiState = uiState.copy(isSyncing = false)
 
         composeRule.onNodeWithTag("search_fab").performClick()
         composeRule.onNodeWithTag("search_overlay").assertExists()
@@ -456,7 +469,7 @@ class MainScreenTest {
         composeRule.setContent {
             RocheTheme {
                 MainScreen(
-                    state = MainUiState(isInitialLoading = true),
+                    state = MainUiState(activeTab = AppTab.INBOX, isInitialLoading = true),
                     onAction = {},
                     onShareEntry = {},
                     onOpenExternalUrl = {},

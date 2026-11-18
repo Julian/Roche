@@ -798,6 +798,197 @@ class RocheRssWorkflowTest {
                 )
             }
         }
+
+    @Test
+    fun `addUrlToWantToRead enriches metadata caches shared PDF stream and keeps Inbox feed-only`() =
+        runTest {
+            val enrichClient = RocheApiClient { request ->
+                if (request.url == "https://essays.example.com/storage") {
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """<html><head><title>Log-Structured Merge Trees</title>""" +
+                                """<meta name="author" content="Pat O'Neil">""" +
+                                """<meta name="description" content="Write amplification and compaction.">""" +
+                                """</head><body><article><p>Full article body text.</p></article></body></html>""",
+                    )
+                } else {
+                    HttpResponse(statusCode = 404, body = "")
+                }
+            }
+            val bgScope = kotlinx.coroutines.CoroutineScope(UnconfinedTestDispatcher(testScheduler))
+            val wantRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = enrichClient,
+                    settings = settings,
+                    cacheDir = File(tempDir, "pdf_cache"),
+                    backgroundScope = bgScope,
+                )
+
+            wantRepo.addUrlToWantToRead(
+                inputUrl = "https://essays.example.com/storage",
+                titleOverride = null,
+                tagCsv = "databases",
+            )
+            testScheduler.advanceUntilIdle()
+
+            val pdfBytes = "%PDF-1.7 sample paper".toByteArray()
+            wantRepo.addUrlToWantToRead(
+                inputUrl = "https://papers.example.com/lsm.pdf",
+                titleOverride = "LSM Paper",
+                forcedContentType = ContentType.PDF,
+                pdfInputStream = pdfBytes.inputStream(),
+            )
+            testScheduler.advanceUntilIdle()
+
+            val snap = wantRepo.snapshot.first { s -> s.entries.size == 2 }
+            val enrichedArticle =
+                snap.entries.first { it.url == "https://essays.example.com/storage" }
+            assertEquals("Log-Structured Merge Trees", enrichedArticle.title)
+            assertEquals("Pat O'Neil", enrichedArticle.author)
+            assertFalse(enrichedArticle.inFeedInbox)
+            assertTrue(enrichedArticle.contentHtml.orEmpty().contains("Full article body text."))
+
+            val cachedPdf = snap.entries.first { it.url == "https://papers.example.com/lsm.pdf" }
+            assertEquals(ContentType.PDF, cachedPdf.contentType)
+            assertTrue(cachedPdf.isCachedOffline)
+            assertTrue(
+                File(File(File(tempDir, "pdf_cache"), "items"), cachedPdf.id)
+                    .resolve("shared_document.pdf")
+                    .exists()
+            )
+
+            // Unscoped Inbox filter excludes manual Want-to-Read items
+            val inboxVisible =
+                RocheRepository.filterEntries(
+                    entries = snap.entries,
+                    filter = com.grayvines.roche.model.InboxFilter.ALL,
+                )
+            assertTrue(inboxVisible.isEmpty())
+            val wantQueue = snap.catalog.wantQueues.first { it.slug == WANT_TO_READ_SLUG }
+            assertEquals(2, wantQueue.entryCount)
+
+            // Starred is a normal manual list in catalog.lists: adding/removing membership toggles
+            // isFavorite
+            val starredList = snap.catalog.lists.first { it.collectionId == STARRED_COLLECTION_ID }
+            assertEquals(CollectionRole.LIST, starredList.role)
+            assertEquals(CollectionMode.MANUAL, starredList.mode)
+            wantRepo.catalog.addCollectionEntry(STARRED_COLLECTION_ID, enrichedArticle.id)
+            val afterListStar =
+                wantRepo.snapshot.first { s ->
+                    s.entries.first { it.id == enrichedArticle.id }.isFavorite
+                }
+            assertEquals(
+                1,
+                afterListStar.catalog.lists
+                    .first { it.collectionId == STARRED_COLLECTION_ID }
+                    .entryCount,
+            )
+            wantRepo.catalog.removeCollectionEntry(STARRED_COLLECTION_ID, enrichedArticle.id)
+            val afterListUnstar =
+                wantRepo.snapshot.first { s ->
+                    !s.entries.first { it.id == enrichedArticle.id }.isFavorite
+                }
+            assertEquals(
+                0,
+                afterListUnstar.catalog.lists
+                    .first { it.collectionId == STARRED_COLLECTION_ID }
+                    .entryCount,
+            )
+        }
+
+    @Test
+    fun `discoverAndSubscribeFeed autodiscovers blog RSS without double fetch and delta sync skips clean content`() =
+        runTest {
+            var rssFetches = 0
+            val sawSyncActiveDuringFetch = java.util.concurrent.atomic.AtomicBoolean(false)
+            lateinit var discRepo: RocheRepository
+            val discoveryClient = RocheApiClient { request ->
+                sawSyncActiveDuringFetch.compareAndSet(false, discRepo.isSyncActive.value)
+                when (request.url) {
+                    "https://systems.example.com" -> {
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """<html><head><title>Systems Notes</title>""" +
+                                    """<link rel="alternate" type="application/rss+xml" href="/index.xml">""" +
+                                    """</head><body><p>Blog home</p></body></html>""",
+                        )
+                    }
+                    "https://systems.example.com/index.xml" -> {
+                        rssFetches += 1
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """<?xml version="1.0" encoding="UTF-8"?>""" +
+                                    """<rss version="2.0"><channel><title>Systems Notes</title>""" +
+                                    """<link>https://systems.example.com</link>""" +
+                                    """<item><title>Kernel Bypass</title>""" +
+                                    """<link>https://systems.example.com/kernel-bypass</link>""" +
+                                    """<description>&lt;p&gt;Zero-copy rings&lt;/p&gt;</description></item>""" +
+                                    """</channel></rss>""",
+                        )
+                    }
+                    else -> {
+                        HttpResponse(statusCode = 404, body = "")
+                    }
+                }
+            }
+            discRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = discoveryClient,
+                    settings = settings,
+                )
+            val result = discRepo.discoverAndSubscribeFeed("systems.example.com").getOrThrow()
+            assertTrue(sawSyncActiveDuringFetch.get())
+            assertFalse(discRepo.isSyncActive.value)
+            assertTrue(result.isFeed)
+            assertEquals("Systems Notes", result.title)
+            assertEquals(1, rssFetches)
+
+            val snap = discRepo.snapshot.first { it.entries.isNotEmpty() }
+            assertEquals(1, snap.entries.size)
+            assertTrue(snap.entries.single().inFeedInbox)
+
+            // Mark everything clean, then verify incremental sync (sinceSeq = 10) sends 0 entries
+            val dao = database.dao()
+            val fullSync =
+                buildTrackedPeerSyncRequest(
+                    dao = dao,
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "peer-android",
+                            deviceName = "Pixel",
+                            sinceSeq = 0L,
+                        ),
+                )
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    com.grayvines.roche.data.remote.PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncSeq = 1L,
+                        serverHlc = "001780000001000-0000-server",
+                        syncTimestamp = "2026-06-01T12:00:00Z",
+                    ),
+                localPeerId = "peer-android",
+                sentBatch = fullSync,
+            )
+
+            val deltaSync =
+                buildTrackedPeerSyncRequest(
+                    dao = dao,
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "peer-android",
+                            deviceName = "Pixel",
+                            sinceSeq = 10L,
+                        ),
+                )
+            assertTrue(deltaSync.request.entries.isEmpty())
+        }
 }
 
 private fun buildStrictLimitChunkingClient(receivedBodies: MutableList<String>): RocheApiClient {

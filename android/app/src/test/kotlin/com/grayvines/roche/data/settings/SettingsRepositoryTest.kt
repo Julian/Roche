@@ -69,7 +69,13 @@ class SettingsRepositoryTest {
             assertEquals(HeadlineFont.SANS, current.headlineFont)
             assertEquals(true, current.ultraDenseRows)
             assertEquals(
-                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
+                listOf(
+                    AppTab.HOME,
+                    AppTab.FEEDS,
+                    AppTab.LISTS,
+                    AppTab.STARRED,
+                    AppTab.SETTINGS,
+                ),
                 current.bottomNavTabs,
             )
             assertNull(store.data.first()[SettingsRepository.KEY_BOTTOM_NAV_TABS])
@@ -306,7 +312,13 @@ class SettingsRepositoryTest {
                 val repository = SettingsRepository(store, countingCipher)
                 val prewarmed = repository.prewarm()
                 assertEquals(
-                    listOf(AppTab.FEEDS, AppTab.QUEUE, AppTab.HOME, AppTab.SETTINGS),
+                    listOf(
+                        AppTab.FEEDS,
+                        AppTab.QUEUE,
+                        AppTab.LISTS,
+                        AppTab.HOME,
+                        AppTab.SETTINGS,
+                    ),
                     prewarmed.bottomNavTabs,
                 )
                 assertEquals("cached-token-99", prewarmed.bearerToken)
@@ -543,13 +555,20 @@ class SettingsRepositoryTest {
     }
 
     @Test
-    fun `SettingsRepository supports optional AppTab LISTS in bottomNavTabs while preserving defaults`() =
+    fun `SettingsRepository supports customizable 5-slot bottomNavTabs while preserving Home-first defaults`() =
         runTest {
             assertEquals(
-                listOf(AppTab.HOME, AppTab.FEEDS, AppTab.STARRED, AppTab.SETTINGS),
-                AppTab.defaultSideTabs,
+                listOf(
+                    AppTab.HOME,
+                    AppTab.FEEDS,
+                    AppTab.LISTS,
+                    AppTab.STARRED,
+                    AppTab.SETTINGS,
+                ),
+                AppTab.defaultBottomTabs,
             )
-            assertTrue(AppTab.LISTS in AppTab.sideTabCandidates)
+            assertTrue(AppTab.LISTS in AppTab.bottomTabCandidates)
+            assertTrue(AppTab.INBOX in AppTab.bottomTabCandidates)
 
             val dataStoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
             try {
@@ -562,11 +581,23 @@ class SettingsRepositoryTest {
                 repository.update {
                     it.copy(
                         bottomNavTabs =
-                            listOf(AppTab.HOME, AppTab.LISTS, AppTab.FEEDS, AppTab.SETTINGS)
+                            listOf(
+                                AppTab.HOME,
+                                AppTab.LISTS,
+                                AppTab.FEEDS,
+                                AppTab.INBOX,
+                                AppTab.SETTINGS,
+                            )
                     )
                 }
                 assertEquals(
-                    listOf(AppTab.HOME, AppTab.LISTS, AppTab.FEEDS, AppTab.SETTINGS),
+                    listOf(
+                        AppTab.HOME,
+                        AppTab.LISTS,
+                        AppTab.FEEDS,
+                        AppTab.INBOX,
+                        AppTab.SETTINGS,
+                    ),
                     repository.settings.first().bottomNavTabs,
                 )
             } finally {

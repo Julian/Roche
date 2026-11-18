@@ -81,7 +81,7 @@ data class EntryContentEntity(
 )
 data class EntryStateEntity(
     @PrimaryKey val entryId: String,
-    val inboxState: String = "unread",
+    val inboxState: String = DEFAULT_INBOX_STATE,
     val readAt: String? = null,
     val progress: Double = 0.0,
     val interactionUpdatedAt: String? = null,
@@ -299,6 +299,7 @@ data class InboxItemRow(
     val feedUrl: String? = null,
     val interactionUpdatedAt: String? = null,
     val audioUrl: String? = null,
+    val inboxState: String = DEFAULT_INBOX_STATE,
 )
 
 @Suppress("LongParameterList")
@@ -311,6 +312,7 @@ data class ItemStateRow(
     val readAt: String?,
     val readProgress: Double,
     val audioUrl: String?,
+    val inboxState: String = DEFAULT_INBOX_STATE,
 )
 
 data class TagRow(
@@ -323,3 +325,5 @@ data class ItemTagRow(
     val itemId: String,
     val tagId: String,
 )
+
+internal const val DEFAULT_INBOX_STATE = "unread"

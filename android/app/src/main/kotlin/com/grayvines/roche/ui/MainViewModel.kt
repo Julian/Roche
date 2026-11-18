@@ -87,12 +87,19 @@ class MainViewModel(
             repository.snapshot,
             settingsForUi,
             transientState,
-        ) { snapshot: RepositorySnapshot, settings: Settings, local: TransientUiState ->
+            repository.isSyncActive,
+        ) {
+            snapshot: RepositorySnapshot,
+            settings: Settings,
+            local: TransientUiState,
+            repoSyncing: Boolean ->
+            val effectiveLocal =
+                if (repoSyncing && !local.isSyncing) local.copy(isSyncing = true) else local
             uiStateMemoizer.build(
                 snapshot = snapshot,
                 settings = settings,
-                local = local,
-                localNetworkTier = local.localNetworkTier,
+                local = effectiveLocal,
+                localNetworkTier = effectiveLocal.localNetworkTier,
             )
         }
 

@@ -39,6 +39,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.isLikelyFeedUrl
 import com.grayvines.roche.data.normalizeTagName
 import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.model.ContentType
@@ -571,59 +572,133 @@ private fun ContextActionItem(
 fun AddUrlOrFeedBottomSheet(
     initialUrl: String,
     initialTitle: String = "",
+    defaultMode: AddSheetMode = AddSheetMode.WANT_TO_READ,
     onDismiss: () -> Unit,
-    onSave: (String, String?, String) -> Unit,
+    onSave: (String, String?, String, AddSheetMode) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     var url by rememberSaveable(initialUrl, initialTitle) { mutableStateOf(initialUrl) }
     var title by rememberSaveable(initialUrl, initialTitle) { mutableStateOf(initialTitle) }
     var tags by rememberSaveable(initialUrl, initialTitle) { mutableStateOf("") }
+    var mode by
+        rememberSaveable(initialUrl, defaultMode) {
+            mutableStateOf(resolveInitialAddMode(initialUrl, defaultMode))
+        }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surface) {
-        Column(
-            modifier =
-                Modifier.fillMaxWidth()
-                    .imePadding()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                text = "Save URL or Subscribe Feed",
-                color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            OutlinedTextField(
-                value = url,
-                onValueChange = { url = it },
-                label = { Text("Article, arXiv PDF, YouTube, or RSS URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
-                label = { Text("Optional Title Override") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+        AddSheetFormBody(
+            mode = mode,
+            url = url,
+            title = title,
+            tags = tags,
+            onModeChange = { mode = it },
+            onUrlChange = { next ->
+                url = next
+                if (isLikelyFeedUrl(next)) {
+                    mode = AddSheetMode.SUBSCRIBE_FEED
+                }
+            },
+            onTitleChange = { title = it },
+            onTagsChange = { tags = it },
+            onSubmit = { onSave(url, title.takeIf { it.isNotBlank() }, tags, mode) },
+        )
+    }
+}
+
+private fun resolveInitialAddMode(initialUrl: String, defaultMode: AddSheetMode): AddSheetMode =
+    if (isLikelyFeedUrl(initialUrl)) AddSheetMode.SUBSCRIBE_FEED else defaultMode
+
+@Suppress("LongParameterList")
+@Composable
+private fun AddSheetFormBody(
+    mode: AddSheetMode,
+    url: String,
+    title: String,
+    tags: String,
+    onModeChange: (AddSheetMode) -> Unit,
+    onUrlChange: (String) -> Unit,
+    onTitleChange: (String) -> Unit,
+    onTagsChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val isFeedMode = mode == AddSheetMode.SUBSCRIBE_FEED
+    val urlHint =
+        if (isFeedMode) {
+            "Blog Homepage, YouTube Channel, or RSS/Atom URL"
+        } else {
+            "Article, PDF, Video, or Media URL"
+        }
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = if (isFeedMode) "Subscribe to Feed" else "Add to Want to Read",
+            color = colors.textPrimary,
+            fontFamily = FontFamily.Serif,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        AddSheetModeSelectorRow(selectedMode = mode, onSelectMode = onModeChange)
+        OutlinedTextField(
+            value = url,
+            onValueChange = onUrlChange,
+            label = { Text(urlHint) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = title,
+            onValueChange = onTitleChange,
+            label = { Text("Optional Title Override") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (!isFeedMode) {
             OutlinedTextField(
                 value = tags,
-                onValueChange = { tags = it },
+                onValueChange = onTagsChange,
                 label = { Text("Tags (comma-separated)") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
-            HeaderActionButton(
-                label = "Save to Roche Inbox",
-                style = RocheButtonStyle.PRIMARY,
-                onClick = { onSave(url, title.takeIf { it.isNotBlank() }, tags) },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(modifier = Modifier.height(16.dp))
         }
+        HeaderActionButton(
+            label = if (isFeedMode) "Find & Subscribe Feed" else "Add to Want to Read",
+            style = RocheButtonStyle.PRIMARY,
+            onClick = onSubmit,
+            modifier = Modifier.fillMaxWidth().testTag("add_sheet_submit_btn"),
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun AddSheetModeSelectorRow(
+    selectedMode: AddSheetMode,
+    onSelectMode: (AddSheetMode) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilterChipPill(
+            label = "Want to Read",
+            selected = selectedMode == AddSheetMode.WANT_TO_READ,
+            onClick = { onSelectMode(AddSheetMode.WANT_TO_READ) },
+            modifier = Modifier.testTag("add_mode_want_to_read"),
+        )
+        FilterChipPill(
+            label = "Subscribe Feed",
+            selected = selectedMode == AddSheetMode.SUBSCRIBE_FEED,
+            onClick = { onSelectMode(AddSheetMode.SUBSCRIBE_FEED) },
+            modifier = Modifier.testTag("add_mode_subscribe_feed"),
+        )
     }
 }
 

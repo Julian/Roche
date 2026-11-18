@@ -11,6 +11,9 @@ import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
 import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
 import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.WANT_TO_READ_SLUG
+import com.grayvines.roche.data.WANT_TO_READ_TITLE
 import com.grayvines.roche.data.canonicalizeSyncUrl
 import com.grayvines.roche.data.collectionEntryNaturalKey
 import com.grayvines.roche.data.encodeCreatorsJson
@@ -184,7 +187,8 @@ internal suspend fun RocheDao.executeMultiTokenSearch(
 }
 
 internal suspend fun RocheDao.ensureStarredSpecExists() {
-    if (getCollectionSpecById(STARRED_COLLECTION_ID) != null) return
+    val existingSpec = getCollectionSpecById(STARRED_COLLECTION_ID)
+    if (existingSpec != null && existingSpec.showInLists && existingSpec.role == "list") return
     val seedHlc = HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
     if (getEntryById(STARRED_COLLECTION_ID) == null) {
         upsertEntry(
@@ -203,14 +207,60 @@ internal suspend fun RocheDao.ensureStarredSpecExists() {
         CollectionSpecEntity(
             collectionId = STARRED_COLLECTION_ID,
             slug = "starred",
-            mode = "manual",
-            role = "system",
+            mode = MODE_MANUAL,
+            role = "list",
+            ruleJson = null,
+            showInLists = true,
+            color = existingSpec?.color,
+        )
+    )
+    insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", "starred", STARRED_COLLECTION_ID))
+}
+
+internal suspend fun RocheDao.ensureWantToReadSpecExists(
+    markDirty: Boolean = true,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
+    if (
+        getCollectionSpecById(WANT_TO_READ_COLLECTION_ID) != null &&
+            getEntryById(WANT_TO_READ_COLLECTION_ID) != null
+    ) {
+        return
+    }
+    val nowIso = nowUtcIso()
+    val hlc =
+        if (markDirty) {
+            nextLocalHlc(this, nodeId)
+        } else {
+            HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
+        }
+    if (getEntryById(WANT_TO_READ_COLLECTION_ID) == null) {
+        upsertEntry(
+            EntryEntity(
+                id = WANT_TO_READ_COLLECTION_ID,
+                kind = EntryKind.COLLECTION.wireValue,
+                title = WANT_TO_READ_TITLE,
+                createdAt = nowIso,
+                updatedAt = nowIso,
+                hlc = hlc,
+                isLocalDirty = markDirty,
+            )
+        )
+    }
+    upsertCollectionSpec(
+        CollectionSpecEntity(
+            collectionId = WANT_TO_READ_COLLECTION_ID,
+            slug = WANT_TO_READ_SLUG,
+            mode = MODE_MANUAL,
+            role = "want",
             ruleJson = null,
             showInLists = false,
             color = null,
         )
     )
-    insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", "starred", STARRED_COLLECTION_ID))
+    insertEntryIdentifierIgnore(
+        EntryIdentifierEntity("slug", WANT_TO_READ_SLUG, WANT_TO_READ_COLLECTION_ID)
+    )
 }
 
 internal suspend fun RocheDao.upsertFeed(
@@ -378,7 +428,11 @@ private suspend fun RocheDao.writeSingleInboxItemInTx(
         )
     )
     val inboxState =
-        if (bounded.status.equals("archived", ignoreCase = true)) "dismissed" else "unread"
+        when {
+            bounded.inboxState.equals("none", ignoreCase = true) -> "none"
+            bounded.status.equals("archived", ignoreCase = true) -> "dismissed"
+            else -> "unread"
+        }
     upsertEntryState(
         EntryStateEntity(
             entryId = bounded.id,
@@ -521,7 +575,7 @@ internal suspend fun RocheDao.upsertTag(
             CollectionSpecEntity(
                 collectionId = tag.id,
                 slug = "tag:$normName",
-                mode = "manual",
+                mode = MODE_MANUAL,
                 role = "tag",
                 ruleJson = null,
                 showInLists = false,
@@ -620,7 +674,11 @@ internal suspend fun RocheDao.setItemStatusAndReadAt(
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             val inboxState =
-                if (status.equals("archived", ignoreCase = true)) "dismissed" else "unread"
+                when {
+                    existing.inboxState.equals("none", ignoreCase = true) -> "none"
+                    status.equals("archived", ignoreCase = true) -> "dismissed"
+                    else -> "unread"
+                }
             upsertEntryState(
                 existing.copy(
                     inboxState = inboxState,
@@ -842,7 +900,8 @@ private suspend fun RocheDao.detachInboxOnlyMemberships(
         val isInboxScoped =
             mem.collectionId == STARRED_COLLECTION_ID ||
                 mem.collectionId == UP_NEXT_COLLECTION_ID ||
-                role == "tag"
+                role == "tag" ||
+                role == "want"
         if (isInboxScoped) {
             deleteCollectionEntry(mem.collectionId, itemId)
             if (recordTombstones) {
@@ -899,3 +958,5 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
     }
     return evictedItemIds
 }
+
+private const val MODE_MANUAL = "manual"

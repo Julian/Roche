@@ -82,13 +82,42 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Share URL target from browsers, YouTube, arXiv, etc. -->
+        </activity>
+
+        <activity
+            android:name=".ShareReceiveActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Roche.ShareReceiver" />
+
+        <!-- Primary Android Share target: save shared URLs & PDFs to Want to Read -->
+        <activity-alias
+            android:name=".ShareWantToReadAlias"
+            android:targetActivity=".ShareReceiveActivity"
+            android:label="Want to Read"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/pdf" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <!-- Secondary Android Share target: autodiscover & subscribe to site RSS/Atom feed -->
+        <activity-alias
+            android:name=".ShareSubscribeFeedAlias"
+            android:targetActivity=".ShareReceiveActivity"
+            android:label="Subscribe Feed"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/*" />
+            </intent-filter>
+        </activity-alias>
 
         <service
             android:name=".data.PeerSyncJobService"

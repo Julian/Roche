@@ -93,8 +93,9 @@ fun FeedsAndTagsTabContent(
 
     Column(modifier = Modifier.fillMaxSize()) {
         FeedsTopHeaderBar(
-            subtitle = subtitle,
+            subtitle = if (state.isSyncing) "$subtitle · Refreshing…" else subtitle,
             hasActiveFilter = hasActiveFilter,
+            isSyncing = state.isSyncing,
             onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
             onSync = { onAction(MainAction.SyncNow) },
         )
@@ -176,6 +177,7 @@ internal fun FeedsFilterDrawerSection(
 internal fun FeedsTopHeaderBar(
     subtitle: String,
     hasActiveFilter: Boolean,
+    isSyncing: Boolean = false,
     onToggleFilterDrawer: () -> Unit,
     onSync: () -> Unit,
 ) {
@@ -199,7 +201,11 @@ internal fun FeedsTopHeaderBar(
             onClick = onSync,
             modifier = Modifier.testTag("feeds_sync_btn"),
         ) {
-            RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+            RefreshIcon(
+                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+                isSpinning = isSyncing,
+            )
         }
     }
 }
@@ -589,33 +595,47 @@ fun OfflineTabContent(
     val offlineEntries = state.offlineEntries
 
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(title = "Offline Vault", subtitle = "${offlineEntries.size} cached")
+        RocheTopHeader(title = "Offline Vault", subtitle = "${offlineEntries.size} cached") {
+            RocheIconActionButton(
+                contentDescription = "Sync",
+                onClick = { onAction(MainAction.SyncNow) },
+            ) {
+                RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+            }
+        }
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        if (offlineEntries.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(32.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    "No offline entries cached on this device.",
-                    color = colors.textMuted,
-                    fontSize = 13.sp,
-                )
-            }
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
-            ) {
-                items(items = offlineEntries, key = { it.id }) { entry ->
-                    OfflineVaultEntryRow(
-                        entry = entry,
-                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                        onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("offline_pull_to_refresh"),
+        ) {
+            if (offlineEntries.isEmpty()) {
+                Box(
+                    modifier =
+                        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "No offline entries cached on this device.",
+                        color = colors.textMuted,
+                        fontSize = 13.sp,
                     )
-                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                    contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
+                ) {
+                    items(items = offlineEntries, key = { it.id }) { entry ->
+                        OfflineVaultEntryRow(
+                            entry = entry,
+                            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                            onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+                        )
+                        HorizontalDivider(color = colors.border, thickness = 1.dp)
+                    }
                 }
             }
         }

@@ -26,7 +26,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
@@ -104,7 +103,7 @@ internal fun VisualDockCustomizerCard(
     val colors = LocalRocheColors.current
     val safeSlotIndex = selectedSlotIndex.coerceIn(0, currentTabs.lastIndex)
     val activeSlotTab =
-        currentTabs.getOrElse(safeSlotIndex) { AppTab.defaultSideTabs[safeSlotIndex] }
+        currentTabs.getOrElse(safeSlotIndex) { AppTab.defaultBottomTabs[safeSlotIndex] }
 
     RocheSurfaceCard {
         Column(
@@ -113,7 +112,7 @@ internal fun VisualDockCustomizerCard(
         ) {
             Text(
                 text =
-                    "Tap any of the 4 outer slots below, then choose which destination sits there. Inbox stays anchored in the center.",
+                    "Tap any of the 5 slots below, then choose which destination sits there. Inbox remains accessible anytime from your Home widget.",
                 color = colors.textSecondary,
                 fontSize = 12.5.sp,
                 lineHeight = 18.sp,
@@ -148,6 +147,7 @@ internal fun DockSlotAssignmentTray(
         listOf(
             "Far Left (Slot 1)",
             "Inner Left (Slot 2)",
+            "Center (Slot 3)",
             "Inner Right (Slot 4)",
             "Far Right (Slot 5)",
         )
@@ -214,35 +214,15 @@ internal fun DockPreviewTray(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        DockPreviewSlot(
-            tab = currentTabs[0],
-            badge = "#1",
-            isSelected = selectedSlotIndex == 0,
-            onClick = { onSelectSlot(0) },
-            modifier = Modifier.testTag("dock_slot_0"),
-        )
-        DockPreviewSlot(
-            tab = currentTabs[1],
-            badge = "#2",
-            isSelected = selectedSlotIndex == 1,
-            onClick = { onSelectSlot(1) },
-            modifier = Modifier.testTag("dock_slot_1"),
-        )
-        LockedCenterInboxDockSlot()
-        DockPreviewSlot(
-            tab = currentTabs[2],
-            badge = "#4",
-            isSelected = selectedSlotIndex == 2,
-            onClick = { onSelectSlot(2) },
-            modifier = Modifier.testTag("dock_slot_2"),
-        )
-        DockPreviewSlot(
-            tab = currentTabs[3],
-            badge = "#5",
-            isSelected = selectedSlotIndex == 3,
-            onClick = { onSelectSlot(3) },
-            modifier = Modifier.testTag("dock_slot_3"),
-        )
+        currentTabs.forEachIndexed { index, tab ->
+            DockPreviewSlot(
+                tab = tab,
+                badge = "#${index + 1}",
+                isSelected = selectedSlotIndex == index,
+                onClick = { onSelectSlot(index) },
+                modifier = Modifier.testTag("dock_slot_$index"),
+            )
+        }
     }
 }
 
@@ -286,38 +266,6 @@ internal fun RowScope.DockPreviewSlot(
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = tab.label,
-            color = colors.textPrimary,
-            fontSize = 10.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-        )
-    }
-}
-
-@Composable
-internal fun RowScope.LockedCenterInboxDockSlot() {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(10.dp)
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier =
-            Modifier.weight(1f)
-                .alpha(LOCKED_CENTER_SLOT_ALPHA)
-                .clip(shape)
-                .border(width = 1.dp, color = colors.border, shape = shape)
-                .padding(vertical = 8.dp, horizontal = 2.dp),
-    ) {
-        Text(
-            text = "Center",
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 9.sp,
-        )
-        Spacer(modifier = Modifier.height(2.dp))
-        BottomTabIcon(tab = AppTab.INBOX, tint = colors.accentBlue, size = 18.dp)
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = AppTab.INBOX.label,
             color = colors.textPrimary,
             fontSize = 10.5.sp,
             fontWeight = FontWeight.SemiBold,
@@ -378,5 +326,3 @@ internal fun DockCandidateOption(
         )
     }
 }
-
-private const val LOCKED_CENTER_SLOT_ALPHA = 0.75f

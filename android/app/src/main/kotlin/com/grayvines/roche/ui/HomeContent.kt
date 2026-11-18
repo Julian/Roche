@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -54,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.CollectionGeneratorState
+import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.HeadlineFont
@@ -94,41 +96,65 @@ fun HomeTabContent(
         AppTab.SETTINGS !in AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
 
     Column(modifier = Modifier.fillMaxSize().testTag("home_screen")) {
-        RocheTopHeader(
-            title = "Home",
-            subtitle = "Overview",
-        ) {
-            RocheIconActionButton(
-                contentDescription = "Sync",
-                onClick = { onAction(MainAction.SyncNow) },
-                modifier = Modifier.testTag("home_sync_btn"),
-            ) {
-                RefreshIcon(tint = colors.textSecondary, size = 17.dp)
-            }
-            if (isSettingsUnpinned) {
-                RocheIconActionButton(
-                    contentDescription = "Settings",
-                    onClick = { onAction(MainAction.SelectTab(AppTab.SETTINGS)) },
-                    modifier = Modifier.testTag("home_spare_settings_btn"),
-                ) {
-                    BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textSecondary, size = 17.dp)
-                }
-            }
-        }
+        HomeTopHeaderBar(
+            isSyncing = state.isSyncing,
+            isSettingsUnpinned = isSettingsUnpinned,
+            onAction = onAction,
+        )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
-            val isBentoTwoColumn = maxWidth >= BENTO_TWO_COLUMN_BREAKPOINT
-            HomeScrollableGrid(
-                state = state,
-                scrollState = scrollState,
-                isWideLayout = isWideLayout,
-                isBentoTwoColumn = isBentoTwoColumn,
-                onAction = onAction,
-                onOpenExternalUrl = onOpenExternalUrl,
-                onOpenCollectionDraw = onOpenCollectionDraw,
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("home_pull_to_refresh"),
+        ) {
+            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
+                val isBentoTwoColumn = maxWidth >= BENTO_TWO_COLUMN_BREAKPOINT
+                HomeScrollableGrid(
+                    state = state,
+                    scrollState = scrollState,
+                    isWideLayout = isWideLayout,
+                    isBentoTwoColumn = isBentoTwoColumn,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeTopHeaderBar(
+    isSyncing: Boolean,
+    isSettingsUnpinned: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    RocheTopHeader(
+        title = "Home",
+        subtitle = if (isSyncing) "Refreshing…" else "Overview",
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Sync",
+            onClick = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.testTag("home_sync_btn"),
+        ) {
+            RefreshIcon(
+                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+                isSpinning = isSyncing,
             )
+        }
+        if (isSettingsUnpinned) {
+            RocheIconActionButton(
+                contentDescription = "Settings",
+                onClick = { onAction(MainAction.SelectTab(AppTab.SETTINGS)) },
+                modifier = Modifier.testTag("home_spare_settings_btn"),
+            ) {
+                BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textSecondary, size = 17.dp)
+            }
         }
     }
 }
@@ -164,6 +190,7 @@ internal fun HomeScrollableGrid(
             }
             hasActiveDraws && isBentoTwoColumn -> {
                 HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
+                HomeInboxWidget(state = state, onAction = onAction)
                 HomeBentoTwoColumnRow(
                     state = state,
                     activeDraws = activeDraws,
@@ -175,6 +202,7 @@ internal fun HomeScrollableGrid(
             }
             else -> {
                 HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
+                HomeInboxWidget(state = state, onAction = onAction)
                 activeDraws.forEach { gen ->
                     HomeCollectionDrawWidget(
                         generator = gen,
@@ -249,6 +277,7 @@ internal fun HomeWideTwoColumnDashboard(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = true)
+            HomeInboxWidget(state = state, onAction = onAction)
             HomeMediaCompanionWidget(state = state, onAction = onAction)
             if (hasActiveDraws) {
                 HomeActiveSourcesWidget(
@@ -693,6 +722,19 @@ private fun CompanionShortcutChips(
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         FilterChipPill(
+            label = "Want to Read",
+            selected = false,
+            onClick = {
+                onAction(
+                    MainAction.OpenCompanionSection(
+                        CompanionSubTab.WANT,
+                        WANT_TO_READ_COLLECTION_ID,
+                    )
+                )
+            },
+            modifier = Modifier.testTag("home_open_want_to_read_btn"),
+        )
+        FilterChipPill(
             label = "Lists",
             selected = false,
             onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS)) },
@@ -733,9 +775,17 @@ internal fun HomeUpNextWidget(
     twoColumnCards: Boolean = false,
 ) {
     val colors = LocalRocheColors.current
+    val wantToReadIds =
+        remember(state.catalog.entriesByCollectionId) {
+            state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(
+                HashSet()
+            ) {
+                it.entry.id
+            }
+        }
     val spotlightEntries =
-        remember(state.activePlayerEntry, state.queueEntries, state.allEntries) {
-            buildHomeSpotlightEntries(state)
+        remember(state.activePlayerEntry, state.queueEntries, state.allEntries, wantToReadIds) {
+            buildHomeSpotlightEntries(state, wantToReadIds)
         }
 
     Column(
@@ -757,6 +807,7 @@ internal fun HomeUpNextWidget(
                                 entry = entry,
                                 isPlayingAudio = entry.id == state.playerState.currentEntryId,
                                 inQueue = state.isEntryInQueue(entry.id),
+                                inWantToRead = entry.id in wantToReadIds,
                                 onClick = { onAction(MainAction.OpenReader(entry.id)) },
                             )
                         }
@@ -772,11 +823,186 @@ internal fun HomeUpNextWidget(
                             entry = entry,
                             isPlayingAudio = entry.id == state.playerState.currentEntryId,
                             inQueue = state.isEntryInQueue(entry.id),
+                            inWantToRead = entry.id in wantToReadIds,
                             onClick = { onAction(MainAction.OpenReader(entry.id)) },
                         )
                     }
                 }
         }
+    }
+}
+
+@Composable
+internal fun HomeInboxWidget(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val feedInboxEntries =
+        remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox && !it.isArchived } }
+    val unreadCount = remember(feedInboxEntries) { feedInboxEntries.count { it.isUnread } }
+    val previewEntries =
+        remember(feedInboxEntries) { feedInboxEntries.take(MAX_WIDGET_INBOX_ITEMS) }
+    val headerLabel = if (unreadCount > 0) "Feed Inbox · $unreadCount unread" else "Feed Inbox"
+    val openInbox = { onAction(MainAction.SelectTab(AppTab.INBOX)) }
+
+    Column(
+        modifier = modifier.fillMaxWidth().testTag("home_widget_inbox"),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        RocheSectionHeader(
+            label = headerLabel,
+            actionLabel = "Open Inbox →",
+            actionTestTag = "home_open_inbox_btn",
+            onActionClick = openInbox,
+        )
+        RocheSurfaceCard {
+            if (previewEntries.isEmpty()) {
+                HomeInboxEmptyBody(onOpenInbox = openInbox, onAction = onAction)
+            } else {
+                HomeInboxPreviewList(
+                    previewEntries = previewEntries,
+                    totalCount = feedInboxEntries.size,
+                    onOpenInbox = openInbox,
+                    onOpenEntry = { onAction(MainAction.OpenReader(it)) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeInboxPreviewList(
+    previewEntries: List<InboxEntry>,
+    totalCount: Int,
+    onOpenInbox: () -> Unit,
+    onOpenEntry: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    previewEntries.forEachIndexed { index, entry ->
+        if (index > 0) {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+        HomeInboxPreviewRow(entry = entry, onClick = { onOpenEntry(entry.id) })
+    }
+    if (totalCount > previewEntries.size) {
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+        Box(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clickable(onClick = onOpenInbox)
+                    .padding(horizontal = 13.dp, vertical = 10.dp)
+                    .testTag("home_inbox_view_all_btn")
+        ) {
+            Text(
+                text = "View all $totalCount feed items in Inbox →",
+                color = colors.accentBlue,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeInboxEmptyBody(
+    onOpenInbox: () -> Unit,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Your feed inbox is caught up.",
+            color = colors.textMuted,
+            fontSize = 12.5.sp,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            HeaderActionButton(label = "Open Inbox", onClick = onOpenInbox)
+            HeaderActionButton(
+                label = "Manage Feeds",
+                onClick = { onAction(MainAction.SelectTab(AppTab.FEEDS)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeInboxPreviewRow(
+    entry: InboxEntry,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily =
+        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
+            FontFamily.Serif
+        } else {
+            FontFamily.SansSerif
+        }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 13.dp, vertical = 10.dp)
+                .testTag("home_inbox_item_${entry.id}"),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            HomeInboxPreviewMetaRow(entry = entry)
+            Text(
+                text = entry.title,
+                color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
+                fontFamily = headlineFamily,
+                fontSize = 14.5.sp,
+                lineHeight = 19.sp,
+                fontWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (entry.showsThumbnailPreview) {
+            EntryThumbnailPreview(entry = entry)
+        }
+    }
+}
+
+@Composable
+private fun HomeInboxPreviewMetaRow(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (entry.isUnread) {
+            Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(colors.accentBlue))
+        }
+        SiteFaviconBadge(
+            primaryFaviconUrl = entry.faviconUrl,
+            fallbackFaviconUrl = entry.fallbackFaviconUrl,
+            domain = entry.displayDomain,
+            title = entry.feedTitle,
+            size = 14.dp,
+        )
+        Text(
+            text = entry.feedTitle,
+            color = colors.textSecondary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        Text(
+            text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.5.sp,
+            maxLines = 1,
+        )
     }
 }
 
@@ -796,44 +1022,52 @@ internal fun HomeUpNextEmptyCard(onAction: (MainAction) -> Unit) {
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 HeaderActionButton(
-                    label = "Open Inbox",
-                    onClick = { onAction(MainAction.SelectTab(AppTab.INBOX)) },
+                    label = "Add to Want to Read",
+                    onClick = { onAction(MainAction.OpenAddSheet()) },
                 )
                 HeaderActionButton(
-                    label = "Save URL or Feed",
-                    onClick = { onAction(MainAction.OpenAddSheet()) },
+                    label = "Open Inbox",
+                    onClick = { onAction(MainAction.SelectTab(AppTab.INBOX)) },
                 )
             }
         }
     }
 }
 
-internal fun buildHomeSpotlightEntries(state: MainUiState): List<InboxEntry> {
+internal fun buildHomeSpotlightEntries(
+    state: MainUiState,
+    wantToReadIds: Set<String> =
+        state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(HashSet()) {
+            it.entry.id
+        },
+): List<InboxEntry> {
     val picked = LinkedHashMap<String, InboxEntry>()
     state.activePlayerEntry?.let { picked[it.id] = it }
-    for (queued in state.queueEntries) {
-        if (picked.size >= MAX_SPOTLIGHT_ITEMS) break
-        picked.putIfAbsent(queued.id, queued)
+    appendSpotlightSlice(picked, state.queueEntries)
+    if (wantToReadIds.isNotEmpty()) {
+        appendSpotlightSlice(picked, state.allEntries) { it.id in wantToReadIds }
     }
-    if (picked.size < MAX_SPOTLIGHT_ITEMS) {
-        state.allEntries
-            .filter { !it.isArchived && it.readProgress > 0.0 && it.readProgress < 0.98 }
-            .forEach { entry ->
-                if (picked.size < MAX_SPOTLIGHT_ITEMS) {
-                    picked.putIfAbsent(entry.id, entry)
-                }
-            }
+    appendSpotlightSlice(picked, state.allEntries) {
+        !it.isArchived && it.readProgress > 0.0 && it.readProgress < 0.98
     }
-    if (picked.size < MAX_SPOTLIGHT_ITEMS) {
-        state.allEntries
-            .filter { !it.isArchived && it.isUnread }
-            .forEach { entry ->
-                if (picked.size < MAX_SPOTLIGHT_ITEMS) {
-                    picked.putIfAbsent(entry.id, entry)
-                }
-            }
+    appendSpotlightSlice(picked, state.allEntries) {
+        it.inFeedInbox && !it.isArchived && it.isUnread
     }
     return picked.values.toList()
+}
+
+private inline fun appendSpotlightSlice(
+    target: LinkedHashMap<String, InboxEntry>,
+    source: List<InboxEntry>,
+    predicate: (InboxEntry) -> Boolean = { true },
+) {
+    if (target.size >= MAX_SPOTLIGHT_ITEMS) return
+    for (entry in source) {
+        if (target.size >= MAX_SPOTLIGHT_ITEMS) break
+        if (predicate(entry)) {
+            target.putIfAbsent(entry.id, entry)
+        }
+    }
 }
 
 @Composable
@@ -841,6 +1075,7 @@ internal fun HomeSpotlightRow(
     entry: InboxEntry,
     isPlayingAudio: Boolean,
     inQueue: Boolean,
+    inWantToRead: Boolean = false,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -854,6 +1089,7 @@ internal fun HomeSpotlightRow(
         when {
             isPlayingAudio -> "NOW PLAYING"
             inQueue -> "QUEUED"
+            inWantToRead && entry.readProgress <= 0.0 -> "WANT TO READ"
             entry.readProgress > 0.0 -> "${(entry.readProgress * 100).toInt()}% READ"
             else -> "LATEST UNREAD"
         }
@@ -1083,5 +1319,6 @@ internal fun HomeFeedShortcutRow(
 private val BENTO_TWO_COLUMN_BREAKPOINT = 340.dp
 private val WIDE_DASHBOARD_BREAKPOINT = 680.dp
 private const val MAX_SPOTLIGHT_ITEMS = 2
+private const val MAX_WIDGET_INBOX_ITEMS = 4
 private const val MAX_WIDGET_FEEDS = 4
 private const val MAX_WIDGET_TAGS = 6

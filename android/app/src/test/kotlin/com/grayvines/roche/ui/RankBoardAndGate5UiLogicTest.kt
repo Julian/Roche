@@ -346,10 +346,14 @@ class RankBoardAndGate5UiLogicTest {
     @Test
     fun `deriveRocheBackStack and popActionForTopKey model multi-layer navigation stacks`() {
         assertEquals(
-            listOf(RocheNavKey.Tab(AppTab.INBOX)),
+            listOf(RocheNavKey.Tab(AppTab.HOME)),
             deriveRocheBackStack(MainUiState()),
         )
-        assertNull(popActionForTopKey(RocheNavKey.Tab(AppTab.INBOX)))
+        assertNull(popActionForTopKey(RocheNavKey.Tab(AppTab.HOME)))
+        assertEquals(
+            MainAction.SelectTab(AppTab.HOME),
+            popActionForTopKey(RocheNavKey.Tab(AppTab.INBOX)),
+        )
 
         val scopedFromFeeds =
             MainUiState(
@@ -367,7 +371,7 @@ class RankBoardAndGate5UiLogicTest {
             )
         assertEquals(
             listOf(
-                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.HOME),
                 RocheNavKey.Tab(AppTab.FEEDS),
                 RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
                 RocheNavKey.Search,
@@ -390,22 +394,22 @@ class RankBoardAndGate5UiLogicTest {
             val collectJob = collectInBackground(viewModel.uiState)
             viewModel.uiState.first { it.allEntries.size == 1 }
 
-            viewModel.dispatch(MainAction.SelectTab(AppTab.HOME))
+            viewModel.dispatch(MainAction.SelectTab(AppTab.INBOX))
             viewModel.dispatch(MainAction.OpenSearch)
             viewModel.dispatch(MainAction.UpdateSearchQuery("Navigation"))
             viewModel.dispatch(MainAction.OpenReader("entry-search-1"))
 
             val readerOverSearchState =
                 viewModel.uiState.first {
-                    it.activeTab == AppTab.HOME &&
+                    it.activeTab == AppTab.INBOX &&
                         it.isSearchOpen &&
                         it.activeReaderEntry?.id == "entry-search-1"
                 }
             val stackInReader = deriveRocheBackStack(readerOverSearchState)
             assertEquals(
                 listOf(
-                    RocheNavKey.Tab(AppTab.INBOX),
                     RocheNavKey.Tab(AppTab.HOME),
+                    RocheNavKey.Tab(AppTab.INBOX),
                     RocheNavKey.Search,
                     RocheNavKey.Reader("entry-search-1"),
                 ),
@@ -421,8 +425,8 @@ class RankBoardAndGate5UiLogicTest {
             val stackInSearch = deriveRocheBackStack(backInSearchState)
             assertEquals(
                 listOf(
-                    RocheNavKey.Tab(AppTab.INBOX),
                     RocheNavKey.Tab(AppTab.HOME),
+                    RocheNavKey.Tab(AppTab.INBOX),
                     RocheNavKey.Search,
                 ),
                 stackInSearch,
@@ -433,13 +437,13 @@ class RankBoardAndGate5UiLogicTest {
             assertEquals(MainAction.CloseSearch, popSearch)
             viewModel.dispatch(popSearch!!)
 
-            val backInHomeState = viewModel.uiState.first { !it.isSearchOpen }
-            val stackInHome = deriveRocheBackStack(backInHomeState)
+            val backInInboxState = viewModel.uiState.first { !it.isSearchOpen }
+            val stackInInbox = deriveRocheBackStack(backInInboxState)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Tab(AppTab.HOME)),
-                stackInHome,
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Tab(AppTab.INBOX)),
+                stackInInbox,
             )
-            assertEquals(MainAction.SelectTab(AppTab.INBOX), popActionForTopKey(stackInHome.last()))
+            assertEquals(MainAction.SelectTab(AppTab.HOME), popActionForTopKey(stackInInbox.last()))
 
             collectJob.cancel()
         }
@@ -489,7 +493,7 @@ class RankBoardAndGate5UiLogicTest {
             assertNull(companionState.selectedTag)
             assertNull(companionState.scopeOriginTab)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Tab(AppTab.LISTS)),
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Tab(AppTab.LISTS)),
                 deriveRocheBackStack(companionState),
             )
 
@@ -539,7 +543,7 @@ class RankBoardAndGate5UiLogicTest {
             viewModel.playerController.cancelAutoTickerForTest()
             assertNull(inPlayer.selectedReaderEntryId)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.FullscreenPlayer("ep-nav-1")),
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
                 deriveRocheBackStack(inPlayer),
             )
 
@@ -554,7 +558,7 @@ class RankBoardAndGate5UiLogicTest {
             assertTrue(inReader.playerState.isPlaying)
             assertEquals(45_000L, inReader.playerState.positionMs)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.Reader("ep-nav-1")),
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Reader("ep-nav-1")),
                 deriveRocheBackStack(inReader),
             )
 
@@ -565,13 +569,13 @@ class RankBoardAndGate5UiLogicTest {
                 }
             val playerStack = deriveRocheBackStack(backInPlayer)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.INBOX), RocheNavKey.FullscreenPlayer("ep-nav-1")),
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
                 playerStack,
             )
 
             viewModel.dispatch(popActionForTopKey(playerStack.last())!!)
             val collapsed = viewModel.uiState.first { !it.playerState.isFullscreenOpen }
-            assertEquals(listOf(RocheNavKey.Tab(AppTab.INBOX)), deriveRocheBackStack(collapsed))
+            assertEquals(listOf(RocheNavKey.Tab(AppTab.HOME)), deriveRocheBackStack(collapsed))
             collectJob.cancel()
         }
 
@@ -629,7 +633,7 @@ class RankBoardAndGate5UiLogicTest {
             assertTrue(initialFrame.isInitialLoading)
             assertEquals(
                 listOf(
-                    RocheNavKey.Tab(AppTab.INBOX),
+                    RocheNavKey.Tab(AppTab.HOME),
                     RocheNavKey.Tab(AppTab.FEEDS),
                     RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
                     RocheNavKey.Search,
@@ -700,21 +704,21 @@ class RankBoardAndGate5UiLogicTest {
     private fun verifySyncRocheNavBackStackAndScrollSnapshot() {
         val liveStack =
             mutableListOf<androidx.navigation3.runtime.NavKey>(
-                RocheNavKey.Tab(AppTab.INBOX),
                 RocheNavKey.Tab(AppTab.HOME),
+                RocheNavKey.Tab(AppTab.INBOX),
                 RocheNavKey.Search,
             )
         syncRocheNavBackStack(
             liveStack,
             listOf(
-                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.HOME),
                 RocheNavKey.Tab(AppTab.FEEDS),
                 RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
             ),
         )
         assertEquals(
             listOf(
-                RocheNavKey.Tab(AppTab.INBOX),
+                RocheNavKey.Tab(AppTab.HOME),
                 RocheNavKey.Tab(AppTab.FEEDS),
                 RocheNavKey.ScopedInbox(feedId = "f-1", tag = null),
             ),

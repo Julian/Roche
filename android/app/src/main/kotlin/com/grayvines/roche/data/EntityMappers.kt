@@ -181,6 +181,7 @@ internal fun toInboxEntry(entity: InboxItemRow, tags: List<String>): InboxEntry 
         readAt = entity.readAt,
         thumbnailUrl = entity.thumbnailUrl,
         audioUrl = entity.audioUrl,
+        inFeedInbox = entity.feedId != null && !entity.inboxState.equals("none", ignoreCase = true),
     )
 
 @Suppress("CyclomaticComplexMethod")
@@ -299,8 +300,10 @@ internal fun createSavedItemEntity(
     title: String,
     hostTitle: String,
     type: ContentType,
+    inboxState: String = "unread",
+    explicitId: String? = null,
 ): InboxItemRow {
-    val id = deterministicItemId(null, url)
+    val id = explicitId ?: deterministicItemId(null, url)
     return InboxItemRow(
         id = id,
         feedId = null,
@@ -327,6 +330,7 @@ internal fun createSavedItemEntity(
         thumbnailMediaId = null,
         duration = null,
         audioUrl = if (type == ContentType.AUDIO) url else null,
+        inboxState = inboxState,
     )
 }
 

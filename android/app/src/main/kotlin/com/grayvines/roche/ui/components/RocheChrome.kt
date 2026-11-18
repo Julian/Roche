@@ -1,5 +1,11 @@
 package com.grayvines.roche.ui.components
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +29,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +41,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -55,9 +63,29 @@ fun RefreshIcon(
     tint: Color,
     modifier: Modifier = Modifier,
     size: Dp = 18.dp,
+    isSpinning: Boolean = false,
 ) {
     val arrowHead = remember { Path() }
-    Canvas(modifier = modifier.size(size)) {
+    val spinModifier =
+        if (isSpinning) {
+            val transition = rememberInfiniteTransition(label = "refresh_spin")
+            val angle by
+                transition.animateFloat(
+                    initialValue = 0f,
+                    targetValue = FULL_ROTATION_DEG,
+                    animationSpec =
+                        infiniteRepeatable(
+                            animation =
+                                tween(durationMillis = SPIN_DURATION_MS, easing = LinearEasing),
+                            repeatMode = RepeatMode.Restart,
+                        ),
+                    label = "refresh_angle",
+                )
+            Modifier.graphicsLayer { rotationZ = angle }
+        } else {
+            Modifier
+        }
+    Canvas(modifier = modifier.size(size).then(spinModifier)) {
         val strokeWidth = this.size.minDimension * REFRESH_STROKE_FRACTION
         val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
         val w = this.size.width
@@ -82,6 +110,9 @@ fun RefreshIcon(
     }
 }
 
+private const val SPIN_DURATION_MS = 900
+private const val FULL_ROTATION_DEG = 360f
+
 private const val REFRESH_STROKE_FRACTION = 0.085f
 private const val REFRESH_ARC_PADDING = 0.18f
 private const val REFRESH_START_ANGLE_DEG = 35f
@@ -95,12 +126,10 @@ private const val REFRESH_ARROW_TOP_Y = 0.14f
 fun RocheBottomBar(
     activeTab: AppTab,
     onSelectTab: (AppTab) -> Unit,
-    sideTabs: List<AppTab> = AppTab.defaultSideTabs,
+    sideTabs: List<AppTab> = AppTab.defaultBottomTabs,
 ) {
     val colors = LocalRocheColors.current
-    val normalizedSideTabs = AppTab.normalizeSideTabs(sideTabs)
-    val leftTabs = normalizedSideTabs.take(2)
-    val rightTabs = normalizedSideTabs.drop(2).take(2)
+    val tabs = AppTab.normalizeBottomTabs(sideTabs)
 
     Column(
         modifier =
@@ -115,18 +144,7 @@ fun RocheBottomBar(
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            leftTabs.forEach { tab ->
-                BottomBarTabItem(
-                    tab = tab,
-                    isSelected = tab == activeTab,
-                    onClick = { onSelectTab(tab) },
-                )
-            }
-            CenterInboxBarItem(
-                isSelected = activeTab == AppTab.INBOX,
-                onClick = { onSelectTab(AppTab.INBOX) },
-            )
-            rightTabs.forEach { tab ->
+            tabs.forEach { tab ->
                 BottomBarTabItem(
                     tab = tab,
                     isSelected = tab == activeTab,
@@ -134,52 +152,6 @@ fun RocheBottomBar(
                 )
             }
         }
-    }
-}
-
-@Composable
-private fun RowScope.CenterInboxBarItem(isSelected: Boolean, onClick: () -> Unit) {
-    val colors = LocalRocheColors.current
-    val pillShape = RoundedCornerShape(14.dp)
-    val pillBg = if (isSelected) colors.accentBlue else colors.surfaceElevated
-    val pillBorder = if (isSelected) colors.accentBlue else colors.accentBlue.copy(alpha = 0.38f)
-    val iconTint = if (isSelected) Color.White else colors.accentBlue
-    val labelColor = if (isSelected) colors.textPrimary else colors.textSecondary
-    val labelWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
-
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-        modifier =
-            Modifier.weight(1f)
-                .clip(RoundedCornerShape(10.dp))
-                .clickable(onClick = onClick)
-                .semantics {
-                    role = Role.Tab
-                    selected = isSelected
-                }
-                .padding(vertical = 6.dp)
-                .testTag("bottom_tab_inbox"),
-    ) {
-        Box(
-            modifier =
-                Modifier.width(48.dp)
-                    .height(28.dp)
-                    .clip(pillShape)
-                    .background(pillBg)
-                    .border(width = 1.dp, color = pillBorder, shape = pillShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            BottomTabIcon(tab = AppTab.INBOX, tint = iconTint, size = 19.dp)
-        }
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = AppTab.INBOX.label,
-            color = labelColor,
-            fontSize = 11.5.sp,
-            fontWeight = labelWeight,
-            maxLines = 1,
-        )
     }
 }
 

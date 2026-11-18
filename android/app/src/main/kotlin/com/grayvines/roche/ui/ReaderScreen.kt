@@ -434,7 +434,7 @@ private fun ReaderTopToolbar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            if (entry.contentType == ContentType.VIDEO) {
+            if (entry.contentType == ContentType.VIDEO || !entry.inFeedInbox) {
                 HeaderActionButton(
                     label = "✓ Finished",
                     style = RocheButtonStyle.PRIMARY,

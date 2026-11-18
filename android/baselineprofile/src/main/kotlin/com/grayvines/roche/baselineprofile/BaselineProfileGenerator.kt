@@ -25,9 +25,11 @@ class BaselineProfileGenerator {
             pressHome()
             startActivityAndWait()
             device.wait(Until.hasObject(By.res(BOTTOM_NAV_TAG)), TIMEOUT_MS)
-            device.wait(Until.gone(By.res(LOADING_STATE_TAG)), TIMEOUT_MS)
+            device.wait(Until.hasObject(By.res(HOME_SCREEN_TAG)), TIMEOUT_MS)
             device.waitForIdle()
 
+            clickTabWithRetry(device, OPEN_INBOX_BTN_TAG)
+            device.wait(Until.gone(By.res(LOADING_STATE_TAG)), TIMEOUT_MS)
             BOTTOM_TAB_TAGS.forEach { tabTag -> clickTabWithRetry(device, tabTag) }
         }
 
@@ -47,6 +49,8 @@ class BaselineProfileGenerator {
     private companion object {
         const val PACKAGE = "com.grayvines.roche"
         const val BOTTOM_NAV_TAG = "bottom_nav_bar"
+        const val HOME_SCREEN_TAG = "home_screen"
+        const val OPEN_INBOX_BTN_TAG = "home_open_inbox_btn"
         const val LOADING_STATE_TAG = "inbox_loading_state"
         const val TIMEOUT_MS = 10_000L
         const val MAX_ITERATIONS = 6
@@ -56,9 +60,9 @@ class BaselineProfileGenerator {
             listOf(
                 "bottom_tab_home",
                 "bottom_tab_feeds",
+                "bottom_tab_lists",
                 "bottom_tab_starred",
                 "bottom_tab_settings",
-                "bottom_tab_inbox",
             )
     }
 }

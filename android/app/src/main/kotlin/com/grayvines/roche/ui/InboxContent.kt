@@ -155,8 +155,8 @@ internal fun InboxEntryListBody(
             }
         } else {
             InboxEmptyState(
-                hasEntriesAtAll = state.allEntries.isNotEmpty(),
-                onSaveClick = { onAction(MainAction.OpenAddSheet()) },
+                hasEntriesAtAll = state.allEntries.any { it.inFeedInbox },
+                onManageFeedsClick = { onAction(MainAction.SelectTab(AppTab.FEEDS)) },
                 onSyncClick = { onAction(MainAction.SyncNow) },
             )
         }
@@ -291,7 +291,11 @@ internal fun InboxHeaderActions(
         onClick = onSync,
         modifier = Modifier.testTag("inbox_sync_btn"),
     ) {
-        RefreshIcon(tint = colors.textSecondary, size = 17.dp)
+        RefreshIcon(
+            tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
+            size = 17.dp,
+            isSpinning = state.isSyncing,
+        )
     }
     if (isSettingsUnpinned) {
         RocheIconActionButton(
@@ -390,7 +394,7 @@ private fun ArchiveAllConfirmDialog(
 @Composable
 private fun InboxEmptyState(
     hasEntriesAtAll: Boolean,
-    onSaveClick: () -> Unit,
+    onManageFeedsClick: () -> Unit,
     onSyncClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -405,16 +409,16 @@ private fun InboxEmptyState(
             Text(
                 text =
                     if (hasEntriesAtAll) {
-                        "No entries match this filter."
+                        "No feed items match this filter."
                     } else {
-                        "Your inbox is empty."
+                        "Your feed inbox is empty."
                     },
                 color = colors.textSecondary,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                HeaderActionButton(label = "Save URL or Feed", onClick = onSaveClick)
+                HeaderActionButton(label = "Manage Feeds", onClick = onManageFeedsClick)
                 HeaderActionButton(label = "Sync", onClick = onSyncClick)
             }
         }

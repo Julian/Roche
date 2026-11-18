@@ -325,26 +325,26 @@ internal fun NavigationSummaryCardSection(
     onOpenNavPage: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val currentTabs = AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
-    val leftSummary = currentTabs.take(2).joinToString(" · ") { it.label }
-    val rightSummary = currentTabs.drop(2).take(2).joinToString(" · ") { it.label }
-    val unpinnedTabs = AppTab.sideTabCandidates.filter { it !in currentTabs }
+    val currentTabs = AppTab.normalizeBottomTabs(state.settings.bottomNavTabs)
+    val summary = currentTabs.joinToString(" · ") { it.label }
+    val unpinnedTabs = AppTab.bottomTabCandidates.filter { it !in currentTabs }
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Navigation")
         RocheSurfaceCard {
             SettingsDrilldownRow(
                 title = "Bottom Navigation Bar",
-                subtitle = "$leftSummary · [Inbox] · $rightSummary",
+                subtitle = summary,
                 onClick = onOpenNavPage,
                 modifier = Modifier.testTag("settings_nav_row"),
             ) {
-                BottomTabIcon(tab = AppTab.INBOX, tint = colors.accentBlue, size = 18.dp)
+                BottomTabIcon(tab = AppTab.HOME, tint = colors.accentBlue, size = 18.dp)
             }
             unpinnedTabs.forEach { unpinnedTab ->
                 val unpinnedSubtitle =
                     when (unpinnedTab) {
                         AppTab.HOME -> "Quick access to your unpinned Home widgets"
+                        AppTab.INBOX -> "Read-only chronological stream from subscribed feeds"
                         AppTab.QUEUE ->
                             "Quick access to your unpinned tab (${state.queueEntries.size} queued)"
                         AppTab.OFFLINE ->

@@ -1,8 +1,10 @@
 package com.grayvines.roche
 
 import android.content.Intent
+import com.grayvines.roche.model.ContentType
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ShareIntentParserTest {
@@ -265,5 +267,84 @@ class ShareIntentParserTest {
                 extraText = "   ",
             )
         )
+    }
+
+    @Test
+    fun `extractSharedContent handles application pdf with originating url arxiv filename and local stream`() {
+        val pdfWithOriginUrl =
+            extractSharedContent(
+                action = Intent.ACTION_SEND,
+                mimeType = "application/pdf",
+                originatingUri = "https://arxiv.org/pdf/2603.11842.pdf",
+                streamUri = "content://com.android.providers.downloads.documents/document/42",
+                streamDisplayName = "Speculative_Decoding.pdf",
+            )
+        assertEquals(
+            SharedContentPayload(
+                url = "https://arxiv.org/pdf/2603.11842.pdf",
+                title = "Speculative_Decoding",
+                forcedContentType = ContentType.PDF,
+                pdfStreamUri = "content://com.android.providers.downloads.documents/document/42",
+            ),
+            pdfWithOriginUrl,
+        )
+
+        val arxivPdfStreamOnly =
+            extractSharedContent(
+                action = Intent.ACTION_SEND,
+                mimeType = "application/pdf",
+                streamUri = "content://downloads/public_downloads/99",
+                streamDisplayName = "2603.11842v2.pdf",
+            )
+        assertEquals(
+            SharedContentPayload(
+                url = "https://arxiv.org/pdf/2603.11842v2",
+                title = "arXiv:2603.11842v2",
+                forcedContentType = ContentType.PDF,
+                pdfStreamUri = "content://downloads/public_downloads/99",
+            ),
+            arxivPdfStreamOnly,
+        )
+
+        val localOnlyPdf =
+            extractSharedContent(
+                action = Intent.ACTION_SEND,
+                mimeType = "application/pdf",
+                streamUri = "content://media/external/file/77",
+                streamDisplayName = "Distributed_Consensus_Notes.pdf",
+            )
+        assertTrue(localOnlyPdf != null && localOnlyPdf.url.startsWith("localpdf://"))
+        assertEquals("Distributed_Consensus_Notes", localOnlyPdf?.title)
+        assertEquals(ContentType.PDF, localOnlyPdf?.forcedContentType)
+        assertEquals("content://media/external/file/77", localOnlyPdf?.pdfStreamUri)
+    }
+
+    @Test
+    fun `extractSharedContent supports text html hrefs and text uri-list mime types`() {
+        val fromHtml =
+            extractSharedContent(
+                action = Intent.ACTION_SEND,
+                mimeType = "text/html",
+                extraHtmlText =
+                    """<p>Read <a href="https://blog.example.com/essay">this essay</a></p>""",
+                extraSubject = "Essay on Storage Engines",
+            )
+        assertEquals(
+            SharedContentPayload(
+                url = "https://blog.example.com/essay",
+                title = "Essay on Storage Engines",
+                forcedContentType = null,
+                pdfStreamUri = null,
+            ),
+            fromHtml,
+        )
+
+        val fromUriList =
+            extractSharedContent(
+                action = Intent.ACTION_SEND,
+                mimeType = "text/uri-list",
+                clipUri = "https://blog.example.com/feed-home",
+            )
+        assertEquals("https://blog.example.com/feed-home", fromUriList?.url)
     }
 }

@@ -481,6 +481,7 @@ class RocheRepositoryTest {
             val savedItem = entries.first { it.url == "https://example.com/offline-note" }
             assertEquals("Offline Note", savedItem.title)
             assertEquals(listOf("crdt"), savedItem.tags)
+            assertFalse(savedItem.inFeedInbox)
         }
 
     @Test
@@ -1482,6 +1483,8 @@ internal fun buildOfflineCacheMockClient(
 internal fun assertTwoWaySyncPushedRequests(pushedBodies: List<String>) {
     val body = pushedBodies.single()
     assertTrue(body.contains("https://example.com/offline-note"))
+    assertTrue(body.contains(""""slug":"want:read""""))
+    assertTrue(body.contains(""""collection_id":"$WANT_TO_READ_COLLECTION_ID""""))
     assertTrue(body.contains(""""inbox_state":"dismissed""""))
     assertTrue(body.contains(""""progress":0.9"""))
     assertTrue(body.contains(""""title":"rust""""))

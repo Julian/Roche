@@ -1,5 +1,6 @@
 package com.grayvines.roche.data
 
+import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
 import com.grayvines.roche.data.local.RocheDao
@@ -9,6 +10,7 @@ import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.buildSqlContainsPattern
 import com.grayvines.roche.data.local.deleteEntryCascade
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
+import com.grayvines.roche.data.local.ensureWantToReadSpecExists
 import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.local.insertItemTag
 import com.grayvines.roche.data.local.removeItemTag
@@ -28,19 +30,24 @@ import com.grayvines.roche.data.settings.keepTokenOnDiscovery
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
 import com.grayvines.roche.data.settings.tailscaleHttpsUpgrades
+import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.io.File
+import java.io.InputStream
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
@@ -98,8 +105,14 @@ class RocheRepository(
     private val itemMutationMutex = Mutex()
     private val backgroundSyncRunning = AtomicBoolean(false)
     private val backgroundSyncPending = AtomicBoolean(false)
+    private val activeSyncCount = AtomicInteger(0)
+    private val _isSyncActive = MutableStateFlow(false)
+    val isSyncActive: StateFlow<Boolean> = _isSyncActive.asStateFlow()
     private val entryCache = InboxEntryCache()
     private val activePeersFlow = MutableStateFlow<List<PeerNodeDto>>(emptyList())
+    internal val hasBackgroundScope: Boolean
+        get() = backgroundScope != null
+
     val catalog: CatalogStore =
         CatalogStore(
             dao = dao,
@@ -351,6 +364,13 @@ class RocheRepository(
         entryIds: List<String>,
         feedId: String? = null,
         allUnread: Boolean = false,
+    ): List<ArchiveStateSnapshot> =
+        withContext(Dispatchers.Default) { archiveBatchInternal(entryIds, feedId, allUnread) }
+
+    private suspend fun archiveBatchInternal(
+        entryIds: List<String>,
+        feedId: String?,
+        allUnread: Boolean,
     ): List<ArchiveStateSnapshot> {
         val targetIds = resolveArchiveBatchTargetIds(dao, entryIds, feedId, allUnread)
         val unarchivedItems = dao.getUnarchivedItemStates().filter { it.id in targetIds }
@@ -415,37 +435,49 @@ class RocheRepository(
             ?: entry.audioUrl?.takeIf { it.isNotBlank() }
             ?: entry.url
 
-    internal suspend fun importOpml(opmlXml: String): Result<Int> = runSuspendCatching {
-        val trimmed = opmlXml.trim()
-        check(trimmed.isNotBlank()) { "OPML file is empty" }
-        val currentSettings = settings.settings.first()
-        check(currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
-            "Configure Server URL in Settings before importing OPML"
-        }
-        val imported =
-            apiClient.importOpml(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                opmlXml = trimmed,
-            )
-        syncWithServer()
-        imported
-    }
-
-    internal suspend fun exportOpml(): Result<String> = runSuspendCatching {
-        val currentSettings = settings.settings.first()
-        if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
+    internal suspend fun importOpml(opmlXml: String): Result<Int> =
+        withContext(Dispatchers.Default) {
             runSuspendCatching {
-                apiClient.exportOpml(
-                    serverUrl = currentSettings.serverUrl,
-                    token = currentSettings.bearerToken,
-                )
+                val trimmed = opmlXml.trim()
+                check(trimmed.isNotBlank()) { "OPML file is empty" }
+                val currentSettings = settings.settings.first()
+                check(
+                    currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank()
+                ) {
+                    "Configure Server URL in Settings before importing OPML"
+                }
+                val imported =
+                    apiClient.importOpml(
+                        serverUrl = currentSettings.serverUrl,
+                        token = currentSettings.bearerToken,
+                        opmlXml = trimmed,
+                    )
+                syncWithServer()
+                imported
             }
-                .getOrElse { buildLocalOpmlXml(dao.getAllFeeds()) }
-        } else {
-            buildLocalOpmlXml(dao.getAllFeeds())
         }
-    }
+
+    internal suspend fun exportOpml(): Result<String> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val currentSettings = settings.settings.first()
+                if (
+                    currentSettings.serverUrl.isNotBlank() &&
+                        currentSettings.bearerToken.isNotBlank()
+                ) {
+                    runSuspendCatching {
+                        apiClient.exportOpml(
+                            serverUrl = currentSettings.serverUrl,
+                            token = currentSettings.bearerToken,
+                        )
+                    }
+                        .getOrElse { buildLocalOpmlXml(dao.getAllFeeds()) }
+                } else {
+                    buildLocalOpmlXml(dao.getAllFeeds())
+                }
+            }
+        }
 
     internal suspend fun updateReadProgress(
         itemId: String,
@@ -551,105 +583,249 @@ class RocheRepository(
         return taggedCount
     }
 
-    suspend fun refreshFeed(feedId: String): Result<String> = runSuspendCatching {
-        val title =
-            refreshFeedOnlineOrOnDevice(
-                dao = dao,
-                apiClient = apiClient,
-                settings = settings,
-                feedId = feedId,
-                onSyncWithServer = { syncWithServer() },
-            )
-        offlineCacheManager.autoDownloadNewEpisodes()
-        title
-    }
-
-    suspend fun deleteFeed(feedId: String): Result<String> = runSuspendCatching {
-        val deletedTitle =
-            deleteFeedFromServerOrLocal(
-                dao = dao,
-                apiClient = apiClient,
-                settings = settings,
-                offlineCacheManager = offlineCacheManager,
-                feedId = feedId,
-            )
-        triggerBackgroundSync()
-        deletedTitle
-    }
-
-    suspend fun deleteItem(itemId: String): Result<String> = runSuspendCatching {
-        val existing = dao.getItemById(itemId)
-        val nodeId = currentLocalPeerId()
-        offlineCacheManager.evictCachedItemFiles(itemId)
-        dao.executeInTransaction {
-            if (existing != null && existing.url.isNotBlank()) {
-                val feedUrl =
-                    existing.feedUrl ?: existing.feedId?.let { fid -> dao.getFeedById(fid)?.url }
-                val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
-                val hlc = nextLocalHlc(dao, nodeId)
-                dao.upsertTombstone(
-                    TombstoneEntity(
-                        entityType = "item",
-                        naturalKey = itemNaturalKey(feedUrl, existing.url),
-                        deletedAt = nowIso,
-                        hlc = hlc,
-                        isLocalDirty = true,
+    suspend fun refreshFeed(feedId: String): Result<String> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val title =
+                    refreshFeedOnlineOrOnDevice(
+                        dao = dao,
+                        apiClient = apiClient,
+                        settings = settings,
+                        feedId = feedId,
+                        onSyncWithServer = { syncWithServer() },
                     )
-                )
+                offlineCacheManager.autoDownloadNewEpisodes()
+                title
             }
-            dao.deleteItemPreservingHistory(
-                itemId = itemId,
-                recordTombstones = true,
-                nodeId = nodeId,
-            )
         }
-        triggerBackgroundSync()
-        existing?.title ?: itemId
     }
+
+    suspend fun deleteFeed(feedId: String): Result<String> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val deletedTitle =
+                    deleteFeedFromServerOrLocal(
+                        dao = dao,
+                        apiClient = apiClient,
+                        settings = settings,
+                        offlineCacheManager = offlineCacheManager,
+                        feedId = feedId,
+                    )
+                triggerBackgroundSync()
+                deletedTitle
+            }
+        }
+
+    suspend fun deleteItem(itemId: String): Result<String> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val existing = dao.getItemById(itemId)
+                val nodeId = currentLocalPeerId()
+                offlineCacheManager.evictCachedItemFiles(itemId)
+                dao.executeInTransaction {
+                    if (existing != null && existing.url.isNotBlank()) {
+                        val feedUrl =
+                            existing.feedUrl
+                                ?: existing.feedId?.let { fid -> dao.getFeedById(fid)?.url }
+                        val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+                        val hlc = nextLocalHlc(dao, nodeId)
+                        dao.upsertTombstone(
+                            TombstoneEntity(
+                                entityType = "item",
+                                naturalKey = itemNaturalKey(feedUrl, existing.url),
+                                deletedAt = nowIso,
+                                hlc = hlc,
+                                isLocalDirty = true,
+                            )
+                        )
+                    }
+                    dao.deleteItemPreservingHistory(
+                        itemId = itemId,
+                        recordTombstones = true,
+                        nodeId = nodeId,
+                    )
+                }
+                triggerBackgroundSync()
+                existing?.title ?: itemId
+            }
+        }
 
     suspend fun saveUrlOrFeed(
         inputUrl: String,
         titleOverride: String?,
         tagCsv: String,
-    ): SaveUrlResult {
-        val trimmedUrl = inputUrl.trim()
-        if (isLikelyFeedUrl(trimmedUrl)) {
-            val feedTitle =
-                subscribeFeedBestEffort(
-                    dao = dao,
-                    apiClient = apiClient,
-                    settings = settings,
-                    url = trimmedUrl,
-                    titleOverride = titleOverride,
-                )
-            triggerBackgroundSync()
-            return SaveUrlResult(title = feedTitle, kind = SavedResourceKind.FEED)
-        }
-        val tags = parseTagCsv(tagCsv)
-        val inferredType = inferContentType(trimmedUrl)
-        val hostTitle = extractHostTitle(trimmedUrl)
-        val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
-        val resolvedTitle = cleanTitleOverride ?: "$hostTitle — Saved Entry"
-        val localEntity = createSavedItemEntity(trimmedUrl, resolvedTitle, hostTitle, inferredType)
-
-        dao.deleteTombstone("item", itemNaturalKey(null, trimmedUrl))
-        dao.upsertItem(localEntity, markDirty = true)
-        attachTagsLocally(dao = dao, itemId = localEntity.id, tagNames = tags, markDirty = true)
-
-        val remoteSaved = pushSavedUrlBestEffort(trimmedUrl, cleanTitleOverride, tags)
-        val finalEntity =
-            if (remoteSaved != null && remoteSaved.id.isNotBlank()) {
-                finalizeOnlineSavedItem(
-                    dao = dao,
-                    localEntity = localEntity,
-                    remoteSaved = remoteSaved,
-                    initialTags = tags,
-                )
+    ): SaveUrlResult =
+        withContext(Dispatchers.Default) {
+            val trimmedUrl = normalizeUserSubmittedUrl(inputUrl)
+            if (isLikelyFeedUrl(trimmedUrl)) {
+                val feedTitle =
+                    subscribeFeedBestEffort(
+                        dao = dao,
+                        apiClient = apiClient,
+                        settings = settings,
+                        url = trimmedUrl,
+                        titleOverride = titleOverride,
+                    )
+                triggerBackgroundSync()
+                SaveUrlResult(title = feedTitle, kind = SavedResourceKind.FEED)
             } else {
-                localEntity
+                addUrlToWantToRead(
+                    inputUrl = trimmedUrl,
+                    titleOverride = titleOverride,
+                    tagCsv = tagCsv,
+                )
             }
-        triggerBackgroundSync()
-        return SaveUrlResult(title = finalEntity.title, kind = SavedResourceKind.ITEM)
+        }
+
+    suspend fun addUrlToWantToRead(
+        inputUrl: String,
+        titleOverride: String? = null,
+        tagCsv: String = "",
+        forcedContentType: ContentType? = null,
+        pdfInputStream: InputStream? = null,
+    ): SaveUrlResult =
+        withContext(Dispatchers.Default) {
+            val normalizedUrl = normalizeUserSubmittedUrl(inputUrl)
+            check(normalizedUrl.isNotBlank()) { "Enter a valid URL" }
+            val tags = parseTagCsv(tagCsv)
+            val inferredType = forcedContentType ?: inferContentType(normalizedUrl)
+            val isLocalPdf = normalizedUrl.startsWith("localpdf://", ignoreCase = true)
+            val hostTitle = if (isLocalPdf) "Local PDF" else extractHostTitle(normalizedUrl)
+            val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
+            val resolvedTitle =
+                cleanTitleOverride
+                    ?: if (inferredType == ContentType.PDF) {
+                        "$hostTitle — PDF"
+                    } else {
+                        "$hostTitle — Saved Entry"
+                    }
+            val localEntity =
+                createSavedItemEntity(
+                    url = normalizedUrl,
+                    title = resolvedTitle,
+                    hostTitle = hostTitle,
+                    type = inferredType,
+                    inboxState = "none",
+                )
+            persistWantToReadItemLocally(localEntity, normalizedUrl, tags)
+            launchWantToReadEnrichment(
+                itemId = localEntity.id,
+                url = normalizedUrl,
+                hasUserTitleOverride = cleanTitleOverride != null,
+                pdfInputStream = pdfInputStream,
+            )
+            SaveUrlResult(title = localEntity.title, kind = SavedResourceKind.ITEM)
+        }
+
+    private suspend fun persistWantToReadItemLocally(
+        localEntity: InboxItemRow,
+        normalizedUrl: String,
+        tags: List<String>,
+    ) {
+        val nodeId = currentLocalPeerId()
+        val isSyncable = isSyncableItemUrl(normalizedUrl)
+        dao.executeInTransaction {
+            val nowIso = nowUtcIso()
+            val hlc = nextLocalHlc(dao, nodeId)
+            dao.ensureWantToReadSpecExists(markDirty = isSyncable, nodeId = nodeId)
+            if (isSyncable) {
+                dao.getEntryById(WANT_TO_READ_COLLECTION_ID)?.let { wantCol ->
+                    dao.upsertEntry(
+                        wantCol.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
+                    )
+                }
+            }
+            dao.deleteTombstone("item", itemNaturalKey(null, normalizedUrl))
+            dao.deleteTombstone(
+                COLLECTION_ENTRY_ENTITY,
+                collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, localEntity.id),
+            )
+            dao.upsertItem(localEntity, markDirty = isSyncable, hlcOverride = hlc)
+            dao.upsertCollectionEntry(
+                CollectionEntryEntity(
+                    collectionId = WANT_TO_READ_COLLECTION_ID,
+                    entryId = localEntity.id,
+                    position = null,
+                    addedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = isSyncable,
+                )
+            )
+            attachTagsLocally(
+                dao = dao,
+                itemId = localEntity.id,
+                tagNames = tags,
+                markDirty = isSyncable,
+            )
+        }
+    }
+
+    private suspend fun launchWantToReadEnrichment(
+        itemId: String,
+        url: String,
+        hasUserTitleOverride: Boolean,
+        pdfInputStream: InputStream?,
+    ) {
+        val scope = backgroundScope
+        if (scope != null) {
+            scope.launch(Dispatchers.IO) {
+                if (pdfInputStream != null) {
+                    copySharedPdfStreamToCache(dao, cacheDir, itemId, pdfInputStream)
+                }
+                runSuspendCatching {
+                    enrichWantToReadItemOnDevice(
+                        dao = dao,
+                        apiClient = apiClient,
+                        itemId = itemId,
+                        url = url,
+                        hasUserTitleOverride = hasUserTitleOverride,
+                    )
+                }
+                triggerBackgroundSync()
+            }
+        } else {
+            if (pdfInputStream != null) {
+                copySharedPdfStreamToCache(dao, cacheDir, itemId, pdfInputStream)
+            }
+            triggerBackgroundSync()
+        }
+    }
+
+    suspend fun discoverAndSubscribeFeed(
+        inputUrl: String,
+        titleOverride: String? = null,
+    ): Result<SaveUrlResult> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            runSuspendCatching {
+                val discovered = discoverFeedFromUrl(apiClient, inputUrl).getOrThrow()
+                val effectiveTitle =
+                    titleOverride?.trim()?.takeIf { it.isNotBlank() } ?: discovered.siteTitle
+                val subscribedTitle =
+                    subscribeFeedBestEffort(
+                        dao = dao,
+                        apiClient = apiClient,
+                        settings = settings,
+                        url = discovered.feedUrl,
+                        titleOverride = effectiveTitle,
+                        prefetchedBatch = discovered.prefetchedBatch,
+                    )
+                triggerBackgroundSync()
+                SaveUrlResult(title = subscribedTitle, kind = SavedResourceKind.FEED)
+            }
+        }
+    }
+
+    fun subscribeFeedInBackground(
+        inputUrl: String,
+        titleOverride: String? = null,
+        onComplete: (Result<SaveUrlResult>) -> Unit = {},
+    ) {
+        val scope = backgroundScope ?: CoroutineScope(Dispatchers.IO)
+        scope.launch {
+            val result =
+                discoverAndSubscribeFeed(inputUrl = inputUrl, titleOverride = titleOverride)
+            onComplete(result)
+        }
     }
 
     internal suspend fun discoverServer(
@@ -720,59 +896,81 @@ class RocheRepository(
         token
     }
 
-    suspend fun syncWithServer(): Result<Int> = syncMutex.withLock {
-        runSuspendCatching {
-            val currentSettings = settings.settings.first()
-            val currentTier = networkTierProvider.currentNetworkTier()
-            if (currentSettings.serverUrl.isBlank()) {
-                if (currentTier != NetworkTier.OFFLINE) {
-                    pollCooperativeFeedsOnDevice(
-                        dao = dao,
-                        apiClient = apiClient,
-                        localPeerId = currentSettings.peerId,
-                        activePeers = emptyList(),
-                    )
-                }
-                error("Configure Server URL in Settings")
+    private inline fun <T> withSyncIndicator(block: () -> T): T {
+        if (activeSyncCount.getAndIncrement() == 0) {
+            _isSyncActive.value = true
+        }
+        return try {
+            block()
+        } finally {
+            if (activeSyncCount.decrementAndGet() <= 0) {
+                activeSyncCount.set(0)
+                _isSyncActive.value = false
             }
-            check(currentSettings.bearerToken.isNotBlank()) {
-                "Pair device in Settings before syncing"
-            }
-            val syncedCount =
-                peerSyncCoordinator(currentTier).syncAndCooperativePoll(currentSettings)
-                    ?: error("Peer sync endpoint unavailable on server")
-            offlineCacheManager.autoDownloadNewEpisodes()
-            syncedCount
         }
     }
 
-    suspend fun pollDueFeedsOnDeviceNow(): Result<Int> = syncMutex.withLock {
-        runSuspendCatching {
-            val currentTier = networkTierProvider.currentNetworkTier()
-            check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
-            val currentSettings = settings.settings.first()
-            val pollOutcome =
-                pollCooperativeFeedsOnDevice(
-                    dao = dao,
-                    apiClient = apiClient,
-                    localPeerId = currentSettings.peerId,
-                    activePeers = activePeersFlow.value,
-                )
-            if (
-                pollOutcome.polledFeedsCount > 0 &&
-                    currentSettings.serverUrl.isNotBlank() &&
-                    currentSettings.bearerToken.isNotBlank()
-            ) {
+    suspend fun syncWithServer(): Result<Int> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            syncMutex.withLock {
                 runSuspendCatching {
-                    peerSyncCoordinator(currentTier)
-                        .syncAndCooperativePoll(
-                            currentSettings = currentSettings,
-                            initialWeightOverride = pollOutcome.measuredWeight,
-                        )
+                    val currentSettings = settings.settings.first()
+                    val currentTier = networkTierProvider.currentNetworkTier()
+                    if (currentSettings.serverUrl.isBlank()) {
+                        if (currentTier != NetworkTier.OFFLINE) {
+                            pollCooperativeFeedsOnDevice(
+                                dao = dao,
+                                apiClient = apiClient,
+                                localPeerId = currentSettings.peerId,
+                                activePeers = emptyList(),
+                            )
+                        }
+                        error("Configure Server URL in Settings")
+                    }
+                    check(currentSettings.bearerToken.isNotBlank()) {
+                        "Pair device in Settings before syncing"
+                    }
+                    val syncedCount =
+                        peerSyncCoordinator(currentTier).syncAndCooperativePoll(currentSettings)
+                            ?: error("Peer sync endpoint unavailable on server")
+                    offlineCacheManager.autoDownloadNewEpisodes()
+                    syncedCount
                 }
             }
-            offlineCacheManager.autoDownloadNewEpisodes()
-            pollOutcome.polledFeedsCount
+        }
+    }
+
+    suspend fun pollDueFeedsOnDeviceNow(): Result<Int> = withSyncIndicator {
+        withContext(Dispatchers.Default) {
+            syncMutex.withLock {
+                runSuspendCatching {
+                    val currentTier = networkTierProvider.currentNetworkTier()
+                    check(currentTier != NetworkTier.OFFLINE) { "Device is currently offline" }
+                    val currentSettings = settings.settings.first()
+                    val pollOutcome =
+                        pollCooperativeFeedsOnDevice(
+                            dao = dao,
+                            apiClient = apiClient,
+                            localPeerId = currentSettings.peerId,
+                            activePeers = activePeersFlow.value,
+                        )
+                    if (
+                        pollOutcome.polledFeedsCount > 0 &&
+                            currentSettings.serverUrl.isNotBlank() &&
+                            currentSettings.bearerToken.isNotBlank()
+                    ) {
+                        runSuspendCatching {
+                            peerSyncCoordinator(currentTier)
+                                .syncAndCooperativePoll(
+                                    currentSettings = currentSettings,
+                                    initialWeightOverride = pollOutcome.measuredWeight,
+                                )
+                        }
+                    }
+                    offlineCacheManager.autoDownloadNewEpisodes()
+                    pollOutcome.polledFeedsCount
+                }
+            }
         }
     }
 
@@ -788,15 +986,17 @@ class RocheRepository(
             val syncResult = syncWithServer()
             if (syncResult.isSuccess) return syncResult
         }
-        return syncMutex.withLock {
-            runSuspendCatching {
-                pollCooperativeFeedsOnDevice(
-                        dao = dao,
-                        apiClient = apiClient,
-                        localPeerId = currentSettings.peerId,
-                        activePeers = activePeersFlow.value,
-                    )
-                    .polledFeedsCount
+        return withSyncIndicator {
+            syncMutex.withLock {
+                runSuspendCatching {
+                    pollCooperativeFeedsOnDevice(
+                            dao = dao,
+                            apiClient = apiClient,
+                            localPeerId = currentSettings.peerId,
+                            activePeers = activePeersFlow.value,
+                        )
+                        .polledFeedsCount
+                }
             }
         }
     }
@@ -851,26 +1051,6 @@ class RocheRepository(
                 settings.update { it.copy(lastPeerSyncCursor = cursor) }
             },
         )
-
-    internal suspend fun pushSavedUrlBestEffort(
-        url: String,
-        titleOverride: String?,
-        tags: List<String>,
-    ): RemoteItemDto? = runSuspendCatching {
-        val currentSettings = settings.settings.first()
-        if (currentSettings.serverUrl.isBlank() || currentSettings.bearerToken.isBlank()) {
-            null
-        } else {
-            apiClient.saveItemUrl(
-                serverUrl = currentSettings.serverUrl,
-                token = currentSettings.bearerToken,
-                url = url,
-                title = titleOverride,
-                tags = tags,
-            )
-        }
-    }
-        .getOrNull()
 
     internal suspend fun markFeedItemFinished(itemId: String): String? {
         val item = dao.getItemById(itemId) ?: return null

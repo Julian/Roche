@@ -9,16 +9,22 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -40,7 +46,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
@@ -52,6 +61,7 @@ import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon
+import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.UndoOrStatusSnackbar
@@ -84,20 +94,7 @@ fun MainScreen(
     val retainedScopedStates = remember {
         mutableStateMapOf<RocheNavKey.ScopedInbox, MainUiState>()
     }
-    if (state.selectedFeedId != null || state.selectedTag != null) {
-        val activeScopedKey =
-            RocheNavKey.ScopedInbox(
-                feedId = state.selectedFeedId,
-                tag = state.selectedTag,
-            )
-        if (
-            activeScopedKey !in retainedScopedStates &&
-                retainedScopedStates.size >= MAX_RETAINED_SCOPED_STATES
-        ) {
-            retainedScopedStates.keys.firstOrNull()?.let(retainedScopedStates::remove)
-        }
-        retainedScopedStates[activeScopedKey] = state
-    }
+    cacheActiveScopedState(state, retainedScopedStates)
     val currentState by rememberUpdatedState(state)
     val currentRetainedSearch by rememberUpdatedState(retainedSearchState)
     val currentPlayerEntry by rememberUpdatedState(activePlayerEntry)
@@ -120,15 +117,11 @@ fun MainScreen(
     val navBackStack = rememberNavBackStack(*desiredBackStack.toTypedArray())
     syncRocheNavBackStack(navBackStack, desiredBackStack)
     val topKey = navBackStack.lastOrNull() as? RocheNavKey ?: desiredBackStack.last()
-    val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
-    val hasFab =
-        showChrome &&
-            topKey !is RocheNavKey.Search &&
-            (topKey as? RocheNavKey.Tab)?.tab != AppTab.SETTINGS
+    val chromeFlags = computeChromeFlags(topKey)
     val activeTabForBar = resolveBarTab(topKey, state)
     var chromeBottomPx by remember { mutableIntStateOf(0) }
     val snackbarBottomOffset =
-        if (showChrome) {
+        if (chromeFlags.showChrome) {
             with(LocalDensity.current) { chromeBottomPx.toDp() }
         } else {
             0.dp
@@ -143,8 +136,9 @@ fun MainScreen(
         MainDestinationScaffold(
             state = state,
             activePlayerEntry = activePlayerEntry,
-            showBottomBar = showChrome,
-            hasFab = hasFab,
+            showBottomBar = chromeFlags.showChrome,
+            hasFab = chromeFlags.hasFab,
+            showAddFab = chromeFlags.showAddFab,
             activeTabForBar = activeTabForBar,
             onChromeBottomHeightChange = { chromeBottomPx = it },
             onAction = onAction,
@@ -218,11 +212,13 @@ fun MainScreen(
 
         MainSnackbarOverlay(
             state = state,
-            hasFab = hasFab,
+            hasFab = chromeFlags.hasFab,
             onAction = onAction,
             modifier =
                 Modifier.align(Alignment.BottomCenter)
-                    .then(if (!showChrome) Modifier.navigationBarsPadding() else Modifier)
+                    .then(
+                        if (!chromeFlags.showChrome) Modifier.navigationBarsPadding() else Modifier
+                    )
                     .padding(bottom = snackbarBottomOffset)
                     .imePadding(),
         )
@@ -234,6 +230,46 @@ fun MainScreen(
         onShareEntry = onShareEntry,
         onOpenExternalUrl = onOpenExternalUrl,
     )
+}
+
+private data class MainChromeFlags(
+    val showChrome: Boolean,
+    val hasFab: Boolean,
+    val showAddFab: Boolean,
+)
+
+private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
+    val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
+    val isInboxTop =
+        topKey is RocheNavKey.ScopedInbox || (topKey as? RocheNavKey.Tab)?.tab == AppTab.INBOX
+    val hasFab =
+        showChrome &&
+            topKey !is RocheNavKey.Search &&
+            (topKey as? RocheNavKey.Tab)?.tab != AppTab.SETTINGS
+    return MainChromeFlags(
+        showChrome = showChrome,
+        hasFab = hasFab,
+        showAddFab = hasFab && !isInboxTop,
+    )
+}
+
+private fun cacheActiveScopedState(
+    state: MainUiState,
+    retainedScopedStates: MutableMap<RocheNavKey.ScopedInbox, MainUiState>,
+) {
+    if (state.selectedFeedId == null && state.selectedTag == null) return
+    val activeScopedKey =
+        RocheNavKey.ScopedInbox(
+            feedId = state.selectedFeedId,
+            tag = state.selectedTag,
+        )
+    if (
+        activeScopedKey !in retainedScopedStates &&
+            retainedScopedStates.size >= MAX_RETAINED_SCOPED_STATES
+    ) {
+        retainedScopedStates.keys.firstOrNull()?.let(retainedScopedStates::remove)
+    }
+    retainedScopedStates[activeScopedKey] = state
 }
 
 private fun resolveBarTab(topKey: RocheNavKey, state: MainUiState): AppTab =
@@ -253,6 +289,7 @@ internal fun MainDestinationScaffold(
     activePlayerEntry: InboxEntry?,
     showBottomBar: Boolean,
     hasFab: Boolean,
+    showAddFab: Boolean = hasFab,
     activeTabForBar: AppTab,
     onChromeBottomHeightChange: (Int) -> Unit,
     onAction: (MainAction) -> Unit,
@@ -265,6 +302,7 @@ internal fun MainDestinationScaffold(
         floatingActionButton = {
             if (hasFab) {
                 FloatingOverlayButtonStack(
+                    showAddFab = showAddFab,
                     onOpenSearch = { onAction(MainAction.OpenSearch) },
                     onOpenAddSheet = { onAction(MainAction.OpenAddSheet()) },
                 )
@@ -290,6 +328,56 @@ internal fun MainDestinationScaffold(
                     .imePadding()
         ) {
             content()
+            if (state.isSyncing) {
+                GlobalSyncActivityBanner(
+                    showPill = showBottomBar,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlobalSyncActivityBanner(
+    showPill: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val pillShape = RoundedCornerShape(14.dp)
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        LinearProgressIndicator(
+            color = colors.accentBlue,
+            trackColor = Color.Transparent,
+            modifier = Modifier.fillMaxWidth().height(2.dp).testTag("global_sync_indicator"),
+        )
+        if (showPill) {
+            Row(
+                modifier =
+                    Modifier.padding(top = 8.dp)
+                        .background(colors.surfaceElevated, pillShape)
+                        .border(1.dp, colors.border, pillShape)
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                        .testTag("global_sync_pill"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                RefreshIcon(
+                    tint = colors.accentBlue,
+                    size = 13.dp,
+                    isSpinning = true,
+                )
+                Text(
+                    text = "Refreshing…",
+                    color = colors.textSecondary,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
         }
     }
 }
@@ -322,13 +410,16 @@ internal fun MainBottomBarChrome(
 internal fun FloatingOverlayButtonStack(
     onOpenSearch: () -> Unit,
     onOpenAddSheet: () -> Unit,
+    showAddFab: Boolean = true,
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         SearchFloatingActionButton(onClick = onOpenSearch)
-        SaveFloatingActionButton(onClick = onOpenAddSheet)
+        if (showAddFab) {
+            SaveFloatingActionButton(onClick = onOpenAddSheet)
+        }
     }
 }
 
@@ -425,12 +516,26 @@ internal fun MainOverlaySheets(
     }
 
     if (state.isAddSheetOpen) {
+        val defaultMode =
+            if (state.activeTab == AppTab.FEEDS) {
+                AddSheetMode.SUBSCRIBE_FEED
+            } else {
+                AddSheetMode.WANT_TO_READ
+            }
         AddUrlOrFeedBottomSheet(
             initialUrl = state.prefilledShareUrl,
             initialTitle = state.prefilledShareTitle,
+            defaultMode = defaultMode,
             onDismiss = { onAction(MainAction.CloseAddSheet) },
-            onSave = { url, title, tags ->
-                onAction(MainAction.SaveUrlOrFeed(url = url, titleOverride = title, tagCsv = tags))
+            onSave = { url, title, tags, mode ->
+                onAction(
+                    MainAction.SaveUrlOrFeed(
+                        url = url,
+                        titleOverride = title,
+                        tagCsv = tags,
+                        mode = mode,
+                    )
+                )
             },
         )
     }
@@ -732,6 +837,7 @@ internal fun MainTabDestinationContent(
                 onAction = onAction,
                 listState = scrollStates.lazyListState(companionScrollKey(state)),
                 onOpenCollectionDraw = onOpenCollectionDraw,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
         AppTab.SETTINGS ->
             SettingsTabContent(

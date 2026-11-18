@@ -39,6 +39,11 @@ enum class CompanionSubTab(val label: String) {
     WANT("Want"),
 }
 
+enum class AddSheetMode {
+    WANT_TO_READ,
+    SUBSCRIBE_FEED,
+}
+
 enum class DrawNoteDialogMode {
     FINISH_AND_RANK,
     ABANDON,
@@ -69,7 +74,7 @@ data class UndoArchiveEvent(
 )
 
 data class MainUiState(
-    val activeTab: AppTab = AppTab.INBOX,
+    val activeTab: AppTab = AppTab.HOME,
     val activeFilter: InboxFilter = InboxFilter.ALL,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
@@ -326,8 +331,12 @@ sealed interface MainAction {
 
     data class UpdateReadProgress(val entryId: String, val progress: Double) : Mutation
 
-    data class SaveUrlOrFeed(val url: String, val titleOverride: String?, val tagCsv: String) :
-        Mutation
+    data class SaveUrlOrFeed(
+        val url: String,
+        val titleOverride: String?,
+        val tagCsv: String,
+        val mode: AddSheetMode? = null,
+    ) : Mutation
 
     data class RefreshFeed(val feedId: String) : Mutation
 
@@ -467,7 +476,7 @@ sealed interface MainAction {
 }
 
 internal data class TransientUiState(
-    val activeTab: AppTab = AppTab.INBOX,
+    val activeTab: AppTab = AppTab.HOME,
     val activeFilter: InboxFilter = InboxFilter.ALL,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
@@ -503,7 +512,7 @@ internal data class TransientUiState(
 
 @Serializable
 internal data class SavedNavigationUiState(
-    val activeTab: AppTab = AppTab.INBOX,
+    val activeTab: AppTab = AppTab.HOME,
     val activeFilter: InboxFilter = InboxFilter.ALL,
     val isSearchOpen: Boolean = false,
     val searchQuery: String = "",
@@ -608,7 +617,7 @@ internal fun reduceUiAction(
                 )
         MainAction.NavigateBackFromScope ->
             state.copy(
-                activeTab = state.scopeOriginTab ?: AppTab.INBOX,
+                activeTab = state.scopeOriginTab ?: AppTab.HOME,
                 selectedFeedId = null,
                 selectedTag = null,
                 scopeOriginTab = null,
@@ -755,10 +764,10 @@ internal fun updateBottomNavSlot(
     slotIndex: Int,
     newTab: AppTab,
 ): List<AppTab> {
-    if (newTab == AppTab.INBOX || newTab !in AppTab.sideTabCandidates) {
-        return AppTab.normalizeSideTabs(current)
+    if (newTab !in AppTab.bottomTabCandidates) {
+        return AppTab.normalizeBottomTabs(current)
     }
-    val normalized = AppTab.normalizeSideTabs(current).toMutableList()
+    val normalized = AppTab.normalizeBottomTabs(current).toMutableList()
     if (slotIndex !in normalized.indices) return normalized
     val existingIndex = normalized.indexOf(newTab)
     val oldTab = normalized[slotIndex]
@@ -766,7 +775,7 @@ internal fun updateBottomNavSlot(
     if (existingIndex != -1 && existingIndex != slotIndex) {
         normalized[existingIndex] = oldTab
     }
-    return AppTab.normalizeSideTabs(normalized)
+    return AppTab.normalizeBottomTabs(normalized)
 }
 
 internal fun buildMainUiState(

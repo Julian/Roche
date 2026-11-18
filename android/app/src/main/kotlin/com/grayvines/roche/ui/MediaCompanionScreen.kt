@@ -4,6 +4,7 @@ package com.grayvines.roche.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,11 +23,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,11 +52,14 @@ import com.grayvines.roche.data.CollectionRole
 import com.grayvines.roche.data.ConsumptionStatus
 import com.grayvines.roche.data.DiaryEntryItem
 import com.grayvines.roche.data.RankedCatalogEntry
+import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
+import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
@@ -67,6 +73,7 @@ fun MediaCompanionScreen(
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = {},
+    onOpenExternalUrl: (String) -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
@@ -82,27 +89,35 @@ fun MediaCompanionScreen(
         )
         HorizontalDivider(color = colors.border, thickness = 1.dp)
 
-        when (state.companionSubTab) {
-            CompanionSubTab.LISTS ->
-                RankedListsPane(
-                    state = state,
-                    listState = listState,
-                    onAction = onAction,
-                    onOpenCreateList = { showCreateListDialog = true },
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-            CompanionSubTab.DIARY ->
-                DiaryHistoryPane(
-                    diaryEntries = state.catalog.diaryEntries,
-                    listState = listState,
-                    onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
-                )
-            CompanionSubTab.WANT ->
-                WantQueuesPane(
-                    state = state,
-                    listState = listState,
-                    onAction = onAction,
-                )
+        PullToRefreshBox(
+            isRefreshing = state.isSyncing,
+            onRefresh = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.fillMaxSize().testTag("lists_pull_to_refresh"),
+        ) {
+            when (state.companionSubTab) {
+                CompanionSubTab.LISTS ->
+                    RankedListsPane(
+                        state = state,
+                        listState = listState,
+                        onAction = onAction,
+                        onOpenCreateList = { showCreateListDialog = true },
+                        onOpenCollectionDraw = onOpenCollectionDraw,
+                        onOpenExternalUrl = onOpenExternalUrl,
+                    )
+                CompanionSubTab.DIARY ->
+                    DiaryHistoryPane(
+                        diaryEntries = state.catalog.diaryEntries,
+                        listState = listState,
+                        onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
+                    )
+                CompanionSubTab.WANT ->
+                    WantQueuesPane(
+                        state = state,
+                        listState = listState,
+                        onAction = onAction,
+                        onOpenExternalUrl = onOpenExternalUrl,
+                    )
+            }
         }
     }
 
@@ -122,11 +137,24 @@ private fun CompanionTopBar(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
 ) {
+    val colors = LocalRocheColors.current
+    val baseSubtitle =
+        "${state.catalog.consumedCount} logged · ${state.catalog.comparisonCount} ranked"
     RocheTopHeader(
         title = "Lists & Diary",
-        subtitle =
-            "${state.catalog.consumedCount} logged · ${state.catalog.comparisonCount} ranked",
+        subtitle = if (state.isSyncing) "$baseSubtitle · Refreshing…" else baseSubtitle,
     ) {
+        RocheIconActionButton(
+            contentDescription = "Sync",
+            onClick = { onAction(MainAction.SyncNow) },
+            modifier = Modifier.testTag("companion_sync_btn"),
+        ) {
+            RefreshIcon(
+                tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
+                size = 17.dp,
+                isSpinning = state.isSyncing,
+            )
+        }
         HeaderActionButton(
             label = "+ Log / Want",
             style = RocheButtonStyle.PRIMARY,
@@ -170,6 +198,7 @@ private fun CompanionSubTabBar(
     }
 }
 
+@Suppress("LongParameterList")
 @Composable
 private fun RankedListsPane(
     state: MainUiState,
@@ -177,6 +206,7 @@ private fun RankedListsPane(
     onAction: (MainAction) -> Unit,
     onOpenCreateList: () -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onOpenExternalUrl: (String) -> Unit = {},
 ) {
     val lists = state.catalog.lists
     val activeList =
@@ -186,6 +216,7 @@ private fun RankedListsPane(
     val rankedEntries =
         activeList?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
     val canEditManualList = isEditableManualUserList(activeList)
+    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
 
     Column(modifier = Modifier.fillMaxSize()) {
         CatalogListChipsRow(
@@ -210,9 +241,11 @@ private fun RankedListsPane(
             activeDraw = activeDraw,
             canEditManualList = canEditManualList,
             rankedEntries = rankedEntries,
+            readableIds = readableIds,
             listState = listState,
             onAction = onAction,
             onOpenCollectionDraw = onOpenCollectionDraw,
+            onOpenExternalUrl = onOpenExternalUrl,
         )
     }
 }
@@ -276,14 +309,16 @@ private fun RankedListBody(
     activeDraw: CollectionDrawSnapshot?,
     canEditManualList: Boolean,
     rankedEntries: List<RankedCatalogEntry>,
+    readableIds: Set<String>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     if (rankedEntries.isEmpty() && activeDraw == null) {
         CompanionEmptyCard(
             title = "No entries in ${activeList?.title ?: "this list"} yet",
-            body = "Log movies, albums, books, games, or finish feed items to build your rankings.",
+            body = "Log movies, albums, books, games, or star/finish items to build your list.",
             ctaLabel = if (canEditManualList) "+ Log & Add Entry" else "+ Log Entry",
             onCta = {
                 onAction(
@@ -302,9 +337,11 @@ private fun RankedListBody(
         activeDraw = activeDraw,
         canEditManualList = canEditManualList,
         rankedEntries = rankedEntries,
+        readableIds = readableIds,
         listState = listState,
         onAction = onAction,
         onOpenCollectionDraw = onOpenCollectionDraw,
+        onOpenExternalUrl = onOpenExternalUrl,
     )
 }
 
@@ -315,9 +352,11 @@ private fun RankedListLazyColumn(
     activeDraw: CollectionDrawSnapshot?,
     canEditManualList: Boolean,
     rankedEntries: List<RankedCatalogEntry>,
+    readableIds: Set<String>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     LazyColumn(
         state = listState,
@@ -335,9 +374,12 @@ private fun RankedListLazyColumn(
             }
         }
         items(rankedEntries, key = { it.entry.id }) { item ->
+            val onOpen =
+                resolveCatalogEntryOpenAction(item, readableIds, onAction, onOpenExternalUrl)
             RankedEntryCardRow(
                 item = item,
                 showQualityMeta = activeList?.isPriorityScoped != true,
+                onOpen = onOpen,
                 onRemoveFromList =
                     buildRemoveListAction(activeList, canEditManualList, item, onAction),
                 onFocusRank = {
@@ -348,6 +390,24 @@ private fun RankedListLazyColumn(
             )
         }
         item { Spacer(modifier = Modifier.height(72.dp)) }
+    }
+}
+
+private fun resolveCatalogEntryOpenAction(
+    item: RankedCatalogEntry,
+    readableIds: Set<String>,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+): (() -> Unit)? {
+    val extUrl = item.entry.url?.takeIf { it.isNotBlank() }
+    return when {
+        item.entry.id in readableIds -> {
+            { onAction(MainAction.OpenReader(item.entry.id)) }
+        }
+        extUrl != null -> {
+            { onOpenExternalUrl(extUrl) }
+        }
+        else -> null
     }
 }
 
@@ -482,6 +542,13 @@ private fun ActiveListToolbarButtons(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (list.collectionId == WANT_TO_READ_COLLECTION_ID) {
+            HeaderActionButton(
+                label = "+ Add URL",
+                onClick = { onAction(MainAction.OpenAddSheet()) },
+                modifier = Modifier.testTag("want_to_read_add_url_btn"),
+            )
+        }
         if (canEditManualList) {
             HeaderActionButton(
                 label = "+ Add",
@@ -524,12 +591,24 @@ private fun ActiveListToolbarButtons(
 private fun RankedEntryCardRow(
     item: RankedCatalogEntry,
     showQualityMeta: Boolean,
+    onOpen: (() -> Unit)? = null,
     onRemoveFromList: (() -> Unit)? = null,
     onFocusRank: () -> Unit,
 ) {
+    val rowMod =
+        if (onOpen != null) {
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onOpen)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .testTag("ranked_entry_row_${item.entry.id}")
+        } else {
+            Modifier.fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .testTag("ranked_entry_row_${item.entry.id}")
+        }
     RocheSurfaceCard {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = rowMod,
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             RankedEntryHeaderRow(
@@ -759,27 +838,26 @@ private fun WantQueuesPane(
     state: MainUiState,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit = {},
 ) {
     val queues = state.catalog.wantQueues
-    val activeQueue =
-        remember(queues, state.selectedWantCollectionId) {
-            queues.firstOrNull { it.collectionId == state.selectedWantCollectionId }
-                ?: queues.firstOrNull { it.entryCount > 0 }
-                ?: queues.firstOrNull()
-        }
-    val entries =
-        activeQueue?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
-
     if (queues.isEmpty()) {
         CompanionEmptyCard(
             title = "Your Want Queue is clear",
             body =
-                "Save movies, books, albums, or games you want to experience next and prioritize them locally.",
-            ctaLabel = "+ Add to Want Queue",
-            onCta = { onAction(MainAction.OpenQuickLogSheet(true)) },
+                "Save articles, PDFs, movies, books, albums, or games you want to experience next and prioritize them locally.",
+            ctaLabel = "+ Add to Want to Read",
+            onCta = { onAction(MainAction.OpenAddSheet()) },
         )
         return
     }
+    val activeQueue =
+        remember(queues, state.selectedWantCollectionId) {
+            resolveActiveWantQueue(queues, state.selectedWantCollectionId)
+        }
+    val entries =
+        activeQueue?.let { state.catalog.entriesByCollectionId[it.collectionId] }.orEmpty()
+    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
 
     Column(modifier = Modifier.fillMaxSize()) {
         WantQueueChipsRow(
@@ -795,22 +873,52 @@ private fun WantQueuesPane(
             )
         }
         if (entries.isEmpty()) {
-            CompanionEmptyCard(
-                title = "No entries in ${activeQueue?.title ?: "Want Queue"} yet",
-                body =
-                    "Save movies, books, albums, or games you want to experience next and prioritize them locally.",
-                ctaLabel = "+ Add to Want Queue",
-                onCta = { onAction(MainAction.OpenQuickLogSheet(true)) },
-            )
+            WantQueueEmptySection(activeQueue = activeQueue, onAction = onAction)
         } else {
             WantQueueEntriesList(
                 entries = entries,
                 activeQueueId = activeQueue?.collectionId,
+                readableIds = readableIds,
                 listState = listState,
                 onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
         }
     }
+}
+
+private fun resolveActiveWantQueue(
+    queues: List<CatalogListSummary>,
+    selectedId: String?,
+): CatalogListSummary? =
+    queues.firstOrNull { it.collectionId == selectedId }
+        ?: queues.firstOrNull { it.entryCount > 0 }
+        ?: queues.firstOrNull()
+
+@Composable
+private fun WantQueueEmptySection(
+    activeQueue: CatalogListSummary?,
+    onAction: (MainAction) -> Unit,
+) {
+    val isWantToRead = activeQueue?.collectionId == WANT_TO_READ_COLLECTION_ID
+    val bodyText =
+        if (isWantToRead) {
+            "Share any article or PDF from your browser, or tap + to save a URL directly to Want to Read."
+        } else {
+            "Save movies, books, albums, or games you want to experience next and prioritize them locally."
+        }
+    CompanionEmptyCard(
+        title = "No entries in ${activeQueue?.title ?: "Want Queue"} yet",
+        body = bodyText,
+        ctaLabel = if (isWantToRead) "+ Add URL to Want to Read" else "+ Add to Want Queue",
+        onCta = {
+            if (isWantToRead) {
+                onAction(MainAction.OpenAddSheet())
+            } else {
+                onAction(MainAction.OpenQuickLogSheet(true))
+            }
+        },
+    )
 }
 
 @Composable
@@ -840,8 +948,10 @@ private fun WantQueueChipsRow(
 private fun WantQueueEntriesList(
     entries: List<RankedCatalogEntry>,
     activeQueueId: String?,
+    readableIds: Set<String>,
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     LazyColumn(
         state = listState,
@@ -850,8 +960,21 @@ private fun WantQueueEntriesList(
         modifier = Modifier.fillMaxSize(),
     ) {
         items(entries, key = { it.entry.id }) { item ->
+            val canOpenReader = item.entry.id in readableIds
+            val extUrl = item.entry.url?.takeIf { it.isNotBlank() }
+            val onOpen: (() -> Unit)? =
+                when {
+                    canOpenReader -> {
+                        { onAction(MainAction.OpenReader(item.entry.id)) }
+                    }
+                    extUrl != null -> {
+                        { onOpenExternalUrl(extUrl) }
+                    }
+                    else -> null
+                }
             WantQueueRowCard(
                 item = item,
+                onOpen = onOpen,
                 onComplete = {
                     onAction(MainAction.CompleteWantEntry(item.entry.id, rankImmediately = true))
                 },
@@ -869,13 +992,19 @@ private fun WantQueueEntriesList(
 @Composable
 private fun WantQueueRowCard(
     item: RankedCatalogEntry,
+    onOpen: (() -> Unit)? = null,
     onComplete: () -> Unit,
     onRemove: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val rowMod =
+        Modifier.fillMaxWidth()
+            .let { base -> if (onOpen != null) base.clickable(onClick = onOpen) else base }
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .testTag("want_row_${item.entry.id}")
     RocheSurfaceCard {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = rowMod,
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
@@ -927,7 +1056,10 @@ private fun CompanionEmptyCard(
     onCta: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Box(modifier = Modifier.fillMaxWidth().padding(14.dp)) {
+    Box(
+        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
         RocheSurfaceCard {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(18.dp),

@@ -62,7 +62,6 @@ internal data class TrackedOutgoingSyncBatch(
 @Suppress("LongParameterList")
 private data class OutgoingGraphSnapshot(
     val entries: List<EntryEntity>,
-    val contentsById: Map<String, EntryContentEntity>,
     val statesById: Map<String, EntryStateEntity>,
     val identsByEntryId: Map<String, List<EntryIdentifierDto>>,
     val specsById: Map<String, CollectionSpecEntity>,
@@ -85,6 +84,52 @@ internal suspend fun buildTrackedPeerSyncRequest(
     config: PeerSyncRequestConfig,
 ): TrackedOutgoingSyncBatch {
     val snap = loadOutgoingGraphSnapshot(dao, config.peerId)
+    val slices = prepareOutgoingSlices(snap, config)
+    val cappedIds = slices.eligibleEntries.take(MAX_PEER_SYNC_ENTRIES).map { it.id }
+    val contentsById = loadEntryContentsByIds(dao, cappedIds, slices.unsyncedFeedIds)
+    val part =
+        partitionOutgoingEntries(
+            slices.eligibleEntries,
+            snap,
+            contentsById,
+            slices.unsyncedFeedIds,
+            config.maxPayloadBytes,
+        )
+    val allOverflowIds = part.countOverflowIds + part.byteOverflowIds
+    val nonOverflowMemberships =
+        slices.sentMemberships.filter {
+            it.collectionId !in allOverflowIds && it.entryId !in allOverflowIds
+        }
+    return assembleTrackedBatch(
+        config,
+        snap,
+        part.wireEntries,
+        part.budgetEntries,
+        slices.unsyncedFeedIds,
+        nonOverflowMemberships,
+        slices.sentGenerators,
+        slices.sentLogs,
+        slices.sentComparisons,
+        slices.sentTombstones,
+        part.byteOverflowIds,
+        part.countOverflowIds,
+    )
+}
+
+private data class PreparedOutgoingSlices(
+    val unsyncedFeedIds: Set<String>,
+    val sentMemberships: List<CollectionEntryEntity>,
+    val sentLogs: List<ConsumptionLogEntity>,
+    val sentComparisons: List<ComparisonEntity>,
+    val sentGenerators: List<CollectionGeneratorEntity>,
+    val sentTombstones: List<TombstoneEntity>,
+    val eligibleEntries: List<EntryEntity>,
+)
+
+private fun prepareOutgoingSlices(
+    snap: OutgoingGraphSnapshot,
+    config: PeerSyncRequestConfig,
+): PreparedOutgoingSlices {
     val isInitial = config.sinceSeq <= 0L
     val unsyncedFeedIds =
         snap.feedSourcesById.values
@@ -92,7 +137,6 @@ internal suspend fun buildTrackedPeerSyncRequest(
             .mapTo(HashSet()) { it.collectionId }
     val catalogRefIds = collectCatalogHistoryIds(snap)
     val unsyncedInboxOnlyIds = collectUnsyncedInboxOnlyIds(snap, unsyncedFeedIds, catalogRefIds)
-
     val sentMemberships =
         selectOutgoingMemberships(snap, unsyncedFeedIds, unsyncedInboxOnlyIds, isInitial)
             .take(MAX_SYNC_COLLECTION_ENTRIES)
@@ -100,49 +144,47 @@ internal suspend fun buildTrackedPeerSyncRequest(
     val sentComparisons = selectOutgoingComparisons(snap.comparisons, isInitial)
     val sentGenerators = selectOutgoingGenerators(snap, isInitial)
     val sentTombstones = selectOutgoingTombstones(snap.tombstones, isInitial)
-
     val outgoingChildRefs =
-        if (isInitial) {
-            collectReferencedIdsFromSlices(
-                sentMemberships,
-                sentGenerators,
-                sentLogs,
-                sentComparisons,
-            )
-        } else {
-            emptySet()
-        }
+        resolveOutgoingChildRefs(
+            isInitial,
+            sentMemberships,
+            sentGenerators,
+            sentLogs,
+            sentComparisons,
+        )
     val eligibleEntries =
         selectEligibleOutgoingEntries(
-            snap = snap,
-            config = config,
-            isInitial = isInitial,
-            unsyncedFeedIds = unsyncedFeedIds,
-            unsyncedInboxOnlyIds = unsyncedInboxOnlyIds,
-            catalogRefIds = catalogRefIds,
-            outgoingChildRefs = outgoingChildRefs,
+            snap,
+            config,
+            isInitial,
+            unsyncedFeedIds,
+            unsyncedInboxOnlyIds,
+            catalogRefIds,
+            outgoingChildRefs,
         )
-    val part =
-        partitionOutgoingEntries(eligibleEntries, snap, unsyncedFeedIds, config.maxPayloadBytes)
-    val allOverflowIds = part.countOverflowIds + part.byteOverflowIds
-    val nonOverflowMemberships = sentMemberships.filter {
-        it.collectionId !in allOverflowIds && it.entryId !in allOverflowIds
-    }
-    return assembleTrackedBatch(
-        config = config,
-        snap = snap,
-        wireEntries = part.wireEntries,
-        budgetEntries = part.budgetEntries,
+    return PreparedOutgoingSlices(
         unsyncedFeedIds = unsyncedFeedIds,
-        sentMemberships = nonOverflowMemberships,
-        sentGenerators = sentGenerators,
+        sentMemberships = sentMemberships,
         sentLogs = sentLogs,
         sentComparisons = sentComparisons,
+        sentGenerators = sentGenerators,
         sentTombstones = sentTombstones,
-        byteOverflowIds = part.byteOverflowIds,
-        countOverflowIds = part.countOverflowIds,
+        eligibleEntries = eligibleEntries,
     )
 }
+
+private fun resolveOutgoingChildRefs(
+    isInitial: Boolean,
+    sentMemberships: List<CollectionEntryEntity>,
+    sentGenerators: List<CollectionGeneratorEntity>,
+    sentLogs: List<ConsumptionLogEntity>,
+    sentComparisons: List<ComparisonEntity>,
+): Set<String> =
+    if (isInitial) {
+        collectReferencedIdsFromSlices(sentMemberships, sentGenerators, sentLogs, sentComparisons)
+    } else {
+        sentMemberships.mapTo(HashSet()) { it.collectionId }
+    }
 
 private data class PartitionedOutgoingEntries(
     val budgetEntries: List<EntryEntity>,
@@ -151,9 +193,28 @@ private data class PartitionedOutgoingEntries(
     val byteOverflowIds: Set<String>,
 )
 
+private const val SQLITE_CONTENT_CHUNK_SIZE = 500
+
+private suspend fun loadEntryContentsByIds(
+    dao: RocheDao,
+    entryIds: List<String>,
+    unsyncedFeedIds: Set<String>,
+): Map<String, EntryContentEntity> {
+    val fetchIds = entryIds.filter { it !in unsyncedFeedIds }
+    if (fetchIds.isEmpty()) return emptyMap()
+    val result = HashMap<String, EntryContentEntity>(fetchIds.size)
+    for (chunk in fetchIds.chunked(SQLITE_CONTENT_CHUNK_SIZE)) {
+        for (row in dao.getEntryContentsByIds(chunk)) {
+            result[row.entryId] = row
+        }
+    }
+    return result
+}
+
 private fun partitionOutgoingEntries(
     eligibleEntries: List<EntryEntity>,
     snap: OutgoingGraphSnapshot,
+    contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
     maxPayloadBytes: Int,
 ): PartitionedOutgoingEntries {
@@ -161,8 +222,10 @@ private fun partitionOutgoingEntries(
     val countOverflowIds =
         eligibleEntries.drop(MAX_PEER_SYNC_ENTRIES).mapTo(LinkedHashSet()) { it.id }
     val (budgetEntries, byteOverflowIds) =
-        splitEntriesByByteBudget(cappedEntries, snap, unsyncedFeedIds, maxPayloadBytes)
-    val wireEntries = budgetEntries.map { toSyncEntryRecordDto(it, snap, unsyncedFeedIds) }
+        splitEntriesByByteBudget(cappedEntries, contentsById, unsyncedFeedIds, maxPayloadBytes)
+    val wireEntries = budgetEntries.map {
+        toSyncEntryRecordDto(it, snap, contentsById, unsyncedFeedIds)
+    }
     return PartitionedOutgoingEntries(budgetEntries, wireEntries, countOverflowIds, byteOverflowIds)
 }
 
@@ -190,7 +253,6 @@ private suspend fun loadOutgoingGraphSnapshot(
     peerId: String,
 ): OutgoingGraphSnapshot {
     val entries = dao.getAllEntries()
-    val contentsById = dao.getAllEntryContents().associateBy { it.entryId }
     val statesById = dao.getAllEntryStates().associateBy { it.entryId }
     val identsByEntryId =
         dao.getAllEntryIdentifiers()
@@ -202,7 +264,6 @@ private suspend fun loadOutgoingGraphSnapshot(
     val clientHlc = storedHlc ?: HlcClock(peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }).tick().encode()
     return OutgoingGraphSnapshot(
         entries = entries,
-        contentsById = contentsById,
         statesById = statesById,
         identsByEntryId = identsByEntryId,
         specsById = specsById,
@@ -246,7 +307,8 @@ private fun collectUnsyncedInboxOnlyIds(
         .filter { entry ->
             val state = snap.statesById[entry.id]
             val isInbox = state != null && state.inboxState != "none"
-            val badItemUrl = isInbox && !isSyncableItemUrl(entry.url.orEmpty())
+            val isLocalPdf = entry.url?.startsWith("localpdf://", ignoreCase = true) == true
+            val badItemUrl = (isInbox || isLocalPdf) && !isSyncableItemUrl(entry.url.orEmpty())
             val isUnsynced = entry.id in itemsInUnsyncedFeeds || badItemUrl
             isUnsynced && entry.id !in catalogRefIds
         }
@@ -374,7 +436,7 @@ private fun isAnyPartDirty(entry: EntryEntity, snap: OutgoingGraphSnapshot): Boo
 
 private fun splitEntriesByByteBudget(
     cappedEntries: List<EntryEntity>,
-    snap: OutgoingGraphSnapshot,
+    contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
     maxBytes: Int,
 ): Pair<List<EntryEntity>, Set<String>> {
@@ -382,7 +444,7 @@ private fun splitEntriesByByteBudget(
     val overflow = LinkedHashSet<String>()
     var usedBytes = 0
     for (entry in cappedEntries) {
-        val estBytes = estimateSyncEntryBytes(entry, snap, unsyncedFeedIds)
+        val estBytes = estimateSyncEntryBytes(entry, contentsById, unsyncedFeedIds)
         val fits = sent.isEmpty() || usedBytes + estBytes <= maxBytes
         if (fits) {
             sent.add(entry)
@@ -412,16 +474,17 @@ internal fun estimateSyncEntryBytes(
 
 private fun estimateSyncEntryBytes(
     entry: EntryEntity,
-    snap: OutgoingGraphSnapshot,
+    contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
 ): Int {
-    val content = if (entry.id in unsyncedFeedIds) null else snap.contentsById[entry.id]
+    val content = if (entry.id in unsyncedFeedIds) null else contentsById[entry.id]
     return estimateSyncEntryBytes(entry, content?.contentHtml, content?.audioUrl)
 }
 
 private fun toSyncEntryRecordDto(
     entry: EntryEntity,
     snap: OutgoingGraphSnapshot,
+    contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
 ): SyncEntryRecordDto {
     val isUnsyncedFeed = entry.id in unsyncedFeedIds
@@ -432,7 +495,7 @@ private fun toSyncEntryRecordDto(
             belongsToUnsyncedFeed ||
             snap.statesById[entry.id] != null && !isSyncableItemUrl(entry.url.orEmpty())
 
-    val rawContent = if (stripInboxPayload) null else snap.contentsById[entry.id]
+    val rawContent = if (stripInboxPayload) null else contentsById[entry.id]
     val rawState = if (stripInboxPayload) null else snap.statesById[entry.id]
     val rawSpec = if (isUnsyncedFeed) null else snap.specsById[entry.id]
     val rawFeedSource = if (isUnsyncedFeed) null else snap.feedSourcesById[entry.id]

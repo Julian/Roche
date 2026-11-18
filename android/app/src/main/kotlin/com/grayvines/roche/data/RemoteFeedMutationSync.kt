@@ -73,16 +73,21 @@ internal suspend fun refreshFeedOnlineOrOnDevice(
     }
 }
 
+@Suppress("LongParameterList")
 internal suspend fun subscribeFeedBestEffort(
     dao: RocheDao,
     apiClient: RocheApiClient,
     settings: SettingsRepository,
     url: String,
     titleOverride: String?,
+    prefetchedBatch: ParsedFeedBatch? = null,
 ): String {
     val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
     val canonicalUrl = canonicalizeFeedUrl(url)
-    val fallbackTitle = cleanTitleOverride ?: extractHostTitle(url)
+    val fallbackTitle =
+        cleanTitleOverride
+            ?: prefetchedBatch?.title?.trim()?.takeIf { it.isNotEmpty() }
+            ?: extractHostTitle(url)
     val currentSettings = settings.settings.first()
     val nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
     dao.deleteTombstone("feed", feedNaturalKey(canonicalUrl))
@@ -125,7 +130,13 @@ internal suspend fun subscribeFeedBestEffort(
         hlcOverride = hlc,
     )
     if (remoteFeed == null) {
-        LocalFeedPoller.pollFeed(dao, apiClient, entity, currentSettings.peerId)
+        LocalFeedPoller.pollFeed(
+            dao = dao,
+            apiClient = apiClient,
+            feed = entity,
+            localPeerId = currentSettings.peerId,
+            prefetchedBatch = prefetchedBatch,
+        )
     }
     return dao.getFeedById(entity.id)?.title ?: entity.title
 }

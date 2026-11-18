@@ -10,9 +10,11 @@ import com.grayvines.roche.data.settings.Settings
 import java.io.IOException
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 
 internal const val MAX_DELTA_CONTINUATION_PAGES = 20
 private const val MAX_OVERFLOW_PUSH_ROUNDS = 25
@@ -53,6 +55,15 @@ internal class PeerSyncCoordinator(
         currentSettings: Settings,
         initialWeightOverride: Double? = null,
         sinceSeqOverride: Long? = null,
+    ): Int? =
+        withContext(Dispatchers.Default) {
+            syncAndPollInternal(currentSettings, initialWeightOverride, sinceSeqOverride)
+        }
+
+    private suspend fun syncAndPollInternal(
+        currentSettings: Settings,
+        initialWeightOverride: Double?,
+        sinceSeqOverride: Long?,
     ): Int? {
         var workingSettings = currentSettings
         var initialRound =

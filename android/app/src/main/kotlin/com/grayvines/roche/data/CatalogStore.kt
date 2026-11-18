@@ -17,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -36,19 +37,20 @@ class CatalogStore(
     val snapshot: Flow<CatalogSnapshot> =
         combine(
                 combine(
-                    dao.observeEntries(),
-                    dao.observeEntryIdentifiers(),
-                    dao.observeCollectionSpecs(),
-                    dao.observeCollectionEntries(),
+                    dao.observeEntriesStamp(),
+                    dao.observeIdentsStamp(),
+                    dao.observeSpecsStamp(),
+                    dao.observeMembersStamp(),
                 ) { _, _, _, _ ->
                     Unit
                 },
-                dao.observeCollectionGenerators(),
-                dao.observeConsumptionLogs(),
-                dao.observeComparisons(),
+                dao.observeGeneratorsStamp(),
+                dao.observeLogsStamp(),
+                dao.observeComparisonsStamp(),
             ) { _, _, _, _ ->
                 Unit
             }
+            .conflate()
             .mapLatest { loadConsistentRawTables() }
             .distinctUntilChanged()
             .map(::buildCatalogSnapshot)
@@ -609,7 +611,8 @@ class CatalogStore(
         val spec = resolveCollectionSpec(idOrSlug) ?: return null
         val isManualList =
             CollectionMode.fromWireValue(spec.mode) == CollectionMode.MANUAL &&
-                CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST
+                (CollectionRole.fromWireValue(spec.role) == CollectionRole.LIST ||
+                    spec.collectionId == STARRED_COLLECTION_ID)
         return spec.takeIf { isManualList }
     }
 

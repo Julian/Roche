@@ -53,7 +53,8 @@ private const val INBOX_FROM_WHERE =
     "FROM entries e " +
         "INNER JOIN entry_state es ON es.entryId = e.id " +
         "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
-        "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed')"
+        "WHERE e.mergedIntoId IS NULL " +
+        "AND (es.inboxState IN ('unread', 'dismissed') OR ec.entryId IS NOT NULL)"
 
 private const val INBOX_SELECT_LIST_PREFIX =
     "SELECT e.id AS id, " +
@@ -78,7 +79,8 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "e.thumbnailUrl AS thumbnailUrl, " +
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
-        "ec.audioUrl AS audioUrl " +
+        "ec.audioUrl AS audioUrl, " +
+        "es.inboxState AS inboxState " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_FULL_PREFIX =
@@ -104,7 +106,8 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "e.thumbnailUrl AS thumbnailUrl, " +
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
-        "ec.audioUrl AS audioUrl " +
+        "ec.audioUrl AS audioUrl, " +
+        "es.inboxState AS inboxState " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
@@ -130,7 +133,8 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "e.thumbnailUrl AS thumbnailUrl, " +
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
-        "ec.audioUrl AS audioUrl " +
+        "ec.audioUrl AS audioUrl, " +
+        "es.inboxState AS inboxState " +
         INBOX_FROM_WHERE
 
 private const val FEED_ROW_SELECT =
@@ -203,6 +207,28 @@ interface RocheDao {
     @Query("SELECT * FROM comparisons ORDER BY ts ASC")
     fun observeComparisons(): Flow<List<ComparisonEntity>>
 
+    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM entries")
+    fun observeEntriesStamp(): Flow<String>
+
+    @Query("SELECT COUNT(*) FROM entry_identifiers") fun observeIdentsStamp(): Flow<Int>
+
+    @Query("SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) FROM collection_specs")
+    fun observeSpecsStamp(): Flow<String>
+
+    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM collection_entries")
+    fun observeMembersStamp(): Flow<String>
+
+    @Query(
+        "SELECT COUNT(*) || ':' || COALESCE(SUM(enabled), 0) || ':' || COALESCE(MAX(hlc), '') FROM collection_generators"
+    )
+    fun observeGeneratorsStamp(): Flow<String>
+
+    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM consumption_log")
+    fun observeLogsStamp(): Flow<String>
+
+    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM comparisons")
+    fun observeComparisonsStamp(): Flow<String>
+
     // --- Core Entries (`entries` + FTS-safe upserts) ---
 
     @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
@@ -262,6 +288,9 @@ interface RocheDao {
 
     @Query("SELECT * FROM entry_content")
     suspend fun getAllEntryContents(): List<EntryContentEntity>
+
+    @Query("SELECT * FROM entry_content WHERE entryId IN (:ids)")
+    suspend fun getEntryContentsByIds(ids: List<String>): List<EntryContentEntity>
 
     @Query("SELECT * FROM entry_content WHERE entryId = :entryId LIMIT 1")
     suspend fun getEntryContentById(entryId: String): EntryContentEntity?
@@ -333,7 +362,9 @@ interface RocheDao {
     @Query(
         "SELECT COUNT(*) FROM entries e " +
             "INNER JOIN entry_state es ON es.entryId = e.id " +
-            "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed')"
+            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+            "WHERE e.mergedIntoId IS NULL " +
+            "AND (es.inboxState IN ('unread', 'dismissed') OR ec.entryId IS NOT NULL)"
     )
     suspend fun countItems(): Int
 
@@ -363,7 +394,8 @@ interface RocheDao {
             "COALESCE(ec.contentType, 'article') AS contentType, " +
             "es.readAt AS readAt, " +
             "es.progress AS readProgress, " +
-            "ec.audioUrl AS audioUrl " +
+            "ec.audioUrl AS audioUrl, " +
+            "es.inboxState AS inboxState " +
             "$INBOX_FROM_WHERE AND e.id = :id LIMIT 1"
     )
     suspend fun getItemStateById(id: String): ItemStateRow?
@@ -376,7 +408,8 @@ interface RocheDao {
             "COALESCE(ec.contentType, 'article') AS contentType, " +
             "es.readAt AS readAt, " +
             "es.progress AS readProgress, " +
-            "ec.audioUrl AS audioUrl " +
+            "ec.audioUrl AS audioUrl, " +
+            "es.inboxState AS inboxState " +
             "FROM entries e " +
             "INNER JOIN entry_state es ON es.entryId = e.id " +
             "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
@@ -435,16 +468,17 @@ interface RocheDao {
     @Query(
         "SELECT e.id FROM entries e " +
             "INNER JOIN entry_state es ON es.entryId = e.id " +
+            "LEFT JOIN entry_content ec_f1 ON ec_f1.entryId = e.id " +
             "INNER JOIN entries_fts ON e.rowid = entries_fts.rowid " +
-            "WHERE e.mergedIntoId IS NULL AND es.inboxState IN ('unread', 'dismissed') " +
+            "WHERE e.mergedIntoId IS NULL " +
+            "AND (es.inboxState IN ('unread', 'dismissed') OR ec_f1.entryId IS NOT NULL) " +
             "AND entries_fts MATCH :tokenMatchQuery " +
             "UNION " +
             "SELECT ec.entryId FROM entry_content ec " +
             "INNER JOIN entry_state es2 ON es2.entryId = ec.entryId " +
             "INNER JOIN entries e2 ON e2.id = ec.entryId " +
             "INNER JOIN entry_content_fts ON ec.rowid = entry_content_fts.rowid " +
-            "WHERE e2.mergedIntoId IS NULL AND es2.inboxState IN ('unread', 'dismissed') " +
-            "AND entry_content_fts MATCH :tokenMatchQuery " +
+            "WHERE e2.mergedIntoId IS NULL AND entry_content_fts MATCH :tokenMatchQuery " +
             "UNION " +
             "SELECT ce.entryId FROM collection_entries ce " +
             "INNER JOIN entry_state es3 ON es3.entryId = ce.entryId " +
@@ -462,9 +496,10 @@ interface RocheDao {
             "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
             "INNER JOIN entries te ON te.id = cs.collectionId " +
             "INNER JOIN entry_state es ON es.entryId = ce.entryId " +
+            "LEFT JOIN entry_content ec_t ON ec_t.entryId = ce.entryId " +
             "INNER JOIN entries ie ON ie.id = ce.entryId " +
             "WHERE cs.role = 'tag' AND te.mergedIntoId IS NULL AND ie.mergedIntoId IS NULL " +
-            "AND es.inboxState IN ('unread', 'dismissed') " +
+            "AND (es.inboxState IN ('unread', 'dismissed') OR ec_t.entryId IS NOT NULL) " +
             "AND te.title LIKE :likePattern ESCAPE '\\'"
     )
     suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
