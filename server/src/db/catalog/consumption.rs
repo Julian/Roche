@@ -452,4 +452,38 @@ impl CatalogRepo<'_> {
         }
         Ok(out)
     }
+
+    /// Removes all `consumed` diary entries for `entry_id` (recording sync tombstones + activity)
+    /// so unfinishing an item in Reader cleanly undoes completion across peers.
+    pub async fn delete_consumed_logs_for_entry(&self, entry_id: &str) -> CatalogResult<usize> {
+        let Some(canon_id) = self.follow_merged_id(entry_id).await? else {
+            return Ok(0);
+        };
+        let now = SyncRepo::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let log_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM consumption_log WHERE entry_id = ? AND status = 'consumed'",
+        )
+        .bind(&canon_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for log_id in &log_ids {
+            sqlx::query("DELETE FROM consumption_log WHERE id = ?")
+                .bind(log_id)
+                .execute(&mut *tx)
+                .await?;
+            SyncRepo::record_tombstone(&mut tx, ActivityEntityType::ConsumptionLog, log_id, now)
+                .await?;
+            SyncRepo::record_activity(
+                &mut tx,
+                ActivityEntityType::ConsumptionLog,
+                log_id,
+                ActivityAction::Delete,
+                now,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(log_ids.len())
+    }
 }

@@ -1234,14 +1234,258 @@
     }
   };
 
+  const initReaderExtras = () => {
+    const root = document.querySelector(".js-reader-root");
+    if (!root) return;
+
+    // 1. Hairline reading progress bar
+    let bar = document.getElementById("roche-read-progress");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "roche-read-progress";
+      bar.className = "reader-progress-bar";
+      bar.setAttribute("aria-hidden", "true");
+      document.body.prepend(bar);
+    }
+    const updateBar = () => {
+      const el = document.documentElement;
+      const scrollable = el.scrollHeight - el.clientHeight;
+      const pct = scrollable > 0 ? Math.max(0, Math.min(100, (window.scrollY / scrollable) * 100)) : 0;
+      bar.style.width = `${pct.toFixed(1)}%`;
+    };
+    updateBar();
+    if (document.body.dataset.readBarBound !== "1") {
+      document.body.dataset.readBarBound = "1";
+      window.addEventListener("scroll", () => {
+        const b = document.getElementById("roche-read-progress");
+        if (!b || !document.querySelector(".js-reader-root")) {
+          if (b) b.remove();
+          return;
+        }
+        const el = document.documentElement;
+        const scrollable = el.scrollHeight - el.clientHeight;
+        const pct = scrollable > 0 ? Math.max(0, Math.min(100, (window.scrollY / scrollable) * 100)) : 0;
+        b.style.width = `${pct.toFixed(1)}%`;
+      }, { passive: true });
+    }
+
+    // 2. Reader font size preference (A- / A+, CSP-safe data attribute)
+    const SIZE_KEY = "roche_reader_font_v1";
+    const MAX_SIZE_IDX = 3;
+    const prose = root.querySelector(".reader-prose");
+    if (prose) {
+      let idx = 1;
+      try {
+        const saved = Number.parseInt(localStorage.getItem(SIZE_KEY) || "1", 10);
+        if (saved >= 0 && saved <= MAX_SIZE_IDX) idx = saved;
+      } catch {}
+      const applySize = () => {
+        root.setAttribute("data-reader-size", String(idx));
+      };
+      applySize();
+      for (const btn of document.querySelectorAll(".js-font-dec")) {
+        if (btn.dataset.bound === "1") continue;
+        btn.dataset.bound = "1";
+        btn.addEventListener("click", () => {
+          idx = Math.max(0, idx - 1);
+          try { localStorage.setItem(SIZE_KEY, String(idx)); } catch {}
+          applySize();
+        });
+      }
+      for (const btn of document.querySelectorAll(".js-font-inc")) {
+        if (btn.dataset.bound === "1") continue;
+        btn.dataset.bound = "1";
+        btn.addEventListener("click", () => {
+          idx = Math.min(MAX_SIZE_IDX, idx + 1);
+          try { localStorage.setItem(SIZE_KEY, String(idx)); } catch {}
+          applySize();
+        });
+      }
+    }
+
+    // 3. Auto-build Table of Contents from h2/h3 in prose
+    const tocList = document.getElementById("roche-reader-toc");
+    const tocGroup = document.getElementById("roche-reader-toc-group");
+    if (tocList && prose && tocList.dataset.built !== "1") {
+      tocList.dataset.built = "1";
+      const headings = Array.from(prose.querySelectorAll("h2, h3")).filter(
+        (h) => (h.textContent || "").trim().length > 0
+      );
+      if (headings.length >= 2) {
+        headings.forEach((h, i) => {
+          if (!h.id) h.id = `sec-${i + 1}`;
+          const li = document.createElement("li");
+          if (h.tagName === "H3") li.className = "toc-sub";
+          const a = document.createElement("a");
+          a.href = `#${h.id}`;
+          a.textContent = h.textContent.trim();
+          li.appendChild(a);
+          tocList.appendChild(li);
+        });
+        if (tocGroup) tocGroup.hidden = false;
+      } else if (tocGroup) {
+        tocGroup.hidden = true;
+      }
+    }
+
+    // 4. Lightweight warm-editorial syntax highlighting for <pre><code> blocks
+    if (prose) {
+      const KW = new Set([
+        "def", "class", "return", "if", "elif", "else", "for", "while", "in", "not", "and", "or",
+        "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break",
+        "continue", "lambda", "yield", "async", "await", "None", "True", "False", "print",
+        "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "match", "use", "mod",
+        "const", "static", "type", "where", "ref", "move", "self", "Self", "super", "crate",
+        "function", "var", "new", "this", "typeof", "export", "default", "switch", "case",
+        "int", "void", "char", "bool", "float", "double", "unsigned", "signed", "long", "short",
+        "sizeof", "typedef", "include", "define", "null", "true", "false", "SELECT", "FROM",
+        "WHERE", "JOIN", "ORDER", "GROUP", "BY", "LIMIT", "INSERT", "UPDATE", "DELETE"
+      ]);
+      const TOKEN_RE =
+        /(#[^\n]*|\/\/[^\n]*|\/\*[\s\S]*?\*\/|"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\b0x[0-9a-fA-F_]+\b|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)/g;
+
+      for (const codeEl of prose.querySelectorAll("pre > code")) {
+        if (codeEl.dataset.highlighted === "1") continue;
+        codeEl.dataset.highlighted = "1";
+        const src = codeEl.textContent || "";
+        if (src.length > 24000) continue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        let m;
+        TOKEN_RE.lastIndex = 0;
+        while ((m = TOKEN_RE.exec(src)) !== null) {
+          if (m.index > last) frag.appendChild(document.createTextNode(src.slice(last, m.index)));
+          const tok = m[0];
+          let cls = "";
+          if (tok.startsWith("#") || tok.startsWith("//") || tok.startsWith("/*")) {
+            cls = "syn-cm";
+          } else if (tok.startsWith('"') || tok.startsWith("'")) {
+            cls = "syn-str";
+          } else if (/^\d/.test(tok)) {
+            cls = "syn-num";
+          } else if (KW.has(tok)) {
+            cls = "syn-kw";
+          } else if (src[TOKEN_RE.lastIndex] === "(") {
+            cls = "syn-fn";
+          }
+          if (cls) {
+            const sp = document.createElement("span");
+            sp.className = cls;
+            sp.textContent = tok;
+            frag.appendChild(sp);
+          } else {
+            frag.appendChild(document.createTextNode(tok));
+          }
+          last = TOKEN_RE.lastIndex;
+        }
+        if (last < src.length) frag.appendChild(document.createTextNode(src.slice(last)));
+        codeEl.replaceChildren(frag);
+      }
+    }
+
+    // 5. Auto-finish sync at bottom of article + click-to-toggle Finished state
+    const finishForm = root.querySelector(".js-finish-toggle-form");
+    const finishBtn = root.querySelector(".js-finish-toggle-btn, .js-proto-finish-toggle");
+    if (finishBtn && finishBtn.dataset.bound !== "1") {
+      finishBtn.dataset.bound = "1";
+      let userUntoggled = root.getAttribute("data-suppress-auto-finish") === "1";
+      const itemId = root.getAttribute("data-item-id") || "";
+      const setFinishedUi = (done) => {
+        finishBtn.classList.toggle("is-done", done);
+        finishBtn.setAttribute("aria-pressed", done ? "true" : "false");
+        finishBtn.textContent = done ? "✓ Finished" : "Mark Finished";
+        finishBtn.setAttribute(
+          "title",
+          done ? "Marked finished — click to unfinish" : "Mark this item as finished"
+        );
+        if (finishForm) {
+          const nextAction = done
+            ? finishForm.getAttribute("data-unfinish-action")
+            : finishForm.getAttribute("data-finish-action");
+          if (nextAction) finishForm.setAttribute("action", nextAction);
+        }
+      };
+      const checkBottomFinish = () => {
+        if (userUntoggled || !document.body.contains(finishBtn)) return;
+        const kind = root.getAttribute("data-kind") || "article";
+        if (kind !== "article" && kind !== "paper") return;
+        const el = document.documentElement;
+        const scrollable = el.scrollHeight - el.clientHeight;
+        if (scrollable <= 8) return;
+        if (window.scrollY / scrollable >= 0.92 && !finishBtn.classList.contains("is-done")) {
+          setFinishedUi(true);
+          if (itemId && finishForm) {
+            postProgress(itemId, 1.0, false);
+          }
+        }
+      };
+      window.addEventListener("scroll", checkBottomFinish, { passive: true });
+      if (!finishForm) {
+        finishBtn.addEventListener("click", () => {
+          const next = !finishBtn.classList.contains("is-done");
+          userUntoggled = !next;
+          setFinishedUi(next);
+        });
+      }
+    }
+  };
+
+  const initOptimisticStars = () => {
+    if (document.body?.dataset.starDelegationBound === "1") return;
+    if (document.body) document.body.dataset.starDelegationBound = "1";
+    document.addEventListener("click", (ev) => {
+      const btn = ev.target?.closest?.(".inbox-star-btn, .reader-star-btn, .js-star-toggle");
+      if (!btn) return;
+      const form = btn.closest("form");
+      const nextStarred = btn.getAttribute("aria-pressed") !== "true";
+      const syncBtn = (el) => {
+        el.classList.toggle("is-starred", nextStarred);
+        el.setAttribute("aria-pressed", nextStarred ? "true" : "false");
+        const glyphHost = el.querySelector("span[aria-hidden]") || el;
+        glyphHost.textContent = nextStarred ? "★" : "☆";
+      };
+
+      // On Reader, keep header star and sticky rail star in sync
+      if (btn.classList.contains("reader-star-btn") || btn.classList.contains("js-star-toggle")) {
+        for (const el of document.querySelectorAll(".reader-star-btn, .js-star-toggle")) {
+          syncBtn(el);
+        }
+      } else {
+        syncBtn(btn);
+      }
+
+      if (!form) return;
+      const action = form.getAttribute("action") || "";
+      if (!action.startsWith("/web/")) return;
+      ev.preventDefault();
+      const csrf = getCsrfToken();
+      const fd = new FormData(form);
+      const params = new URLSearchParams();
+      for (const [k, v] of fd.entries()) {
+        if (typeof v === "string") params.append(k, v);
+      }
+      fetch(action, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "X-Roche-Csrf": csrf,
+        },
+        body: params.toString(),
+        credentials: "same-origin",
+      }).catch(() => {});
+    });
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
+    initReaderExtras();
     initRankBoard();
     initOpmlFileHelper();
     initRefreshBanner();
     initSleeveDrawers();
     initSidebarFeedFilter();
     initFaviconFallbacks();
+    initOptimisticStars();
   };
 
   if (document.readyState === "loading") {

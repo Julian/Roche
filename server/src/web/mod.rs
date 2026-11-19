@@ -71,6 +71,7 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
         .route("/web/items/{id}/unarchive", post(views_reader::post_item_unarchive::<F>))
         .route("/web/items/{id}/progress", post(views_reader::post_item_progress::<F>))
         .route("/web/items/{id}/finish", post(views_reader::post_item_finish::<F>))
+        .route("/web/items/{id}/unfinish", post(views_reader::post_item_unfinish::<F>))
         .route("/web/items/{id}/tags", post(views_reader::post_item_tag_add::<F>))
         .route(
             "/web/items/{id}/tags/{tag_id}/remove",

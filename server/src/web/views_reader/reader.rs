@@ -7,23 +7,31 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{AddTagForm, FinishItemForm, ProgressForm, render_audio_play_button};
+use super::{AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, render_audio_play_button};
 use crate::{
     content::fetcher::HtmlSanitizer,
-    db::{ConsumptionStatus, EntryKind, ItemStatus, MediaType, ReadAtPatch, SyncRepo},
+    db::{
+        ConsumptionStatus, EntryKind, ItemStatus, MediaType, ReadAtPatch, SyncRepo,
+        WANT_TO_READ_COLLECTION_ID,
+    },
     error::ApiError,
     scheduler::FeedFetcher,
     service::{ItemDetail, RocheService},
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, redirect_with_flash,
-            render_inline_csrf_form, render_inline_csrf_form_with_class, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, esc, redirect_see_other,
+            redirect_with_flash, render_feed_favicon, render_inline_csrf_form,
+            render_inline_csrf_form_with_class, render_page, safe_local_redirect, urlencode,
+            web_api_error_response,
         },
         links::sanitize_non_local_href,
     },
 };
+
+const QUEUE_ADD_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"M8 5.2v3.6M6.2 7h3.6\"/></svg>";
+const QUEUE_CHECK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"m6 6.8 1.5 1.5 2.6-2.6\"/></svg>";
+const TOP_ARROW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 13V3.5\"/><path d=\"M4 7.5 8 3.5l4 4\"/></svg>";
 
 pub(in crate::web) async fn reader_get<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
@@ -36,23 +44,40 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
         Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
     };
 
-    let rank_slug = match service.catalog().get_entry_detail(&id).await {
-        Ok(Some(ed)) if ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed) => {
-            service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
+    let (is_consumed, rank_slug) = match service.catalog().get_entry_detail(&id).await {
+        Ok(Some(ed)) => {
+            let consumed = ed.log_history.iter().any(|l| l.status == ConsumptionStatus::Consumed);
+            let slug = if consumed {
+                service.catalog().rank_target_after_consumption(&ed.entry).await.ok().flatten()
+            } else {
+                None
+            };
+            (consumed, slug)
         }
-        _ => None,
+        _ => (false, None),
     };
 
     let active_nav = if detail.item.in_want_to_read {
         NavSection::Queue
     } else if detail.item.feed_id.is_none() && detail.item.is_favorite {
-        NavSection::Lists
+        NavSection::Starred
     } else {
         NavSection::Inbox
     };
+    let is_finished =
+        is_consumed || detail.item.read_at.is_some() || detail.item.read_progress >= 0.98;
+    let suppress_auto_finish =
+        flash.notice.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
 
-    let mut body = String::with_capacity(12_288);
-    render_reader_article(&mut body, &detail, rank_slug.as_deref(), &session.csrf_token);
+    let mut body = String::with_capacity(14_336);
+    render_reader_article(
+        &mut body,
+        &detail,
+        is_finished,
+        suppress_auto_finish,
+        rank_slug.as_deref(),
+        &session.csrf_token,
+    );
 
     render_page(&PageShell {
         title: &detail.item.title,
@@ -65,123 +90,180 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
     .into_response()
 }
 
+fn estimate_reading_minutes(detail: &ItemDetail) -> Option<usize> {
+    let src = detail
+        .item
+        .content_html
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| detail.item.summary.as_deref().filter(|s| !s.trim().is_empty()))?;
+    let mut words = 0usize;
+    let mut in_tag = false;
+    let mut in_word = false;
+    for ch in src.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                in_word = false;
+            }
+            '>' => in_tag = false,
+            c if !in_tag => {
+                if c.is_whitespace() {
+                    in_word = false;
+                } else if !in_word {
+                    words += 1;
+                    in_word = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if words == 0 { None } else { Some((words / 230).max(1)) }
+}
+
 fn render_reader_article(
     out: &mut String,
     detail: &ItemDetail,
+    is_finished: bool,
+    suppress_auto_finish: bool,
     rank_slug: Option<&str>,
     csrf: &str,
 ) {
     let item = &detail.item;
     let entry_kind = EntryKind::from_content_type(item.content_type);
-    let reader_path = format!("/reader/{}", urlencode(&item.id));
+    let id_enc = urlencode(&item.id);
+    let reader_path = format!("/reader/{id_enc}");
+    let suppress_attr = if suppress_auto_finish { " data-suppress-auto-finish=\"1\"" } else { "" };
 
     let _ = writeln!(
         out,
-        "<article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-progress=\"{:.4}\">\n\
-         <div class=\"reader-header\">\n\
-           <div class=\"item-byline\">",
+        "<div class=\"reader-layout\">\n\
+         <article class=\"reader-article js-reader-root\" data-item-id=\"{}\" data-kind=\"{}\" data-progress=\"{:.4}\" data-finished=\"{}\"{suppress_attr}>",
         esc(&item.id),
         entry_kind.as_str(),
         item.read_progress.clamp(0.0, 1.0),
+        if is_finished { "1" } else { "0" },
     );
-    if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
-        let _ = write!(out, "<strong>{}</strong>", esc(ft));
-    }
-    if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
-        let _ = write!(out, "<span>by {}</span>", esc(author));
-    }
-    if let Some(dt) = item.published_at {
-        let _ = write!(out, "<span>{}</span>", dt.format("%B %d, %Y"));
+
+    render_reader_header(out, detail, &id_enc, &reader_path, csrf);
+    render_reader_media_and_prose(out, detail);
+    render_reader_end_card(out, detail, &id_enc, &reader_path, is_finished, csrf);
+    render_reader_tags(out, detail, &id_enc, csrf);
+    out.push_str("</article>\n");
+    render_reader_rail(out, detail, &id_enc, &reader_path, rank_slug, csrf);
+    out.push_str("</div>\n");
+}
+
+fn render_reader_crumb_row(out: &mut String, detail: &ItemDetail) {
+    let item = &detail.item;
+    let (back_href, back_label) = if item.in_want_to_read {
+        ("/queue", "Back to Queue")
+    } else {
+        ("/inbox", "Back to Inbox")
+    };
+    let _ = write!(
+        out,
+        "<div class=\"reader-crumb-row\">\n\
+           <a class=\"reader-back-link\" href=\"{back_href}\">&larr; {back_label}</a>\n\
+           <span>",
+    );
+    let read_mins = estimate_reading_minutes(detail);
+    if let Some(mins) = read_mins {
+        let _ = write!(out, "{mins} min read");
     }
     if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
+        if read_mins.is_some() {
+            out.push_str(" &middot; ");
+        }
         let _ = write!(
             out,
             "<a href=\"{}\" target=\"_blank\" rel=\"noopener\">Original &#8599;</a>",
             esc(ext_href)
         );
     }
-    out.push_str("</div>\n");
+    out.push_str("</span>\n</div>\n");
+}
 
-    let _ = writeln!(out, "<h2>{}</h2>", esc(&item.title));
+fn render_reader_header(
+    out: &mut String,
+    detail: &ItemDetail,
+    id_enc: &str,
+    reader_path: &str,
+    csrf: &str,
+) {
+    let item = &detail.item;
+    render_reader_crumb_row(out, detail);
+    out.push_str("<div class=\"reader-header\">\n<div class=\"reader-title-row\">\n");
 
-    out.push_str("<div class=\"reader-toolbar\">\n");
-    render_audio_play_button(out, item);
-
-    let id_enc = urlencode(&item.id);
-    let finish_action = format!("/web/items/{id_enc}/finish");
-    // Explicit "Finished" & "Finished & Rank" controls (essential for Videos, available on all feed items)
-    render_inline_csrf_form(
-        out,
-        &finish_action,
-        csrf,
-        &[("return_to", &reader_path)],
-        None,
-        "<button type=\"submit\" class=\"btn btn-primary btn-small\">&#10003; Finished</button>",
-    );
-    render_inline_csrf_form(
-        out,
-        &finish_action,
-        csrf,
-        &[("rank_after", "1")],
-        None,
-        "<button type=\"submit\" class=\"btn btn-small\">Finished &amp; Rank</button>",
-    );
-
-    let (arch_action, arch_label, arch_return) = if item.feed_id.is_some() {
-        if item.status == ItemStatus::Unread {
-            ("archive", "Archive", "/inbox")
-        } else {
-            ("unarchive", "Move to Inbox", "/inbox")
-        }
-    } else if item.in_want_to_read {
-        ("archive", "Remove from Want to Read", "/queue")
+    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
+        ("&#9733;", "true", "btn btn-ghost reader-star-btn is-starred")
     } else {
-        ("unarchive", "+ Want to Read", reader_path.as_str())
+        ("&#9734;", "false", "btn btn-ghost reader-star-btn")
     };
-    let prog_str = format!("{:.4}", item.read_progress.clamp(0.0, 1.0));
-    let arch_btn = format!("<button type=\"submit\" class=\"btn btn-small\">{arch_label}</button>");
-    render_inline_csrf_form_with_class(
-        out,
-        &format!("/web/items/{id_enc}/{arch_action}"),
-        csrf,
-        Some("js-reader-archive-form"),
-        &[("progress", &prog_str), ("return_to", arch_return)],
-        None,
-        &arch_btn,
-    );
-
-    let (star_glyph, star_pressed) =
-        if item.is_favorite { ("&#9733;", "true") } else { ("&#9734;", "false") };
     let star_btn = format!(
-        "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span> Star</button>"
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        esc(&item.title),
     );
     render_inline_csrf_form(
         out,
         &format!("/web/items/{id_enc}/star"),
         csrf,
-        &[("return_to", &reader_path)],
+        &[("return_to", reader_path)],
         None,
         &star_btn,
     );
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "<a class=\"btn btn-small btn-ghost\" href=\"/entries/{}\">Catalog Entry</a>",
-        esc(&id_enc),
+        "<h2>{}</h2>\n</div>\n<div class=\"reader-meta-row\">\n<div class=\"item-byline\">",
+        esc(&item.title),
     );
-    if let Some(slug) = rank_slug {
-        let _ = write!(
+    if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
+        let icon_url = item.feed_url.as_deref().or(Some(item.url.as_str()));
+        if let Some(fid) = item.feed_id.as_deref() {
+            let _ = write!(
+                out,
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=all&amp;feed={}\">",
+                esc(&urlencode(fid)),
+            );
+            render_feed_favicon(out, icon_url, ft, true);
+            let _ = write!(out, "<span>{}</span></a>", esc(ft));
+        } else {
+            out.push_str("<span class=\"byline-item byline-feed\">");
+            render_feed_favicon(out, icon_url, ft, true);
+            let _ = write!(out, "<span>{}</span></span>", esc(ft));
+        }
+    }
+    if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
+        let _ = write!(out, "<span class=\"byline-item\">by {}</span>", esc(author));
+    }
+    if let Some(dt) = item.published_at {
+        let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%B %d, %Y"));
+    }
+    out.push_str("</div>\n<div class=\"reader-quick-tools\">\n");
+    render_audio_play_button(out, item);
+    if item.in_want_to_read {
+        render_inline_csrf_form(
             out,
-            "<a class=\"btn btn-small btn-ghost\" href=\"/rank/{slug}?focus={id}\">Compare</a>",
-            slug = esc(&urlencode(slug)),
-            id = esc(&urlencode(&item.id)),
+            &format!("/web/want/read/remove/{id_enc}"),
+            csrf,
+            &[],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">In Queue &times;</button>",
+        );
+    } else {
+        render_inline_csrf_form(
+            out,
+            &format!("/web/entries/{id_enc}/list-add"),
+            csrf,
+            &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", reader_path)],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">+ Queue</button>",
         );
     }
-    out.push_str("</div>\n</div>\n");
-
-    render_reader_media_and_tags(out, detail, csrf);
+    out.push_str("</div>\n</div>\n</div>\n");
 }
 
-fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &str) {
+fn render_reader_media_and_prose(out: &mut String, detail: &ItemDetail) {
     let item = &detail.item;
     for m in &detail.media {
         match m.media_type {
@@ -219,9 +301,66 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
         out.push_str("<p class=\"empty\">No extracted article text stored for this entry.</p>\n");
     }
     out.push_str("</div>\n");
+}
 
+fn render_reader_end_card(
+    out: &mut String,
+    _detail: &ItemDetail,
+    id_enc: &str,
+    reader_path: &str,
+    is_finished: bool,
+    csrf: &str,
+) {
+    let finish_action = format!("/web/items/{id_enc}/finish");
+    let unfinish_action = format!("/web/items/{id_enc}/unfinish");
+    out.push_str("<div class=\"reader-end-card\">\n<div class=\"reader-end-center\">\n");
+    render_inline_csrf_form(
+        out,
+        &finish_action,
+        csrf,
+        &[("rank_after", "1")],
+        None,
+        "<button type=\"submit\" class=\"btn btn-primary reader-end-rank-btn\">Rank</button>",
+    );
+    out.push_str("\n</div>\n<div class=\"reader-end-right\">\n");
+    let (toggle_action, btn_cls, pressed, label, title) = if is_finished {
+        (
+            unfinish_action.as_str(),
+            "btn btn-small btn-ghost btn-finished is-done js-finish-toggle-btn",
+            "true",
+            "&#10003; Finished",
+            "Marked finished — click to unfinish",
+        )
+    } else {
+        (
+            finish_action.as_str(),
+            "btn btn-small btn-ghost btn-finished js-finish-toggle-btn",
+            "false",
+            "Mark Finished",
+            "Mark this item as finished",
+        )
+    };
+    let toggle_btn = format!(
+        "<button type=\"submit\" class=\"{btn_cls}\" aria-pressed=\"{pressed}\" title=\"{title}\">{label}</button>"
+    );
+    let _ = writeln!(
+        out,
+        "<form method=\"post\" action=\"{}\" class=\"inline-form js-finish-toggle-form\" data-finish-action=\"{}\" data-unfinish-action=\"{}\">\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
+           <input type=\"hidden\" name=\"return_to\" value=\"{}\">\
+           {toggle_btn}\
+         </form>",
+        esc(toggle_action),
+        esc(&finish_action),
+        esc(&unfinish_action),
+        esc(csrf),
+        esc(reader_path),
+    );
+    out.push_str("</div>\n</div>\n");
+}
+
+fn render_reader_tags(out: &mut String, detail: &ItemDetail, id_enc: &str, csrf: &str) {
     out.push_str("<h3>Tags</h3>\n<div class=\"pill-bar\">\n");
-    let item_id_enc = urlencode(&item.id);
     for tag in &detail.tags {
         let _ = write!(out, "<span class=\"pill\">#{} ", esc(&tag.name));
         let remove_btn = format!(
@@ -230,7 +369,7 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
         );
         render_inline_csrf_form(
             out,
-            &format!("/web/items/{item_id_enc}/tags/{}/remove", urlencode(&tag.id)),
+            &format!("/web/items/{id_enc}/tags/{}/remove", urlencode(&tag.id)),
             csrf,
             &[],
             None,
@@ -242,11 +381,138 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
         out,
         "<form method=\"post\" action=\"/web/items/{}/tags\" class=\"tag-add-form\">\
            <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
-           <input type=\"text\" name=\"name\" required aria-label=\"Add tag\" placeholder=\"Add tag...\" class=\"tag-add-input\">\
+           <input type=\"text\" name=\"name\" required aria-label=\"Add tag\" placeholder=\"Add tag…\" class=\"tag-add-input\">\
            <button type=\"submit\" class=\"btn btn-small\">+ Tag</button>\
-         </form>\n</div>\n</article>\n",
-        esc(&item_id_enc),
+         </form>\n</div>\n",
+        esc(id_enc),
         esc(csrf),
+    );
+}
+
+fn render_reader_rail(
+    out: &mut String,
+    detail: &ItemDetail,
+    id_enc: &str,
+    reader_path: &str,
+    rank_slug: Option<&str>,
+    csrf: &str,
+) {
+    let item = &detail.item;
+    out.push_str(
+        "<div class=\"reader-rail\">\n\
+           <div class=\"reader-rail-group\" id=\"roche-reader-toc-group\" hidden>\n\
+             <div class=\"reader-rail-title\">Contents</div>\n\
+             <ul class=\"reader-toc\" id=\"roche-reader-toc\"></ul>\n\
+           </div>\n\
+           <div class=\"reader-rail-group\">\n\
+             <div class=\"reader-rail-title\">Typography</div>\n\
+             <div class=\"reader-size-controls\">\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-dec\" aria-label=\"Decrease text size\">A&minus;</button>\n\
+               <button type=\"button\" class=\"btn btn-small btn-ghost js-font-inc\" aria-label=\"Increase text size\">A+</button>\n\
+             </div>\n\
+           </div>\n\
+           <div class=\"reader-rail-group\">\n\
+             <div class=\"reader-rail-title\">Actions</div>\n\
+             <div class=\"reader-rail-actions\">\n",
+    );
+
+    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
+        ("&#9733;", "true", "rail-icon-btn js-star-toggle is-starred")
+    } else {
+        ("&#9734;", "false", "rail-icon-btn js-star-toggle")
+    };
+    let star_btn = format!(
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        esc(&item.title),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/items/{id_enc}/star"),
+        csrf,
+        &[("return_to", reader_path)],
+        None,
+        &star_btn,
+    );
+
+    if item.in_want_to_read {
+        let q_btn = format!(
+            "<button type=\"submit\" class=\"rail-icon-btn\" title=\"Remove from Queue\" aria-label=\"Remove {} from Queue\">{QUEUE_CHECK_SVG}</button>",
+            esc(&item.title),
+        );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/want/read/remove/{id_enc}"),
+            csrf,
+            &[],
+            None,
+            &q_btn,
+        );
+    } else {
+        let q_btn = format!(
+            "<button type=\"submit\" class=\"rail-icon-btn\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">{QUEUE_ADD_SVG}</button>",
+            esc(&item.title),
+        );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/entries/{id_enc}/list-add"),
+            csrf,
+            &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", reader_path)],
+            None,
+            &q_btn,
+        );
+    }
+
+    out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>\n");
+    render_reader_rail_archive(out, item, id_enc, reader_path, csrf);
+
+    let _ = writeln!(
+        out,
+        "<a class=\"rail-icon-btn\" href=\"#roche-masthead\" title=\"Back to top\" aria-label=\"Back to top\">{TOP_ARROW_SVG}</a>\n\
+         </div>\n\
+         <a class=\"reader-rail-link\" href=\"/entries/{}\">History &amp; Lists &rarr;</a>",
+        esc(id_enc),
+    );
+    if let Some(slug) = rank_slug {
+        let _ = writeln!(
+            out,
+            "<br><a class=\"reader-rail-link\" href=\"/rank/{slug}?focus={id}\">Compare &rarr;</a>",
+            slug = esc(&urlencode(slug)),
+            id = esc(&urlencode(&item.id)),
+        );
+    }
+    out.push_str("</div>\n</div>\n");
+}
+
+fn render_reader_rail_archive(
+    out: &mut String,
+    item: &crate::db::Item,
+    id_enc: &str,
+    reader_path: &str,
+    csrf: &str,
+) {
+    let (arch_action, arch_title, arch_return) = if item.feed_id.is_some() {
+        if item.status == ItemStatus::Unread {
+            ("archive", "Archive (mark read)", "/inbox")
+        } else {
+            ("unarchive", "Move back to Inbox", "/inbox")
+        }
+    } else if item.in_want_to_read {
+        ("archive", "Remove from Queue", "/queue")
+    } else {
+        ("unarchive", "Add to Queue", reader_path)
+    };
+    let prog_str = format!("{:.4}", item.read_progress.clamp(0.0, 1.0));
+    let arch_btn = format!(
+        "<button type=\"submit\" class=\"rail-icon-btn\" title=\"{arch_title}\" aria-label=\"{arch_title}\">{ARCHIVE_BOX_SVG}</button>"
+    );
+    render_inline_csrf_form_with_class(
+        out,
+        &format!("/web/items/{id_enc}/{arch_action}"),
+        csrf,
+        Some("js-reader-archive-form"),
+        &[("progress", &prog_str), ("return_to", arch_return)],
+        None,
+        &arch_btn,
     );
 }
 
@@ -350,6 +616,34 @@ pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
         let base = safe_local_redirect(form.return_to.as_deref(), default_return);
         redirect_with_flash(&base, "notice", "Marked finished & logged to Diary")
     }
+}
+
+pub(in crate::web) async fn post_item_unfinish<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Path(id): Path<String>,
+    Form(form): Form<ItemReturnForm>,
+) -> Response {
+    let existing = match service.items().get(&id).await {
+        Ok(d) => d,
+        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
+    };
+    if let Err(err) = service.catalog().delete_consumed_logs_for_entry(&id).await {
+        return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
+    }
+    if let Err(err) = service
+        .items()
+        .update(&id, Some(ItemStatus::Unread), None, Some(0.0), ReadAtPatch::MarkUnread)
+        .await
+    {
+        return web_api_error_response(&err, Some(&session.csrf_token));
+    }
+    if existing.item.feed_id.is_none() {
+        let _ = service.catalog().add_collection_entry(WANT_TO_READ_COLLECTION_ID, &id, None).await;
+    }
+    let fallback = format!("/reader/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    redirect_with_flash(&dest, "notice", "Marked unfinished")
 }
 
 pub(in crate::web) async fn post_item_tag_add<F: FeedFetcher>(

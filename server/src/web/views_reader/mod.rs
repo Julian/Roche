@@ -19,7 +19,7 @@ pub(super) use inbox::{
 };
 pub(super) use reader::{
     item_audio_get, post_item_finish, post_item_progress, post_item_tag_add, post_item_tag_remove,
-    reader_get, web_media_get,
+    post_item_unfinish, reader_get, web_media_get,
 };
 
 #[derive(Debug, Default, Deserialize)]

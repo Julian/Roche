@@ -115,7 +115,10 @@ async fn render_home_inner<F: FeedFetcher>(
         .flat_map(|e| e.creators.iter().cloned())
         .collect();
     home_creators.extend(recent_diary.iter().flat_map(|d| d.entry.creators.iter().cloned()));
-    let artist_links = load_artist_id_by_lower_name(service, &home_creators).await;
+    let (artist_links, diary_tiers) = tokio::join!(
+        load_artist_id_by_lower_name(service, &home_creators),
+        load_diary_tiers(service, &recent_diary),
+    );
 
     let mut body = String::with_capacity(16_384);
     body.push_str(
@@ -151,7 +154,7 @@ async fn render_home_inner<F: FeedFetcher>(
         render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
     }
 
-    render_recent_diary_section(&mut body, &recent_diary, &artist_links);
+    render_recent_diary_section(&mut body, &recent_diary, &artist_links, &diary_tiers);
     body.push_str("</div>\n</div>\n");
 
     Ok(render_page(&PageShell {
@@ -603,18 +606,36 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
     out.push_str("</div></li>\n");
 }
 
-// TODO(backend): include entry global rating tier/score in ConsumptionLogView instead of stubbing
-fn mock_diary_tier(entry_id: &str) -> char {
-    const TIERS: [char; 5] = ['S', 'A', 'A', 'B', 'C'];
-    let hash =
-        entry_id.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
-    TIERS[hash % TIERS.len()]
+async fn load_diary_tiers<F: FeedFetcher>(
+    service: &RocheService<F>,
+    diary: &[ConsumptionLogView],
+) -> HashMap<String, char> {
+    let mut slugs: Vec<&'static str> = diary
+        .iter()
+        .filter(|d| d.status == crate::db::ConsumptionStatus::Consumed)
+        .filter_map(|d| d.entry.kind.default_list_slug())
+        .collect();
+    slugs.sort_unstable();
+    slugs.dedup();
+
+    let mut tiers = HashMap::new();
+    for slug in slugs {
+        if let Ok(ranked) = service.catalog().get_ranked_collection(slug, false).await {
+            for row in ranked.rows {
+                if let Some(t) = row.tier {
+                    tiers.entry(row.entry.id).or_insert(t);
+                }
+            }
+        }
+    }
+    tiers
 }
 
 fn render_recent_diary_section(
     out: &mut String,
     diary: &[ConsumptionLogView],
     artist_links: &HashMap<String, String>,
+    diary_tiers: &HashMap<String, char>,
 ) {
     out.push_str(
         "<section class=\"rail-block\">\n\
@@ -628,7 +649,7 @@ fn render_recent_diary_section(
     } else {
         for row in diary {
             let tier = if row.status == crate::db::ConsumptionStatus::Consumed {
-                Some(mock_diary_tier(&row.entry.id))
+                diary_tiers.get(&row.entry.id).copied()
             } else {
                 None
             };
