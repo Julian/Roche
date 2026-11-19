@@ -12,7 +12,7 @@ use axum::{
 
 use super::{
     DiaryFilterQuery, QuickLogForm, WantCompleteForm, load_existing_reader_item_ids,
-    parse_consumption_status, parse_csv_list, parse_optional_year, render_kind_options,
+    parse_consumption_status, parse_optional_year, render_kind_options,
 };
 use crate::{
     db::{
@@ -25,8 +25,8 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
-            render_diary_row, render_inline_csrf_form, render_page, urlencode,
+            FlashQuery, NavSection, PageShell, esc, parse_csv_list, rank_collection_href,
+            redirect_with_flash, render_diary_row, render_inline_csrf_form, render_page, urlencode,
             web_api_error_response,
         },
         links::{load_artist_id_by_lower_name, render_creator_links},
@@ -79,12 +79,17 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
         entries.len()
     );
 
+    let active_status = status_filter.map_or("", ConsumptionStatus::as_str);
     body.push_str("<div class=\"pill-bar\">\n");
     for (slug, label) in
         [("", "All"), ("consumed", "Consumed"), ("started", "Started"), ("abandoned", "Abandoned")]
     {
-        let is_cur = q.status.as_deref().unwrap_or("") == slug;
-        let cls = if is_cur { "pill is-active" } else { "pill" };
+        let is_cur = active_status == slug;
+        let attrs = if is_cur {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
         let mut params = Vec::new();
         if let Some(yr) = q.year {
             params.push(format!("year={yr}"));
@@ -97,7 +102,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
         } else {
             format!("/diary?{}", params.join("&"))
         };
-        let _ = writeln!(body, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
+        let _ = writeln!(body, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
     body.push_str("</div>\n");
 
@@ -204,7 +209,7 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
 fn render_quick_log_panel(out: &mut String, csrf: &str) {
     let _ = write!(
         out,
-        "<details class=\"editorial-panel\" open>\n\
+        "<details class=\"editorial-panel\" open data-default-open>\n\
            <summary>+ Log Work or Add to Want Queue</summary>\n\
            <form method=\"post\" action=\"/web/log\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
@@ -325,7 +330,7 @@ pub(in crate::web) async fn post_quick_log<F: FeedFetcher>(
 ) -> Response {
     let kind = match EntryKind::parse_flexible(&form.kind) {
         Ok(k) => k,
-        Err(e) => return redirect_see_other(&format!("/queue?err={}", urlencode(&e.to_string()))),
+        Err(e) => return redirect_with_flash("/queue", "err", &e.to_string()),
     };
     let creators = parse_csv_list(form.creators.as_deref());
     let release_year = parse_optional_year(form.release_year.as_deref());
@@ -353,17 +358,21 @@ pub(in crate::web) async fn post_quick_log<F: FeedFetcher>(
                 if form.rank_after.as_deref() == Some("1") && queue.member_count >= 2 {
                     let q_slug = queue.slug.as_deref().unwrap_or(&queue.id);
                     let base = q_slug.strip_prefix("want:").unwrap_or(q_slug);
-                    redirect_see_other(&format!(
-                        "/rank/{}?want=true&focus={}&notice={}",
-                        urlencode(base),
-                        urlencode(&entry.id),
-                        urlencode("Added to Want queue")
-                    ))
+                    redirect_with_flash(
+                        &format!(
+                            "/rank/{}?want=true&focus={}",
+                            urlencode(base),
+                            urlencode(&entry.id)
+                        ),
+                        "notice",
+                        "Added to Want queue",
+                    )
                 } else {
-                    redirect_see_other(&format!(
-                        "/queue?notice={}",
-                        urlencode(&format!("Added '{}' to {}", entry.title, queue.title))
-                    ))
+                    redirect_with_flash(
+                        "/queue",
+                        "notice",
+                        &format!("Added '{}' to {}", entry.title, queue.title),
+                    )
                 }
             }
             Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
@@ -387,17 +396,21 @@ pub(in crate::web) async fn post_quick_log<F: FeedFetcher>(
                     && let Ok(Some(slug)) =
                         service.catalog().rank_target_after_consumption(&logged.entry).await
                 {
-                    redirect_see_other(&format!(
-                        "/rank/{}?focus={}&notice={}",
-                        urlencode(&slug),
-                        urlencode(&logged.entry.id),
-                        urlencode("Logged to Diary")
-                    ))
+                    redirect_with_flash(
+                        &format!(
+                            "/rank/{}?focus={}",
+                            urlencode(&slug),
+                            urlencode(&logged.entry.id)
+                        ),
+                        "notice",
+                        "Logged to Diary",
+                    )
                 } else {
-                    redirect_see_other(&format!(
-                        "/diary?notice={}",
-                        urlencode(&format!("Logged '{}' to Diary", logged.entry.title))
-                    ))
+                    redirect_with_flash(
+                        "/diary",
+                        "notice",
+                        &format!("Logged '{}' to Diary", logged.entry.title),
+                    )
                 }
             }
             Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
@@ -421,17 +434,17 @@ pub(in crate::web) async fn post_want_complete<F: FeedFetcher>(
                 && let Ok(Some(slug)) =
                     service.catalog().rank_target_after_consumption(&logged.entry).await
             {
-                redirect_see_other(&format!(
-                    "/rank/{}?focus={}&notice={}",
-                    urlencode(&slug),
-                    urlencode(&logged.entry.id),
-                    urlencode("Completed from queue — rank globally")
-                ))
+                redirect_with_flash(
+                    &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
+                    "notice",
+                    "Completed from queue — rank globally",
+                )
             } else {
-                redirect_see_other(&format!(
-                    "/queue?notice={}",
-                    urlencode(&format!("Completed '{}' & logged to Diary", logged.entry.title))
-                ))
+                redirect_with_flash(
+                    "/queue",
+                    "notice",
+                    &format!("Completed '{}' & logged to Diary", logged.entry.title),
+                )
             }
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
@@ -444,10 +457,11 @@ pub(in crate::web) async fn post_want_remove<F: FeedFetcher>(
     Path((queue, entry_id)): Path<(String, String)>,
 ) -> Response {
     match service.catalog().unwant_entry(&queue, &entry_id).await {
-        Ok(removed) => redirect_see_other(&format!(
-            "/queue?notice={}",
-            urlencode(&format!("Removed '{}' from queue", removed.title))
-        )),
+        Ok(removed) => redirect_with_flash(
+            "/queue",
+            "notice",
+            &format!("Removed '{}' from queue", removed.title),
+        ),
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }

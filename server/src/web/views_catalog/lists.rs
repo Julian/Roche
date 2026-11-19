@@ -12,7 +12,7 @@ use axum::{
 
 use super::{
     AddListEntryForm, CreateListForm, ListPageQuery, ListsOverviewQuery,
-    load_existing_reader_item_ids, parse_csv_list, parse_optional_year, render_kind_options,
+    load_existing_reader_item_ids, parse_optional_year, render_kind_options,
     render_search_kind_options,
 };
 use crate::{
@@ -26,8 +26,9 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
-            render_inline_csrf_form, render_page, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, parse_csv_list, rank_collection_href,
+            redirect_with_flash, render_inline_csrf_form, render_page, urlencode,
+            web_api_error_response,
         },
         links::{load_artist_id_by_lower_name, render_creator_links},
         views_home::render_collection_draw_section,
@@ -243,11 +244,11 @@ pub(in crate::web) async fn post_list_create<F: FeedFetcher>(
     match created {
         Ok(col) => {
             let slug = col.slug.as_deref().unwrap_or(&col.id);
-            redirect_see_other(&format!(
-                "/lists/{}?notice={}",
-                urlencode(slug),
-                urlencode("Created manual list")
-            ))
+            redirect_with_flash(
+                &format!("/lists/{}", urlencode(slug)),
+                "notice",
+                "Created manual list",
+            )
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
@@ -576,10 +577,11 @@ pub(in crate::web) async fn post_list_add_entry<F: FeedFetcher>(
 ) -> Response {
     let query = form.title_or_id.trim();
     if query.is_empty() {
-        return redirect_see_other(&format!(
-            "/lists/{}?err=Title+cannot+be+empty",
-            urlencode(&slug)
-        ));
+        return redirect_with_flash(
+            &format!("/lists/{}", urlencode(&slug)),
+            "err",
+            "Title cannot be empty",
+        );
     }
 
     let parsed_kind = form
@@ -618,11 +620,11 @@ pub(in crate::web) async fn post_list_add_entry<F: FeedFetcher>(
     };
 
     match service.catalog().add_collection_entry(&slug, &entry_id, None).await {
-        Ok(()) => redirect_see_other(&format!(
-            "/lists/{}?notice={}",
-            urlencode(&slug),
-            urlencode("Added work to list")
-        )),
+        Ok(()) => redirect_with_flash(
+            &format!("/lists/{}", urlencode(&slug)),
+            "notice",
+            "Added work to list",
+        ),
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }
@@ -633,11 +635,11 @@ pub(in crate::web) async fn post_list_remove_entry<F: FeedFetcher>(
     Path((slug, entry_id)): Path<(String, String)>,
 ) -> Response {
     match service.catalog().remove_collection_entry(&slug, &entry_id).await {
-        Ok(_) => redirect_see_other(&format!(
-            "/lists/{}?notice={}",
-            urlencode(&slug),
-            urlencode("Removed work from list")
-        )),
+        Ok(_) => redirect_with_flash(
+            &format!("/lists/{}", urlencode(&slug)),
+            "notice",
+            "Removed work from list",
+        ),
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }

@@ -34,27 +34,27 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
     };
 
     let mut body = String::with_capacity(6_144);
+    body.push_str("<div class=\"page-head\"><h2>Feeds</h2><div class=\"flex-row flex-center\">");
+    render_inline_csrf_form(
+        &mut body,
+        "/web/feeds/refresh-all",
+        &session.csrf_token,
+        &[("return_to", "/feeds")],
+        None,
+        "<button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh All</button>",
+    );
     let _ = writeln!(
         body,
-        "<div class=\"page-head\">\
-           <h2>Feeds</h2>\
-           <div class=\"flex-row flex-center\">\
-             <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <input type=\"hidden\" name=\"return_to\" value=\"/feeds\">\
-               <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh All</button>\
-             </form>\
-             <a class=\"btn btn-small btn-ghost\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\
+        "<a class=\"btn btn-small btn-ghost\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\
            </div>\
          </div>\n\
          <p class=\"lede\">{} subscribed sources (RSS/Atom, Podcasts, YouTube channels, arXiv). Paste a site homepage or YouTube channel to autodiscover its feed.</p>",
         feeds.len(),
-        csrf = esc(&session.csrf_token),
     );
 
     let _ = write!(
         body,
-        "<details class=\"editorial-panel\" open>\n\
+        "<details class=\"editorial-panel\" open data-default-open>\n\
            <summary>+ Subscribe to Feed</summary>\n\
            <form method=\"post\" action=\"/web/feeds/create\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
@@ -183,7 +183,7 @@ pub(in crate::web) async fn post_feed_create<F: FeedFetcher>(
     let source = match FeedSource::parse(&form.url) {
         Ok(s) => s,
         Err(e) => {
-            return redirect_see_other(&format!("/feeds?err={}", urlencode(&e.to_string())));
+            return redirect_with_flash("/feeds", "err", &e.to_string());
         }
     };
     let req_type = match form.feed_type.as_deref() {
@@ -199,10 +199,7 @@ pub(in crate::web) async fn post_feed_create<F: FeedFetcher>(
             tokio::spawn(async move {
                 let _ = service_bg.feeds().refresh(&feed_id).await;
             });
-            redirect_see_other(&format!(
-                "/feeds?notice={}",
-                urlencode("Subscribed to feed (refreshing in background)")
-            ))
+            redirect_with_flash("/feeds", "notice", "Subscribed to feed (refreshing in background)")
         }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
@@ -222,10 +219,7 @@ pub(in crate::web) async fn post_feed_opml<F: FeedFetcher>(
                     service_bg.feeds().poll_feeds_concurrently(imported).await;
                 });
             }
-            redirect_see_other(&format!(
-                "/feeds?notice={}",
-                urlencode(&format!("Imported {count} feeds from OPML"))
-            ))
+            redirect_with_flash("/feeds", "notice", &format!("Imported {count} feeds from OPML"))
         }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
@@ -261,7 +255,7 @@ pub(in crate::web) async fn post_feed_refresh<F: FeedFetcher>(
     tokio::spawn(async move {
         let _ = service_bg.feeds().refresh(&id).await;
     });
-    redirect_see_other(&format!("/feeds?notice={}", urlencode("Refreshing feed in background…")))
+    redirect_with_flash("/feeds", "notice", "Refreshing feed in background…")
 }
 
 pub(in crate::web) async fn post_feed_refresh_all<F: FeedFetcher>(
@@ -320,10 +314,11 @@ pub(in crate::web) async fn post_feed_delete<F: FeedFetcher>(
     Path(id): Path<String>,
 ) -> Response {
     match service.feeds().delete(&id).await {
-        Ok(()) => redirect_see_other(&format!(
-            "/feeds?notice={}",
-            urlencode("Removed feed subscription (diary & rankings preserved)")
-        )),
+        Ok(()) => redirect_with_flash(
+            "/feeds",
+            "notice",
+            "Removed feed subscription (diary & rankings preserved)",
+        ),
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
 }

@@ -1515,22 +1515,41 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
     use super::links::sanitize_non_local_href;
 
     for blocked in [
+        "http://0.0.0.0/a",
+        "http://0.1.2.3/a",
         "http://127.0.0.1/a",
         "http://10.0.0.1/a",
         "http://169.254.169.254/latest/meta-data",
         "http://100.64.0.1/tailscale",
         "http://100.127.255.254/cgnat",
+        "http://240.0.0.1/reserved",
+        "http://255.255.255.255/broadcast",
         "http://[::1]/a",
+        "http://[::127.0.0.1]/ipv4-compat-loopback",
+        "http://[::169.254.169.254]/ipv4-compat-meta",
+        "http://[::8.8.8.8]/ipv4-compat",
+        "http://[::ffff:0:127.0.0.1]/siit",
+        "http://[64:ff9b::127.0.0.1]/nat64-wkp",
+        "http://[64:ff9b:1::1]/nat64-local",
+        "http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/teredo",
         "http://[fc00::1]/ula",
         "http://[fd12:3456::1]/ula",
         "http://[fe80::1]/link-local",
+        "http://[fec0::1]/site-local",
         "http://[::ffff:127.0.0.1]/mapped-loopback",
         "http://[::ffff:10.0.0.1]/mapped-private",
         "http://[::ffff:169.254.169.254]/mapped-meta",
         "http://[::ffff:100.64.0.5]/mapped-cgnat",
+        "http://[::ffff:0.1.2.3]/mapped-this-network",
+        "http://[::ffff:240.0.0.1]/mapped-reserved",
         "http://[2002:7f00:0001::1]/6to4",
         "https://localhost/foo",
         "https://printer.local/foo",
+        "http://roche.local/entry",
+        "https://metadata.google.internal/computeMetadata/v1/",
+        "http://home.arpa/admin",
+        "http://router.home.arpa/status",
+        "https://user:pass@example.com/secret",
     ] {
         assert!(sanitize_non_local_href(blocked).is_none(), "expected {blocked} to be blocked");
     }
@@ -1554,36 +1573,65 @@ fn test_is_same_origin_post_origin_and_referer_fallback() {
     // Sec-Fetch-Site present
     let mut h = HeaderMap::new();
     h.insert("sec-fetch-site", "same-origin".parse().unwrap());
-    assert!(is_same_origin_post(&h));
+    assert!(is_same_origin_post(&h, true));
+    assert!(is_same_origin_post(&h, false));
 
     let mut h = HeaderMap::new();
     h.insert("sec-fetch-site", "cross-site".parse().unwrap());
-    assert!(!is_same_origin_post(&h));
+    assert!(!is_same_origin_post(&h, true));
 
-    // Sec-Fetch-Site absent -> falls back to Origin vs Host
+    // Sec-Fetch-Site absent -> falls back to Origin vs Host with strict scheme check
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example:8080".parse().unwrap());
     h.insert(header::ORIGIN, "https://roche.example:8080".parse().unwrap());
-    assert!(is_same_origin_post(&h));
+    assert!(is_same_origin_post(&h, true));
+    assert!(!is_same_origin_post(&h, false));
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example:8080".parse().unwrap());
+    h.insert(header::ORIGIN, "http://roche.example:8080".parse().unwrap());
+    assert!(is_same_origin_post(&h, false));
+    assert!(!is_same_origin_post(&h, true));
 
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example:8080".parse().unwrap());
     h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
-    assert!(!is_same_origin_post(&h));
+    assert!(!is_same_origin_post(&h, true));
 
-    // Sec-Fetch-Site & Origin absent -> falls back to Referer vs Host
+    // Reject malformed Host headers containing `?`, `#`, `/`, or `@`
+    for bad_host in
+        ["roche.example?x=1", "roche.example#frag", "roche.example/path", "u@roche.example"]
+    {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, bad_host.parse().unwrap());
+        h.insert(header::ORIGIN, "https://roche.example".parse().unwrap());
+        assert!(
+            !is_same_origin_post(&h, true),
+            "expected malformed host {bad_host} to be rejected"
+        );
+    }
+
+    // Sec-Fetch-Site & Origin absent -> falls back to Referer vs Host with strict scheme check
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example".parse().unwrap());
     h.insert(header::REFERER, "https://roche.example/login".parse().unwrap());
-    assert!(is_same_origin_post(&h));
+    assert!(is_same_origin_post(&h, true));
+    assert!(!is_same_origin_post(&h, false));
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example".parse().unwrap());
+    h.insert(header::REFERER, "http://roche.example/login".parse().unwrap());
+    assert!(is_same_origin_post(&h, false));
+    assert!(!is_same_origin_post(&h, true));
 
     let mut h = HeaderMap::new();
     h.insert(header::HOST, "roche.example".parse().unwrap());
     h.insert(header::REFERER, "https://evil.example/login".parse().unwrap());
-    assert!(!is_same_origin_post(&h));
+    assert!(!is_same_origin_post(&h, true));
 
     // All absent -> rejected
-    assert!(!is_same_origin_post(&HeaderMap::new()));
+    assert!(!is_same_origin_post(&HeaderMap::new(), true));
+    assert!(!is_same_origin_post(&HeaderMap::new(), false));
 }
 
 #[test]
@@ -1820,4 +1868,297 @@ async fn test_web_filters_labels_and_destructive_confirmations() {
             .await;
     assert!(entry_html.contains("data-confirm=\"Merge this duplicate"));
     assert!(entry_html.contains("aria-label=\"Canonical entry UUID, URL, or exact title\""));
+}
+
+#[test]
+fn test_safe_local_redirect_ascii_fallback_and_fragment_preserving_flash() {
+    use super::html::{redirect_see_other, redirect_with_flash, safe_local_redirect};
+
+    // Non-ASCII redirect targets are rejected
+    assert_eq!(safe_local_redirect(Some("/inbox?q=caf\u{00e9}"), "/fallback"), "/fallback");
+    assert_eq!(safe_local_redirect(Some("/inbox?q=ok"), "/fallback"), "/inbox?q=ok");
+
+    // `redirect_see_other` always emits a Location header (never a Location-less 303)
+    let non_ascii_resp = redirect_see_other("/inbox?q=caf\u{00e9}");
+    assert_eq!(non_ascii_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(non_ascii_resp.headers().get(header::LOCATION).unwrap(), "/");
+
+    // `redirect_with_flash` preserves `#fragment` after query parameters
+    let frag_only = redirect_with_flash("/entries/abc#notes", "notice", "Saved ok");
+    assert_eq!(
+        frag_only.headers().get(header::LOCATION).unwrap(),
+        "/entries/abc?notice=Saved+ok#notes"
+    );
+
+    let query_and_frag = redirect_with_flash("/inbox?status=all#row-5", "err", "Failed");
+    assert_eq!(
+        query_and_frag.headers().get(header::LOCATION).unwrap(),
+        "/inbox?status=all&err=Failed#row-5"
+    );
+
+    let question_in_frag = redirect_with_flash("/inbox#frag?x=1", "notice", "Hi");
+    assert_eq!(
+        question_in_frag.headers().get(header::LOCATION).unwrap(),
+        "/inbox?notice=Hi#frag?x=1"
+    );
+}
+
+#[test]
+fn test_try_reserve_enrichment_slot_bounds_concurrency_before_marking_cache() {
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use super::artist_enrich::{
+        EnrichAttemptCache, MAX_CONCURRENT_ENRICH_TASKS, try_reserve_enrichment_slot,
+    };
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS));
+    let cache = Mutex::new(EnrichAttemptCache::default());
+    let now = Instant::now();
+    let ttl = Duration::from_secs(60);
+
+    let mut held = Vec::new();
+    for idx in 0..MAX_CONCURRENT_ENRICH_TASKS {
+        let permit =
+            try_reserve_enrichment_slot(&sem, &cache, format!("artist-{idx}|sp=false"), now, ttl)
+                .unwrap_or_else(|| panic!("expected slot {idx} to be reserved"));
+        held.push(permit);
+    }
+    assert_eq!(sem.available_permits(), 0);
+
+    // Exhausted semaphore rejects new artist WITHOUT marking it in the attempt cache
+    assert!(
+        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl)
+            .is_none()
+    );
+
+    // Releasing one permit lets the previously-throttled artist run immediately
+    drop(held.pop());
+    assert_eq!(sem.available_permits(), 1);
+    let overflow_permit =
+        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl);
+    assert!(overflow_permit.is_some());
+    drop(overflow_permit);
+
+    // Duplicate key within TTL returns None and does NOT leak a semaphore permit
+    assert_eq!(sem.available_permits(), 1);
+    assert!(
+        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl)
+            .is_none()
+    );
+    assert_eq!(sem.available_permits(), 1);
+    drop(held);
+    assert_eq!(sem.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
+}
+
+#[tokio::test]
+async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Standard form POST > 128 KiB with known body length is rejected with 413
+    let big_summary = "a".repeat(140 * 1024);
+    let oversized_regular = post_form(
+        &app,
+        "/web/lists/create",
+        &cookie,
+        &[("_csrf", &csrf), ("title", "Too Big"), ("summary", &big_summary)],
+    )
+    .await;
+    assert_eq!(oversized_regular.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB
+    let raw_form =
+        encode_form(&[("_csrf", &csrf), ("title", "Streamed"), ("summary", &big_summary)]);
+    let stream_body =
+        Body::from_stream(tokio_util::io::ReaderStream::new(std::io::Cursor::new(raw_form)));
+    let streamed_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/web/lists/create")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(stream_body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 3. Authenticated OPML upload > 128 KiB (within 4 MiB) is accepted
+    let padding = " ".repeat(160 * 1024);
+    let opml_xml = format!(
+        "<?xml version=\"1.0\"?><opml version=\"2.0\"><body><!--{padding}--></body></opml>"
+    );
+    let opml_resp =
+        post_form(&app, "/web/feeds/opml", &cookie, &[("_csrf", &csrf), ("opml_xml", &opml_xml)])
+            .await;
+    assert_eq!(opml_resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        opml_resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/feeds?notice=")
+    );
+}
+
+#[tokio::test]
+async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    // 1. Default-open panels on /feeds and /queue carry `data-default-open` and roche.js honors it
+    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
+    assert!(feeds_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
+    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
+    assert!(queue_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
+    assert!(super::ROCHE_JS.contains("details[open]:not([data-default-open])"));
+    assert!(!super::ROCHE_JS.contains("resp.url?.includes(\"/login\")"));
+    assert!(super::ROCHE_JS.contains("pathname === \"/login\""));
+    assert!(super::ROCHE_JS.contains("syncCsrfFromDoc"));
+    assert!(super::ROCHE_JS.contains("resp.status === 401"));
+    assert!(super::ROCHE_JS.contains("resp.status === 403"));
+
+    // 2. Invalid `kind` on `/inbox` does not render a bogus chip or narrow batch controls
+    let feed_url = Url::parse("https://blog.example/feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Blog"), None).await.unwrap();
+    let art_url = Url::parse("https://blog.example/post-1").unwrap();
+    db.items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Feed Post One",
+            url: &art_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    let bogus_kind_html =
+        read_body_html(get_authed(&app, "/inbox?kind=bogus", &cookie).await).await;
+    assert!(!bogus_kind_html.contains("active-filters"));
+    assert!(!bogus_kind_html.contains("Kind: bogus"));
+    assert!(!bogus_kind_html.contains("name=\"kind\" value=\"bogus\""));
+    assert!(bogus_kind_html.contains("Archive All Unread"));
+
+    // 3. Active filter pills on `/inbox` and `/diary` carry `aria-current="true"`
+    let valid_kind_html =
+        read_body_html(get_authed(&app, "/inbox?kind=article", &cookie).await).await;
+    assert!(valid_kind_html.contains(
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=unread&amp;kind=article\">Unread</a>"
+    ));
+    assert!(valid_kind_html.contains(
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/inbox?status=unread\">Articles</a>"
+    ));
+    assert!(
+        valid_kind_html
+            .contains("<a class=\"pill\" href=\"/inbox?status=all&amp;kind=article\">All</a>")
+    );
+
+    let diary_consumed_html =
+        read_body_html(get_authed(&app, "/diary?status=consumed", &cookie).await).await;
+    assert!(diary_consumed_html.contains(
+        "<a class=\"pill is-active\" aria-current=\"true\" href=\"/diary?status=consumed\">Consumed</a>"
+    ));
+    assert!(diary_consumed_html.contains("<a class=\"pill\" href=\"/diary\">All</a>"));
+}
+
+#[tokio::test]
+async fn test_round2_web_security_reader_origin_and_rank_redirect() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    // 1. Login POST enforces HTTPS scheme match on Origin when Sec-Fetch-Site is absent
+    let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
+    let login_body = encode_form(&[("pairing_code", &code), ("device_name", "Scheme Check")]);
+    let mut http_origin_over_https = Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::HOST, "roche.example")
+        .header(header::ORIGIN, "http://roche.example")
+        .header("x-forwarded-proto", "https")
+        .body(Body::from(login_body))
+        .unwrap();
+    http_origin_over_https
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41000)));
+    assert_eq!(
+        app.clone().oneshot(http_origin_over_https).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 2. Reader suppresses non-local `Original` links (e.g. http://roche.local or 127.0.0.1)
+    let local_item_url = Url::parse("http://roche.local/private-note").unwrap();
+    let (local_item, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &local_item_url,
+            title: "Local Synthetic Note",
+            summary: Some("Local body"),
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    let local_reader_html =
+        read_body_html(get_authed(&app, &format!("/reader/{}", local_item.id), &cookie).await)
+            .await;
+    assert!(!local_reader_html.contains("Original &#8599;"));
+    assert!(local_reader_html.contains("class=\"inline-form js-reader-archive-form\""));
+
+    let pub_item_url = Url::parse("https://example.org/public-essay").unwrap();
+    let (pub_item, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &pub_item_url,
+            title: "Public Essay",
+            summary: Some("Public body"),
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    let pub_reader_html =
+        read_body_html(get_authed(&app, &format!("/reader/{}", pub_item.id), &cookie).await).await;
+    assert!(pub_reader_html.contains("href=\"https://example.org/public-essay\""));
+    assert!(pub_reader_html.contains("Original &#8599;"));
+
+    // 3. Invalid ranking ordering preserves `want=true`, `focus`, and `round`
+    let bad_rank_resp = post_form(
+        &app,
+        "/rank/movies",
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("want", "true"),
+            ("focus", "entry-xyz"),
+            ("round", "2"),
+            ("ordering_json", "not-valid-json"),
+        ],
+    )
+    .await;
+    assert_eq!(bad_rank_resp.status(), StatusCode::SEE_OTHER);
+    let bad_rank_loc = bad_rank_resp.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+    assert!(bad_rank_loc.starts_with("/rank/movies?"), "got {bad_rank_loc}");
+    assert!(bad_rank_loc.contains("want=true"), "got {bad_rank_loc}");
+    assert!(bad_rank_loc.contains("focus=entry-xyz"), "got {bad_rank_loc}");
+    assert!(bad_rank_loc.contains("round=2"), "got {bad_rank_loc}");
+    assert!(bad_rank_loc.contains("err=Invalid+comparison+ordering"), "got {bad_rank_loc}");
 }

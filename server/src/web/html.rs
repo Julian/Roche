@@ -62,6 +62,7 @@ pub(super) fn safe_local_redirect(candidate: Option<&str>, fallback: &str) -> St
         && raw.starts_with('/')
         && !raw.starts_with("//")
         && !raw.contains('\\')
+        && raw.is_ascii()
         && !raw.bytes().any(|b| b < 0x20 || b == 0x7f)
     {
         return raw.to_owned();
@@ -72,16 +73,31 @@ pub(super) fn safe_local_redirect(candidate: Option<&str>, fallback: &str) -> St
 pub(super) fn redirect_see_other(location: &str) -> Response {
     let safe_loc = safe_local_redirect(Some(location), "/");
     let mut resp = StatusCode::SEE_OTHER.into_response();
-    if let Ok(val) = HeaderValue::from_str(&safe_loc) {
-        resp.headers_mut().insert(header::LOCATION, val);
-    }
+    let val = HeaderValue::from_str(&safe_loc).unwrap_or_else(|_| HeaderValue::from_static("/"));
+    resp.headers_mut().insert(header::LOCATION, val);
     resp
 }
 
 pub(super) fn redirect_with_flash(base: &str, param: &str, msg: &str) -> Response {
     let safe_base = safe_local_redirect(Some(base), "/");
-    let sep = if safe_base.contains('?') { '&' } else { '?' };
-    redirect_see_other(&format!("{safe_base}{sep}{param}={}", urlencode(msg)))
+    let (path_and_query, fragment) = match safe_base.split_once('#') {
+        Some((before, frag)) => (before, Some(frag)),
+        None => (safe_base.as_str(), None),
+    };
+    let sep = if path_and_query.contains('?') { '&' } else { '?' };
+    let mut loc = format!("{path_and_query}{sep}{param}={}", urlencode(msg));
+    if let Some(frag) = fragment {
+        loc.push('#');
+        loc.push_str(frag);
+    }
+    redirect_see_other(&loc)
+}
+
+#[must_use]
+pub(super) fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
+    raw.map_or_default(|s| {
+        s.split(',').map(str::trim).filter(|c| !c.is_empty()).map(ToOwned::to_owned).collect()
+    })
 }
 
 #[must_use]
@@ -123,13 +139,36 @@ pub(super) fn render_inline_csrf_form(
     confirm: Option<&str>,
     button_html: &str,
 ) {
+    render_inline_csrf_form_with_class(
+        out,
+        action,
+        csrf,
+        None,
+        hidden_fields,
+        confirm,
+        button_html,
+    );
+}
+
+pub(super) fn render_inline_csrf_form_with_class(
+    out: &mut String,
+    action: &str,
+    csrf: &str,
+    extra_class: Option<&str>,
+    hidden_fields: &[(&str, &str)],
+    confirm: Option<&str>,
+    button_html: &str,
+) {
+    let class_attr = extra_class
+        .map_or_else(|| "inline-form".to_owned(), |extra| format!("inline-form {extra}"));
     let confirm_attr =
         confirm.map_or_else(String::new, |msg| format!(" data-confirm=\"{}\"", esc(msg)));
     let _ = write!(
         out,
-        "<form method=\"post\" action=\"{}\" class=\"inline-form\"{confirm_attr}>\
+        "<form method=\"post\" action=\"{}\" class=\"{}\"{confirm_attr}>\
            <input type=\"hidden\" name=\"_csrf\" value=\"{}\">",
         esc(action),
+        esc(&class_attr),
         esc(csrf),
     );
     for (name, value) in hidden_fields {

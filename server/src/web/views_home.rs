@@ -10,9 +10,8 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_see_other,
-        redirect_with_flash, render_diary_row, render_inline_csrf_form, render_page, urlencode,
-        web_api_error_response,
+        FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_with_flash,
+        render_diary_row, render_inline_csrf_form, render_page, urlencode, web_api_error_response,
     },
     links::{
         collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
@@ -337,15 +336,18 @@ fn render_home_quick_actions_bar(out: &mut String, csrf: &str) {
              <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
              <input type=\"text\" name=\"url\" required placeholder=\"Save article, PDF, arXiv, or video URL to Want to Read...\" aria-label=\"URL to save to Want to Read\">\n\
              <button type=\"submit\" class=\"btn btn-primary btn-small\">+ Want to Read</button>\n\
-           </form>\n\
-           <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
-             <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>\n\
-           </form>\n\
-         </div>\n",
+           </form>\n",
         csrf = esc(csrf),
     );
+    render_inline_csrf_form(
+        out,
+        "/web/feeds/refresh-all",
+        csrf,
+        &[("return_to", "/")],
+        None,
+        "<button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>",
+    );
+    out.push_str("\n</div>\n");
 }
 
 fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: usize, csrf: &str) {
@@ -499,19 +501,22 @@ pub(super) async fn post_generator_finish<F: FeedFetcher>(
                     "Finished '{}' — rank it in {}",
                     completed.title, next_state.collection_title
                 );
-                redirect_see_other(&format!(
-                    "/rank/{}?focus={}&notice={}",
-                    urlencode(&target_slug),
-                    urlencode(&completed.id),
-                    urlencode(&notice)
-                ))
+                redirect_with_flash(
+                    &format!(
+                        "/rank/{}?focus={}",
+                        urlencode(&target_slug),
+                        urlencode(&completed.id),
+                    ),
+                    "notice",
+                    &notice,
+                )
             } else {
                 let next_part = next_state
                     .current_entry
                     .as_ref()
                     .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
                 let notice = format!("Logged '{}' to Diary{next_part}", completed.title);
-                redirect_see_other(&format!("/?notice={}", urlencode(&notice)))
+                redirect_with_flash("/", "notice", &notice)
             }
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
@@ -531,7 +536,7 @@ pub(super) async fn post_generator_abandon<F: FeedFetcher>(
                 .as_ref()
                 .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
             let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
-            redirect_see_other(&format!("/?notice={}", urlencode(&notice)))
+            redirect_with_flash("/", "notice", &notice)
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }

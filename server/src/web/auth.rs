@@ -4,20 +4,22 @@ use axum::{
     Form,
     body::{Body, to_bytes},
     extract::{ConnectInfo, Extension, Request, State, rejection::ExtensionRejection},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, uri::Authority},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 
-use super::html::{redirect_see_other, render_error_page, render_login_page};
+use super::{
+    MAX_WEB_FORM_BODY_BYTES, MAX_WEB_OPML_BODY_BYTES, OPML_UPLOAD_PATH,
+    html::{redirect_see_other, render_error_page, render_login_page},
+};
 use crate::{error::ApiError, scheduler::FeedFetcher, service::RocheService};
 
 pub(super) const SESSION_COOKIE_NAME: &str = "roche_session";
 pub(super) const LOGGED_OUT_COOKIE_NAME: &str = "roche_logged_out";
 pub(super) const CSRF_HEADER_NAME: &str = "x-roche-csrf";
 const TAILSCALE_LOGIN_HEADER: &str = "tailscale-user-login";
-const MAX_FORM_BODY_FOR_CSRF: usize = 4 * 1024 * 1024;
 const SESSION_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
@@ -110,18 +112,25 @@ fn append_set_cookie(resp: &mut Response, cookie: &str) {
     }
 }
 
-fn url_matches_host(raw_url: &str, host_header: &str) -> bool {
+fn url_matches_host(raw_url: &str, host_header: &str, expected_https: bool) -> bool {
     let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
         return false;
     };
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let expected_scheme = if expected_https { "https" } else { "http" };
+    if parsed.scheme() != expected_scheme {
         return false;
     }
     let host_clean = host_header.trim();
-    if host_clean.is_empty() || host_clean.contains('/') || host_clean.contains('@') {
+    if host_clean.is_empty()
+        || host_clean.contains('/')
+        || host_clean.contains('@')
+        || host_clean.contains('?')
+        || host_clean.contains('#')
+        || host_clean.parse::<Authority>().is_err()
+    {
         return false;
     }
-    let Ok(expected) = url::Url::parse(&format!("{}://{host_clean}", parsed.scheme())) else {
+    let Ok(expected) = url::Url::parse(&format!("{expected_scheme}://{host_clean}")) else {
         return false;
     };
     let (Some(got_host), Some(exp_host)) = (parsed.host_str(), expected.host_str()) else {
@@ -132,7 +141,7 @@ fn url_matches_host(raw_url: &str, host_header: &str) -> bool {
 }
 
 #[must_use]
-pub(super) fn is_same_origin_post(headers: &HeaderMap) -> bool {
+pub(super) fn is_same_origin_post(headers: &HeaderMap, expected_https: bool) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         let clean = site.trim();
         return clean.eq_ignore_ascii_case("same-origin") || clean.eq_ignore_ascii_case("none");
@@ -141,10 +150,10 @@ pub(super) fn is_same_origin_post(headers: &HeaderMap) -> bool {
         return false;
     };
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        return url_matches_host(origin, host);
+        return url_matches_host(origin, host, expected_https);
     }
     if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
-        return url_matches_host(referer, host);
+        return url_matches_host(referer, host, expected_https);
     }
     false
 }
@@ -206,7 +215,9 @@ pub(super) async fn login_post<F: FeedFetcher>(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    if !is_same_origin_post(&headers) {
+    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
+    let secure = is_forwarded_https(peer_addr, &headers);
+    if !is_same_origin_post(&headers, secure) {
         return render_error_page(
             StatusCode::FORBIDDEN,
             "Forbidden",
@@ -214,14 +225,12 @@ pub(super) async fn login_post<F: FeedFetcher>(
             None,
         );
     }
-    let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
     let ts_login = verified_tailscale_login(&service, peer_addr, &headers);
     let label =
         form.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Roche Web");
 
     match service.pair_device_for_request(label, &form.pairing_code, peer_addr, &headers).await {
         Ok(raw_token) => {
-            let secure = is_forwarded_https(peer_addr, &headers);
             let mut resp = redirect_see_other("/");
             append_set_cookie(&mut resp, &build_session_set_cookie(&raw_token, secure));
             append_set_cookie(&mut resp, &build_clear_logged_out_cookie(secure));
@@ -253,7 +262,8 @@ pub(super) async fn login_tailscale_post<F: FeedFetcher>(
     headers: HeaderMap,
 ) -> Response {
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
-    if !is_same_origin_post(&headers) {
+    let secure = is_forwarded_https(peer_addr, &headers);
+    if !is_same_origin_post(&headers, secure) {
         return render_error_page(
             StatusCode::FORBIDDEN,
             "Forbidden",
@@ -283,7 +293,6 @@ pub(super) async fn login_tailscale_post<F: FeedFetcher>(
         )
             .into_response();
     };
-    let secure = is_forwarded_https(peer_addr, &headers);
     let mut resp = redirect_see_other("/");
     append_set_cookie(&mut resp, &build_session_set_cookie(&minted, secure));
     append_set_cookie(&mut resp, &build_clear_logged_out_cookie(secure));
@@ -402,8 +411,13 @@ async fn verify_and_rebuild_mutating_request<F: FeedFetcher>(
         )));
     }
 
+    let max_body = if req.uri().path() == OPML_UPLOAD_PATH {
+        MAX_WEB_OPML_BODY_BYTES
+    } else {
+        MAX_WEB_FORM_BODY_BYTES
+    };
     let (mut parts, body) = req.into_parts();
-    let Ok(bytes) = to_bytes(body, MAX_FORM_BODY_FOR_CSRF).await else {
+    let Ok(bytes) = to_bytes(body, max_body).await else {
         return Err(Box::new(render_error_page(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Payload Too Large",

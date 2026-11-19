@@ -10,6 +10,26 @@
 
   const getCsrfToken = () => document.body?.getAttribute("data-csrf") ?? "";
 
+  const isLoginUrl = (rawUrl) => {
+    if (!rawUrl) return false;
+    try {
+      return new URL(rawUrl, window.location.origin).pathname === "/login";
+    } catch {
+      return false;
+    }
+  };
+
+  const syncCsrfFromDoc = (doc) => {
+    if (!doc?.body?.hasAttribute("data-csrf") || !document.body) return false;
+    const nextCsrf = doc.body.getAttribute("data-csrf") || "";
+    if (!nextCsrf) return false;
+    document.body.setAttribute("data-csrf", nextCsrf);
+    for (const input of document.querySelectorAll('input[name="_csrf"]')) {
+      input.value = nextCsrf;
+    }
+    return true;
+  };
+
   const postProgress = (itemId, progress, keepalive = false) => {
     if (!itemId || !Number.isFinite(progress)) return;
     const clamped = Math.max(0, Math.min(1, progress));
@@ -39,7 +59,7 @@
     }
   };
 
-  const showInlinePjaxError = (message) => {
+  const showInlinePjaxError = (message, actionLink = null) => {
     hideRefreshBanner();
     const curMain = document.getElementById("roche-main");
     if (!curMain) return;
@@ -49,6 +69,13 @@
     banner.setAttribute("role", "alert");
     banner.textContent =
       message || "Request failed. Audio playback is unaffected — please try again.";
+    if (actionLink?.href && actionLink?.label) {
+      banner.appendChild(document.createTextNode(" "));
+      const link = document.createElement("a");
+      link.href = actionLink.href;
+      link.textContent = actionLink.label;
+      banner.appendChild(link);
+    }
     curMain.prepend(banner);
   };
 
@@ -271,9 +298,7 @@
         }
         return false;
       }
-      if (doc.body?.hasAttribute("data-csrf") && document.body) {
-        document.body.setAttribute("data-csrf", doc.body.getAttribute("data-csrf") || "");
-      }
+      syncCsrfFromDoc(doc);
       curMain.replaceChildren(...Array.from(nextMain.childNodes));
       const nextNav = doc.getElementById("roche-nav");
       const curNav = document.getElementById("roche-nav");
@@ -334,8 +359,32 @@
       try {
         const resp = await fetch(reqUrl, opts);
         if (controller && activePjaxController !== controller) return;
-        if (resp.redirected && resp.url?.includes("/login")) {
+        if (resp.redirected && isLoginUrl(resp.url)) {
           window.location.href = resp.url;
+          return;
+        }
+        if (resp.status === 401) {
+          if (!isAudioPlaying()) {
+            window.location.href = "/login";
+          } else {
+            showInlinePjaxError("Your session has expired. Audio playback continues —", {
+              href: "/login",
+              label: "Sign in again",
+            });
+          }
+          return;
+        }
+        if (resp.status === 403) {
+          const errHtml = await resp.text();
+          if (controller && activePjaxController !== controller) return;
+          const errDoc = new DOMParser().parseFromString(errHtml, "text/html");
+          if (syncCsrfFromDoc(errDoc)) {
+            showInlinePjaxError(
+              "Your security token expired and has been refreshed. Please try your action again."
+            );
+          } else {
+            showInlinePjaxError("Action was rejected (403). Please reload and try again.");
+          }
           return;
         }
         if (!resp.ok && resp.status !== 400 && resp.status !== 404 && resp.status !== 409) {
@@ -844,7 +893,7 @@
     }
     const curMain = document.getElementById("roche-main");
     if (!curMain) return false;
-    if (curMain.querySelector("details[open]")) return true;
+    if (curMain.querySelector("details[open]:not([data-default-open])")) return true;
     for (const el of curMain.querySelectorAll("input, textarea, select")) {
       if (el.type === "hidden" || el.type === "submit" || el.type === "button") continue;
       if (el.type === "checkbox" || el.type === "radio") {
@@ -877,7 +926,7 @@
             headers: { Accept: "application/json" },
             credentials: "same-origin",
           });
-          if (!resp.ok) return;
+          if (!resp.ok || (resp.redirected && isLoginUrl(resp.url))) return;
           const data = await resp.json();
           if (data?.is_refreshing) {
             banner.hidden = false;
@@ -899,6 +948,10 @@
             ) {
               const curUrl = `${window.location.pathname}${window.location.search}`;
               const r = await fetch(curUrl, { credentials: "same-origin" });
+              if (r.redirected && isLoginUrl(r.url)) {
+                window.location.href = r.url;
+                return;
+              }
               if (r.ok) {
                 const html = await r.text();
                 const currentPathSearch = `${window.location.pathname}${window.location.search}`;
@@ -909,6 +962,7 @@
                 const nextMain = doc.getElementById("roche-main");
                 const curMain = document.getElementById("roche-main");
                 if (nextMain && curMain) {
+                  syncCsrfFromDoc(doc);
                   curMain.replaceChildren(...Array.from(nextMain.childNodes));
                   initReaderProgress();
                   initRankBoard();

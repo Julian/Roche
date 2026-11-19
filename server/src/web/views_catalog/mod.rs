@@ -162,12 +162,6 @@ pub(super) fn render_search_kind_options(selected: Option<EntryKind>) -> String 
     out
 }
 
-pub(super) fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
-    raw.map_or_default(|s| {
-        s.split(',').map(str::trim).filter(|c| !c.is_empty()).map(ToOwned::to_owned).collect()
-    })
-}
-
 pub(super) fn parse_optional_year(raw: Option<&str>) -> Option<i32> {
     raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok())
 }

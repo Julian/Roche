@@ -15,7 +15,7 @@ use super::{
     auth::WebSession,
     html::{
         FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
-        render_page, urlencode, web_api_error_response,
+        redirect_with_flash, render_page, urlencode, web_api_error_response,
     },
     links::{load_artist_id_by_lower_name, render_creator_links, web_primary_open_url},
 };
@@ -444,15 +444,14 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
 
     let want = matches!(find_val("want"), Some("true" | "1"));
     let focus = find_val("focus").map(str::trim).filter(|s| !s.is_empty());
-    let round = find_val("round").and_then(|r| r.parse::<usize>().ok()).unwrap_or(0);
+    let round_opt = find_val("round").and_then(|r| r.parse::<usize>().ok());
+    let round = round_opt.unwrap_or(0);
     let covered = find_val("covered").unwrap_or("");
 
     let ordering = parse_submitted_ordering(&pairs);
     let Some(groups) = ordering else {
-        return redirect_see_other(&format!(
-            "/rank/{}?err=Invalid+comparison+ordering",
-            urlencode(&slug)
-        ));
+        let base = build_rank_session_href(&slug, round_opt, want, focus, None);
+        return redirect_with_flash(&base, "err", "Invalid comparison ordering");
     };
 
     let (effective_want, scope_col_id) = if want {
@@ -478,17 +477,40 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
         return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
     }
 
-    let mut query_parts = vec![format!("round={}", round + 1)];
-    if effective_want {
+    redirect_see_other(&build_rank_session_href(
+        &slug,
+        Some(round + 1),
+        effective_want,
+        focus,
+        Some(covered),
+    ))
+}
+
+fn build_rank_session_href(
+    slug: &str,
+    round: Option<usize>,
+    want: bool,
+    focus: Option<&str>,
+    covered: Option<&str>,
+) -> String {
+    let mut query_parts = Vec::new();
+    if let Some(r) = round {
+        query_parts.push(format!("round={r}"));
+    }
+    if want {
         query_parts.push("want=true".to_owned());
     }
     if let Some(fid) = focus {
         query_parts.push(format!("focus={}", urlencode(fid)));
     }
-    if !covered.is_empty() {
-        query_parts.push(format!("covered={}", urlencode(covered)));
+    if let Some(cov) = covered.filter(|c| !c.is_empty()) {
+        query_parts.push(format!("covered={}", urlencode(cov)));
     }
-    redirect_see_other(&format!("/rank/{}?{}", urlencode(&slug), query_parts.join("&")))
+    if query_parts.is_empty() {
+        format!("/rank/{}", urlencode(slug))
+    } else {
+        format!("/rank/{}?{}", urlencode(slug), query_parts.join("&"))
+    }
 }
 
 fn parse_submitted_ordering(pairs: &[(String, String)]) -> Option<Vec<Vec<String>>> {

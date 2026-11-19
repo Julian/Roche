@@ -1,10 +1,11 @@
 #[cfg(not(test))]
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     future::Future,
     pin::Pin,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -193,6 +194,7 @@ where
 }
 
 const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
+pub(in crate::web) const MAX_CONCURRENT_ENRICH_TASKS: usize = 4;
 #[cfg(not(test))]
 const FAILED_ENRICH_TTL: Duration = Duration::from_mins(30);
 
@@ -224,6 +226,23 @@ impl EnrichAttemptCache {
     }
 }
 
+pub(in crate::web) fn try_reserve_enrichment_slot(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    cache: &Mutex<EnrichAttemptCache>,
+    attempt_key: String,
+    now: Instant,
+    ttl: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permit = Arc::clone(semaphore).try_acquire_owned().ok()?;
+    let Ok(mut guard) = cache.lock() else {
+        return None;
+    };
+    if !guard.should_attempt_and_mark(attempt_key, now, ttl) {
+        return None;
+    }
+    Some(permit)
+}
+
 #[cfg(not(test))]
 static ENRICH_HTTP_CLIENT: LazyLock<Option<crate::content::http::SafeHttpClient>> =
     LazyLock::new(|| crate::content::http::SafeHttpClient::new(Duration::from_millis(2_500)).ok());
@@ -231,6 +250,10 @@ static ENRICH_HTTP_CLIENT: LazyLock<Option<crate::content::http::SafeHttpClient>
 #[cfg(not(test))]
 static ATTEMPTED_ARTIST_KEYS: LazyLock<Mutex<EnrichAttemptCache>> =
     LazyLock::new(|| Mutex::new(EnrichAttemptCache::default()));
+
+#[cfg(not(test))]
+static ENRICH_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS)));
 
 #[cfg(not(test))]
 pub(in crate::web) fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
@@ -246,17 +269,19 @@ pub(in crate::web) fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
     let can_resolve_spotify = detail.entry.identifier("spotify").is_none()
         && detail.children.iter().any(|c| child_spotify_web_url(c).is_some());
     let attempt_key = format!("{}|sp={can_resolve_spotify}", detail.entry.id);
-    {
-        let Ok(mut cache) = ATTEMPTED_ARTIST_KEYS.lock() else {
-            return;
-        };
-        if !cache.should_attempt_and_mark(attempt_key, Instant::now(), FAILED_ENRICH_TTL) {
-            return;
-        }
-    }
+    let Some(permit) = try_reserve_enrichment_slot(
+        &ENRICH_SEMAPHORE,
+        &ATTEMPTED_ARTIST_KEYS,
+        attempt_key,
+        Instant::now(),
+        FAILED_ENRICH_TTL,
+    ) else {
+        return;
+    };
     let svc = Arc::clone(service);
     let mut detail_bg = detail.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         let _ = tokio::time::timeout(
             Duration::from_secs(4),
             enrich_artist_detail_with_fetcher(&svc, &mut detail_bg, client),
