@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.data
 
+import androidx.compose.ui.graphics.ImageBitmap
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
@@ -25,7 +26,9 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
+import com.grayvines.roche.ui.components.ThumbnailLoader
 import java.io.File
+import java.lang.reflect.Proxy
 import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -34,13 +37,18 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -1259,7 +1267,247 @@ class RocheRepositoryTest {
             )
         )
     }
+
+    @Test
+    internal fun `UrlClassifier rejects substring spoofing while preserving genuine YouTube and arXiv URLs`() {
+        val spoofedYoutubeFeed = "https://evil.example/post?q=youtube.com/feeds/videos.xml"
+        val spoofedArxivQuery = "https://evil.example/post?ref=arxiv.org"
+        val spoofedArxivPath = "https://evil.example/arxiv.org/rss/cs.LG"
+        val spoofedArxivSubdomain = "https://arxiv.org.evil.example/abs/2603.11842"
+        val spoofedYoutubeHost = "https://notyoutube.com/watch?v=dQw4w9WgXcQ"
+        val spoofedGenericFeedXml = "https://evil.example/feeds/videos.xml"
+
+        assertFalse(isLikelyFeedUrl(spoofedYoutubeFeed))
+        assertEquals("rss", inferFeedTypeWireValue(spoofedYoutubeFeed))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedYoutubeFeed))
+        assertEquals("evil.example", extractHostTitle(spoofedYoutubeFeed))
+
+        assertFalse(isLikelyFeedUrl(spoofedArxivQuery))
+        assertEquals("rss", inferFeedTypeWireValue(spoofedArxivQuery))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedArxivQuery))
+        assertEquals("evil.example", extractHostTitle(spoofedArxivQuery))
+
+        assertFalse(isLikelyFeedUrl(spoofedArxivPath))
+        assertEquals("rss", inferFeedTypeWireValue(spoofedArxivPath))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedArxivPath))
+
+        assertEquals("rss", inferFeedTypeWireValue(spoofedArxivSubdomain))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedArxivSubdomain))
+        assertEquals("rss", inferFeedTypeWireValue(spoofedYoutubeHost))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedYoutubeHost))
+        assertEquals("rss", inferFeedTypeWireValue(spoofedGenericFeedXml))
+        assertEquals(ContentType.ARTICLE, inferContentType(spoofedGenericFeedXml))
+        assertEquals("evil.example", extractHostTitle(spoofedGenericFeedXml))
+        assertEquals("youtu.be", extractHostTitle("https://youtu.be/feeds/videos.xml"))
+        assertEquals("article", resolveCandidateContentType("rss", spoofedArxivQuery))
+        assertEquals("article", resolveCandidateContentType("rss", spoofedYoutubeFeed))
+
+        // Genuine YouTube and arXiv URLs continue to classify accurately
+        val ytFeed = "https://www.youtube.com/feeds/videos.xml?channel_id=UC_x5XG1OV2P6uZZ5FSM9Ttw"
+        assertTrue(isLikelyFeedUrl(ytFeed))
+        assertEquals("youtube", inferFeedTypeWireValue(ytFeed))
+        assertEquals("YouTube Channel", extractHostTitle(ytFeed))
+        assertEquals(ContentType.VIDEO, inferContentType("https://m.youtube.com/watch?v=abc123"))
+        assertEquals(ContentType.VIDEO, inferContentType("https://youtu.be/abc123"))
+        assertEquals("youtube", inferFeedTypeWireValue("https://music.youtube.com/watch?v=abc123"))
+
+        assertTrue(isLikelyFeedUrl("https://rss.arxiv.org/rss/cs.AI"))
+        assertTrue(isLikelyFeedUrl("https://www.arxiv.org/rss/cs.LG"))
+        assertTrue(isLikelyFeedUrl("https://export.arxiv.org/api/query?search_query=cat:cs.LG"))
+        assertFalse(isLikelyFeedUrl("https://arxiv.org/abs/2603.11842"))
+        assertEquals("arxiv", inferFeedTypeWireValue("https://arxiv.org/abs/2603.11842"))
+        assertEquals(ContentType.PDF, inferContentType("https://arxiv.org/abs/2603.11842"))
+    }
+
+    @Test
+    internal fun `OfflineCacheManager and ThumbnailLoader share ThumbnailDiskCache safely under concurrency and pruning`() =
+        runTest {
+            val sharedUrl = "https://cdn.example.com/shared-hero.jpg"
+            val payload = ByteArray(64) { idx -> (idx + 1).toByte() }
+            val sharedCacheDir = File(tempDir, "shared_thumb_cache")
+            var nowMs = 10_000_000L
+            val sharedDiskCache =
+                ThumbnailDiskCache(
+                    cacheDir = sharedCacheDir,
+                    clockMs = { nowMs },
+                    maxFiles = 4,
+                    maxBytes = 1024L * 1024L,
+                )
+            val apiClient = RocheApiClient {
+                HttpResponse(statusCode = 200, body = "", bodyBytes = payload)
+            }
+            val dao = database.dao()
+            for (idx in 1..4) {
+                dao.upsertItem(
+                    InboxItemRow(
+                        id = "item-shared-thumb-$idx",
+                        feedId = null,
+                        feedTitle = "Saved",
+                        title = "Hero Article $idx",
+                        url = "https://example.com/hero-$idx",
+                        author = null,
+                        summary = null,
+                        contentText = "Body",
+                        contentHtml = "<p>Body</p>",
+                        contentType = "article",
+                        status = "unread",
+                        isFavorite = false,
+                        publishedAt = "2026-06-01T10:00:00Z",
+                        createdAt = "2026-06-01T10:00:00Z",
+                        readProgress = 0.0,
+                        thumbnailMediaId = null,
+                        duration = null,
+                        isCachedOffline = false,
+                        thumbnailUrl = sharedUrl,
+                    )
+                )
+            }
+            val cacheManager =
+                OfflineCacheManager(
+                    dao = dao,
+                    apiClient = apiClient,
+                    settings = settings,
+                    cacheDir = sharedCacheDir,
+                    thumbnailDiskCache = sharedDiskCache,
+                )
+            val fakeBitmap = createTestImageBitmap()
+            val decoder: (ByteArray) -> androidx.compose.ui.graphics.ImageBitmap? = { bytes ->
+                if (bytes.contentEquals(payload)) fakeBitmap else null
+            }
+            val loader =
+                ThumbnailLoader(
+                    apiClient = apiClient,
+                    settings = settings,
+                    cacheDir = sharedCacheDir,
+                    decoder = decoder,
+                    clockMs = { nowMs },
+                    diskCache = sharedDiskCache,
+                )
+
+            runConcurrentSharedThumbWrites(
+                cacheManager = cacheManager,
+                apiClient = apiClient,
+                sharedCacheDir = sharedCacheDir,
+                sharedDiskCache = sharedDiskCache,
+                decoder = decoder,
+                clockMs = { nowMs },
+                sharedUrl = sharedUrl,
+            )
+
+            val thumbsDir = File(sharedCacheDir, THUMBNAILS_SUBDIR)
+            val targetFile = File(thumbsDir, diskCacheKey(sharedUrl))
+            assertTrue(targetFile.isFile)
+            assertArrayEquals(payload, targetFile.readBytes())
+            assertTrue(thumbsDir.listFiles().orEmpty().none { it.name.endsWith(".tmp") })
+
+            // Mixed writes from OfflineCacheManager and ThumbnailLoader respect shared LRU cap (4)
+            for (idx in 1..6) {
+                nowMs += 1_000L
+                val url = "https://cdn.example.com/pruned-$idx.jpg"
+                val written =
+                    if (idx % 2 == 0) {
+                        sharedDiskCache.writeBytes(url, payload)
+                    } else {
+                        loader.loadThumbnail(url)
+                    }
+                assertNotNull(written)
+            }
+            val remaining = thumbsDir.listFiles().orEmpty()
+            assertTrue(remaining.none { it.name.endsWith(".tmp") })
+            assertEquals(4, remaining.size)
+            assertFalse(targetFile.exists())
+        }
+
+    private suspend fun runConcurrentSharedThumbWrites(
+        cacheManager: OfflineCacheManager,
+        apiClient: RocheApiClient,
+        sharedCacheDir: File,
+        sharedDiskCache: ThumbnailDiskCache,
+        decoder: (ByteArray) -> androidx.compose.ui.graphics.ImageBitmap?,
+        clockMs: () -> Long,
+        sharedUrl: String,
+    ) = coroutineScope {
+        val offlineJobs =
+            (1..4).map { idx ->
+                async(Dispatchers.IO) {
+                    cacheManager.setOfflineCacheState("item-shared-thumb-$idx", enabled = true)
+                }
+            }
+        val loaderJobs =
+            (1..4).map {
+                async(Dispatchers.IO) {
+                    ThumbnailLoader(
+                            apiClient = apiClient,
+                            settings = settings,
+                            cacheDir = sharedCacheDir,
+                            decoder = decoder,
+                            clockMs = clockMs,
+                            diskCache = sharedDiskCache,
+                        )
+                        .loadThumbnail(sharedUrl)
+                }
+            }
+        assertTrue(offlineJobs.awaitAll().all { it })
+        assertTrue(loaderJobs.awaitAll().all { it != null })
+    }
+
+    @Test
+    internal fun `guarded RocheRepository mutators serialize concurrent item and want mutations without deadlock`() =
+        runTest {
+            seedTestDatabase()
+            coroutineScope {
+                val jobs =
+                    listOf(
+                        async(Dispatchers.Default) { repository.toggleStar("item-1") },
+                        async(Dispatchers.Default) { repository.toggleReadState("item-1") },
+                        async(Dispatchers.Default) { repository.setReadState("item-1", true) },
+                        async(Dispatchers.Default) {
+                            repository.updateReadProgress("item-1", 0.95)
+                        },
+                        async(Dispatchers.Default) { repository.toggleTagOnItem("item-1", "sync") },
+                        async(Dispatchers.Default) {
+                            val snap =
+                                repository.setArchiveStateWithSnapshot("item-2", archived = true)
+                            if (snap != null) {
+                                repository.restoreArchiveSnapshots(listOf(snap))
+                            }
+                        },
+                        async(Dispatchers.Default) {
+                            repository.saveUrlOrFeed(
+                                inputUrl = "https://example.com/concurrent-want",
+                                titleOverride = "Concurrent Want",
+                                tagCsv = "reading",
+                            )
+                        },
+                        async(Dispatchers.Default) { repository.markFeedItemFinished("item-1") },
+                    )
+                jobs.awaitAll()
+            }
+
+            val item1 = database.dao().getItemById("item-1")!!
+            assertEquals("archived", item1.status)
+            assertTrue(database.dao().countTerminalLogsForEntry("item-1") >= 1)
+            val savedWant =
+                repository.snapshot.first().entries.firstOrNull {
+                    it.url == "https://example.com/concurrent-want"
+                }
+            assertNotNull(savedWant)
+            assertEquals("Concurrent Want", savedWant?.title)
+        }
 }
+
+private fun createTestImageBitmap(): ImageBitmap =
+    Proxy.newProxyInstance(
+        ImageBitmap::class.java.classLoader,
+        arrayOf(ImageBitmap::class.java),
+    ) { _, method, _ ->
+        when (method.name) {
+            "getWidth",
+            "getHeight" -> 16
+            "toString" -> "TestImageBitmap(16x16)"
+            else -> 0
+        }
+    } as ImageBitmap
 
 private const val TEST_OVERFLOW_TOKEN_COUNT = 20
 

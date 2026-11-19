@@ -7,6 +7,7 @@ import com.grayvines.roche.data.AndroidNetworkTierProvider
 import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.PeerSyncScheduler
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.ThumbnailDiskCache
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.RocheApiClient
@@ -56,6 +57,10 @@ class AppGraph(context: Context) : AutoCloseable {
 
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
 
+    val thumbnailDiskCache: ThumbnailDiskCache by lazy {
+        ThumbnailDiskCache(cacheDir = offlineCacheDir)
+    }
+
     val repository: RocheRepository by lazy {
         lateinit var repo: RocheRepository
         val resolver =
@@ -73,6 +78,7 @@ class AppGraph(context: Context) : AutoCloseable {
                 networkTierProvider = networkTierProvider,
                 backgroundScope = appScope,
                 albumStreamingResolver = resolver,
+                thumbnailDiskCache = thumbnailDiskCache,
             )
         repo
     }
@@ -82,6 +88,7 @@ class AppGraph(context: Context) : AutoCloseable {
             apiClient = apiClient,
             settings = settings,
             cacheDir = offlineCacheDir,
+            diskCache = thumbnailDiskCache,
         )
     }
 

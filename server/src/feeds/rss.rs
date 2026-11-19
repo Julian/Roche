@@ -22,7 +22,7 @@ pub struct RssItem {
     pub thumbnail_url: Option<String>,
     pub audio_url: Option<Url>,
     pub duration: Option<i64>,
-    pub author: Option<String>,
+    pub authors: Vec<String>,
     pub pub_date: Option<DateTime<Utc>>,
 }
 
@@ -122,20 +122,12 @@ impl RssParser {
                 let description = summary.clone().or_else(|| body.clone()).unwrap_or_default();
                 let content_html = body.or(summary);
 
-                let authors: Vec<String> = entry
-                    .authors
-                    .into_iter()
-                    .filter_map(|a| {
-                        let trimmed = a.name.as_deref()?.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-                    })
-                    .collect();
-                let author = (!authors.is_empty())
-                    .then(|| authors.join(", "))
-                    .or_else(|| supp.and_then(|s| s.itunes_author.clone()))
-                    .or_else(|| {
-                        audio_url.is_some().then(|| supplemental.feed_author.clone()).flatten()
-                    });
+                let authors = Self::extract_entry_authors(
+                    entry.authors,
+                    supp,
+                    audio_url.is_some(),
+                    supplemental.feed_author.as_deref(),
+                );
 
                 RssItem {
                     title,
@@ -145,13 +137,38 @@ impl RssParser {
                     thumbnail_url,
                     audio_url,
                     duration,
-                    author,
+                    authors,
                     pub_date,
                 }
             })
             .collect();
 
         Ok((parsed_feed, items))
+    }
+
+    fn extract_entry_authors(
+        entry_authors: Vec<feed_rs::model::Person>,
+        supp: Option<&SupplementalEntryMeta>,
+        has_audio: bool,
+        feed_author: Option<&str>,
+    ) -> Vec<String> {
+        let mut authors: Vec<String> = entry_authors
+            .into_iter()
+            .filter_map(|a| {
+                let trimmed = a.name.as_deref()?.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            })
+            .collect();
+        if authors.is_empty()
+            && let Some(fallback) = supp
+                .and_then(|s| s.itunes_author.as_deref())
+                .or_else(|| has_audio.then_some(feed_author).flatten())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            authors.push(fallback.to_owned());
+        }
+        authors
     }
 
     fn match_supplemental_entry<'a>(
@@ -774,7 +791,7 @@ mod tests {
             items[0].thumbnail_url.as_deref(),
             Some("https://cdn.example.com/acquired-cover.jpg")
         );
-        assert_eq!(items[0].author.as_deref(), Some("Ben Gilbert & David Rosenthal"));
+        assert_eq!(items[0].authors, vec!["Ben Gilbert & David Rosenthal"]);
 
         // Second item has no <link> and non-URL <guid>, so link falls back to audio_url
         assert_eq!(
@@ -790,7 +807,7 @@ mod tests {
             items[1].thumbnail_url.as_deref(),
             Some("https://cdn.example.com/ep-custom-art.png")
         );
-        assert_eq!(items[1].author.as_deref(), Some("Guest Host"));
+        assert_eq!(items[1].authors, vec!["Guest Host"]);
     }
 
     #[test]
@@ -859,7 +876,7 @@ mod tests {
         );
         assert_eq!(items[0].duration, Some(15 * 60 + 30));
         assert_eq!(items[0].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-1.jpg"));
-        assert_eq!(items[0].author.as_deref(), Some("Host One"));
+        assert_eq!(items[0].authors, vec!["Host One"]);
 
         assert_eq!(items[1].title, "Episode 2 Missing ID Matched By Link");
         assert_eq!(
@@ -872,7 +889,7 @@ mod tests {
         );
         assert_eq!(items[1].duration, Some(42 * 60 + 10));
         assert_eq!(items[1].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-2.jpg"));
-        assert_eq!(items[1].author.as_deref(), Some("Host Two"));
+        assert_eq!(items[1].authors, vec!["Host Two"]);
 
         assert_eq!(items[2].title, "Episode 3 Missing ID And Link");
         assert_eq!(
@@ -881,7 +898,7 @@ mod tests {
         );
         assert_eq!(items[2].duration, Some(8 * 60 + 5));
         assert_eq!(items[2].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-3.jpg"));
-        assert_eq!(items[2].author.as_deref(), Some("Host Three"));
+        assert_eq!(items[2].authors, vec!["Host Three"]);
     }
 
     #[test]

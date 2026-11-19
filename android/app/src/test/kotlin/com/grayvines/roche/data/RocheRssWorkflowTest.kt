@@ -694,7 +694,7 @@ class RocheRssWorkflowTest {
             listOf(
                 "http://intranet/rss.xml",
                 "https://user:pass@example.com/rss.xml",
-                "https://example.com:8443/rss.xml",
+                "https://example.com:9000/rss.xml",
                 "http://127.0.0.1/rss.xml",
                 "http://[::1]/rss.xml",
                 "http://10.0.0.1/rss.xml",
@@ -715,6 +715,8 @@ class RocheRssWorkflowTest {
         blockedFeedUrls.forEach { url -> assertFalse(isSyncablePublicUrl(url), url) }
 
         assertTrue(isSyncablePublicUrl("https://blog.example.com/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://blog.example.com:8080/rss.xml"))
+        assertTrue(isSyncablePublicUrl("https://blog.example.com:8443/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://172.15.0.1/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://172.32.0.1/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://100.63.255.1/rss.xml"))

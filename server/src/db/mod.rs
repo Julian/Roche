@@ -76,6 +76,17 @@ pub(crate) fn json_string_like_pattern(value: &str) -> String {
     format!("%{}%", escape_like_literal(&json_quoted))
 }
 
+/// Trims, removes empty names, and JSON-encodes a slice of creator names for `entries.creators_json`.
+/// Returns `None` if no non-empty creator names remain.
+pub(crate) fn serialize_creators_json(creators: &[String]) -> Option<String> {
+    let cleaned: Vec<&str> =
+        creators.iter().map(String::as_str).map(str::trim).filter(|s| !s.is_empty()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&cleaned).ok()
+}
+
 /// Begins a SQLite write transaction using `BEGIN IMMEDIATE` so WAL-mode writers
 /// acquire the RESERVED lock up-front and respect `busy_timeout` instead of failing
 /// immediately with `SQLITE_BUSY` on a read-to-write lock upgrade.

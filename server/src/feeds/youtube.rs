@@ -31,6 +31,11 @@ impl YouTubeParser {
     }
 
     #[must_use]
+    pub fn is_youtube_feed_url(url: &Url) -> bool {
+        Self::is_youtube_host(url.host_str()) && url.path() == "/feeds/videos.xml"
+    }
+
+    #[must_use]
     pub fn extract_video_id(url: &Url) -> Option<String> {
         let host = url.host_str()?;
         if Self::is_youtube_host(Some(host)) {
@@ -216,6 +221,25 @@ impl YouTubeParser {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_youtube_feed_url_rejects_spoofed_hosts() {
+        let valid = Url::parse(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+        )
+        .unwrap();
+        assert!(YouTubeParser::is_youtube_feed_url(&valid));
+
+        for spoofed in [
+            "https://evil.example/page?q=youtube.com/feeds/videos.xml",
+            "https://evil.example/youtube.com/feeds/videos.xml",
+            "https://notyoutube.com/feeds/videos.xml",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            let parsed = Url::parse(spoofed).unwrap();
+            assert!(!YouTubeParser::is_youtube_feed_url(&parsed), "expected false for {spoofed}");
+        }
+    }
 
     #[test]
     fn test_extract_channel_id() {

@@ -18,18 +18,34 @@ macro_rules! tag_select_sql {
        (SELECT COUNT(*)
         FROM collection_entries ce
         LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
+        LEFT JOIN entry_content ec ON ec.entry_id = ce.entry_id
         JOIN entries ie ON ie.id = ce.entry_id
         WHERE ce.collection_id = e.id
           AND ie.merged_into_id IS NULL
           AND (
+              es.inbox_state IN ('unread', 'dismissed')
+              OR ec.entry_id IS NOT NULL
+              OR (
+                  ie.kind IN ('article', 'paper', 'video', 'podcast_episode')
+                  AND EXISTS (
+                      SELECT 1 FROM collection_entries ce_li
+                      JOIN collection_specs cs_li ON cs_li.collection_id = ce_li.collection_id
+                      WHERE ce_li.entry_id = ie.id
+                        AND cs_li.collection_role IN ('want', 'list')
+                  )
+              )
+          )
+          AND (
               es.inbox_state = 'unread'
               OR (
                   COALESCE(es.inbox_state, 'none') = 'none'
-                  AND es.read_at IS NULL
-                  AND EXISTS (
-                      SELECT 1 FROM collection_entries ce_wtr
-                      WHERE ce_wtr.collection_id = ?
-                        AND ce_wtr.entry_id = ie.id
+                  AND (
+                      es.read_at IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM collection_entries ce_wtr
+                          WHERE ce_wtr.collection_id = ?
+                            AND ce_wtr.entry_id = ie.id
+                      )
                   )
               )
           )) AS unread_count
@@ -539,5 +555,95 @@ impl<'a> TagRepo<'a> {
         }
         out.sort_by(|a, b| a.item_id.cmp(&b.item_id).then_with(|| a.tag_id.cmp(&b.tag_id)));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use chrono::Utc;
+    use url::Url;
+
+    use crate::db::{
+        ContentType, Db, EntryKind, ItemFilter, ItemStatus, ItemStatusFilter, ManualItemInput,
+        ReadAtPatch, UpsertEntryInput,
+    };
+
+    #[tokio::test]
+    async fn test_tag_unread_count_matches_unread_filter_for_read_wtr_item_and_excludes_non_reader()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let url = Url::parse("https://example.com/wtr-reread").unwrap();
+        let (item, tags) = db
+            .items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &url,
+                title: "Re-read Essay",
+                summary: None,
+                content_html: Some("<p>Body</p>"),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                tags: &["essays".to_owned()],
+            })
+            .await
+            .unwrap();
+        let tag_id = &tags[0].id;
+        assert_eq!(tags[0].unread_count, 1);
+
+        // Tag a non-reader catalog entry (Movie with no entry_content / entry_state) — must NOT count
+        let movie = db
+            .catalog()
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Movie),
+                title: "Stalker".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        db.tags().add_to_item(&movie.id, tag_id).await.unwrap();
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 1);
+
+        // Mark item read and archive (removes from Want-to-Read) -> unread_count drops to 0
+        db.items()
+            .update(
+                &item.id,
+                Some(ItemStatus::Archived),
+                None,
+                Some(1.0),
+                ReadAtPatch::MarkRead(Utc::now()),
+            )
+            .await
+            .unwrap();
+        let unread_page_archived = db
+            .items()
+            .list_filtered_page(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                tag_id: Some(tag_id.clone()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(unread_page_archived.items.len(), 0);
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 0);
+
+        // Re-add read item to Want-to-Read (read_at IS NOT NULL, in WTR) -> unread_count == 1
+        db.catalog().add_collection_entry("want:read", &item.id, None).await.unwrap();
+        let unread_page_reread = db
+            .items()
+            .list_filtered_page(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                tag_id: Some(tag_id.clone()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(unread_page_reread.items.len(), 1);
+        assert_eq!(unread_page_reread.items[0].id, item.id);
+        assert!(unread_page_reread.items[0].read_at.is_some());
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 1);
+        assert_eq!(db.tags().list().await.unwrap()[0].unread_count, 1);
+        assert_eq!(db.tags().list_for_item(&item.id).await.unwrap()[0].unread_count, 1);
     }
 }

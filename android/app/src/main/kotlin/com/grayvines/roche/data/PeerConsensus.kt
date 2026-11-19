@@ -710,14 +710,14 @@ internal fun shouldPeerPollFeed(
     ) == localPeerId
 }
 
+internal fun isAllowedPublicPort(port: Int): Boolean = port == -1 || port in ALLOWED_PUBLIC_PORTS
+
 internal fun isSyncablePublicUrl(rawUrl: String): Boolean {
     val split = splitHierarchicalUrl(rawUrl.trim()) ?: return false
     val allowedScheme = split.scheme == SCHEME_HTTP || split.scheme == SCHEME_HTTPS
-    val allowedPort =
-        split.port == -1 || split.port == DEFAULT_HTTP_PORT || split.port == DEFAULT_HTTPS_PORT
     return allowedScheme &&
         split.userInfo == null &&
-        allowedPort &&
+        isAllowedPublicPort(split.port) &&
         split.host.isNotBlank() &&
         isPublicHost(split.host)
 }
@@ -805,28 +805,47 @@ private fun isPublicIpv4Literal(host: String): Boolean {
         host.split('.').mapNotNull { part ->
             part.toIntOrNull()?.takeIf { it in 0..IPV4_OCTET_MAX }
         }
-    return octets.size == IPV4_OCTET_COUNT && isPublicIpv4Octets(octets[0], octets[1])
+    return octets.size == IPV4_OCTET_COUNT && isPublicIpv4Octets(octets[0], octets[1], octets[2])
 }
 
-private fun isPublicIpv4Bytes(bytes: ByteArray): Boolean =
-    bytes.size == IPV4_OCTET_COUNT &&
+private fun isPublicIpv4Bytes(bytes: ByteArray, offset: Int = 0): Boolean =
+    bytes.size >= offset + IPV4_OCTET_COUNT &&
         isPublicIpv4Octets(
-            bytes[0].toInt() and IPV4_OCTET_MAX,
-            bytes[1].toInt() and IPV4_OCTET_MAX,
+            bytes[offset].toInt() and IPV4_OCTET_MAX,
+            bytes[offset + 1].toInt() and IPV4_OCTET_MAX,
+            bytes[offset + 2].toInt() and IPV4_OCTET_MAX,
         )
 
-private fun isPublicIpv4Octets(first: Int, second: Int): Boolean {
-    val isRfc1918 =
-        first == IPV4_PRIVATE_10 ||
-            first == IPV4_PRIVATE_192 && second == IPV4_PRIVATE_168 ||
-            first == IPV4_PRIVATE_172 && second in IPV4_PRIVATE_172_MIN..IPV4_PRIVATE_172_MAX
-    val isReservedOrLocal =
-        first == 0 ||
-            first == IPV4_LOOPBACK_127 ||
-            first >= IPV4_MULTICAST_START ||
-            first == IPV4_LINK_LOCAL_169 && second == IPV4_LINK_LOCAL_254 ||
-            first == IPV4_CGNAT_100 && second in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX
-    return !isRfc1918 && !isReservedOrLocal
+private fun isPublicIpv4Octets(first: Int, second: Int, third: Int): Boolean =
+    !isIpv4PrivateOrLocal(first, second) && !isIpv4DocumentationOrBenchmark(first, second, third)
+
+private fun isIpv4PrivateOrLocal(first: Int, second: Int): Boolean =
+    when {
+        first == 0 || first == IPV4_LOOPBACK_127 || first == IPV4_PRIVATE_10 -> true
+        first >= IPV4_MULTICAST_START -> true
+        first == IPV4_PRIVATE_192 && second == IPV4_PRIVATE_168 -> true
+        first == IPV4_PRIVATE_172 && second in IPV4_PRIVATE_172_MIN..IPV4_PRIVATE_172_MAX -> true
+        first == IPV4_LINK_LOCAL_169 && second == IPV4_LINK_LOCAL_254 -> true
+        first == IPV4_CGNAT_100 && second in IPV4_CGNAT_MIN..IPV4_CGNAT_MAX -> true
+        else -> false
+    }
+
+private fun isIpv4DocumentationOrBenchmark(first: Int, second: Int, third: Int): Boolean =
+    isIpv4TestNet1OrIetf(first, second, third) || isIpv4TestNet2Or3OrBenchmark(first, second, third)
+
+private fun isIpv4TestNet1OrIetf(first: Int, second: Int, third: Int): Boolean =
+    first == IPV4_PRIVATE_192 && second == 0 && (third == 0 || third == IPV4_DOC_TEST_NET_1_B2)
+
+private fun isIpv4TestNet2Or3OrBenchmark(first: Int, second: Int, third: Int): Boolean {
+    val isTestNet2 =
+        first == IPV4_BENCHMARK_198 &&
+            second == IPV4_DOC_TEST_NET_2_B1 &&
+            third == IPV4_DOC_TEST_NET_2_B2
+    val isTestNet3 =
+        first == IPV4_DOC_TEST_NET_3_B0 && second == 0 && third == IPV4_DOC_TEST_NET_3_B2
+    val isBenchmark =
+        first == IPV4_BENCHMARK_198 && second in IPV4_BENCHMARK_MIN..IPV4_BENCHMARK_MAX
+    return isTestNet2 || isTestNet3 || isBenchmark
 }
 
 private fun isPublicIpv6Literal(bracketedHost: String): Boolean = runCatching {
@@ -834,16 +853,74 @@ private fun isPublicIpv6Literal(bracketedHost: String): Boolean = runCatching {
 }
     .getOrDefault(false)
 
+private fun ipv6Segment(bytes: ByteArray, index: Int): Int {
+    val byteOffset = index * 2
+    val hi = bytes[byteOffset].toInt() and IPV4_OCTET_MAX
+    val lo = bytes[byteOffset + 1].toInt() and IPV4_OCTET_MAX
+    return hi shl IPV6_SEGMENT_SHIFT or lo
+}
+
 private fun isPublicIpv6Address(addr: InetAddress): Boolean {
     val bytes = addr.address
-    val firstByte = bytes[0].toInt() and IPV4_OCTET_MAX
-    val isUniqueLocal = firstByte and IPV6_ULA_MASK == IPV6_ULA_PREFIX
-    return !isUniqueLocal &&
-        !addr.isLoopbackAddress &&
-        !addr.isAnyLocalAddress &&
-        !addr.isLinkLocalAddress &&
-        !addr.isSiteLocalAddress &&
-        !addr.isMulticastAddress
+    if (bytes.size != IPV6_BYTE_COUNT) return false
+    if (isStandardNonGlobalIpv6(addr, bytes)) return false
+    if (hasEmbeddedIpv4Prefix(bytes)) {
+        return isPublicIpv4Bytes(bytes, offset = IPV6_EMBEDDED_IPV4_OFFSET)
+    }
+    return !isSpecialPurposeIpv6(bytes)
+}
+
+private fun isStandardNonGlobalIpv6(addr: InetAddress, bytes: ByteArray): Boolean {
+    val firstSeg = ipv6Segment(bytes, 0)
+    return when {
+        firstSeg and IPV6_ULA_SEG_MASK == IPV6_ULA_SEG_PREFIX -> true
+        addr.isLoopbackAddress || addr.isAnyLocalAddress -> true
+        addr.isLinkLocalAddress || addr.isSiteLocalAddress -> true
+        addr.isMulticastAddress -> true
+        else -> false
+    }
+}
+
+private fun hasEmbeddedIpv4Prefix(bytes: ByteArray): Boolean {
+    val leadZero =
+        (0 until IPV6_EMBEDDED_LEAD_ZERO_SEGMENTS).all { idx -> ipv6Segment(bytes, idx) == 0 }
+    if (!leadZero) return false
+    val sixthSeg = ipv6Segment(bytes, IPV6_MAPPED_SEG_INDEX)
+    return sixthSeg == 0 || sixthSeg == IPV6_MAPPED_SEG_VALUE
+}
+
+private fun isSpecialPurposeIpv6(bytes: ByteArray): Boolean {
+    val s0 = ipv6Segment(bytes, 0)
+    val s1 = ipv6Segment(bytes, 1)
+    val s2 = ipv6Segment(bytes, 2)
+    return when {
+        isNat64Ipv6(bytes, s0, s1, s2) -> true
+        isDiscardIpv6(bytes, s0) -> true
+        is2001SpecialIpv6(s0, s1, s2) -> true
+        s0 == IPV6_6TO4_SEG0 -> true
+        else -> false
+    }
+}
+
+private fun isNat64Ipv6(bytes: ByteArray, s0: Int, s1: Int, s2: Int): Boolean {
+    if (s0 != IPV6_NAT64_SEG0 || s1 != IPV6_NAT64_SEG1) return false
+    if (s2 == IPV6_NAT64_LOCAL_SEG2) return true
+    return (2 until IPV6_NAT64_WELL_KNOWN_ZERO_END).all { idx -> ipv6Segment(bytes, idx) == 0 }
+}
+
+private fun isDiscardIpv6(bytes: ByteArray, s0: Int): Boolean =
+    s0 == IPV6_DISCARD_SEG0 &&
+        (1 until IPV6_DISCARD_ZERO_END).all { idx -> ipv6Segment(bytes, idx) == 0 }
+
+private fun is2001SpecialIpv6(s0: Int, s1: Int, s2: Int): Boolean {
+    if (s0 != IPV6_2001_SEG0) return false
+    return when {
+        s1 == 0 -> true
+        s1 == IPV6_DOC_SEG1 -> true
+        s1 == IPV6_BENCHMARK_SEG1 && s2 == 0 -> true
+        s1 and IPV6_ORCHID_MASK == IPV6_ORCHID_V2_PREFIX -> true
+        else -> false
+    }
 }
 
 private const val DIGEST_ALGORITHM_SHA256 = "SHA-256"
@@ -851,6 +928,10 @@ private const val SCHEME_HTTP = "http"
 private const val SCHEME_HTTPS = "https"
 private const val DEFAULT_HTTP_PORT = 80
 private const val DEFAULT_HTTPS_PORT = 443
+private const val ALT_HTTP_PORT = 8080
+private const val ALT_HTTPS_PORT = 8443
+private val ALLOWED_PUBLIC_PORTS =
+    setOf(DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT, ALT_HTTP_PORT, ALT_HTTPS_PORT)
 private const val MAX_URL_PORT = 65_535
 private const val HEX_UPPER = "0123456789ABCDEF"
 private const val URL_USERINFO_SAFE = "-._~!$&'()*+,;=:"
@@ -877,9 +958,34 @@ private const val IPV4_LINK_LOCAL_254 = 254
 private const val IPV4_CGNAT_100 = 100
 private const val IPV4_CGNAT_MIN = 64
 private const val IPV4_CGNAT_MAX = 127
+private const val IPV4_BENCHMARK_198 = 198
+private const val IPV4_BENCHMARK_MIN = 18
+private const val IPV4_BENCHMARK_MAX = 19
+private const val IPV4_DOC_TEST_NET_1_B2 = 2
+private const val IPV4_DOC_TEST_NET_2_B1 = 51
+private const val IPV4_DOC_TEST_NET_2_B2 = 100
+private const val IPV4_DOC_TEST_NET_3_B0 = 203
+private const val IPV4_DOC_TEST_NET_3_B2 = 113
 private const val IPV4_MULTICAST_START = 224
-private const val IPV6_ULA_MASK = 0xfe
-private const val IPV6_ULA_PREFIX = 0xfc
+private const val IPV6_SEGMENT_SHIFT = 8
+private const val IPV6_ULA_SEG_MASK = 0xfe00
+private const val IPV6_ULA_SEG_PREFIX = 0xfc00
+private const val IPV6_EMBEDDED_LEAD_ZERO_SEGMENTS = 5
+private const val IPV6_MAPPED_SEG_INDEX = 5
+private const val IPV6_MAPPED_SEG_VALUE = 0xffff
+private const val IPV6_EMBEDDED_IPV4_OFFSET = 12
+private const val IPV6_NAT64_SEG0 = 0x0064
+private const val IPV6_NAT64_SEG1 = 0xff9b
+private const val IPV6_NAT64_LOCAL_SEG2 = 0x0001
+private const val IPV6_NAT64_WELL_KNOWN_ZERO_END = 6
+private const val IPV6_DISCARD_SEG0 = 0x0100
+private const val IPV6_DISCARD_ZERO_END = 4
+private const val IPV6_2001_SEG0 = 0x2001
+private const val IPV6_DOC_SEG1 = 0x0db8
+private const val IPV6_BENCHMARK_SEG1 = 0x0002
+private const val IPV6_ORCHID_MASK = 0xfff0
+private const val IPV6_ORCHID_V2_PREFIX = 0x0020
+private const val IPV6_6TO4_SEG0 = 0x2002
 private const val TS_NET_SUFFIX = ".ts.net"
 private const val MISSING_DELIM = "\u0000"
 private const val URL_SCHEME_SEP_LEN = 3

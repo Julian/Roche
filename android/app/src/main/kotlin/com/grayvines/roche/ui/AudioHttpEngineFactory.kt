@@ -19,7 +19,10 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.HttpUtil
 import com.grayvines.roche.data.remote.MAX_REDIRECTS
 import com.grayvines.roche.data.remote.PublicUrlValidator
+import com.grayvines.roche.data.remote.filterRedirectHeaders
+import com.grayvines.roche.data.remote.isSameOriginHost
 import com.grayvines.roche.data.remote.resolveRedirectUrl
+import com.grayvines.roche.data.remote.shouldRewriteRedirectToGet
 import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
@@ -245,6 +248,7 @@ internal class SafeRedirectHttpDataSource(
         var currentUrl = validateUrl(rawUrl.trim())
         var method = httpMethod
         var body = httpBody
+        var currentHeaders = requestHeaders
 
         for (hop in 0..maxRedirects) {
             val conn =
@@ -252,7 +256,7 @@ internal class SafeRedirectHttpDataSource(
                     url = currentUrl,
                     httpMethod = method,
                     httpBody = body,
-                    requestHeaders = requestHeaders,
+                    requestHeaders = currentHeaders,
                     position = position,
                     length = length,
                 )
@@ -269,10 +273,18 @@ internal class SafeRedirectHttpDataSource(
                 runCatching { conn.disconnect() }
                 if (hop >= maxRedirects) break
                 val nextRaw =
-                    resolveRedirectUrl(currentUrl, location)
+                    location?.let { resolveRedirectUrl(currentUrl, it) }
                         ?: throw IOException("Blocked or invalid audio redirect URL")
-                currentUrl = validateUrl(nextRaw)
-                if (responseCode in POST_TO_GET_REDIRECT_CODES && method == "POST") {
+                val nextUrl = validateUrl(nextRaw)
+                val switchToGet = shouldRewriteRedirectToGet(method, responseCode)
+                currentHeaders =
+                    filterRedirectHeaders(
+                        headers = currentHeaders,
+                        sameOrigin = isSameOriginHost(currentUrl, nextUrl),
+                        dropPayloadHeaders = switchToGet,
+                    )
+                currentUrl = nextUrl
+                if (switchToGet) {
                     method = "GET"
                     body = null
                 }
@@ -293,7 +305,7 @@ internal class SafeRedirectHttpDataSource(
         position: Long,
         length: Long,
     ): HttpURLConnection {
-        val conn = openConnection(URI.create(url).toURL())
+        val conn = openConnection(URI.create(url.trim().replace(" ", "%20")).toURL())
         var handedOff = false
         try {
             conn.instanceFollowRedirects = false
@@ -352,7 +364,6 @@ internal class SafeRedirectHttpDataSource(
         const val HTTP_SUCCESS_MAX = 299
         const val HTTP_RANGE_NOT_SATISFIABLE = 416
         const val SKIP_BUFFER_BYTES = 4096
-        val POST_TO_GET_REDIRECT_CODES = 301..303
         val REDIRECT_STATUS_CODES = setOf(300, 301, 302, 303, 307, 308)
     }
 }

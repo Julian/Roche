@@ -45,8 +45,14 @@ impl ArxivParser {
                 });
                 let title = entry.title.map_or_default(|t| t.content);
 
-                let authors: Vec<String> =
-                    entry.authors.into_iter().filter_map(|a| a.name).collect();
+                let authors: Vec<String> = entry
+                    .authors
+                    .into_iter()
+                    .filter_map(|a| {
+                        let trimmed = a.name.as_deref()?.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                    })
+                    .collect();
 
                 let summary = entry.summary.map_or_default(|s| s.content);
 

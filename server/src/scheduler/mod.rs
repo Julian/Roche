@@ -701,7 +701,7 @@ impl FeedIngester {
                         Some(PollItemCandidate {
                             title: item.title,
                             url,
-                            author: item.author,
+                            creators: item.authors,
                             published_at: item.pub_date,
                             summary,
                             content_html,
@@ -739,7 +739,7 @@ impl FeedIngester {
                         PollItemCandidate {
                             title: video.title,
                             url: video.watch_url,
-                            author: author.clone(),
+                            creators: author.clone().into_iter().collect(),
                             published_at: video.published_at,
                             content_html: Some(clean_desc),
                             thumbnail_url,
@@ -764,8 +764,6 @@ impl FeedIngester {
                     .into_iter()
                     .filter_map(|paper| {
                         let url = paper.abstract_url?;
-                        let authors = paper.authors.join(", ");
-                        let author = (!authors.is_empty()).then_some(authors);
                         let clean_summary = HtmlSanitizer::clean(&paper.summary);
                         let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
                             &clean_summary,
@@ -774,7 +772,7 @@ impl FeedIngester {
                         Some(PollItemCandidate {
                             title: paper.title,
                             url,
-                            author,
+                            creators: paper.authors,
                             published_at: paper.published_at,
                             content_html: Some(clean_summary),
                             thumbnail_url: None,
@@ -991,7 +989,7 @@ mod tests {
             .map(|idx| PollItemCandidate {
                 title: format!("Paper {idx}"),
                 url: Url::parse(&format!("https://example.com/paper-{idx}.pdf")).unwrap(),
-                author: None,
+                creators: Vec::new(),
                 published_at: None,
                 summary: format!("Summary {idx}"),
                 content_html: None,
@@ -1458,5 +1456,41 @@ mod tests {
         assert!(res.unwrap().is_ok());
         drop(tx);
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_arxiv_poll_preserves_separate_authors_in_creators_json() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>arXiv cs.LG</title>
+          <entry>
+            <id>http://arxiv.org/abs/2401.12345v1</id>
+            <title>Distributed Consensus Revisited</title>
+            <summary>We study multi-author consensus.</summary>
+            <author><name>Alice Smith</name></author>
+            <author><name>Bob Jones</name></author>
+            <link rel="alternate" type="text/html" href="https://arxiv.org/abs/2401.12345"/>
+          </entry>
+        </feed>"#;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url =
+            Url::parse("https://export.arxiv.org/api/query?search_query=cat:cs.LG").unwrap();
+        let feed = db.feeds().create(FeedType::Arxiv, &feed_url, None, None).await.unwrap();
+        let batch = FeedIngester::parse_feed_content(FeedType::Arxiv, xml).unwrap();
+        let inserted = db.feeds().record_poll_batch(&feed.id, &batch).await.unwrap();
+        assert_eq!(inserted.len(), 1);
+        let item_id = &inserted[0].0;
+
+        let creators_json: String =
+            sqlx::query_scalar("SELECT creators_json FROM entries WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(creators_json, r#"["Alice Smith","Bob Jones"]"#);
+
+        let item = db.items().get(item_id).await.unwrap().unwrap();
+        assert_eq!(item.author.as_deref(), Some("Alice Smith, Bob Jones"));
     }
 }

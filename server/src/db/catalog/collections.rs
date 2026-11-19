@@ -181,25 +181,9 @@ impl CatalogRepo<'_> {
         summary: Option<&str>,
         color: Option<&str>,
     ) -> CatalogResult<CollectionSummary> {
-        let clean_title = title.trim();
-        if clean_title.is_empty() {
-            return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
-        }
-        if !matches!(role, CollectionRole::List | CollectionRole::Want) {
-            return Err(CatalogError::InvalidInput(
-                "Custom collections must have role 'list' or 'want'".to_owned(),
-            ));
-        }
-
-        let derived_slug = slug
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| slugify_title(clean_title), slugify_title);
-        if derived_slug.is_empty() {
-            return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
-        }
-
-        let id = deterministic_system_collection_id(&format!("custom:{derived_slug}"));
+        let (clean_title, derived_slug, id) =
+            derive_manual_collection_slug_and_id(title, slug, role)?;
+        let clean_title = clean_title.as_str();
         let now = SyncRepo::now_utc();
         let show_in_lists = role == CollectionRole::List;
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
@@ -921,7 +905,47 @@ fn append_dynamic_rule_sql_filters(qb: &mut QueryBuilder<Sqlite>, rule: &Dynamic
     }
 }
 
-pub(super) fn slugify_title(title: &str) -> String {
+pub(super) fn derive_manual_collection_slug_and_id(
+    title: &str,
+    slug: Option<&str>,
+    role: CollectionRole,
+) -> CatalogResult<(String, String, String)> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
+    }
+    if !matches!(role, CollectionRole::List | CollectionRole::Want) {
+        return Err(CatalogError::InvalidInput(
+            "Custom collections must have role 'list' or 'want'".to_owned(),
+        ));
+    }
+
+    let raw_source = slug.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(clean_title);
+    let slug_input = if role == CollectionRole::Want
+        && raw_source.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("want:"))
+    {
+        &raw_source[5..]
+    } else {
+        raw_source
+    };
+    let base_slug = slugify_title(slug_input);
+    if base_slug.is_empty() {
+        return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
+    }
+
+    let (derived_slug, id) = if role == CollectionRole::Want {
+        let full_slug = format!("want:{base_slug}");
+        let det_id = deterministic_system_collection_id(&full_slug);
+        (full_slug, det_id)
+    } else {
+        let det_id = deterministic_system_collection_id(&format!("custom:{base_slug}"));
+        (base_slug, det_id)
+    };
+
+    Ok((clean_title.to_owned(), derived_slug, id))
+}
+
+fn slugify_title(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut prev_sep = false;
     for ch in title.chars() {

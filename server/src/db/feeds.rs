@@ -142,7 +142,7 @@ impl TryFrom<RawFeedRow> for Feed {
 pub struct PollItemCandidate {
     pub title: String,
     pub url: Url,
-    pub author: Option<String>,
+    pub creators: Vec<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub summary: String,
     pub content_html: Option<String>,
@@ -1044,12 +1044,7 @@ impl<'a> FeedRepo<'a> {
                 }
             } else {
                 let entry_kind = EntryKind::from_content_type(item.content_type);
-                let creators_json = item
-                    .author
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|a| serde_json::to_string(&[a]).ok())
+                let creators_json = crate::db::serialize_creators_json(&item.creators)
                     .unwrap_or_else(|| "[]".to_owned());
 
                 let res = sqlx::query!(
@@ -1156,17 +1151,12 @@ impl<'a> FeedRepo<'a> {
         if item.audio_url.is_none()
             && clean_duration.is_none()
             && item.thumbnail_url.is_none()
-            && item.author.is_none()
+            && item.creators.is_empty()
         {
             return Ok(());
         }
 
-        let new_creators_json = item
-            .author
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|a| serde_json::to_string(&[a]).ok());
+        let new_creators_json = crate::db::serialize_creators_json(&item.creators);
         let thumb_ref = item.thumbnail_url.as_deref();
         let creators_ref = new_creators_json.as_deref();
         let audio_ref = item.audio_url.as_deref();

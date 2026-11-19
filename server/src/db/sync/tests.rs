@@ -247,7 +247,7 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
                     PollItemCandidate {
                         title: "Post 1".to_string(),
                         url: item1_url.clone(),
-                        author: None,
+                        creators: Vec::new(),
                         published_at: None,
                         summary: "Short".to_string(),
                         content_html: Some("<p>Short</p>".to_string()),
@@ -259,7 +259,7 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
                     PollItemCandidate {
                         title: "Post 2".to_string(),
                         url: item2_url.clone(),
-                        author: None,
+                        creators: Vec::new(),
                         published_at: None,
                         summary: "To be deleted".to_string(),
                         content_html: None,
@@ -603,7 +603,7 @@ async fn test_sync_seq_delta_and_multipage_content_html() {
         .map(|idx| PollItemCandidate {
             title: format!("Article {idx}"),
             url: Url::parse(&format!("https://example.com/article-{idx}")).unwrap(),
-            author: None,
+            creators: Vec::new(),
             published_at: None,
             summary: format!("Summary {idx}"),
             content_html: Some(format!("<p>Body content {idx}</p>")),
@@ -807,7 +807,7 @@ async fn test_sync_seq_pagination_and_pruned_cursor_reset() {
         .map(|idx| PollItemCandidate {
             title: format!("Cap Item {idx}"),
             url: Url::parse(&format!("https://example.com/cap-item-{idx}")).unwrap(),
-            author: None,
+            creators: Vec::new(),
             published_at: None,
             summary: format!("Summary {idx}"),
             content_html: Some(format!("<p>Body {idx}</p>")),

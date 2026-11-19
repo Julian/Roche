@@ -946,7 +946,7 @@ internal fun buildRedirectedRequest(
     )
 }
 
-private fun filterRedirectHeaders(
+internal fun filterRedirectHeaders(
     headers: Map<String, String>,
     sameOrigin: Boolean,
     dropPayloadHeaders: Boolean,
@@ -974,8 +974,8 @@ internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = ru
     .getOrNull()
 
 internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
-    val origin = URI.create(firstUrl.trim()).toURL()
-    val target = URI.create(secondUrl.trim()).toURL()
+    val origin = URI.create(firstUrl.trim().replace(" ", "%20")).toURL()
+    val target = URI.create(secondUrl.trim().replace(" ", "%20")).toURL()
     val originHost = origin.host
     val targetHost = target.host
     val sameProtocol = origin.protocol.equals(target.protocol, ignoreCase = true)

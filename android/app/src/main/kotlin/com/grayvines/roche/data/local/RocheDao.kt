@@ -225,9 +225,39 @@ interface RocheDao {
     @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM entries")
     fun observeEntriesStamp(): Flow<String>
 
-    @Query("SELECT COUNT(*) FROM entry_identifiers") fun observeIdentsStamp(): Flow<Int>
+    @Query(
+        "SELECT COUNT(*) || ':' || " +
+            "COALESCE(SUM(LENGTH(entryId) * 31 + LENGTH(scheme) * 7 + LENGTH(value)), 0) || ':' || " +
+            "COALESCE(SUM(COALESCE(UNICODE(entryId), 0) * 17 + " +
+            "COALESCE(UNICODE(SUBSTR(entryId, -1, 1)), 0) * 31 + " +
+            "COALESCE(UNICODE(SUBSTR(entryId, LENGTH(entryId) / 2 + 1, 1)), 0) * 13 + " +
+            "COALESCE(UNICODE(value), 0) * 7 + " +
+            "COALESCE(UNICODE(SUBSTR(value, -1, 1)), 0)), 0) || ':' || " +
+            "COALESCE(MIN(entryId), '') || ':' || COALESCE(MAX(entryId), '') || ':' || " +
+            "COALESCE(MIN(value), '') || ':' || COALESCE(MAX(value), '') " +
+            "FROM entry_identifiers"
+    )
+    fun observeIdentsStamp(): Flow<String>
 
-    @Query("SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) FROM collection_specs")
+    @Query(
+        "SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) || ':' || " +
+            "COALESCE(SUM(LENGTH(COALESCE(slug, '')) * 31 + LENGTH(role) * 7 + " +
+            "LENGTH(mode) * 13 + LENGTH(COALESCE(ruleJson, '')) * 17 + " +
+            "LENGTH(COALESCE(color, '')) * 23 + " +
+            "COALESCE(UNICODE(COALESCE(slug, '')), 0) * 3 + " +
+            "COALESCE(UNICODE(SUBSTR(COALESCE(slug, ''), -1, 1)), 0) * 5 + " +
+            "COALESCE(UNICODE(role), 0) * 11 + COALESCE(UNICODE(mode), 0) * 19 + " +
+            "COALESCE(UNICODE(COALESCE(ruleJson, '')), 0) * 29 + " +
+            "COALESCE(UNICODE(SUBSTR(COALESCE(ruleJson, ''), -1, 1)), 0) * 37 + " +
+            "COALESCE(UNICODE(COALESCE(color, '')), 0) * 41 + " +
+            "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), 2, 1)), 0) * 47 + " +
+            "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), -1, 1)), 0) * 43), 0) || ':' || " +
+            "COALESCE(MIN(COALESCE(slug, '')), '') || ':' || " +
+            "COALESCE(MAX(COALESCE(slug, '')), '') || ':' || " +
+            "COALESCE(MIN(COALESCE(color, '')), '') || ':' || " +
+            "COALESCE(MAX(COALESCE(color, '')), '') " +
+            "FROM collection_specs"
+    )
     fun observeSpecsStamp(): Flow<String>
 
     @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM collection_entries")

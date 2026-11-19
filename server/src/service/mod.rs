@@ -31,7 +31,7 @@ use crate::{
         PeerSyncResponse, ReadAtPatch, SyncRepo, Tag,
     },
     error::ApiError,
-    feeds::{FeedSource, OpmlDocument},
+    feeds::{FeedSource, OpmlDocument, YouTubeParser},
     media::{MediaStore, ytdlp::YtDlpWorker},
     scheduler::{
         FeedFetcher, FeedIngester, FeedPollLocks, HttpFeedFetcher, MediaIngestContext, PollError,
@@ -756,7 +756,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         initial_type: FeedType,
         validated_url: Url,
     ) -> Result<(FeedType, Url), ApiError> {
-        if validated_url.as_str().contains("youtube.com/feeds/videos.xml")
+        if YouTubeParser::is_youtube_feed_url(&validated_url)
             || crate::feeds::ArxivParser::is_arxiv_host(validated_url.host_str())
         {
             return Ok((initial_type, validated_url));
@@ -810,7 +810,7 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         .unwrap_or_default();
 
         for cand in candidates {
-            if cand.as_str().contains("youtube.com/feeds/videos.xml") {
+            if YouTubeParser::is_youtube_feed_url(&cand) {
                 return Ok((FeedType::Youtube, cand));
             }
             if let Ok(Ok(cand_body)) =
@@ -1114,7 +1114,6 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             && let Some(paper) = parsed.items.into_iter().next()
         {
             let clean_title = paper.title.split_whitespace().collect::<Vec<_>>().join(" ");
-            let author_csv = (!paper.authors.is_empty()).then(|| paper.authors.join(", "));
             let clean_summary = HtmlSanitizer::plain_text_truncate(
                 &paper.summary,
                 crate::content::fetcher::MAX_SUMMARY_CHARS,
@@ -1125,7 +1124,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
                 .apply_background_enrichment(
                     item_id,
                     (!clean_title.is_empty()).then_some(clean_title.as_str()),
-                    author_csv.as_deref(),
+                    &paper.authors,
                     paper.published_at,
                     (!clean_summary.is_empty()).then_some(clean_summary.as_str()),
                     None,
@@ -1161,7 +1160,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
                             .apply_background_enrichment(
                                 item_id,
                                 snapshot.title.as_deref(),
-                                snapshot.author.as_deref(),
+                                snapshot.author.as_slice(),
                                 None,
                                 snapshot.summary.as_deref(),
                                 snapshot.thumbnail_url.as_deref(),
@@ -1505,5 +1504,122 @@ mod tests {
             .unwrap();
         assert_eq!(existing.len(), 1);
         assert!(existing.contains(&saved.id));
+    }
+
+    struct MapServiceFetcher(HashMap<String, String>);
+
+    impl FeedFetcher for MapServiceFetcher {
+        fn fetch_feed(
+            &self,
+            url: &Url,
+        ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+            let res = self
+                .0
+                .get(url.as_str())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unexpected URL: {url}"));
+            std::future::ready(res)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_feed_url_does_not_bypass_or_misclassify_spoofed_youtube_url() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let spoofed_page = "https://evil.example/page?q=youtube.com/feeds/videos.xml";
+        let spoofed_cand = "https://evil.example/feed?q=youtube.com/feeds/videos.xml";
+        let plain_html =
+            "<!DOCTYPE html><html><head><title>Not a feed</title></head><body>Hi</body></html>";
+        let html_with_spoofed_rss = format!(
+            "<!DOCTYPE html><html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"{spoofed_cand}\"></head><body>Hi</body></html>"
+        );
+        let valid_rss = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <rss version="2.0"><channel><title>Evil Blog</title><link>https://evil.example/</link>
+            <item><title>Post</title><link>https://evil.example/post</link></item></channel></rss>"#;
+
+        // Case 1: Initial URL containing "youtube.com/feeds/videos.xml" in query must NOT bypass discovery
+        let fetcher_plain =
+            MapServiceFetcher(HashMap::from([(spoofed_page.to_owned(), plain_html.to_owned())]));
+        let svc_plain = RocheService::new(db.clone(), fetcher_plain, Config::default());
+        let err = svc_plain
+            .feeds()
+            .discover_feed_url_if_needed(FeedType::Rss, Url::parse(spoofed_page).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+
+        // Case 2: Discovered candidate containing "youtube.com/feeds/videos.xml" in query must NOT
+        // be misclassified as FeedType::Youtube; it is parsed as normal RSS instead.
+        let fetcher_rss = MapServiceFetcher(HashMap::from([
+            (spoofed_page.to_owned(), html_with_spoofed_rss),
+            (spoofed_cand.to_owned(), valid_rss.to_owned()),
+        ]));
+        let svc_rss = RocheService::new(db, fetcher_rss, Config::default());
+        let (feed_type, discovered_url) = svc_rss
+            .feeds()
+            .discover_feed_url_if_needed(FeedType::Rss, Url::parse(spoofed_page).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(feed_type, FeedType::Rss);
+        assert_eq!(discovered_url.as_str(), spoofed_cand);
+    }
+
+    #[tokio::test]
+    async fn test_arxiv_save_enrichment_preserves_separate_authors_in_creators_json() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let paper_url = Url::parse("https://arxiv.org/abs/2402.54321").unwrap();
+        let api_url = "https://export.arxiv.org/api/query?id_list=2402.54321";
+        let arxiv_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>ArXiv Query</title>
+          <entry>
+            <id>http://arxiv.org/abs/2402.54321v1</id>
+            <title>Multi Author Paper</title>
+            <summary>Abstract text.</summary>
+            <author><name>Alice Smith</name></author>
+            <author><name>Bob Jones</name></author>
+            <link rel="alternate" type="text/html" href="https://arxiv.org/abs/2402.54321"/>
+          </entry>
+        </feed>"#;
+
+        let fetcher =
+            MapServiceFetcher(HashMap::from([(api_url.to_owned(), arxiv_xml.to_owned())]));
+        let service = RocheService::new(db.clone(), fetcher, Config::default());
+        let (saved, _) = db
+            .items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &paper_url,
+                title: paper_url.as_str(),
+                summary: None,
+                content_html: None,
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Paper,
+                tags: &[],
+            })
+            .await
+            .unwrap();
+
+        ItemService::enrich_and_ingest_saved_item(
+            &service,
+            &saved.id,
+            &paper_url,
+            ContentType::Paper,
+            Some("2402.54321"),
+            false,
+        )
+        .await;
+
+        let creators_json: String =
+            sqlx::query_scalar("SELECT creators_json FROM entries WHERE id = ?")
+                .bind(&saved.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(creators_json, r#"["Alice Smith","Bob Jones"]"#);
+
+        let item = db.items().get(&saved.id).await.unwrap().unwrap();
+        assert_eq!(item.title, "Multi Author Paper");
+        assert_eq!(item.author.as_deref(), Some("Alice Smith, Bob Jones"));
     }
 }

@@ -56,8 +56,7 @@ impl FeedSource {
                 ),
             },
             Self::Url(url) => {
-                let is_youtube_feed_url = YouTubeParser::is_youtube_host(url.host_str())
-                    && url.path() == "/feeds/videos.xml";
+                let is_youtube_feed_url = YouTubeParser::is_youtube_feed_url(&url);
                 match requested_type {
                     FeedType::Youtube => {
                         if !is_youtube_feed_url

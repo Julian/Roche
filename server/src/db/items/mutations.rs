@@ -990,19 +990,19 @@ impl ItemRepo<'_> {
         &self,
         id: &str,
         title: Option<&str>,
-        author: Option<&str>,
+        authors: &[String],
         published_at: Option<DateTime<Utc>>,
         summary: Option<&str>,
         thumbnail_url: Option<&str>,
         content_html: Option<&str>,
     ) -> Result<()> {
         let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
-        let clean_author = author.map(str::trim).filter(|s| !s.is_empty());
+        let new_creators_json = crate::db::serialize_creators_json(authors);
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
         let clean_thumb = thumbnail_url.map(str::trim).filter(|s| !s.is_empty());
         let clean_html = content_html.filter(|s| !s.trim().is_empty());
         if clean_title.is_none()
-            && clean_author.is_none()
+            && new_creators_json.is_none()
             && published_at.is_none()
             && clean_summary.is_none()
             && clean_thumb.is_none()
@@ -1011,7 +1011,6 @@ impl ItemRepo<'_> {
             return Ok(());
         }
 
-        let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
         let creators_ref = new_creators_json.as_deref();
         let now = SyncRepo::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;

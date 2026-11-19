@@ -648,11 +648,8 @@ internal fun pickRicherString(first: String?, second: String?): String? {
 
 internal fun resolveCandidateContentType(feedType: String, itemUrl: String): String =
     when {
-        feedType.equals("arxiv", ignoreCase = true) ||
-            itemUrl.contains("arxiv.org", ignoreCase = true) -> "paper"
-        feedType.equals("youtube", ignoreCase = true) ||
-            itemUrl.contains("youtube.com", ignoreCase = true) ||
-            itemUrl.contains("youtu.be", ignoreCase = true) -> "video"
+        feedType.equals("arxiv", ignoreCase = true) || isArxivUrl(itemUrl) -> "paper"
+        feedType.equals("youtube", ignoreCase = true) || isYoutubeUrl(itemUrl) -> "video"
         feedType.equals("podcast", ignoreCase = true) || isDirectAudioUrl(itemUrl) ->
             CONTENT_TYPE_AUDIO
         else -> "article"

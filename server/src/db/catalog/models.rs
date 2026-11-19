@@ -29,6 +29,9 @@ pub enum CatalogError {
 
     #[error("Conflict: {0}")]
     Conflict(String),
+
+    #[error("Internal catalog error: {0}")]
+    Internal(String),
 }
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;

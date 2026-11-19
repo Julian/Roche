@@ -120,10 +120,7 @@ impl SafeHttpClient {
                 if normalized.is_empty() || !normalized.contains('.') {
                     anyhow::bail!("Single-label or empty domain names are not allowed");
                 }
-                if normalized.rsplit('.').next().is_some_and(|tld| {
-                    matches!(tld, "localhost" | "local" | "internal" | "home" | "lan")
-                }) || normalized.ends_with(".ts.net")
-                {
+                if Self::is_local_or_tailnet_domain(&normalized) {
                     anyhow::bail!("Local or Tailnet domain names are not allowed");
                 }
             }
@@ -142,23 +139,45 @@ impl SafeHttpClient {
         Ok(())
     }
 
+    /// Returns `true` if a lowercased, trailing-dot-stripped domain name belongs to a
+    /// local, private, or Tailnet namespace.
     #[must_use]
-    pub fn is_global_ip(ip: IpAddr) -> bool {
+    pub(crate) fn is_local_or_tailnet_domain(normalized_domain: &str) -> bool {
+        normalized_domain == "home.arpa"
+            || normalized_domain.ends_with(".home.arpa")
+            || normalized_domain.ends_with(".ts.net")
+            || normalized_domain.rsplit('.').next().is_some_and(|tld| {
+                matches!(tld, "localhost" | "local" | "internal" | "home" | "lan")
+            })
+    }
+
+    #[must_use]
+    pub(crate) fn is_global_ip(ip: IpAddr) -> bool {
         if let IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4() {
-                return IpNetwork::from(IpAddr::V4(v4)).is_global();
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return Self::is_global_ip(IpAddr::V4(v4));
             }
             let s = v6.segments();
+            // Deprecated IPv4-compatible (::/96, also covers :: and ::1)
             // NAT64 Well-Known Prefix (64:ff9b::/96) and Local-Use NAT64 (64:ff9b:1::/48)
             // SIIT IPv4-translated (::ffff:0:0/96)
             // Discard-Only (100::/64)
+            // Teredo (2001:0000::/32)
             // ORCHIDv2 (2001:20::/28)
+            // Documentation (2001:db8::/32)
             // 6to4 (2002::/16) — can embed private/loopback IPv4 addresses
-            if (s[0] == 0x0064 && s[1] == 0xff9b)
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
+            // ULA (fc00::/7), link-local (fe80::/10), deprecated site-local (fec0::/10)
+            if s[0..6] == [0, 0, 0, 0, 0, 0]
+                || (s[0] == 0x0064 && s[1] == 0xff9b)
+                || s[0..6] == [0, 0, 0, 0, 0xffff, 0]
                 || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                || (s[0] == 0x2001 && s[1] == 0x0000)
                 || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
                 || s[0] == 0x2002
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
             {
                 return false;
             }

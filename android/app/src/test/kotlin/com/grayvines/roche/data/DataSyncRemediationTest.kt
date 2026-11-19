@@ -485,6 +485,33 @@ class DataSyncRemediationTest {
         assertEquals(albumA, afterStaleRemote.currentEntryId)
         assertTrue(afterStaleRemote.isLocalDirty)
     }
+
+    @Test
+    internal fun `rolled back transaction calling nextLocalHlc does not permanently advance FLAG_LOCAL_HLC`() =
+        runTest {
+            val dao = database.dao()
+            val baseMs = 1_700_000_000_000L
+            val futureMs = baseMs + 60_000L
+            val beforeHlc = nextLocalHlc(dao, nodeId = "android-tx-1", nowMs = baseMs)
+            assertEquals(beforeHlc, dao.getLocalSyncFlag(FLAG_LOCAL_HLC))
+
+            val failure = runCatching {
+                dao.executeInTransaction {
+                    val transient = nextLocalHlc(dao, nodeId = "android-tx-1", nowMs = futureMs)
+                    assertTrue(transient > beforeHlc)
+                    error("Simulated transaction rollback")
+                }
+            }
+                .exceptionOrNull()
+            assertTrue(failure is IllegalStateException)
+            assertEquals(beforeHlc, dao.getLocalSyncFlag(FLAG_LOCAL_HLC))
+
+            val nextAfterRollback = nextLocalHlc(dao, nodeId = "android-tx-1", nowMs = baseMs)
+            val parsedNext = HlcTimestamp.parse(nextAfterRollback)!!
+            assertEquals(baseMs, parsedNext.wallMs)
+            assertEquals(1, parsedNext.counter)
+            assertEquals(nextAfterRollback, dao.getLocalSyncFlag(FLAG_LOCAL_HLC))
+        }
 }
 
 private suspend fun seedPayloadTooLargeFixture(

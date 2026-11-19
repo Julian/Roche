@@ -1779,7 +1779,7 @@ impl SyncRepo<'_> {
                 PollItemCandidate {
                     title: final_title.to_owned(),
                     url: parsed_u.clone(),
-                    author: rec.creators.first().cloned(),
+                    creators: rec.creators.clone(),
                     published_at: rec.published_at,
                     summary: prep.clean_summary.clone().unwrap_or_default(),
                     content_html: prep.clean_html.clone(),

@@ -1522,6 +1522,10 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "http://169.254.169.254/latest/meta-data",
         "http://100.64.0.1/tailscale",
         "http://100.127.255.254/cgnat",
+        "http://192.0.2.1/doc",
+        "http://198.18.0.1/benchmark",
+        "http://198.51.100.1/doc",
+        "http://203.0.113.1/doc",
         "http://240.0.0.1/reserved",
         "http://255.255.255.255/broadcast",
         "http://[::1]/a",
@@ -1531,7 +1535,10 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "http://[::ffff:0:127.0.0.1]/siit",
         "http://[64:ff9b::127.0.0.1]/nat64-wkp",
         "http://[64:ff9b:1::1]/nat64-local",
+        "http://[100::1]/discard",
         "http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/teredo",
+        "http://[2001:20::1]/orchidv2",
+        "http://[2001:db8::1]/doc",
         "http://[fc00::1]/ula",
         "http://[fd12:3456::1]/ula",
         "http://[fe80::1]/link-local",
@@ -1549,6 +1556,9 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "https://metadata.google.internal/computeMetadata/v1/",
         "http://home.arpa/admin",
         "http://router.home.arpa/status",
+        "http://nas.lan/status",
+        "http://router.home/status",
+        "https://my-box.tail1234.ts.net/status",
         "https://user:pass@example.com/secret",
     ] {
         assert!(sanitize_non_local_href(blocked).is_none(), "expected {blocked} to be blocked");
@@ -1556,6 +1566,7 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
 
     for allowed in [
         "https://example.com/audio.mp3",
+        "https://example.com:8444/audio.mp3",
         "https://8.8.8.8/file.mp3",
         "https://[2606:4700:4700::1111]/file.mp3",
         "https://[::ffff:8.8.8.8]/file.mp3",
@@ -2066,7 +2077,7 @@ async fn seed_a11y_landmark_fixtures(db: &Db) -> (String, String, String) {
         .apply_background_enrichment(
             &item.id,
             None,
-            None,
+            &[],
             None,
             None,
             None,

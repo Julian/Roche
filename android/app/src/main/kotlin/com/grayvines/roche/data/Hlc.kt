@@ -3,9 +3,6 @@ package com.grayvines.roche.data
 import com.grayvines.roche.data.local.RocheDao
 import java.time.Instant
 import java.util.Locale
-import java.util.WeakHashMap
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
 internal const val MAX_HLC_WALL_MS = 999_999_999_999_999L
 internal const val MAX_HLC_COUNTER = 0xFFFF
@@ -220,33 +217,17 @@ internal fun resolveOrSynthesizeHlc(
     }
 }
 
-private val hlcClockMutex = Mutex()
-private val lastHlcByDao = WeakHashMap<RocheDao, String>()
-
-private fun maxHlcRaw(first: String?, second: String?): String? {
-    val parsedFirst = HlcTimestamp.parse(first)
-    val parsedSecond = HlcTimestamp.parse(second)
-    return when {
-        parsedFirst == null -> parsedSecond?.encode()
-        parsedSecond == null -> parsedFirst.encode()
-        parsedFirst >= parsedSecond -> parsedFirst.encode()
-        else -> parsedSecond.encode()
-    }
-}
-
 internal suspend fun nextLocalHlc(
     dao: RocheDao,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
     nowMs: Long = System.currentTimeMillis(),
 ): String {
-    val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val next = hlcClockMutex.withLock {
-        val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
-        val ticked = HlcClock(nodeId, seed).tick(nowMs).encode()
-        lastHlcByDao[dao] = ticked
-        ticked
+    var next = ""
+    dao.executeInTransaction {
+        val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
+        next = HlcClock(nodeId, dbPrev).tick(nowMs).encode()
+        dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     }
-    dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }
 
@@ -256,21 +237,18 @@ internal suspend fun witnessRemoteHlcInDao(
     remoteHlcValues: Iterable<String?>,
     nowMs: Long = System.currentTimeMillis(),
 ): String {
-    val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val next = hlcClockMutex.withLock {
-        val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
-        val clock = HlcClock(nodeId, seed)
+    var next = ""
+    dao.executeInTransaction {
+        val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
+        val clock = HlcClock(nodeId, dbPrev)
         var witnessedAny = false
         for (raw in remoteHlcValues) {
             val parsed = HlcTimestamp.parse(raw) ?: continue
             clock.witness(parsed, nowMs)
             witnessedAny = true
         }
-        val advanced =
-            (if (witnessedAny) clock.current() else null)?.encode() ?: clock.tick(nowMs).encode()
-        lastHlcByDao[dao] = advanced
-        advanced
+        next = (if (witnessedAny) clock.current() else null)?.encode() ?: clock.tick(nowMs).encode()
+        dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     }
-    dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }

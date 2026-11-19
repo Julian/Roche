@@ -74,21 +74,31 @@ mod tests {
         assert!(SafeHttpClient::parse_url("http://localhost:8080/admin").is_err());
         assert!(SafeHttpClient::parse_url("http://localhost.:8080/admin").is_err());
         assert!(SafeHttpClient::parse_url("http://nas.local./").is_err());
+        assert!(SafeHttpClient::parse_url("http://home.arpa/").is_err());
+        assert!(SafeHttpClient::parse_url("http://router.home.arpa/").is_err());
+        assert!(SafeHttpClient::parse_url("http://router.home.arpa./").is_err());
         assert!(SafeHttpClient::parse_url("http://my-node.tail1234.ts.net/").is_err());
         assert!(SafeHttpClient::parse_url("http://singlelabel/").is_err());
         assert!(SafeHttpClient::parse_url("http://127.0.0.1:8080/").is_err());
         assert!(SafeHttpClient::parse_url("http://169.254.169.254/latest/meta-data").is_err());
         assert!(SafeHttpClient::parse_url("http://192.168.1.1/").is_err());
+        assert!(SafeHttpClient::parse_url("http://192.0.2.1/").is_err());
+        assert!(SafeHttpClient::parse_url("http://198.18.0.1/").is_err());
         assert!(SafeHttpClient::parse_url("http://100.100.100.100/").is_err());
         assert!(SafeHttpClient::parse_url("http://100.64.0.5:8080/").is_err());
         assert!(SafeHttpClient::parse_url("http://[::1]:8080/").is_err());
+        assert!(SafeHttpClient::parse_url("http://[::8.8.8.8]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[::ffff:127.0.0.1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[::ffff:0:127.0.0.1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[64:ff9b::127.0.0.1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[100::1]/").is_err());
+        assert!(
+            SafeHttpClient::parse_url("http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/").is_err()
+        );
         assert!(SafeHttpClient::parse_url("http://[2001:20::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[fc00::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[fe80::1]/").is_err());
+        assert!(SafeHttpClient::parse_url("http://[fec0::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[2001:db8::1]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[2002:7f00:0001::]/").is_err());
         assert!(SafeHttpClient::parse_url("http://[2002:c0a8:0101::1]/").is_err());

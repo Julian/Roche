@@ -6,7 +6,6 @@ import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RemoteMediaDto
 import com.grayvines.roche.data.remote.RocheApiClient
-import com.grayvines.roche.data.remote.moveFileAtomically
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.extractAllImageUrlsFromHtml
 import com.grayvines.roche.model.extractFirstImageUrlFromHtml
@@ -24,6 +23,7 @@ internal class OfflineCacheManager(
     private val apiClient: RocheApiClient,
     private val settings: SettingsRepository,
     private val cacheDir: File? = null,
+    private val thumbnailDiskCache: ThumbnailDiskCache = ThumbnailDiskCache(cacheDir),
 ) {
     private val activeCacheTokens = ConcurrentHashMap<String, Long>()
     private val tokenSequence = AtomicLong(0L)
@@ -241,7 +241,6 @@ internal class OfflineCacheManager(
         }
         for (imageUrl in externalImageUrls) {
             cacheExternalThumbBestEffort(
-                rootDir = rootDir,
                 itemId = itemId,
                 thumbnailUrl = imageUrl,
                 attemptToken = attemptToken,
@@ -251,7 +250,6 @@ internal class OfflineCacheManager(
     }
 
     private suspend fun cacheExternalThumbBestEffort(
-        rootDir: File,
         itemId: String,
         thumbnailUrl: String,
         attemptToken: Long,
@@ -262,12 +260,7 @@ internal class OfflineCacheManager(
                 it.isNotEmpty() && it.size <= MAX_OFFLINE_THUMBNAIL_BYTES
             } ?: return
         if (isCacheAttemptActive(itemId, attemptToken)) {
-            withContext(Dispatchers.IO) {
-                runSuspendCatching {
-                    val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-                    writeBytesAtomically(thumbsDir, diskCacheKey(thumbnailUrl), bytes)
-                }
-            }
+            runSuspendCatching { thumbnailDiskCache.writeBytes(thumbnailUrl, bytes) }
         }
     }
 
@@ -300,7 +293,7 @@ internal class OfflineCacheManager(
         if (!stillActive) {
             evictCachedItemFiles(itemId)
         } else if (streamed && isThumbnail) {
-            copyCachedThumbnailBestEffort(rootDir, targetFile, mediaId)
+            runSuspendCatching { thumbnailDiskCache.copyFromFile(mediaId, targetFile) }
         }
         return streamed && stillActive
     }
@@ -372,29 +365,6 @@ internal suspend fun resolveTargetItemMediaFile(
             .getOrNull()
     }
 
-internal suspend fun copyCachedThumbnailBestEffort(
-    rootDir: File,
-    sourceFile: File,
-    mediaId: String,
-) {
-    withContext(Dispatchers.IO) {
-        runSuspendCatching {
-            val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-            thumbsDir.mkdirs()
-            val target = resolveSafeChildFile(thumbsDir, mediaId)
-            val tempFile = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
-            try {
-                sourceFile.copyTo(tempFile, overwrite = true)
-                moveFileAtomically(tempFile, target)
-            } finally {
-                if (tempFile.exists()) {
-                    tempFile.delete()
-                }
-            }
-        }
-    }
-}
-
 internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow =
     mergeRemoteItemIntoLocal(
         local = local,
@@ -436,20 +406,6 @@ internal fun resolveSafeChildFile(parentDir: File, childName: String): File {
         "Resolved path escapes cache directory"
     }
     return childCanonical
-}
-
-internal fun writeBytesAtomically(parentDir: File, fileName: String, bytes: ByteArray) {
-    parentDir.mkdirs()
-    val target = resolveSafeChildFile(parentDir, fileName)
-    val tempFile = File(target.parentFile, "${target.name}.${System.nanoTime()}.tmp")
-    try {
-        tempFile.writeBytes(bytes)
-        moveFileAtomically(tempFile, target)
-    } finally {
-        if (tempFile.exists()) {
-            tempFile.delete()
-        }
-    }
 }
 
 internal fun isHttpThumbnailUrl(value: String): Boolean =

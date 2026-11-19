@@ -13,6 +13,7 @@ import com.grayvines.roche.data.local.deleteCollectionGeneratorWithTombstone
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.Locale
 import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -332,8 +333,7 @@ class CatalogStore(
             ensureSystemSeeded()
             val cleanTitle = title.trim()
             require(cleanTitle.isNotEmpty()) { "Collection title cannot be empty" }
-            val rawSlug = slugifyTitle(cleanTitle)
-            val slug = if (role == CollectionRole.WANT) "want:$rawSlug" else rawSlug
+            val slug = buildCustomCollectionSlug(cleanTitle, role)
             val existing = dao.getCollectionSpecBySlug(slug)
             if (existing != null) {
                 ensureCollectionEntryRow(existing.collectionId, cleanTitle)
@@ -354,6 +354,21 @@ class CatalogStore(
             onLocalMutation()
         }
         return id
+    }
+
+    private fun buildCustomCollectionSlug(cleanTitle: String, role: CollectionRole): String {
+        val slugSource =
+            if (
+                role == CollectionRole.WANT &&
+                    cleanTitle.startsWith(WANT_SLUG_PREFIX, ignoreCase = true)
+            ) {
+                cleanTitle.substring(WANT_SLUG_PREFIX.length)
+            } else {
+                cleanTitle
+            }
+        val rawSlug = slugifyTitle(slugSource)
+        require(rawSlug.isNotEmpty()) { "Collection slug cannot be empty" }
+        return if (role == CollectionRole.WANT) "$WANT_SLUG_PREFIX$rawSlug" else rawSlug
     }
 
     private suspend fun ensureCollectionEntryRow(collectionId: String, cleanTitle: String) {
@@ -628,23 +643,43 @@ class CatalogStore(
     internal suspend fun logFeedItemCompletion(itemId: String): String {
         val resolvedId = mutationMutex.withLock {
             ensureSystemSeeded()
-            val nowIso = nowUtcIso()
-            val nodeId = resolveLocalPeerId()
-            var id = itemId
-            dao.executeInTransaction {
-                id =
-                    logFeedItemConsumedInDao(
-                        dao = dao,
-                        itemId = itemId,
-                        nowIso = nowIso,
-                        nodeId = nodeId,
-                    )
-                advanceActiveDrawsLocked(id, ConsumptionStatus.CONSUMED, nowIso, nodeId)
-            }
-            id
+            logFeedItemCompletionLocked(itemId)
         }
         onLocalMutation()
         return resolvedId
+    }
+
+    internal suspend fun logItemCompletionIfUnlogged(itemId: String): String? {
+        val resolvedId = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val targetId = followMergedId(itemId) ?: itemId
+            if (dao.countTerminalLogsForEntry(targetId) > 0) {
+                null
+            } else {
+                logFeedItemCompletionLocked(itemId)
+            }
+        }
+        if (resolvedId != null) {
+            onLocalMutation()
+        }
+        return resolvedId
+    }
+
+    private suspend fun logFeedItemCompletionLocked(itemId: String): String {
+        val nowIso = nowUtcIso()
+        val nodeId = resolveLocalPeerId()
+        var id = itemId
+        dao.executeInTransaction {
+            id =
+                logFeedItemConsumedInDao(
+                    dao = dao,
+                    itemId = itemId,
+                    nowIso = nowIso,
+                    nodeId = nodeId,
+                )
+            advanceActiveDrawsLocked(id, ConsumptionStatus.CONSUMED, nowIso, nodeId)
+        }
+        return id
     }
 
     internal fun notifyLocalMutation() {
@@ -748,9 +783,9 @@ class CatalogStore(
         val direct = dao.getCollectionSpecById(clean) ?: dao.getCollectionSpecBySlug(clean)
         if (direct != null) return direct
         val normalizedSlug =
-            if (clean.startsWith("want:", ignoreCase = true)) {
+            if (clean.startsWith(WANT_SLUG_PREFIX, ignoreCase = true)) {
                 val base = clean.substringAfter(':')
-                EntryKind.fromFlexibleAlias(base)?.let { "want:${it.systemListSlug}" }
+                EntryKind.fromFlexibleAlias(base)?.let { "$WANT_SLUG_PREFIX${it.systemListSlug}" }
             } else {
                 EntryKind.fromFlexibleAlias(clean)?.systemListSlug
             }
@@ -789,7 +824,7 @@ class CatalogStore(
 internal fun nowUtcIso(): String = Instant.now().truncatedTo(ChronoUnit.MILLIS).toString()
 
 internal fun slugifyTitle(raw: String): String =
-    raw.trim().lowercase().replace(NON_SLUG_REGEX, "_").trim('_').ifEmpty { "list" }
+    raw.trim().lowercase(Locale.ROOT).replace(NON_SLUG_REGEX, "_").trim('_')
 
 internal fun extractYearPrefix(rawIso: String?): Int? {
     val clean = rawIso?.trim().orEmpty()
@@ -811,4 +846,5 @@ internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
     )
 
 private const val YEAR_CHARS = 4
+private const val WANT_SLUG_PREFIX = "want:"
 private val NON_SLUG_REGEX = Regex("[^a-z0-9]+")

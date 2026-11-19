@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    net::IpAddr,
 };
 
 use crate::{
+    content::http::SafeHttpClient,
     db::{CatalogEntry, EntryKind, canonicalize_sync_url},
     scheduler::FeedFetcher,
     service::RocheService,
@@ -133,51 +135,6 @@ fn classify_url_host(raw_url: &str) -> Option<UrlHostClass> {
     None
 }
 
-fn is_non_global_ipv4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, ..] = v4.octets();
-    let is_this_network = a == 0;
-    let is_cgnat = a == 100 && (64..=127).contains(&b);
-    let is_reserved = a >= 240;
-    is_this_network
-        || v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || is_cgnat
-        || is_reserved
-}
-
-fn is_non_global_ipv6(v6: std::net::Ipv6Addr) -> bool {
-    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
-        return true;
-    }
-    if let Some(mapped) = v6.to_ipv4_mapped() {
-        return is_non_global_ipv4(mapped);
-    }
-    let segs = v6.segments();
-    let is_ipv4_compatible = segs[0..6] == [0, 0, 0, 0, 0, 0];
-    let is_siit_translated = segs[0..6] == [0, 0, 0, 0, 0xffff, 0];
-    let is_nat64 =
-        segs[0] == 0x0064 && segs[1] == 0xff9b && (segs[2] == 0x0001 || segs[2..6] == [0, 0, 0, 0]);
-    let is_discard = segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0;
-    let is_teredo = segs[0] == 0x2001 && segs[1] == 0x0000;
-    let is_6to4 = segs[0] == 0x2002;
-    let is_ula = (segs[0] & 0xfe00) == 0xfc00;
-    let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
-    let is_deprecated_site_local = (segs[0] & 0xffc0) == 0xfec0;
-    is_ipv4_compatible
-        || is_siit_translated
-        || is_nat64
-        || is_discard
-        || is_teredo
-        || is_6to4
-        || is_ula
-        || is_link_local
-        || is_deprecated_site_local
-}
-
 #[must_use]
 pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
     let href = safe_external_href(raw)?;
@@ -193,23 +150,18 @@ pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
             let lower = domain.trim_end_matches('.').to_ascii_lowercase();
             if lower.is_empty()
                 || !lower.contains('.')
-                || lower == "home.arpa"
-                || lower.ends_with(".home.arpa")
-                || lower
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|tld| matches!(tld, "local" | "localhost" | "internal"))
+                || SafeHttpClient::is_local_or_tailnet_domain(&lower)
             {
                 return None;
             }
         }
         url::Host::Ipv4(v4) => {
-            if is_non_global_ipv4(v4) {
+            if !SafeHttpClient::is_global_ip(IpAddr::V4(v4)) {
                 return None;
             }
         }
         url::Host::Ipv6(v6) => {
-            if is_non_global_ipv6(v6) {
+            if !SafeHttpClient::is_global_ip(IpAddr::V6(v6)) {
                 return None;
             }
         }

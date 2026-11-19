@@ -471,7 +471,7 @@ async fn run_infer_scores(
     {
         tokio::task::spawn_blocking(move || infer_scores(&member_ids, &orderings))
             .await
-            .map_err(|e| CatalogError::InvalidInput(format!("EP ranking worker failed: {e}")))
+            .map_err(|e| CatalogError::Internal(format!("EP ranking worker failed: {e}")))
     } else {
         Ok(infer_scores(&member_ids, &orderings))
     }

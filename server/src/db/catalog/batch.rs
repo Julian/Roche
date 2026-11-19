@@ -5,7 +5,7 @@ use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    collections::slugify_title,
+    collections::derive_manual_collection_slug_and_id,
     identity_norm::{normalize_identifier_scheme, normalize_identifier_value},
     models::{
         BatchCollectionInput, BatchComparisonInput, BatchGeneratorInput, CatalogBatchInput,
@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     db::{
-        sync::{SyncRepo, collection_entry_natural_key, deterministic_system_collection_id},
+        sync::{SyncRepo, collection_entry_natural_key},
         types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
     },
     ranking::validate_ordering,
@@ -174,7 +174,7 @@ impl CatalogRepo<'_> {
                 updated_at = excluded.updated_at",
         )
         .bind(&target_id)
-        .bind(clean_title)
+        .bind(&clean_title)
         .bind(clean_summary)
         .bind(now)
         .bind(now)
@@ -414,35 +414,15 @@ impl CatalogRepo<'_> {
 
 fn derive_batch_collection_slug_and_id(
     col: &BatchCollectionInput,
-) -> CatalogResult<(&str, String, String)> {
-    let clean_title = col.title.trim();
-    if clean_title.is_empty() {
-        return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
-    }
-    if !matches!(col.role, CollectionRole::List | CollectionRole::Want) {
-        return Err(CatalogError::InvalidInput(
-            "Batch collections must have role 'list' or 'want'".to_owned(),
-        ));
-    }
-    let derived_slug = col
-        .slug
+) -> CatalogResult<(String, String, String)> {
+    let (clean_title, derived_slug, default_id) =
+        derive_manual_collection_slug_and_id(&col.title, col.slug.as_deref(), col.role)?;
+    let requested_id = col
+        .id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map_or_else(|| slugify_title(clean_title), slugify_title);
-    if derived_slug.is_empty() {
-        return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
-    }
-    let requested_id = col.id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or_else(
-        || {
-            if derived_slug.starts_with("want:") {
-                deterministic_system_collection_id(&derived_slug)
-            } else {
-                deterministic_system_collection_id(&format!("custom:{derived_slug}"))
-            }
-        },
-        str::to_owned,
-    );
+        .map_or(default_id, str::to_owned);
     Ok((clean_title, derived_slug, requested_id))
 }
 
@@ -577,5 +557,94 @@ mod tests {
         assert_eq!(ranked.rows.len(), 2);
         assert_eq!(ranked.rows[0].entry.title, "In The Wee Small Hours");
         assert_eq!(ranked.rows[1].entry.title, "Ellington at Newport");
+    }
+
+    #[tokio::test]
+    async fn test_custom_want_collection_slug_and_id_converge_across_manual_want_and_batch() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let catalog = db.catalog();
+        let expected_id = crate::db::deterministic_system_collection_id("want:weekend_watch");
+
+        let manual = catalog
+            .create_manual_collection("Weekend Watch", None, CollectionRole::Want, None, None)
+            .await
+            .unwrap();
+        assert_eq!(manual.slug.as_deref(), Some("want:weekend_watch"));
+        assert_eq!(manual.id, expected_id);
+
+        // `get_or_create_want_collection("weekend_watch")` resolves to the exact same collection
+        let resolved = catalog.get_or_create_want_collection("weekend_watch").await.unwrap();
+        assert_eq!(resolved.id, expected_id);
+        assert_eq!(resolved.slug.as_deref(), Some("want:weekend_watch"));
+
+        // Case-insensitive "WANT:" prefix on an explicit slug is stripped before slugifying
+        let prefixed = catalog
+            .create_manual_collection(
+                "Autumn Queue",
+                Some("WANT:Autumn Queue"),
+                CollectionRole::Want,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefixed.slug.as_deref(), Some("want:autumn_queue"));
+        assert_eq!(prefixed.id, crate::db::deterministic_system_collection_id("want:autumn_queue"));
+
+        // Empty base slug after stripping "want:" is rejected
+        let empty_err = catalog
+            .create_manual_collection("Empty Want", Some("WANT:"), CollectionRole::Want, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(empty_err, crate::db::CatalogError::InvalidInput(_)));
+
+        // `apply_batch` with `slug: Some("want:weekend_watch")` converges to the same ID and slug
+        let batch_db = Db::connect("sqlite::memory:").await.unwrap();
+        let batch = CatalogBatchInput {
+            collections: vec![BatchCollectionInput {
+                ref_key: Some("col:ww".to_owned()),
+                id: None,
+                title: "Weekend Watch".to_owned(),
+                slug: Some("want:weekend_watch".to_owned()),
+                role: CollectionRole::Want,
+                summary: None,
+                color: None,
+                members: Vec::new(),
+            }],
+            entries: Vec::new(),
+            logs: Vec::new(),
+            comparisons: Vec::new(),
+            generators: Vec::new(),
+            dry_run: false,
+        };
+        batch_db.catalog().apply_batch(&batch).await.unwrap();
+        let batched =
+            batch_db.catalog().get_collection_summary("want:weekend_watch").await.unwrap();
+        assert_eq!(batched.id, expected_id);
+        assert_eq!(batched.slug.as_deref(), Some("want:weekend_watch"));
+
+        // Explicit `col.id` override in batch is still honored
+        let custom_id_batch = CatalogBatchInput {
+            collections: vec![BatchCollectionInput {
+                ref_key: None,
+                id: Some("explicit-want-id".to_owned()),
+                title: "Explicit Queue".to_owned(),
+                slug: Some("want:explicit_queue".to_owned()),
+                role: CollectionRole::Want,
+                summary: None,
+                color: None,
+                members: Vec::new(),
+            }],
+            entries: Vec::new(),
+            logs: Vec::new(),
+            comparisons: Vec::new(),
+            generators: Vec::new(),
+            dry_run: false,
+        };
+        batch_db.catalog().apply_batch(&custom_id_batch).await.unwrap();
+        let explicit =
+            batch_db.catalog().get_collection_summary("want:explicit_queue").await.unwrap();
+        assert_eq!(explicit.id, "explicit-want-id");
+        assert_eq!(explicit.slug.as_deref(), Some("want:explicit_queue"));
     }
 }

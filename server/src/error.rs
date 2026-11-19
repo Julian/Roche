@@ -210,6 +210,9 @@ impl ApiError {
             }
             crate::db::CatalogError::ImmutableCollection { .. }
             | crate::db::CatalogError::InvalidInput(_) => Some(Self::BadRequest(err.to_string())),
+            crate::db::CatalogError::Internal(msg) => {
+                Some(Self::Internal(anyhow::anyhow!("{msg}")))
+            }
         }
     }
 
@@ -331,3 +334,33 @@ pub struct ProblemQuery<T>(pub T);
 #[derive(Debug, Clone, Copy, Default, FromRequestParts)]
 #[from_request(via(Path), rejection(ApiError))]
 pub struct ProblemPath<T>(pub T);
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::ApiError;
+    use crate::db::CatalogError;
+
+    #[test]
+    fn test_catalog_internal_error_maps_to_http_500() {
+        let direct: ApiError =
+            CatalogError::Internal("EP ranking worker failed: panicked".to_owned()).into();
+        let (status, problem) = direct.to_problem_details();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.status, 500);
+        assert_eq!(problem.title, "Internal Server Error");
+        assert_eq!(problem.detail.as_deref(), Some("An unexpected internal error occurred"));
+
+        let wrapped = ApiError::Internal(anyhow::Error::from(CatalogError::Internal(
+            "EP ranking worker failed: cancelled".to_owned(),
+        )));
+        let (wrapped_status, wrapped_problem) = wrapped.to_problem_details();
+        assert_eq!(wrapped_status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(wrapped_problem.status, 500);
+        assert_eq!(
+            wrapped_problem.detail.as_deref(),
+            Some("An unexpected internal error occurred")
+        );
+    }
+}
