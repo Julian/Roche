@@ -11,20 +11,30 @@ use super::{
     auth::WebSession,
     html::{
         FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_with_flash,
-        render_diary_row, render_inline_csrf_form, render_page, urlencode, web_api_error_response,
+        render_diary_row_with_tier, render_inline_csrf_form, render_page, urlencode,
+        web_api_error_response,
     },
     links::{
-        collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
+        WebLinkIcon, collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
         render_creator_links, sanitize_non_local_href,
     },
     views_reader::render_audio_play_button,
 };
 use crate::{
-    db::{CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter, ItemStatusFilter},
+    db::{
+        CollectionGeneratorState, ConsumptionLogView, ContentType, Item, ItemFilter,
+        ItemStatusFilter, WANT_TO_READ_COLLECTION_ID,
+    },
     error::ApiError,
     scheduler::FeedFetcher,
     service::RocheService,
 };
+
+const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
+
+const WIKI_MARK_SVG: &str = "<svg viewBox=\"0 0 24 24\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M12.09 13.119c-.936 1.932-2.217 4.548-2.853 5.728-.616 1.074-1.127.931-1.532.029-1.406-3.321-4.293-9.144-5.651-12.409-.251-.601-.441-.987-.619-1.139-.181-.15-.554-.24-1.122-.271C.103 5.033 0 4.982 0 4.898v-.455l.052-.045c.924-.005 5.401 0 5.401 0l.051.045v.434c0 .119-.075.176-.225.176l-.564.031c-.485.029-.727.164-.727.436 0 .135.053.33.166.601 1.082 2.646 4.818 10.521 4.818 10.521l.136.046 2.411-4.81-.482-1.067-1.658-3.264s-.318-.654-.428-.872c-.728-1.443-.712-1.518-1.447-1.617-.207-.023-.313-.05-.313-.149v-.468l.06-.045h4.292l.113.037v.451c0 .105-.076.15-.227.15l-.308.047c-.792.061-.661.381-.136 1.422l1.582 3.252 1.758-3.504c.293-.64.233-.801.111-.947-.07-.084-.305-.22-.812-.24l-.201-.021c-.052 0-.098-.015-.145-.051-.045-.031-.067-.076-.067-.129v-.427l.061-.045c1.247-.008 4.043 0 4.043 0l.059.045v.436c0 .121-.059.178-.193.178-.646.03-.782.095-1.023.439-.12.186-.375.589-.646 1.039l-2.301 4.273-.065.135 2.792 5.712.17.048 4.396-10.438c.154-.422.129-.722-.064-.895-.197-.172-.346-.273-.857-.295l-.42-.016c-.061 0-.105-.014-.152-.045-.043-.029-.072-.075-.072-.119v-.436l.059-.045h4.961l.041.045v.437c0 .119-.074.18-.209.18-.648.03-1.127.18-1.443.421-.314.255-.557.616-.736 1.067 0 0-4.043 9.258-5.426 12.339-.525 1.007-1.053.917-1.503-.031-.571-1.171-1.773-3.786-2.646-5.711l.053-.036z\"/></svg>";
+
+const SPOTIFY_MARK_SVG: &str = "<svg viewBox=\"0 0 24 24\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm4.58 14.42a.62.62 0 0 1-.86.2c-2.35-1.44-5.31-1.76-8.8-.96a.62.62 0 1 1-.28-1.22c3.82-.87 7.1-.5 9.74 1.12a.62.62 0 0 1 .2.86zm1.22-2.72a.78.78 0 0 1-1.07.26c-2.69-1.65-6.79-2.13-9.97-1.17a.78.78 0 1 1-.45-1.49c3.63-1.1 8.15-.57 11.23 1.33a.78.78 0 0 1 .26 1.07zm.1-2.83C14.68 8.95 9.37 8.78 6.29 9.71a.94.94 0 1 1-.54-1.8c3.53-1.07 9.4-.87 13.11 1.34a.94.94 0 0 1-.96 1.62z\"/></svg>";
 
 #[derive(Debug, Deserialize)]
 pub(super) struct GeneratorToggleForm {
@@ -59,7 +69,7 @@ async fn render_home_inner<F: FeedFetcher>(
         status: Some(ItemStatusFilter::Unread),
         inbox_only: Some(true),
         include_content: Some(false),
-        per_page: Some(12),
+        per_page: Some(20),
         ..ItemFilter::default()
     };
     let readable_filter = ItemFilter {
@@ -108,42 +118,44 @@ async fn render_home_inner<F: FeedFetcher>(
     home_creators.extend(recent_diary.iter().flat_map(|d| d.entry.creators.iter().cloned()));
     let artist_links = load_artist_id_by_lower_name(service, &home_creators).await;
 
-    let mut body = String::with_capacity(10_240);
-    render_home_quick_actions_bar(&mut body, &session.csrf_token);
-    for gen_state in &active_generators {
-        render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
-    }
+    let mut body = String::with_capacity(16_384);
+    body.push_str(
+        "<div class=\"home-grid\">\n<section class=\"home-main\" aria-label=\"Feed Inbox\">\n",
+    );
     render_in_progress_section(&mut body, &active_readable_page.items);
+    render_unread_summary_section(
+        &mut body,
+        &unread_page.items,
+        sync_status.unread_items_count,
+        &session.csrf_token,
+    );
+    body.push_str(
+        "</section>\n<aside class=\"home-rail\" aria-label=\"Queue, Active Draw and Diary\">\n",
+    );
+
     let wtr_total = collections
         .iter()
-        .find(|c| c.id == crate::db::WANT_TO_READ_COLLECTION_ID)
+        .find(|c| c.id == WANT_TO_READ_COLLECTION_ID)
         .map_or(want_to_read_page.items.len(), |c| c.member_count);
+    let other_want_total: usize = collections
+        .iter()
+        .filter(|c| c.role == crate::db::CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
+        .map(|c| c.member_count)
+        .sum();
     render_want_to_read_section(
         &mut body,
         &want_to_read_page.items,
         wtr_total,
+        other_want_total,
         &session.csrf_token,
     );
 
-    let other_want_total: usize = collections
-        .iter()
-        .filter(|c| {
-            c.role == crate::db::CollectionRole::Want
-                && c.id != crate::db::WANT_TO_READ_COLLECTION_ID
-        })
-        .map(|c| c.member_count)
-        .sum();
-    if other_want_total > 0 {
-        let _ = writeln!(
-            body,
-            "<div class=\"section-head\"><h2>Up Next Queues ({other_want_total})</h2>\
-             <a class=\"section-action\" href=\"/queue\">Manage Queues &rarr;</a></div>\n\
-             <p class=\"meta\">You have <em>{other_want_total}</em> queued movies, books, albums, or games in your Want lists.</p>"
-        );
+    for gen_state in &active_generators {
+        render_collection_draw_section(&mut body, gen_state, &artist_links, &session.csrf_token);
     }
 
-    render_unread_summary_section(&mut body, &unread_page.items, sync_status.unread_items_count);
     render_recent_diary_section(&mut body, &recent_diary, &artist_links);
+    body.push_str("</aside>\n</div>\n");
 
     Ok(render_page(&PageShell {
         title: "Roche",
@@ -171,11 +183,11 @@ pub(in crate::web) fn render_collection_draw_section(
     let Some(entry) = &state.current_entry else {
         let _ = write!(
             out,
-            "<section class=\"album-sleeve album-sleeve-single\">\n\
+            "<section class=\"rail-block album-sleeve album-sleeve-single\">\n\
                <div>\n\
                  <div class=\"album-kicker\">{} Completed</div>\n\
                  <h2 class=\"album-title\">All {} Works Completed</h2>\n\
-                 <p class=\"meta\">{} finished &middot; {} abandoned. <a href=\"/lists/{}\">View ranked list &rarr;</a></p>\n\
+                 <p class=\"meta\">{} finished &middot; {} skipped. <a href=\"/lists/{}\">View ranked list &rarr;</a></p>\n\
                </div>\n\
              </section>\n",
             esc(&state.collection_title),
@@ -187,33 +199,47 @@ pub(in crate::web) fn render_collection_draw_section(
         return;
     };
 
-    out.push_str("<section class=\"album-sleeve\">\n<div>\n");
-    if let Some(cover) = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+    let ext_links = collect_web_external_links(entry, None);
+    let spotify_href =
+        ext_links.iter().find(|l| l.icon == WebLinkIcon::Spotify).map(|l| l.href.as_str());
+    let wiki_href =
+        ext_links.iter().find(|l| l.icon == WebLinkIcon::Wikipedia).map(|l| l.href.as_str());
+    let entry_href = format!("/entries/{}", urlencode(&entry.id));
+
+    out.push_str("<section class=\"rail-block album-sleeve\" aria-label=\"Active Collection Draw\">\n<div class=\"sleeve-body\">\n");
+    render_sleeve_cover(out, entry, &entry_href, spotify_href);
+    out.push_str("<div class=\"sleeve-info\">\n<div class=\"sleeve-head-row\">\n<div class=\"album-title-row\">\n");
+    let _ = writeln!(
+        out,
+        "<h2 class=\"album-title\"><a href=\"{}\">{}</a></h2>",
+        esc(&entry_href),
+        esc(&entry.title),
+    );
+    if let Some(wk) = wiki_href {
         let _ = writeln!(
             out,
-            "<img class=\"album-cover\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
-            esc(cover),
+            "<a class=\"wiki-icon-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\" title=\"Wikipedia\" aria-label=\"Open {} on Wikipedia\">{WIKI_MARK_SVG}</a>",
+            esc(wk),
+            esc(&entry.title),
         );
-    } else {
-        out.push_str("<div class=\"album-cover-placeholder\" aria-hidden=\"true\">&#9835;</div>\n");
     }
-    out.push_str("</div>\n<div>\n");
-
-    let draw_number = state.consumed_count + state.abandoned_count + 1;
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "<div class=\"album-kicker\"><a href=\"/lists/{}\">{}</a> &middot; #{} of {} ({} remaining)</div>",
-        esc(&list_key_enc),
-        esc(&state.collection_title),
-        draw_number,
-        state.total_pool,
-        state.remaining_count
-    );
-    let _ = writeln!(
-        out,
-        "<h2 class=\"album-title\"><a href=\"/entries/{}\">{}</a></h2>",
-        esc(&urlencode(&entry.id)),
-        esc(&entry.title)
+        "</div>\n\
+         <details class=\"sleeve-skip-details\">\n\
+           <summary title=\"Skip this work and draw next\">Skip</summary>\n\
+           <form class=\"album-inline-form sleeve-skip-form-wrap\" method=\"post\" action=\"/web/lists/{list}/generator/abandon\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <div class=\"field mb-sm\">\n\
+               <label for=\"skip-notes-{list}\">Skip note (optional)</label>\n\
+               <textarea id=\"skip-notes-{list}\" class=\"textarea-compact\" name=\"notes\" placeholder=\"Optional note…\"></textarea>\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn btn-small\">Skip &amp; Draw Next</button>\n\
+           </form>\n\
+         </details>\n\
+         </div>\n",
+        list = esc(&list_key_enc),
+        csrf = esc(csrf),
     );
 
     if !entry.creators.is_empty() || entry.release_year.is_some() {
@@ -223,7 +249,7 @@ pub(in crate::web) fn render_collection_draw_section(
             if entry.creators.is_empty() {
                 let _ = write!(out, "{yr}");
             } else {
-                let _ = write!(out, " ({yr})");
+                let _ = write!(out, " <span class=\"album-year\">({yr})</span>");
             }
         }
         out.push_str("</div>\n");
@@ -234,52 +260,93 @@ pub(in crate::web) fn render_collection_draw_section(
         let _ = writeln!(out, "<div class=\"album-genres\">{}</div>", esc(&genres.join(" · ")));
     }
 
-    let ext_links = collect_web_external_links(entry, None);
-    if !ext_links.is_empty() {
-        out.push_str("<div class=\"album-actions\">\n");
-        for link in ext_links {
-            let _ = writeln!(
-                out,
-                "<a class=\"btn btn-small\" href=\"{}\" target=\"_blank\" rel=\"noopener\">{}<span>{}</span></a>",
-                esc(&link.href),
-                link.icon.svg(),
-                esc(&link.label)
-            );
-        }
-        out.push_str("</div>\n");
-    }
+    render_sleeve_rank_row(out, &list_key_enc, csrf);
+    out.push_str("</div>\n</div>\n");
 
-    render_draw_mutation_forms(out, &list_key_enc, csrf);
-    out.push_str("</div>\n</section>\n");
+    render_sleeve_progress_foot(out, state, &list_key_enc);
+    out.push_str("</section>\n");
 }
 
-fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) {
+fn render_sleeve_rank_row(out: &mut String, list_key_enc: &str, csrf: &str) {
     let _ = write!(
         out,
-        "<details class=\"album-inline-details\">\n\
-           <summary class=\"btn btn-primary\">Finish &amp; Rank</summary>\n\
-           <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/finish\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field mb-sm\">\n\
-               <label for=\"finish-notes-{list}\">Notes (optional)</label>\n\
-               <textarea id=\"finish-notes-{list}\" name=\"notes\" placeholder=\"Impressions, standout moments...\"></textarea>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn btn-primary\">Log Finished &amp; Rank</button>\n\
-           </form>\n\
-         </details>\n\
-         <details class=\"album-inline-details\">\n\
-           <summary class=\"btn btn-ghost btn-small\">Abandon</summary>\n\
-           <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/abandon\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field mb-sm\">\n\
-               <label for=\"abandon-notes-{list}\">Why abandon? (optional)</label>\n\
-               <textarea id=\"abandon-notes-{list}\" name=\"notes\" placeholder=\"Optional note...\"></textarea>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn\">Abandon &amp; Draw Next</button>\n\
-           </form>\n\
-         </details>\n",
+        "<div class=\"sleeve-rank-row\">\n\
+           <details class=\"sleeve-rank-details\">\n\
+             <summary class=\"btn btn-primary btn-small\">Rank</summary>\n\
+             <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/finish\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <div class=\"field mb-sm\">\n\
+                 <label for=\"rank-notes-{list}\">Notes (optional)</label>\n\
+                 <textarea id=\"rank-notes-{list}\" class=\"textarea-compact\" name=\"notes\" placeholder=\"Impressions…\"></textarea>\n\
+               </div>\n\
+               <button type=\"submit\" class=\"btn btn-primary btn-small\">Log &amp; Rank</button>\n\
+             </form>\n\
+           </details>\n\
+         </div>\n",
         list = esc(list_key_enc),
         csrf = esc(csrf),
+    );
+}
+
+fn render_sleeve_cover(
+    out: &mut String,
+    entry: &crate::db::CatalogEntry,
+    entry_href: &str,
+    spotify_href: Option<&str>,
+) {
+    out.push_str("<div class=\"sleeve-art\">\n");
+    let cover_inner =
+        entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href).map_or_else(
+            || "<div class=\"album-cover-placeholder\" aria-hidden=\"true\">&#9835;</div>".to_owned(),
+            |cover| {
+                format!(
+                    "<img class=\"album-cover\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+                    esc(cover)
+                )
+            },
+        );
+    if let Some(sp) = spotify_href {
+        let _ = writeln!(
+            out,
+            "<a class=\"album-cover-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\" title=\"Listen on Spotify\" aria-label=\"Listen to {} on Spotify\">\n\
+               {cover_inner}\n\
+               <span class=\"cover-spotify-badge\" aria-hidden=\"true\">{SPOTIFY_MARK_SVG}</span>\n\
+             </a>",
+            esc(sp),
+            esc(&entry.title),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "<a class=\"album-cover-link\" href=\"{}\" aria-label=\"Open {}\">{cover_inner}</a>",
+            esc(entry_href),
+            esc(&entry.title),
+        );
+    }
+    out.push_str("</div>\n");
+}
+
+fn render_sleeve_progress_foot(
+    out: &mut String,
+    state: &CollectionGeneratorState,
+    list_key_enc: &str,
+) {
+    let done_count = state.consumed_count + state.abandoned_count;
+    let draw_number = done_count + 1;
+    let total_pool = state.total_pool.max(1);
+    let pct_done = (done_count * 100) / total_pool;
+    let _ = writeln!(
+        out,
+        "<div class=\"sleeve-progress-foot\">\n\
+           <div class=\"album-kicker\">\n\
+             <a href=\"/lists/{list}\">{title}</a>\n\
+             <span class=\"kicker-count\">#{draw_number} of {pool}</span>\n\
+           </div>\n\
+           <progress class=\"sleeve-progress\" value=\"{done_count}\" max=\"{total_pool}\" aria-label=\"{title} progress: {done_count} of {total_pool} ({pct_done}%)\"></progress>\n\
+         </div>",
+        list = esc(list_key_enc),
+        title = esc(&state.collection_title),
+        pool = state.total_pool,
     );
 }
 
@@ -287,9 +354,7 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     let in_progress: Vec<&Item> = unread_items
         .iter()
         .filter(|i| {
-            i.read_progress >= 0.03
-                || i.content_type == crate::db::ContentType::Audio
-                || i.audio_url.is_some()
+            i.read_progress >= 0.03 || i.content_type == ContentType::Audio || i.audio_url.is_some()
         })
         .take(4)
         .collect();
@@ -300,7 +365,7 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     out.push_str(
         "<div class=\"section-head\"><h2>Continue Reading &amp; Listening</h2>\
          <a class=\"section-action\" href=\"/inbox\">Inbox &rarr;</a></div>\n\
-         <ul class=\"inbox-list\">\n",
+         <ul class=\"inbox-list mb-lg\">\n",
     );
     for item in in_progress {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -314,10 +379,19 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
             esc(&item.title),
         );
         if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
-            let _ = write!(out, "<span>{}</span>", esc(ft));
+            if let Some(fid) = item.feed_id.as_deref() {
+                let _ = write!(
+                    out,
+                    "<a class=\"byline-item\" href=\"/inbox?status=all&amp;feed={}\">{}</a>",
+                    esc(&urlencode(fid)),
+                    esc(ft)
+                );
+            } else {
+                let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(ft));
+            }
         }
         if pct > 0 {
-            let _ = write!(out, "<span>{pct}%</span>");
+            let _ = write!(out, "<span class=\"byline-item\">{pct}%</span>");
         }
         out.push_str("</div></div><div class=\"inbox-controls\">");
         render_audio_play_button(out, item);
@@ -326,79 +400,89 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     out.push_str("</ul>\n");
 }
 
-fn render_home_quick_actions_bar(out: &mut String, csrf: &str) {
-    let _ = write!(
-        out,
-        "<div class=\"quick-save-bar\">\n\
-           <form method=\"post\" action=\"/web/items/save\" class=\"quick-save-form\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
-             <input type=\"text\" name=\"url\" required placeholder=\"Save article, PDF, arXiv, or video URL to Want to Read...\" aria-label=\"URL to save to Want to Read\">\n\
-             <button type=\"submit\" class=\"btn btn-primary btn-small\">+ Want to Read</button>\n\
-           </form>\n",
-        csrf = esc(csrf),
-    );
-    render_inline_csrf_form(
-        out,
-        "/web/feeds/refresh-all",
-        csrf,
-        &[("return_to", "/")],
-        None,
-        "<button type=\"submit\" class=\"btn btn-small\"><span aria-hidden=\"true\">&#8635;</span> Refresh Feeds</button>",
-    );
-    out.push_str("\n</div>\n");
-}
-
-fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: usize, csrf: &str) {
+fn render_want_to_read_section(
+    out: &mut String,
+    items: &[Item],
+    total_count: usize,
+    other_want_total: usize,
+    csrf: &str,
+) {
     let _ = writeln!(
         out,
-        "<div class=\"section-head\"><h2>Want to Read ({total_count})</h2>\
-         <a class=\"section-action\" href=\"/queue\">Full Queue &rarr;</a></div>"
+        "<section class=\"rail-block rail-card\">\n\
+         <div class=\"section-head\"><h2>Queue ({total_count})</h2>\
+         <a class=\"section-action\" href=\"/queue\">All Queues &rarr;</a></div>"
+    );
+    let _ = write!(
+        out,
+        "<form method=\"post\" action=\"/web/items/save\" class=\"quick-save-inline\">\n\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+           <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
+           <input type=\"text\" name=\"url\" required placeholder=\"Add URL to queue…\" aria-label=\"Add URL to Queue\">\n\
+           <button type=\"submit\" class=\"btn btn-small\">+ Add</button>\n\
+         </form>\n",
+        csrf = esc(csrf),
     );
     if items.is_empty() {
         out.push_str(
-            "<p class=\"empty\">Your reading list is clear. Paste a link or PDF URL above, or share from Android to save for later.</p>\n",
+            "<p class=\"empty\">Queue is clear. Paste a URL above or promote items from your inbox.</p>\n",
         );
-        return;
-    }
-
-    out.push_str("<ul class=\"inbox-list\">\n");
-    for item in items.iter().take(6) {
-        let _ = write!(
-            out,
-            "<li class=\"inbox-row\"><div class=\"inbox-main\">\
-             <div class=\"inbox-title\"><a href=\"/reader/{id}\">{title}</a></div>\
-             <div class=\"item-byline\"><span class=\"badge\">{ctype}</span>",
-            id = esc(&urlencode(&item.id)),
-            title = esc(&item.title),
-            ctype = esc(content_type_label(item.content_type)),
-        );
-        if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
-            let _ = write!(out, "<span>{}</span>", esc(author));
+    } else {
+        out.push_str("<ul class=\"inbox-list\">\n");
+        for item in items.iter().take(6) {
+            let _ = write!(
+                out,
+                "<li class=\"inbox-row\"><div class=\"inbox-main\">\
+                 <div class=\"inbox-title\"><a href=\"/reader/{id}\">{title}</a></div>\
+                 <div class=\"item-byline\">",
+                id = esc(&urlencode(&item.id)),
+                title = esc(&item.title),
+            );
+            if item.content_type != ContentType::Article {
+                let _ = write!(
+                    out,
+                    "<span class=\"badge badge-kind\">{}</span>",
+                    esc(content_type_label(item.content_type))
+                );
+            }
+            if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
+                let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(author));
+            }
+            if let Some(pub_at) = item.published_at {
+                let _ =
+                    write!(out, "<span class=\"byline-item\">{}</span>", pub_at.format("%b %d"));
+            }
+            for tag_name in &item.tag_names.0 {
+                let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
+            }
+            out.push_str("</div></div><div class=\"inbox-controls\">");
+            render_audio_play_button(out, item);
+            let action = format!("/web/items/{}/finish", urlencode(&item.id));
+            render_inline_csrf_form(
+                out,
+                &action,
+                csrf,
+                &[("return_to", "/")],
+                None,
+                &format!(
+                    "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-label=\"Mark {} as done\"><span aria-hidden=\"true\">&#10003;</span> Done</button>",
+                    esc(&item.title),
+                ),
+            );
+            out.push_str("</div></li>\n");
         }
-        for tag_name in &item.tag_names.0 {
-            let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
-        }
-        out.push_str("</div></div><div class=\"inbox-controls\">");
-        render_audio_play_button(out, item);
-        let action = format!("/web/items/{}/finish", urlencode(&item.id));
-        render_inline_csrf_form(
-            out,
-            &action,
-            csrf,
-            &[("return_to", "/")],
-            None,
-            &format!(
-                "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-label=\"Mark {} as done\"><span aria-hidden=\"true\">&#10003;</span> Done</button>",
-                esc(&item.title),
-            ),
-        );
-        out.push_str("</div></li>\n");
+        out.push_str("</ul>\n");
     }
-    out.push_str("</ul>\n");
+    if other_want_total > 0 {
+        let _ = writeln!(
+            out,
+            "<p class=\"meta mt-sm mb-0\">+<em>{other_want_total}</em> in other <a href=\"/queue\">Want queues</a>.</p>"
+        );
+    }
+    out.push_str("</section>\n");
 }
 
-fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64) {
+fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64, csrf: &str) {
     let _ = writeln!(
         out,
         "<div class=\"section-head\"><h2>Feed Inbox ({total_unread})</h2>\
@@ -412,27 +496,113 @@ fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread:
     }
 
     out.push_str("<ul class=\"inbox-list\">\n");
-    for item in items.iter().take(8) {
-        let _ = write!(
-            out,
-            "<li class=\"inbox-row\"><div class=\"inbox-main\">\
-             <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
-             <div class=\"item-byline\"><span class=\"badge\">{}</span>",
-            esc(&urlencode(&item.id)),
-            esc(&item.title),
-            esc(content_type_label(item.content_type)),
-        );
-        if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
-            let _ = write!(out, "<span>{}</span>", esc(ft));
-        }
-        if let Some(pub_at) = item.published_at {
-            let _ = write!(out, "<span>{}</span>", pub_at.format("%b %d"));
-        }
-        out.push_str("</div></div><div class=\"inbox-controls\">");
-        render_audio_play_button(out, item);
-        out.push_str("</div></li>\n");
+    for item in items.iter().take(20) {
+        render_home_inbox_row(out, item, csrf);
     }
     out.push_str("</ul>\n");
+}
+
+fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
+    let id_enc = urlencode(&item.id);
+    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
+        ("&#9733;", "true", "btn btn-small btn-ghost inbox-star-btn is-starred")
+    } else {
+        ("&#9734;", "false", "btn btn-small btn-ghost inbox-star-btn")
+    };
+    let star_btn = format!(
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        esc(&item.title),
+    );
+
+    out.push_str("<li class=\"inbox-row\"><div class=\"inbox-star-col\">");
+    render_inline_csrf_form(
+        out,
+        &format!("/web/items/{id_enc}/star"),
+        csrf,
+        &[("return_to", "/")],
+        None,
+        &star_btn,
+    );
+    out.push_str("</div>");
+
+    if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+        let _ = write!(
+            out,
+            "<a class=\"inbox-thumb-link\" href=\"/reader/{id_enc}\" tabindex=\"-1\" aria-hidden=\"true\">\
+               <img class=\"inbox-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+             </a>",
+            esc(thumb),
+        );
+    }
+
+    let _ = write!(
+        out,
+        "<div class=\"inbox-main\">\
+         <div class=\"inbox-title\"><a href=\"/reader/{id_enc}\">{}</a></div>\
+         <div class=\"item-byline\">",
+        esc(&item.title),
+    );
+    if item.content_type != ContentType::Article {
+        let _ = write!(
+            out,
+            "<span class=\"badge badge-kind\">{}</span>",
+            esc(content_type_label(item.content_type))
+        );
+    }
+    if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(fid) = item.feed_id.as_deref() {
+            let _ = write!(
+                out,
+                "<a class=\"byline-item\" href=\"/inbox?status=all&amp;feed={}\">{}</a>",
+                esc(&urlencode(fid)),
+                esc(ft)
+            );
+        } else {
+            let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(ft));
+        }
+    }
+    if let Some(pub_at) = item.published_at {
+        let _ = write!(out, "<span class=\"byline-item\">{}</span>", pub_at.format("%b %d"));
+    }
+    out.push_str("</div></div><div class=\"inbox-controls inbox-controls-subtle\">");
+    render_audio_play_button(out, item);
+
+    let queue_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">+ Queue</button>",
+        esc(&item.title),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/entries/{id_enc}/list-add"),
+        csrf,
+        &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", "/")],
+        None,
+        &queue_btn,
+    );
+
+    out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
+
+    let arch_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
+        esc(&item.title),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/items/{id_enc}/archive"),
+        csrf,
+        &[("return_to", "/")],
+        None,
+        &arch_btn,
+    );
+    out.push_str("</div></li>\n");
+}
+
+// TODO(backend): include entry global rating tier/score in ConsumptionLogView instead of stubbing
+fn mock_diary_tier(entry_id: &str) -> char {
+    const TIERS: [char; 5] = ['S', 'A', 'A', 'B', 'C'];
+    let hash =
+        entry_id.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    TIERS[hash % TIERS.len()]
 }
 
 fn render_recent_diary_section(
@@ -441,19 +611,25 @@ fn render_recent_diary_section(
     artist_links: &HashMap<String, String>,
 ) {
     out.push_str(
-        "<div class=\"section-head\"><h2>Recent Diary</h2>\
+        "<section class=\"rail-block\">\n\
+         <div class=\"section-head\"><h2>Recent Diary</h2>\
          <a class=\"section-action\" href=\"/diary\">Full Diary &rarr;</a></div>\n",
     );
     if diary.is_empty() {
         out.push_str(
-            "<p class=\"empty\">No media logged yet. <a href=\"/queue\">Log a work or add to a Want queue</a>.</p>\n",
+            "<p class=\"empty\">No media logged yet. <a href=\"/queue\">Log a work or add to a Queue</a>.</p>\n",
         );
-        return;
+    } else {
+        for row in diary {
+            let tier = if row.status == crate::db::ConsumptionStatus::Consumed {
+                Some(mock_diary_tier(&row.entry.id))
+            } else {
+                None
+            };
+            render_diary_row_with_tier(out, row, artist_links, false, tier);
+        }
     }
-
-    for row in diary {
-        render_diary_row(out, row, artist_links, false);
-    }
+    out.push_str("</section>\n");
 }
 
 pub(super) async fn post_generator_toggle<F: FeedFetcher>(

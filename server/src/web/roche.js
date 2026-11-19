@@ -1111,19 +1111,136 @@
     }
   });
 
+  /* --- 6. Theme Toggle, Masthead Search & Sleeve Drawers --- */
+  const THEME_STORAGE_KEY = "roche_theme_v1";
+
+  const applySavedTheme = () => {
+    try {
+      const saved = localStorage.getItem(THEME_STORAGE_KEY);
+      if (saved === "dark" || saved === "light") {
+        document.documentElement.setAttribute("data-theme", saved);
+      }
+    } catch {}
+  };
+  applySavedTheme();
+
+  const initShellControls = () => {
+    const themeBtn = document.getElementById("roche-theme-toggle");
+    if (themeBtn && themeBtn.dataset.bound !== "1") {
+      themeBtn.dataset.bound = "1";
+      const isCurrentlyDark = () => {
+        const attr = document.documentElement.getAttribute("data-theme");
+        if (attr === "dark") return true;
+        if (attr === "light") return false;
+        return Boolean(window.matchMedia?.("(prefers-color-scheme: dark)")?.matches);
+      };
+      const syncThemeLabel = () => {
+        const dark = isCurrentlyDark();
+        themeBtn.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+        themeBtn.setAttribute("title", dark ? "Switch to light theme" : "Switch to dark theme");
+      };
+      syncThemeLabel();
+      themeBtn.addEventListener("click", () => {
+        const next = isCurrentlyDark() ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        try {
+          localStorage.setItem(THEME_STORAGE_KEY, next);
+        } catch {}
+        syncThemeLabel();
+      });
+    }
+
+    const masthead = document.getElementById("roche-masthead");
+    const searchToggle = document.getElementById("roche-search-toggle");
+    const searchInput = document.getElementById("roche-global-search");
+    if (searchToggle && masthead && searchToggle.dataset.bound !== "1") {
+      searchToggle.dataset.bound = "1";
+      searchToggle.addEventListener("click", () => {
+        const open = masthead.classList.toggle("is-search-open");
+        searchToggle.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) searchInput?.focus();
+      });
+    }
+
+    if (document.body && document.body.dataset.globalKeysBound !== "1") {
+      document.body.dataset.globalKeysBound = "1";
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key !== "/" || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+        const target = ev.target;
+        if (target?.matches?.("input, textarea, select, [contenteditable]")) return;
+        if (document.getElementById("roche-rank-board")) return;
+        const input = document.getElementById("roche-global-search");
+        if (!input) return;
+        ev.preventDefault();
+        const hdr = document.getElementById("roche-masthead");
+        if (hdr && window.getComputedStyle(input).display === "none") {
+          hdr.classList.add("is-search-open");
+          document.getElementById("roche-search-toggle")?.setAttribute("aria-expanded", "true");
+        }
+        input.focus();
+        input.select();
+      });
+    }
+
+    const refreshForm = document.getElementById("roche-masthead-refresh");
+    if (refreshForm && refreshForm.dataset.bound !== "1") {
+      refreshForm.dataset.bound = "1";
+      refreshForm.addEventListener("submit", () => {
+        const retInput = refreshForm.querySelector('input[name="return_to"]');
+        if (retInput) {
+          retInput.value = `${window.location.pathname}${window.location.search}`;
+        }
+      });
+    }
+  };
+
+  const initSleeveDrawers = () => {
+    for (const container of document.querySelectorAll(".sleeve-actions")) {
+      if (container.dataset.bound === "1") continue;
+      container.dataset.bound = "1";
+      const drawers = Array.from(container.querySelectorAll("details.album-inline-details"));
+      for (const drawer of drawers) {
+        drawer.addEventListener("toggle", () => {
+          if (!drawer.open) return;
+          for (const other of drawers) {
+            if (other !== drawer && other.open) other.open = false;
+          }
+        });
+      }
+    }
+  };
+
+  const initSidebarFeedFilter = () => {
+    const input = document.querySelector(".sidebar-feed-filter");
+    const list = document.getElementById("proto-feed-list") || document.getElementById("roche-sidebar-feeds");
+    if (!input || !list || input.dataset.bound === "1") return;
+    input.dataset.bound = "1";
+    input.addEventListener("input", () => {
+      const q = input.value.trim().toLowerCase();
+      for (const li of list.children) {
+        const name = (li.getAttribute("data-feed-name") || li.textContent || "").toLowerCase();
+        li.hidden = Boolean(q && !name.includes(q));
+      }
+    });
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
     initRankBoard();
     initOpmlFileHelper();
     initRefreshBanner();
+    initSleeveDrawers();
+    initSidebarFeedFilter();
   };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
+      initShellControls();
       initAudioPlayer();
       initPageWidgets();
     });
   } else {
+    initShellControls();
     initAudioPlayer();
     initPageWidgets();
   }

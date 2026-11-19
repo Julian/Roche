@@ -185,11 +185,21 @@ pub(super) fn render_diary_row(
     artist_links: &HashMap<String, String>,
     show_notes: bool,
 ) {
+    render_diary_row_with_tier(out, row, artist_links, show_notes, None);
+}
+
+pub(super) fn render_diary_row_with_tier(
+    out: &mut String,
+    row: &ConsumptionLogView,
+    artist_links: &HashMap<String, String>,
+    show_notes: bool,
+    tier: Option<char>,
+) {
     let _ = write!(
         out,
         "<div class=\"diary-row\">\
            <span class=\"date\">{}</span>\
-           <span><a href=\"/entries/{}\">{}</a>",
+           <span class=\"diary-title\"><a href=\"/entries/{}\">{}</a>",
         row.ts.format("%b %d"),
         esc(&urlencode(&row.entry.id)),
         esc(&row.entry.title),
@@ -202,8 +212,15 @@ pub(super) fn render_diary_row(
     if row.status != ConsumptionStatus::Consumed {
         let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
     }
+    out.push_str("</span><span class=\"diary-meta\">");
+    if let Some(t) = tier {
+        let _ = write!(
+            out,
+            "<span class=\"tier-pill tier-{t}\" title=\"Tier {t}\" aria-label=\"Tier {t}\">{t}</span>"
+        );
+    }
     let _ =
-        write!(out, "</span><span class=\"kind\">{}</span>", esc(row.entry.kind.display_label()));
+        write!(out, "<span class=\"kind\">{}</span></span>", esc(row.entry.kind.display_label()));
     if show_notes && let Some(notes) = row.notes.as_deref().filter(|s| !s.is_empty()) {
         let _ = writeln!(out, "<div class=\"notes\">{}</div>", esc(notes));
     }
@@ -214,12 +231,28 @@ pub(super) fn render_diary_row(
 pub(super) enum NavSection {
     Home,
     Inbox,
+    Starred,
     Feeds,
     Lists,
     Rank,
     Diary,
     Queue,
     None,
+}
+
+impl NavSection {
+    const fn default_path(self) -> &'static str {
+        match self {
+            Self::Home | Self::None => "/",
+            Self::Inbox => "/inbox",
+            Self::Starred => "/starred",
+            Self::Feeds => "/feeds",
+            Self::Lists => "/lists",
+            Self::Queue => "/queue",
+            Self::Diary => "/diary",
+            Self::Rank => "/rank",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, serde::Deserialize)]
@@ -237,9 +270,10 @@ pub(super) struct PageShell<'a> {
     pub body_html: &'a str,
 }
 
-const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
+const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
     (NavSection::Home, "/", "Home"),
     (NavSection::Inbox, "/inbox", "Inbox"),
+    (NavSection::Starred, "/starred", "Starred"),
     (NavSection::Feeds, "/feeds", "Feeds"),
     (NavSection::Lists, "/lists", "Lists"),
     (NavSection::Queue, "/queue", "Queue"),
@@ -248,7 +282,7 @@ const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
 ];
 
 pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
-    let mut out = String::with_capacity(shell.body_html.len() + 2_400);
+    let mut out = String::with_capacity(shell.body_html.len() + 3_200);
     let page_title = if shell.title.is_empty() || shell.title == "Roche" {
         "Roche".to_owned()
     } else {
@@ -262,42 +296,17 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
          <head>\n\
            <meta charset=\"utf-8\">\n\
            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-           <title>{}</title>\n\
+           <title>{title}</title>\n\
            <link rel=\"stylesheet\" href=\"/static/roche.css\">\n\
          </head>\n\
-         <body data-csrf=\"{}\">\n\
-         <a class=\"skip-link\" href=\"#roche-main\">Skip to content</a>\n\
-         <header class=\"masthead\">\n\
-           <div class=\"masthead-top\">\n\
-             <h1><a href=\"/\">Roche</a></h1>\n\
-             <form class=\"logout-form\" method=\"post\" action=\"/logout\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n\
-               <button type=\"submit\" class=\"link-btn\">Sign out</button>\n\
-             </form>\n\
-           </div>\n\
-           <nav id=\"roche-nav\" class=\"primary-nav\" aria-label=\"Primary\">",
-        esc(&page_title),
-        esc(shell.csrf_token),
-        esc(shell.csrf_token),
+         <body data-csrf=\"{csrf}\">\n\
+         <a class=\"skip-link\" href=\"#roche-main\">Skip to content</a>\n",
+        title = esc(&page_title),
+        csrf = esc(shell.csrf_token),
     );
 
-    for (sec, href, label) in NAV_ITEMS {
-        let attrs =
-            if sec == shell.active { " class=\"is-active\" aria-current=\"page\"" } else { "" };
-        let _ = write!(out, "<a href=\"{href}\"{attrs}>{label}</a>");
-    }
-
-    let refresh_hidden = if shell.is_refreshing { "" } else { " hidden" };
-    let refresh_active = if shell.is_refreshing { "1" } else { "0" };
-    let _ = write!(
-        out,
-        "</nav>\n\
-         <div id=\"roche-refresh-banner\" class=\"refresh-banner\" data-active=\"{refresh_active}\" role=\"status\" aria-live=\"polite\"{refresh_hidden}>\n\
-           <span class=\"refresh-spinner\" aria-hidden=\"true\">&#8635;</span>\n\
-           <span class=\"js-refresh-label\">Refreshing feeds &amp; metadata in background&hellip;</span>\n\
-         </div>\n\
-         </header>\n<main id=\"roche-main\" tabindex=\"-1\">\n",
-    );
+    render_masthead(&mut out, shell);
+    out.push_str("<main id=\"roche-main\" tabindex=\"-1\">\n");
 
     if let Some(msg) = shell.flash.err.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let _ =
@@ -309,11 +318,15 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
 
     out.push_str(shell.body_html);
 
-    out.push_str(
+    let _ = write!(
+        out,
         "\n</main>\n\
          <footer class=\"colophon\">\n\
-           <span aria-hidden=\"true\">&#10086;</span>\n\
-           <span>Roche &middot; Reader, Podcasts &amp; Ranked Library</span>\n\
+           <span class=\"colophon-brand\"><span aria-hidden=\"true\">&#10086;</span> <span>Roche &middot; Reader, Podcasts &amp; Ranked Library</span></span>\n\
+           <form class=\"logout-form\" method=\"post\" action=\"/logout\">\n\
+             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+             <button type=\"submit\" class=\"link-btn\">Sign out</button>\n\
+           </form>\n\
          </footer>\n\
          <aside id=\"roche-player-bar\" class=\"player-bar\" aria-label=\"Audio player\" hidden>\n\
            <div class=\"player-inner\">\n\
@@ -330,9 +343,64 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
          <script src=\"/static/roche.js\" defer></script>\n\
          </body>\n\
          </html>\n",
+        csrf = esc(shell.csrf_token),
     );
 
     Html(out)
+}
+
+fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
+    let refresh_return = shell.active.default_path();
+    // TODO(backend): point global masthead search to unified items+catalog-entries search endpoint
+    let _ = write!(
+        out,
+        "<header class=\"masthead\" id=\"roche-masthead\">\n\
+           <div class=\"masthead-top\">\n\
+             <h1><a href=\"/\">Roche</a></h1>\n\
+             <form method=\"get\" action=\"/inbox\" class=\"masthead-search\" id=\"roche-masthead-search\" role=\"search\">\n\
+               <input type=\"hidden\" name=\"status\" value=\"all\">\n\
+               <svg class=\"icon search-icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><circle cx=\"7\" cy=\"7\" r=\"4.5\"/><path d=\"M10.5 10.5L14 14\" stroke-linecap=\"round\"/></svg>\n\
+               <input type=\"search\" name=\"q\" id=\"roche-global-search\" class=\"masthead-search-input\" placeholder=\"Search…\" aria-label=\"Search Roche\">\n\
+               <kbd class=\"search-kbd\" aria-hidden=\"true\">/</kbd>\n\
+             </form>\n\
+             <div class=\"masthead-utils\">\n\
+               <button type=\"button\" id=\"roche-search-toggle\" class=\"util-btn masthead-search-toggle\" aria-label=\"Search\" aria-expanded=\"false\" aria-controls=\"roche-masthead-search\">\n\
+                 <svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><circle cx=\"7\" cy=\"7\" r=\"4.5\"/><path d=\"M10.5 10.5L14 14\" stroke-linecap=\"round\"/></svg>\n\
+               </button>\n\
+               <form id=\"roche-masthead-refresh\" class=\"inline-form\" method=\"post\" action=\"/web/feeds/refresh-all\">\n\
+                 <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+                 <input type=\"hidden\" name=\"return_to\" value=\"{refresh_return}\">\n\
+                 <button type=\"submit\" class=\"util-btn\" title=\"Refresh all feeds\" aria-label=\"Refresh all feeds\">\n\
+                   <svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>\n\
+                   <span class=\"util-label\">Refresh</span>\n\
+                 </button>\n\
+               </form>\n\
+               <button type=\"button\" id=\"roche-theme-toggle\" class=\"util-btn\" title=\"Switch color theme\" aria-label=\"Switch color theme\">\n\
+                 <svg class=\"icon icon-moon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" aria-hidden=\"true\"><path d=\"M13.2 9.9A5.5 5.5 0 0 1 6.1 2.8a5.5 5.5 0 1 0 7.1 7.1Z\" stroke-linejoin=\"round\"/></svg>\n\
+                 <svg class=\"icon icon-sun\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" aria-hidden=\"true\"><circle cx=\"8\" cy=\"8\" r=\"3\"/><path d=\"M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1\" stroke-linecap=\"round\"/></svg>\n\
+               </button>\n\
+             </div>\n\
+           </div>\n\
+           <nav id=\"roche-nav\" class=\"primary-nav\" aria-label=\"Primary\">",
+        csrf = esc(shell.csrf_token),
+        refresh_return = esc(refresh_return),
+    );
+    for (sec, href, label) in NAV_ITEMS {
+        let attrs =
+            if sec == shell.active { " class=\"is-active\" aria-current=\"page\"" } else { "" };
+        let _ = write!(out, "<a href=\"{href}\"{attrs}>{label}</a>");
+    }
+    let refresh_hidden = if shell.is_refreshing { "" } else { " hidden" };
+    let refresh_active = if shell.is_refreshing { "1" } else { "0" };
+    let _ = write!(
+        out,
+        "</nav>\n\
+         <div id=\"roche-refresh-banner\" class=\"refresh-banner\" data-active=\"{refresh_active}\" role=\"status\" aria-live=\"polite\"{refresh_hidden}>\n\
+           <span class=\"refresh-spinner\" aria-hidden=\"true\">&#8635;</span>\n\
+           <span class=\"js-refresh-label\">Refreshing feeds &amp; metadata in background&hellip;</span>\n\
+         </div>\n\
+         </header>\n",
+    );
 }
 
 pub(super) fn render_login_page(

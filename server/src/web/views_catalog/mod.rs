@@ -74,6 +74,8 @@ pub(super) struct EntryLogForm {
 #[derive(Debug, Deserialize)]
 pub(super) struct EntryAddToListForm {
     pub list_slug_or_id: String,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

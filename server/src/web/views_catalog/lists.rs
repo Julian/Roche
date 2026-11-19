@@ -316,9 +316,14 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
     );
 
     let flash = FlashQuery { notice: q.notice, err: q.err };
+    let active_nav = if view.collection.slug.as_deref() == Some("starred") {
+        NavSection::Starred
+    } else {
+        NavSection::Lists
+    };
     render_page(&PageShell {
         title: &view.collection.title,
-        active: NavSection::Lists,
+        active: active_nav,
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),

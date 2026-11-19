@@ -19,8 +19,8 @@ use crate::{
         artist_enrich::spawn_artist_enrichment_if_needed,
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_with_flash, render_page, urlencode,
-            web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, redirect_with_flash, render_page,
+            safe_local_redirect, urlencode, web_api_error_response,
         },
         links::{
             collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
@@ -412,7 +412,14 @@ pub(in crate::web) async fn post_entry_list_add<F: FeedFetcher>(
 ) -> Response {
     match service.catalog().add_collection_entry(&form.list_slug_or_id, &id, None).await {
         Ok(()) => {
-            redirect_with_flash(&format!("/entries/{}", urlencode(&id)), "notice", "Added to list")
+            let fallback = format!("/entries/{}", urlencode(&id));
+            let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+            let msg = if form.list_slug_or_id == crate::db::WANT_TO_READ_COLLECTION_ID {
+                "Added to Want to Read"
+            } else {
+                "Added to list"
+            };
+            redirect_with_flash(&dest, "notice", msg)
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
