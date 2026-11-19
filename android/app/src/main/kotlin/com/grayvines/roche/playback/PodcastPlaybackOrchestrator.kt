@@ -3,7 +3,6 @@ package com.grayvines.roche.playback
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
-import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.first
@@ -11,26 +10,21 @@ import kotlinx.coroutines.launch
 
 private const val UP_NEXT_TITLE_LIMIT = 36
 
-internal class PodcastPlaybackOrchestrator(
+class PodcastPlaybackOrchestrator(
     private val repository: RocheRepository,
     private val settingsRepository: SettingsRepository,
 ) {
     suspend fun playAudioEntry(
         playerController: PodcastPlayerController,
         entryId: String,
-        openFullscreen: Boolean = true,
+        toggleIfCurrent: Boolean = false,
     ): Boolean {
         val latestSnapshot = repository.snapshot.first()
         val latestSettings = settingsRepository.settings.first()
         val allEntries = latestSnapshot.entries
         val entry = allEntries.firstOrNull { it.id == entryId } ?: return false
         if (playerController.state.value.currentEntryId == entryId) {
-            if (openFullscreen) {
-                playerController.openFullscreen()
-                if (!playerController.state.value.isPlaying) {
-                    playerController.togglePlayPause(latestSettings.smartRewindEnabled)
-                }
-            } else {
+            if (toggleIfCurrent || !playerController.state.value.isPlaying) {
                 playerController.togglePlayPause(latestSettings.smartRewindEnabled)
             }
             return true
@@ -49,18 +43,12 @@ internal class PodcastPlaybackOrchestrator(
             updatedQueue = nextQueue
             current.copy(queueItemIds = nextQueue)
         }
-        val entriesById = allEntries.associateBy { it.id }
-        val hasNextAudio = updatedQueue.any { id ->
-            id != entryId &&
-                entriesById[id]?.let { !it.isArchived && it.contentType == ContentType.AUDIO } ==
-                    true
-        }
+        val hasNextAudio = hasNextQueuedAudio(allEntries, updatedQueue, excludeEntryId = entryId)
         playerController.playEntry(
             entry = entry,
             sourceUriOrPath = source,
             speed = effectiveSpeed,
             skipSilenceEnabled = latestSettings.skipSilenceEnabled,
-            openFullscreen = openFullscreen,
             hasNextQueuedAudio = hasNextAudio,
             smartRewindEnabled = latestSettings.smartRewindEnabled,
         )
@@ -72,12 +60,12 @@ internal class PodcastPlaybackOrchestrator(
         val currentId = playerController.state.value.currentEntryId ?: return
         val latestSettings = settingsRepository.settings.first()
         val latestEntries = repository.snapshot.first().entries
-        val byId = latestEntries.associateBy { it.id }
         val hasNext =
-            latestSettings.queueItemIds.any { id ->
-                id != currentId &&
-                    byId[id]?.let { !it.isArchived && it.contentType == ContentType.AUDIO } == true
-            }
+            hasNextQueuedAudio(
+                latestEntries,
+                latestSettings.queueItemIds,
+                excludeEntryId = currentId,
+            )
         playerController.updateHasNextQueuedAudio(hasNext)
         playerController.updateSmartRewindEnabled(latestSettings.smartRewindEnabled)
     }
@@ -86,7 +74,6 @@ internal class PodcastPlaybackOrchestrator(
         playerController: PodcastPlayerController,
         completedEntryId: String,
     ) {
-        val wasFullscreen = playerController.state.value.isFullscreenOpen
         repository.updateReadProgress(
             itemId = completedEntryId,
             progress = 1.0,
@@ -103,7 +90,7 @@ internal class PodcastPlaybackOrchestrator(
                 playAudioEntry(
                     playerController = playerController,
                     entryId = nextAudio.id,
-                    openFullscreen = wasFullscreen,
+                    toggleIfCurrent = false,
                 )
             if (started) {
                 playerController.emitUiMessage(
@@ -119,13 +106,12 @@ internal class PodcastPlaybackOrchestrator(
         }
     }
 
-    suspend fun performSkipToNextQueuedAudio(playerController: PodcastPlayerController) {
-        val currentState = playerController.state.value
-        val currentId = currentState.currentEntryId
+    suspend fun performSkipToNextQueuedAudio(playerController: PodcastPlayerController): Boolean {
+        val currentId = playerController.state.value.currentEntryId
         val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = currentId)
         if (nextAudio == null) {
             playerController.emitUiMessage("No next audio episode in Queue")
-            return
+            return false
         }
         if (currentId != null) {
             playerController.flushCurrentProgressIfNeeded()
@@ -140,12 +126,11 @@ internal class PodcastPlaybackOrchestrator(
                 }
             }
         }
-        val openFullscreen = if (currentId != null) currentState.isFullscreenOpen else true
         val started =
             playAudioEntry(
                 playerController = playerController,
                 entryId = nextAudio.id,
-                openFullscreen = openFullscreen,
+                toggleIfCurrent = false,
             )
         if (started) {
             playerController.emitUiMessage("Up next · ${nextAudio.title.take(UP_NEXT_TITLE_LIMIT)}")
@@ -153,17 +138,13 @@ internal class PodcastPlaybackOrchestrator(
             playerController.stopAndClear()
             playerController.emitUiMessage("Could not play next episode")
         }
+        return started
     }
 
     private suspend fun resolveNextQueuedAudioEntry(excludeEntryId: String?): InboxEntry? {
         val latestSettings = settingsRepository.settings.first()
         val latestEntries = repository.snapshot.first().entries
-        val byId = latestEntries.associateBy { it.id }
-        return latestSettings.queueItemIds
-            .mapNotNull { byId[it] }
-            .firstOrNull {
-                !it.isArchived && it.contentType == ContentType.AUDIO && it.id != excludeEntryId
-            }
+        return findNextQueuedAudioEntry(latestEntries, latestSettings.queueItemIds, excludeEntryId)
     }
 
     suspend fun performSetPlaybackSpeed(
@@ -189,55 +170,41 @@ internal class PodcastPlaybackOrchestrator(
     }
 }
 
+@Suppress("LongParameterList")
 internal fun createManagedPlayerController(
     scope: CoroutineScope,
     repository: RocheRepository,
     settingsRepository: SettingsRepository,
-    playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
-    mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
-    clockMs: () -> Long = System::currentTimeMillis,
-): PodcastPlayerController {
-    val orchestrator =
+    orchestrator: PodcastPlaybackOrchestrator =
         PodcastPlaybackOrchestrator(
             repository = repository,
             settingsRepository = settingsRepository,
-        )
-    var controllerRef: PodcastPlayerController? = null
-    val controller =
-        PodcastPlayerController(
-            scope = scope,
-            backend = playerBackend,
-            mediaSessionBridge = mediaSessionBridge,
-            onProgressSaved = buildProgressSaveHandler(scope, repository, clockMs),
-            onEpisodeCompleted = { completedEntryId ->
-                controllerRef?.let { active ->
-                    scope.launch {
-                        orchestrator.handleAudioEpisodeCompleted(active, completedEntryId)
-                    }
-                }
-            },
-            onSkipToNextRequested = {
-                controllerRef?.let { active ->
-                    scope.launch {
-                        orchestrator.performSkipToNextQueuedAudio(active)
-                    }
-                }
-            },
-            onSpeedChangedFromSession = { speed ->
-                controllerRef?.let { active ->
-                    scope.launch {
-                        orchestrator.performSetPlaybackSpeed(
-                            playerController = active,
-                            speed = speed,
-                            applyToCurrentPodcast = null,
-                        )
-                    }
-                }
-            },
-        )
-    controllerRef = controller
-    return controller
-}
+        ),
+    playerBackend: AudioPlayerBackend = NoOpAudioPlayerBackend(),
+    mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
+    clockMs: () -> Long = System::currentTimeMillis,
+): PodcastPlayerController =
+    PodcastPlayerController(
+        scope = scope,
+        backend = playerBackend,
+        mediaSessionBridge = mediaSessionBridge,
+        onProgressSaved = buildProgressSaveHandler(scope, repository, clockMs),
+        onEpisodeCompleted = { active, completedEntryId ->
+            scope.launch { orchestrator.handleAudioEpisodeCompleted(active, completedEntryId) }
+        },
+        onSkipToNextRequested = { active ->
+            scope.launch { orchestrator.performSkipToNextQueuedAudio(active) }
+        },
+        onSpeedChangedFromSession = { active, speed ->
+            scope.launch {
+                orchestrator.performSetPlaybackSpeed(
+                    playerController = active,
+                    speed = speed,
+                    applyToCurrentPodcast = null,
+                )
+            }
+        },
+    )
 
 private fun buildProgressSaveHandler(
     scope: CoroutineScope,

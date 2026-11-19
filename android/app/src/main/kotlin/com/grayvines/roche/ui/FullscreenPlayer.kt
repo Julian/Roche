@@ -2,8 +2,6 @@
 
 package com.grayvines.roche.ui
 
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -38,7 +36,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -60,12 +57,11 @@ import com.grayvines.roche.ui.components.FastForwardIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.PlayPauseIcon
+import com.grayvines.roche.ui.components.PodcastArtworkBox
 import com.grayvines.roche.ui.components.RewindIcon
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.SkipNextIcon
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.components.drawPodcastArtworkCanvas
-import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import kotlin.math.roundToLong
@@ -82,12 +78,6 @@ fun DockedMiniPlayer(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val bitmap =
-        rememberEntryThumbnailBitmap(
-            primaryKey = entry.thumbnailMediaId,
-            fallbackKey = entry.effectiveThumbnailUrl ?: entry.faviconUrl,
-        )
-    val artShape = RoundedCornerShape(8.dp)
 
     Column(
         modifier =
@@ -110,26 +100,7 @@ fun DockedMiniPlayer(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Box(
-                modifier =
-                    Modifier.size(40.dp)
-                        .clip(artShape)
-                        .background(Color(0xFF1A242D))
-                        .border(1.dp, colors.border, artShape)
-            ) {
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else {
-                    Canvas(modifier = Modifier.matchParentSize()) {
-                        drawPodcastArtworkCanvas(colors)
-                    }
-                }
-            }
+            PodcastArtworkBox(entry = entry, size = 40.dp, cornerRadius = 8.dp)
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -145,7 +116,7 @@ fun DockedMiniPlayer(
                         if (playerState.isBuffering) {
                             "${entry.feedTitle} · Buffering…"
                         } else {
-                            "${entry.feedTitle} · ${playerState.speedAdjustedRemainingLabel}"
+                            "${entry.feedTitle} · ${playerState.formattedMiniRemaining}"
                         },
                     color = colors.textMuted,
                     fontFamily = FontFamily.Monospace,
@@ -228,6 +199,8 @@ fun FullscreenPodcastPlayer(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
+    isSpeedSheetOpen: Boolean = false,
+    activeDrawerTab: PlayerDrawerTab? = null,
 ) {
     val colors = LocalRocheColors.current
 
@@ -277,11 +250,12 @@ fun FullscreenPodcastPlayer(
 
         FullscreenPlayerDrawerBar(
             playerState = playerState,
+            activeDrawerTab = activeDrawerTab,
             onAction = onAction,
         )
     }
 
-    if (playerState.isSpeedSheetOpen) {
+    if (isSpeedSheetOpen) {
         PlaybackSpeedAndPodcastSheet(
             feed = feed,
             entry = entry,
@@ -290,12 +264,11 @@ fun FullscreenPodcastPlayer(
         )
     }
 
-    val drawerTab = playerState.activeDrawerTab
-    if (drawerTab != null) {
+    if (activeDrawerTab != null) {
         PlayerContentDrawerSheet(
             entry = entry,
             playerState = playerState,
-            activeTab = drawerTab,
+            activeTab = activeDrawerTab,
             onAction = onAction,
             onOpenExternalUrl = onOpenExternalUrl,
         )
@@ -490,11 +463,11 @@ private fun PlayerOverflowMenuButton(
                 },
             )
             DropdownMenuItem(
-                text = { Text("Share at ${playerState.elapsedFormatted}…") },
+                text = { Text("Share at ${playerState.formattedElapsed}…") },
                 onClick = {
                     showOverflowMenu = false
                     onShareEntry(
-                        entry.copy(title = "${entry.title} (at ${playerState.elapsedFormatted})")
+                        entry.copy(title = "${entry.title} (at ${playerState.formattedElapsed})")
                     )
                 },
             )
@@ -544,25 +517,18 @@ private fun FullscreenPlayerArtworkAndMeta(
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
-    val bitmap =
-        rememberEntryThumbnailBitmap(
-            primaryKey = entry.thumbnailMediaId,
-            fallbackKey = entry.effectiveThumbnailUrl ?: entry.faviconUrl,
-        )
-    val artShape = RoundedCornerShape(18.dp)
     val currentChapter = playerState.currentChapter
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Box(
+        PodcastArtworkBox(
+            entry = entry,
+            size = 264.dp,
+            cornerRadius = 18.dp,
             modifier =
-                Modifier.size(264.dp)
-                    .clip(artShape)
-                    .background(Color(0xFF1A242D))
-                    .border(1.dp, colors.border, artShape)
-                    .clickable { onAction(MainAction.TogglePlayPause) }
+                Modifier.clickable { onAction(MainAction.TogglePlayPause) }
                     .semantics {
                         role = Role.Button
                         contentDescription =
@@ -572,21 +538,8 @@ private fun FullscreenPlayerArtworkAndMeta(
                                 "Album artwork (Tap to play)"
                             }
                     }
-                    .testTag("player_album_artwork")
+                    .testTag("player_album_artwork"),
         ) {
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                Canvas(modifier = Modifier.matchParentSize()) {
-                    drawPodcastArtworkCanvas(colors)
-                }
-            }
-
             Box(
                 contentAlignment = Alignment.Center,
                 modifier =
@@ -700,7 +653,7 @@ private fun PlayerScrubberSection(
             onDragPreviewChange = { previewFraction = it },
             contentDescription = "Playback position",
             stateDescription =
-                "${previewState.elapsedFormatted} elapsed, ${previewState.remainingFormatted} remaining",
+                "${previewState.formattedElapsed} elapsed, ${previewState.formattedRemaining} remaining",
             modifier = Modifier.fillMaxWidth().testTag("player_scrubber_slider"),
         )
         Row(
@@ -709,20 +662,20 @@ private fun PlayerScrubberSection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = previewState.elapsedFormatted,
+                text = previewState.formattedElapsed,
                 color = colors.textSecondary,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.5.sp,
             )
             Text(
-                text = "${previewState.speedAdjustedRemainingLabel} (at $speedLabel)",
+                text = "${previewState.formattedMiniRemaining} (at $speedLabel)",
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
             )
             Text(
-                text = previewState.remainingFormatted,
+                text = previewState.formattedRemaining,
                 color = colors.textSecondary,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.5.sp,
@@ -876,6 +829,7 @@ private fun FullscreenPlayerTransportRow(
 @Composable
 internal fun FullscreenPlayerDrawerBar(
     playerState: PodcastPlayerState,
+    activeDrawerTab: PlayerDrawerTab?,
     onAction: (MainAction) -> Unit,
 ) {
     Row(
@@ -884,19 +838,19 @@ internal fun FullscreenPlayerDrawerBar(
     ) {
         FilterChipPill(
             label = "Show Notes",
-            selected = playerState.activeDrawerTab == PlayerDrawerTab.SHOW_NOTES,
+            selected = activeDrawerTab == PlayerDrawerTab.SHOW_NOTES,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.SHOW_NOTES)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_shownotes"),
         )
         FilterChipPill(
             label = "Chapters (${playerState.chapters.size})",
-            selected = playerState.activeDrawerTab == PlayerDrawerTab.CHAPTERS,
+            selected = activeDrawerTab == PlayerDrawerTab.CHAPTERS,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.CHAPTERS)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_chapters"),
         )
         FilterChipPill(
             label = "Transcript",
-            selected = playerState.activeDrawerTab == PlayerDrawerTab.TRANSCRIPT,
+            selected = activeDrawerTab == PlayerDrawerTab.TRANSCRIPT,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_transcript"),
         )

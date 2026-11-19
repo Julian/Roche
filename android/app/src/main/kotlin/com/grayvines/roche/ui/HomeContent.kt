@@ -31,7 +31,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -63,16 +62,18 @@ import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.ui.components.BottomTabIcon
+import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
+import com.grayvines.roche.ui.components.SyncHeaderActionButton
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
@@ -83,6 +84,7 @@ fun HomeTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
+    activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
         val fallback =
@@ -92,36 +94,35 @@ fun HomeTabContent(
         }
     },
 ) {
-    val colors = LocalRocheColors.current
     val isSettingsUnpinned =
         AppTab.SETTINGS !in AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
 
-    Column(modifier = Modifier.fillMaxSize().testTag("home_screen")) {
-        HomeTopHeaderBar(
-            isSyncing = state.isSyncing,
-            isSettingsUnpinned = isSettingsUnpinned,
-            onAction = onAction,
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("home_pull_to_refresh"),
-        ) {
-            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
-                val isBentoTwoColumn = maxWidth >= BENTO_TWO_COLUMN_BREAKPOINT
-                HomeScrollableGrid(
-                    state = state,
-                    scrollState = scrollState,
-                    isWideLayout = isWideLayout,
-                    isBentoTwoColumn = isBentoTwoColumn,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-            }
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "home_pull_to_refresh",
+        modifier = Modifier.testTag("home_screen"),
+        header = {
+            HomeTopHeaderBar(
+                isSyncing = state.isSyncing,
+                isSettingsUnpinned = isSettingsUnpinned,
+                onAction = onAction,
+            )
+        },
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
+            val isBentoTwoColumn = maxWidth >= BENTO_TWO_COLUMN_BREAKPOINT
+            HomeScrollableGrid(
+                state = state,
+                scrollState = scrollState,
+                isWideLayout = isWideLayout,
+                isBentoTwoColumn = isBentoTwoColumn,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                onOpenCollectionDraw = onOpenCollectionDraw,
+            )
         }
     }
 }
@@ -137,17 +138,11 @@ private fun HomeTopHeaderBar(
         title = "Home",
         subtitle = if (isSyncing) "Refreshing…" else "Overview",
     ) {
-        RocheIconActionButton(
-            contentDescription = "Sync",
+        SyncHeaderActionButton(
+            isSyncing = isSyncing,
             onClick = { onAction(MainAction.SyncNow) },
             modifier = Modifier.testTag("home_sync_btn"),
-        ) {
-            RefreshIcon(
-                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
-                size = 17.dp,
-                isSpinning = isSyncing,
-            )
-        }
+        )
         if (isSettingsUnpinned) {
             RocheIconActionButton(
                 contentDescription = "Settings",
@@ -166,6 +161,7 @@ internal fun HomeScrollableGrid(
     scrollState: ScrollState,
     isWideLayout: Boolean,
     isBentoTwoColumn: Boolean,
+    activeAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -184,13 +180,19 @@ internal fun HomeScrollableGrid(
                 HomeWideTwoColumnDashboard(
                     state = state,
                     activeDraws = activeDraws,
+                    activeAudioEntryId = activeAudioEntryId,
                     onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             }
             hasActiveDraws && isBentoTwoColumn -> {
-                HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
+                HomeUpNextWidget(
+                    state = state,
+                    activeAudioEntryId = activeAudioEntryId,
+                    onAction = onAction,
+                    twoColumnCards = false,
+                )
                 HomeInboxWidget(state = state, onAction = onAction)
                 HomeBentoTwoColumnRow(
                     state = state,
@@ -202,26 +204,52 @@ internal fun HomeScrollableGrid(
                 HomeMediaCompanionWidget(state = state, onAction = onAction)
             }
             else -> {
-                HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = false)
-                HomeInboxWidget(state = state, onAction = onAction)
-                activeDraws.forEach { gen ->
-                    HomeCollectionDrawWidget(
-                        generator = gen,
-                        onAction = onAction,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                        onOpenCollectionDraw = onOpenCollectionDraw,
-                    )
-                }
-                HomeMediaCompanionWidget(state = state, onAction = onAction)
-                HomeActiveSourcesWidget(
+                HomeSingleColumnDashboard(
                     state = state,
+                    activeDraws = activeDraws,
+                    splitSourcesWhenUnconfigured = !hasActiveDraws && isBentoTwoColumn,
+                    activeAudioEntryId = activeAudioEntryId,
                     onAction = onAction,
-                    splitColumnsWhenUnconfigured = !hasActiveDraws && isBentoTwoColumn,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             }
         }
         Spacer(modifier = Modifier.height(76.dp))
     }
+}
+
+@Composable
+private fun HomeSingleColumnDashboard(
+    state: MainUiState,
+    activeDraws: List<CollectionGeneratorState>,
+    splitSourcesWhenUnconfigured: Boolean,
+    activeAudioEntryId: String?,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+) {
+    HomeUpNextWidget(
+        state = state,
+        activeAudioEntryId = activeAudioEntryId,
+        onAction = onAction,
+        twoColumnCards = false,
+    )
+    HomeInboxWidget(state = state, onAction = onAction)
+    activeDraws.forEach { gen ->
+        HomeCollectionDrawWidget(
+            generator = gen,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+            onOpenCollectionDraw = onOpenCollectionDraw,
+        )
+    }
+    HomeMediaCompanionWidget(state = state, onAction = onAction)
+    HomeActiveSourcesWidget(
+        state = state,
+        onAction = onAction,
+        splitColumnsWhenUnconfigured = splitSourcesWhenUnconfigured,
+    )
 }
 
 @Composable
@@ -263,6 +291,7 @@ internal fun HomeBentoTwoColumnRow(
 internal fun HomeWideTwoColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
+    activeAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
@@ -277,7 +306,12 @@ internal fun HomeWideTwoColumnDashboard(
             modifier = Modifier.weight(1.12f),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            HomeUpNextWidget(state = state, onAction = onAction, twoColumnCards = true)
+            HomeUpNextWidget(
+                state = state,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                twoColumnCards = true,
+            )
             HomeInboxWidget(state = state, onAction = onAction)
             HomeMediaCompanionWidget(state = state, onAction = onAction)
             if (hasActiveDraws) {
@@ -777,9 +811,9 @@ internal fun HomeUpNextWidget(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
+    activeAudioEntryId: String? = null,
     twoColumnCards: Boolean = false,
 ) {
-    val colors = LocalRocheColors.current
     val wantToReadIds =
         remember(state.catalog.entriesByCollectionId) {
             state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(
@@ -788,9 +822,10 @@ internal fun HomeUpNextWidget(
                 it.entry.id
             }
         }
+    val activePlayerEntry = state.resolveActivePlayerEntry(activeAudioEntryId)
     val spotlightEntries =
-        remember(state.activePlayerEntry, state.queueEntries, state.allEntries, wantToReadIds) {
-            buildHomeSpotlightEntries(state, wantToReadIds)
+        remember(activePlayerEntry, state.queueEntries, state.allEntries, wantToReadIds) {
+            buildHomeSpotlightEntries(state, wantToReadIds, activePlayerEntry)
         }
 
     Column(
@@ -798,41 +833,63 @@ internal fun HomeUpNextWidget(
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         RocheSectionHeader(label = "Continue & Up Next")
-        when {
-            spotlightEntries.isEmpty() -> HomeUpNextEmptyCard(onAction = onAction)
-            twoColumnCards && spotlightEntries.size >= 2 ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    spotlightEntries.forEach { entry ->
-                        RocheSurfaceCard(modifier = Modifier.weight(1f)) {
-                            HomeSpotlightRow(
-                                entry = entry,
-                                isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                                inQueue = state.isEntryInQueue(entry.id),
-                                inWantToRead = entry.id in wantToReadIds,
-                                onClick = { onAction(MainAction.OpenReader(entry.id)) },
-                            )
-                        }
-                    }
+        if (spotlightEntries.isEmpty()) {
+            HomeUpNextEmptyCard(onAction = onAction)
+        } else {
+            HomeSpotlightEntriesBody(
+                state = state,
+                spotlightEntries = spotlightEntries,
+                wantToReadIds = wantToReadIds,
+                activeAudioEntryId = activeAudioEntryId,
+                twoColumnCards = twoColumnCards,
+                onAction = onAction,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeSpotlightEntriesBody(
+    state: MainUiState,
+    spotlightEntries: List<InboxEntry>,
+    wantToReadIds: Set<String>,
+    activeAudioEntryId: String?,
+    twoColumnCards: Boolean,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (twoColumnCards && spotlightEntries.size >= 2) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            spotlightEntries.forEach { entry ->
+                RocheSurfaceCard(modifier = Modifier.weight(1f)) {
+                    HomeSpotlightRow(
+                        entry = entry,
+                        isPlayingAudio = entry.id == activeAudioEntryId,
+                        inQueue = state.isEntryInQueue(entry.id),
+                        inWantToRead = entry.id in wantToReadIds,
+                        onClick = { onAction(MainAction.OpenReader(entry.id)) },
+                    )
                 }
-            else ->
-                RocheSurfaceCard {
-                    spotlightEntries.forEachIndexed { index, entry ->
-                        if (index > 0) {
-                            HorizontalDivider(color = colors.border, thickness = 1.dp)
-                        }
-                        HomeSpotlightRow(
-                            entry = entry,
-                            isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                            inQueue = state.isEntryInQueue(entry.id),
-                            inWantToRead = entry.id in wantToReadIds,
-                            onClick = { onAction(MainAction.OpenReader(entry.id)) },
-                        )
-                    }
+            }
+        }
+    } else {
+        RocheSurfaceCard {
+            spotlightEntries.forEachIndexed { index, entry ->
+                if (index > 0) {
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
+                HomeSpotlightRow(
+                    entry = entry,
+                    isPlayingAudio = entry.id == activeAudioEntryId,
+                    inQueue = state.isEntryInQueue(entry.id),
+                    inWantToRead = entry.id in wantToReadIds,
+                    onClick = { onAction(MainAction.OpenReader(entry.id)) },
+                )
+            }
         }
     }
 }
@@ -954,7 +1011,13 @@ private fun HomeInboxPreviewRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            HomeInboxPreviewMetaRow(entry = entry)
+            EntrySourceMetadataRow(
+                entry = entry,
+                showUnreadDot = true,
+                trailingMetaText =
+                    "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+                trailingMetaFontSize = 10.5.sp,
+            )
             Text(
                 text = entry.title,
                 color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
@@ -969,42 +1032,6 @@ private fun HomeInboxPreviewRow(
         if (entry.showsThumbnailPreview) {
             EntryThumbnailPreview(entry = entry)
         }
-    }
-}
-
-@Composable
-private fun HomeInboxPreviewMetaRow(entry: InboxEntry) {
-    val colors = LocalRocheColors.current
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (entry.isUnread) {
-            Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(colors.accentBlue))
-        }
-        SiteFaviconBadge(
-            primaryFaviconUrl = entry.faviconUrl,
-            fallbackFaviconUrl = entry.fallbackFaviconUrl,
-            domain = entry.displayDomain,
-            title = entry.feedTitle,
-            size = 14.dp,
-        )
-        Text(
-            text = entry.feedTitle,
-            color = colors.textSecondary,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false),
-        )
-        Text(
-            text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.5.sp,
-            maxLines = 1,
-        )
     }
 }
 
@@ -1042,9 +1069,10 @@ internal fun buildHomeSpotlightEntries(
         state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(HashSet()) {
             it.entry.id
         },
+    activePlayerEntry: InboxEntry? = null,
 ): List<InboxEntry> {
     val picked = LinkedHashMap<String, InboxEntry>()
-    state.activePlayerEntry?.let { picked[it.id] = it }
+    activePlayerEntry?.let { picked[it.id] = it }
     appendSpotlightSlice(picked, state.queueEntries)
     if (wantToReadIds.isNotEmpty()) {
         appendSpotlightSlice(picked, state.allEntries) { it.id in wantToReadIds }
@@ -1104,7 +1132,12 @@ internal fun HomeSpotlightRow(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            HomeSpotlightSourceHeader(entry = entry, badge = badge)
+            EntrySourceMetadataRow(
+                entry = entry,
+                faviconSize = 15.dp,
+                feedLabelFontSize = 11.5.sp,
+                trailingBadge = badge,
+            )
             Text(
                 text = entry.title,
                 color = colors.textPrimary,
@@ -1119,48 +1152,6 @@ internal fun HomeSpotlightRow(
         if (entry.showsThumbnailPreview) {
             EntryThumbnailPreview(entry = entry)
         }
-    }
-}
-
-@Composable
-internal fun HomeSpotlightSourceHeader(
-    entry: InboxEntry,
-    badge: String,
-) {
-    val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Row(
-            modifier = Modifier.weight(1f).padding(end = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            SiteFaviconBadge(
-                primaryFaviconUrl = entry.faviconUrl,
-                fallbackFaviconUrl = entry.fallbackFaviconUrl,
-                domain = entry.displayDomain,
-                title = entry.feedTitle,
-                size = 15.dp,
-            )
-            Text(
-                text = entry.feedTitle,
-                color = colors.textSecondary,
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        Text(
-            text = badge,
-            color = colors.accentVerdigris,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.SemiBold,
-        )
     }
 }
 

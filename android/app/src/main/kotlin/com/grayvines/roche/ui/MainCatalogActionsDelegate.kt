@@ -5,15 +5,14 @@ import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 @Suppress("TooManyFunctions")
-internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
+internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
     private val catalogActionMutex = Mutex()
 
-    internal suspend fun execute(action: MainAction.Mutation) = catalogActionMutex.withLock {
+    internal suspend fun execute(action: MainAction.CatalogMutation) = catalogActionMutex.withLock {
         when (action) {
             is MainAction.SetCollectionGeneratorEnabled ->
                 performToggleGenerator(action.collectionIdOrSlug, action.enabled)
@@ -32,7 +31,6 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 performCompleteWantEntry(action.entryId, action.rankImmediately)
             is MainAction.RemoveWantEntry ->
                 performRemoveWantEntry(action.collectionId, action.entryId)
-            else -> Unit
         }
     }
 
@@ -40,10 +38,10 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         collectionIdOrSlug: String,
         enabled: Boolean,
     ) {
-        val meta = vm.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
         val title = meta?.title ?: "List"
         runSuspendCatching {
-            vm.repository.catalog.setCollectionGeneratorEnabled(collectionIdOrSlug, enabled)
+            host.repository.catalog.setCollectionGeneratorEnabled(collectionIdOrSlug, enabled)
         }
             .onSuccess { drawn ->
                 val message =
@@ -52,10 +50,10 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                         drawn != null -> "$title draw active · ${drawn.title}"
                         else -> "$title pool complete"
                     }
-                vm.showStatusMessage(message)
+                host.showStatusMessage(message)
             }
             .onFailure { err ->
-                vm.showStatusMessage("Draw error (${err.message ?: "error"})")
+                host.showStatusMessage("Draw error (${err.message ?: "error"})")
             }
     }
 
@@ -63,8 +61,8 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         collectionId: String,
         notes: String,
     ) {
-        vm.transientState.update { it.copy(drawNoteDialog = null) }
-        runSuspendCatching { vm.repository.catalog.finishActiveDraw(collectionId, notes) }
+        host.updateTransient { it.copy(drawNoteDialog = null) }
+        runSuspendCatching { host.repository.catalog.finishActiveDraw(collectionId, notes) }
             .onSuccess { step ->
                 val openedInList =
                     openRankSessionForCollection(
@@ -73,17 +71,17 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                     )
                 val openedRank =
                     openedInList ||
-                        vm.repository.catalog.resolveEntrySystemListSlug(step.entryId)?.let { slug
+                        host.repository.catalog.resolveEntrySystemListSlug(step.entryId)?.let { slug
                             ->
                             openRankSessionForCollection(slug, step.entryId)
                         } == true
                 if (!openedRank) {
                     val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
-                    vm.showStatusMessage("Logged to Diary$nextPart")
+                    host.showStatusMessage("Logged to Diary$nextPart")
                 }
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not finish draw (${err.message ?: "error"})")
+                host.showStatusMessage("Could not finish draw (${err.message ?: "error"})")
             }
     }
 
@@ -91,14 +89,14 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         collectionId: String,
         notes: String,
     ) {
-        vm.transientState.update { it.copy(drawNoteDialog = null) }
-        runSuspendCatching { vm.repository.catalog.abandonActiveDraw(collectionId, notes) }
+        host.updateTransient { it.copy(drawNoteDialog = null) }
+        runSuspendCatching { host.repository.catalog.abandonActiveDraw(collectionId, notes) }
             .onSuccess { step ->
                 val nextPart = step.nextDraw?.let { " · Next: ${it.title}" }.orEmpty()
-                vm.showStatusMessage("Abandoned draw$nextPart")
+                host.showStatusMessage("Abandoned draw$nextPart")
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not abandon draw (${err.message ?: "error"})")
+                host.showStatusMessage("Could not abandon draw (${err.message ?: "error"})")
             }
     }
 
@@ -112,7 +110,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 focusEntryId = focusEntryId,
             )
         if (!opened) {
-            vm.showStatusMessage("Need at least 2 entries in this list to compare")
+            host.showStatusMessage("Need at least 2 entries in this list to compare")
         }
     }
 
@@ -120,11 +118,11 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         collectionIdOrSlug: String,
         focusEntryId: String?,
     ): Boolean {
-        val rankMeta = vm.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
+        val rankMeta = host.repository.catalog.resolveCollectionRankMeta(collectionIdOrSlug)
         val title = rankMeta?.title ?: "Rankings"
         val scopeId = rankMeta?.scopeCollectionId
         val cluster =
-            vm.repository.catalog.selectNextRankCluster(
+            host.repository.catalog.selectNextRankCluster(
                 collectionIdOrSlug = collectionIdOrSlug,
                 focusEntryId = focusEntryId,
                 roundIndex = 0,
@@ -144,7 +142,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 val settlement =
                     focusEntryId
                         ?.let {
-                            vm.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug)
+                            host.repository.catalog.resolveEntrySettlement(it, collectionIdOrSlug)
                         }
                         ?.takeIf { it.totalCount >= MIN_RANKABLE_COLLECTION_COUNT }
                 settlement?.let {
@@ -160,21 +158,21 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 }
             }
         if (nextSession != null) {
-            vm.transientState.update { it.copy(rankSession = nextSession) }
+            host.updateTransient { it.copy(rankSession = nextSession) }
         }
         return nextSession != null
     }
 
     private suspend fun performSubmitRankCluster(ordering: List<List<String>>) {
-        val session = vm.transientState.value.rankSession ?: return
+        val session = host.currentTransientState().rankSession ?: return
         runSuspendCatching {
-            vm.repository.catalog.recordComparison(
+            host.repository.catalog.recordComparison(
                 ordering = ordering,
                 scopeCollectionId = session.scopeCollectionId,
             )
         }
             .onFailure { err ->
-                vm.showStatusMessage("Invalid ordering (${err.message ?: "error"})")
+                host.showStatusMessage("Invalid ordering (${err.message ?: "error"})")
                 return
             }
         val judgedSet = session.cluster.map { it.entryId }.toSet()
@@ -185,7 +183,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performSkipRankCluster() {
-        val session = vm.transientState.value.rankSession ?: return
+        val session = host.currentTransientState().rankSession ?: return
         advanceRankSession(session = session, forceRandomNext = true)
     }
 
@@ -196,7 +194,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         val nextRound = session.roundIndex + 1
         val nextCluster = selectDeduplicatedNextCluster(session, nextRound, forceRandomNext)
         if (nextCluster.isNotEmpty()) {
-            vm.transientState.update {
+            host.updateTransient {
                 it.copy(
                     rankSession =
                         session.copy(
@@ -210,10 +208,10 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         }
         val settlement =
             session.focusEntryId?.let {
-                vm.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
+                host.repository.catalog.resolveEntrySettlement(it, session.collectionIdOrSlug)
             }
         if (settlement != null) {
-            vm.transientState.update {
+            host.updateTransient {
                 it.copy(
                     rankSession =
                         session.copy(
@@ -224,8 +222,8 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 )
             }
         } else {
-            vm.transientState.update { it.copy(rankSession = null) }
-            vm.showStatusMessage("Rankings settled for ${session.collectionTitle}")
+            host.updateTransient { it.copy(rankSession = null) }
+            host.showStatusMessage("Rankings settled for ${session.collectionTitle}")
         }
     }
 
@@ -238,7 +236,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
             return emptyList()
         }
         val candidate =
-            vm.repository.catalog.selectNextRankCluster(
+            host.repository.catalog.selectNextRankCluster(
                 collectionIdOrSlug = session.collectionIdOrSlug,
                 focusEntryId = session.focusEntryId,
                 roundIndex = nextRound,
@@ -248,7 +246,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
             return candidate
         }
         return if (session.focusEntryId == null) {
-            vm.repository.catalog
+            host.repository.catalog
                 .selectNextRankCluster(
                     collectionIdOrSlug = session.collectionIdOrSlug,
                     focusEntryId = null,
@@ -274,28 +272,30 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         entryId: String,
         rankImmediately: Boolean,
     ) {
-        val resolvedId = vm.repository.markFeedItemFinished(entryId)
-        vm.cleanupRemovedEntries(setOf(entryId))
+        val resolvedId = host.repository.markFeedItemFinished(entryId)
+        host.cleanupRemovedEntries(setOf(entryId))
         if (resolvedId == null) {
-            vm.showStatusMessage("Entry not found")
+            host.showStatusMessage("Entry not found")
             return
         }
         if (rankImmediately) {
-            val pair = vm.repository.prepareFeedItemForRank(entryId)
+            val pair = host.repository.prepareFeedItemForRank(entryId)
             val slug = (pair?.second ?: EntryKind.ARTICLE).systemListSlug
             val opened = openRankSessionForCollection(slug, resolvedId)
             if (!opened) {
-                vm.showStatusMessage("Logged to Diary (rank #1 — log at least 2 items to compare)")
+                host.showStatusMessage(
+                    "Logged to Diary (rank #1 — log at least 2 items to compare)"
+                )
             }
         } else {
-            vm.showStatusMessage("Marked finished & logged to Diary")
+            host.showStatusMessage("Marked finished & logged to Diary")
         }
     }
 
     private suspend fun performSubmitQuickLog(action: MainAction.SubmitQuickLog) {
         val cleanTitle = action.title.trim()
         if (cleanTitle.isEmpty()) {
-            vm.showStatusMessage("Enter a title")
+            host.showStatusMessage("Enter a title")
             return
         }
         val targetListId = action.targetCollectionId?.trim()?.takeIf { it.isNotEmpty() }
@@ -304,7 +304,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                 handleQuickLogSaved(action, cleanTitle, targetListId, entryId)
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not save (${err.message ?: "error"})")
+                host.showStatusMessage("Could not save (${err.message ?: "error"})")
             }
     }
 
@@ -323,12 +323,12 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
             )
         val savedId =
             when {
-                action.addToListOnly -> vm.repository.catalog.upsertEntry(input)
-                action.addToWant -> vm.repository.catalog.wantEntry(input)
-                else -> vm.repository.catalog.logEntry(input, action.status, action.notes)
+                action.addToListOnly -> host.repository.catalog.upsertEntry(input)
+                action.addToWant -> host.repository.catalog.wantEntry(input)
+                else -> host.repository.catalog.logEntry(input, action.status, action.notes)
             }
         if (targetListId != null) {
-            vm.repository.catalog.addCollectionEntry(targetListId, savedId)
+            host.repository.catalog.addCollectionEntry(targetListId, savedId)
         }
         return savedId
     }
@@ -339,8 +339,8 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         targetListId: String?,
         entryId: String,
     ) {
-        val listLabel = vm.transientState.value.quickLogTargetCollectionTitle
-        vm.transientState.update {
+        val listLabel = host.currentTransientState().quickLogTargetCollectionTitle
+        host.updateTransient {
             it.copy(
                 isQuickLogSheetOpen = false,
                 quickLogTargetCollectionId = null,
@@ -351,7 +351,7 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
         if (!action.addToWant && !action.addToListOnly && action.rankAfterLog) {
             val rankTarget = targetListId ?: action.kind.systemListSlug
             if (!openRankSessionForCollection(rankTarget, entryId)) {
-                vm.showStatusMessage(
+                host.showStatusMessage(
                     "Logged \"$cleanTitle\" (rank #1 — log at least 2 items to compare)"
                 )
             }
@@ -363,63 +363,63 @@ internal class MainCatalogActionsDelegate(private val vm: MainViewModel) {
                     action.addToWant -> "Added to Want Queue"
                     else -> "Logged to Diary"
                 }
-            vm.showStatusMessage("$verb · $cleanTitle")
+            host.showStatusMessage("$verb · $cleanTitle")
         }
     }
 
     private suspend fun performCreateCustomList(rawTitle: String) {
-        runSuspendCatching { vm.repository.catalog.createCustomList(rawTitle) }
+        runSuspendCatching { host.repository.catalog.createCustomList(rawTitle) }
             .onSuccess { specId ->
-                vm.transientState.update {
+                host.updateTransient {
                     it.copy(
                         companionSubTab = CompanionSubTab.LISTS,
                         selectedCatalogCollectionId = specId,
                     )
                 }
-                vm.showStatusMessage("Created list \"${rawTitle.trim()}\"")
+                host.showStatusMessage("Created list \"${rawTitle.trim()}\"")
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not create list (${err.message ?: "error"})")
+                host.showStatusMessage("Could not create list (${err.message ?: "error"})")
             }
     }
 
     private suspend fun performCompleteWantEntry(entryId: String, rankImmediately: Boolean) {
         runSuspendCatching {
-            vm.repository.catalog.logExistingEntry(entryId, ConsumptionStatus.CONSUMED, null)
+            host.repository.catalog.logExistingEntry(entryId, ConsumptionStatus.CONSUMED, null)
         }
             .onSuccess { resolvedId ->
                 val targetId = resolvedId ?: entryId
-                val listSlug = vm.repository.catalog.resolveEntrySystemListSlug(targetId)
+                val listSlug = host.repository.catalog.resolveEntrySystemListSlug(targetId)
                 if (rankImmediately && listSlug != null) {
                     val opened = openRankSessionForCollection(listSlug, targetId)
                     if (!opened) {
-                        vm.showStatusMessage(
+                        host.showStatusMessage(
                             "Completed & logged to Diary (rank #1 — log at least 2 items to compare)"
                         )
                     }
                 } else {
-                    vm.showStatusMessage("Completed & logged to Diary")
+                    host.showStatusMessage("Completed & logged to Diary")
                 }
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not complete item (${err.message ?: "error"})")
+                host.showStatusMessage("Could not complete item (${err.message ?: "error"})")
             }
     }
 
     private suspend fun performRemoveWantEntry(collectionId: String, entryId: String) {
-        val meta = vm.repository.catalog.resolveCollectionRankMeta(collectionId)
+        val meta = host.repository.catalog.resolveCollectionRankMeta(collectionId)
         val label = if (meta?.scopeCollectionId != null) "Want Queue" else meta?.title ?: "list"
         runSuspendCatching {
-            vm.repository.catalog.removeCollectionEntry(collectionId, entryId)
+            host.repository.catalog.removeCollectionEntry(collectionId, entryId)
         }
             .onSuccess {
-                vm.transientState.update { cur ->
+                host.updateTransient { cur ->
                     cur.copy(optimisticFavorites = cur.optimisticFavorites - entryId)
                 }
-                vm.showStatusMessage("Removed from $label")
+                host.showStatusMessage("Removed from $label")
             }
             .onFailure { err ->
-                vm.showStatusMessage("Could not remove (${err.message ?: "error"})")
+                host.showStatusMessage("Could not remove (${err.message ?: "error"})")
             }
     }
 

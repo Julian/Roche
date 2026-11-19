@@ -27,6 +27,7 @@ import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
+import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -44,6 +45,7 @@ class MainActivity : ComponentActivity() {
             settings = graph.settings,
             mediaSessionBridge = graph.mediaSessionBridge,
             sharedPlayerController = graph.playerController,
+            sharedPlaybackOrchestrator = graph.playbackOrchestrator,
         )
     }
 
@@ -94,6 +96,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     MainScreen(
                         state = state,
+                        playerStateFlow = viewModel.playerState,
                         onAction = viewModel::dispatch,
                         onShareEntry = ::shareEntryViaSystemSheet,
                         onOpenExternalUrl = ::openUrlInBrowser,
@@ -148,36 +151,59 @@ class MainActivity : ComponentActivity() {
             openMusicCollectionDraw(draw)
             return
         }
-        val inInbox = viewModel.uiState.value.allEntries.any { it.id == draw.entryId }
-        val extUrl = draw.primaryExternalUrl
-        when {
-            inInbox -> viewModel.dispatch(MainAction.OpenReader(draw.entryId))
-            !extUrl.isNullOrBlank() -> openUrlInBrowser(extUrl)
-            draw.collectionId.isNotBlank() ->
-                viewModel.dispatch(
-                    MainAction.OpenCompanionSection(CompanionSubTab.LISTS, draw.collectionId)
-                )
-        }
+        val readableIds = viewModel.uiState.value.allEntries.mapTo(HashSet()) { it.id }
+        val fallback: (() -> Unit)? =
+            draw.collectionId
+                .takeIf { it.isNotBlank() }
+                ?.let { colId ->
+                    {
+                        viewModel.dispatch(
+                            MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId)
+                        )
+                    }
+                }
+        resolveCatalogEntryOpenAction(
+                entryId = draw.entryId,
+                externalUrl = draw.primaryExternalUrl,
+                readableIds = readableIds,
+                onOpenReader = { entryId -> viewModel.dispatch(MainAction.OpenReader(entryId)) },
+                onOpenExternalUrl = ::openUrlInBrowser,
+                onFallback = fallback,
+            )
+            ?.invoke()
     }
 
     private fun openMusicCollectionDraw(draw: CollectionDrawSnapshot) {
-        if (!needsYoutubeAlbumBrowseUpgrade(this, draw) && tryOpenDirectAlbumNow(this, draw)) {
-            return
-        }
-        if (!hasInstalledMusicApp(this)) {
-            openAlbumInMusicApp(this, draw, ::openUrlInBrowser)
-            return
-        }
-        val repo = (application as RocheApp).graph.repository
         musicDrawResolveJob?.cancel()
         musicDrawResolveJob = lifecycleScope.launch {
-            val enriched =
-                withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
-                    repo.resolveCollectionDrawStreaming(draw)
-                } ?: draw
-            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
+            when (val plan = resolveInitialAlbumLaunchPlan(this@MainActivity, draw)) {
+                is InitialAlbumLaunchPlan.LaunchDirect -> {
+                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                        launchStreamingResolution(this@MainActivity, draw, plan.resolution)
+                    }
+                }
+                InitialAlbumLaunchPlan.FallbackSearchOrBrowser -> {
+                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                        launchAlbumSearchOrFallback(this@MainActivity, draw, ::openUrlInBrowser)
+                    }
+                }
+                InitialAlbumLaunchPlan.NeedsEnrichment -> {
+                    enrichAndLaunchAlbum(draw)
+                }
             }
+        }
+    }
+
+    private suspend fun enrichAndLaunchAlbum(draw: CollectionDrawSnapshot) {
+        val repo = (application as RocheApp).graph.repository
+        val enriched =
+            withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
+                repo.resolveCollectionDrawStreaming(draw)
+            } ?: draw
+        val resolution = resolveEnrichedAlbumLaunch(this@MainActivity, enriched)
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return
+        if (!launchStreamingResolution(this@MainActivity, enriched, resolution)) {
+            launchAlbumSearchOrFallback(this@MainActivity, enriched, ::openUrlInBrowser)
         }
     }
 

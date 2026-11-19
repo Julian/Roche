@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -25,10 +24,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -37,10 +34,10 @@ import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.ui.components.FilterChipPill
-import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.SettingToggleRow
+import com.grayvines.roche.ui.components.SheetActionFooter
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -101,7 +98,7 @@ private fun DrawNoteSheetHeader(
     Text(
         text = if (isAbandon) "Abandon Draw" else "Finish & Rank",
         color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
+        fontFamily = currentHeadlineFontFamily(),
         fontSize = 19.sp,
         fontWeight = FontWeight.SemiBold,
     )
@@ -136,34 +133,21 @@ private fun DrawNoteSheetFooter(
     canConfirm: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        HeaderActionButton(
-            label = "Cancel",
-            onClick = { onAction(MainAction.CloseDrawNoteDialog) },
-        )
-        Spacer(modifier = Modifier.size(8.dp))
-        HeaderActionButton(
-            label = if (isAbandon) "Abandon & Draw Next" else "Finish & Rank",
-            style = RocheButtonStyle.PRIMARY,
-            enabled = canConfirm,
-            onClick = {
-                if (canConfirm) {
-                    val action =
-                        if (isAbandon) {
-                            MainAction.ConfirmAbandonDraw(collectionId, notes)
-                        } else {
-                            MainAction.ConfirmFinishDraw(collectionId, notes)
-                        }
-                    onAction(action)
+    SheetActionFooter(
+        confirmLabel = if (isAbandon) "Abandon & Draw Next" else "Finish & Rank",
+        confirmEnabled = canConfirm,
+        confirmTestTag = "draw_confirm_action_btn",
+        onCancel = { onAction(MainAction.CloseDrawNoteDialog) },
+        onConfirm = {
+            val action =
+                if (isAbandon) {
+                    MainAction.ConfirmAbandonDraw(collectionId, notes)
+                } else {
+                    MainAction.ConfirmFinishDraw(collectionId, notes)
                 }
-            },
-            modifier = Modifier.testTag("draw_confirm_action_btn"),
-        )
-    }
+            onAction(action)
+        },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -277,15 +261,12 @@ private fun QuickLogSheetBody(
                 else -> "Save Log"
             }
         val canSubmit = title.isNotBlank()
-        QuickLogFooterRow(
-            submitLabel = submitLabel,
-            canSubmit = canSubmit,
+        SheetActionFooter(
+            confirmLabel = submitLabel,
+            confirmEnabled = canSubmit,
+            confirmTestTag = "quick_log_submit_btn",
             onCancel = { onAction(MainAction.CloseQuickLogSheet) },
-            onSubmit = {
-                if (canSubmit) {
-                    onAction(submitAction)
-                }
-            },
+            onConfirm = { onAction(submitAction) },
         )
         Spacer(modifier = Modifier.height(14.dp))
     }
@@ -344,7 +325,7 @@ private fun QuickLogSelectorsSection(
     Text(
         text = heading,
         color = colors.textPrimary,
-        fontFamily = FontFamily.Serif,
+        fontFamily = currentHeadlineFontFamily(),
         fontSize = 19.sp,
         fontWeight = FontWeight.SemiBold,
     )
@@ -486,29 +467,6 @@ private fun QuickLogDiaryOptions(
             subtitle = "Compare against entries in $rankTargetTitle",
             checked = rankAfterLog,
             onCheckedChange = onRankToggle,
-        )
-    }
-}
-
-@Composable
-private fun QuickLogFooterRow(
-    submitLabel: String,
-    canSubmit: Boolean,
-    onCancel: () -> Unit,
-    onSubmit: () -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End,
-    ) {
-        HeaderActionButton(label = "Cancel", onClick = onCancel)
-        Spacer(modifier = Modifier.size(8.dp))
-        HeaderActionButton(
-            label = submitLabel,
-            style = RocheButtonStyle.PRIMARY,
-            enabled = canSubmit,
-            onClick = onSubmit,
-            modifier = Modifier.testTag("quick_log_submit_btn"),
         )
     }
 }

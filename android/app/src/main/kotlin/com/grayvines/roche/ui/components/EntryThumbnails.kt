@@ -261,30 +261,12 @@ fun EntryThumbnailPreview(entry: InboxEntry, modifier: Modifier = Modifier) {
 @Composable
 private fun PodcastEpisodeThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(10.dp)
-    val bitmap =
-        rememberEntryThumbnailBitmap(
-            primaryKey = entry.thumbnailMediaId,
-            fallbackKey = entry.effectiveThumbnailUrl ?: entry.faviconUrl,
-        )
-    Box(
-        modifier =
-            modifier
-                .size(56.dp)
-                .clip(shape)
-                .background(Color(0xFF1A242D))
-                .border(width = 1.dp, color = colors.border, shape = shape)
+    PodcastArtworkBox(
+        entry = entry,
+        size = 56.dp,
+        cornerRadius = 10.dp,
+        modifier = modifier,
     ) {
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            Canvas(modifier = Modifier.matchParentSize()) { drawPodcastArtworkCanvas(colors) }
-        }
         Box(
             contentAlignment = Alignment.Center,
             modifier =

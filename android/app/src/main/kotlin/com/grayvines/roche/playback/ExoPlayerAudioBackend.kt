@@ -27,9 +27,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal fun isSafeAudioPlaybackSource(
     source: String,
@@ -148,7 +148,6 @@ internal constructor(
     internal var activeOnCompletion: (() -> Unit)? = null
     internal var activeOnError: (() -> Unit)? = null
     internal var latestMetadata: MediaMetadata = MediaMetadata.EMPTY
-    private var positionSyncJob: Job? = null
 
     @Volatile internal var cachedPositionMs: Long = 0L
     @Volatile internal var cachedDurationMs: Long = DEFAULT_FALLBACK_DURATION_MS
@@ -182,18 +181,8 @@ internal constructor(
                 notifyExternalPlayState(player)
             }
 
-            override fun onIsPlayingChanged(isPlaying: Boolean) {
-                val player = exoPlayer ?: return
-                syncVolatileStateFromPlayer(player)
-                stopPositionSync()
-                if (isPlaying) {
-                    startPositionSync()
-                }
-            }
-
             override fun onPlayerError(error: PlaybackException) {
                 cachedIsPlaying = false
-                stopPositionSync()
                 val callback = activeOnError
                 clearActiveCallbacks()
                 callback?.invoke()
@@ -238,28 +227,11 @@ internal constructor(
         return previous
     }
 
-    internal fun startPositionSync() {
-        positionSyncJob?.cancel()
-        positionSyncJob =
-            activeBackendScope().launch {
-                var keepPolling = true
-                while (isActive && keepPolling) {
-                    delay(POSITION_POLL_INTERVAL_MS)
-                    val player = exoPlayer
-                    if (player == null) {
-                        keepPolling = false
-                    } else {
-                        syncVolatileStateFromPlayer(player)
-                        keepPolling = player.isPlaying
-                    }
-                }
-            }
-    }
-
-    internal fun stopPositionSync() {
-        positionSyncJob?.cancel()
-        positionSyncJob = null
-    }
+    override suspend fun syncPositionFromPlayer(): Long =
+        withContext(mainDispatcher) {
+            exoPlayer?.let { player -> syncVolatileStateFromPlayer(player) }
+            cachedPositionMs
+        }
 
     override fun bindExternalPlayStateListener(listener: ((Boolean) -> Unit)?) {
         externalPlayStateListener = listener
@@ -410,7 +382,6 @@ internal constructor(
 
     internal fun handlePlayerEnded() {
         cachedIsPlaying = false
-        stopPositionSync()
         val completion = activeOnCompletion
         clearActiveCallbacks()
         completion?.invoke()
@@ -485,7 +456,6 @@ internal constructor(
         scopeToCancel.launch {
             if (loadGeneration.get() == generationAtRelease) {
                 cachedIsPlaying = false
-                stopPositionSync()
                 clearActiveCallbacks()
                 activeLoadId = 0L
                 notifiedReadyLoadId = -1L
@@ -507,7 +477,6 @@ internal constructor(
         val dispatchScope =
             scopeToCancel.takeIf { it.isActive } ?: CoroutineScope(SupervisorJob() + mainDispatcher)
         dispatchScope.launch {
-            stopPositionSync()
             clearActiveCallbacks()
             exoPlayer?.let { player ->
                 player.removeListener(playerListener)
@@ -593,7 +562,6 @@ internal constructor(
     internal companion object {
         internal const val SEEK_BACK_INCREMENT_MS = 15_000L
         internal const val SEEK_FORWARD_INCREMENT_MS = 30_000L
-        internal const val POSITION_POLL_INTERVAL_MS = 250L
         internal const val MIN_SPEED = 0.50f
         internal const val MAX_SPEED = 3.50f
     }

@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.collection.LruCache
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -30,7 +29,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -60,6 +58,7 @@ import com.grayvines.roche.reader.parseHtmlArticleBlocks
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.StarIcon
@@ -69,7 +68,6 @@ import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.roundToInt
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -79,7 +77,14 @@ internal data class ParsedArticleBlocksState(
     val isParsing: Boolean,
 )
 
+private data class CachedIdentityBlocks(
+    val rawHtml: String,
+    val baseUrl: String?,
+    val blocks: List<ArticleBlock>,
+)
+
 private val parsedArticleBlocksCache = LruCache<String, List<ArticleBlock>>(MAX_CACHED_PARSED_DOCS)
+private val recentIdentityBlocksCache = LruCache<Int, CachedIdentityBlocks>(MAX_CACHED_PARSED_DOCS)
 
 private fun articleBlocksCacheKey(cleanHtml: String, baseUrl: String?): String {
     val digest = MessageDigest.getInstance("SHA-256")
@@ -89,34 +94,67 @@ private fun articleBlocksCacheKey(cleanHtml: String, baseUrl: String?): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
+private fun lookupIdentityCachedBlocks(
+    cleanHtml: String,
+    baseUrl: String?,
+): List<ArticleBlock>? {
+    val identityKey = System.identityHashCode(cleanHtml)
+    return synchronized(recentIdentityBlocksCache) {
+        recentIdentityBlocksCache[identityKey]
+            ?.takeIf { it.rawHtml === cleanHtml && it.baseUrl == baseUrl }
+            ?.blocks
+    }
+}
+
+private fun cacheIdentityBlocks(
+    cleanHtml: String,
+    baseUrl: String?,
+    blocks: List<ArticleBlock>,
+) {
+    val identityKey = System.identityHashCode(cleanHtml)
+    synchronized(recentIdentityBlocksCache) {
+        recentIdentityBlocksCache.put(
+            identityKey,
+            CachedIdentityBlocks(rawHtml = cleanHtml, baseUrl = baseUrl, blocks = blocks),
+        )
+    }
+}
+
+private suspend fun loadOrParseArticleBlocks(
+    cleanHtml: String,
+    baseUrl: String?,
+): List<ArticleBlock> =
+    withContext(Dispatchers.Default) {
+        val shaKey = articleBlocksCacheKey(cleanHtml, baseUrl)
+        val cached = synchronized(parsedArticleBlocksCache) { parsedArticleBlocksCache[shaKey] }
+        if (cached != null) {
+            cached
+        } else {
+            val parsed = parseHtmlArticleBlocks(rawHtml = cleanHtml, baseUrl = baseUrl)
+            synchronized(parsedArticleBlocksCache) { parsedArticleBlocksCache.put(shaKey, parsed) }
+            parsed
+        }
+    }
+
 @Composable
 internal fun rememberParsedArticleBlocks(
     htmlBody: String?,
     baseUrl: String?,
 ): ParsedArticleBlocksState {
     val cleanHtml = htmlBody?.takeIf { it.isNotBlank() }
-    val cacheKey =
-        remember(cleanHtml, baseUrl) {
-            if (cleanHtml == null) "" else articleBlocksCacheKey(cleanHtml, baseUrl)
-        }
     val initialState =
-        remember(cacheKey) {
+        remember(cleanHtml, baseUrl) {
             resolveInitialParsedBlocks(
-                cacheKey = cacheKey,
                 cleanHtml = cleanHtml,
+                baseUrl = baseUrl,
             )
         }
     val state by
-        produceState(initialValue = initialState, cacheKey) {
+        produceState(initialValue = initialState, cleanHtml, baseUrl) {
             value = initialState
             if (initialState.isParsing && cleanHtml != null) {
-                val parsed =
-                    withContext(Dispatchers.Default) {
-                        parseHtmlArticleBlocks(rawHtml = cleanHtml, baseUrl = baseUrl)
-                    }
-                synchronized(parsedArticleBlocksCache) {
-                    parsedArticleBlocksCache.put(cacheKey, parsed)
-                }
+                val parsed = loadOrParseArticleBlocks(cleanHtml, baseUrl)
+                cacheIdentityBlocks(cleanHtml, baseUrl, parsed)
                 value = ParsedArticleBlocksState(parsed, isParsing = false)
             }
         }
@@ -124,11 +162,11 @@ internal fun rememberParsedArticleBlocks(
 }
 
 private fun resolveInitialParsedBlocks(
-    cacheKey: String,
     cleanHtml: String?,
+    baseUrl: String?,
 ): ParsedArticleBlocksState {
     if (cleanHtml == null) return ParsedArticleBlocksState(emptyList(), isParsing = false)
-    val cached = synchronized(parsedArticleBlocksCache) { parsedArticleBlocksCache[cacheKey] }
+    val cached = lookupIdentityCachedBlocks(cleanHtml, baseUrl)
     return if (cached != null) {
         ParsedArticleBlocksState(cached, isParsing = false)
     } else {
@@ -206,38 +244,23 @@ internal fun ReaderTypographySection(
     listState: LazyListState,
     onAction: (MainAction) -> Unit,
 ) {
-    var backProgress by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(visible) {
-        if (!visible) {
-            backProgress = 0f
-        }
-    }
-    PredictiveBackHandler(enabled = visible) { progress ->
-        try {
-            progress.collect { backEvent -> backProgress = backEvent.progress }
-            backProgress = 0f
-            onDismiss()
-        } catch (cancelled: CancellationException) {
-            backProgress = 0f
-            throw cancelled
-        }
-    }
-    if (!visible) return
-    val coroutineScope = rememberCoroutineScope()
-    val headingBlockIndices = remember(blocks) { orderedHeadingBlockIndices(blocks) }
-    ReaderTypographyDrawer(
-        blocks = blocks,
-        settings = settings,
-        onAction = onAction,
-        modifier = Modifier.predictiveBackDrawerGraphics(backProgress),
-        onJumpToSection = { headingIndex ->
-            headingBlockIndices.getOrNull(headingIndex)?.let { blockIdx ->
-                coroutineScope.launch {
-                    listState.animateScrollToItem(HEADER_ITEM_COUNT + blockIdx)
+    PredictiveBackDrawerContainer(visible = visible, onDismiss = onDismiss) { drawerModifier ->
+        val coroutineScope = rememberCoroutineScope()
+        val headingBlockIndices = remember(blocks) { orderedHeadingBlockIndices(blocks) }
+        ReaderTypographyDrawer(
+            blocks = blocks,
+            settings = settings,
+            onAction = onAction,
+            modifier = drawerModifier,
+            onJumpToSection = { headingIndex ->
+                headingBlockIndices.getOrNull(headingIndex)?.let { blockIdx ->
+                    coroutineScope.launch {
+                        listState.animateScrollToItem(HEADER_ITEM_COUNT + blockIdx)
+                    }
                 }
-            }
-        },
-    )
+            },
+        )
+    }
 }
 
 @Composable

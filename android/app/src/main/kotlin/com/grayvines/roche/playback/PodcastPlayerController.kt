@@ -91,9 +91,6 @@ data class PodcastPlayerState(
     val skipSilenceEnabled: Boolean = false,
     val smartRewindEnabled: Boolean = true,
     val sleepTimerRemainingSec: Int? = null,
-    val isFullscreenOpen: Boolean = false,
-    val isSpeedSheetOpen: Boolean = false,
-    val activeDrawerTab: PlayerDrawerTab? = null,
     val chapters: List<PodcastChapter> = emptyList(),
 ) {
     val hasActiveEpisode: Boolean
@@ -150,15 +147,6 @@ data class PodcastPlayerState(
             }
         }
 
-    val elapsedFormatted: String
-        get() = formattedElapsed
-
-    val remainingFormatted: String
-        get() = formattedRemaining
-
-    val speedAdjustedRemainingLabel: String
-        get() = formattedMiniRemaining
-
     val sleepTimerRemainingMinutes: Int?
         get() = sleepTimerRemainingSec?.let { ((it + 59) / 60).coerceAtLeast(1) }
 }
@@ -190,6 +178,8 @@ interface AudioPlayerBackend {
 
     fun bindExternalPlayStateListener(listener: ((Boolean) -> Unit)?) = Unit
 
+    suspend fun syncPositionFromPlayer(): Long = currentPositionMs()
+
     fun currentPositionMs(): Long
 
     fun durationMs(): Long
@@ -210,9 +200,14 @@ class PodcastPlayerController(
         { entryId, progress, _ ->
             onProgressChanged(entryId, progress)
         },
-    private val onEpisodeCompleted: (entryId: String) -> Unit = {},
-    private val onSkipToNextRequested: () -> Unit = {},
-    private val onSpeedChangedFromSession: (Float) -> Unit = {},
+    private val onEpisodeCompleted: (controller: PodcastPlayerController, entryId: String) -> Unit =
+        { _, _ ->
+        },
+    private val onSkipToNextRequested: (controller: PodcastPlayerController) -> Unit = {},
+    private val onSpeedChangedFromSession:
+        (controller: PodcastPlayerController, speed: Float) -> Unit =
+        { _, _ ->
+        },
     private val onPlaybackError: (String) -> Unit = {},
 ) : PodcastMediaSessionCallbacks {
     private val _state = MutableStateFlow(PodcastPlayerState())
@@ -271,7 +266,6 @@ class PodcastPlayerController(
         sourceUriOrPath: String,
         speed: Float,
         skipSilenceEnabled: Boolean,
-        openFullscreen: Boolean = true,
         hasNextQueuedAudio: Boolean = _state.value.hasNextQueuedAudio,
         smartRewindEnabled: Boolean = _state.value.smartRewindEnabled,
     ) {
@@ -300,8 +294,6 @@ class PodcastPlayerController(
                 playbackSpeed = clampedSpeed,
                 skipSilenceEnabled = skipSilenceEnabled,
                 smartRewindEnabled = smartRewindEnabled,
-                isFullscreenOpen = openFullscreen,
-                activeDrawerTab = null,
                 chapters = parsedChapters,
             )
         }
@@ -369,9 +361,7 @@ class PodcastPlayerController(
                 _state.value.positionMs.coerceIn(0L, safeDurationMs)
             }
         val stillPlaying = _state.value.isPlaying
-        if (stillPlaying) {
-            backend.play()
-        } else {
+        if (!stillPlaying) {
             backend.pause()
         }
         _state.update {
@@ -550,33 +540,6 @@ class PodcastPlayerController(
         _state.update { it.copy(sleepTimerRemainingSec = seconds) }
     }
 
-    fun openFullscreen() {
-        if (_state.value.hasActiveEpisode) {
-            _state.update { it.copy(isFullscreenOpen = true) }
-        }
-    }
-
-    fun closeFullscreen() {
-        _state.update {
-            it.copy(
-                isFullscreenOpen = false,
-                isSpeedSheetOpen = false,
-                activeDrawerTab = null,
-            )
-        }
-    }
-
-    fun setSpeedSheetOpen(open: Boolean) {
-        _state.update { it.copy(isSpeedSheetOpen = open) }
-    }
-
-    fun selectDrawerTab(tab: PlayerDrawerTab?) {
-        _state.update { current ->
-            val next = if (current.activeDrawerTab == tab) null else tab
-            current.copy(activeDrawerTab = next)
-        }
-    }
-
     fun completeActiveEpisodeNow() {
         handleActiveEpisodeFinished()
     }
@@ -625,7 +588,7 @@ class PodcastPlayerController(
             MediaSessionCommand.TOGGLE_PLAY_PAUSE -> togglePlayPause()
             MediaSessionCommand.REWIND_15S -> skipBySeconds(-15)
             MediaSessionCommand.FAST_FORWARD_30S -> skipBySeconds(30)
-            MediaSessionCommand.SKIP_TO_NEXT -> onSkipToNextRequested()
+            MediaSessionCommand.SKIP_TO_NEXT -> onSkipToNextRequested(this)
             MediaSessionCommand.STOP -> stopAndClear()
         }
     }
@@ -636,7 +599,7 @@ class PodcastPlayerController(
 
     override fun onSetPlaybackSpeed(speed: Float) {
         setPlaybackSpeed(speed)
-        onSpeedChangedFromSession(_state.value.playbackSpeed)
+        onSpeedChangedFromSession(this, _state.value.playbackSpeed)
     }
 
     private fun handleActiveEpisodeFinished() {
@@ -654,7 +617,7 @@ class PodcastPlayerController(
                     positionMs = it.durationMs,
                 )
             }
-            onEpisodeCompleted(completedId)
+            onEpisodeCompleted(this, completedId)
         } else {
             backend.release()
             _state.update {
@@ -663,7 +626,7 @@ class PodcastPlayerController(
                     positionMs = it.durationMs,
                 )
             }
-            onEpisodeCompleted(completedId)
+            onEpisodeCompleted(this, completedId)
             if (_state.value.currentEntryId == completedId && !_state.value.isPlaying) {
                 syncMediaSessionBridge()
             }
@@ -716,6 +679,7 @@ class PodcastPlayerController(
             var tickCount = 0
             while (isActive && _state.value.isPlaying) {
                 withContext(Dispatchers.Default) { delay(1_000L) }
+                backend.syncPositionFromPlayer()
                 tickCount++
                 if (!advanceSingleTick(tickCount)) {
                     break

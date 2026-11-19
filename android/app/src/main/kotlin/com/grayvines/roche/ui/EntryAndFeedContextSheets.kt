@@ -3,7 +3,6 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
@@ -44,22 +42,22 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.isLocalPdfUrl
-import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
-import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.playback.formatPlaybackSpeedLabel
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.PodcastSpeedStrip
+import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SiteFaviconBadge
+import com.grayvines.roche.ui.components.TagChipsEditor
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.net.URI
-import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -127,7 +125,7 @@ private fun ContextSheetHeaderAndTags(
             Text(
                 text = entry.title,
                 color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
+                fontFamily = currentHeadlineFontFamily(),
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Medium,
             )
@@ -161,53 +159,16 @@ internal fun ContextSheetTagsEditor(
     allTags: List<String>,
     onAction: (MainAction) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
-    var customTag by rememberSaveable { mutableStateOf("") }
-
-    Text(
-        text = "TAGS (TAP TO TOGGLE)",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 10.sp,
+    TagChipsEditor(
+        headerLabel = "TAGS (TAP TO TOGGLE)",
+        availableTags = allTags,
+        inputPlaceholder = "Add new #tag…",
+        submitButtonLabel = "Add Tag",
+        draftKey = entry.id,
+        isChipSelected = { tag -> entry.tags.any { it.equals(tag, ignoreCase = true) } },
+        onChipClick = { tag -> onAction(MainAction.ToggleTagOnEntry(entry.id, tag)) },
+        onSubmitCustomTag = { tag -> onAction(MainAction.ToggleTagOnEntry(entry.id, tag)) },
     )
-    if (allTags.isNotEmpty()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            allTags.forEach { tag ->
-                val assigned = entry.tags.any { it.equals(tag, ignoreCase = true) }
-                FilterChipPill(
-                    label = "#$tag",
-                    selected = assigned,
-                    onClick = { onAction(MainAction.ToggleTagOnEntry(entry.id, tag)) },
-                )
-            }
-        }
-    }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = customTag,
-            onValueChange = { customTag = it },
-            placeholder = { Text("Add new #tag…", fontSize = 12.sp) },
-            singleLine = true,
-            modifier = Modifier.weight(1f),
-        )
-        HeaderActionButton(
-            label = "Add Tag",
-            onClick = {
-                val clean = normalizeTagName(customTag)
-                if (clean.isNotBlank()) {
-                    onAction(MainAction.ToggleTagOnEntry(entry.id, clean))
-                    customTag = ""
-                }
-            },
-        )
-    }
 }
 
 @Composable
@@ -369,7 +330,7 @@ internal fun FeedContextHeaderRow(feed: FeedItem) {
             Text(
                 text = feed.title,
                 color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
+                fontFamily = currentHeadlineFontFamily(),
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
@@ -445,29 +406,16 @@ internal fun FeedPodcastSettingsSection(
         fontFamily = FontFamily.Monospace,
         fontSize = 10.sp,
     )
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        FilterChipPill(
-            label = "Default",
-            selected = feed.customPlaybackSpeed == null,
-            onClick = { onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = null)) },
-        )
-        PLAYBACK_SPEED_PRESETS.forEach { preset ->
-            val label = formatPlaybackSpeedLabel(preset)
-            val isSelected =
-                feed.customPlaybackSpeed != null &&
-                    abs(feed.customPlaybackSpeed - preset) < SPEED_EPSILON
-            FilterChipPill(
-                label = label,
-                selected = isSelected,
-                onClick = {
-                    onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = preset))
-                },
-            )
-        }
-    }
+    PodcastSpeedStrip(
+        selectedSpeed = feed.customPlaybackSpeed,
+        includeDefaultChip = true,
+        onSelectDefault = {
+            onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = null))
+        },
+        onSelectSpeed = { preset ->
+            onAction(MainAction.SetFeedPlaybackSpeed(feedId = feed.id, speed = preset))
+        },
+    )
     HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
@@ -477,54 +425,22 @@ internal fun FeedBulkTagRow(
     availableTags: List<String>,
     onAction: (MainAction) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
-    var customFeedTag by rememberSaveable(feed.id) { mutableStateOf("") }
-    Text(
-        text = "TAG ACTIVE FEED ITEMS",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 10.sp,
+    TagChipsEditor(
+        headerLabel = "TAG ACTIVE FEED ITEMS",
+        availableTags = availableTags,
+        inputPlaceholder = "Apply #tag to feed items…",
+        submitButtonLabel = "Tag Feed",
+        draftKey = feed.id,
+        chipLabel = { "+ #$it" },
+        onChipClick = { tag ->
+            onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = tag))
+        },
+        onSubmitCustomTag = { tag ->
+            onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = tag))
+        },
+        inputTestTag = "feed_tag_input",
+        submitTestTag = "feed_tag_apply_btn",
     )
-    if (availableTags.isNotEmpty()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            availableTags.forEach { tag ->
-                FilterChipPill(
-                    label = "+ #$tag",
-                    selected = false,
-                    onClick = {
-                        onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = tag))
-                    },
-                )
-            }
-        }
-    }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = customFeedTag,
-            onValueChange = { customFeedTag = it },
-            placeholder = { Text("Apply #tag to feed items…", fontSize = 12.sp) },
-            singleLine = true,
-            modifier = Modifier.weight(1f).testTag("feed_tag_input"),
-        )
-        HeaderActionButton(
-            label = "Tag Feed",
-            onClick = {
-                val clean = normalizeTagName(customFeedTag)
-                if (clean.isNotBlank()) {
-                    onAction(MainAction.ApplyTagToFeed(feedId = feed.id, tagName = clean))
-                    customFeedTag = ""
-                }
-            },
-            modifier = Modifier.testTag("feed_tag_apply_btn"),
-        )
-    }
 }
 
 @Composable
@@ -599,10 +515,9 @@ private fun DestructiveConfirmDialog(
 ) {
     val colors = LocalRocheColors.current
     val confirmModifier = if (confirmTestTag != null) Modifier.testTag(confirmTestTag) else Modifier
-    AlertDialog(
+    RocheAlertDialog(
+        title = title,
         onDismissRequest = onDismiss,
-        containerColor = colors.surfaceElevated,
-        title = { Text(title, color = colors.textPrimary) },
         text = { Text(text = message, color = colors.textSecondary) },
         confirmButton = {
             TextButton(onClick = onConfirm, modifier = confirmModifier) {
@@ -710,7 +625,7 @@ private fun AddSheetFormBody(
         Text(
             text = if (isFeedMode) "Subscribe to Feed" else "Add to Want to Read",
             color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
+            fontFamily = currentHeadlineFontFamily(),
             fontSize = 18.sp,
             fontWeight = FontWeight.Medium,
         )
@@ -790,5 +705,3 @@ private fun isBareHomepageCandidate(rawInput: String): Boolean {
     val isRootPath = parsed.path.isNullOrEmpty() || parsed.path == "/"
     return hasValidHost && isRootPath && parsed.query.isNullOrEmpty()
 }
-
-private const val SPEED_EPSILON = 0.02f

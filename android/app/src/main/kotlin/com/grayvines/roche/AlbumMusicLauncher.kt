@@ -13,6 +13,8 @@ import androidx.core.net.toUri
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.candidateStreamingUrls
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 internal data class MusicUrlCandidate(
     val packageName: String,
@@ -29,33 +31,57 @@ internal sealed interface MusicUrlResolution {
     data class ChooserTargets(val targets: List<MusicUrlCandidate>) : MusicUrlResolution
 }
 
-internal fun tryOpenDirectAlbumNow(
-    context: Context,
-    album: CollectionDrawSnapshot,
-): Boolean {
-    val candidates = queryStreamingUrlCandidates(context, album)
-    val resolution =
-        selectMusicUrlResolution(
-            candidates = candidates,
-            selfPackageName = context.packageName,
-            browserPackages = queryBrowserPackages(context.packageManager),
-        )
-    return launchStreamingResolution(context, album, resolution)
+internal sealed interface InitialAlbumLaunchPlan {
+    data class LaunchDirect(val resolution: MusicUrlResolution) : InitialAlbumLaunchPlan
+
+    data object NeedsEnrichment : InitialAlbumLaunchPlan
+
+    data object FallbackSearchOrBrowser : InitialAlbumLaunchPlan
 }
 
-internal fun needsYoutubeAlbumBrowseUpgrade(
+internal suspend fun resolveInitialAlbumLaunchPlan(
     context: Context,
     album: CollectionDrawSnapshot,
-): Boolean {
-    if (album.hasYoutubeAlbumBrowseId) return false
-    val candidates = queryStreamingUrlCandidates(context, album)
-    val resolution =
+): InitialAlbumLaunchPlan =
+    withContext(Dispatchers.IO) {
+        val browserPackages = queryBrowserPackages(context.packageManager)
+        val directResolution =
+            selectMusicUrlResolution(
+                candidates = queryStreamingUrlCandidates(context, album),
+                selfPackageName = context.packageName,
+                browserPackages = browserPackages,
+            )
+        val needsUpgrade =
+            !album.hasYoutubeAlbumBrowseId && usesYoutubePlaylistUrl(directResolution)
+        when {
+            !needsUpgrade && directResolution != MusicUrlResolution.None ->
+                InitialAlbumLaunchPlan.LaunchDirect(directResolution)
+            hasInstalledMusicApp(context, browserPackages) -> InitialAlbumLaunchPlan.NeedsEnrichment
+            else -> InitialAlbumLaunchPlan.FallbackSearchOrBrowser
+        }
+    }
+
+internal suspend fun resolveEnrichedAlbumLaunch(
+    context: Context,
+    album: CollectionDrawSnapshot,
+): MusicUrlResolution =
+    withContext(Dispatchers.IO) {
+        val browserPackages = queryBrowserPackages(context.packageManager)
         selectMusicUrlResolution(
-            candidates = candidates,
+            candidates = queryStreamingUrlCandidates(context, album),
             selfPackageName = context.packageName,
-            browserPackages = queryBrowserPackages(context.packageManager),
+            browserPackages = browserPackages,
         )
-    return usesYoutubePlaylistUrl(resolution)
+    }
+
+internal fun launchAlbumSearchOrFallback(
+    context: Context,
+    album: CollectionDrawSnapshot,
+    onOpenFallbackUrl: (String) -> Unit,
+) {
+    if (!tryLaunchMediaSearch(context, album)) {
+        onOpenFallbackUrl(album.youtubeMusicUrl)
+    }
 }
 
 internal fun usesYoutubePlaylistUrl(resolution: MusicUrlResolution): Boolean =
@@ -69,29 +95,18 @@ internal fun usesYoutubePlaylistUrl(resolution: MusicUrlResolution): Boolean =
 private fun isYoutubeMusicPlaylistUrl(url: String): Boolean =
     url.startsWith(YT_MUSIC_PLAYLIST_URL_PREFIX)
 
-internal fun hasInstalledMusicApp(context: Context): Boolean {
+private fun hasInstalledMusicApp(
+    context: Context,
+    browserPackages: Set<String>,
+): Boolean {
     val candidates = queryUrlListCandidates(context, PLATFORM_PROBE_URLS)
     val resolution =
         selectMusicUrlResolution(
             candidates = candidates,
             selfPackageName = context.packageName,
-            browserPackages = queryBrowserPackages(context.packageManager),
+            browserPackages = browserPackages,
         )
     return resolution != MusicUrlResolution.None
-}
-
-internal fun openAlbumInMusicApp(
-    context: Context,
-    album: CollectionDrawSnapshot,
-    onOpenFallbackUrl: (String) -> Unit,
-) {
-    if (tryOpenDirectAlbumNow(context, album)) {
-        return
-    }
-    if (tryLaunchMediaSearch(context, album)) {
-        return
-    }
-    onOpenFallbackUrl(album.youtubeMusicUrl)
 }
 
 internal fun selectMusicUrlResolution(

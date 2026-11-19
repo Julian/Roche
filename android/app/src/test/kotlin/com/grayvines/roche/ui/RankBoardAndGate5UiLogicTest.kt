@@ -26,7 +26,6 @@ import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
-import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.extractPlainTextHeadings
 import java.io.File
@@ -365,7 +364,7 @@ class RankBoardAndGate5UiLogicTest {
                 selectedFeedId = "f-1",
                 scopeOriginTab = AppTab.FEEDS,
                 isSearchOpen = true,
-                playerState = PodcastPlayerState(currentEntryId = "ep-1", isFullscreenOpen = true),
+                isPlayerFullscreenOpen = true,
             )
         val fullStack =
             deriveRocheBackStack(
@@ -538,48 +537,47 @@ class RankBoardAndGate5UiLogicTest {
             viewModel.uiState.first { it.allEntries.size == 1 }
 
             viewModel.dispatch(MainAction.OpenReader("ep-nav-1"))
-            val inPlayer =
-                viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-nav-1" &&
-                        !it.playerState.isBuffering &&
-                        it.playerState.isFullscreenOpen
-                }
+            viewModel.playerState.first { it.currentEntryId == "ep-nav-1" && !it.isBuffering }
+            val inPlayer = viewModel.uiState.first { it.isPlayerFullscreenOpen }
             viewModel.playerController.cancelAutoTickerForTest()
             assertNull(inPlayer.selectedReaderEntryId)
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
-                deriveRocheBackStack(inPlayer),
+                deriveRocheBackStack(inPlayer, activeAudioEntryId = "ep-nav-1"),
             )
 
             viewModel.dispatch(MainAction.SeekPlayerToMs(45_000L))
-            viewModel.uiState.first { it.playerState.positionMs == 45_000L }
+            viewModel.playerState.first { it.positionMs == 45_000L }
 
             viewModel.dispatch(MainAction.OpenReader("ep-nav-1", forceArticleView = true))
             val inReader =
                 viewModel.uiState.first {
-                    !it.playerState.isFullscreenOpen && it.selectedReaderEntryId == "ep-nav-1"
+                    !it.isPlayerFullscreenOpen && it.selectedReaderEntryId == "ep-nav-1"
                 }
-            assertTrue(inReader.playerState.isPlaying)
-            assertEquals(45_000L, inReader.playerState.positionMs)
+            assertTrue(viewModel.playerState.value.isPlaying)
+            assertEquals(45_000L, viewModel.playerState.value.positionMs)
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Reader("ep-nav-1")),
-                deriveRocheBackStack(inReader),
+                deriveRocheBackStack(inReader, activeAudioEntryId = "ep-nav-1"),
             )
 
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-nav-1", openFullscreen = true))
             val backInPlayer =
                 viewModel.uiState.first {
-                    it.playerState.isFullscreenOpen && it.selectedReaderEntryId == null
+                    it.isPlayerFullscreenOpen && it.selectedReaderEntryId == null
                 }
-            val playerStack = deriveRocheBackStack(backInPlayer)
+            val playerStack = deriveRocheBackStack(backInPlayer, activeAudioEntryId = "ep-nav-1")
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
                 playerStack,
             )
 
             viewModel.dispatch(popActionForTopKey(playerStack.last())!!)
-            val collapsed = viewModel.uiState.first { !it.playerState.isFullscreenOpen }
-            assertEquals(listOf(RocheNavKey.Tab(AppTab.HOME)), deriveRocheBackStack(collapsed))
+            val collapsed = viewModel.uiState.first { !it.isPlayerFullscreenOpen }
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.HOME)),
+                deriveRocheBackStack(collapsed, activeAudioEntryId = "ep-nav-1"),
+            )
             collectJob.cancel()
         }
 

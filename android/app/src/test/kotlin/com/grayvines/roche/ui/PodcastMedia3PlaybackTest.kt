@@ -186,10 +186,10 @@ class PodcastMedia3PlaybackTest {
             drainJobs ->
             assertTrue(backend.skipSilenceEnabled)
             vm.dispatch(MainAction.SetSkipSilence(false))
-            vm.uiState.first { !it.playerState.skipSilenceEnabled }
+            vm.playerState.first { !it.skipSilenceEnabled }
             assertFalse(backend.skipSilenceEnabled)
             vm.dispatch(MainAction.SetSkipSilence(true))
-            vm.uiState.first { it.playerState.skipSilenceEnabled }
+            vm.playerState.first { it.skipSilenceEnabled }
             assertTrue(backend.skipSilenceEnabled)
 
             val initialReadAt =
@@ -258,12 +258,13 @@ class PodcastMedia3PlaybackTest {
             val vm = MainViewModel(repo, settings, sharedPlayerController = controller)
             val collectJob = collectInBackground(vm.uiState)
             try {
-                assertFalse(vm.uiState.value.playerState.skipSilenceEnabled)
-                vm.uiState.first { !it.isInitialLoading && !it.playerState.skipSilenceEnabled }
+                assertFalse(vm.playerState.value.skipSilenceEnabled)
+                vm.uiState.first { !it.isInitialLoading }
+                vm.playerState.first { !it.skipSilenceEnabled }
                 assertFalse(backend.skipSilenceEnabled)
 
                 settings.update { it.copy(skipSilenceEnabled = true) }
-                vm.uiState.first { it.playerState.skipSilenceEnabled }
+                vm.playerState.first { it.skipSilenceEnabled }
                 assertTrue(backend.skipSilenceEnabled)
             } finally {
                 controller.releaseController()
@@ -486,12 +487,10 @@ class PodcastMedia3PlaybackTest {
         try {
             vm.uiState.first { it.allEntries.size == 1 }
             vm.dispatch(MainAction.PlayAudioEntry("ep-1"))
-            vm.uiState.first {
-                it.playerState.currentEntryId == "ep-1" &&
-                    it.playerState.isPlaying &&
-                    !it.playerState.isBuffering &&
-                    !it.allEntries.first().readAt.isNullOrBlank()
+            vm.playerState.first {
+                it.currentEntryId == "ep-1" && it.isPlaying && !it.isBuffering
             }
+            vm.uiState.first { !it.allEntries.first().readAt.isNullOrBlank() }
             controller.cancelAutoTickerForTest()
             drainJobs()
             syncRequests.clear()

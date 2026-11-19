@@ -52,6 +52,7 @@ import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @Suppress("DataClassContainsFunctions")
 internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>) {
@@ -262,7 +263,7 @@ private fun RankSettlementSheetBody(
         Text(
             text = settlement.title,
             color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
+            fontFamily = currentHeadlineFontFamily(),
             fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
         )
@@ -401,7 +402,7 @@ private fun ClusterRankHeader(
             Text(
                 text = "Order best to worst (tap = to tie)",
                 color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
+                fontFamily = currentHeadlineFontFamily(),
                 fontSize = 18.sp,
                 fontWeight = FontWeight.SemiBold,
             )

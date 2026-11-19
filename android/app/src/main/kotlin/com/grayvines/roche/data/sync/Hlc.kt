@@ -7,6 +7,20 @@ import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
 import com.grayvines.roche.core.MAX_HLC_WALL_MS
 import com.grayvines.roche.data.local.RocheDao
 
+internal fun compareHlc(a: String?, b: String?): Int {
+    val parsedA = HlcTimestamp.parse(a)
+    val parsedB = HlcTimestamp.parse(b)
+    return when {
+        parsedA != null && parsedB != null -> parsedA.compareTo(parsedB)
+        parsedA != null -> 1
+        parsedB != null -> -1
+        else -> a.orEmpty().compareTo(b.orEmpty())
+    }
+}
+
+internal fun maxHlc(a: String?, b: String?): String =
+    if (compareHlc(a, b) >= 0) a.orEmpty() else b.orEmpty()
+
 internal fun resolveOrSynthesizeHlc(
     rawHlc: String?,
     fallbackIso: String?,

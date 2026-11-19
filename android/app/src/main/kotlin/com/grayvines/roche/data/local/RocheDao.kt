@@ -258,6 +258,12 @@ interface RocheDao {
 
     @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
 
+    @Query("SELECT * FROM entries WHERE id IN (:ids)")
+    suspend fun getEntriesByIds(ids: List<String>): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE mergedIntoId IS NOT NULL AND mergedIntoId != ''")
+    suspend fun getMergedEntries(): List<EntryEntity>
+
     @Query("SELECT * FROM entries WHERE id = :id LIMIT 1")
     suspend fun getEntryById(id: String): EntryEntity?
 
@@ -354,6 +360,9 @@ interface RocheDao {
     // --- Satellite `entry_state` ---
 
     @Query("SELECT * FROM entry_state") suspend fun getAllEntryStates(): List<EntryStateEntity>
+
+    @Query("SELECT * FROM entry_state WHERE entryId IN (:ids)")
+    suspend fun getEntryStatesByIds(ids: List<String>): List<EntryStateEntity>
 
     @Query("SELECT * FROM entry_state WHERE isLocalDirty = 1")
     suspend fun getDirtyEntryStates(): List<EntryStateEntity>
@@ -640,6 +649,9 @@ interface RocheDao {
     @Query("SELECT * FROM entry_identifiers")
     suspend fun getAllEntryIdentifiers(): List<EntryIdentifierEntity>
 
+    @Query("SELECT * FROM entry_identifiers WHERE entryId IN (:entryIds)")
+    suspend fun getEntryIdentsByEntryIds(entryIds: List<String>): List<EntryIdentifierEntity>
+
     @Query(
         "SELECT entryId FROM entry_identifiers " +
             "WHERE scheme = :scheme AND value = :value LIMIT 1"
@@ -688,6 +700,9 @@ interface RocheDao {
 
     @Query("SELECT * FROM collection_entries WHERE isLocalDirty = 1")
     suspend fun getDirtyCollectionEntries(): List<CollectionEntryEntity>
+
+    @Query("SELECT * FROM collection_entries WHERE collectionId IN (:collectionIds)")
+    suspend fun getMembershipsByColIds(collectionIds: List<String>): List<CollectionEntryEntity>
 
     @Query(
         "SELECT * FROM collection_entries WHERE collectionId = :collectionId " +
@@ -869,6 +884,13 @@ interface RocheDao {
             "THEN 1 ELSE 0 END"
     )
     suspend fun hasCatalogHistoryRaw(entryId: String, quotedPattern: String): Int
+
+    @Query(
+        "SELECT CASE WHEN EXISTS (" +
+            "SELECT 1 FROM comparisons WHERE scopeCollectionId = :entryId" +
+            ") THEN 1 ELSE 0 END"
+    )
+    suspend fun hasComparisonScopeRaw(entryId: String): Int
 
     @Transaction
     suspend fun executeInTransaction(block: suspend () -> Unit) {

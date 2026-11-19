@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -19,40 +18,33 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
@@ -62,80 +54,72 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
-import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.reader.extractInboxSnippet
 import com.grayvines.roche.ui.components.BottomTabIcon
 import com.grayvines.roche.ui.components.DownloadTrayIcon
+import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.RefreshIcon
+import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
+import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheTopHeader
-import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
+import com.grayvines.roche.ui.components.SyncHeaderActionButton
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
-import kotlinx.coroutines.CancellationException
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @Composable
 fun InboxTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    activeAudioEntryId: String? = null,
 ) {
-    val colors = LocalRocheColors.current
     var showTagFilterDrawer by rememberSaveable { mutableStateOf(false) }
-    var drawerBackProgress by remember { mutableFloatStateOf(0f) }
 
-    PredictiveBackHandler(enabled = showTagFilterDrawer && state.tags.isNotEmpty()) { progress ->
-        try {
-            progress.collect { backEvent -> drawerBackProgress = backEvent.progress }
-            drawerBackProgress = 0f
-            showTagFilterDrawer = false
-        } catch (cancelled: CancellationException) {
-            drawerBackProgress = 0f
-            throw cancelled
-        }
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        InboxHeaderSection(
-            state = state,
-            showTagFilterDrawer = showTagFilterDrawer,
-            onToggleTagDrawer = {
-                drawerBackProgress = 0f
-                showTagFilterDrawer = !showTagFilterDrawer
-            },
-            onAction = onAction,
-        )
-        InboxFilterStrip(state = state, onAction = onAction)
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        if (showTagFilterDrawer && state.tags.isNotEmpty()) {
-            InboxTagFilterDrawer(
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "inbox_pull_to_refresh",
+        header = {
+            InboxHeaderSection(
                 state = state,
-                modifier = Modifier.predictiveBackDrawerGraphics(drawerBackProgress),
-                onSelectTag = { tagName ->
-                    drawerBackProgress = 0f
-                    showTagFilterDrawer = false
-                    onAction(MainAction.FilterByTag(tagName))
-                },
+                showTagFilterDrawer = showTagFilterDrawer,
+                onToggleTagDrawer = { showTagFilterDrawer = !showTagFilterDrawer },
+                onAction = onAction,
             )
-        }
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("inbox_pull_to_refresh"),
-        ) {
-            InboxEntryListBody(state = state, onAction = onAction, listState = listState)
-        }
+        },
+        subHeader = { InboxFilterStrip(state = state, onAction = onAction) },
+        drawer = {
+            PredictiveBackDrawerContainer(
+                visible = showTagFilterDrawer && state.tags.isNotEmpty(),
+                onDismiss = { showTagFilterDrawer = false },
+            ) { drawerModifier ->
+                InboxTagFilterDrawer(
+                    state = state,
+                    modifier = drawerModifier,
+                    onSelectTag = { tagName ->
+                        showTagFilterDrawer = false
+                        onAction(MainAction.FilterByTag(tagName))
+                    },
+                )
+            }
+        },
+    ) {
+        InboxEntryListBody(
+            state = state,
+            onAction = onAction,
+            listState = listState,
+            activeAudioEntryId = activeAudioEntryId,
+        )
     }
 }
 
@@ -144,6 +128,7 @@ internal fun InboxEntryListBody(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    activeAudioEntryId: String? = null,
 ) {
     val colors = LocalRocheColors.current
     if (state.visibleEntries.isEmpty()) {
@@ -167,6 +152,7 @@ internal fun InboxEntryListBody(
             )
         }
     } else {
+        val nextQueuedAudioId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize().testTag("inbox_list"),
@@ -177,8 +163,8 @@ internal fun InboxEntryListBody(
                     entry = entry,
                     ultraDense = state.settings.ultraDenseRows,
                     swipeToArchiveEnabled = state.settings.swipeToArchive,
-                    isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                    isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
+                    isPlayingAudio = entry.id == activeAudioEntryId,
+                    isQueuedNextAudio = entry.id == nextQueuedAudioId,
                     onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                     onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                     onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
@@ -293,17 +279,11 @@ internal fun InboxHeaderActions(
             FilingCabinetIcon(tint = colors.textSecondary, isArchived = false, size = 17.dp)
         }
     }
-    RocheIconActionButton(
-        contentDescription = "Sync",
+    SyncHeaderActionButton(
+        isSyncing = state.isSyncing,
         onClick = onSync,
         modifier = Modifier.testTag("inbox_sync_btn"),
-    ) {
-        RefreshIcon(
-            tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
-            size = 17.dp,
-            isSpinning = state.isSyncing,
-        )
-    }
+    )
     if (isSettingsUnpinned) {
         RocheIconActionButton(
             contentDescription = "Settings",
@@ -365,17 +345,9 @@ private fun ArchiveAllConfirmDialog(
 ) {
     val colors = LocalRocheColors.current
     val noun = if (unarchivedCount == 1) "entry" else "entries"
-    AlertDialog(
+    RocheAlertDialog(
+        title = "Archive $unarchivedCount $noun?",
         onDismissRequest = onDismiss,
-        containerColor = colors.surface,
-        title = {
-            Text(
-                text = "Archive $unarchivedCount $noun?",
-                color = colors.textPrimary,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.Medium,
-            )
-        },
         text = {
             Text(
                 text =
@@ -706,19 +678,25 @@ private fun InboxEntryTextColumn(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val isSerif = LocalHeadlineFont.current == HeadlineFont.SERIF
-    val headlineFamily = if (isSerif) FontFamily.Serif else FontFamily.SansSerif
+    val headlineFamily = currentHeadlineFontFamily()
     val titleColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
     val titleWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Normal
     val (titleSize, titleLineHeight, maxTitleLines) =
         if (ultraDense) Triple(14.sp, 19.sp, 1) else Triple(15.5.sp, 21.sp, 2)
     val snippet =
-        androidx.compose.runtime.remember(entry.summary, ultraDense) {
+        remember(entry.summary, ultraDense) {
             if (ultraDense) "" else extractInboxSnippet(entry.summary.orEmpty())
         }
 
     Column(modifier = modifier) {
-        EntrySourceMetaRow(entry = entry)
+        EntrySourceMetadataRow(
+            entry = entry,
+            showUnreadDot = true,
+            unreadDotTestTag = "unread_dot_${entry.id}",
+            emphasizeFeedTitleWhenUnread = true,
+            trailingMetaText = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+            showOfflineIndicator = true,
+        )
         Spacer(modifier = Modifier.height(3.dp))
         Text(
             text = entry.title,
@@ -751,60 +729,6 @@ private fun InboxEntryTextColumn(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.testTag("listening_history_badge_${entry.id}"),
-            )
-        }
-    }
-}
-
-@Composable
-private fun EntrySourceMetaRow(entry: InboxEntry) {
-    val colors = LocalRocheColors.current
-    val feedLabelColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
-    val feedLabelWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Medium
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (entry.isUnread) {
-            Box(
-                modifier =
-                    Modifier.size(6.dp)
-                        .clip(CircleShape)
-                        .background(colors.accentBlue)
-                        .testTag("unread_dot_${entry.id}")
-            )
-        }
-        SiteFaviconBadge(
-            primaryFaviconUrl = entry.faviconUrl,
-            fallbackFaviconUrl = entry.fallbackFaviconUrl,
-            domain = entry.displayDomain,
-            title = entry.feedTitle,
-            size = 14.dp,
-        )
-        Text(
-            text = entry.feedTitle,
-            color = feedLabelColor,
-            fontSize = 11.sp,
-            fontWeight = feedLabelWeight,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false),
-        )
-        Text(
-            text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            maxLines = 1,
-        )
-        if (entry.isCachedOffline) {
-            Text(
-                text = "↓",
-                color = colors.accentVerdigris,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                modifier = Modifier.semantics { contentDescription = "Cached offline" },
             )
         }
     }

@@ -3,184 +3,140 @@ package com.grayvines.roche.ui
 import com.grayvines.roche.core.isLikelyFeedUrl
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.SaveUrlResult
 import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
-import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.extractCleanDomain
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.update
 
 @Suppress("TooManyFunctions")
-internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
+internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     internal val inFlightStarCounts = mutableMapOf<String, Int>()
 
-    internal suspend fun tryExecute(action: MainAction.Mutation): Boolean =
+    internal suspend fun execute(action: MainAction.InboxReaderMutation) {
         when (action) {
-            is MainAction.ToggleArchive -> {
+            is MainAction.EntryMutation -> executeEntryMutation(action)
+            is MainAction.PlaybackMutation -> executePlaybackMutation(action)
+            is MainAction.QueueFeedAudioMutation -> executeQueueFeedAudioMutation(action)
+        }
+    }
+
+    private suspend fun executeEntryMutation(action: MainAction.EntryMutation) {
+        when (action) {
+            is MainAction.ToggleArchive ->
                 performToggleArchive(action.entry, action.liveReadProgress)
-                true
-            }
-            MainAction.UndoLastArchive -> {
-                performUndoArchive()
-                true
-            }
-            MainAction.ArchiveVisibleEntries -> {
-                performArchiveVisibleEntries()
-                true
-            }
-            is MainAction.ToggleStar -> {
-                performToggleStar(action.entryId)
-                true
-            }
-            is MainAction.ToggleReadState -> {
-                performToggleReadState(action.entryId)
-                true
-            }
-            is MainAction.ToggleOfflineCache -> {
-                performToggleOffline(action.entryId)
-                true
-            }
-            is MainAction.ToggleTagOnEntry -> {
-                vm.repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
-                true
-            }
-            is MainAction.UpdateReadProgress -> {
-                vm.repository.updateReadProgress(
+            MainAction.UndoLastArchive -> performUndoArchive()
+            MainAction.ArchiveVisibleEntries -> performArchiveVisibleEntries()
+            is MainAction.ToggleStar -> performToggleStar(action.entryId)
+            is MainAction.ToggleReadState -> performToggleReadState(action.entryId)
+            is MainAction.ToggleOfflineCache -> performToggleOffline(action.entryId)
+            is MainAction.ToggleTagOnEntry ->
+                host.repository.toggleTagOnItem(itemId = action.entryId, tagName = action.tagName)
+            is MainAction.UpdateReadProgress ->
+                host.repository.updateReadProgress(
                     itemId = action.entryId,
                     progress = action.progress,
                 )
-                true
-            }
-            is MainAction.SaveUrlOrFeed -> {
+            is MainAction.SaveUrlOrFeed ->
                 performSaveUrl(action.url, action.titleOverride, action.tagCsv, action.mode)
-                true
-            }
-            is MainAction.DeleteEntry -> {
-                performDeleteEntry(action.entryId)
-                true
-            }
-            else -> {
-                tryExecutePlayerOrQueue(action)
-            }
+            is MainAction.DeleteEntry -> performDeleteEntry(action.entryId)
         }
+    }
 
-    private suspend fun tryExecutePlayerOrQueue(action: MainAction.Mutation): Boolean =
+    private suspend fun executePlaybackMutation(action: MainAction.PlaybackMutation) {
         when (action) {
-            is MainAction.PlayAudioEntry -> {
+            is MainAction.PlayAudioEntry ->
                 performPlayAudioEntry(action.entryId, action.openFullscreen)
-                true
-            }
-            MainAction.TogglePlayPause -> {
-                val smartRewind = vm.settingsRepository.settings.first().smartRewindEnabled
-                vm.playerController.togglePlayPause(smartRewindEnabled = smartRewind)
-                true
-            }
-            is MainAction.SeekPlayerToFraction -> {
-                vm.playerController.seekToFraction(action.fraction)
-                true
-            }
-            is MainAction.SeekPlayerToMs -> {
-                vm.playerController.seekToMs(action.positionMs)
-                true
-            }
-            is MainAction.SkipPlayerBySeconds -> {
-                vm.playerController.skipBySeconds(action.deltaSeconds)
-                true
-            }
-            MainAction.SkipToNextQueuedAudio -> {
-                vm.playbackOrchestrator.performSkipToNextQueuedAudio(vm.playerController)
-                true
-            }
-            is MainAction.SetPlaybackSpeed -> {
-                vm.playbackOrchestrator.performSetPlaybackSpeed(
-                    playerController = vm.playerController,
+            MainAction.TogglePlayPause -> performTogglePlayPause()
+            is MainAction.SeekPlayerToFraction ->
+                host.playerController.seekToFraction(action.fraction)
+            is MainAction.SeekPlayerToMs -> host.playerController.seekToMs(action.positionMs)
+            is MainAction.SkipPlayerBySeconds ->
+                host.playerController.skipBySeconds(action.deltaSeconds)
+            MainAction.SkipToNextQueuedAudio -> performSkipToNextQueuedAudio()
+            is MainAction.SetPlaybackSpeed ->
+                host.playbackOrchestrator.performSetPlaybackSpeed(
+                    playerController = host.playerController,
                     speed = action.speed,
                     applyToCurrentPodcast = action.applyToCurrentPodcast,
                 )
-                true
-            }
-            is MainAction.SetRememberPodcastSpeed -> {
+            is MainAction.SetRememberPodcastSpeed ->
                 performSetRememberPodcastSpeed(action.feedId, action.enabled)
-                true
-            }
-            is MainAction.SetSkipSilence -> {
-                vm.playerController.setSkipSilence(action.enabled)
-                vm.settingsRepository.update { it.copy(skipSilenceEnabled = action.enabled) }
-                true
-            }
-            is MainAction.SetSmartRewind -> {
-                vm.settingsRepository.update { it.copy(smartRewindEnabled = action.enabled) }
-                vm.playerController.updateSmartRewindEnabled(action.enabled)
-                true
-            }
-            is MainAction.SetSleepTimerMinutes -> {
-                performSetSleepTimerMinutes(action.minutes)
-                true
-            }
-            else -> {
-                tryExecuteQueueOrFeedAudio(action)
-            }
+            is MainAction.SetSkipSilence -> performSetSkipSilence(action.enabled)
+            is MainAction.SetSmartRewind -> performSetSmartRewind(action.enabled)
+            is MainAction.SetSleepTimerMinutes -> performSetSleepTimerMinutes(action.minutes)
         }
+    }
 
-    private suspend fun tryExecuteQueueOrFeedAudio(action: MainAction.Mutation): Boolean =
+    private suspend fun performTogglePlayPause() {
+        val smartRewind = host.settingsRepository.settings.first().smartRewindEnabled
+        host.playerController.togglePlayPause(smartRewindEnabled = smartRewind)
+    }
+
+    private suspend fun performSetSkipSilence(enabled: Boolean) {
+        host.playerController.setSkipSilence(enabled)
+        host.settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
+    }
+
+    private suspend fun performSetSmartRewind(enabled: Boolean) {
+        host.settingsRepository.update { it.copy(smartRewindEnabled = enabled) }
+        host.playerController.updateSmartRewindEnabled(enabled)
+    }
+
+    private suspend fun executeQueueFeedAudioMutation(action: MainAction.QueueFeedAudioMutation) {
         when (action) {
-            is MainAction.SetFeedAutoDownload -> {
+            is MainAction.SetFeedAutoDownload ->
                 performSetFeedAutoDownload(action.feedId, action.enabled)
-                true
-            }
-            is MainAction.SetFeedPlaybackSpeed -> {
+            is MainAction.SetFeedPlaybackSpeed ->
                 performSetFeedPlaybackSpeed(action.feedId, action.speed)
-                true
-            }
-            is MainAction.ToggleQueueMembership -> {
-                performToggleQueueMembership(action.entryId)
-                true
-            }
-            is MainAction.AddToQueue -> {
-                performAddToQueue(action.entryId, action.playNext)
-                true
-            }
-            is MainAction.RemoveFromQueue -> {
+            is MainAction.ToggleQueueMembership -> performToggleQueueMembership(action.entryId)
+            is MainAction.AddToQueue -> performAddToQueue(action.entryId, action.playNext)
+            is MainAction.RemoveFromQueue ->
                 performRemoveFromQueue(action.entryId, showBanner = true)
-                true
-            }
-            is MainAction.MoveQueueItemUp -> {
-                performMoveQueueItemUp(action.entryId)
-                true
-            }
-            is MainAction.MoveQueueItemToTop -> {
-                performMoveQueueItemToTop(action.entryId)
-                true
-            }
-            else -> {
-                false
-            }
+            is MainAction.MoveQueueItemUp -> performMoveQueueItemUp(action.entryId)
+            is MainAction.MoveQueueItemToTop -> performMoveQueueItemToTop(action.entryId)
         }
+    }
 
     internal suspend fun performPlayAudioEntry(
         entryId: String,
         openFullscreen: Boolean = true,
     ) {
         val played =
-            vm.playbackOrchestrator.playAudioEntry(
-                playerController = vm.playerController,
+            host.playbackOrchestrator.playAudioEntry(
+                playerController = host.playerController,
                 entryId = entryId,
-                openFullscreen = openFullscreen,
+                toggleIfCurrent = !openFullscreen,
             )
         if (played) {
-            vm.transientState.update { current ->
+            host.updateTransient { current ->
                 if (openFullscreen) {
                     current.copy(
                         selectedReaderEntryId = null,
                         readerContent = current.readerContent?.takeIf { it.itemId == entryId },
                         contextSheetEntryId = null,
+                        isPlayerFullscreenOpen = true,
+                        activePlayerDrawerTab = null,
                     )
                 } else {
                     current.copy(contextSheetEntryId = null)
                 }
+            }
+        }
+    }
+
+    private suspend fun performSkipToNextQueuedAudio() {
+        val wasIdle = !host.playerController.state.value.hasActiveEpisode
+        val started = host.playbackOrchestrator.performSkipToNextQueuedAudio(host.playerController)
+        if (started && wasIdle) {
+            host.updateTransient {
+                it.copy(
+                    isPlayerFullscreenOpen = true,
+                    activePlayerDrawerTab = null,
+                )
             }
         }
     }
@@ -193,16 +149,16 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         var failed = false
         try {
             runSuspendCatching {
-                vm.repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
+                host.repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
             }
                 .onSuccess { starred ->
                     if (!bannerAlreadyShown) {
-                        vm.showStatusMessage(if (starred) "Starred" else "Removed star")
+                        host.showStatusMessage(if (starred) "Starred" else "Removed star")
                     }
                 }
                 .onFailure { err ->
                     failed = true
-                    vm.showStatusMessage("Could not update star (${err.message ?: "error"})")
+                    host.showStatusMessage("Could not update star (${err.message ?: "error"})")
                 }
         } finally {
             if (bannerAlreadyShown) {
@@ -224,12 +180,15 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             }
         if (remaining == 0) {
             val persistedFav =
-                vm.repository.latestSnapshot?.entries?.firstOrNull { it.id == entryId }?.isFavorite
+                host.repository.latestSnapshot
+                    ?.entries
+                    ?.firstOrNull { it.id == entryId }
+                    ?.isFavorite
             val settled =
                 persistedFav != null &&
-                    vm.transientState.value.optimisticFavorites[entryId] == persistedFav
+                    host.currentTransientState().optimisticFavorites[entryId] == persistedFav
             if (forceClear || settled) {
-                vm.transientState.update { current ->
+                host.updateTransient { current ->
                     current.copy(optimisticFavorites = current.optimisticFavorites - entryId)
                 }
             }
@@ -237,7 +196,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     }
 
     internal fun reconcileOptimisticStars(persistedById: Map<String, Boolean>) {
-        val currentOpt = vm.transientState.value.optimisticFavorites
+        val currentOpt = host.currentTransientState().optimisticFavorites
         if (currentOpt.isEmpty()) return
         val settledIds =
             synchronized(inFlightStarCounts) {
@@ -246,15 +205,15 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 }
             }
         if (settledIds.isNotEmpty()) {
-            vm.transientState.update { current ->
+            host.updateTransient { current ->
                 current.copy(optimisticFavorites = current.optimisticFavorites - settledIds.toSet())
             }
         }
     }
 
     private suspend fun performToggleReadState(entryId: String) {
-        val isRead = vm.repository.toggleReadState(entryId)
-        vm.transientState.update {
+        val isRead = host.repository.toggleReadState(entryId)
+        host.updateTransient {
             it.copy(
                 contextSheetEntryId = null,
                 undoEvent = null,
@@ -265,15 +224,15 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performToggleOffline(entryId: String) {
-        val prevEntry = vm.latestEntries().firstOrNull { it.id == entryId }
+        val prevEntry = host.latestEntries().firstOrNull { it.id == entryId }
         val wasCached = prevEntry?.isCachedOffline == true
-        val cached = vm.repository.toggleOfflineCache(entryId)
-        if (cached && vm.transientState.value.selectedReaderEntryId == entryId) {
-            vm.repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
-                vm.applyReaderContentIfActive(entryId, content)
+        val cached = host.repository.toggleOfflineCache(entryId)
+        if (cached && host.currentTransientState().selectedReaderEntryId == entryId) {
+            host.repository.hydrateItemContentIfNeeded(entryId)?.let { content ->
+                host.applyReaderContentIfActive(entryId, content)
             }
         }
-        val entry = vm.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
+        val entry = host.latestEntries().firstOrNull { it.id == entryId } ?: prevEntry
         val isAudio = entry?.contentType == ContentType.AUDIO
         val msg =
             when {
@@ -284,7 +243,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 isAudio -> "Deleted local episode download"
                 else -> "Removed local offline copy"
             }
-        vm.showStatusMessage(msg)
+        host.showStatusMessage(msg)
     }
 
     private suspend fun performToggleArchive(
@@ -293,12 +252,15 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     ) {
         val targetArchived = !entry.isArchived
         if (targetArchived && liveReadProgress != null && liveReadProgress > entry.readProgress) {
-            vm.repository.updateReadProgress(itemId = entry.id, progress = liveReadProgress)
+            host.repository.updateReadProgress(itemId = entry.id, progress = liveReadProgress)
         }
         val snapshot =
-            vm.repository.setArchiveStateWithSnapshot(itemId = entry.id, archived = targetArchived)
+            host.repository.setArchiveStateWithSnapshot(
+                itemId = entry.id,
+                archived = targetArchived,
+            )
         if (targetArchived) {
-            vm.cleanupRemovedEntries(setOf(entry.id))
+            host.cleanupRemovedEntries(setOf(entry.id))
         }
         val previousStatus = snapshot?.previousStatus ?: entry.status
         val previousReadAt = snapshot?.previousReadAt ?: entry.readAt
@@ -309,7 +271,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 targetArchived -> "Archived"
                 else -> "Restored to Unread"
             }
-        vm.transientState.update { current ->
+        host.updateTransient { current ->
             val nextReaderId =
                 if (current.selectedReaderEntryId == entry.id) {
                     null
@@ -335,23 +297,23 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performUndoArchive() {
-        val pending = vm.transientState.value.undoEvent ?: return
+        val pending = host.currentTransientState().undoEvent ?: return
         if (pending.batchSnapshots.size > 1) {
-            vm.repository.restoreArchiveSnapshots(pending.batchSnapshots)
-            vm.showStatusMessage("Restored ${pending.batchSnapshots.size} entries")
+            host.repository.restoreArchiveSnapshots(pending.batchSnapshots)
+            host.showStatusMessage("Restored ${pending.batchSnapshots.size} entries")
         } else {
-            vm.repository.restoreStatus(
+            host.repository.restoreStatus(
                 itemId = pending.itemId,
                 status = pending.previousStatus,
                 readAt = pending.previousReadAt,
             )
-            vm.showStatusMessage("Restored entry")
+            host.showStatusMessage("Restored entry")
         }
     }
 
     private suspend fun performArchiveVisibleEntries() {
-        val local = vm.transientState.value
-        val entries = applyOptimisticFavorites(vm.latestEntries(), local.optimisticFavorites)
+        val local = host.currentTransientState()
+        val entries = applyOptimisticFavorites(host.latestEntries(), local.optimisticFavorites)
         val visible =
             RocheRepository.filterEntries(
                 entries = entries,
@@ -363,7 +325,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         val unarchivedIds = visible.filter { !it.isArchived }.map { it.id }
         if (unarchivedIds.isEmpty()) return
         val snapshots =
-            vm.repository.archiveBatchWithSnapshots(
+            host.repository.archiveBatchWithSnapshots(
                 entryIds = unarchivedIds,
                 feedId = local.selectedFeedId,
                 allUnread =
@@ -374,11 +336,11 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             )
         if (snapshots.isEmpty()) return
         val archivedIds = snapshots.map { it.itemId }.toSet()
-        vm.cleanupRemovedEntries(archivedIds)
+        host.cleanupRemovedEntries(archivedIds)
         val archivedCount = snapshots.size
         val noun = entryCountNoun(archivedCount)
         val first = snapshots.first()
-        vm.transientState.update {
+        host.updateTransient {
             it.copy(
                 statusBanner = null,
                 messageSequence = it.messageSequence + 1,
@@ -409,8 +371,8 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                 } else {
                     AddSheetMode.WANT_TO_READ
                 }
-        vm.cancelDeepSearch()
-        vm.transientState.update {
+        host.cancelDeepSearch()
+        host.updateTransient {
             it.clearSearch()
                 .copy(
                     isAddSheetOpen = false,
@@ -425,12 +387,12 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             performSubscribeFeedAction(cleanUrl, titleOverride)
         } else {
             val created =
-                vm.repository.addUrlToWantToRead(
+                host.repository.addUrlToWantToRead(
                     inputUrl = cleanUrl,
                     titleOverride = titleOverride,
                     tagCsv = tagCsv,
                 )
-            vm.showStatusMessage(
+            host.showStatusMessage(
                 "Added to Want to Read · \"${created.title.take(SNACKBAR_TITLE_LIMIT)}\""
             )
         }
@@ -438,101 +400,84 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
 
     private suspend fun performSubscribeFeedAction(url: String, titleOverride: String?) {
         val hostLabel = extractCleanDomain(url).ifBlank { url }.take(SNACKBAR_TITLE_LIMIT)
-        if (vm.repository.hasBackgroundScope) {
-            vm.transientState.update {
-                it.copy(
-                    statusBanner = "Finding RSS feed for $hostLabel…",
-                    messageSequence = it.messageSequence + 1,
-                )
-            }
-            vm.repository.subscribeFeedInBackground(
+        host.showStatusMessage("Finding RSS feed for $hostLabel…")
+        if (host.repository.hasBackgroundScope) {
+            host.repository.subscribeFeedInBackground(
                 inputUrl = url,
                 titleOverride = titleOverride,
-            ) { result ->
-                result
-                    .onSuccess { saved ->
-                        vm.transientState.update {
-                            it.copy(
-                                statusBanner =
-                                    "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                                messageSequence = it.messageSequence + 1,
-                            )
-                        }
-                    }
-                    .onFailure { err ->
-                        vm.showStatusMessage(err.message ?: "Could not subscribe to feed")
-                    }
-            }
+                onComplete = ::handleSubscribeFeedResult,
+            )
         } else {
-            vm.repository
-                .discoverAndSubscribeFeed(inputUrl = url, titleOverride = titleOverride)
-                .onSuccess { saved ->
-                    vm.transientState.update {
-                        it.copy(
-                            activeTab = AppTab.FEEDS,
-                            statusBanner =
-                                "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                            messageSequence = it.messageSequence + 1,
-                        )
-                    }
-                }
-                .onFailure { err ->
-                    vm.showStatusMessage(err.message ?: "Could not subscribe to feed")
-                }
+            val result =
+                host.repository.discoverAndSubscribeFeed(
+                    inputUrl = url,
+                    titleOverride = titleOverride,
+                )
+            handleSubscribeFeedResult(result)
         }
     }
 
+    private fun handleSubscribeFeedResult(result: Result<SaveUrlResult>) {
+        result
+            .onSuccess { saved ->
+                host.showStatusMessage("Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"")
+            }
+            .onFailure { err ->
+                host.showStatusMessage(err.message ?: "Could not subscribe to feed")
+            }
+    }
+
     private suspend fun performDeleteEntry(entryId: String) {
-        vm.repository
+        host.repository
             .deleteItem(entryId)
             .onSuccess { title ->
-                vm.cleanupRemovedEntries(setOf(entryId))
-                vm.showStatusMessage("Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
+                host.cleanupRemovedEntries(setOf(entryId))
+                host.showStatusMessage("Deleted \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
             }
             .onFailure { error ->
-                vm.showStatusMessage("Delete failed (${error.message ?: "error"})")
+                host.showStatusMessage("Delete failed (${error.message ?: "error"})")
             }
     }
 
     private fun performSetSleepTimerMinutes(minutes: Int?) {
-        vm.playerController.setSleepTimerMinutes(minutes)
+        host.playerController.setSleepTimerMinutes(minutes)
         val msg = if (minutes == null) "Sleep timer off" else "Sleep timer set for ${minutes}m"
-        vm.showStatusMessage(msg)
+        host.showStatusMessage(msg)
     }
 
     private suspend fun performSetRememberPodcastSpeed(feedId: String, enabled: Boolean) {
-        val currentSpeed = vm.playerController.state.value.playbackSpeed
-        vm.repository.setFeedPlaybackSpeed(
+        val currentSpeed = host.playerController.state.value.playbackSpeed
+        host.repository.setFeedPlaybackSpeed(
             feedId = feedId,
             speed = if (enabled) currentSpeed else null,
         )
     }
 
     private suspend fun performSetFeedAutoDownload(feedId: String, enabled: Boolean) {
-        vm.repository.setFeedAutoDownload(feedId = feedId, enabled = enabled)
+        host.repository.setFeedAutoDownload(feedId = feedId, enabled = enabled)
         val msg =
             if (enabled) {
                 "Auto-downloading new episodes for this podcast"
             } else {
                 "Disabled auto-download for this podcast"
             }
-        vm.showStatusMessage(msg)
+        host.showStatusMessage(msg)
     }
 
     private suspend fun performSetFeedPlaybackSpeed(feedId: String, speed: Float?) {
         val clamped = speed?.let(::clampPlaybackSpeed)
-        vm.repository.setFeedPlaybackSpeed(feedId = feedId, speed = clamped)
-        val currentEntryId = vm.playerController.state.value.currentEntryId
+        host.repository.setFeedPlaybackSpeed(feedId = feedId, speed = clamped)
+        val currentEntryId = host.playerController.state.value.currentEntryId
         val activeEntry = currentEntryId?.let { id ->
-            vm.latestEntries().firstOrNull { it.id == id }
+            host.latestEntries().firstOrNull { it.id == id }
         }
         if (activeEntry?.feedId == feedId && clamped != null) {
-            vm.playerController.setPlaybackSpeed(clamped)
+            host.playerController.setPlaybackSpeed(clamped)
         }
     }
 
     private suspend fun performToggleQueueMembership(entryId: String) {
-        val inQueue = entryId in vm.settingsRepository.settings.first().queueItemIds
+        val inQueue = entryId in host.settingsRepository.settings.first().queueItemIds
         if (inQueue) {
             performRemoveFromQueue(entryId, showBanner = true)
         } else {
@@ -541,8 +486,8 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performAddToQueue(entryId: String, playNext: Boolean) {
-        val activeAudioId = vm.playerController.state.value.currentEntryId
-        vm.settingsRepository.update { current ->
+        val activeAudioId = host.playerController.state.value.currentEntryId
+        host.settingsRepository.update { current ->
             val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
             if (playNext) {
                 val insertIndex =
@@ -557,24 +502,24 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             }
             current.copy(queueItemIds = withoutTarget)
         }
-        vm.playbackOrchestrator.syncActivePlayerQueueState(vm.playerController)
-        vm.transientState.update { it.copy(contextSheetEntryId = null) }
-        vm.showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
+        host.updateTransient { it.copy(contextSheetEntryId = null) }
+        host.showStatusMessage(if (playNext) "Queued to play next" else "Added to Queue")
     }
 
     private suspend fun performRemoveFromQueue(entryId: String, showBanner: Boolean) {
-        vm.settingsRepository.update { current ->
+        host.settingsRepository.update { current ->
             current.copy(queueItemIds = current.queueItemIds.filterNot { it == entryId })
         }
-        vm.playbackOrchestrator.syncActivePlayerQueueState(vm.playerController)
-        vm.transientState.update { it.copy(contextSheetEntryId = null) }
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
+        host.updateTransient { it.copy(contextSheetEntryId = null) }
         if (showBanner) {
-            vm.showStatusMessage("Removed from Queue")
+            host.showStatusMessage("Removed from Queue")
         }
     }
 
     private suspend fun performMoveQueueItemUp(entryId: String) {
-        vm.settingsRepository.update { current ->
+        host.settingsRepository.update { current ->
             val list = current.queueItemIds.toMutableList()
             val idx = list.indexOf(entryId)
             if (idx > 0) {
@@ -584,12 +529,12 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             }
             current.copy(queueItemIds = list)
         }
-        vm.playbackOrchestrator.syncActivePlayerQueueState(vm.playerController)
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
     }
 
     private suspend fun performMoveQueueItemToTop(entryId: String) {
-        val activeAudioId = vm.playerController.state.value.currentEntryId
-        vm.settingsRepository.update { current ->
+        val activeAudioId = host.playerController.state.value.currentEntryId
+        host.settingsRepository.update { current ->
             val withoutTarget = current.queueItemIds.filterNot { it == entryId }.toMutableList()
             val targetIdx =
                 if (activeAudioId != null && withoutTarget.firstOrNull() == activeAudioId) {
@@ -600,7 +545,7 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
             withoutTarget.add(targetIdx.coerceAtMost(withoutTarget.size), entryId)
             current.copy(queueItemIds = withoutTarget)
         }
-        vm.playbackOrchestrator.syncActivePlayerQueueState(vm.playerController)
-        vm.showStatusMessage("Moved to top of Queue")
+        host.playbackOrchestrator.syncActivePlayerQueueState(host.playerController)
+        host.showStatusMessage("Moved to top of Queue")
     }
 }

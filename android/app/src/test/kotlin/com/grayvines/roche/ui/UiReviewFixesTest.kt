@@ -22,7 +22,6 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
 import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
-import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.playback.SafeRedirectHttpDataSource
 import com.grayvines.roche.playback.parseChaptersFromEpisodeNotes
 import com.grayvines.roche.playback.resolveSafeHttpPlaybackUrl
@@ -263,13 +262,12 @@ class UiReviewFixesTest {
                 readerContent = articleFull,
                 activePlayerNotesContent = podcastFull,
                 allEntries = listOf(article, podcast),
-                playerState = PodcastPlayerState(currentEntryId = "pod-1"),
             )
 
         assertEquals(articleFull.contentHtml, state.activeReaderEntry?.contentHtml)
-        assertEquals(podcastFull.contentHtml, state.activePlayerEntry?.contentHtml)
+        assertEquals(podcastFull.contentHtml, state.resolveActivePlayerEntry("pod-1")?.contentHtml)
 
-        val closedReaderTransient =
+        val closed =
             reduceUiAction(
                 TransientUiState(
                     selectedReaderEntryId = "article-1",
@@ -278,8 +276,8 @@ class UiReviewFixesTest {
                 ),
                 MainAction.CloseReader,
             )
-        assertNull(closedReaderTransient.readerContent)
-        assertEquals(podcastFull, closedReaderTransient.activePlayerNotesContent)
+        assertNull(closed.readerContent)
+        assertEquals(podcastFull, closed.activePlayerNotesContent)
     }
 
     @Suppress("LongParameterList")

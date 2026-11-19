@@ -18,6 +18,7 @@ import com.grayvines.roche.media.ThumbnailLoader
 import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
 import com.grayvines.roche.playback.ExoPlayerAudioBackend
 import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
 import com.grayvines.roche.playback.PodcastPlayerController
 import com.grayvines.roche.playback.createManagedPlayerController
 import java.io.File
@@ -120,11 +121,19 @@ class AppGraph(context: Context) : AutoCloseable {
         )
     }
 
+    val playbackOrchestrator: PodcastPlaybackOrchestrator by lazy {
+        PodcastPlaybackOrchestrator(
+            repository = repository,
+            settingsRepository = settings,
+        )
+    }
+
     val playerController: PodcastPlayerController by lazy {
         createManagedPlayerController(
             scope = appScope,
             repository = repository,
             settingsRepository = settings,
+            orchestrator = playbackOrchestrator,
             playerBackend = audioPlayerBackend,
             mediaSessionBridge = mediaSessionBridge,
         )

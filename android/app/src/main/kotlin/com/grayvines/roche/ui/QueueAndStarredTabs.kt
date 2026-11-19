@@ -26,7 +26,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,16 +51,18 @@ import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.ui.components.EntrySourceMetadataRow
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheTopHeader
-import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
+import com.grayvines.roche.ui.components.SyncHeaderActionButton
+import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
@@ -123,9 +124,9 @@ fun StarredTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
 ) {
-    val colors = LocalRocheColors.current
     var selectedTypeFilter by rememberSaveable { mutableStateOf<ContentType?>(null) }
     val orderedRows =
         remember(state.starredEntries, state.catalog.entriesByCollectionId) {
@@ -137,35 +138,36 @@ fun StarredTabContent(
         }
     val totalCount = orderedRows.size
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        StarredListHeaderBar(
-            totalCount = totalCount,
-            isSyncing = state.isSyncing,
-            onAction = onAction,
-        )
-        StarredTypeFilterStrip(
-            allCount = totalCount,
-            selectedType = selectedTypeFilter,
-            onSelectType = { selectedTypeFilter = it },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("starred_pull_to_refresh"),
-        ) {
-            if (visibleRows.isEmpty()) {
-                StarredEmptyPlaceholder(selectedTypeFilter = selectedTypeFilter)
-            } else {
-                StarredEntriesList(
-                    rows = visibleRows,
-                    state = state,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    listState = listState,
-                )
-            }
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "starred_pull_to_refresh",
+        header = {
+            StarredListHeaderBar(
+                totalCount = totalCount,
+                isSyncing = state.isSyncing,
+                onAction = onAction,
+            )
+        },
+        subHeader = {
+            StarredTypeFilterStrip(
+                allCount = totalCount,
+                selectedType = selectedTypeFilter,
+                onSelectType = { selectedTypeFilter = it },
+            )
+        },
+    ) {
+        if (visibleRows.isEmpty()) {
+            StarredEmptyPlaceholder(selectedTypeFilter = selectedTypeFilter)
+        } else {
+            StarredEntriesList(
+                rows = visibleRows,
+                state = state,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                listState = listState,
+            )
         }
     }
 }
@@ -197,7 +199,6 @@ private fun StarredListHeaderBar(
     isSyncing: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
     val subtitle = if (isSyncing) "$totalCount in list · Refreshing…" else "$totalCount in list"
     RocheTopHeader(
         title = "Starred",
@@ -224,17 +225,11 @@ private fun StarredListHeaderBar(
                 modifier = Modifier.testTag("starred_rank_btn"),
             )
         }
-        RocheIconActionButton(
-            contentDescription = "Sync",
+        SyncHeaderActionButton(
+            isSyncing = isSyncing,
             onClick = { onAction(MainAction.SyncNow) },
             modifier = Modifier.testTag("starred_sync_btn"),
-        ) {
-            RefreshIcon(
-                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
-                size = 17.dp,
-                isSpinning = isSyncing,
-            )
-        }
+        )
     }
 }
 
@@ -243,12 +238,14 @@ private fun StarredListHeaderBar(
 private fun StarredEntriesList(
     rows: List<StarredDisplayRow>,
     state: MainUiState,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     listState: LazyListState,
 ) {
     val colors = LocalRocheColors.current
     val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
+    val nextQueuedAudioId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().testTag("starred_list"),
@@ -262,8 +259,8 @@ private fun StarredEntriesList(
                         entry = entry,
                         ultraDense = state.settings.ultraDenseRows,
                         swipeToArchiveEnabled = state.settings.swipeToArchive,
-                        isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                        isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
+                        isPlayingAudio = entry.id == activeAudioEntryId,
+                        isQueuedNextAudio = entry.id == nextQueuedAudioId,
                         onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                         onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                         onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
@@ -273,17 +270,14 @@ private fun StarredEntriesList(
                 }
                 is StarredDisplayRow.CatalogRow -> {
                     val catItem = row.item
-                    val extUrl = catItem.entry.url?.takeIf { it.isNotBlank() }
-                    val onOpen: (() -> Unit)? =
-                        when {
-                            catItem.entry.id in readableIds -> {
-                                { onAction(MainAction.OpenReader(catItem.entry.id)) }
-                            }
-                            extUrl != null -> {
-                                { onOpenExternalUrl(extUrl) }
-                            }
-                            else -> null
-                        }
+                    val onOpen =
+                        resolveCatalogEntryOpenAction(
+                            entryId = catItem.entry.id,
+                            externalUrl = catItem.entry.url,
+                            readableIds = readableIds,
+                            onOpenReader = { entryId -> onAction(MainAction.OpenReader(entryId)) },
+                            onOpenExternalUrl = onOpenExternalUrl,
+                        )
                     StarredCatalogEntryRow(
                         item = catItem,
                         onOpen = onOpen,
@@ -412,8 +406,8 @@ fun QueueTabContent(
     onAction: (MainAction) -> Unit,
     upNextListState: LazyListState = rememberLazyListState(),
     historyListState: LazyListState = rememberLazyListState(),
+    activeAudioEntryId: String? = null,
 ) {
-    val colors = LocalRocheColors.current
     var showHistory by rememberSaveable { mutableStateOf(false) }
     val queueEntries = state.queueEntries
     val historyEntries = state.listeningHistoryEntries
@@ -425,48 +419,51 @@ fun QueueTabContent(
             audioCount > 0 -> "${queueEntries.size} items · $audioCount audio"
             else -> "${queueEntries.size} items"
         }
+    val nextQueuedAudio = state.resolveNextQueuedAudioEntry(activeAudioEntryId)
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Queue",
-            subtitle = subtitle,
-        ) {
-            if (state.nextQueuedAudioEntry != null && state.playerState.currentEntryId == null) {
-                HeaderActionButton(
-                    label = "▶ Play Audio",
-                    onClick = { onAction(MainAction.SkipToNextQueuedAudio) },
-                    modifier = Modifier.testTag("queue_play_audio_btn"),
-                )
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "queue_pull_to_refresh",
+        header = {
+            RocheTopHeader(
+                title = "Queue",
+                subtitle = subtitle,
+            ) {
+                if (nextQueuedAudio != null && activeAudioEntryId == null) {
+                    HeaderActionButton(
+                        label = "▶ Play Audio",
+                        onClick = { onAction(MainAction.SkipToNextQueuedAudio) },
+                        modifier = Modifier.testTag("queue_play_audio_btn"),
+                    )
+                }
             }
-        }
-        QueueModeFilterRow(
-            queueCount = queueEntries.size,
-            historyCount = historyEntries.size,
-            showHistory = showHistory,
-            onSelectHistory = { showHistory = it },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("queue_pull_to_refresh"),
-        ) {
-            if (showHistory) {
-                ListeningHistoryListContent(
-                    historyEntries = historyEntries,
-                    state = state,
-                    onAction = onAction,
-                    listState = historyListState,
-                )
-            } else {
-                UpNextQueueListContent(
-                    queueEntries = queueEntries,
-                    state = state,
-                    onAction = onAction,
-                    listState = upNextListState,
-                )
-            }
+        },
+        subHeader = {
+            QueueModeFilterRow(
+                queueCount = queueEntries.size,
+                historyCount = historyEntries.size,
+                showHistory = showHistory,
+                onSelectHistory = { showHistory = it },
+            )
+        },
+    ) {
+        if (showHistory) {
+            ListeningHistoryListContent(
+                historyEntries = historyEntries,
+                state = state,
+                activeAudioEntryId = activeAudioEntryId,
+                onAction = onAction,
+                listState = historyListState,
+            )
+        } else {
+            UpNextQueueListContent(
+                queueEntries = queueEntries,
+                activeAudioEntryId = activeAudioEntryId,
+                nextQueuedAudioId = nextQueuedAudio?.id,
+                onAction = onAction,
+                listState = upNextListState,
+            )
         }
     }
 }
@@ -505,7 +502,8 @@ private fun QueueModeFilterRow(
 @Composable
 private fun UpNextQueueListContent(
     queueEntries: List<InboxEntry>,
-    state: MainUiState,
+    activeAudioEntryId: String?,
+    nextQueuedAudioId: String?,
     onAction: (MainAction) -> Unit,
     listState: LazyListState,
 ) {
@@ -537,8 +535,8 @@ private fun UpNextQueueListContent(
             QueueEntryRowItem(
                 entry = entry,
                 canMoveUp = index > 0,
-                isPlayingAudio = entry.id == state.playerState.currentEntryId,
-                isQueuedNextAudio = entry.id == state.nextQueuedAudioEntryId,
+                isPlayingAudio = entry.id == activeAudioEntryId,
+                isQueuedNextAudio = entry.id == nextQueuedAudioId,
                 onOpen = { onAction(MainAction.OpenReader(entry.id)) },
                 onLongPress = { onAction(MainAction.OpenContextSheet(entry.id)) },
                 onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
@@ -556,6 +554,7 @@ private fun UpNextQueueListContent(
 private fun ListeningHistoryListContent(
     historyEntries: List<InboxEntry>,
     state: MainUiState,
+    activeAudioEntryId: String?,
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
 ) {
@@ -586,7 +585,7 @@ private fun ListeningHistoryListContent(
         items(items = historyEntries, key = { it.id }) { entry ->
             ListeningHistoryRowItem(
                 entry = entry,
-                isPlaying = entry.id == state.playerState.currentEntryId,
+                isPlaying = entry.id == activeAudioEntryId,
                 inQueue = state.isEntryInQueue(entry.id),
                 onAction = onAction,
             )
@@ -775,42 +774,13 @@ private fun QueueEntryTextColumn(
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
     Column(modifier = modifier) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            SiteFaviconBadge(
-                primaryFaviconUrl = entry.faviconUrl,
-                fallbackFaviconUrl = entry.fallbackFaviconUrl,
-                domain = entry.displayDomain,
-                title = entry.feedTitle,
-                size = 14.dp,
-            )
-            Text(
-                text = entry.feedTitle,
-                color = colors.textSecondary,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
-            )
-            Text(
-                text = "· ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.5.sp,
-                maxLines = 1,
-            )
-            if (entry.isCachedOffline) {
-                Text(
-                    text = "↓",
-                    color = colors.accentVerdigris,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                )
-            }
-        }
+        EntrySourceMetadataRow(
+            entry = entry,
+            trailingMetaText =
+                "· ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
+            trailingMetaFontSize = 10.5.sp,
+            showOfflineIndicator = true,
+        )
         Spacer(modifier = Modifier.height(3.dp))
         Text(
             text = entry.title,

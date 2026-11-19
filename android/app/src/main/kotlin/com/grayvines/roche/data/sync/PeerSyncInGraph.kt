@@ -8,6 +8,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_ITEM
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.canonicalOrderingJson
@@ -35,6 +36,7 @@ import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
+import com.grayvines.roche.data.local.FeedSourceEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
@@ -42,6 +44,72 @@ import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.ranking.EpRankingEngine
+
+private class GraphEdgesBatchCache(private val dao: RocheDao) {
+    private var tombstonesByType: MutableMap<String, MutableMap<String, TombstoneEntity>>? = null
+    private var feedSources: List<FeedSourceEntity>? = null
+    private var specsByIdCache: Map<String, CollectionSpecEntity>? = null
+    private var membershipsByKeyCache: MutableMap<Pair<String, String>, CollectionEntryEntity>? =
+        null
+
+    suspend fun tombstonesFor(entityType: String): MutableMap<String, TombstoneEntity> {
+        val grouped =
+            tombstonesByType
+                ?: HashMap<String, MutableMap<String, TombstoneEntity>>().also { map ->
+                    for (tomb in dao.getAllTombstones()) {
+                        map.getOrPut(tomb.entityType.lowercase()) { HashMap() }[tomb.naturalKey] =
+                            tomb
+                    }
+                    tombstonesByType = map
+                }
+        return grouped.getOrPut(entityType.lowercase()) { HashMap() }
+    }
+
+    fun removeTombstone(entityType: String, naturalKey: String) {
+        tombstonesByType?.get(entityType.lowercase())?.remove(naturalKey)
+    }
+
+    suspend fun feedSources(): List<FeedSourceEntity> =
+        feedSources ?: dao.getAllFeedSources().also { feedSources = it }
+
+    suspend fun specsById(): Map<String, CollectionSpecEntity> =
+        specsByIdCache
+            ?: dao.getAllCollectionSpecs()
+                .associateBy { it.collectionId }
+                .also {
+                    specsByIdCache = it
+                }
+
+    suspend fun membershipsByKey(): MutableMap<Pair<String, String>, CollectionEntryEntity> =
+        membershipsByKeyCache
+            ?: dao.getAllCollectionEntries()
+                .associateByTo(HashMap()) { it.collectionId to it.entryId }
+                .also { membershipsByKeyCache = it }
+
+    fun putMemberships(rows: List<CollectionEntryEntity>) {
+        val map = membershipsByKeyCache ?: return
+        for (row in rows) {
+            map[row.collectionId to row.entryId] = row
+        }
+    }
+
+    fun removeMembership(collectionId: String, entryId: String) {
+        membershipsByKeyCache?.remove(collectionId to entryId)
+    }
+
+    suspend fun refreshMembershipsForEntry(entryId: String) {
+        val map = membershipsByKeyCache ?: return
+        val iter = map.entries.iterator()
+        while (iter.hasNext()) {
+            if (iter.next().key.second == entryId) {
+                iter.remove()
+            }
+        }
+        for (row in dao.getCollectionEntriesForEntry(entryId)) {
+            map[row.collectionId to row.entryId] = row
+        }
+    }
+}
 
 @Suppress("LongParameterList")
 internal suspend fun mergeIncomingGraphEdgesInTx(
@@ -55,8 +123,10 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     nowIso: String,
     nowMs: Long = System.currentTimeMillis(),
 ) {
+    val cache = GraphEdgesBatchCache(dao)
     mergeCollectionEntriesInDao(
         dao = dao,
+        cache = cache,
         incoming = response.collectionEntries,
         redirects = redirects,
         suppressedEntryIds = suppressedEntryIds,
@@ -64,9 +134,10 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         nowIso = nowIso,
         nowMs = nowMs,
     )
-    enforceLinkedItemTombstones(dao)
+    enforceLinkedItemTombstones(dao, cache)
     mergeConsumptionLogsInDao(
         dao = dao,
+        cache = cache,
         incoming = response.consumptionLog,
         redirects = redirects,
         serverNode = serverNode,
@@ -83,6 +154,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     )
     mergeIncomingGeneratorsInDao(
         dao = dao,
+        cache = cache,
         catalogStore = catalogStore,
         incoming = response.collectionGenerators,
         redirects = redirects,
@@ -94,22 +166,22 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     )
 }
 
-private suspend fun enforceLinkedItemTombstones(dao: RocheDao) {
-    val itemTombstones =
-        dao.getAllTombstones()
-            .filter { it.entityType.equals("item", ignoreCase = true) }
-            .associateBy { it.naturalKey }
+private suspend fun enforceLinkedItemTombstones(dao: RocheDao, cache: GraphEdgesBatchCache) {
+    val itemTombstones = cache.tombstonesFor(TOMBSTONE_ENTITY_ITEM)
     if (itemTombstones.isEmpty()) return
-
+    val tombstonedItemUrls = extractTombstonedItemUrls(itemTombstones.keys)
     val feedUrlsByColId =
-        dao.getAllFeedSources().associate { it.collectionId to canonicalizeSyncUrl(it.feedUrl) }
+        cache.feedSources().associate { it.collectionId to canonicalizeSyncUrl(it.feedUrl) }
     val membershipsByEntry =
-        dao.getAllCollectionEntries().groupBy({ it.entryId }, { it.collectionId })
+        cache.membershipsByKey().values.groupBy({ it.entryId }, { it.collectionId })
     val statesById = dao.getAllEntryStates().associateBy { it.entryId }
 
     for (entry in dao.getAllEntries()) {
+        val rawUrl = entry.url?.takeIf { it.isNotBlank() }
+        if (rawUrl == null || canonicalizeSyncUrl(rawUrl) !in tombstonedItemUrls) continue
         reconcileLinkedInboxTombstone(
             dao = dao,
+            cache = cache,
             entry = entry,
             state = statesById[entry.id],
             entryColIds = membershipsByEntry[entry.id].orEmpty(),
@@ -119,9 +191,19 @@ private suspend fun enforceLinkedItemTombstones(dao: RocheDao) {
     }
 }
 
+private fun extractTombstonedItemUrls(keys: Set<String>): Set<String> = buildSet {
+    for (natKey in keys) {
+        val sep = natKey.indexOf('\u0000')
+        if (sep >= 0 && sep + 1 < natKey.length) {
+            add(canonicalizeSyncUrl(natKey.substring(sep + 1)))
+        }
+    }
+}
+
 @Suppress("LongParameterList")
 private suspend fun reconcileLinkedInboxTombstone(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     entry: EntryEntity,
     state: EntryStateEntity?,
     entryColIds: List<String>,
@@ -142,15 +224,19 @@ private suspend fun reconcileLinkedInboxTombstone(
         } else {
             feedUrls.map { itemNaturalKey(it, itemUrl) }
         }
-    val activeTomb = keys.mapNotNull { itemTombstones[it] }.maxByOrNull { it.hlc } ?: return
-    if (state.hlc > activeTomb.hlc) {
-        dao.deleteTombstone("item", activeTomb.naturalKey)
+    val activeTomb =
+        keys.mapNotNull { itemTombstones[it] }.maxWithOrNull { a, b -> compareHlc(a.hlc, b.hlc) }
+            ?: return
+    if (compareHlc(state.hlc, activeTomb.hlc) > 0) {
+        dao.deleteTombstone(TOMBSTONE_ENTITY_ITEM, activeTomb.naturalKey)
+        cache.removeTombstone(TOMBSTONE_ENTITY_ITEM, activeTomb.naturalKey)
     } else {
         dao.deleteItemPreservingHistory(
             itemId = entry.id,
             recordTombstones = false,
             hlcOverride = activeTomb.hlc,
         )
+        cache.refreshMembershipsForEntry(entry.id)
     }
 }
 
@@ -173,6 +259,7 @@ private suspend fun isManualInboxItemActive(
 @Suppress("LongParameterList")
 private suspend fun mergeCollectionEntriesInDao(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     incoming: List<SyncCollectionEntryDto>,
     redirects: Map<String, String>,
     suppressedEntryIds: Set<String>,
@@ -181,17 +268,13 @@ private suspend fun mergeCollectionEntriesInDao(
     nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
-    val existingMemberships =
-        dao.getAllCollectionEntries().associateBy { it.collectionId to it.entryId }
-    val feedIds = dao.getAllFeedSources().mapTo(HashSet()) { it.collectionId }
+    val existingMemberships = cache.membershipsByKey()
+    val feedIds = cache.feedSources().mapTo(HashSet()) { it.collectionId }
     val childrenByParent = HashMap<String, MutableSet<String>>()
     for ((colId, entryId) in existingMemberships.keys) {
         childrenByParent.getOrPut(colId) { HashSet() }.add(entryId)
     }
-    val tombstones =
-        dao.getAllTombstones()
-            .filter { it.entityType.equals(TOMBSTONE_ENTITY_COLLECTION_ENTRY, ignoreCase = true) }
-            .associateBy { it.naturalKey }
+    val tombstones = cache.tombstonesFor(TOMBSTONE_ENTITY_COLLECTION_ENTRY)
     val ctx =
         IncomingMembershipCtx(
             redirects = redirects,
@@ -208,6 +291,7 @@ private suspend fun mergeCollectionEntriesInDao(
         val resolved = resolveIncomingMembershipDto(ce, ctx, serverNode, nowIso) ?: continue
         resolved.second?.let { natKey ->
             dao.deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_ENTRY, natKey)
+            cache.removeTombstone(TOMBSTONE_ENTITY_COLLECTION_ENTRY, natKey)
         }
         val row = resolved.first
         childrenByParent.getOrPut(row.collectionId) { HashSet() }.add(row.entryId)
@@ -218,6 +302,7 @@ private suspend fun mergeCollectionEntriesInDao(
     }
     if (upserts.isNotEmpty()) {
         dao.upsertCollectionEntries(upserts)
+        cache.putMemberships(upserts)
     }
     for (fid in linkedFeedIds) {
         dao.clearFallbackFeedTitleForFeed(fid)
@@ -250,7 +335,7 @@ private fun resolveIncomingMembershipDto(
     val memHlc = resolveOrSynthesizeHlc(ce.hlc, ce.addedAt, nowIso, serverNode, ctx.nowMs)
     val natKey = collectionEntryNaturalKey(colId, entryId)
     val tomb = ctx.tombstones[natKey]
-    if (tomb != null && tomb.hlc >= memHlc) return null
+    if (tomb != null && compareHlc(tomb.hlc, memHlc) >= 0) return null
 
     val existing = ctx.existingMemberships[colId to entryId]
     val incomingWins = shouldIncomingWinHlc(memHlc, existing?.hlc, existing?.isLocalDirty == true)
@@ -263,7 +348,7 @@ private fun resolveIncomingMembershipDto(
             entryId = entryId,
             position = ce.position,
             addedAt = ce.addedAt.ifBlank { nowIso },
-            hlc = maxOf(memHlc, existing?.hlc.orEmpty()),
+            hlc = maxHlc(memHlc, existing?.hlc),
             isLocalDirty = false,
         )
     return entity to tomb?.let { natKey }
@@ -290,6 +375,7 @@ private data class IncomingLogsMergePlan(
 @Suppress("LongParameterList")
 private suspend fun mergeConsumptionLogsInDao(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     incoming: List<SyncConsumptionLogDto>,
     redirects: Map<String, String>,
     serverNode: String,
@@ -297,10 +383,7 @@ private suspend fun mergeConsumptionLogsInDao(
     nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
-    val tombstonesById =
-        dao.getAllTombstones()
-            .filter { it.entityType.equals(TOMBSTONE_ENTITY_CONSUMPTION_LOG, ignoreCase = true) }
-            .associateBy { it.naturalKey }
+    val tombstonesById = cache.tombstonesFor(TOMBSTONE_ENTITY_CONSUMPTION_LOG)
     val existingConsumedByEntry =
         dao.getAllConsumptionLogs()
             .filter { ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED }
@@ -315,13 +398,14 @@ private suspend fun mergeConsumptionLogsInDao(
     val plan = acc.toPlan()
     plan.clearedTombstoneIds.forEach {
         dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, it)
+        cache.removeTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, it)
     }
     plan.replacedAutoLogIds.forEach { dao.deleteConsumptionLogById(it) }
     if (plan.toInsert.isNotEmpty()) {
         dao.insertConsumptionLogsIgnore(plan.toInsert)
     }
     if (plan.maxConsumedHlcByEntry.isNotEmpty()) {
-        prunePromotedWantMemberships(dao, plan.maxConsumedHlcByEntry)
+        prunePromotedWantMemberships(dao, cache, plan.maxConsumedHlcByEntry)
     }
 }
 
@@ -384,7 +468,7 @@ private class IncomingLogsAcc(
 
     private fun checkAndClearLogTombstone(id: String, logHlc: String): Boolean {
         val tomb = tombstonesById[id] ?: return true
-        if (tomb.hlc >= logHlc) return false
+        if (compareHlc(tomb.hlc, logHlc) >= 0) return false
         clearedTombstoneIds.add(id)
         return true
     }
@@ -396,9 +480,9 @@ private class IncomingLogsAcc(
     }
 
     private fun recordConsumedHlc(entryId: String, logHlc: String) {
-        var best = maxOf(maxConsumedHlcByEntry[entryId].orEmpty(), logHlc)
+        var best = maxHlc(maxConsumedHlcByEntry[entryId], logHlc)
         for (existing in existingConsumedByEntry[entryId].orEmpty()) {
-            best = maxOf(best, existing.hlc)
+            best = maxHlc(best, existing.hlc)
         }
         maxConsumedHlcByEntry[entryId] = best
     }
@@ -414,22 +498,30 @@ private class IncomingLogsAcc(
 
 private suspend fun prunePromotedWantMemberships(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     maxConsumedHlcByEntry: Map<String, String>,
 ) {
     val wantIds =
-        dao.getAllCollectionSpecs()
+        cache
+            .specsById()
+            .values
             .filter {
                 CollectionRole.fromWireValue(it.role) == CollectionRole.WANT ||
                     it.collectionId == UP_NEXT_COLLECTION_ID
             }
             .mapTo(HashSet()) { it.collectionId }
     if (wantIds.isEmpty()) return
-    for (mem in dao.getAllCollectionEntries()) {
+    val toRemove = ArrayList<Pair<String, String>>()
+    for (mem in cache.membershipsByKey().values) {
         val consumedHlc =
             if (mem.collectionId in wantIds) maxConsumedHlcByEntry[mem.entryId] else null
-        if (consumedHlc != null && mem.hlc <= consumedHlc) {
-            dao.deleteCollectionEntry(mem.collectionId, mem.entryId)
+        if (consumedHlc != null && compareHlc(mem.hlc, consumedHlc) <= 0) {
+            toRemove.add(mem.collectionId to mem.entryId)
         }
+    }
+    for ((colId, entryId) in toRemove) {
+        dao.deleteCollectionEntry(colId, entryId)
+        cache.removeMembership(colId, entryId)
     }
 }
 
@@ -489,6 +581,7 @@ private fun canonicalizeIncomingOrdering(
 @Suppress("LongParameterList")
 private suspend fun mergeIncomingGeneratorsInDao(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     catalogStore: CatalogStore?,
     incoming: List<SyncCollectionGeneratorDto>,
     redirects: Map<String, String>,
@@ -498,11 +591,12 @@ private suspend fun mergeIncomingGeneratorsInDao(
     nowMs: Long,
     allowLocalAutoAdvance: Boolean,
 ) {
-    val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
+    val specsById = cache.specsById()
     val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
     val remoteByColId =
         filterTombstonedGenerators(
             dao = dao,
+            cache = cache,
             remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects),
             serverNode = serverNode,
             nowIso = nowIso,
@@ -531,22 +625,25 @@ private suspend fun mergeIncomingGeneratorsInDao(
 
 private suspend fun filterTombstonedGenerators(
     dao: RocheDao,
+    cache: GraphEdgesBatchCache,
     remoteByColId: Map<String, SyncCollectionGeneratorDto>,
     serverNode: String,
     nowIso: String,
     nowMs: Long,
 ): Map<String, SyncCollectionGeneratorDto> {
     if (remoteByColId.isEmpty()) return remoteByColId
+    val genTombstones = cache.tombstonesFor(TOMBSTONE_ENTITY_COLLECTION_GENERATOR)
     val filtered = LinkedHashMap<String, SyncCollectionGeneratorDto>(remoteByColId.size)
     for ((colId, remote) in remoteByColId) {
-        val tomb = dao.getTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
+        val tomb = genTombstones[colId]
         if (tomb != null) {
             val incHlc =
                 resolveOrSynthesizeHlc(remote.hlc, remote.updatedAt, nowIso, serverNode, nowMs)
-            if (tomb.hlc >= incHlc) {
+            if (compareHlc(tomb.hlc, incHlc) >= 0) {
                 continue
             }
             dao.deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
+            cache.removeTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
         }
         filtered[colId] = remote
     }
@@ -653,12 +750,11 @@ private fun selectBaseGeneratorEntity(
                 )
             val remoteEntryId = remoteGen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
             val localEntryId = localGen?.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
+            val hlcCmp = if (localGen == null) 1 else compareHlc(remHlc, localGen.hlc)
             val preferRemote =
                 localGen == null ||
-                    remHlc > localGen.hlc ||
-                    remHlc == localGen.hlc &&
-                        localEntryId.isNullOrBlank() &&
-                        !remoteEntryId.isNullOrBlank()
+                    hlcCmp > 0 ||
+                    hlcCmp == 0 && localEntryId.isNullOrBlank() && !remoteEntryId.isNullOrBlank()
             when {
                 preferRemote ->
                     CollectionGeneratorEntity(
@@ -670,7 +766,7 @@ private fun selectBaseGeneratorEntity(
                         hlc = remHlc,
                         isLocalDirty = false,
                     )
-                remHlc < localGen.hlc &&
+                hlcCmp < 0 &&
                     (localGen.enabled != remoteGen.enabled || localEntryId != remoteEntryId) ->
                     localGen.copy(isLocalDirty = true)
                 else -> localGen
@@ -690,56 +786,104 @@ private fun selectBaseGeneratorEntity(
         )
 }
 
+internal class DuplicateFoldBatchCache(private val dao: RocheDao) {
+    private var membershipsByKey: MutableMap<Pair<String, String>, CollectionEntryEntity>? = null
+    private var comparisonsById: MutableMap<String, ComparisonEntity>? = null
+    private var generatorsByColId: MutableMap<String, CollectionGeneratorEntity>? = null
+
+    suspend fun membershipsByKey(): MutableMap<Pair<String, String>, CollectionEntryEntity> =
+        membershipsByKey
+            ?: dao.getAllCollectionEntries()
+                .associateByTo(HashMap()) { it.collectionId to it.entryId }
+                .also { membershipsByKey = it }
+
+    suspend fun comparisonsById(): MutableMap<String, ComparisonEntity> =
+        comparisonsById
+            ?: dao.getAllComparisons()
+                .associateByTo(HashMap()) { it.id }
+                .also {
+                    comparisonsById = it
+                }
+
+    suspend fun generatorsByColId(): MutableMap<String, CollectionGeneratorEntity> =
+        generatorsByColId
+            ?: dao.getAllCollectionGenerators()
+                .associateByTo(HashMap()) { it.collectionId }
+                .also { generatorsByColId = it }
+}
+
 internal suspend fun foldMergedDuplicateInDao(
     dao: RocheDao,
     dupId: String,
     canonId: String,
     nowIso: String,
+    cache: DuplicateFoldBatchCache? = null,
 ) {
+    val batch = cache ?: DuplicateFoldBatchCache(dao)
     dao.repointIdentifiersToEntry(dupId, canonId)
-    repointMergedMembershipsInDao(dao, dupId, canonId, nowIso)
+    repointMergedMembershipsInDao(dao, batch, dupId, canonId, nowIso)
     dao.repointConsumptionLogsToEntry(dupId, canonId)
-    repointMergedComparisonsInDao(dao, dupId, canonId)
-    for (gen in dao.getAllCollectionGenerators()) {
+    repointMergedComparisonsInDao(dao, batch, dupId, canonId)
+    val generators = batch.generatorsByColId()
+    val updatedGenerators = ArrayList<CollectionGeneratorEntity>()
+    for (gen in generators.values) {
         if (gen.currentEntryId == dupId) {
-            dao.upsertCollectionGenerator(gen.copy(currentEntryId = canonId, updatedAt = nowIso))
+            val updated = gen.copy(currentEntryId = canonId, updatedAt = nowIso)
+            dao.upsertCollectionGenerator(updated)
+            updatedGenerators.add(updated)
         }
+    }
+    for (updated in updatedGenerators) {
+        generators[updated.collectionId] = updated
     }
 }
 
 private suspend fun repointMergedMembershipsInDao(
     dao: RocheDao,
+    batch: DuplicateFoldBatchCache,
     dupId: String,
     canonId: String,
     nowIso: String,
 ) {
-    val allMemberships = dao.getAllCollectionEntries()
-    val existingPairs = allMemberships.map { it.collectionId to it.entryId }.toHashSet()
+    val memberships = batch.membershipsByKey()
     val migrated = ArrayList<CollectionEntryEntity>()
-    for (mem in allMemberships) {
-        if (mem.entryId == dupId && mem.collectionId != canonId) {
-            if (mem.collectionId to canonId !in existingPairs) {
-                migrated.add(mem.copy(entryId = canonId, addedAt = nowIso))
-            }
-        } else if (mem.collectionId == dupId && mem.entryId != canonId) {
-            if (canonId to mem.entryId !in existingPairs) {
-                migrated.add(mem.copy(collectionId = canonId, addedAt = nowIso))
-            }
-        }
+    val removedKeys = ArrayList<Pair<String, String>>()
+    for ((key, mem) in memberships) {
+        if (mem.entryId != dupId && mem.collectionId != dupId) continue
+        removedKeys.add(key)
+        buildMigratedMembership(mem, memberships, dupId, canonId, nowIso)?.let(migrated::add)
     }
     dao.deleteMergedDupMemberships(dupId)
+    removedKeys.forEach(memberships::remove)
     if (migrated.isNotEmpty()) {
         dao.upsertCollectionEntries(migrated)
+        migrated.forEach { memberships[it.collectionId to it.entryId] = it }
     }
+}
+
+private fun buildMigratedMembership(
+    mem: CollectionEntryEntity,
+    existing: Map<Pair<String, String>, CollectionEntryEntity>,
+    dupId: String,
+    canonId: String,
+    nowIso: String,
+): CollectionEntryEntity? {
+    val targetColId = if (mem.collectionId == dupId) canonId else mem.collectionId
+    val targetEntryId = if (mem.entryId == dupId) canonId else mem.entryId
+    if (targetColId == targetEntryId) return null
+    if (targetColId to targetEntryId in existing) return null
+    return mem.copy(collectionId = targetColId, entryId = targetEntryId, addedAt = nowIso)
 }
 
 private suspend fun repointMergedComparisonsInDao(
     dao: RocheDao,
+    batch: DuplicateFoldBatchCache,
     dupId: String,
     canonId: String,
 ) {
+    val comparisons = batch.comparisonsById()
     val affected =
-        dao.getAllComparisons().filter {
+        comparisons.values.filter {
             it.scopeCollectionId == dupId || it.orderingJson.contains(dupId)
         }
     for (comp in affected) {
@@ -747,16 +891,18 @@ private suspend fun repointMergedComparisonsInDao(
         val newScope = if (comp.scopeCollectionId == dupId) canonId else comp.scopeCollectionId
         val rewritten = rewriteOrderingAfterMerge(parsed, dupId, canonId)
         dao.deleteComparisonById(comp.id)
+        comparisons.remove(comp.id)
         if (rewritten.sumOf { it.size } >= EpRankingEngine.MIN_K) {
             val tsMillis = parseIsoInstant(comp.ts)?.toEpochMilli() ?: 0L
             val newId = deterministicComparisonId(newScope, tsMillis, rewritten)
-            dao.insertComparisonIgnore(
+            val updated =
                 comp.copy(
                     id = newId,
                     scopeCollectionId = newScope,
                     orderingJson = canonicalOrderingJson(rewritten),
                 )
-            )
+            dao.insertComparisonIgnore(updated)
+            comparisons.putIfAbsent(newId, updated)
         }
     }
 }

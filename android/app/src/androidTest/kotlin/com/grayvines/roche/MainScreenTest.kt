@@ -25,6 +25,7 @@ import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainUiState
 import com.grayvines.roche.ui.theme.RocheTheme
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Rule
 import org.junit.Test
 
@@ -518,15 +519,17 @@ class MainScreenTest {
                                 com.grayvines.roche.data.settings.Settings(
                                     queueItemIds = listOf(audioEntry.id, articleEntry.id)
                                 ),
-                            playerState =
-                                com.grayvines.roche.playback.PodcastPlayerState(
-                                    currentEntryId = audioEntry.id,
-                                    isPlaying = true,
-                                    positionMs = 120_000L,
-                                    durationMs = 3_600_000L,
-                                    playbackSpeed = 2.65f,
-                                    isFullscreenOpen = true,
-                                ),
+                            isPlayerFullscreenOpen = true,
+                        ),
+                    playerStateFlow =
+                        MutableStateFlow(
+                            com.grayvines.roche.playback.PodcastPlayerState(
+                                currentEntryId = audioEntry.id,
+                                isPlaying = true,
+                                positionMs = 120_000L,
+                                durationMs = 3_600_000L,
+                                playbackSpeed = 2.65f,
+                            )
                         ),
                     onAction = { dispatched.add(it) },
                     onShareEntry = {},
