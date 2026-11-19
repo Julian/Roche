@@ -458,65 +458,6 @@ class RocheRssWorkflowTest {
         }
 
     @Test
-    fun `classifyNetworkCapabilities maps ethernet wifi cellular and unvalidated states`() {
-        assertEquals(
-            NetworkTier.WIRED,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = true,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.WIFI,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.CELLULAR,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = true,
-            ),
-        )
-        assertEquals(
-            NetworkTier.WIFI,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = false,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.OFFLINE,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = false,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-    }
-
-    @Test
     fun `live network tier provider and background sync adapt weight and offline fallback`() =
         runTest {
             val peerSyncBodies = mutableListOf<String>()

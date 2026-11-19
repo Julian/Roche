@@ -12,8 +12,8 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
 import com.grayvines.roche.data.local.TagRow
-import com.grayvines.roche.data.local.buildFts5MatchQuery
 import com.grayvines.roche.data.local.buildSqlContainsPattern
+import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.local.insertItemTag
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertFeeds
@@ -1002,10 +1002,10 @@ class RocheRepositoryTest {
             assertTrue(snippet?.contains("NeedleInHaystackToken99") == true)
 
             assertEquals(
-                """{title creatorsJson url summary contentText contentHtml fallbackFeedTitle} : ("hello"* "world"* "v2"*)""",
-                buildFts5MatchQuery("  \"hello\" -world: (v2)* "),
+                listOf("\"hello\"*", "\"world\"*", "\"v2\"*"),
+                extractFtsTokenQueries("  \"hello\" -world: (v2)* "),
             )
-            assertNull(buildFts5MatchQuery("--- () *** \"\""))
+            assertTrue(extractFtsTokenQueries("--- () *** \"\"").isEmpty())
             assertTrue(repository.searchDeepEntries("--- () ***").isEmpty())
 
             database.dao().upsertFeeds(SeedData.feeds)
@@ -1153,8 +1153,8 @@ class RocheRepositoryTest {
             dao.upsertTag(TagRow(id = "tag-sys", name = "systems"))
             dao.insertItemTag(ItemTagRow(itemId = uuidId, tagId = "tag-sys"))
 
-            assertNull(buildFts5MatchQuery("\u0000"))
-            assertNull(buildFts5MatchQuery("  \u0000  "))
+            assertTrue(extractFtsTokenQueries("\u0000").isEmpty())
+            assertTrue(extractFtsTokenQueries("  \u0000  ").isEmpty())
             assertEquals("%%", buildSqlContainsPattern("\u0000"))
             assertTrue(repository.searchDeepEntries("\u0000").isEmpty())
             assertTrue(repository.searchDeepEntries("#\u0000").isEmpty())
@@ -1162,9 +1162,9 @@ class RocheRepositoryTest {
             assertTrue(repository.searchDeepEntries("Morning 550e8400").isEmpty())
 
             val twentyTokens = (1..TEST_OVERFLOW_TOKEN_COUNT).joinToString(" ") { "tok$it" }
-            val cappedQuery = buildFts5MatchQuery(twentyTokens).orEmpty()
-            assertTrue(cappedQuery.contains("\"tok16\"*"))
-            assertFalse(cappedQuery.contains("tok17"))
+            val cappedTokens = extractFtsTokenQueries(twentyTokens)
+            assertTrue(cappedTokens.contains("\"tok16\"*"))
+            assertFalse(cappedTokens.any { it.contains("tok17") })
 
             val dupFirst = baseItem.copy(id = "dup-1", title = "StaleBatchToken71")
             val dupSecond = baseItem.copy(id = "dup-1", title = "LatestBatchToken72")

@@ -545,11 +545,6 @@ pub async fn configure_node_https(
     Ok(())
 }
 
-/// Advertises the local Roche server as a Tailscale Service (`svc:<name>`) via `tailscale serve`.
-pub async fn advertise_service(cfg: &TailscaleConfig, port: u16) -> Result<Option<String>> {
-    advertise_service_with_target(cfg, "127.0.0.1", port).await
-}
-
 /// Resolves the local TCP upstream host that `tailscale serve` should proxy to for `listen_host`.
 ///
 /// Maps wildcard/IPv4 loopback binds to `127.0.0.1` while preserving IPv6 loopback (`::1`) and

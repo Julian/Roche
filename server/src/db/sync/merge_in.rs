@@ -24,7 +24,7 @@ use super::{
     },
 };
 use crate::{
-    content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, is_direct_audio_url},
+    content::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, is_direct_audio_url},
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
         ConsumptionStatus, ContentType, EntryKind, FeedRepo, FeedType, HexColor, InboxState,

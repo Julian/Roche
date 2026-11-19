@@ -41,31 +41,22 @@ fun interface NetworkTierProvider {
     fun activeTailnetDomains(): List<String> = emptyList()
 }
 
-@Suppress("LongParameterList")
-internal fun classifyNetworkCapabilities(
-    hasInternet: Boolean,
-    isValidated: Boolean,
-    hasEthernet: Boolean,
-    hasWifi: Boolean,
-    hasCellular: Boolean,
-    isMetered: Boolean,
-): NetworkTier =
-    when {
-        !hasInternet || !isValidated -> NetworkTier.OFFLINE
-        hasEthernet -> NetworkTier.WIRED
-        hasWifi && !isMetered -> NetworkTier.WIFI
-        hasWifi || hasCellular -> NetworkTier.CELLULAR
-        !isMetered -> NetworkTier.WIFI
-        else -> NetworkTier.CELLULAR
-    }
-
+@Serializable
 data class PeerNodeDto(
-    val peerId: String,
-    val deviceName: String,
-    val networkTier: String = NetworkTier.WIFI.wireValue,
+    @SerialName("peer_id") val peerId: String = "",
+    @SerialName("device_name") val deviceName: String = "",
+    @SerialName("network_tier") val networkTier: String = NetworkTier.WIFI.wireValue,
     val weight: Double = NetworkTier.WIFI.defaultWeight,
-    val lastSeenAt: String = "",
+    @SerialName("last_seen_at") val lastSeenAt: String = "",
 )
+
+internal fun PeerNodeDto.normalized(): PeerNodeDto =
+    copy(
+        peerId = peerId.takeIf { it.isNotBlank() }.orEmpty(),
+        deviceName = deviceName.takeIf { it.isNotBlank() }.orEmpty(),
+        networkTier = networkTier.takeIf { it.isNotBlank() } ?: NetworkTier.WIFI.wireValue,
+        lastSeenAt = lastSeenAt.takeIf { it.isNotBlank() }.orEmpty(),
+    )
 
 @Serializable
 data class SyncTombstoneDto(

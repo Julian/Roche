@@ -79,3 +79,28 @@ pub fn resolve_pdf_url(url: &Url) -> Option<Url> {
 pub fn is_valid_pdf_bytes(bytes: &[u8]) -> bool {
     UrlClassifier::is_valid_pdf_bytes(bytes)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_classification_and_pdf_resolution() {
+        let arxiv = Url::parse("https://arxiv.org/abs/2301.07041v2").unwrap();
+        assert_eq!(UrlClassifier::classify(&arxiv), ContentType::Paper);
+        assert_eq!(classify_url(&arxiv), ContentType::Paper);
+        assert_eq!(
+            resolve_pdf_url(&arxiv).unwrap().as_str(),
+            "https://arxiv.org/pdf/2301.07041v2.pdf"
+        );
+
+        let pdf = Url::parse("https://example.com/papers/whitepaper.pdf").unwrap();
+        assert_eq!(classify_url(&pdf), ContentType::Pdf);
+        assert_eq!(resolve_pdf_url(&pdf).unwrap().as_str(), pdf.as_str());
+
+        let yt = Url::parse("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert_eq!(classify_url(&yt), ContentType::Video);
+        assert!(resolve_pdf_url(&yt).is_none());
+    }
+}

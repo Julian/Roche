@@ -34,8 +34,6 @@ internal const val LIST_PREVIEW_HTML_CHARS = 2_048
 internal const val MAX_FTS_QUERY_TOKENS = 16
 
 private const val SEED_EPOCH_ISO = "1970-01-01T00:00:00Z"
-private const val FTS_SEARCHABLE_COLUMNS_PREFIX =
-    "{title creatorsJson url summary contentText contentHtml fallbackFeedTitle} : "
 private val SYNTHETIC_ARTICLE_DURATION_REGEX = Regex("""^\d+m$""")
 
 internal fun truncateInboxItemForStorage(item: InboxItemRow): InboxItemRow {
@@ -110,15 +108,6 @@ internal fun extractFtsTokenQueries(rawQuery: String): List<String> {
     return tokens.take(MAX_FTS_QUERY_TOKENS).map { token ->
         val escaped = token.replace("\"", "\"\"")
         "\"$escaped\"*"
-    }
-}
-
-internal fun buildFts5MatchQuery(rawQuery: String): String? {
-    val tokenQueries = extractFtsTokenQueries(rawQuery)
-    return if (tokenQueries.isEmpty()) {
-        null
-    } else {
-        "$FTS_SEARCHABLE_COLUMNS_PREFIX(${tokenQueries.joinToString(separator = " ")})"
     }
 }
 

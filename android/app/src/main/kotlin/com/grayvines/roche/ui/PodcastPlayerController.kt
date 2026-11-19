@@ -57,22 +57,12 @@ interface PodcastMediaSessionCallbacks {
     fun onSeekToMs(positionMs: Long)
 
     fun onSetPlaybackSpeed(speed: Float)
-
-    fun onAudioFocusLost(transient: Boolean)
-
-    fun onAudioFocusGained()
-
-    fun onAudioBecomingNoisy()
 }
 
 interface PodcastMediaSessionBridge {
     fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks)
 
     fun unbindCallbacks(callbacks: PodcastMediaSessionCallbacks) = Unit
-
-    fun requestAudioFocus(): Boolean
-
-    fun abandonAudioFocus()
 
     fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?)
 
@@ -81,10 +71,6 @@ interface PodcastMediaSessionBridge {
 
 object NoOpPodcastMediaSessionBridge : PodcastMediaSessionBridge {
     override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) = Unit
-
-    override fun requestAudioFocus(): Boolean = true
-
-    override fun abandonAudioFocus() = Unit
 
     override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) = Unit
 
@@ -234,7 +220,6 @@ class PodcastPlayerController(
 
     @Volatile private var tickerJob: Job? = null
     @Volatile private var pausedAtEpochMs: Long? = null
-    @Volatile private var resumeAfterTransientFocusLoss: Boolean = false
     @Volatile private var pendingResumeProgress: Double? = null
     @Volatile private var activeSourceUriOrPath: String = ""
     @Volatile private var backendFailed: Boolean = false
@@ -291,14 +276,12 @@ class PodcastPlayerController(
         smartRewindEnabled: Boolean = _state.value.smartRewindEnabled,
     ) {
         tickerJob?.cancel()
-        val hasFocus = mediaSessionBridge.requestAudioFocus()
         val clampedSpeed = clampPlaybackSpeed(speed)
         val bounds = resolveInitialBounds(entry)
         pendingResumeProgress = bounds.pendingResume
         val parsedChapters = extractBestChaptersFromEntry(entry)
         val resolvedArtworkUrl = resolveArtworkUrl(entry)
         pausedAtEpochMs = null
-        resumeAfterTransientFocusLoss = false
         activeSourceUriOrPath = sourceUriOrPath
         backendFailed = false
         lastPersistedEntryId = entry.id
@@ -310,7 +293,7 @@ class PodcastPlayerController(
                 currentPodcastTitle = entry.feedTitle,
                 currentArtworkUrl = resolvedArtworkUrl,
                 hasNextQueuedAudio = hasNextQueuedAudio,
-                isPlaying = hasFocus,
+                isPlaying = true,
                 isBuffering = true,
                 positionMs = bounds.initialPositionMs,
                 durationMs = bounds.estimatedDurationMs,
@@ -329,7 +312,7 @@ class PodcastPlayerController(
             fallbackDurationMs = bounds.estimatedDurationMs,
             speed = clampedSpeed,
             skipSilenceEnabled = skipSilenceEnabled,
-            playWhenReady = hasFocus,
+            playWhenReady = true,
             onPrepared = { dur -> handleBackendPrepared(entry.id, dur) },
             onCompletion = { handleActiveEpisodeFinished() },
             onError = { handleBackendError(entry.id) },
@@ -365,8 +348,6 @@ class PodcastPlayerController(
         if (_state.value.currentEntryId != entryId) return
         backendFailed = true
         tickerJob?.cancel()
-        resumeAfterTransientFocusLoss = false
-        mediaSessionBridge.abandonAudioFocus()
         _state.update { it.copy(isBuffering = false, isPlaying = false) }
         syncMediaSessionBridge()
         emitUiMessage(DEFAULT_PLAYBACK_ERROR_MESSAGE)
@@ -448,11 +429,9 @@ class PodcastPlayerController(
     ) {
         val current = _state.value
         if (!current.hasActiveEpisode) return
-        resumeAfterTransientFocusLoss = false
         if (current.isPlaying) {
-            pausePlaybackInternal(nowEpochMs = nowEpochMs, abandonFocus = true)
+            pausePlaybackInternal(nowEpochMs = nowEpochMs)
         } else {
-            if (!mediaSessionBridge.requestAudioFocus()) return
             applySmartRewindIfEligible(
                 current = current,
                 smartRewindEnabled = smartRewindEnabled,
@@ -489,12 +468,9 @@ class PodcastPlayerController(
         )
     }
 
-    private fun pausePlaybackInternal(nowEpochMs: Long, abandonFocus: Boolean) {
+    private fun pausePlaybackInternal(nowEpochMs: Long) {
         tickerJob?.cancel()
         backend.pause()
-        if (abandonFocus) {
-            mediaSessionBridge.abandonAudioFocus()
-        }
         pausedAtEpochMs = nowEpochMs
         _state.update { it.copy(isPlaying = false) }
         syncMediaSessionBridge()
@@ -619,13 +595,11 @@ class PodcastPlayerController(
 
     fun stopAndClear() {
         tickerJob?.cancel()
-        resumeAfterTransientFocusLoss = false
         pendingResumeProgress = null
         activeSourceUriOrPath = ""
         backendFailed = false
         lastPersistedEntryId = null
         lastPersistedProgress = -1.0
-        mediaSessionBridge.abandonAudioFocus()
         backend.release()
         _state.value = PodcastPlayerState()
         mediaSessionBridge.updatePlaybackSession(null)
@@ -665,40 +639,10 @@ class PodcastPlayerController(
         onSpeedChangedFromSession(_state.value.playbackSpeed)
     }
 
-    override fun onAudioFocusLost(transient: Boolean) {
-        val current = _state.value
-        if (current.isPlaying) {
-            resumeAfterTransientFocusLoss = transient
-            pausePlaybackInternal(
-                nowEpochMs = System.currentTimeMillis(),
-                abandonFocus = !transient,
-            )
-        } else if (!transient) {
-            resumeAfterTransientFocusLoss = false
-            mediaSessionBridge.abandonAudioFocus()
-        }
-    }
-
-    override fun onAudioFocusGained() {
-        val current = _state.value
-        if (resumeAfterTransientFocusLoss && current.hasActiveEpisode && !current.isPlaying) {
-            resumeAfterTransientFocusLoss = false
-            togglePlayPause()
-        }
-    }
-
-    override fun onAudioBecomingNoisy() {
-        resumeAfterTransientFocusLoss = false
-        if (_state.value.isPlaying) {
-            pausePlaybackInternal(nowEpochMs = System.currentTimeMillis(), abandonFocus = true)
-        }
-    }
-
     private fun handleActiveEpisodeFinished() {
         val snapshotBeforeFinish = _state.value
         val completedId = snapshotBeforeFinish.currentEntryId ?: return
         tickerJob?.cancel()
-        resumeAfterTransientFocusLoss = false
         pendingResumeProgress = null
         if (snapshotBeforeFinish.hasNextQueuedAudio) {
             // Keep the active MediaSession / foreground service alive while transitioning to the
@@ -820,10 +764,8 @@ class PodcastPlayerController(
             nextSleep != current.sleepTimerRemainingSec
 
     private fun stopForSleepTimer(nextPos: Long, updatedDuration: Long) {
-        resumeAfterTransientFocusLoss = false
         pausedAtEpochMs = System.currentTimeMillis()
         backend.pause()
-        mediaSessionBridge.abandonAudioFocus()
         _state.update {
             it.copy(
                 positionMs = nextPos,

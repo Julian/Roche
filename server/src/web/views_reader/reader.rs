@@ -9,7 +9,7 @@ use axum::{
 
 use super::{AddTagForm, FinishItemForm, ProgressForm, render_audio_play_button};
 use crate::{
-    content::fetcher::HtmlSanitizer,
+    content::HtmlSanitizer,
     db::{ConsumptionStatus, EntryKind, ItemStatus, MediaType, ReadAtPatch, SyncRepo},
     error::ApiError,
     scheduler::FeedFetcher,

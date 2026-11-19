@@ -113,40 +113,6 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
-    pub async fn list_tombstones(
-        &self,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<SyncTombstone>> {
-        let rows = match since {
-            None => {
-                sqlx::query_as::<_, SyncTombstone>(
-                    "SELECT entity_type, natural_key, deleted_at, hlc
-                     FROM sync_tombstones
-                     ORDER BY sync_seq ASC",
-                )
-                .fetch_all(self.pool)
-                .await?
-            }
-            Some(ts) => {
-                sqlx::query_as::<_, SyncTombstone>(
-                    "SELECT entity_type, natural_key, deleted_at, hlc
-                     FROM sync_tombstones
-                     WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) >= strftime('%Y-%m-%dT%H:%M:%fZ', ?)
-                     ORDER BY sync_seq ASC",
-                )
-                .bind(ts)
-                .fetch_all(self.pool)
-                .await?
-            }
-        };
-        Ok(rows)
-    }
-
-    pub async fn list_activity(&self) -> Result<Vec<ActivityEntry>> {
-        let mut conn = self.pool.acquire().await?;
-        Self::list_activity_in_tx(&mut conn).await
-    }
-
     pub(crate) async fn list_activity_in_tx(
         conn: &mut SqliteConnection,
     ) -> Result<Vec<ActivityEntry>> {

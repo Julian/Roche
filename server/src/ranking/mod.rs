@@ -6,6 +6,7 @@ pub mod board;
 pub use board::{RankBoard, RankBoardRow};
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     hash::BuildHasher,
 };
@@ -351,19 +352,34 @@ pub fn rescale_to_quantiles<S: BuildHasher>(
     buckets
 }
 
-/// Orders item IDs from highest score to lowest score with deterministic tie-breaking.
-#[must_use]
-pub fn rank_ids_by_score<S: BuildHasher>(
-    item_ids: &[String],
+/// Sorts `items` in place from highest posterior mean to lowest, grouping items whose means
+/// differ by at most [`MEAN_TIE_EPSILON`] and ordering each tie band with `tie_cmp`.
+pub fn sort_by_score_with_ties<T, S, IdFn, TieCmp>(
+    items: &mut [T],
     scores: &HashMap<String, Score, S>,
-) -> Vec<String> {
-    let mut out = item_ids.to_vec();
-    out.sort_by(|a, b| {
-        let ma = scores.get(a).copied().unwrap_or_default().mean;
-        let mb = scores.get(b).copied().unwrap_or_default().mean;
-        mb.total_cmp(&ma).then_with(|| a.cmp(b))
-    });
-    out
+    id_of: IdFn,
+    mut tie_cmp: TieCmp,
+) where
+    S: BuildHasher,
+    IdFn: Fn(&T) -> &str,
+    TieCmp: FnMut(&T, &T) -> Ordering,
+{
+    let mean_of = |item: &T| scores.get(id_of(item)).copied().unwrap_or_default().mean;
+    items.sort_by(|a, b| mean_of(b).total_cmp(&mean_of(a)).then_with(|| tie_cmp(a, b)));
+    let mut tie_start = 0usize;
+    while tie_start < items.len() {
+        let base_mean = mean_of(&items[tie_start]);
+        let mut tie_end = tie_start + 1;
+        while tie_end < items.len()
+            && (mean_of(&items[tie_end]) - base_mean).abs() <= MEAN_TIE_EPSILON
+        {
+            tie_end += 1;
+        }
+        if tie_end - tie_start > 1 {
+            items[tie_start..tie_end].sort_by(&mut tie_cmp);
+        }
+        tie_start = tie_end;
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -791,5 +807,31 @@ mod tests {
         let focus = vec!["a".to_owned()];
         let cluster = select_cluster(&scores, &items, 5, false, Some(&focus), &mut rng);
         assert_eq!(cluster, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn test_sort_by_score_with_ties_groups_epsilon_bands() {
+        let mut items = vec![
+            ("id-z", "Zebra"),
+            ("id-low", "Aardvark"),
+            ("id-a", "alpha"),
+            ("id-unscored-b", "Beta"),
+            ("id-unscored-a", "Alpha"),
+        ];
+        let scores = HashMap::from([
+            ("id-z".to_owned(), Score { mean: 1.0, variance: 0.2 }),
+            ("id-a".to_owned(), Score { mean: 1.0 - MEAN_TIE_EPSILON * 0.5, variance: 0.2 }),
+            ("id-low".to_owned(), Score { mean: -1.0, variance: 0.2 }),
+        ]);
+
+        sort_by_score_with_ties(
+            &mut items,
+            &scores,
+            |&(id, _)| id,
+            |a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then_with(|| a.0.cmp(b.0)),
+        );
+
+        let ordered_ids: Vec<&str> = items.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ordered_ids, vec!["id-a", "id-z", "id-unscored-a", "id-unscored-b", "id-low"]);
     }
 }

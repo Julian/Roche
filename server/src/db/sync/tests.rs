@@ -1162,35 +1162,14 @@ fn test_cross_stack_golden_vectors() {
             std::collections::HashMap::new()
         };
         let mut sorted: Vec<&RankedEntryInput> = case.entries.iter().collect();
-        sorted.sort_by(|a, b| {
-            let sa = scores.get(&a.id).copied().unwrap_or_default().mean;
-            let sb = scores.get(&b.id).copied().unwrap_or_default().mean;
-            sb.total_cmp(&sa)
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let mut i = 0usize;
-        while i < sorted.len() {
-            let base = scores.get(&sorted[i].id).copied().unwrap_or_default().mean;
-            let mut j = i + 1;
-            while j < sorted.len() {
-                let cur = scores.get(&sorted[j].id).copied().unwrap_or_default().mean;
-                if (cur - base).abs() <= crate::ranking::MEAN_TIE_EPSILON {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j - i > 1 {
-                sorted[i..j].sort_by(|a, b| {
-                    a.title
-                        .to_lowercase()
-                        .cmp(&b.title.to_lowercase())
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-            }
-            i = j;
-        }
+        crate::ranking::sort_by_score_with_ties(
+            &mut sorted,
+            &scores,
+            |entry| entry.id.as_str(),
+            |a, b| {
+                a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id))
+            },
+        );
         assert_eq!(
             sorted.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
             case.expected_ids,

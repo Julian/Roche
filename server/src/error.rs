@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::content::fetcher::SsrfBlockedError;
+use crate::content::SsrfBlockedError;
 
 /// RFC 9457 §4.2.1 blank problem type URI for generic HTTP status responses.
 pub const PROBLEM_TYPE_BLANK: &str = "about:blank";

@@ -8,7 +8,12 @@ import com.grayvines.roche.data.SyncComparisonDto
 import com.grayvines.roche.data.SyncConsumptionLogDto
 import com.grayvines.roche.data.SyncEntryRecordDto
 import com.grayvines.roche.data.SyncTombstoneDto
+import com.grayvines.roche.data.normalizeConsecutiveFailures
 import java.io.IOException
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 
 object RocheProblemTypes {
     const val BLANK = "about:blank"
@@ -58,24 +63,43 @@ fun formatProblemDetailsMessage(error: ProblemDetailsException): String =
         else -> error.detail.ifBlank { error.message ?: "${error.title} (${error.statusCode})" }
     }
 
+@Serializable
 @Suppress("LongParameterList")
 data class RemoteFeedDto(
-    val id: String,
-    val title: String,
-    val url: String,
-    val siteUrl: String?,
-    val feedType: String,
-    val unreadCount: Int,
+    val id: String = "",
+    val title: String = "",
+    val url: String = "",
+    @SerialName("site_url") val siteUrl: String? = null,
+    @SerialName("feed_type") val feedType: String = DEFAULT_FEED_TYPE,
+    @SerialName("unread_count") val unreadCount: Int = 0,
     val description: String? = null,
     val language: String? = null,
-    val pollInterval: Int = 30,
-    val lastPolled: String? = null,
-    val lastPolledBy: String? = null,
-    val lastError: String? = null,
-    val lastErrorBy: String? = null,
-    val consecutiveFailures: Int = 0,
-    val isActive: Boolean = true,
+    @SerialName("poll_interval") val pollInterval: Int = DEFAULT_POLL_INTERVAL,
+    @SerialName("last_polled") val lastPolled: String? = null,
+    @SerialName("last_polled_by") val lastPolledBy: String? = null,
+    @SerialName("last_error") val lastError: String? = null,
+    @SerialName("last_error_by") val lastErrorBy: String? = null,
+    @SerialName("consecutive_failures") val consecutiveFailures: Int = 0,
+    @SerialName("is_active") val isActive: Boolean = true,
 )
+
+internal fun RemoteFeedDto.normalized(): RemoteFeedDto {
+    val cleanLastError = lastError.nullIfBlank()
+    return copy(
+        id = id.nullIfBlank().orEmpty(),
+        title = title.nullIfBlank().orEmpty(),
+        url = url.nullIfBlank().orEmpty(),
+        siteUrl = siteUrl.nullIfBlank(),
+        feedType = feedType.nullIfBlank() ?: DEFAULT_FEED_TYPE,
+        description = description.nullIfBlank(),
+        language = language.nullIfBlank(),
+        lastPolled = lastPolled.nullIfBlank(),
+        lastPolledBy = lastPolledBy.nullIfBlank(),
+        lastError = cleanLastError,
+        lastErrorBy = cleanLastError?.let { lastErrorBy.nullIfBlank() },
+        consecutiveFailures = normalizeConsecutiveFailures(cleanLastError, consecutiveFailures),
+    )
+}
 
 @Suppress("LongParameterList")
 data class RemoteItemDto(
@@ -104,53 +128,64 @@ data class RemoteItemDto(
     val audioUrl: String? = null,
 )
 
-data class RemoteTagDto(
-    val id: String,
-    val name: String,
-    val unreadCount: Int,
-    val color: String? = null,
-)
-
+@Serializable
+@OptIn(ExperimentalSerializationApi::class)
 @Suppress("LongParameterList")
 data class PeerSyncRequestDto(
-    val peerId: String,
-    val deviceName: String? = null,
+    @SerialName("peer_id") val peerId: String,
+    @SerialName("device_name") val deviceName: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("network_tier")
     val networkTier: String = NetworkTier.WIFI.wireValue,
     val weight: Double? = null,
-    val sinceSeq: Long = 0L,
-    val clientHlc: String? = null,
+    @SerialName("since_seq") val sinceSeq: Long = 0L,
+    @SerialName("client_hlc") val clientHlc: String? = null,
     val entries: List<SyncEntryRecordDto> = emptyList(),
+    @SerialName("collection_entries")
     val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
+    @SerialName("collection_generators")
     val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
-    val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
     val comparisons: List<SyncComparisonDto> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
 )
 
+@Serializable
 @Suppress("LongParameterList")
 data class PeerSyncResponseDto(
-    val serverPeerId: String,
-    val syncSeq: Long = 0L,
-    val serverHlc: String = "",
-    val syncTimestamp: String = "",
-    val hasMore: Boolean = false,
-    val resetRequired: Boolean = false,
-    val activePeers: List<PeerNodeDto> = emptyList(),
+    @SerialName("server_peer_id") val serverPeerId: String = "",
+    @SerialName("sync_seq") val syncSeq: Long = 0L,
+    @SerialName("server_hlc") val serverHlc: String = "",
+    @SerialName("sync_timestamp") val syncTimestamp: String = "",
+    @SerialName("has_more") val hasMore: Boolean = false,
+    @SerialName("reset_required") val resetRequired: Boolean = false,
+    @SerialName("active_peers") val activePeers: List<PeerNodeDto> = emptyList(),
     val entries: List<SyncEntryRecordDto> = emptyList(),
+    @SerialName("collection_entries")
     val collectionEntries: List<SyncCollectionEntryDto> = emptyList(),
+    @SerialName("collection_generators")
     val collectionGenerators: List<SyncCollectionGeneratorDto> = emptyList(),
-    val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
+    @SerialName("consumption_log") val consumptionLog: List<SyncConsumptionLogDto> = emptyList(),
     val comparisons: List<SyncComparisonDto> = emptyList(),
     val tombstones: List<SyncTombstoneDto> = emptyList(),
 )
 
+@Serializable
 data class RemoteMediaDto(
-    val id: String,
-    val itemId: String,
-    val mediaType: String,
-    val fileSize: Long? = null,
-    val mimeType: String? = null,
+    val id: String = "",
+    @SerialName("item_id") val itemId: String = "",
+    @SerialName("media_type") val mediaType: String = DEFAULT_MEDIA_TYPE,
+    @SerialName("file_size") val fileSize: Long? = null,
+    @SerialName("mime_type") val mimeType: String? = null,
 )
+
+internal fun RemoteMediaDto.normalized(): RemoteMediaDto =
+    copy(
+        id = id.nullIfBlank().orEmpty(),
+        itemId = itemId.nullIfBlank().orEmpty(),
+        mediaType = mediaType.nullIfBlank() ?: DEFAULT_MEDIA_TYPE,
+        mimeType = mimeType.nullIfBlank(),
+    )
 
 data class DiscoveredServerDto(
     val probedUrl: String,

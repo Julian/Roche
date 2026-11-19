@@ -98,7 +98,6 @@ class AppGraph(context: Context) : AutoCloseable {
             allowedLocalDirs = listOf(offlineCacheDir, appContext.cacheDir),
             parentScope = appScope,
             httpEngineProvider = { httpTransport.sharedHttpEngine },
-            httpEngineExecutorProvider = { httpTransport.sharedCallbackExecutor },
         )
     }
 

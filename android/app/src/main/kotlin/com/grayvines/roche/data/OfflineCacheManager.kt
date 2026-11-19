@@ -366,11 +366,7 @@ internal suspend fun resolveTargetItemMediaFile(
     }
 
 internal fun mergeHydratedItemDetail(local: InboxItemRow, detail: RemoteItemDto): InboxItemRow =
-    mergeRemoteItemIntoLocal(
-        local = local,
-        remote = detail,
-        adoptRemoteIdentity = false,
-    )
+    mergeRemoteItemIntoLocal(local = local, remote = detail)
 
 internal fun collectEligibleMediaIds(
     remoteMedia: List<RemoteMediaDto>,

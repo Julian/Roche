@@ -24,7 +24,7 @@ use url::Url;
 use crate::{
     auth::{pairing::PairingManager, tokens::TokenManager},
     config::Config,
-    content::fetcher::{HtmlSanitizer, SafeHttpClient, SsrfBlockedError, classify_url},
+    content::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, SsrfBlockedError, classify_url},
     db::{
         ActivityEntry, ArchiveBatchScope, ContentType, Db, DeviceToken, Feed, FeedType, HexColor,
         Item, ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, PeerSyncRequest,
@@ -1148,10 +1148,8 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
             && let Some(paper) = parsed.items.into_iter().next()
         {
             let clean_title = paper.title.split_whitespace().collect::<Vec<_>>().join(" ");
-            let clean_summary = HtmlSanitizer::plain_text_truncate(
-                &paper.summary,
-                crate::content::fetcher::MAX_SUMMARY_CHARS,
-            );
+            let clean_summary =
+                HtmlSanitizer::plain_text_truncate(&paper.summary, MAX_SUMMARY_CHARS);
             let _ = service
                 .db
                 .items()

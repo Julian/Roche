@@ -517,19 +517,6 @@ impl<'a> TagRepo<'a> {
             .await?)
     }
 
-    pub async fn list_all_item_tags(&self) -> Result<Vec<ItemTag>> {
-        Ok(sqlx::query_as!(
-            ItemTag,
-            "SELECT ce.entry_id AS item_id, ce.collection_id AS tag_id
-             FROM collection_entries ce
-             JOIN collection_specs cs ON cs.collection_id = ce.collection_id
-             WHERE cs.collection_role = 'tag'
-             ORDER BY ce.entry_id, ce.collection_id",
-        )
-        .fetch_all(self.pool)
-        .await?)
-    }
-
     pub(crate) async fn list_item_tags_for_items_in_tx(
         conn: &mut SqliteConnection,
         item_ids: &[String],

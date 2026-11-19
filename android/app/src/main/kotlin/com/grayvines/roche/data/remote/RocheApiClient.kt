@@ -4,7 +4,6 @@ import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.File
 
-@Suppress("TooManyFunctions")
 class RocheApiClient(
     private val vpnCheck: VpnTransportCheck,
     private val transport: HttpTransport,
@@ -89,9 +88,6 @@ class RocheApiClient(
         return extractTokenFromPairResponse(body)
     }
 
-    suspend fun fetchFeeds(serverUrl: String, token: String): List<RemoteFeedDto> =
-        parseFeedsJsonArray(serverJson(serverUrl, METHOD_GET, FEEDS_PATH, token))
-
     internal suspend fun createFeed(
         serverUrl: String,
         token: String,
@@ -129,60 +125,6 @@ class RocheApiClient(
             path = feedPath(feedId),
             token = token,
         )
-    }
-
-    internal suspend fun updateFeedTitle(
-        serverUrl: String,
-        bearerToken: String,
-        feedId: String,
-        title: String,
-    ): RemoteFeedDto =
-        updateFeed(serverUrl = serverUrl, token = bearerToken, feedId = feedId, title = title)
-
-    internal suspend fun updateFeed(
-        serverUrl: String,
-        token: String,
-        feedId: String,
-        title: String? = null,
-        pollInterval: Int? = null,
-        isActive: Boolean? = null,
-    ): RemoteFeedDto =
-        parseFeedJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_PATCH,
-                path = feedPath(feedId),
-                token = token,
-                body =
-                    buildUpdateFeedPayload(
-                        title = title,
-                        pollInterval = pollInterval,
-                        isActive = isActive,
-                    ),
-            )
-        )
-
-    suspend fun fetchItems(serverUrl: String, token: String): List<RemoteItemDto> {
-        val baseUrl = serverUrl.trimEnd('/')
-        PublicUrlValidator.ensureSafeServerEndpoint(baseUrl, vpnCheck::isActive)
-        val collected = LinkedHashMap<String, RemoteItemDto>()
-        for (page in 1..MAX_SYNC_PAGES) {
-            val path =
-                if (page == 1) {
-                    "/api/v1/items?per_page=$ITEMS_PER_PAGE"
-                } else {
-                    "/api/v1/items?per_page=$ITEMS_PER_PAGE&page=$page"
-                }
-            val pageItems = parseItemsEnvelopeJson(serverJson(baseUrl, METHOD_GET, path, token))
-            val beforeSize = collected.size
-            pageItems.forEach { item ->
-                if (item.id.isNotBlank() && item.id !in collected) {
-                    collected[item.id] = item
-                }
-            }
-            if (pageItems.size < ITEMS_PER_PAGE || collected.size == beforeSize) break
-        }
-        return collected.values.toList()
     }
 
     internal suspend fun fetchItemDetail(
@@ -352,112 +294,6 @@ class RocheApiClient(
         return parsePeerSyncResponseJson(response.body)
     }
 
-    suspend fun saveItemUrl(
-        serverUrl: String,
-        token: String,
-        url: String,
-        title: String?,
-        tags: List<String>,
-    ): RemoteItemDto =
-        parseItemJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_POST,
-                path = "/api/v1/items/save",
-                token = token,
-                body = buildSaveItemPayload(url = url, title = title, tags = tags),
-            )
-        )
-
-    suspend fun deleteItem(serverUrl: String, token: String, itemId: String) {
-        serverJson(
-            serverUrl = serverUrl,
-            method = METHOD_DELETE,
-            path = itemPath(itemId),
-            token = token,
-        )
-    }
-
-    internal suspend fun updateItem(
-        serverUrl: String,
-        token: String,
-        itemId: String,
-        status: String? = null,
-        isFavorite: Boolean? = null,
-        readProgress: Double? = null,
-        readAt: String? = null,
-    ): RemoteItemDto =
-        parseItemJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_PATCH,
-                path = itemPath(itemId),
-                token = token,
-                body =
-                    buildUpdateItemPayload(
-                        status = status,
-                        isFavorite = isFavorite,
-                        readProgress = readProgress,
-                        readAt = readAt,
-                    ),
-            )
-        )
-
-    suspend fun fetchTags(serverUrl: String, token: String): List<RemoteTagDto> =
-        parseTagsJsonArray(serverJson(serverUrl, METHOD_GET, "/api/v1/tags", token))
-
-    internal suspend fun addTagToItem(
-        serverUrl: String,
-        token: String,
-        itemId: String,
-        tagName: String,
-    ): List<RemoteTagDto> =
-        parseTagsJsonArray(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_POST,
-                path = "${itemPath(itemId)}/tags",
-                token = token,
-                body = buildAddItemTagPayload(tagName),
-            )
-        )
-
-    internal suspend fun removeTagFromItem(
-        serverUrl: String,
-        token: String,
-        itemId: String,
-        tagId: String,
-    ) {
-        serverJson(
-            serverUrl = serverUrl,
-            method = METHOD_DELETE,
-            path = "${itemPath(itemId)}/tags/${encodePathSegment(tagId)}",
-            token = token,
-        )
-    }
-
-    internal suspend fun archiveBatch(
-        serverUrl: String,
-        token: String,
-        itemIds: List<String> = emptyList(),
-        feedId: String? = null,
-        allUnread: Boolean = false,
-    ): Int =
-        parseArchivedCountJson(
-            serverJson(
-                serverUrl = serverUrl,
-                method = METHOD_POST,
-                path = "/api/v1/items/archive-batch",
-                token = token,
-                body =
-                    buildArchiveBatchPayload(
-                        itemIds = itemIds,
-                        feedId = feedId,
-                        allUnread = allUnread,
-                    ),
-            )
-        )
-
     internal suspend fun importOpml(
         serverUrl: String,
         token: String,
@@ -485,10 +321,7 @@ class RocheApiClient(
         private const val ITEMS_PATH = "/api/v1/items"
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
-        private const val METHOD_PATCH = "PATCH"
         private const val METHOD_DELETE = "DELETE"
-        private const val ITEMS_PER_PAGE = 200
-        private const val MAX_SYNC_PAGES = 25
         private const val EXTERNAL_IMAGE_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/124.0.0.0 Mobile Safari/537.36"

@@ -202,26 +202,6 @@ interface RocheDao {
     )
     fun observeItemTags(): Flow<List<ItemTagRow>>
 
-    @Query("SELECT * FROM entries") fun observeEntries(): Flow<List<EntryEntity>>
-
-    @Query("SELECT * FROM entry_identifiers")
-    fun observeEntryIdentifiers(): Flow<List<EntryIdentifierEntity>>
-
-    @Query("SELECT * FROM collection_specs")
-    fun observeCollectionSpecs(): Flow<List<CollectionSpecEntity>>
-
-    @Query("SELECT * FROM collection_entries")
-    fun observeCollectionEntries(): Flow<List<CollectionEntryEntity>>
-
-    @Query("SELECT * FROM collection_generators")
-    fun observeCollectionGenerators(): Flow<List<CollectionGeneratorEntity>>
-
-    @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
-    fun observeConsumptionLogs(): Flow<List<ConsumptionLogEntity>>
-
-    @Query("SELECT * FROM comparisons ORDER BY ts ASC")
-    fun observeComparisons(): Flow<List<ComparisonEntity>>
-
     @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM entries")
     fun observeEntriesStamp(): Flow<String>
 
@@ -314,9 +294,6 @@ interface RocheDao {
 
     @Query("DELETE FROM entries WHERE id = :id") suspend fun deleteRawEntryById(id: String)
 
-    @Query("DELETE FROM entries WHERE id IN (:ids)")
-    suspend fun deleteRawEntriesByIds(ids: List<String>)
-
     @Query("UPDATE entries SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
     suspend fun clearEntryDirtyIfSameHlc(id: String, expectedHlc: String)
 
@@ -330,9 +307,6 @@ interface RocheDao {
     suspend fun markMembershipsDirtyForEntries(ids: List<String>)
 
     // --- Satellite `entry_content` (FTS-safe upserts) ---
-
-    @Query("SELECT * FROM entry_content")
-    suspend fun getAllEntryContents(): List<EntryContentEntity>
 
     @Query("SELECT * FROM entry_content WHERE entryId IN (:ids)")
     suspend fun getEntryContentsByIds(ids: List<String>): List<EntryContentEntity>
@@ -758,12 +732,6 @@ interface RocheDao {
         expectedHlc: String,
     )
 
-    @Query(
-        "UPDATE collection_entries SET isLocalDirty = 1 " +
-            "WHERE collectionId = :collectionId AND entryId = :entryId"
-    )
-    suspend fun markCollectionEntryDirty(collectionId: String, entryId: String)
-
     @Query("SELECT * FROM collection_generators")
     suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
 
@@ -817,9 +785,6 @@ interface RocheDao {
     @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearConsumptionLogsDirty(ids: List<String>)
 
-    @Query("UPDATE consumption_log SET isLocalDirty = 1 WHERE id IN (:ids)")
-    suspend fun markConsumptionLogsDirty(ids: List<String>)
-
     @Query("DELETE FROM consumption_log WHERE id = :id")
     suspend fun deleteConsumptionLogById(id: String)
 
@@ -840,9 +805,6 @@ interface RocheDao {
 
     @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearComparisonsDirty(ids: List<String>)
-
-    @Query("UPDATE comparisons SET isLocalDirty = 1 WHERE id IN (:ids)")
-    suspend fun markComparisonsDirty(ids: List<String>)
 
     @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
 
@@ -880,8 +842,6 @@ interface RocheDao {
         expectedHlc: String,
     )
 
-    @Query("DELETE FROM sync_tombstones") suspend fun clearAllTombstones()
-
     @Query("SELECT flagValue FROM local_sync_flags WHERE flagKey = :key LIMIT 1")
     suspend fun getLocalSyncFlag(key: String): String?
 
@@ -895,9 +855,6 @@ interface RocheDao {
             "THEN excluded.flagValue ELSE local_sync_flags.flagValue END"
     )
     suspend fun upsertLocalSyncFlagIfGreater(key: String, value: String)
-
-    @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
-    suspend fun deleteLocalSyncFlag(key: String)
 
     // --- Catalog History Check ---
 

@@ -188,7 +188,7 @@ impl ItemRepo<'_> {
     }
 
     pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
-        use crate::content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS};
+        use crate::content::{HtmlSanitizer, MAX_SUMMARY_CHARS};
 
         let candidates = sqlx::query!(
             "SELECT e.id,
@@ -272,7 +272,7 @@ impl ItemRepo<'_> {
     }
 
     pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
-        use crate::{content::fetcher::HtmlSanitizer, feeds::youtube::YouTubeParser};
+        use crate::{content::HtmlSanitizer, feeds::youtube::YouTubeParser};
 
         let candidates = sqlx::query!(
             "SELECT e.id,

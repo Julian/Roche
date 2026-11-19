@@ -7,7 +7,7 @@ use quick_xml::{
 use url::Url;
 
 use crate::{
-    content::{fetcher::SafeHttpClient, xml_util},
+    content::{SafeHttpClient, xml_util},
     db::{Feed, FeedType},
 };
 

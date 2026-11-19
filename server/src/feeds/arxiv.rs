@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::fetcher::SafeHttpClient;
+use crate::content::SafeHttpClient;
 
 #[derive(Debug, Clone)]
 pub struct ArxivFeed {

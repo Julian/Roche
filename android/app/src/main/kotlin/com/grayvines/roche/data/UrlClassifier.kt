@@ -3,7 +3,6 @@ package com.grayvines.roche.data
 import com.grayvines.roche.model.ContentType
 import java.net.URI
 import java.util.Locale
-import java.util.UUID
 
 internal const val DEFAULT_SAVED_HOST = "Saved Link"
 private const val LOCAL_TAG_PREFIX = "tag-"
@@ -30,8 +29,6 @@ private val YOUTUBE_CHANNEL_URL_REGEX =
         """^https?://(?:www\.|m\.)?youtube\.com/channel/([A-Za-z0-9_-]{24})(?:[/?#].*)?$""",
         RegexOption.IGNORE_CASE,
     )
-
-internal fun newTagId(): String = "$LOCAL_TAG_PREFIX${UUID.randomUUID()}"
 
 internal fun isLocalTagId(id: String): Boolean =
     id.startsWith(LOCAL_TAG_PREFIX) && !id.startsWith(SERVER_TAG_PREFIX)

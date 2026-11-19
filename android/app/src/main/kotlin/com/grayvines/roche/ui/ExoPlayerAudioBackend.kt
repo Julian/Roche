@@ -19,7 +19,6 @@ import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import java.io.File
 import java.net.URI
-import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -211,8 +210,6 @@ internal constructor(
             listOf(File(context.applicationContext.filesDir, "offline_media"), context.cacheDir),
         parentScope: CoroutineScope? = null,
         httpEngineProvider: (() -> HttpEngine)? = null,
-        @Suppress("UNUSED_PARAMETER", "UnusedParameter")
-        httpEngineExecutorProvider: (() -> Executor)? = null,
     ) : this(
         appContext = context.applicationContext,
         allowedLocalDirs = allowedLocalDirs,

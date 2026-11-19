@@ -6,7 +6,7 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::extract_entry_timestamp;
-use crate::content::{fetcher::SafeHttpClient, xml_util};
+use crate::content::{SafeHttpClient, xml_util};
 
 #[derive(Debug, Clone)]
 pub struct YouTubeFeed {

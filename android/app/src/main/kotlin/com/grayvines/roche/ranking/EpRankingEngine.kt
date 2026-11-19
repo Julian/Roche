@@ -8,7 +8,6 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 import kotlin.random.Random
-import kotlinx.serialization.Serializable
 
 object EpRankingEngine {
     const val PRIOR_ALPHA: Double = 1.0
@@ -24,7 +23,6 @@ object EpRankingEngine {
     private const val ZERO_MEAN_SNAP: Double = 1e-12
     private const val DEFAULT_MAX_ITER: Int = 100
 
-    @Serializable
     data class Score(
         val mean: Double = 0.0,
         val variance: Double = COLD_START_VARIANCE,

@@ -199,27 +199,6 @@ impl<'a> MediaRepo<'a> {
         .await?)
     }
 
-    pub async fn list_for_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as!(
-            Media,
-            "SELECT m.id,
-                    m.entry_id AS item_id,
-                    m.media_type AS \"media_type: MediaType\",
-                    m.local_path AS \"path!: String\",
-                    m.file_size,
-                    m.duration
-             FROM entry_media m
-             WHERE m.local_path IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM collection_entries ce
-                   WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
-               )",
-            feed_id,
-        )
-        .fetch_all(self.pool)
-        .await?)
-    }
-
     /// Lists downloaded media files belonging to items in `feed_id` that will NOT remain readable
     /// after deleting `feed_id` (i.e. items that are neither saved in a `list`/`want` collection
     /// such as `Starred` or `Want to Read`, nor cross-posted in another subscribed feed).

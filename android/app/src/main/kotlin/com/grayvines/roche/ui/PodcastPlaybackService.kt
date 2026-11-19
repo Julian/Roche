@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.view.KeyEvent
 import androidx.annotation.OptIn
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaMetadata
@@ -31,20 +30,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-internal fun mapMediaKeyCodeToCommand(keyCode: Int): MediaSessionCommand? =
-    when (keyCode) {
-        KeyEvent.KEYCODE_MEDIA_PLAY -> MediaSessionCommand.PLAY
-        KeyEvent.KEYCODE_MEDIA_PAUSE -> MediaSessionCommand.PAUSE
-        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-        KeyEvent.KEYCODE_HEADSETHOOK -> MediaSessionCommand.TOGGLE_PLAY_PAUSE
-        KeyEvent.KEYCODE_MEDIA_REWIND,
-        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> MediaSessionCommand.REWIND_15S
-        KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> MediaSessionCommand.FAST_FORWARD_30S
-        KeyEvent.KEYCODE_MEDIA_NEXT -> MediaSessionCommand.SKIP_TO_NEXT
-        KeyEvent.KEYCODE_MEDIA_STOP -> MediaSessionCommand.STOP
-        else -> null
-    }
 
 internal data class SessionMetadataKey(
     val entryId: String,
@@ -121,10 +106,6 @@ internal constructor(
     internal fun activeCallbacks(): PodcastMediaSessionCallbacks? = callbacks
 
     internal fun currentSnapshot(): MediaSessionMetadataSnapshot? = latestSnapshot
-
-    override fun requestAudioFocus(): Boolean = true
-
-    override fun abandonAudioFocus() = Unit
 
     override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
         if (released) return

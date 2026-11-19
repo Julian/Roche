@@ -8,11 +8,6 @@ import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
 
-data class SharedLinkPayload(
-    val url: String,
-    val title: String? = null,
-)
-
 data class SharedContentPayload(
     val url: String,
     val title: String? = null,
@@ -24,27 +19,6 @@ internal data class MatchedHttpUrl(
     val url: String,
     val startIndex: Int,
 )
-
-fun extractSharedLink(
-    action: String?,
-    mimeType: String?,
-    extraText: String?,
-    extraSubject: String? = null,
-    extraTitle: String? = null,
-): SharedLinkPayload? {
-    if (!isSupportedShareMime(action, mimeType) || extraText.isNullOrBlank()) {
-        return null
-    }
-    val match = findFirstHttpUrl(extraText) ?: return null
-    val rawTitle =
-        extraSubject?.trim()?.takeIf { it.isNotBlank() }
-            ?: extraTitle?.trim()?.takeIf { it.isNotBlank() }
-            ?: extractPrefixTitle(extraText, match.startIndex)
-    return SharedLinkPayload(
-        url = match.url,
-        title = sanitizeCandidateTitle(rawTitle, match.url),
-    )
-}
 
 @Suppress("LongParameterList")
 fun extractSharedContent(

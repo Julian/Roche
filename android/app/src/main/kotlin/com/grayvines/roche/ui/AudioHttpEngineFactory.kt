@@ -3,8 +3,6 @@ package com.grayvines.roche.ui
 import android.content.Context
 import android.net.Uri
 import android.net.http.HttpEngine
-import android.os.Build
-import android.os.ext.SdkExtensions
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.C
@@ -36,17 +34,9 @@ internal fun createAudioDataSourceFactory(
     context: Context,
     httpEngine: HttpEngine,
 ): DataSource.Factory {
-    val useHttpEngine =
-        SdkExtensions.getExtensionVersion(Build.VERSION_CODES.S) >= MIN_S_EXT_HTTP_ENGINE
-    val connectionOpener: (URL) -> HttpURLConnection =
-        if (useHttpEngine) {
-            { url -> httpEngine.openConnection(url) as HttpURLConnection }
-        } else {
-            { url -> url.openConnection() as HttpURLConnection }
-        }
     val safeHttpFactory = DataSource.Factory {
         SafeRedirectHttpDataSource(
-            openConnection = connectionOpener,
+            openConnection = { url -> httpEngine.openConnection(url) as HttpURLConnection },
             userAgent = ROCHE_AUDIO_USER_AGENT,
             connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
             readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
@@ -439,6 +429,5 @@ internal fun resolveSafeHttpPlaybackUrl(
 }
 
 internal const val ROCHE_AUDIO_USER_AGENT = "Roche-Android/1.0"
-internal const val MIN_S_EXT_HTTP_ENGINE = 7
 internal const val AUDIO_HTTP_CONNECT_TIMEOUT_MS = 15_000
 internal const val AUDIO_HTTP_READ_TIMEOUT_MS = 30_000

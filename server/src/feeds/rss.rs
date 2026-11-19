@@ -4,7 +4,7 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::fetcher::{HtmlSanitizer, SafeHttpClient, is_direct_audio_url};
+use crate::content::{HtmlSanitizer, SafeHttpClient, is_direct_audio_url};
 
 #[derive(Debug, Clone)]
 pub struct RssFeed {

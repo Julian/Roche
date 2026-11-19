@@ -260,55 +260,20 @@ private fun String?.nonBlankOr(fallback: String?): String? =
 internal fun mergeRemoteItemIntoLocal(
     local: InboxItemRow,
     remote: RemoteItemDto,
-    adoptRemoteIdentity: Boolean,
 ): InboxItemRow =
     local.copy(
-        id = if (adoptRemoteIdentity) remote.id else local.id,
         title = remote.title.ifBlank { local.title },
         author = remote.author.nonBlankOr(local.author),
-        summary =
-            (if (adoptRemoteIdentity) {
-                    remote.summary ?: local.summary
-                } else {
-                    remote.summary.nonBlankOr(local.summary)
-                })
-                ?.take(MAX_SQLITE_SUMMARY_CHARS),
+        summary = remote.summary.nonBlankOr(local.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
         contentText =
-            (if (adoptRemoteIdentity) {
-                    remote.contentText ?: local.contentText
-                } else {
-                    remote.contentText.nonBlankOr(
-                        local.contentText?.takeIf { it.isNotBlank() && it != local.summary }
-                    )
-                })
+            remote.contentText
+                .nonBlankOr(local.contentText?.takeIf { it.isNotBlank() && it != local.summary })
                 ?.take(MAX_SQLITE_TEXT_CHARS),
         contentHtml = remote.contentHtml.nonBlankOr(local.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
-        contentType =
-            if (adoptRemoteIdentity) {
-                remote.contentType.ifBlank { local.contentType }
-            } else {
-                local.contentType
-            },
-        createdAt =
-            if (adoptRemoteIdentity) {
-                remote.createdAt.ifBlank { local.createdAt }
-            } else {
-                local.createdAt
-            },
         thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(local.thumbnailMediaId),
         duration = remote.duration.nonBlankOr(local.duration),
         thumbnailUrl = remote.thumbnailUrl.nonBlankOr(local.thumbnailUrl),
         audioUrl = remote.audioUrl.nonBlankOr(local.audioUrl),
-    )
-
-internal fun reconcileSavedItemEntity(
-    localEntity: InboxItemRow,
-    remoteSaved: RemoteItemDto,
-): InboxItemRow =
-    mergeRemoteItemIntoLocal(
-        local = localEntity,
-        remote = remoteSaved,
-        adoptRemoteIdentity = true,
     )
 
 internal fun createSavedItemEntity(

@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::{
-    content::fetcher::{
+    content::{
         HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url, is_valid_pdf_bytes,
         resolve_pdf_url,
     },

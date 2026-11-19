@@ -12,7 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 pub use youtube::YouTubeParser;
 
-use crate::{content::fetcher::SafeHttpClient, db::FeedType};
+use crate::{
+    content::{SafeHttpClient, is_direct_pdf_url},
+    db::FeedType,
+};
 
 /// Validated feed creation source: either a full [`Url`] or a 24-character `YouTube` channel ID (`UC...`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -106,10 +109,7 @@ impl FeedSource {
 
     fn validate_arxiv_feed_url(url: &Url) -> Result<()> {
         let path = url.path();
-        if path.starts_with("/abs/")
-            || path.starts_with("/pdf/")
-            || crate::content::fetcher::is_direct_pdf_url(url)
-        {
+        if path.starts_with("/abs/") || path.starts_with("/pdf/") || is_direct_pdf_url(url) {
             anyhow::bail!("URL points to a single arXiv paper, not an arXiv feed");
         }
         Ok(())

@@ -270,7 +270,7 @@ impl RocheServer {
         poll: bool,
     ) -> anyhow::Result<usize> {
         let bytes = tokio::fs::read(path).await?;
-        let opml_str = content::fetcher::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
+        let opml_str = content::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
         let service = Self::connect_service(cfg).await?;
         let imported = service.feeds().import_opml(opml_str).await?;
         let count = imported.len();

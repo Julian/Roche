@@ -708,6 +708,109 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_html_sanitizer_strips_scripts() {
+        let clean =
+            HtmlSanitizer::clean("<html><body><script>alert(1)</script><p>Hello</p></body></html>");
+        assert!(!clean.contains("<script>"));
+        assert!(clean.contains("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn test_extract_snapshot() {
+        let html = r#"<!DOCTYPE html>
+        <html>
+          <head>
+            <script>if (1 < 2 && 3 > 1) { console.log("<title>Fake</title>"); }</script>
+            <title>Deep Systems &amp; Storage</title>
+            <meta name="description" content="A guide to crash-safe SQLite & WAL." />
+          </head>
+          <body>
+            <svg><title>Icon Title</title></svg>
+            <script>evil()</script>
+            <article><p>First paragraph body.</p></article>
+          </body>
+        </html>"#;
+
+        let snap = HtmlSanitizer::extract_snapshot(html);
+        assert_eq!(snap.title.as_deref(), Some("Deep Systems & Storage"));
+        assert_eq!(snap.summary.as_deref(), Some("A guide to crash-safe SQLite & WAL."));
+        assert!(snap.content_html.contains("<p>First paragraph body.</p>"));
+        assert!(!snap.content_html.contains("<script>"));
+        assert!(!snap.content_html.contains("Deep Systems"));
+        assert!(!snap.content_html.contains("Icon Title"));
+    }
+
+    #[test]
+    fn test_plain_text_excerpt_strips_html_decodes_entities_and_truncates() {
+        let html = r#"<figure><img src="https://example.com/chart.png" alt="chart"></figure><p>We had some <strong>big drawdowns</strong> &amp; volatility &mdash; in the market.</p><p>Second paragraph here.</p>"#;
+        let excerpt = HtmlSanitizer::plain_text_excerpt(html, 320);
+        assert_eq!(
+            excerpt,
+            "We had some big drawdowns & volatility \u{2014} in the market. Second paragraph here."
+        );
+        assert!(!excerpt.contains('<'));
+        assert!(!excerpt.contains("&amp;"));
+
+        let truncated = HtmlSanitizer::plain_text_excerpt(html, 40);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.chars().count() <= 40);
+
+        // Heavily indented HTML with > 600 whitespace characters before text should not truncate early
+        let indented_html = format!(
+            "<div>\n{}\n<p>{}\n<br/>Second line after break</p></div>",
+            " ".repeat(600),
+            "word ".repeat(50)
+        );
+        let indented_excerpt = HtmlSanitizer::plain_text_excerpt(&indented_html, 320);
+        assert!(indented_excerpt.contains("Second line after break"));
+        assert!(indented_excerpt.chars().count() > 250);
+
+        let snap = HtmlSanitizer::extract_snapshot(
+            "<html><body><p>First line<br>Second line</p></body></html>",
+        );
+        assert_eq!(snap.summary.as_deref(), Some("First line Second line"));
+    }
+
+    #[test]
+    fn test_extract_first_image_url_with_base_resolves_relative_and_skips_emojis_svg_and_small_icons()
+     {
+        let base = Url::parse("https://blog.example.com/posts/2026/predicate-logic/").unwrap();
+        let html = r#"
+            <p>Emoji <img src="https://s.w.org/images/core/emoji/17.0.2/72x72/21a9.png" alt="↩"> and
+            smiley <img class="wp-smiley" src="https://blog.example.com/smile.png"> and
+            tiny <img src="/icon.png" width="24" height="24"> and
+            vector <img src="/diagram.svg"> and
+            real <img src="img/quantifier-breakdown.png"></p>
+        "#;
+        let extracted = HtmlSanitizer::extract_first_image_url_with_base(html, Some(&base));
+        assert_eq!(
+            extracted.as_deref(),
+            Some(
+                "https://blog.example.com/posts/2026/predicate-logic/img/quantifier-breakdown.png"
+            )
+        );
+
+        let root_rel = HtmlSanitizer::extract_first_image_url_with_base(
+            r#"<img src="/static/hero.webp">"#,
+            Some(&base),
+        );
+        assert_eq!(root_rel.as_deref(), Some("https://blog.example.com/static/hero.webp"));
+
+        // Images inside <script>, <noscript>, <template>, <style>, <svg>, <math> must be ignored,
+        // and `<` inside <script> must not abort extraction of the real image below.
+        let tricky_html = r#"
+            <script>if (a < b) { const fake = '<img src="https://evil.example.com/script.jpg">'; }</script>
+            <noscript><img src="https://tracker.example.com/beacon.png"></noscript>
+            <template><img src="https://evil.example.com/template.png"></template>
+            <style>.x { content: "<img src='https://evil.example.com/style.png'>"; }</style>
+            <p><img src="https://blog.example.com/real-hero.jpg" width="800" height="600"></p>
+        "#;
+        let extracted_safe =
+            HtmlSanitizer::extract_first_image_url_with_base(tricky_html, Some(&base));
+        assert_eq!(extracted_safe.as_deref(), Some("https://blog.example.com/real-hero.jpg"));
+    }
+
+    #[test]
     fn test_extract_first_image_url_handles_mixed_case_and_image_free_html() {
         let base = Url::parse("https://blog.example.com/posts/demo/").unwrap();
         assert!(HtmlSanitizer::extract_first_image_url_with_base("", Some(&base)).is_none());

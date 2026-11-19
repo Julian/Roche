@@ -510,10 +510,6 @@ class MainViewModel(
         }
     }
 
-    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
-        playbackOrchestrator.handleAudioEpisodeCompleted(playerController, completedEntryId)
-    }
-
     internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
 
     internal suspend fun performImportOpml(opmlXml: String) {

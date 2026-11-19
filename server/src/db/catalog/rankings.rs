@@ -16,8 +16,8 @@ use crate::{
         types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
     },
     ranking::{
-        MAX_K_DEFAULT, MEAN_TIE_EPSILON, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores,
-        rescale_to_quantiles, select_cluster, tier_label, validate_ordering,
+        MAX_K_DEFAULT, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores, rescale_to_quantiles,
+        select_cluster, sort_by_score_with_ties, tier_label, validate_ordering,
     },
 };
 
@@ -152,37 +152,14 @@ impl CatalogRepo<'_> {
         };
 
         let mut sorted_members = members;
-        sorted_members.sort_by(|a, b| {
-            let sa = scores.get(&a.id).copied().unwrap_or_default().mean;
-            let sb = scores.get(&b.id).copied().unwrap_or_default().mean;
-            sb.total_cmp(&sa)
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let mut tie_start = 0usize;
-        while tie_start < sorted_members.len() {
-            let base_mean =
-                scores.get(&sorted_members[tie_start].id).copied().unwrap_or_default().mean;
-            let mut tie_end = tie_start + 1;
-            while tie_end < sorted_members.len() {
-                let cur_mean =
-                    scores.get(&sorted_members[tie_end].id).copied().unwrap_or_default().mean;
-                if (cur_mean - base_mean).abs() <= MEAN_TIE_EPSILON {
-                    tie_end += 1;
-                } else {
-                    break;
-                }
-            }
-            if tie_end - tie_start > 1 {
-                sorted_members[tie_start..tie_end].sort_by(|a, b| {
-                    a.title
-                        .to_lowercase()
-                        .cmp(&b.title.to_lowercase())
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-            }
-            tie_start = tie_end;
-        }
+        sort_by_score_with_ties(
+            &mut sorted_members,
+            &scores,
+            |entry| entry.id.as_str(),
+            |a, b| {
+                a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id))
+            },
+        );
 
         let max_abs = scores.values().map(|s| s.mean.abs()).fold(0.0_f64, f64::max);
         let scale = if max_abs > 0.0 { max_abs } else { 1.0 };

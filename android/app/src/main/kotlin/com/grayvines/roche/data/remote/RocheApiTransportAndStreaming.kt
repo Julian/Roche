@@ -25,7 +25,6 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -98,9 +97,6 @@ class HttpEngineTransport(
 
     internal val sharedHttpEngine: HttpEngine
         get() = httpEngine
-
-    internal val sharedCallbackExecutor: Executor
-        get() = executor
 
     override suspend fun execute(request: HttpRequest): HttpResponse =
         withContext(Dispatchers.IO) { executeFollowingRedirects(request) }
@@ -391,6 +387,7 @@ internal class BufferedUrlRequestCallback(
     private val httpRequest: HttpRequest,
     private val watchdog: HopWatchdog,
     private val continuation: CancellableContinuation<BufferedHopOutcome>,
+    initialMaxAllowedBytes: Int = MAX_RESPONSE_CHARS,
 ) : UrlRequest.Callback {
     private val readBuffer: ByteBuffer = ByteBuffer.allocateDirect(DIRECT_READ_BUFFER_BYTES)
     private val scratch = ByteArray(READ_BUFFER_CHARS)
@@ -398,7 +395,7 @@ internal class BufferedUrlRequestCallback(
     private val settled = AtomicBoolean(false)
     private val abortError = AtomicReference<IOException?>(null)
     private val startedRequestRef = AtomicReference<UrlRequest?>(null)
-    @Volatile private var maxAllowedBytes: Int = MAX_RESPONSE_CHARS
+    @Volatile private var maxAllowedBytes: Int = initialMaxAllowedBytes
     @Volatile private var redirectStatus: Int = 0
     @Volatile private var redirectLocation: String? = null
     @Volatile private var redirectHeaders: Map<String, String> = emptyMap()
@@ -984,28 +981,6 @@ internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = ru
 }
     .getOrDefault(false)
 
-internal fun readBoundedBytes(
-    input: InputStream,
-    maxBytes: Int = MAX_MEDIA_BYTES,
-): ByteArray = input.use { stream ->
-    require(maxBytes >= 0) { "maxBytes must be non-negative" }
-    val out = ByteArrayOutputStream()
-    val buffer = ByteArray(READ_BUFFER_CHARS)
-    var total = 0
-    while (true) {
-        val remainingToLimit = maxBytes - total
-        val maxReadLen = if (remainingToLimit >= buffer.size) buffer.size else remainingToLimit + 1
-        val read = stream.read(buffer, 0, maxReadLen)
-        if (read == -1) break
-        if (read > maxBytes - total) {
-            throw ResponseTooLargeException(maxBytes = maxBytes.toLong())
-        }
-        total += read
-        out.write(buffer, 0, read)
-    }
-    out.toByteArray()
-}
-
 internal fun readBoundedText(input: InputStream): String =
     BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
         val builder = StringBuilder()
@@ -1081,9 +1056,6 @@ internal suspend fun streamTransportResponseToFile(
         }
     }
 }
-
-internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
-    "${serverUrl.trimEnd('/')}/api/v1/items/${encodePathSegment(itemId)}"
 
 internal fun encodePathSegment(raw: String): String =
     URLEncoder.encode(raw, StandardCharsets.UTF_8.name()).replace("+", "%20")

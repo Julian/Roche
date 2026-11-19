@@ -20,29 +20,29 @@ class PublicUrlValidatorTest {
         val vpnOffClient =
             RocheApiClient(
                 vpnCheck = VpnTransportCheck { false },
-                transport = { HttpResponse(statusCode = 200, body = """{"feeds":[]}""") },
+                transport = { HttpResponse(statusCode = 200, body = "<opml/>") },
             )
         assertThrows(IOException::class.java) {
-            runBlocking { vpnOffClient.fetchFeeds("https://roche.tail9876.ts.net", "tok") }
+            runBlocking { vpnOffClient.exportOpml("https://roche.tail9876.ts.net", "tok") }
         }
         assertThrows(IOException::class.java) {
-            runBlocking { vpnOffClient.fetchFeeds("https://roche", "tok") }
+            runBlocking { vpnOffClient.exportOpml("https://roche", "tok") }
         }
         assertEquals(
-            emptyList<RemoteFeedDto>(),
-            vpnOffClient.fetchFeeds("http://localhost:8080", "tok"),
+            "<opml/>",
+            vpnOffClient.exportOpml("http://localhost:8080", "tok"),
         )
 
         val vpnOnClient =
             RocheApiClient(
                 vpnCheck = VpnTransportCheck { true },
-                transport = { HttpResponse(statusCode = 200, body = """{"feeds":[]}""") },
+                transport = { HttpResponse(statusCode = 200, body = "<opml/>") },
             )
         assertThrows(IOException::class.java) {
-            runBlocking { vpnOnClient.fetchFeeds("http://mac-mini.tail9876.ts.net:8080", "tok") }
+            runBlocking { vpnOnClient.exportOpml("http://mac-mini.tail9876.ts.net:8080", "tok") }
         }
         assertThrows(IOException::class.java) {
-            runBlocking { vpnOnClient.fetchFeeds("http://100.64.0.9:8080", "tok") }
+            runBlocking { vpnOnClient.exportOpml("http://100.64.0.9:8080", "tok") }
         }
 
         assertTrue(PeerSyncScheduler.requiresVpnForServerUrl("https://roche.tail9876.ts.net"))
