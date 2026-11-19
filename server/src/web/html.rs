@@ -10,7 +10,7 @@ use axum::{
 
 use super::links::render_creator_links;
 use crate::{
-    db::{ConsumptionLogView, ConsumptionStatus, ContentType, FeedType},
+    db::{ConsumptionLogView, ConsumptionStatus, ContentType},
     error::ApiError,
 };
 
@@ -112,6 +112,8 @@ pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
 
 pub(super) const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
 
+pub(super) const REFRESH_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
 #[must_use]
 pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
     match ct {
@@ -140,6 +142,15 @@ pub(super) fn render_feed_favicon(
     label: &str,
     small: bool,
 ) {
+    render_feed_favicon_with_class(out, raw_url, label, if small { "feed-favicon-sm" } else { "" });
+}
+
+pub(super) fn render_feed_favicon_with_class(
+    out: &mut String,
+    raw_url: Option<&str>,
+    label: &str,
+    size_class: &str,
+) {
     let host = raw_url
         .and_then(|u| url::Url::parse(u).ok())
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
@@ -151,7 +162,7 @@ pub(super) fn render_feed_favicon(
         .find(|c| c.is_alphanumeric())
         .map_or('?', |c| c.to_ascii_uppercase());
     let tone = seed.bytes().fold(0usize, |acc, b| acc.wrapping_add(usize::from(b))) % 5;
-    let sz_cls = if small { " feed-favicon-sm" } else { "" };
+    let sz_cls = if size_class.is_empty() { String::new() } else { format!(" {size_class}") };
     let _ = write!(
         out,
         "<span class=\"feed-favicon{sz_cls} fav-tone-{tone}\" aria-hidden=\"true\">{letter}"
@@ -164,16 +175,6 @@ pub(super) fn render_feed_favicon(
         );
     }
     out.push_str("</span>");
-}
-
-#[must_use]
-pub(super) const fn feed_type_label(ft: FeedType) -> &'static str {
-    match ft {
-        FeedType::Rss => "RSS",
-        FeedType::Podcast => "Podcast",
-        FeedType::Youtube => "YouTube",
-        FeedType::Arxiv => "arXiv",
-    }
 }
 
 pub(super) fn render_inline_csrf_form(
@@ -416,7 +417,7 @@ fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
                  <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
                  <input type=\"hidden\" name=\"return_to\" value=\"{refresh_return}\">\n\
                  <button type=\"submit\" class=\"util-btn\" title=\"Refresh all feeds\" aria-label=\"Refresh all feeds\">\n\
-                   <svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>\n\
+                   {REFRESH_SVG}\n\
                    <span class=\"util-label\">Refresh</span>\n\
                  </button>\n\
                </form>\n\

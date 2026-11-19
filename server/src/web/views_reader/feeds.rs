@@ -16,12 +16,98 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, feed_type_label, redirect_see_other,
-            redirect_with_flash, render_inline_csrf_form, render_page, safe_local_redirect,
-            urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, REFRESH_SVG, esc, redirect_see_other,
+            redirect_with_flash, render_feed_favicon_with_class, render_inline_csrf_form,
+            render_page, safe_local_redirect, urlencode, web_api_error_response,
         },
     },
 };
+
+struct FeedStats {
+    total: usize,
+    active: usize,
+    paused: usize,
+    failing: usize,
+    rss: usize,
+    podcast: usize,
+    youtube: usize,
+    arxiv: usize,
+}
+
+impl FeedStats {
+    fn from_feeds(feeds: &[Feed]) -> Self {
+        let mut stats = Self {
+            total: feeds.len(),
+            active: 0,
+            paused: 0,
+            failing: 0,
+            rss: 0,
+            podcast: 0,
+            youtube: 0,
+            arxiv: 0,
+        };
+        for f in feeds {
+            if f.is_active {
+                stats.active += 1;
+                if has_active_error(f) {
+                    stats.failing += 1;
+                }
+            } else {
+                stats.paused += 1;
+            }
+            match f.feed_type {
+                FeedType::Rss => stats.rss += 1,
+                FeedType::Podcast => stats.podcast += 1,
+                FeedType::Youtube => stats.youtube += 1,
+                FeedType::Arxiv => stats.arxiv += 1,
+            }
+        }
+        stats
+    }
+}
+
+fn has_active_error(feed: &Feed) -> bool {
+    feed.is_active && feed.last_error.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
+
+const fn feed_kind_key(ft: FeedType) -> &'static str {
+    match ft {
+        FeedType::Rss => "rss",
+        FeedType::Podcast => "podcast",
+        FeedType::Youtube => "youtube",
+        FeedType::Arxiv => "arxiv",
+    }
+}
+
+const fn feed_kind_badge(ft: FeedType) -> Option<(&'static str, &'static str)> {
+    match ft {
+        FeedType::Rss => None,
+        FeedType::Podcast => Some(("badge-podcast", "Podcast")),
+        FeedType::Youtube => Some(("badge-video", "YouTube")),
+        FeedType::Arxiv => Some(("badge-paper", "arXiv")),
+    }
+}
+
+fn clean_feed_error(raw: &str) -> String {
+    let mut txt = raw.trim();
+    for prefix in ["Upstream feed error: ", "Upstream server returned "] {
+        if let Some(stripped) = txt.strip_prefix(prefix) {
+            txt = stripped;
+        }
+    }
+    let mut chars = txt.chars();
+    let short: String = chars.by_ref().take(110).collect();
+    if chars.next().is_some() { format!("{short}…") } else { short }
+}
+
+fn display_feed_title(feed: &Feed) -> &str {
+    feed.title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| feed.url.as_str())
+}
+
+fn display_feed_host(feed: &Feed) -> &str {
+    let host = feed.url.host_str().unwrap_or("");
+    host.strip_prefix("www.").unwrap_or(host)
+}
 
 pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
@@ -33,66 +119,38 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
         Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
     };
 
-    let mut body = String::with_capacity(6_144);
-    body.push_str("<div class=\"page-head\"><h2>Feeds</h2><div class=\"flex-row flex-center\">");
-    render_inline_csrf_form(
-        &mut body,
-        "/web/feeds/refresh-all",
-        &session.csrf_token,
-        &[("return_to", "/feeds")],
-        None,
-        "<button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh All</button>",
-    );
-    let _ = writeln!(
-        body,
-        "<a class=\"btn btn-small btn-ghost\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\
-           </div>\
-         </div>\n\
-         <p class=\"lede\">{} subscribed sources (RSS/Atom, Podcasts, YouTube channels, arXiv). Paste a site homepage or YouTube channel to autodiscover its feed.</p>",
-        feeds.len(),
-    );
+    let stats = FeedStats::from_feeds(&feeds);
+    let mut sorted: Vec<&Feed> = feeds.iter().collect();
+    sorted.sort_by(|a, b| {
+        let bucket = |f: &Feed| -> u8 {
+            if has_active_error(f) {
+                0
+            } else if f.is_active {
+                1
+            } else {
+                2
+            }
+        };
+        bucket(a).cmp(&bucket(b)).then_with(|| {
+            display_feed_title(a).to_lowercase().cmp(&display_feed_title(b).to_lowercase())
+        })
+    });
 
-    let _ = write!(
-        body,
-        "<details class=\"editorial-panel\" open data-default-open>\n\
-           <summary>+ Subscribe to Feed</summary>\n\
-           <form method=\"post\" action=\"/web/feeds/create\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"form-grid\">\n\
-               <div class=\"field\"><label for=\"feed-url\">Site Homepage, Feed URL, or YouTube Channel</label>\
-                 <input id=\"feed-url\" name=\"url\" type=\"text\" required placeholder=\"https://danluu.com, https://example.com/feed.xml, or UC...\"></div>\n\
-               <div class=\"field\"><label for=\"feed-title\">Custom Title (optional)</label>\
-                 <input id=\"feed-title\" name=\"title\" type=\"text\" placeholder=\"Leave blank to use feed title\"></div>\n\
-               <div class=\"field\"><label for=\"feed-type\">Source Kind</label>\
-                 <select id=\"feed-type\" name=\"feed_type\">\
-                   <option value=\"rss\">Auto / RSS</option>\
-                   <option value=\"podcast\">Podcast</option>\
-                   <option value=\"youtube\">YouTube</option>\
-                   <option value=\"arxiv\">arXiv</option>\
-                 </select></div>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn btn-primary\">Subscribe</button>\n\
-           </form>\n\
-         </details>\n\
-         <details class=\"editorial-panel\">\n\
-           <summary>Import OPML</summary>\n\
-           <form method=\"post\" action=\"/web/feeds/opml\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field mb-sm\">\n\
-               <label for=\"opml-file\">Choose .opml / .xml file (or paste XML below)</label>\n\
-               <input id=\"opml-file\" type=\"file\" accept=\".opml,.xml,text/xml\" class=\"js-opml-file\">\n\
-             </div>\n\
-             <div class=\"field mb-sm\">\n\
-               <label for=\"opml-xml\">OPML XML</label>\n\
-               <textarea id=\"opml-xml\" name=\"opml_xml\" required class=\"js-opml-textarea\" placeholder=\"&lt;opml version=&quot;2.0&quot;&gt;...\"></textarea>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn btn-primary\">Import Subscriptions</button>\n\
-           </form>\n\
-         </details>\n",
-        csrf = esc(&session.csrf_token),
+    let mut body = String::with_capacity(8_192);
+    body.push_str(
+        "<div class=\"feeds-grid\">\n<section class=\"feeds-main\" aria-label=\"Subscribed feeds\">\n",
     );
-
-    render_feeds_table(&mut body, &feeds, &session.csrf_token);
+    if sorted.is_empty() {
+        body.push_str(
+            "<p class=\"empty\">No feeds subscribed yet. Paste a site homepage, feed URL, or YouTube channel in the Subscribe panel to get started.</p>\n",
+        );
+    } else {
+        render_feeds_toolbar(&mut body, &stats);
+        render_feeds_list(&mut body, &sorted, &session.csrf_token);
+    }
+    body.push_str("</section>\n");
+    render_feeds_rail(&mut body, &stats, &session.csrf_token);
+    body.push_str("</div>\n");
 
     render_page(&PageShell {
         title: "Feeds",
@@ -105,74 +163,233 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
     .into_response()
 }
 
-fn render_feeds_table(out: &mut String, feeds: &[Feed], csrf: &str) {
-    if feeds.is_empty() {
-        out.push_str("<p class=\"empty\">No feeds subscribed yet.</p>\n");
-        return;
+fn render_feeds_toolbar(out: &mut String, stats: &FeedStats) {
+    let _ = writeln!(
+        out,
+        "<div class=\"feeds-toolbar\">\n\
+           <div class=\"feeds-toolbar-pills\" role=\"group\" aria-label=\"Filter by status\">\n\
+             <button type=\"button\" class=\"pill is-active js-feeds-pill\" data-status=\"all\" aria-pressed=\"true\">All ({})</button>",
+        stats.total,
+    );
+    if stats.paused > 0 {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"pill js-feeds-pill\" data-status=\"active\" aria-pressed=\"false\">Active ({})</button>",
+            stats.active,
+        );
     }
+    if stats.failing > 0 {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"pill pill-warn js-feeds-pill\" data-status=\"errors\" aria-pressed=\"false\">Errors ({})</button>",
+            stats.failing,
+        );
+    }
+    if stats.paused > 0 {
+        let _ = writeln!(
+            out,
+            "<button type=\"button\" class=\"pill js-feeds-pill\" data-status=\"paused\" aria-pressed=\"false\">Paused ({})</button>",
+            stats.paused,
+        );
+    }
+    out.push_str(
+        "</div>\n\
+         <div class=\"feeds-toolbar-controls\">\n\
+           <select id=\"roche-feeds-kind\" class=\"feeds-kind-select\" aria-label=\"Filter by feed type\">\n\
+             <option value=\"all\">All types</option>",
+    );
+    for (val, label, count) in [
+        ("rss", "RSS", stats.rss),
+        ("podcast", "Podcasts", stats.podcast),
+        ("youtube", "YouTube", stats.youtube),
+        ("arxiv", "arXiv", stats.arxiv),
+    ] {
+        if count > 0 {
+            let _ = write!(out, "<option value=\"{val}\">{label} ({count})</option>");
+        }
+    }
+    out.push_str(
+        "</select>\n\
+           <input type=\"search\" id=\"roche-feeds-search\" class=\"feeds-filter-input\" placeholder=\"Filter feeds…\" aria-label=\"Filter subscribed feeds\">\n\
+         </div>\n\
+       </div>\n",
+    );
+}
 
-    out.push_str("<ul class=\"inbox-list\">\n");
+fn render_feeds_list(out: &mut String, feeds: &[&Feed], csrf: &str) {
+    out.push_str("<ul class=\"inbox-list\" id=\"roche-feeds-list\">\n");
     for f in feeds {
-        let title = f.title.as_deref().filter(|s| !s.is_empty()).unwrap_or_else(|| f.url.as_str());
+        render_feed_row(out, f, csrf);
+    }
+    out.push_str("</ul>\n");
+}
+
+fn render_feed_row(out: &mut String, f: &Feed, csrf: &str) {
+    let title = display_feed_title(f);
+    let host = display_feed_host(f);
+    let kind_key = feed_kind_key(f.feed_type);
+    let paused = !f.is_active;
+    let active_err = if paused {
+        None
+    } else {
+        f.last_error.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(clean_feed_error)
+    };
+    let row_cls = if paused { "inbox-row feed-row is-paused" } else { "inbox-row feed-row" };
+    let search_blob = format!("{title} {host} {kind_key}");
+
+    let _ = writeln!(
+        out,
+        "<li class=\"{row_cls}\" data-feed-search=\"{}\" data-feed-kind=\"{kind_key}\" data-feed-paused=\"{}\" data-feed-error=\"{}\">",
+        esc(&search_blob),
+        if paused { "1" } else { "0" },
+        if active_err.is_some() { "1" } else { "0" },
+    );
+    render_feed_favicon_with_class(out, Some(f.url.as_str()), title, "feed-favicon-lg");
+
+    let id_enc = urlencode(&f.id);
+    let _ = write!(
+        out,
+        "<div class=\"inbox-main\">\n\
+           <div class=\"inbox-title\"><a href=\"/inbox?status=all&amp;feed={id}\">{title}</a></div>\n\
+           <div class=\"item-byline\">",
+        id = esc(&id_enc),
+        title = esc(title),
+    );
+    if let Some((badge_cls, label)) = feed_kind_badge(f.feed_type) {
+        let _ = write!(out, "<span class=\"badge badge-kind {badge_cls}\">{label}</span>");
+    }
+    if paused {
+        out.push_str("<span class=\"badge\">Paused</span>");
+    }
+    if f.unread_count > 0 {
         let _ = write!(
             out,
-            "<li class=\"inbox-row\">\n\
-               <div class=\"inbox-main\">\n\
-                 <div class=\"inbox-title\"><a href=\"/inbox?status=all&amp;feed={id}\">{title}</a></div>\n\
-                 <div class=\"item-byline\">\n\
-                   <span class=\"badge\">{ftype}</span>\n\
-                   <span>{unread} unread</span>",
-            id = esc(&urlencode(&f.id)),
-            title = esc(title),
-            ftype = esc(feed_type_label(f.feed_type)),
-            unread = f.unread_count,
+            "<span class=\"byline-item feed-row-unread\">{} unread</span>",
+            f.unread_count,
         );
-        if !f.is_active {
-            out.push_str("<span class=\"badge\">Paused</span>");
-        }
-        if let Some(polled) = f.last_polled {
-            let _ = write!(out, "<span>Polled {}</span>", polled.format("%Y-%m-%d %H:%M"));
-        }
-        if let Some(err) = f.last_error.as_deref().filter(|s| !s.is_empty()) {
-            let short_err: String = err.chars().take(90).collect();
-            let _ = write!(out, "<span class=\"badge badge-warn\">{}</span>", esc(&short_err));
-        }
-        out.push_str("</div>\n</div>\n<div class=\"inbox-controls\">\n");
+    } else {
+        out.push_str("<span class=\"byline-item\">0 unread</span>");
+    }
+    if !host.is_empty() {
+        let _ = write!(out, "<span class=\"byline-item\">{}</span>", esc(host));
+    }
+    if let Some(polled) = f.last_polled {
+        let _ = write!(
+            out,
+            "<span class=\"byline-item\">Polled {}</span>",
+            polled.format("%b %d, %H:%M"),
+        );
+    }
+    out.push_str("</div>\n");
+    if let Some(err_txt) = active_err {
+        let _ = writeln!(out, "<p class=\"feed-row-error\">&#9888; {}</p>", esc(&err_txt));
+    }
+    out.push_str("</div>\n<div class=\"inbox-controls inbox-controls-subtle\">\n");
 
-        let id_enc = urlencode(&f.id);
+    if f.is_active {
+        let refresh_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Refresh {t}\" aria-label=\"Refresh {t}\">{REFRESH_SVG}</button>",
+            t = esc(title),
+        );
         render_inline_csrf_form(
             out,
             &format!("/web/feeds/{id_enc}/refresh"),
             csrf,
             &[],
             None,
-            "<button type=\"submit\" class=\"btn btn-small\">Refresh</button>",
+            &refresh_btn,
         );
-
-        let (next_active, toggle_label) =
-            if f.is_active { ("false", "Pause") } else { ("true", "Resume") };
-        let toggle_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">{toggle_label}</button>"
-        );
-        render_inline_csrf_form(
-            out,
-            &format!("/web/feeds/{id_enc}/toggle-active"),
-            csrf,
-            &[("active", next_active)],
-            None,
-            &toggle_btn,
-        );
-        render_inline_csrf_form(
-            out,
-            &format!("/web/feeds/{id_enc}/delete"),
-            csrf,
-            &[],
-            Some("Delete this feed subscription? Your diary and rankings will be preserved."),
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Delete</button>",
-        );
-        out.push_str("\n</div>\n</li>\n");
     }
-    out.push_str("</ul>\n");
+    let (next_active, toggle_label) =
+        if f.is_active { ("false", "Pause") } else { ("true", "Resume") };
+    let toggle_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\">{toggle_label}</button>"
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/feeds/{id_enc}/toggle-active"),
+        csrf,
+        &[("active", next_active)],
+        None,
+        &toggle_btn,
+    );
+    out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
+    render_inline_csrf_form(
+        out,
+        &format!("/web/feeds/{id_enc}/delete"),
+        csrf,
+        &[],
+        Some("Delete this feed subscription? Your diary and rankings will be preserved."),
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-danger-quiet\">Delete</button>",
+    );
+    out.push_str("\n</div>\n</li>\n");
+}
+
+fn render_feeds_rail(out: &mut String, stats: &FeedStats, csrf: &str) {
+    let warn_cls = if stats.failing > 0 { " is-warn" } else { "" };
+    let _ = write!(
+        out,
+        "<div class=\"feeds-rail\">\n\
+           <section class=\"rail-block rail-card\">\n\
+             <div class=\"section-head\"><h2>Subscribe</h2></div>\n\
+             <form method=\"post\" action=\"/web/feeds/create\" class=\"rail-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <div class=\"field\">\n\
+                 <label for=\"feed-url\">Site, Feed URL, or YouTube Channel</label>\n\
+                 <input id=\"feed-url\" name=\"url\" type=\"text\" required placeholder=\"https://danluu.com or feed.xml\">\n\
+               </div>\n\
+               <div class=\"field\">\n\
+                 <label for=\"feed-title\">Custom Title (optional)</label>\n\
+                 <input id=\"feed-title\" name=\"title\" type=\"text\" placeholder=\"Auto-detected from feed\">\n\
+               </div>\n\
+               <div class=\"field\">\n\
+                 <label for=\"feed-type\">Source Kind</label>\n\
+                 <select id=\"feed-type\" name=\"feed_type\">\n\
+                   <option value=\"rss\">Auto / RSS</option>\n\
+                   <option value=\"podcast\">Podcast</option>\n\
+                   <option value=\"youtube\">YouTube</option>\n\
+                   <option value=\"arxiv\">arXiv</option>\n\
+                 </select>\n\
+               </div>\n\
+               <button type=\"submit\" class=\"btn btn-primary btn-small\">Subscribe</button>\n\
+             </form>\n\
+           </section>\n\
+           <section class=\"rail-block rail-card\">\n\
+             <div class=\"section-head\"><h2>Feed Health</h2></div>\n\
+             <div class=\"rail-stats\">\n\
+               <div><span class=\"rail-stat-num\">{active}</span><span class=\"rail-stat-label\">Active</span></div>\n\
+               <div><span class=\"rail-stat-num\">{paused}</span><span class=\"rail-stat-label\">Paused</span></div>\n\
+               <div><span class=\"rail-stat-num{warn_cls}\">{failing}</span><span class=\"rail-stat-label\">Failing</span></div>\n\
+             </div>\n\
+           </section>\n\
+           <section class=\"rail-block rail-card\">\n\
+             <div class=\"section-head\"><h2>OPML Backup</h2></div>\n\
+             <div class=\"rail-opml-actions\">\n\
+               <span class=\"text-soft rail-opml-note\">Portable subscription list</span>\n\
+               <a class=\"btn btn-small btn-ghost\" href=\"/web/feeds/export.opml\" download=\"roche-feeds.opml\">Export OPML</a>\n\
+             </div>\n\
+             <details class=\"rail-details\">\n\
+               <summary>Import OPML</summary>\n\
+               <form method=\"post\" action=\"/web/feeds/opml\" class=\"rail-form\">\n\
+                 <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+                 <div class=\"field\">\n\
+                   <label for=\"opml-file\">Choose .opml / .xml file</label>\n\
+                   <input id=\"opml-file\" type=\"file\" accept=\".opml,.xml,text/xml\" class=\"js-opml-file\">\n\
+                 </div>\n\
+                 <div class=\"field\">\n\
+                   <label for=\"opml-xml\">Or paste XML</label>\n\
+                   <textarea id=\"opml-xml\" name=\"opml_xml\" required class=\"textarea-compact js-opml-textarea\" placeholder=\"&lt;opml version=&quot;2.0&quot;&gt;…\"></textarea>\n\
+                 </div>\n\
+                 <button type=\"submit\" class=\"btn btn-small\">Import Subscriptions</button>\n\
+               </form>\n\
+             </details>\n\
+           </section>\n\
+         </div>\n",
+        csrf = esc(csrf),
+        active = stats.active,
+        paused = stats.paused,
+        failing = stats.failing,
+    );
 }
 
 pub(in crate::web) async fn post_feed_create<F: FeedFetcher>(

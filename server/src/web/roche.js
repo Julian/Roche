@@ -1075,9 +1075,7 @@
                 if (nextMain && curMain) {
                   syncCsrfFromDoc(doc);
                   curMain.replaceChildren(...Array.from(nextMain.childNodes));
-                  initReaderProgress();
-                  initRankBoard();
-                  initOpmlFileHelper();
+                  initPageWidgets();
                 }
               }
             }
@@ -1476,6 +1474,49 @@
     });
   };
 
+  const initFeedsFilter = () => {
+    const list = document.getElementById("roche-feeds-list");
+    if (!list || list.dataset.bound === "1") return;
+    list.dataset.bound = "1";
+    const input = document.getElementById("roche-feeds-search");
+    const kindSelect = document.getElementById("roche-feeds-kind");
+    const pills = Array.from(document.querySelectorAll(".js-feeds-pill"));
+    let activeStatus = "all";
+
+    const apply = () => {
+      const q = (input?.value || "").trim().toLowerCase();
+      const activeKind = (kindSelect?.value || "all").toLowerCase();
+      for (const row of list.children) {
+        const hay = (row.getAttribute("data-feed-search") || "").toLowerCase();
+        const kind = (row.getAttribute("data-feed-kind") || "").toLowerCase();
+        const paused = row.getAttribute("data-feed-paused") === "1";
+        const hasErr = row.getAttribute("data-feed-error") === "1";
+        const matchStatus =
+          activeStatus === "all" ||
+          (activeStatus === "active" && !paused) ||
+          (activeStatus === "errors" && hasErr) ||
+          (activeStatus === "paused" && paused);
+        const matchKind = activeKind === "all" || kind === activeKind;
+        const matchQuery = !q || hay.includes(q);
+        row.hidden = !(matchStatus && matchKind && matchQuery);
+      }
+    };
+
+    input?.addEventListener("input", apply);
+    kindSelect?.addEventListener("change", apply);
+    for (const pill of pills) {
+      pill.addEventListener("click", () => {
+        activeStatus = pill.getAttribute("data-status") || "all";
+        for (const p of pills) {
+          const isCur = p === pill;
+          p.classList.toggle("is-active", isCur);
+          p.setAttribute("aria-pressed", isCur ? "true" : "false");
+        }
+        apply();
+      });
+    }
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
     initReaderExtras();
@@ -1484,6 +1525,7 @@
     initRefreshBanner();
     initSleeveDrawers();
     initSidebarFeedFilter();
+    initFeedsFilter();
     initFaviconFallbacks();
     initOptimisticStars();
   };

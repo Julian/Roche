@@ -2372,9 +2372,10 @@ async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, _csrf) = login_browser(&db, &app).await;
 
-    // 1. Default-open panels on /feeds and /queue carry `data-default-open` and roche.js honors it
+    // 1. Subscribe rail on /feeds is directly visible (no unguarded `<details open>`) and default-open panel on /queue carries `data-default-open`
     let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(feeds_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
+    assert!(feeds_html.contains("action=\"/web/feeds/create\""));
+    assert!(!feeds_html.contains("<details class=\"rail-details\" open>"));
     let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
     assert!(queue_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
     assert!(super::ROCHE_JS.contains("details[open]:not([data-default-open])"));
@@ -2620,4 +2621,39 @@ async fn test_load_existing_reader_item_ids_batched_lookup_and_catalog_links() {
     let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
     assert!(queue_html.contains(&format!("/reader/{}", want_with_url.id)));
     assert!(!queue_html.contains(&format!("/reader/{}", want_no_url.id)));
+}
+
+#[tokio::test]
+async fn test_feeds_page_suppresses_paused_errors_and_separates_status_and_kind_filters() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let active_url = Url::parse("https://active.example/rss.xml").unwrap();
+    let active = db
+        .feeds()
+        .create(FeedType::Rss, &active_url, Some("Active Broken Feed"), None)
+        .await
+        .unwrap();
+    db.feeds().mark_error(&active.id, "Upstream feed error: unable to parse feed").await.unwrap();
+
+    let paused_url = Url::parse("https://paused.example/podcast.xml").unwrap();
+    let paused = db
+        .feeds()
+        .create(FeedType::Podcast, &paused_url, Some("Paused Podcast"), None)
+        .await
+        .unwrap();
+    db.feeds().mark_error(&paused.id, "Upstream server returned HTTP 403 Forbidden").await.unwrap();
+    db.feeds().archive(&paused.id).await.unwrap();
+
+    let html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
+    assert!(html.contains(">All (2)</button>"));
+    assert!(html.contains(">Active (1)</button>"));
+    assert!(html.contains(">Errors (1)</button>"));
+    assert!(html.contains(">Paused (1)</button>"));
+    assert!(html.contains("id=\"roche-feeds-kind\""));
+    assert!(html.contains("<option value=\"rss\">RSS (1)</option>"));
+    assert!(html.contains("<option value=\"podcast\">Podcasts (1)</option>"));
+    assert!(html.contains("unable to parse feed"));
+    assert!(!html.contains("HTTP 403 Forbidden"));
+    assert!(!html.contains(&format!("/web/feeds/{}/refresh", paused.id)));
 }
