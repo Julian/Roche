@@ -10,7 +10,8 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+        FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_see_other,
+        redirect_with_flash, render_diary_row, render_inline_csrf_form, render_page, urlencode,
         web_api_error_response,
     },
     links::{
@@ -20,10 +21,7 @@ use super::{
     views_reader::render_audio_play_button,
 };
 use crate::{
-    db::{
-        CollectionGeneratorState, ConsumptionLogView, ConsumptionStatus, Item, ItemFilter,
-        ItemStatusFilter,
-    },
+    db::{CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter, ItemStatusFilter},
     error::ApiError,
     scheduler::FeedFetcher,
     service::RocheService,
@@ -58,45 +56,50 @@ async fn render_home_inner<F: FeedFetcher>(
     session: &WebSession,
     flash: &FlashQuery,
 ) -> Result<Response, ApiError> {
-    let active_generators = service.catalog().list_collection_generators(true).await?;
-
-    let unread_page = service
-        .items()
-        .query()
-        .with_filter(ItemFilter {
-            status: Some(ItemStatusFilter::Unread),
-            inbox_only: Some(true),
-            include_content: Some(false),
-            per_page: Some(12),
-            ..ItemFilter::default()
-        })
-        .list_page()
-        .await?;
-    let active_readable_page = service
-        .items()
-        .query()
-        .with_filter(ItemFilter {
-            status: Some(ItemStatusFilter::Unread),
-            include_content: Some(false),
-            per_page: Some(20),
-            ..ItemFilter::default()
-        })
-        .list_page()
-        .await?;
-    let want_to_read_page = service
-        .items()
-        .query()
-        .with_filter(ItemFilter {
-            collection_id: Some(crate::db::WANT_TO_READ_COLLECTION_ID.to_owned()),
-            include_content: Some(false),
-            per_page: Some(8),
-            ..ItemFilter::default()
-        })
-        .list_page()
-        .await?;
-    let sync_status = service.sync_status().await?;
-    let recent_diary = service.catalog().list_diary(None, None, 8).await?;
-    let collections = service.catalog().list_collections(true, false).await?;
+    let unread_filter = ItemFilter {
+        status: Some(ItemStatusFilter::Unread),
+        inbox_only: Some(true),
+        include_content: Some(false),
+        per_page: Some(12),
+        ..ItemFilter::default()
+    };
+    let readable_filter = ItemFilter {
+        status: Some(ItemStatusFilter::Unread),
+        include_content: Some(false),
+        per_page: Some(20),
+        ..ItemFilter::default()
+    };
+    let wtr_filter = ItemFilter {
+        collection_id: Some(crate::db::WANT_TO_READ_COLLECTION_ID.to_owned()),
+        include_content: Some(false),
+        per_page: Some(8),
+        ..ItemFilter::default()
+    };
+    let catalog = service.catalog();
+    let (
+        active_generators_res,
+        unread_page_res,
+        active_readable_page_res,
+        want_to_read_page_res,
+        sync_status_res,
+        recent_diary_res,
+        collections_res,
+    ) = tokio::join!(
+        catalog.list_collection_generators(true),
+        service.items().query().with_filter(unread_filter).list_page(),
+        service.items().query().with_filter(readable_filter).list_page(),
+        service.items().query().with_filter(wtr_filter).list_page(),
+        service.sync_status(),
+        catalog.list_diary(None, None, 8),
+        catalog.list_collections(true, false),
+    );
+    let active_generators = active_generators_res?;
+    let unread_page = unread_page_res?;
+    let active_readable_page = active_readable_page_res?;
+    let want_to_read_page = want_to_read_page_res?;
+    let sync_status = sync_status_res?;
+    let recent_diary = recent_diary_res?;
+    let collections = collections_res?;
 
     let mut home_creators: Vec<String> = active_generators
         .iter()
@@ -169,7 +172,7 @@ pub(in crate::web) fn render_collection_draw_section(
     let Some(entry) = &state.current_entry else {
         let _ = write!(
             out,
-            "<section class=\"album-sleeve\" style=\"grid-template-columns:1fr\">\n\
+            "<section class=\"album-sleeve album-sleeve-single\">\n\
                <div>\n\
                  <div class=\"album-kicker\">{} Completed</div>\n\
                  <h2 class=\"album-title\">All {} Works Completed</h2>\n\
@@ -259,7 +262,7 @@ fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) 
            <summary class=\"btn btn-primary\">Finish &amp; Rank</summary>\n\
            <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/finish\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
+             <div class=\"field mb-sm\">\n\
                <label for=\"finish-notes-{list}\">Notes (optional)</label>\n\
                <textarea id=\"finish-notes-{list}\" name=\"notes\" placeholder=\"Impressions, standout moments...\"></textarea>\n\
              </div>\n\
@@ -270,7 +273,7 @@ fn render_draw_mutation_forms(out: &mut String, list_key_enc: &str, csrf: &str) 
            <summary class=\"btn btn-ghost btn-small\">Abandon</summary>\n\
            <form class=\"album-inline-form\" method=\"post\" action=\"/web/lists/{list}/generator/abandon\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field\" style=\"margin-bottom:0.55rem\">\n\
+             <div class=\"field mb-sm\">\n\
                <label for=\"abandon-notes-{list}\">Why abandon? (optional)</label>\n\
                <textarea id=\"abandon-notes-{list}\" name=\"notes\" placeholder=\"Optional note...\"></textarea>\n\
              </div>\n\
@@ -364,10 +367,10 @@ fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: us
             out,
             "<li class=\"inbox-row\"><div class=\"inbox-main\">\
              <div class=\"inbox-title\"><a href=\"/reader/{id}\">{title}</a></div>\
-             <div class=\"item-byline\"><span class=\"badge\">{ctype:?}</span>",
+             <div class=\"item-byline\"><span class=\"badge\">{ctype}</span>",
             id = esc(&urlencode(&item.id)),
             title = esc(&item.title),
-            ctype = item.content_type,
+            ctype = esc(content_type_label(item.content_type)),
         );
         if let Some(author) = item.author.as_deref().filter(|s| !s.is_empty()) {
             let _ = write!(out, "<span>{}</span>", esc(author));
@@ -377,15 +380,14 @@ fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: us
         }
         out.push_str("</div></div><div class=\"inbox-controls\">");
         render_audio_play_button(out, item);
-        let _ = write!(
+        let action = format!("/web/items/{}/finish", urlencode(&item.id));
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/items/{id}/finish\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <input type=\"hidden\" name=\"return_to\" value=\"/\">\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">&#10003; Done</button>\
-             </form>",
-            id = esc(&urlencode(&item.id)),
-            csrf = esc(csrf),
+            &action,
+            csrf,
+            &[("return_to", "/")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">&#10003; Done</button>",
         );
         out.push_str("</div></li>\n");
     }
@@ -411,10 +413,10 @@ fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread:
             out,
             "<li class=\"inbox-row\"><div class=\"inbox-main\">\
              <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
-             <div class=\"item-byline\"><span class=\"badge\">{:?}</span>",
+             <div class=\"item-byline\"><span class=\"badge\">{}</span>",
             esc(&urlencode(&item.id)),
             esc(&item.title),
-            item.content_type,
+            esc(content_type_label(item.content_type)),
         );
         if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
             let _ = write!(out, "<span>{}</span>", esc(ft));
@@ -446,28 +448,7 @@ fn render_recent_diary_section(
     }
 
     for row in diary {
-        let _ = write!(
-            out,
-            "<div class=\"diary-row\">\
-               <span class=\"date\">{}</span>\
-               <span><a href=\"/entries/{}\">{}</a>",
-            row.ts.format("%b %d"),
-            esc(&urlencode(&row.entry.id)),
-            esc(&row.entry.title),
-        );
-        if !row.entry.creators.is_empty() {
-            out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
-            render_creator_links(out, &row.entry.creators, artist_links, false);
-            out.push_str("</span>");
-        }
-        if row.status != ConsumptionStatus::Consumed {
-            let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
-        }
-        let _ = writeln!(
-            out,
-            "</span><span class=\"kind\">{}</span></div>",
-            esc(row.entry.kind.display_label())
-        );
+        render_diary_row(out, row, artist_links, false);
     }
 }
 
@@ -488,13 +469,9 @@ pub(super) async fn post_generator_toggle<F: FeedFetcher>(
             let to_list = form.redirect_list.as_deref().is_some_and(|v| v == "true" || v == "1");
             if to_list {
                 let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
-                redirect_see_other(&format!(
-                    "/lists/{}?notice={}",
-                    urlencode(list_key),
-                    urlencode(&msg)
-                ))
+                redirect_with_flash(&format!("/lists/{}", urlencode(list_key)), "notice", &msg)
             } else {
-                redirect_see_other(&format!("/?notice={}", urlencode(&msg)))
+                redirect_with_flash("/", "notice", &msg)
             }
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fmt::Write as _, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use axum::{
     Form,
@@ -7,8 +11,9 @@ use axum::{
 };
 
 use super::{
-    AddListEntryForm, CreateListForm, ListPageQuery, ListsOverviewQuery, parse_csv_list,
-    parse_optional_year, render_kind_options, render_search_kind_options,
+    AddListEntryForm, CreateListForm, ListPageQuery, ListsOverviewQuery,
+    load_existing_reader_item_ids, parse_csv_list, parse_optional_year, render_kind_options,
+    render_search_kind_options,
 };
 use crate::{
     db::{
@@ -21,8 +26,8 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
-            web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
+            render_inline_csrf_form, render_page, urlencode, web_api_error_response,
         },
         links::{load_artist_id_by_lower_name, render_creator_links},
         views_home::render_collection_draw_section,
@@ -116,8 +121,8 @@ fn render_catalog_search_form(
 ) {
     let _ = write!(
         out,
-        "<form method=\"get\" action=\"/lists\" style=\"display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem\">\n\
-           <input type=\"search\" name=\"q\" aria-label=\"Search catalog\" value=\"{}\" placeholder=\"Search catalog works, artists, creators, identifiers...\" style=\"flex:1;min-width:14rem\">\n\
+        "<form method=\"get\" action=\"/lists\" class=\"search-form\">\n\
+           <input type=\"search\" name=\"q\" aria-label=\"Search catalog\" value=\"{}\" placeholder=\"Search catalog works, artists, creators, identifiers...\" class=\"search-input\">\n\
            <select name=\"kind\" aria-label=\"Filter by kind\">{}</select>\n\
            <button type=\"submit\" class=\"btn\">Search</button>",
         esc(clean_q.unwrap_or("")),
@@ -146,7 +151,7 @@ fn render_catalog_search_results(
         out.push_str("<p class=\"empty\">No matching works in catalog.</p>\n");
         return;
     }
-    out.push_str("<ul class=\"plain\" style=\"margin-bottom:1.75rem\">\n");
+    out.push_str("<ul class=\"plain mb-xl\">\n");
     for entry in results {
         let _ = write!(
             out,
@@ -155,12 +160,12 @@ fn render_catalog_search_results(
             esc(&entry.title),
         );
         if !entry.creators.is_empty() {
-            out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+            out.push_str(" <span class=\"text-soft\">&mdash; ");
             render_creator_links(out, &entry.creators, artist_links, false);
             out.push_str("</span>");
         }
         if let Some(yr) = entry.release_year {
-            let _ = write!(out, " <span style=\"color:var(--ink-faint)\">({yr})</span>");
+            let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
         }
         let _ =
             writeln!(out, " <span class=\"badge\">{}</span></li>", esc(entry.kind.display_label()));
@@ -280,7 +285,13 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
     if let Some(drawn) = gen_state.as_ref().and_then(|gs| gs.current_entry.as_ref()) {
         page_creators.extend(drawn.creators.iter().cloned());
     }
-    let artist_links = load_artist_id_by_lower_name(&service, &page_creators).await;
+    let (artist_links, reader_item_ids) = tokio::join!(
+        load_artist_id_by_lower_name(&service, &page_creators),
+        load_existing_reader_item_ids(
+            &service,
+            view.rows[start_idx..end_idx].iter().map(|r| &r.entry),
+        ),
+    );
 
     let mut body = String::with_capacity(12_288);
     render_ranked_list_body(
@@ -290,6 +301,7 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
         page_num,
         total_pages,
         &artist_links,
+        &reader_item_ids,
         &session.csrf_token,
     );
 
@@ -305,6 +317,7 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
     .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_ranked_list_body(
     out: &mut String,
     view: &RankedCollectionView,
@@ -312,6 +325,7 @@ fn render_ranked_list_body(
     page_num: usize,
     total_pages: usize,
     artist_links: &HashMap<String, String>,
+    reader_item_ids: &HashSet<String>,
     csrf: &str,
 ) {
     let slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
@@ -322,33 +336,31 @@ fn render_ranked_list_body(
 
     let _ = write!(
         out,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\n\
+        "<div class=\"page-head\">\n\
            <h2>{}</h2>\n\
-           <div style=\"display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap\">",
+           <div class=\"flex-row flex-center\">",
         esc(&view.collection.title)
     );
     if let Some(gs) = gen_state {
         let next_enabled = if gs.enabled { "false" } else { "true" };
         let label = if gs.enabled { "Pause Draw" } else { "Enable Draw" };
-        let _ = write!(
+        let toggle_action = format!("/web/lists/{slug_enc}/generator/toggle");
+        let btn_html = format!("<button type=\"submit\" class=\"btn btn-small\">{label}</button>");
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/lists/{}/generator/toggle\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
-               <input type=\"hidden\" name=\"enabled\" value=\"{next_enabled}\">\
-               <input type=\"hidden\" name=\"redirect_list\" value=\"true\">\
-               <button type=\"submit\" class=\"btn btn-small\">{label}</button>\
-             </form>",
-            esc(&slug_enc),
-            esc(csrf),
+            &toggle_action,
+            csrf,
+            &[("enabled", next_enabled), ("redirect_list", "true")],
+            None,
+            &btn_html,
         );
     }
     if view.rows.len() >= 2 {
-        let want_suffix =
-            if view.collection.role == CollectionRole::Want { "?want=true" } else { "" };
+        let rank_href = rank_collection_href(slug, view.collection.role == CollectionRole::Want);
         let _ = write!(
             out,
-            "<a class=\"btn btn-primary btn-small\" href=\"/rank/{}{want_suffix}\">Compare &amp; Rank</a>",
-            esc(&slug_enc)
+            "<a class=\"btn btn-primary btn-small\" href=\"{}\">Compare &amp; Rank</a>",
+            esc(&rank_href)
         );
     }
     out.push_str("</div></div>\n");
@@ -371,7 +383,7 @@ fn render_ranked_list_body(
         render_collection_draw_section(out, gs, artist_links, csrf);
     }
 
-    if is_manual_list {
+    if is_editable_manual {
         render_manual_list_add_panel(out, slug, csrf);
     }
 
@@ -397,7 +409,7 @@ fn render_ranked_list_body(
            <th class=\"score num\">Score</th>",
     );
     if is_editable_manual {
-        out.push_str("<th></th>");
+        out.push_str("<th><span class=\"sr-only\">Actions</span></th>");
     }
     out.push_str("</tr></thead>\n<tbody>\n");
 
@@ -405,7 +417,16 @@ fn render_ranked_list_body(
     for (idx, row) in slice.iter().enumerate() {
         let tier_break = idx > 0 && row.tier != prev_tier;
         prev_tier = row.tier;
-        render_ranked_table_row(out, row, tier_break, is_editable_manual, slug, artist_links, csrf);
+        render_ranked_table_row(
+            out,
+            row,
+            tier_break,
+            is_editable_manual,
+            slug,
+            artist_links,
+            reader_item_ids,
+            csrf,
+        );
     }
     out.push_str("</tbody>\n</table>\n");
 
@@ -414,6 +435,7 @@ fn render_ranked_list_body(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_ranked_table_row(
     out: &mut String,
     row: &crate::db::RankedEntryRow,
@@ -421,12 +443,14 @@ fn render_ranked_table_row(
     is_editable_manual: bool,
     slug: &str,
     artist_links: &HashMap<String, String>,
+    reader_item_ids: &HashSet<String>,
     csrf: &str,
 ) {
     let tr_cls = if tier_break { " class=\"tier-break\"" } else { "" };
     let tier_char = row.tier.unwrap_or('·');
     let tier_cls = row.tier.map_or_else(String::new, |t| format!(" tier-{t}"));
     let tick_pct = row.bar_pct.clamp(4.0, 96.0);
+    let sigma = row.score.variance.max(0.0).sqrt();
 
     let _ = write!(
         out,
@@ -442,34 +466,35 @@ fn render_ranked_table_row(
     if let Some(yr) = row.entry.release_year {
         let _ = write!(out, "<span class=\"year\">({yr})</span>");
     }
-    if row.entry.kind.is_reader_openable() && row.entry.url.is_some() {
+    if reader_item_ids.contains(&row.entry.id) {
         let _ = write!(
             out,
-            " <a class=\"badge\" style=\"margin-left:0.4rem\" href=\"/reader/{id}\">Read &rarr;</a>",
+            " <a class=\"badge ml-xs\" href=\"/reader/{id}\">Read &rarr;</a>",
             id = esc(&urlencode(&row.entry.id)),
         );
     }
     let _ = write!(
         out,
         "</td>\
-         <td class=\"score\"><div class=\"score-mark\" title=\"μ = {:.2}, σ = {:.2}\">\
-           <span class=\"tick\" style=\"left:{tick_pct:.1}%\"></span></div></td>",
-        row.score.mean,
-        row.score.variance.max(0.0).sqrt(),
+         <td class=\"score\"><div class=\"score-mark-wrap\" title=\"μ = {mean:.2}, σ = {sigma:.2}\">\
+           <span class=\"sr-only\">Score {mean:.2} (±{sigma:.2})</span>\
+           <svg class=\"score-mark\" viewBox=\"0 0 100 12\" width=\"100\" height=\"12\" aria-hidden=\"true\">\
+             <line class=\"score-axis\" x1=\"0\" y1=\"6\" x2=\"100\" y2=\"6\"/>\
+             <line class=\"score-mid\" x1=\"50\" y1=\"2\" x2=\"50\" y2=\"10\"/>\
+             <circle class=\"tick\" cx=\"{tick_pct:.1}\" cy=\"6\" r=\"3.5\"/>\
+           </svg></div></td>",
+        mean = row.score.mean,
     );
     if is_editable_manual {
-        let _ = write!(
-            out,
-            "<td class=\"num\">\
-               <form method=\"post\" action=\"/web/lists/{slug_enc}/remove/{id_enc}\" class=\"inline-form\">\
-                 <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                 <button type=\"submit\" class=\"link-btn\" title=\"Remove from list\">&times;</button>\
-               </form>\
-             </td>",
-            slug_enc = esc(&urlencode(slug)),
-            id_enc = esc(&urlencode(&row.entry.id)),
-            csrf = esc(csrf),
+        let remove_action =
+            format!("/web/lists/{}/remove/{}", urlencode(slug), urlencode(&row.entry.id));
+        let remove_btn = format!(
+            "<button type=\"submit\" class=\"link-btn\" title=\"Remove from list\" aria-label=\"Remove {} from list\">&times;</button>",
+            esc(&row.entry.title)
         );
+        out.push_str("<td class=\"num\">");
+        render_inline_csrf_form(out, &remove_action, csrf, &[], None, &remove_btn);
+        out.push_str("</td>");
     }
     out.push_str("</tr>\n");
 }
@@ -501,7 +526,7 @@ fn render_manual_list_add_panel(out: &mut String, slug: &str, csrf: &str) {
 }
 
 fn render_list_pager(out: &mut String, slug: &str, page_num: usize, total_pages: usize) {
-    out.push_str("<nav class=\"pager\">");
+    out.push_str("<nav class=\"pager\" aria-label=\"Pagination\">");
     if page_num > 1 {
         let _ = write!(
             out,
@@ -512,7 +537,7 @@ fn render_list_pager(out: &mut String, slug: &str, page_num: usize, total_pages:
     }
     for p in 1..=total_pages {
         if p == page_num {
-            let _ = write!(out, "<span class=\"current\">{p}</span>");
+            let _ = write!(out, "<span class=\"current\" aria-current=\"page\">{p}</span>");
         } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
             let _ = write!(out, "<a href=\"/lists/{}?page={p}\">{p}</a>", esc(&urlencode(slug)));
         } else if p.abs_diff(page_num) == 3 {

@@ -16,8 +16,9 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, feed_type_label, redirect_see_other,
+            redirect_with_flash, render_inline_csrf_form, render_page, safe_local_redirect,
+            urlencode, web_api_error_response,
         },
     },
 };
@@ -35,9 +36,9 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
     let mut body = String::with_capacity(6_144);
     let _ = writeln!(
         body,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
+        "<div class=\"page-head\">\
            <h2>Feeds</h2>\
-           <div style=\"display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap\">\
+           <div class=\"flex-row flex-center\">\
              <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
                <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
                <input type=\"hidden\" name=\"return_to\" value=\"/feeds\">\
@@ -77,11 +78,11 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
            <summary>Import OPML</summary>\n\
            <form method=\"post\" action=\"/web/feeds/opml\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"field\" style=\"margin-bottom:0.6rem\">\n\
+             <div class=\"field mb-sm\">\n\
                <label for=\"opml-file\">Choose .opml / .xml file (or paste XML below)</label>\n\
                <input id=\"opml-file\" type=\"file\" accept=\".opml,.xml,text/xml\" class=\"js-opml-file\">\n\
              </div>\n\
-             <div class=\"field\" style=\"margin-bottom:0.65rem\">\n\
+             <div class=\"field mb-sm\">\n\
                <label for=\"opml-xml\">OPML XML</label>\n\
                <textarea id=\"opml-xml\" name=\"opml_xml\" required class=\"js-opml-textarea\" placeholder=\"&lt;opml version=&quot;2.0&quot;&gt;...\"></textarea>\n\
              </div>\n\
@@ -119,11 +120,11 @@ fn render_feeds_table(out: &mut String, feeds: &[Feed], csrf: &str) {
                <div class=\"inbox-main\">\n\
                  <div class=\"inbox-title\"><a href=\"/inbox?status=all&amp;feed={id}\">{title}</a></div>\n\
                  <div class=\"item-byline\">\n\
-                   <span class=\"badge\">{ftype:?}</span>\n\
+                   <span class=\"badge\">{ftype}</span>\n\
                    <span>{unread} unread</span>",
             id = esc(&urlencode(&f.id)),
             title = esc(title),
-            ftype = f.feed_type,
+            ftype = esc(feed_type_label(f.feed_type)),
             unread = f.unread_count,
         );
         if !f.is_active {
@@ -138,32 +139,38 @@ fn render_feeds_table(out: &mut String, feeds: &[Feed], csrf: &str) {
         }
         out.push_str("</div>\n</div>\n<div class=\"inbox-controls\">\n");
 
-        let _ = write!(
+        let id_enc = urlencode(&f.id);
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/feeds/{id}/refresh\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <button type=\"submit\" class=\"btn btn-small\">Refresh</button>\
-             </form>",
-            id = esc(&urlencode(&f.id)),
-            csrf = esc(csrf),
+            &format!("/web/feeds/{id_enc}/refresh"),
+            csrf,
+            &[],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small\">Refresh</button>",
         );
 
         let (next_active, toggle_label) =
             if f.is_active { ("false", "Pause") } else { ("true", "Resume") };
-        let _ = writeln!(
-            out,
-            "<form method=\"post\" action=\"/web/feeds/{id}/toggle-active\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <input type=\"hidden\" name=\"active\" value=\"{next_active}\">\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">{toggle_label}</button>\
-             </form>\
-             <form method=\"post\" action=\"/web/feeds/{id}/delete\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Delete</button>\
-             </form>\n</div>\n</li>",
-            id = esc(&urlencode(&f.id)),
-            csrf = esc(csrf),
+        let toggle_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">{toggle_label}</button>"
         );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/feeds/{id_enc}/toggle-active"),
+            csrf,
+            &[("active", next_active)],
+            None,
+            &toggle_btn,
+        );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/feeds/{id_enc}/delete"),
+            csrf,
+            &[],
+            Some("Delete this feed subscription? Your diary and rankings will be preserved."),
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Delete</button>",
+        );
+        out.push_str("\n</div>\n</li>\n");
     }
     out.push_str("</ul>\n");
 }
@@ -265,13 +272,12 @@ pub(in crate::web) async fn post_feed_refresh_all<F: FeedFetcher>(
     let base = safe_local_redirect(form.return_to.as_deref(), "/feeds");
     match service.feeds().refresh_all_in_background().await {
         Ok(count) => {
-            let sep = if base.contains('?') { '&' } else { '?' };
             let msg = if count == 0 {
                 "No active feeds to refresh".to_owned()
             } else {
                 format!("Refreshing {count} feeds in background…")
             };
-            redirect_see_other(&format!("{base}{sep}notice={}", urlencode(&msg)))
+            redirect_with_flash(&base, "notice", &msg)
         }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }

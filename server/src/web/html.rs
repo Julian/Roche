@@ -1,11 +1,18 @@
-use std::fmt::{self, Write as _};
+use std::{
+    collections::HashMap,
+    fmt::{self, Write as _},
+};
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 
-use crate::error::ApiError;
+use super::links::render_creator_links;
+use crate::{
+    db::{ConsumptionLogView, ConsumptionStatus, ContentType, FeedType},
+    error::ApiError,
+};
 
 /// HTML-escapes interpolated text (`&`, `<`, `>`, `"`, `'`) with zero intermediate heap allocation.
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +78,99 @@ pub(super) fn redirect_see_other(location: &str) -> Response {
     resp
 }
 
+pub(super) fn redirect_with_flash(base: &str, param: &str, msg: &str) -> Response {
+    let safe_base = safe_local_redirect(Some(base), "/");
+    let sep = if safe_base.contains('?') { '&' } else { '?' };
+    redirect_see_other(&format!("{safe_base}{sep}{param}={}", urlencode(msg)))
+}
+
+#[must_use]
+pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
+    let normalized = if want { slug.strip_prefix("want:").unwrap_or(slug) } else { slug };
+    if want {
+        format!("/rank/{}?want=true", urlencode(normalized))
+    } else {
+        format!("/rank/{}", urlencode(normalized))
+    }
+}
+
+#[must_use]
+pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
+    match ct {
+        ContentType::Article => "Article",
+        ContentType::Video => "Video",
+        ContentType::Paper => "Paper",
+        ContentType::Audio => "Audio",
+        ContentType::Pdf => "PDF",
+    }
+}
+
+#[must_use]
+pub(super) const fn feed_type_label(ft: FeedType) -> &'static str {
+    match ft {
+        FeedType::Rss => "RSS",
+        FeedType::Podcast => "Podcast",
+        FeedType::Youtube => "YouTube",
+        FeedType::Arxiv => "arXiv",
+    }
+}
+
+pub(super) fn render_inline_csrf_form(
+    out: &mut String,
+    action: &str,
+    csrf: &str,
+    hidden_fields: &[(&str, &str)],
+    confirm: Option<&str>,
+    button_html: &str,
+) {
+    let confirm_attr =
+        confirm.map_or_else(String::new, |msg| format!(" data-confirm=\"{}\"", esc(msg)));
+    let _ = write!(
+        out,
+        "<form method=\"post\" action=\"{}\" class=\"inline-form\"{confirm_attr}>\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{}\">",
+        esc(action),
+        esc(csrf),
+    );
+    for (name, value) in hidden_fields {
+        let _ =
+            write!(out, "<input type=\"hidden\" name=\"{}\" value=\"{}\">", esc(name), esc(value));
+    }
+    out.push_str(button_html);
+    out.push_str("</form>");
+}
+
+pub(super) fn render_diary_row(
+    out: &mut String,
+    row: &ConsumptionLogView,
+    artist_links: &HashMap<String, String>,
+    show_notes: bool,
+) {
+    let _ = write!(
+        out,
+        "<div class=\"diary-row\">\
+           <span class=\"date\">{}</span>\
+           <span><a href=\"/entries/{}\">{}</a>",
+        row.ts.format("%b %d"),
+        esc(&urlencode(&row.entry.id)),
+        esc(&row.entry.title),
+    );
+    if !row.entry.creators.is_empty() {
+        out.push_str(" <span class=\"text-soft\">&mdash; ");
+        render_creator_links(out, &row.entry.creators, artist_links, false);
+        out.push_str("</span>");
+    }
+    if row.status != ConsumptionStatus::Consumed {
+        let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
+    }
+    let _ =
+        write!(out, "</span><span class=\"kind\">{}</span>", esc(row.entry.kind.display_label()));
+    if show_notes && let Some(notes) = row.notes.as_deref().filter(|s| !s.is_empty()) {
+        let _ = writeln!(out, "<div class=\"notes\">{}</div>", esc(notes));
+    }
+    out.push_str("</div>\n");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NavSection {
     Home,
@@ -127,6 +227,7 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
            <link rel=\"stylesheet\" href=\"/static/roche.css\">\n\
          </head>\n\
          <body data-csrf=\"{}\">\n\
+         <a class=\"skip-link\" href=\"#roche-main\">Skip to content</a>\n\
          <header class=\"masthead\">\n\
            <div class=\"masthead-top\">\n\
              <h1><a href=\"/\">Roche</a></h1>\n\
@@ -135,15 +236,16 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
                <button type=\"submit\" class=\"link-btn\">Sign out</button>\n\
              </form>\n\
            </div>\n\
-           <nav id=\"roche-nav\" class=\"primary-nav\">",
+           <nav id=\"roche-nav\" class=\"primary-nav\" aria-label=\"Primary\">",
         esc(&page_title),
         esc(shell.csrf_token),
         esc(shell.csrf_token),
     );
 
     for (sec, href, label) in NAV_ITEMS {
-        let cls = if sec == shell.active { " class=\"is-active\"" } else { "" };
-        let _ = write!(out, "<a href=\"{href}\"{cls}>{label}</a>");
+        let attrs =
+            if sec == shell.active { " class=\"is-active\" aria-current=\"page\"" } else { "" };
+        let _ = write!(out, "<a href=\"{href}\"{attrs}>{label}</a>");
     }
 
     let refresh_hidden = if shell.is_refreshing { "" } else { " hidden" };
@@ -155,14 +257,15 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
            <span class=\"refresh-spinner\" aria-hidden=\"true\">&#8635;</span>\n\
            <span class=\"js-refresh-label\">Refreshing feeds &amp; metadata in background&hellip;</span>\n\
          </div>\n\
-         </header>\n<main id=\"roche-main\">\n",
+         </header>\n<main id=\"roche-main\" tabindex=\"-1\">\n",
     );
 
     if let Some(msg) = shell.flash.err.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "<div class=\"notice notice-error\">{}</div>", esc(msg));
+        let _ =
+            writeln!(out, "<div class=\"notice notice-error\" role=\"alert\">{}</div>", esc(msg));
     } else if let Some(msg) = shell.flash.notice.as_deref().map(str::trim).filter(|s| !s.is_empty())
     {
-        let _ = writeln!(out, "<div class=\"notice\">{}</div>", esc(msg));
+        let _ = writeln!(out, "<div class=\"notice\" role=\"status\">{}</div>", esc(msg));
     }
 
     out.push_str(shell.body_html);
@@ -219,14 +322,15 @@ pub(super) fn render_login_page(
     );
 
     if let Some(err) = error_msg.map(str::trim).filter(|s| !s.is_empty()) {
-        let _ = writeln!(out, "<div class=\"notice notice-error\">{}</div>", esc(err));
+        let _ =
+            writeln!(out, "<div class=\"notice notice-error\" role=\"alert\">{}</div>", esc(err));
     }
 
     if let Some(ts_login) = tailscale_user.map(str::trim).filter(|s| !s.is_empty()) {
         let _ = writeln!(
             out,
-            "<form method=\"post\" action=\"/login/tailscale\" style=\"margin-bottom:1.1rem\">\n\
-               <button type=\"submit\" class=\"btn btn-primary\" style=\"width:100%\">Sign in as {}</button>\n\
+            "<form method=\"post\" action=\"/login/tailscale\" class=\"mb-lg\">\n\
+               <button type=\"submit\" class=\"btn btn-primary w-full\">Sign in as {}</button>\n\
              </form>\n",
             esc(ts_login)
         );
@@ -234,11 +338,11 @@ pub(super) fn render_login_page(
 
     out.push_str(
         "<form method=\"post\" action=\"/login\">\n\
-           <div class=\"field\" style=\"margin-bottom:0.85rem\">\n\
+           <div class=\"field mb-md\">\n\
              <label for=\"pairing_code\">Pairing Code</label>\n\
              <input id=\"pairing_code\" name=\"pairing_code\" type=\"password\" required autocomplete=\"one-time-code\" autofocus placeholder=\"e.g. 4f9a-82c1\">\n\
            </div>\n\
-           <div class=\"field\" style=\"margin-bottom:1.1rem\">\n\
+           <div class=\"field mb-lg\">\n\
              <label for=\"device_name\">Browser Label (optional)</label>\n\
              <input id=\"device_name\" name=\"device_name\" type=\"text\" maxlength=\"80\" placeholder=\"Roche Web\">\n\
            </div>\n\
@@ -248,7 +352,7 @@ pub(super) fn render_login_page(
 
     if tailscale_enabled {
         out.push_str(
-            "<p class=\"meta\" style=\"margin-top:1.25rem;margin-bottom:0;font-size:0.82rem\">\
+            "<p class=\"meta login-tip\">\
              Tip: when served via local <code>tailscale serve</code>, add your Tailnet login to \
              <code>tailscale.auto_auth_users</code> in <code>config.toml</code> for automatic sign-in.\
              </p>\n",
@@ -277,6 +381,7 @@ pub(super) fn render_error_page(
         || {
             Html(format!(
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
                  <title>{}</title><link rel=\"stylesheet\" href=\"/static/roche.css\"></head>\
                  <body><main>{}</main></body></html>",
                 esc(heading),

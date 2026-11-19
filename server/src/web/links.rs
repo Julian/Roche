@@ -133,6 +133,32 @@ fn classify_url_host(raw_url: &str) -> Option<UrlHostClass> {
     None
 }
 
+fn is_non_global_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = v4.octets();
+    let is_cgnat = a == 100 && (64..=127).contains(&b);
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || is_cgnat
+}
+
+fn is_non_global_ipv6(v6: std::net::Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+        return true;
+    }
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_non_global_ipv4(mapped);
+    }
+    let segs = v6.segments();
+    let is_ula = (segs[0] & 0xfe00) == 0xfc00;
+    let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+    let is_6to4 = segs[0] == 0x2002;
+    is_ula || is_link_local || is_6to4
+}
+
 #[must_use]
 pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
     let href = safe_external_href(raw)?;
@@ -154,12 +180,12 @@ pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
             }
         }
         url::Host::Ipv4(v4) => {
-            if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+            if is_non_global_ipv4(v4) {
                 return None;
             }
         }
         url::Host::Ipv6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
+            if is_non_global_ipv6(v6) {
                 return None;
             }
         }
@@ -301,7 +327,7 @@ pub(in crate::web) fn render_creator_links(
     artist_links: &HashMap<String, String>,
     open_new_tab: bool,
 ) {
-    let target_attr = if open_new_tab { " target=\"_blank\"" } else { "" };
+    let target_attr = if open_new_tab { " target=\"_blank\" rel=\"noopener\"" } else { "" };
     for (idx, creator) in creators.iter().enumerate() {
         if idx > 0 {
             out.push_str(", ");

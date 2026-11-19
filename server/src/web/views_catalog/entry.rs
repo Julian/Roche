@@ -16,7 +16,7 @@ use crate::{
     scheduler::FeedFetcher,
     service::RocheService,
     web::{
-        artist_enrich::enrich_artist_detail_if_needed,
+        artist_enrich::spawn_artist_enrichment_if_needed,
         auth::WebSession,
         html::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
@@ -35,7 +35,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
     Path(id): Path<String>,
     Query(flash): Query<FlashQuery>,
 ) -> Response {
-    let mut detail = match service.catalog().get_entry_detail(&id).await {
+    let detail = match service.catalog().get_entry_detail(&id).await {
         Ok(Some(d)) => d,
         Ok(None) => {
             return web_api_error_response(
@@ -47,7 +47,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
             return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
         }
     };
-    enrich_artist_detail_if_needed(&service, &mut detail).await;
+    spawn_artist_enrichment_if_needed(&service, &detail);
 
     let mut relevant_creators: Vec<String> = detail.entry.creators.clone();
     relevant_creators.extend(detail.children.iter().flat_map(|c| c.creators.iter().cloned()));
@@ -207,7 +207,7 @@ fn render_entry_facts(
             });
             let compare_btn = if app.total >= 2 {
                 format!(
-                    " <a class=\"btn btn-small btn-ghost\" style=\"margin-left:0.5rem\" href=\"/rank/{}?focus={}\">Compare</a>",
+                    " <a class=\"btn btn-small btn-ghost ml-sm\" href=\"/rank/{}?focus={}\">Compare</a>",
                     esc(&urlencode(&app.slug)),
                     esc(&urlencode(&entry.id)),
                 )
@@ -323,7 +323,7 @@ fn render_entry_diary_and_actions(
                  <input id=\"log-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked>\
                  <label for=\"log-rank\">Compare &amp; rank after logging</label></div>\n\
              </div>\n\
-             <div class=\"field\" style=\"margin-bottom:0.65rem\">\
+             <div class=\"field mb-sm\">\
                <label for=\"log-notes\">Notes (optional)</label>\
                <textarea id=\"log-notes\" name=\"notes\"></textarea></div>\n\
              <button type=\"submit\" class=\"btn btn-primary\">Save Log</button>\n\
@@ -340,9 +340,9 @@ fn render_entry_diary_and_actions(
         );
         let _ = write!(
             out,
-            "<form method=\"post\" action=\"/web/entries/{}/list-add\" style=\"display:flex;gap:0.5rem;flex-wrap:wrap\">\n\
+            "<form method=\"post\" action=\"/web/entries/{}/list-add\" class=\"flex-row\">\n\
                <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n\
-               <select name=\"list_slug_or_id\">",
+               <select name=\"list_slug_or_id\" aria-label=\"Target custom list\">",
             esc(&id_enc),
             esc(csrf),
         );
@@ -359,11 +359,11 @@ fn render_entry_diary_and_actions(
         out,
         "<details class=\"editorial-panel\">\n\
            <summary>Deduplicate: Merge Into Canonical Work&hellip;</summary>\n\
-           <form method=\"post\" action=\"/web/entries/{id_enc}/merge\">\n\
+           <form method=\"post\" action=\"/web/entries/{id_enc}/merge\" data-confirm=\"Merge this duplicate into the target canonical entry? This action cannot be undone.\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <p class=\"meta\" style=\"margin-top:0\">Folds identifiers, collection memberships, diary logs, and comparisons from this duplicate into the target canonical entry.</p>\n\
-             <div style=\"display:flex;gap:0.5rem;flex-wrap:wrap\">\n\
-               <input name=\"canonical_query\" type=\"text\" required placeholder=\"Canonical Entry UUID, URL, or exact title\" style=\"flex:1\">\n\
+             <p class=\"meta mt-0\">Folds identifiers, collection memberships, diary logs, and comparisons from this duplicate into the target canonical entry.</p>\n\
+             <div class=\"flex-row\">\n\
+               <input name=\"canonical_query\" type=\"text\" required aria-label=\"Canonical entry UUID, URL, or exact title\" placeholder=\"Canonical Entry UUID, URL, or exact title\" class=\"flex-1\">\n\
                <button type=\"submit\" class=\"btn\">Merge Duplicate</button>\n\
              </div>\n\
            </form>\n\

@@ -110,12 +110,43 @@ fn append_set_cookie(resp: &mut Response, cookie: &str) {
     }
 }
 
+fn url_matches_host(raw_url: &str, host_header: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let host_clean = host_header.trim();
+    if host_clean.is_empty() || host_clean.contains('/') || host_clean.contains('@') {
+        return false;
+    }
+    let Ok(expected) = url::Url::parse(&format!("{}://{host_clean}", parsed.scheme())) else {
+        return false;
+    };
+    let (Some(got_host), Some(exp_host)) = (parsed.host_str(), expected.host_str()) else {
+        return false;
+    };
+    got_host.eq_ignore_ascii_case(exp_host)
+        && parsed.port_or_known_default() == expected.port_or_known_default()
+}
+
 #[must_use]
-fn is_same_origin_post(headers: &HeaderMap) -> bool {
-    headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()).is_none_or(|site| {
+pub(super) fn is_same_origin_post(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         let clean = site.trim();
-        clean.eq_ignore_ascii_case("same-origin") || clean.eq_ignore_ascii_case("none")
-    })
+        return clean.eq_ignore_ascii_case("same-origin") || clean.eq_ignore_ascii_case("none");
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        return url_matches_host(origin, host);
+    }
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        return url_matches_host(referer, host);
+    }
+    false
 }
 
 /// Checks whether `Tailscale-User-Login` can be trusted:
@@ -337,10 +368,8 @@ pub(super) async fn require_web_auth_and_csrf<F: FeedFetcher>(
     };
 
     let mut resp = next.run(final_req).await;
-    if let Some(cookie_str) = newly_minted_cookie
-        && let Ok(val) = HeaderValue::from_str(&cookie_str)
-    {
-        resp.headers_mut().insert(header::SET_COOKIE, val);
+    if let Some(cookie_str) = newly_minted_cookie {
+        append_set_cookie(&mut resp, &cookie_str);
     }
     resp
 }

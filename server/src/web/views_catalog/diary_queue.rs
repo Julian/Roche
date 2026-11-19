@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
     sync::Arc,
 };
@@ -11,8 +11,8 @@ use axum::{
 };
 
 use super::{
-    DiaryFilterQuery, QuickLogForm, WantCompleteForm, parse_consumption_status, parse_csv_list,
-    parse_optional_year, render_kind_options,
+    DiaryFilterQuery, QuickLogForm, WantCompleteForm, load_existing_reader_item_ids,
+    parse_consumption_status, parse_csv_list, parse_optional_year, render_kind_options,
 };
 use crate::{
     db::{
@@ -25,7 +25,8 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+            FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
+            render_diary_row, render_inline_csrf_form, render_page, urlencode,
             web_api_error_response,
         },
         links::{load_artist_id_by_lower_name, render_creator_links},
@@ -70,7 +71,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
     let mut body = String::with_capacity(8_192);
     let _ = writeln!(
         body,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
+        "<div class=\"page-head\">\
            <h2>Diary</h2>\
            <a class=\"btn btn-small\" href=\"/queue\">+ Log Media</a>\
          </div>\n\
@@ -84,9 +85,19 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
     {
         let is_cur = q.status.as_deref().unwrap_or("") == slug;
         let cls = if is_cur { "pill is-active" } else { "pill" };
-        let href =
-            if slug.is_empty() { "/diary".to_owned() } else { format!("/diary?status={slug}") };
-        let _ = writeln!(body, "<a class=\"{cls}\" href=\"{href}\">{label}</a>");
+        let mut params = Vec::new();
+        if let Some(yr) = q.year {
+            params.push(format!("year={yr}"));
+        }
+        if !slug.is_empty() {
+            params.push(format!("status={slug}"));
+        }
+        let href = if params.is_empty() {
+            "/diary".to_owned()
+        } else {
+            format!("/diary?{}", params.join("&"))
+        };
+        let _ = writeln!(body, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
     }
     body.push_str("</div>\n");
 
@@ -116,32 +127,7 @@ fn render_diary_months(
     for (month_heading, rows) in months {
         let _ = writeln!(out, "<section class=\"diary-month\">\n<h3>{}</h3>", esc(month_heading));
         for row in rows {
-            let _ = write!(
-                out,
-                "<div class=\"diary-row\">\
-                   <span class=\"date\">{}</span>\
-                   <span><a href=\"/entries/{}\">{}</a>",
-                row.ts.format("%b %d"),
-                esc(&urlencode(&row.entry.id)),
-                esc(&row.entry.title),
-            );
-            if !row.entry.creators.is_empty() {
-                out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
-                render_creator_links(out, &row.entry.creators, artist_links, false);
-                out.push_str("</span>");
-            }
-            if row.status != ConsumptionStatus::Consumed {
-                let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
-            }
-            let _ = writeln!(
-                out,
-                "</span><span class=\"kind\">{}</span>",
-                esc(row.entry.kind.display_label())
-            );
-            if let Some(notes) = row.notes.as_deref().filter(|s| !s.is_empty()) {
-                let _ = writeln!(out, "<div class=\"notes\">{}</div>", esc(notes));
-            }
-            out.push_str("</div>\n");
+            render_diary_row(out, row, artist_links, true);
         }
         out.push_str("</section>\n");
     }
@@ -175,7 +161,12 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         .values()
         .flat_map(|v| v.rows.iter().flat_map(|r| r.entry.creators.iter().cloned()))
         .collect();
-    let artist_links = load_artist_id_by_lower_name(&service, &queue_creators).await;
+    let queue_entries: Vec<&crate::db::CatalogEntry> =
+        ranked_queues.values().flat_map(|v| v.rows.iter().map(|r| &r.entry)).collect();
+    let (artist_links, reader_item_ids) = tokio::join!(
+        load_artist_id_by_lower_name(&service, &queue_creators),
+        load_existing_reader_item_ids(&service, queue_entries),
+    );
 
     let mut body = String::with_capacity(8_192);
     body.push_str(
@@ -189,7 +180,13 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         body.push_str("<p class=\"empty\">Your Want queues are empty. Use the form above to add a movie, book, album, paper, or game.</p>\n");
     } else {
         for (_, qview) in ranked_queues {
-            render_want_queue_section(&mut body, &qview, &artist_links, &session.csrf_token);
+            render_want_queue_section(
+                &mut body,
+                &qview,
+                &artist_links,
+                &reader_item_ids,
+                &session.csrf_token,
+            );
         }
     }
 
@@ -230,10 +227,10 @@ fn render_quick_log_panel(out: &mut String, csrf: &str) {
                    <option value=\"abandoned\">Log Abandoned</option>\
                  </select></div>\n\
              </div>\n\
-             <div class=\"field\" style=\"margin-bottom:0.55rem\">\
+             <div class=\"field mb-sm\">\
                <label for=\"ql-notes\">Notes (optional)</label>\
-               <textarea id=\"ql-notes\" name=\"notes\" style=\"min-height:2.8rem\" placeholder=\"Optional notes...\"></textarea></div>\n\
-             <div class=\"field field-check\" style=\"margin-bottom:0.75rem\">\
+               <textarea id=\"ql-notes\" name=\"notes\" class=\"textarea-compact\" placeholder=\"Optional notes...\"></textarea></div>\n\
+             <div class=\"field field-check mb-md\">\
                <input id=\"ql-rank\" name=\"rank_after\" type=\"checkbox\" value=\"1\" checked>\
                <label for=\"ql-rank\">Open comparison ranking immediately when applicable</label></div>\n\
              <button type=\"submit\" class=\"btn btn-primary\">Save</button>\n\
@@ -248,10 +245,10 @@ fn render_want_queue_section(
     out: &mut String,
     qview: &RankedCollectionView,
     artist_links: &HashMap<String, String>,
+    reader_item_ids: &HashSet<String>,
     csrf: &str,
 ) {
     let q_slug = qview.collection.slug.as_deref().unwrap_or(&qview.collection.id);
-    let base_slug = q_slug.strip_prefix("want:").unwrap_or(q_slug);
     let _ = write!(
         out,
         "<div class=\"section-head\"><h3>{} ({})</h3>",
@@ -259,10 +256,11 @@ fn render_want_queue_section(
         qview.rows.len()
     );
     if qview.rows.len() >= 2 {
+        let rank_href = rank_collection_href(q_slug, true);
         let _ = write!(
             out,
-            "<a class=\"section-action\" href=\"/rank/{}?want=true\">Prioritize Queue &rarr;</a>",
-            esc(&urlencode(base_slug))
+            "<a class=\"section-action\" href=\"{}\">Prioritize Queue &rarr;</a>",
+            esc(&rank_href)
         );
     }
     out.push_str("</div>\n<ol class=\"queue\">\n");
@@ -274,7 +272,7 @@ fn render_want_queue_section(
             render_creator_links(&mut by, &row.entry.creators, artist_links, false);
             by.push_str("</span>");
         }
-        let read_btn = if row.entry.kind.is_reader_openable() && row.entry.url.is_some() {
+        let read_btn = if reader_item_ids.contains(&row.entry.id) {
             format!(
                 "<a class=\"btn btn-small\" href=\"/reader/{}\">Read</a>",
                 esc(&urlencode(&row.entry.id))
@@ -282,32 +280,40 @@ fn render_want_queue_section(
         } else {
             String::new()
         };
-        let _ = writeln!(
+        let id_enc = urlencode(&row.entry.id);
+        let q_enc = urlencode(q_slug);
+        let complete_action = format!("/web/want/{q_enc}/complete/{id_enc}");
+        let remove_action = format!("/web/want/{q_enc}/remove/{id_enc}");
+        let _ = write!(
             out,
             "<li><div class=\"queue-row\">\
                <span><a href=\"/entries/{id}\">{title}</a>{by}</span>\
-               <span class=\"inbox-controls\">\
-                 {read_btn}\
-                 <form method=\"post\" action=\"/web/want/{q}/complete/{id}\" class=\"inline-form\">\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                   <input type=\"hidden\" name=\"rank_after\" value=\"1\">\
-                   <button type=\"submit\" class=\"btn btn-small btn-primary\">&#10003; Done &amp; Rank</button>\
-                 </form>\
-                 <form method=\"post\" action=\"/web/want/{q}/complete/{id}\" class=\"inline-form\">\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                   <button type=\"submit\" class=\"btn btn-small\">&#10003; Done</button>\
-                 </form>\
-                 <form method=\"post\" action=\"/web/want/{q}/remove/{id}\" class=\"inline-form\">\
-                   <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                   <button type=\"submit\" class=\"btn btn-small btn-ghost\">&times;</button>\
-                 </form>\
-               </span>\
-             </div></li>",
-            id = esc(&urlencode(&row.entry.id)),
+               <span class=\"inbox-controls\">{read_btn}",
+            id = esc(&id_enc),
             title = esc(&row.entry.title),
-            q = esc(&urlencode(q_slug)),
-            csrf = esc(csrf),
         );
+        render_inline_csrf_form(
+            out,
+            &complete_action,
+            csrf,
+            &[("rank_after", "1")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-primary\">&#10003; Done &amp; Rank</button>",
+        );
+        render_inline_csrf_form(
+            out,
+            &complete_action,
+            csrf,
+            &[],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small\">&#10003; Done</button>",
+        );
+        let remove_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-label=\"Remove {} from queue\" title=\"Remove from queue\">&times;</button>",
+            esc(&row.entry.title)
+        );
+        render_inline_csrf_form(out, &remove_action, csrf, &[], None, &remove_btn);
+        out.push_str("</span></div></li>\n");
     }
     out.push_str("</ol>\n");
 }

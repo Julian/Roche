@@ -1,8 +1,11 @@
-use std::{collections::HashSet, fmt::Write as _, future::Future, pin::Pin};
 #[cfg(not(test))]
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{
-    sync::{LazyLock, Mutex},
-    time::Duration,
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -189,18 +192,50 @@ where
     }
 }
 
+const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
+#[cfg(not(test))]
+const FAILED_ENRICH_TTL: Duration = Duration::from_mins(30);
+
+#[derive(Debug, Default)]
+pub(in crate::web) struct EnrichAttemptCache {
+    entries: HashMap<String, Instant>,
+}
+
+impl EnrichAttemptCache {
+    pub(in crate::web) fn should_attempt_and_mark(
+        &mut self,
+        key: String,
+        now: Instant,
+        ttl: Duration,
+    ) -> bool {
+        if let Some(&prev) = self.entries.get(&key)
+            && now.saturating_duration_since(prev) < ttl
+        {
+            return false;
+        }
+        if self.entries.len() >= MAX_ENRICH_ATTEMPT_CACHE {
+            self.entries.retain(|_, ts| now.saturating_duration_since(*ts) < ttl);
+            if self.entries.len() >= MAX_ENRICH_ATTEMPT_CACHE {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(key, now);
+        true
+    }
+}
+
 #[cfg(not(test))]
 static ENRICH_HTTP_CLIENT: LazyLock<Option<crate::content::http::SafeHttpClient>> =
     LazyLock::new(|| crate::content::http::SafeHttpClient::new(Duration::from_millis(2_500)).ok());
 
 #[cfg(not(test))]
-static ATTEMPTED_ARTIST_KEYS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static ATTEMPTED_ARTIST_KEYS: LazyLock<Mutex<EnrichAttemptCache>> =
+    LazyLock::new(|| Mutex::new(EnrichAttemptCache::default()));
 
 #[cfg(not(test))]
-pub(in crate::web) async fn enrich_artist_detail_if_needed<F: FeedFetcher>(
-    service: &RocheService<F>,
-    detail: &mut EntryDetailView,
+pub(in crate::web) fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
+    service: &Arc<RocheService<F>>,
+    detail: &EntryDetailView,
 ) {
     if !should_attempt_enrichment(detail) {
         return;
@@ -212,28 +247,28 @@ pub(in crate::web) async fn enrich_artist_detail_if_needed<F: FeedFetcher>(
         && detail.children.iter().any(|c| child_spotify_web_url(c).is_some());
     let attempt_key = format!("{}|sp={can_resolve_spotify}", detail.entry.id);
     {
-        let Ok(mut attempted) = ATTEMPTED_ARTIST_KEYS.lock() else {
+        let Ok(mut cache) = ATTEMPTED_ARTIST_KEYS.lock() else {
             return;
         };
-        if attempted.contains(&attempt_key) {
+        if !cache.should_attempt_and_mark(attempt_key, Instant::now(), FAILED_ENRICH_TTL) {
             return;
         }
-        if attempted.len() >= 4_096 {
-            attempted.clear();
-        }
-        attempted.insert(attempt_key);
     }
-    let _ = tokio::time::timeout(
-        Duration::from_secs(4),
-        enrich_artist_detail_with_fetcher(service, detail, client),
-    )
-    .await;
+    let svc = Arc::clone(service);
+    let mut detail_bg = detail.clone();
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(4),
+            enrich_artist_detail_with_fetcher(&svc, &mut detail_bg, client),
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]
-pub(in crate::web) async fn enrich_artist_detail_if_needed<F: FeedFetcher>(
-    _service: &RocheService<F>,
-    _detail: &mut EntryDetailView,
+pub(in crate::web) const fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
+    _service: &std::sync::Arc<RocheService<F>>,
+    _detail: &EntryDetailView,
 ) {
 }
 
@@ -784,7 +819,7 @@ fn strip_html_tags(raw: &str) -> String {
     out
 }
 
-fn decode_html_entities(raw: &str) -> String {
+pub(in crate::web) fn decode_html_entities(raw: &str) -> String {
     if !raw.contains('&') {
         return raw.to_owned();
     }
@@ -793,7 +828,7 @@ fn decode_html_entities(raw: &str) -> String {
     while let Some(amp_idx) = rest.find('&') {
         out.push_str(&rest[..amp_idx]);
         let after_amp = &rest[amp_idx + 1..];
-        if let Some(semi_idx) = after_amp[..after_amp.len().min(12)].find(';') {
+        if let Some(semi_idx) = after_amp.find(';').filter(|&i| i <= 12) {
             let entity = &after_amp[..semi_idx];
             if let Some(decoded) = decode_single_entity(entity) {
                 out.push(decoded);

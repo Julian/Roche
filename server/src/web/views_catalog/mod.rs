@@ -2,12 +2,16 @@ mod diary_queue;
 mod entry;
 mod lists;
 
-use std::fmt::Write as _;
+use std::{collections::HashSet, fmt::Write as _};
 
 use serde::Deserialize;
 
 use super::html::esc;
-use crate::db::{ConsumptionStatus, EntryKind};
+use crate::{
+    db::{CatalogEntry, ConsumptionStatus, EntryKind},
+    scheduler::FeedFetcher,
+    service::RocheService,
+};
 
 pub(super) use diary_queue::{
     diary_get, post_quick_log, post_want_complete, post_want_remove, queue_get,
@@ -174,4 +178,23 @@ pub(super) fn parse_consumption_status(raw: &str) -> ConsumptionStatus {
         "abandoned" => ConsumptionStatus::Abandoned,
         _ => ConsumptionStatus::Consumed,
     }
+}
+
+pub(super) async fn load_existing_reader_item_ids<'a, F: FeedFetcher>(
+    service: &RocheService<F>,
+    entries: impl IntoIterator<Item = &'a CatalogEntry>,
+) -> HashSet<String> {
+    let mut candidate_ids = HashSet::new();
+    for entry in entries {
+        if entry.kind.is_reader_openable() && entry.url.is_some() {
+            candidate_ids.insert(entry.id.clone());
+        }
+    }
+    let mut existing = HashSet::new();
+    for id in candidate_ids {
+        if service.items().get(&id).await.is_ok() {
+            existing.insert(id);
+        }
+    }
+    existing
 }

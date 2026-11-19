@@ -15,8 +15,9 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_see_other,
+            redirect_with_flash, render_inline_csrf_form, render_page, safe_local_redirect,
+            urlencode, web_api_error_response,
         },
     },
 };
@@ -66,6 +67,8 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
     };
 
+    let (feed_label, tag_label) = load_inbox_filter_labels(&service, clean_feed, clean_tag).await;
+
     let nav_ctx = InboxNavParams {
         status: status_slug,
         kind: clean_kind,
@@ -79,7 +82,7 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
     let mut body = String::with_capacity(8_192);
     let _ = writeln!(
         body,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:0.75rem\">\
+        "<div class=\"page-head\">\
            <h2>Feed Inbox</h2>\
            <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
@@ -91,23 +94,10 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         csrf = esc(&session.csrf_token),
         ret = esc(&return_url),
     );
-    render_inbox_filter_bar(&mut body, &nav_ctx);
+    render_inbox_filter_bar(&mut body, &nav_ctx, feed_label.as_deref(), tag_label.as_deref());
     render_inbox_batch_controls(&mut body, &session.csrf_token, &nav_ctx, &page.items, &return_url);
     render_item_rows(&mut body, &page.items, &session.csrf_token, &return_url);
-
-    if page_num > 1 || page.has_more {
-        body.push_str("<nav class=\"pager\">");
-        if page_num > 1 {
-            let prev = build_inbox_href(&InboxNavParams { page: page_num - 1, ..nav_ctx });
-            let _ = write!(body, "<a href=\"{}\">&larr; Newer</a>", esc(&prev));
-        }
-        let _ = write!(body, "<span class=\"current\">Page {page_num}</span>");
-        if page.has_more {
-            let next = build_inbox_href(&InboxNavParams { page: page_num + 1, ..nav_ctx });
-            let _ = write!(body, "<a href=\"{}\">Older &rarr;</a>", esc(&next));
-        }
-        body.push_str("</nav>\n");
-    }
+    render_inbox_pager(&mut body, &nav_ctx, page_num, page.has_more);
 
     let flash = FlashQuery { notice: q.notice, err: q.err };
     render_page(&PageShell {
@@ -119,6 +109,52 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         body_html: &body,
     })
     .into_response()
+}
+
+async fn load_inbox_filter_labels<F: FeedFetcher>(
+    service: &RocheService<F>,
+    clean_feed: Option<&str>,
+    clean_tag: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let feed_label = match clean_feed {
+        Some(fid) => service
+            .feeds()
+            .get(fid)
+            .await
+            .ok()
+            .and_then(|f| f.title.filter(|t| !t.is_empty()).or_else(|| Some(f.url.to_string())))
+            .or_else(|| Some(fid.to_owned())),
+        None => None,
+    };
+    let tag_label = match clean_tag {
+        Some(tid) => {
+            service.tags().get(tid).await.ok().map(|t| t.name).or_else(|| Some(tid.to_owned()))
+        }
+        None => None,
+    };
+    (feed_label, tag_label)
+}
+
+fn render_inbox_pager(
+    out: &mut String,
+    nav_ctx: &InboxNavParams<'_>,
+    page_num: usize,
+    has_more: bool,
+) {
+    if page_num <= 1 && !has_more {
+        return;
+    }
+    out.push_str("<nav class=\"pager\" aria-label=\"Pagination\">");
+    if page_num > 1 {
+        let prev = build_inbox_href(&InboxNavParams { page: page_num - 1, ..*nav_ctx });
+        let _ = write!(out, "<a href=\"{}\">&larr; Newer</a>", esc(&prev));
+    }
+    let _ = write!(out, "<span class=\"current\" aria-current=\"page\">Page {page_num}</span>");
+    if has_more {
+        let next = build_inbox_href(&InboxNavParams { page: page_num + 1, ..*nav_ctx });
+        let _ = write!(out, "<a href=\"{}\">Older &rarr;</a>", esc(&next));
+    }
+    out.push_str("</nav>\n");
 }
 
 #[derive(Clone, Copy)]
@@ -151,25 +187,88 @@ fn build_inbox_href(p: &InboxNavParams<'_>) -> String {
     format!("/inbox?{}", parts.join("&"))
 }
 
-fn render_inbox_filter_bar(out: &mut String, p: &InboxNavParams<'_>) {
+fn render_inbox_filter_bar(
+    out: &mut String,
+    p: &InboxNavParams<'_>,
+    feed_label: Option<&str>,
+    tag_label: Option<&str>,
+) {
     out.push_str("<div class=\"pill-bar\">\n");
     for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
-        let cls = if p.status == slug && p.kind.is_none() { "pill is-active" } else { "pill" };
-        let href = build_inbox_href(&InboxNavParams { status: slug, kind: None, page: 1, ..*p });
+        let cls = if p.status == slug { "pill is-active" } else { "pill" };
+        let href = build_inbox_href(&InboxNavParams { status: slug, page: 1, ..*p });
         let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
     }
     for (k_slug, label) in
         [("article", "Articles"), ("audio", "Audio"), ("video", "Video"), ("paper", "Papers")]
     {
-        let cls = if p.kind == Some(k_slug) { "pill is-active" } else { "pill" };
-        let href = build_inbox_href(&InboxNavParams { kind: Some(k_slug), page: 1, ..*p });
+        let is_cur = p.kind == Some(k_slug);
+        let cls = if is_cur { "pill is-active" } else { "pill" };
+        let next_kind = if is_cur { None } else { Some(k_slug) };
+        let href = build_inbox_href(&InboxNavParams { kind: next_kind, page: 1, ..*p });
         let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
     }
     out.push_str("</div>\n");
 
+    let has_active_filters =
+        p.feed.is_some() || p.tag.is_some() || p.kind.is_some() || p.q.is_some();
+    if has_active_filters {
+        out.push_str("<div class=\"pill-bar active-filters\">\n");
+        if let Some(label) = feed_label {
+            let clear_href = build_inbox_href(&InboxNavParams { feed: None, page: 1, ..*p });
+            let _ = writeln!(
+                out,
+                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear feed filter\">Feed: {} &times;</a>",
+                esc(&clear_href),
+                esc(label),
+            );
+        }
+        if let Some(label) = tag_label {
+            let clear_href = build_inbox_href(&InboxNavParams { tag: None, page: 1, ..*p });
+            let _ = writeln!(
+                out,
+                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear tag filter\">Tag: #{} &times;</a>",
+                esc(&clear_href),
+                esc(label),
+            );
+        }
+        if let Some(k) = p.kind {
+            let clear_href = build_inbox_href(&InboxNavParams { kind: None, page: 1, ..*p });
+            let _ = writeln!(
+                out,
+                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear kind filter\">Kind: {} &times;</a>",
+                esc(&clear_href),
+                esc(k),
+            );
+        }
+        if let Some(search) = p.q {
+            let clear_href = build_inbox_href(&InboxNavParams { q: None, page: 1, ..*p });
+            let _ = writeln!(
+                out,
+                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear search filter\">Search: &ldquo;{}&rdquo; &times;</a>",
+                esc(&clear_href),
+                esc(search),
+            );
+        }
+        let reset_href = build_inbox_href(&InboxNavParams {
+            status: p.status,
+            kind: None,
+            feed: None,
+            tag: None,
+            q: None,
+            page: 1,
+        });
+        let _ = writeln!(
+            out,
+            "<a class=\"btn btn-small btn-ghost\" href=\"{}\">Clear filters</a>",
+            esc(&reset_href),
+        );
+        out.push_str("</div>\n");
+    }
+
     let _ = writeln!(
         out,
-        "<form method=\"get\" action=\"/inbox\" style=\"display:flex;gap:0.5rem;margin-bottom:0.9rem\">\n\
+        "<form method=\"get\" action=\"/inbox\" class=\"search-form\">\n\
            <input type=\"hidden\" name=\"status\" value=\"{}\">",
         esc(p.status),
     );
@@ -184,7 +283,7 @@ fn render_inbox_filter_bar(out: &mut String, p: &InboxNavParams<'_>) {
     }
     let _ = write!(
         out,
-        "<input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Search titles, full text, feeds, tags...\" style=\"flex:1\">\n\
+        "<input type=\"search\" name=\"q\" aria-label=\"Search inbox\" value=\"{}\" placeholder=\"Search titles, full text, feeds, tags...\" class=\"flex-1\">\n\
          <button type=\"submit\" class=\"btn\">Search</button>\n\
          </form>\n",
         esc(p.q.unwrap_or("")),
@@ -204,50 +303,41 @@ fn render_inbox_batch_controls(
     if p.status == "archived" || unread_ids.is_empty() {
         return;
     }
-    out.push_str(
-        "<div style=\"display:flex;justify-content:flex-end;align-items:baseline;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem\">\n",
-    );
+    out.push_str("<div class=\"batch-controls\">\n");
     if has_narrowing {
         let joined = unread_ids.join(",");
-        let _ = write!(
+        let btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Shown Unread ({})</button>",
+            unread_ids.len()
+        );
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-               <input type=\"hidden\" name=\"ids\" value=\"{ids}\">\n\
-               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Shown Unread ({n})</button>\n\
-             </form>\n",
-            csrf = esc(csrf),
-            ids = esc(&joined),
-            ret = esc(return_to),
-            n = unread_ids.len(),
+            "/web/items/archive-batch",
+            csrf,
+            &[("ids", &joined), ("return_to", return_to)],
+            None,
+            &btn,
         );
     } else if let Some(fid) = p.feed {
-        let _ = write!(
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-               <input type=\"hidden\" name=\"feed_id\" value=\"{feed}\">\n\
-               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread</button>\n\
-             </form>\n",
-            csrf = esc(csrf),
-            feed = esc(fid),
-            ret = esc(return_to),
+            "/web/items/archive-batch",
+            csrf,
+            &[("feed_id", fid), ("return_to", return_to)],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive Feed Unread</button>",
         );
     } else {
-        let _ = write!(
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/items/archive-batch\" class=\"inline-form\">\n\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\n\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>\n\
-             </form>\n",
-            csrf = esc(csrf),
-            ret = esc(return_to),
+            "/web/items/archive-batch",
+            csrf,
+            &[("return_to", return_to)],
+            Some("Archive all unread items in your inbox?"),
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>",
         );
     }
-    out.push_str("</div>\n");
+    out.push_str("\n</div>\n");
 }
 
 pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, return_to: &str) {
@@ -264,11 +354,11 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
             out,
             "<li class=\"{row_cls}\">\n\
                <div class=\"inbox-main\">\n\
-                 <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\n\
-                 <div class=\"item-byline\"><span class=\"badge\">{:?}</span>",
+                 <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
+                 <div class=\"item-byline\"><span class=\"badge\">{}</span>",
             esc(&urlencode(&item.id)),
             esc(&item.title),
-            item.content_type,
+            esc(content_type_label(item.content_type)),
         );
         if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
             if let Some(fid) = item.feed_id.as_deref() {
@@ -297,17 +387,23 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
         out.push_str("</div>\n<div class=\"inbox-controls\">\n");
         render_audio_play_button(out, item);
 
-        let star_label = if item.is_favorite { "&#9733;" } else { "&#9734;" };
-        let _ = write!(
+        let id_enc = urlencode(&item.id);
+        let (star_glyph, star_pressed, star_action_lbl) = if item.is_favorite {
+            ("&#9733;", "true", "Unstar")
+        } else {
+            ("&#9734;", "false", "Star")
+        };
+        let star_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Toggle Star\" aria-label=\"{star_action_lbl} {}\" aria-pressed=\"{star_pressed}\">{star_glyph}</button>",
+            esc(&item.title),
+        );
+        render_inline_csrf_form(
             out,
-            "<form method=\"post\" action=\"/web/items/{id}/star\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Toggle Star\">{star_label}</button>\
-             </form>",
-            id = esc(&urlencode(&item.id)),
-            csrf = esc(csrf),
-            ret = esc(return_to),
+            &format!("/web/items/{id_enc}/star"),
+            csrf,
+            &[("return_to", return_to)],
+            None,
+            &star_btn,
         );
 
         let (arch_action, arch_label) = if item.status == ItemStatus::Unread {
@@ -315,17 +411,18 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
         } else {
             ("unarchive", "Restore")
         };
-        let _ = writeln!(
-            out,
-            "<form method=\"post\" action=\"/web/items/{id}/{arch_action}\" class=\"inline-form\">\
-               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-               <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-               <button type=\"submit\" class=\"btn btn-small btn-ghost\">{arch_label}</button>\
-             </form>\n</div>\n</li>",
-            id = esc(&urlencode(&item.id)),
-            csrf = esc(csrf),
-            ret = esc(return_to),
+        let arch_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">{arch_label}</button>"
         );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/items/{id_enc}/{arch_action}"),
+            csrf,
+            &[("return_to", return_to)],
+            None,
+            &arch_btn,
+        );
+        out.push_str("\n</div>\n</li>\n");
     }
     out.push_str("</ul>\n");
 }
@@ -359,10 +456,7 @@ pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
     };
     let fallback_err_dest = safe_local_redirect(form.return_to.as_deref(), "/");
     let Ok(parsed_url) = Url::parse(&normalized) else {
-        let sep = if fallback_err_dest.contains('?') { '&' } else { '?' };
-        return redirect_see_other(&format!(
-            "{fallback_err_dest}{sep}err=Please+enter+a+valid+http(s)+URL"
-        ));
+        return redirect_with_flash(&fallback_err_dest, "err", "Please enter a valid http(s) URL");
     };
     let tags: Vec<String> = form.tags.as_deref().map_or_default(|s| {
         s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(ToOwned::to_owned).collect()
@@ -371,18 +465,13 @@ pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
     match service.items().save(&parsed_url, form.title.as_deref(), &tags).await {
         Ok(saved) => {
             if let Some(ret) = form.return_to.as_deref().filter(|s| !s.trim().is_empty()) {
-                let base = safe_local_redirect(Some(ret), "/");
-                let sep = if base.contains('?') { '&' } else { '?' };
-                redirect_see_other(&format!(
-                    "{base}{sep}notice={}",
-                    urlencode("Added to Want to Read")
-                ))
+                redirect_with_flash(ret, "notice", "Added to Want to Read")
             } else {
-                redirect_see_other(&format!(
-                    "/reader/{}?notice={}",
-                    urlencode(&saved.item.id),
-                    urlencode("Added to Want to Read")
-                ))
+                redirect_with_flash(
+                    &format!("/reader/{}", urlencode(&saved.item.id)),
+                    "notice",
+                    "Added to Want to Read",
+                )
             }
         }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
@@ -406,11 +495,7 @@ pub(in crate::web) async fn post_item_archive_batch<F: FeedFetcher>(
     match batch_res {
         Ok(count) => {
             let base = safe_local_redirect(form.return_to.as_deref(), "/inbox");
-            let sep = if base.contains('?') { '&' } else { '?' };
-            redirect_see_other(&format!(
-                "{base}{sep}notice={}",
-                urlencode(&format!("Archived {count} unread items"))
-            ))
+            redirect_with_flash(&base, "notice", &format!("Archived {count} unread items"))
         }
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }

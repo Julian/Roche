@@ -14,8 +14,8 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
-        web_api_error_response,
+        FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
+        render_page, urlencode, web_api_error_response,
     },
     links::{load_artist_id_by_lower_name, render_creator_links, web_primary_open_url},
 };
@@ -101,16 +101,16 @@ pub(super) async fn rank_picker_get<F: FeedFetcher>(
             );
             for col in want_queues {
                 let raw_slug = col.slug.as_deref().unwrap_or(&col.id);
-                let base_slug = raw_slug.strip_prefix("want:").unwrap_or(raw_slug);
+                let href = rank_collection_href(raw_slug, true);
                 let _ = writeln!(
                     body,
                     "<tr>\
-                       <td class=\"name\"><a href=\"/rank/{s}?want=true\">{title}</a></td>\
+                       <td class=\"name\"><a href=\"{href}\">{title}</a></td>\
                        <td class=\"stat\">{m} queued</td>\
                        <td class=\"stat\">{c} priority comparisons</td>\
-                       <td class=\"stat\"><a class=\"btn btn-small\" href=\"/rank/{s}?want=true\">Prioritize</a></td>\
+                       <td class=\"stat\"><a class=\"btn btn-small\" href=\"{href}\">Prioritize</a></td>\
                      </tr>",
-                    s = esc(&urlencode(base_slug)),
+                    href = esc(&href),
                     title = esc(&col.title),
                     m = col.member_count,
                     c = col.comparison_count,
@@ -243,8 +243,8 @@ fn render_settled_rank_view(
         let _ = writeln!(
             out,
             "<div class=\"album-kicker\">Placement Settled</div>\n\
-             <h3 style=\"border:none;margin:0.2rem 0 0.5rem;font-size:1.2rem;text-transform:none;letter-spacing:0;color:var(--ink)\">{}</h3>\n\
-             <p class=\"lede\" style=\"margin-bottom:0.85rem\">Settled at <strong>#{}</strong> of {}{} after {round} comparison round(s).</p>",
+             <h3 class=\"settled-title\">{}</h3>\n\
+             <p class=\"lede mb-md\">Settled at <strong>#{}</strong> of {}{} after {round} comparison round(s).</p>",
             esc(&row.entry.title),
             row.rank,
             ranked_view.rows.len(),
@@ -253,22 +253,22 @@ fn render_settled_rank_view(
     } else if let Some(fid) = focus_id {
         let _ = writeln!(
             out,
-            "<p class=\"lede\" style=\"margin-bottom:0.85rem\">This work is not in <strong>{}</strong> yet. Mark it Finished / Consumed on its <a href=\"/entries/{}\">entry page</a> before ranking it.</p>",
+            "<p class=\"lede mb-md\">This work is not in <strong>{}</strong> yet. Mark it Finished / Consumed on its <a href=\"/entries/{}\">entry page</a> before ranking it.</p>",
             esc(&ranked_view.collection.title),
             esc(&urlencode(fid)),
         );
     } else if ranked_view.rows.len() < 2 {
         out.push_str(
-            "<p class=\"lede\" style=\"margin-bottom:0.85rem\">Need at least 2 works in this collection before running comparisons.</p>\n",
+            "<p class=\"lede mb-md\">Need at least 2 works in this collection before running comparisons.</p>\n",
         );
     } else {
         let _ = writeln!(
             out,
-            "<p class=\"lede\" style=\"margin-bottom:0.85rem\">Rankings are well-calibrated after {round} round(s).</p>"
+            "<p class=\"lede mb-md\">Rankings are well-calibrated after {round} round(s).</p>"
         );
     }
 
-    out.push_str("<div style=\"display:flex;gap:0.5rem;flex-wrap:wrap\">\n");
+    out.push_str("<div class=\"flex-row\">\n");
     if want {
         out.push_str("<a class=\"btn btn-primary\" href=\"/queue\">Back to Queue</a>\n");
     } else {
@@ -305,7 +305,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
     let mode_label = if ctx.is_want { "Local Queue Priority" } else { "Global Quality" };
     let _ = writeln!(
         out,
-        "<div style=\"display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:1rem\">\
+        "<div class=\"page-head\">\
            <h2>{}</h2>\
            <span class=\"badge\">{} &middot; Round {}</span>\
          </div>\n\
@@ -345,7 +345,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
 
     out.push_str(
         "</ul>\n\
-         <div style=\"display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center\">\n\
+         <div class=\"flex-row flex-center\">\n\
            <button type=\"submit\" class=\"btn btn-primary\">Submit Comparison</button>\n\
            <button type=\"button\" class=\"btn js-rank-tie-all\">= Tie All</button>\n\
          </div>\n\
@@ -355,7 +355,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
     // Skip form (GET to next round with covered signature recorded so cluster doesn't immediately repeat)
     let _ = write!(
         out,
-        "<form method=\"get\" action=\"/rank/{slug_enc}\" class=\"js-rank-skip-form\" style=\"margin-top:0.55rem\">\n\
+        "<form method=\"get\" action=\"/rank/{slug_enc}\" class=\"js-rank-skip-form mt-sm\">\n\
            <input type=\"hidden\" name=\"want\" value=\"{want}\">\n\
            <input type=\"hidden\" name=\"focus\" value=\"{focus}\">\n\
            <input type=\"hidden\" name=\"round\" value=\"{next_round}\">\n\
@@ -390,24 +390,28 @@ fn render_cluster_card(
            <div class=\"rank-left\">\n\
              <span class=\"rank-pos js-rank-pos\">#{rank_num}</span>\n\
              <div>\n\
-               <strong><a href=\"/entries/{id_enc}\" target=\"_blank\">{title}</a></strong>",
+               <strong><a href=\"/entries/{id_enc}\" target=\"_blank\" rel=\"noopener\">{title}</a></strong>",
         id = esc(&item.id),
         open_url = esc(&open_url),
         id_enc = esc(&urlencode(&item.id)),
         title = esc(&item.title),
     );
     if !item.creators.is_empty() {
-        out.push_str(" <span style=\"color:var(--ink-soft)\">&mdash; ");
+        out.push_str(" <span class=\"text-soft\">&mdash; ");
         render_creator_links(out, &item.creators, artist_links, true);
         out.push_str("</span>");
     }
     if let Some(yr) = item.release_year {
-        let _ = write!(out, " <span style=\"color:var(--ink-faint)\">({yr})</span>");
+        let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
     }
     out.push_str("</div>\n</div>\n<div class=\"rank-controls\">\n");
 
-    let _ =
-        write!(out, "<noscript><select name=\"pos_{}\" class=\"js-noscript-pos\">", esc(&item.id));
+    let _ = write!(
+        out,
+        "<noscript><select name=\"pos_{}\" class=\"js-noscript-pos\" aria-label=\"Rank position for {}\">",
+        esc(&item.id),
+        esc(&item.title),
+    );
     for p in 1..=cluster_len {
         let sel = if p == rank_num { " selected" } else { "" };
         let _ = write!(out, "<option value=\"{p}\"{sel}>#{p}</option>");
@@ -417,10 +421,11 @@ fn render_cluster_card(
     let tie_disabled = if idx == 0 { " disabled" } else { "" };
     let _ = writeln!(
         out,
-        "<button type=\"button\" class=\"btn btn-small js-card-up\" title=\"Move Up (K)\">&uarr;</button>\
-         <button type=\"button\" class=\"btn btn-small js-card-down\" title=\"Move Down (J)\">&darr;</button>\
-         <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\">= Tie</button>\
-         </div>\n</li>"
+        "<button type=\"button\" class=\"btn btn-small js-card-up\" title=\"Move Up (K)\" aria-label=\"Move {title} up\">&uarr;</button>\
+         <button type=\"button\" class=\"btn btn-small js-card-down\" title=\"Move Down (J)\" aria-label=\"Move {title} down\">&darr;</button>\
+         <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\" aria-label=\"Tie {title} with above\" aria-pressed=\"false\">= Tie</button>\
+         </div>\n</li>",
+        title = esc(&item.title),
     );
 }
 

@@ -31,16 +31,36 @@
     }
   };
 
+  const hideRefreshBanner = () => {
+    const banner = document.getElementById("roche-refresh-banner");
+    if (banner) {
+      banner.hidden = true;
+      banner.setAttribute("data-active", "0");
+    }
+  };
+
   const showInlinePjaxError = (message) => {
+    hideRefreshBanner();
     const curMain = document.getElementById("roche-main");
     if (!curMain) return;
     curMain.querySelector(".js-pjax-error")?.remove();
     const banner = document.createElement("div");
     banner.className = "notice notice-error js-pjax-error";
+    banner.setAttribute("role", "alert");
     banner.textContent =
       message || "Request failed. Audio playback is unaffected — please try again.";
     curMain.prepend(banner);
   };
+
+  /* Confirmation handler for destructive forms (runs before PJAX & refresh-banner listeners) */
+  document.addEventListener("submit", (ev) => {
+    const form = ev.target;
+    const msg = form?.getAttribute?.("data-confirm");
+    if (msg && !window.confirm(msg)) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+    }
+  });
 
   /* --- 1. Persistent Podcast Player --- */
   const initAudioPlayer = () => {
@@ -112,6 +132,7 @@
       activeItem = meta;
       completionSent = false;
       bar.hidden = false;
+      document.body?.classList.add("has-player-bar");
       if (titleEl) titleEl.textContent = meta.title || "Episode";
       if (subEl) subEl.textContent = meta.feed || "Podcast";
       if (readerLink) readerLink.href = `/reader/${encodeURIComponent(meta.itemId)}`;
@@ -202,8 +223,10 @@
       flushActiveProgress(true);
       audio.pause();
       audio.removeAttribute("src");
+      audio.load();
       activeItem = null;
       bar.hidden = true;
+      document.body?.classList.remove("has-player-bar");
       saveSession();
     });
 
@@ -284,6 +307,7 @@
         }
       } else {
         window.scrollTo(0, 0);
+        curMain.focus?.({ preventScroll: true });
       }
       initPageWidgets();
       return true;
@@ -600,6 +624,7 @@
           if (tieBtn) {
             tieBtn.disabled = flatIdx === 0;
             tieBtn.textContent = tied ? "Untie" : "= Tie";
+            tieBtn.setAttribute("aria-pressed", tied ? "true" : "false");
           }
           ids.push(card.getAttribute("data-entry-id"));
           flatIdx += 1;
@@ -717,8 +742,7 @@
     });
 
     const onKeyDown = (ev) => {
-      const tag = ev.target?.tagName ? ev.target.tagName.toLowerCase() : "";
-      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (ev.target?.closest?.("input, textarea, select, [contenteditable]")) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
 
       const cards = flatCards();
@@ -776,6 +800,11 @@
           window.open(url, "_blank", "noopener");
         }
       } else if (ev.key === "Enter") {
+        if (
+          ev.target?.closest?.("a, button, summary, input, textarea, select, [contenteditable]")
+        ) {
+          return;
+        }
         ev.preventDefault();
         if (typeof form.requestSubmit === "function") {
           form.requestSubmit();
@@ -807,6 +836,28 @@
       });
       reader.readAsText(file);
     });
+  };
+
+  const hasDirtyFormOrOpenDetails = () => {
+    if (document.activeElement?.matches?.("input, textarea, select, [contenteditable]")) {
+      return true;
+    }
+    const curMain = document.getElementById("roche-main");
+    if (!curMain) return false;
+    if (curMain.querySelector("details[open]")) return true;
+    for (const el of curMain.querySelectorAll("input, textarea, select")) {
+      if (el.type === "hidden" || el.type === "submit" || el.type === "button") continue;
+      if (el.type === "checkbox" || el.type === "radio") {
+        if (el.checked !== el.defaultChecked) return true;
+      } else if (el.tagName === "SELECT") {
+        for (const opt of el.options) {
+          if (opt.selected !== opt.defaultSelected) return true;
+        }
+      } else if (el.value !== el.defaultValue) {
+        return true;
+      }
+    }
+    return false;
   };
 
   /* --- 5. Background Refresh Status Indicator --- */
@@ -843,13 +894,17 @@
             banner.setAttribute("data-active", "0");
             if (
               wasActive &&
-              !document.activeElement?.matches?.("input, textarea, select") &&
+              !hasDirtyFormOrOpenDetails() &&
               ["/", "/inbox", "/feeds", "/queue"].includes(window.location.pathname)
             ) {
               const curUrl = `${window.location.pathname}${window.location.search}`;
               const r = await fetch(curUrl, { credentials: "same-origin" });
               if (r.ok) {
                 const html = await r.text();
+                const currentPathSearch = `${window.location.pathname}${window.location.search}`;
+                if (curUrl !== currentPathSearch || hasDirtyFormOrOpenDetails()) {
+                  return;
+                }
                 const doc = new DOMParser().parseFromString(html, "text/html");
                 const nextMain = doc.getElementById("roche-main");
                 const curMain = document.getElementById("roche-main");
@@ -874,6 +929,7 @@
   };
 
   document.addEventListener("submit", (ev) => {
+    if (ev.defaultPrevented) return;
     const form = ev.target;
     const action = form?.getAttribute?.("action") || "";
     if (

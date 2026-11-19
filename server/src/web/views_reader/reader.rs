@@ -17,9 +17,11 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page,
-            safe_external_href, safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, redirect_see_other, redirect_with_flash,
+            render_page, safe_external_href, safe_local_redirect, urlencode,
+            web_api_error_response,
         },
+        links::sanitize_non_local_href,
     },
 };
 
@@ -151,12 +153,13 @@ fn render_reader_article(
     );
 
     let star_label = if item.is_favorite { "&#9733; Starred" } else { "&#9734; Star" };
+    let star_pressed = if item.is_favorite { "true" } else { "false" };
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/web/items/{id}/star\" class=\"inline-form\">\
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-           <button type=\"submit\" class=\"btn btn-small btn-ghost\">{star_label}</button>\
+           <button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\">{star_label}</button>\
          </form>\
          <a class=\"btn btn-small btn-ghost\" href=\"/entries/{id}\">Catalog Entry</a>",
         id = esc(&urlencode(&item.id)),
@@ -218,23 +221,23 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
     for tag in &detail.tags {
         let _ = writeln!(
             out,
-            "<span class=\"pill\">#{} \
-               <form method=\"post\" action=\"/web/items/{}/tags/{}/remove\" class=\"inline-form\">\
-                 <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
-                 <button type=\"submit\" class=\"link-btn\" style=\"margin-left:0.25rem\">&times;</button>\
+            "<span class=\"pill\">#{tag_name} \
+               <form method=\"post\" action=\"/web/items/{item_id}/tags/{tag_id}/remove\" class=\"inline-form\">\
+                 <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
+                 <button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {tag_name}\" title=\"Remove tag\">&times;</button>\
                </form>\
              </span>",
-            esc(&tag.name),
-            esc(&urlencode(&item.id)),
-            esc(&urlencode(&tag.id)),
-            esc(csrf),
+            tag_name = esc(&tag.name),
+            item_id = esc(&urlencode(&item.id)),
+            tag_id = esc(&urlencode(&tag.id)),
+            csrf = esc(csrf),
         );
     }
     let _ = write!(
         out,
-        "<form method=\"post\" action=\"/web/items/{}/tags\" style=\"display:inline-flex;gap:0.35rem\">\
+        "<form method=\"post\" action=\"/web/items/{}/tags\" class=\"tag-add-form\">\
            <input type=\"hidden\" name=\"_csrf\" value=\"{}\">\
-           <input type=\"text\" name=\"name\" required placeholder=\"Add tag...\" style=\"width:9rem;padding:0.22rem 0.45rem;font-size:0.82rem\">\
+           <input type=\"text\" name=\"name\" required aria-label=\"Add tag\" placeholder=\"Add tag...\" class=\"tag-add-input\">\
            <button type=\"submit\" class=\"btn btn-small\">+ Tag</button>\
          </form>\n</div>\n</article>\n",
         esc(&urlencode(&item.id)),
@@ -257,7 +260,7 @@ pub(in crate::web) async fn item_audio_get<F: FeedFetcher>(
     {
         return resp;
     }
-    if let Some(ext_audio) = detail.item.audio_url.as_deref().and_then(safe_external_href) {
+    if let Some(ext_audio) = detail.item.audio_url.as_deref().and_then(sanitize_non_local_href) {
         let mut resp = StatusCode::SEE_OTHER.into_response();
         if let Ok(val) = header::HeaderValue::from_str(ext_audio) {
             resp.headers_mut().insert(header::LOCATION, val);
@@ -341,11 +344,7 @@ pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
         ))
     } else {
         let base = safe_local_redirect(form.return_to.as_deref(), default_return);
-        let sep = if base.contains('?') { '&' } else { '?' };
-        redirect_see_other(&format!(
-            "{base}{sep}notice={}",
-            urlencode("Marked finished & logged to Diary")
-        ))
+        redirect_with_flash(&base, "notice", "Marked finished & logged to Diary")
     }
 }
 

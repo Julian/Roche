@@ -124,6 +124,7 @@ async fn login_browser(db: &Db, app: &Router) -> (String, String) {
         .method("POST")
         .uri("/login")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header("sec-fetch-site", "same-origin")
         .header("x-forwarded-proto", "https")
         .body(Body::from(body))
         .unwrap();
@@ -1493,4 +1494,330 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
         serde_json::from_slice(&to_bytes(status_resp.into_body(), 16 * 1024).await.unwrap())
             .unwrap();
     assert!(status_json["is_refreshing"].is_boolean());
+}
+
+#[test]
+fn test_decode_html_entities_multibyte_utf8_no_panic() {
+    use super::artist_enrich::decode_html_entities;
+
+    // '&' followed by 10 ASCII bytes + a 3-byte UTF-8 char straddling byte 12 (bytes 10..13)
+    let input = "A &0123456789\u{2014}end &amp; &quot;Bj\u{00f6}rk&quot; &#x27;ok&#x27;";
+    let decoded = decode_html_entities(input);
+    assert_eq!(decoded, "A &0123456789\u{2014}end & \"Bj\u{00f6}rk\" 'ok'");
+
+    // Multi-byte chars immediately after '&' with no semicolon
+    let no_semi = "&日本語テスト文字列";
+    assert_eq!(decode_html_entities(no_semi), no_semi);
+}
+
+#[test]
+fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat() {
+    use super::links::sanitize_non_local_href;
+
+    for blocked in [
+        "http://127.0.0.1/a",
+        "http://10.0.0.1/a",
+        "http://169.254.169.254/latest/meta-data",
+        "http://100.64.0.1/tailscale",
+        "http://100.127.255.254/cgnat",
+        "http://[::1]/a",
+        "http://[fc00::1]/ula",
+        "http://[fd12:3456::1]/ula",
+        "http://[fe80::1]/link-local",
+        "http://[::ffff:127.0.0.1]/mapped-loopback",
+        "http://[::ffff:10.0.0.1]/mapped-private",
+        "http://[::ffff:169.254.169.254]/mapped-meta",
+        "http://[::ffff:100.64.0.5]/mapped-cgnat",
+        "http://[2002:7f00:0001::1]/6to4",
+        "https://localhost/foo",
+        "https://printer.local/foo",
+    ] {
+        assert!(sanitize_non_local_href(blocked).is_none(), "expected {blocked} to be blocked");
+    }
+
+    for allowed in [
+        "https://example.com/audio.mp3",
+        "https://8.8.8.8/file.mp3",
+        "https://[2606:4700:4700::1111]/file.mp3",
+        "https://[::ffff:8.8.8.8]/file.mp3",
+    ] {
+        assert!(sanitize_non_local_href(allowed).is_some(), "expected {allowed} to be allowed");
+    }
+}
+
+#[test]
+fn test_is_same_origin_post_origin_and_referer_fallback() {
+    use axum::http::HeaderMap;
+
+    use super::auth::is_same_origin_post;
+
+    // Sec-Fetch-Site present
+    let mut h = HeaderMap::new();
+    h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+    assert!(is_same_origin_post(&h));
+
+    let mut h = HeaderMap::new();
+    h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+    assert!(!is_same_origin_post(&h));
+
+    // Sec-Fetch-Site absent -> falls back to Origin vs Host
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example:8080".parse().unwrap());
+    h.insert(header::ORIGIN, "https://roche.example:8080".parse().unwrap());
+    assert!(is_same_origin_post(&h));
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example:8080".parse().unwrap());
+    h.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+    assert!(!is_same_origin_post(&h));
+
+    // Sec-Fetch-Site & Origin absent -> falls back to Referer vs Host
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example".parse().unwrap());
+    h.insert(header::REFERER, "https://roche.example/login".parse().unwrap());
+    assert!(is_same_origin_post(&h));
+
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, "roche.example".parse().unwrap());
+    h.insert(header::REFERER, "https://evil.example/login".parse().unwrap());
+    assert!(!is_same_origin_post(&h));
+
+    // All absent -> rejected
+    assert!(!is_same_origin_post(&HeaderMap::new()));
+}
+
+#[test]
+fn test_enrich_attempt_cache_ttl() {
+    use std::time::{Duration, Instant};
+
+    use super::artist_enrich::EnrichAttemptCache;
+
+    let mut cache = EnrichAttemptCache::default();
+    let t0 = Instant::now();
+    let ttl = Duration::from_secs(60);
+
+    assert!(cache.should_attempt_and_mark("a1|sp=false".to_owned(), t0, ttl));
+    assert!(!cache.should_attempt_and_mark(
+        "a1|sp=false".to_owned(),
+        t0 + Duration::from_secs(30),
+        ttl
+    ));
+    assert!(cache.should_attempt_and_mark(
+        "a1|sp=false".to_owned(),
+        t0 + Duration::from_secs(61),
+        ttl
+    ));
+}
+
+async fn read_body_html(resp: Response) -> String {
+    String::from_utf8(to_bytes(resp.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn test_item_audio_blocks_local_redirect_and_allows_public() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let local_url = Url::parse("https://pod.example/ep-local").unwrap();
+    let (local_item, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &local_url,
+            title: "Local Audio Ep",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: Some("http://127.0.0.1:9999/secret.mp3"),
+            duration: None,
+            content_type: ContentType::Audio,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+
+    let blocked_resp =
+        get_authed(&app, &format!("/web/items/{}/audio", local_item.id), &cookie).await;
+    assert_eq!(blocked_resp.status(), StatusCode::NOT_FOUND);
+
+    let pub_url = Url::parse("https://pod.example/ep-public").unwrap();
+    let (pub_item, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &pub_url,
+            title: "Public Audio Ep",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: Some("https://cdn.pod.example/ep1.mp3"),
+            duration: None,
+            content_type: ContentType::Audio,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+
+    let ok_resp = get_authed(&app, &format!("/web/items/{}/audio", pub_item.id), &cookie).await;
+    assert_eq!(ok_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(ok_resp.headers().get(header::LOCATION).unwrap(), "https://cdn.pod.example/ep1.mp3");
+}
+
+#[tokio::test]
+async fn test_web_csp_a11y_and_reader_link_existence() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    // 1. Strict CSP without 'unsafe-inline' on style-src
+    let home_resp = get_authed(&app, "/", &cookie).await;
+    let csp = home_resp
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(csp.contains("style-src 'self'"));
+    assert!(!csp.contains("'unsafe-inline'"));
+    let home_html = read_body_html(home_resp).await;
+    assert!(home_html.contains("class=\"skip-link\""));
+    assert!(home_html.contains("aria-label=\"Primary\""));
+    assert!(home_html.contains("aria-current=\"page\""));
+    assert!(home_html.contains("<main id=\"roche-main\" tabindex=\"-1\">"));
+
+    // 2. Unauthenticated error page includes viewport meta tag
+    let unauth_post = app
+        .clone()
+        .oneshot(Request::builder().method("POST").uri("/web/log").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauth_post.status(), StatusCode::UNAUTHORIZED);
+    let err_html = read_body_html(unauth_post).await;
+    assert!(err_html.contains("name=\"viewport\""));
+
+    // 3. Reader link existence check for system list vs manual list
+    let quick_logged_art = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Quick Logged Article".to_owned(),
+            url: Some("https://example.org/quick-logged-article".to_owned()),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&quick_logged_art.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_authed(&app, &format!("/reader/{}", quick_logged_art.id), &cookie).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let articles_list_html =
+        read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
+    assert!(articles_list_html.contains("Quick Logged Article"));
+    assert!(!articles_list_html.contains(&format!("/reader/{}", quick_logged_art.id)));
+    assert!(articles_list_html.contains("<span class=\"sr-only\">Score "));
+
+    let manual_list = db
+        .catalog()
+        .create_manual_collection("Custom List", None, crate::db::CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    db.catalog()
+        .add_collection_entry(
+            manual_list.slug.as_deref().unwrap_or(&manual_list.id),
+            &quick_logged_art.id,
+            None,
+        )
+        .await
+        .unwrap();
+    let list_html = read_body_html(
+        get_authed(
+            &app,
+            &format!("/lists/{}", manual_list.slug.as_deref().unwrap_or(&manual_list.id)),
+            &cookie,
+        )
+        .await,
+    )
+    .await;
+    assert!(list_html.contains("aria-label=\"Remove Quick Logged Article from list\""));
+}
+
+#[tokio::test]
+async fn test_web_filters_labels_and_destructive_confirmations() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    // 1. Queue remove button aria-label & Want list rank link stripping `want:` prefix
+    let want_video_input = crate::db::UpsertEntryInput {
+        kind: Some(EntryKind::Video),
+        title: "Queued Reader Video".to_owned(),
+        url: Some("https://example.org/reader-video".to_owned()),
+        ..crate::db::UpsertEntryInput::default()
+    };
+    let (_, catalog_only) = db.catalog().want_entry(&want_video_input, None).await.unwrap();
+    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
+    assert!(queue_html.contains("Queued Reader Video"));
+    assert!(queue_html.contains("aria-label=\"Remove Queued Reader Video from queue\""));
+
+    let second_vid_input = crate::db::UpsertEntryInput {
+        kind: Some(EntryKind::Video),
+        title: "Second Queued Video".to_owned(),
+        ..crate::db::UpsertEntryInput::default()
+    };
+    let (want_col, _) = db.catalog().want_entry(&second_vid_input, None).await.unwrap();
+    let want_slug = want_col.slug.as_deref().unwrap_or(&want_col.id);
+    let base_want_slug = want_slug.strip_prefix("want:").unwrap_or(want_slug);
+
+    let want_list_html =
+        read_body_html(get_authed(&app, &format!("/lists/{want_slug}"), &cookie).await).await;
+    assert!(want_list_html.contains(&format!("/rank/{base_want_slug}?want=true")));
+    assert!(!want_list_html.contains("/rank/want%3A"));
+
+    // 2. Diary status pills preserve `year` query parameter
+    let diary_html = read_body_html(get_authed(&app, "/diary?year=2025", &cookie).await).await;
+    assert!(diary_html.contains("/diary?year=2025&amp;status=consumed"));
+    assert!(diary_html.contains("/diary?year=2025&amp;status=started"));
+    assert!(diary_html.contains("/diary?year=2025&amp;status=abandoned"));
+
+    // 3. Inbox active filter chips, accessible labels, proper ContentType label, and destructive confirm
+    let yt_url = Url::parse("https://www.youtube.com/feeds/videos.xml?channel_id=UC123").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Youtube, &yt_url, Some("Tech Channel"), None).await.unwrap();
+    let pdf_url = Url::parse("https://example.org/pdf-item").unwrap();
+    db.items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "A PDF Paper",
+            url: &pdf_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Pdf,
+        })
+        .await
+        .unwrap();
+
+    let inbox_html = read_body_html(get_authed(&app, "/inbox", &cookie).await).await;
+    assert!(inbox_html.contains(">PDF</span>"));
+    assert!(inbox_html.contains("aria-label=\"Search inbox\""));
+    assert!(inbox_html.contains("aria-pressed=\"false\""));
+    assert!(inbox_html.contains("data-confirm=\"Archive all unread items in your inbox?\""));
+
+    let filtered_inbox = read_body_html(
+        get_authed(&app, &format!("/inbox?feed={}&kind=article", feed.id), &cookie).await,
+    )
+    .await;
+    assert!(filtered_inbox.contains("active-filters"));
+    assert!(filtered_inbox.contains("Clear filters"));
+
+    // 4. Feeds display label (`YouTube`) and destructive delete confirmation
+    let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
+    assert!(feeds_html.contains(">YouTube</span>"));
+    assert!(feeds_html.contains("data-confirm=\"Delete this feed subscription?"));
+
+    // 5. Entry page merge confirmation and accessible labels
+    let entry_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", catalog_only.id), &cookie).await)
+            .await;
+    assert!(entry_html.contains("data-confirm=\"Merge this duplicate"));
+    assert!(entry_html.contains("aria-label=\"Canonical entry UUID, URL, or exact title\""));
 }
