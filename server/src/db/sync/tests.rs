@@ -2434,3 +2434,124 @@ async fn test_starred_batch_generator_rejected_and_collection_tombstone_enforced
     // #12: count_rankable_members matches actual member count
     assert_eq!(db.catalog().count_rankable_members(&list_col.id, false).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn test_peer_finish_draw_preserves_peer_next_draw_and_returns_conflict_winner() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let col = db
+        .catalog()
+        .create_manual_collection(
+            "1001 Albums",
+            Some("1001-albums"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut album_ids = Vec::new();
+    for title in ["Album A", "Album B", "Album C", "Album D"] {
+        let entry = db
+            .catalog()
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Album),
+                title: title.to_owned(),
+                creators: vec!["Artist".to_owned()],
+                ..crate::db::UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        db.catalog().add_collection_entry(&col.id, &entry.id, None).await.unwrap();
+        album_ids.push(entry.id);
+    }
+
+    // Initialize generator explicitly on Album A with an older timestamp so the peer's offline
+    // finish (also earlier than server `now`) is strictly newer than the initial draw.
+    let initial_ts = Utc::now() - chrono::Duration::minutes(10);
+    db.catalog()
+        .update_collection_generator(&col.id, Some(true), Some(&album_ids[0]), Some(initial_ts))
+        .await
+        .unwrap();
+    let initial_hlc = HlcTimestamp::from_datetime(initial_ts, "server").encode();
+    sqlx::query("UPDATE collection_generators SET updated_at = ?, hlc = ? WHERE collection_id = ?")
+        .bind(initial_ts)
+        .bind(&initial_hlc)
+        .bind(&col.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // Peer finished Album A 2 minutes ago (earlier than server `now`!) and drew Album B.
+    let peer_finish_ts = Utc::now() - chrono::Duration::minutes(2);
+    let peer_log_hlc = HlcTimestamp::from_datetime(peer_finish_ts, "android").encode();
+    let peer_gen_hlc =
+        HlcTimestamp::from_datetime(peer_finish_ts + chrono::Duration::milliseconds(1), "android")
+            .encode();
+
+    let (resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-peer".to_owned(),
+            consumption_log: vec![crate::db::SyncConsumptionLogRecord {
+                id: "log-finish-a".to_owned(),
+                entry_id: album_ids[0].clone(),
+                ts: peer_finish_ts,
+                status: ConsumptionStatus::Consumed,
+                notes: None,
+                created_at: Some(peer_finish_ts),
+                hlc: peer_log_hlc,
+            }],
+            collection_generators: vec![crate::db::SyncCollectionGeneratorRecord {
+                collection_id: col.id.clone(),
+                enabled: true,
+                current_entry_id: Some(album_ids[1].clone()),
+                drawn_at: Some(peer_finish_ts),
+                updated_at: peer_finish_ts,
+                hlc: peer_gen_hlc.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // Server must NOT have prematurely drawn a different album during consumption_log merge;
+    // it must adopt the peer's Album B draw.
+    let gen_after = db.catalog().get_collection_generator(&col.id).await.unwrap();
+    assert_eq!(
+        gen_after.current_entry.as_ref().map(|e| e.id.as_str()),
+        Some(album_ids[1].as_str()),
+        "server must preserve the peer's drawn entry instead of advancing with server `now`"
+    );
+
+    // Now a second peer with an already up-to-date `since_seq` sends a stale generator pointing
+    // at Album C with an older HLC. Server must keep Album B AND echo it back in the response so
+    // the stale peer converges.
+    let stale_ts = peer_finish_ts - chrono::Duration::seconds(30);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "stale-peer").encode();
+    let (conflict_resp, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "stale-peer".to_owned(),
+            since_seq: resp.sync_seq,
+            collection_generators: vec![crate::db::SyncCollectionGeneratorRecord {
+                collection_id: col.id.clone(),
+                enabled: true,
+                current_entry_id: Some(album_ids[2].clone()),
+                drawn_at: Some(stale_ts),
+                updated_at: stale_ts,
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let returned = conflict_resp
+        .collection_generators
+        .iter()
+        .find(|g| g.collection_id == col.id)
+        .expect("server must return winning generator when rejecting a stale differing draw");
+    assert_eq!(returned.current_entry_id.as_deref(), Some(album_ids[1].as_str()));
+    assert_eq!(returned.hlc, peer_gen_hlc);
+}

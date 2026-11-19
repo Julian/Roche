@@ -2219,13 +2219,24 @@ impl SyncRepo<'_> {
                 mut target_drawn_at,
                 mut target_updated,
                 mut target_hlc,
+                local_won_conflict,
             ) = match local_gen {
-                None => (inc.enabled, mapped_inc_entry, inc.drawn_at, inc.updated_at, inc_hlc),
+                None => {
+                    (inc.enabled, mapped_inc_entry, inc.drawn_at, inc.updated_at, inc_hlc, false)
+                }
                 Some((l_en, l_eid, l_drawn, l_upd, l_hlc)) => {
                     if inc_hlc.as_str() >= l_hlc.as_str() {
-                        (inc.enabled, mapped_inc_entry, inc.drawn_at, inc.updated_at, inc_hlc)
+                        (
+                            inc.enabled,
+                            mapped_inc_entry,
+                            inc.drawn_at,
+                            inc.updated_at,
+                            inc_hlc,
+                            false,
+                        )
                     } else {
-                        (l_en, l_eid, l_drawn, l_upd, l_hlc)
+                        let differs = inc.enabled != l_en || mapped_inc_entry != l_eid;
+                        (l_en, l_eid, l_drawn, l_upd, l_hlc, differs)
                     }
                 }
             };
@@ -2278,6 +2289,20 @@ impl SyncRepo<'_> {
             .bind(&target_hlc)
             .execute(&mut *tx)
             .await?;
+
+            if local_won_conflict {
+                sqlx::query("UPDATE sync_clock SET current_seq = current_seq + 1 WHERE id = 1")
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE collection_generators
+                     SET sync_seq = (SELECT current_seq FROM sync_clock WHERE id = 1)
+                     WHERE collection_id = ?",
+                )
+                .bind(&col_id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         // Advance any active local generator whose drawn entry became terminal during this sync

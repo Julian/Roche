@@ -504,4 +504,129 @@ class DataSyncRemediationTest {
         assertFalse(isPermanentKeystoreInvalidation(IllegalStateException("device locked")))
         assertFalse(isCleartextAllowed("example.com"))
     }
+
+    private suspend fun seedAlbumsGeneratorFixture(
+        catalog: CatalogStore,
+        nowIso: String,
+        initialHlc: String,
+    ): List<String> {
+        val listId = catalog.createCustomList("1001 Albums")
+        val albums =
+            listOf("Album A", "Album B", "Album C").map { title ->
+                catalog
+                    .upsertEntry(UpsertCatalogEntryInput(kind = EntryKind.ALBUM, title = title))
+                    .also { catalog.addCollectionEntry(listId, it) }
+            }
+        database
+            .dao()
+            .upsertCollectionGenerator(
+                com.grayvines.roche.data.local.CollectionGeneratorEntity(
+                    collectionId = listId,
+                    enabled = true,
+                    currentEntryId = albums[0],
+                    drawnAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = initialHlc,
+                    isLocalDirty = false,
+                )
+            )
+        return listOf(listId) + albums
+    }
+
+    @Test
+    fun `paginated sync defers generator auto-advance until final page`() = runTest {
+        val dao = database.dao()
+        val catalog = CatalogStore(dao = dao, localPeerIdProvider = { "android-peer-1" })
+        catalog.ensureSystemSeeded()
+        val nowIso = "2026-11-18T19:46:10Z"
+        val initialHlc = HlcTimestamp.create(1_795_031_000_000L, 0, "server").encode()
+        val (listId, albumA, albumB) = seedAlbumsGeneratorFixture(catalog, nowIso, initialHlc)
+        val serverLogHlc = HlcTimestamp.create(1_795_031_100_000L, 0, "server").encode()
+        val serverGenHlc = HlcTimestamp.create(1_795_031_100_001L, 0, "server").encode()
+
+        val page1 =
+            com.grayvines.roche.data.remote.PeerSyncResponseDto(
+                serverPeerId = "server",
+                serverHlc = serverGenHlc,
+                syncTimestamp = nowIso,
+                hasMore = true,
+                consumptionLog =
+                    listOf(
+                        SyncConsumptionLogDto(
+                            "log-a-done",
+                            albumA,
+                            nowIso,
+                            "consumed",
+                            hlc = serverLogHlc,
+                        )
+                    ),
+            )
+        reconcilePeerSyncResponse(dao, page1, "android-peer-1", catalogStore = catalog)
+        val afterPage1 = dao.getCollectionGenerator(listId)!!
+        assertEquals(albumA, afterPage1.currentEntryId)
+        assertFalse(afterPage1.isLocalDirty)
+
+        val page2 =
+            com.grayvines.roche.data.remote.PeerSyncResponseDto(
+                serverPeerId = "server",
+                serverHlc = serverGenHlc,
+                syncTimestamp = nowIso,
+                hasMore = false,
+                collectionGenerators =
+                    listOf(
+                        SyncCollectionGeneratorDto(
+                            listId,
+                            true,
+                            albumB,
+                            nowIso,
+                            nowIso,
+                            serverGenHlc,
+                        )
+                    ),
+            )
+        reconcilePeerSyncResponse(dao, page2, "android-peer-1", catalogStore = catalog)
+        val afterPage2 = dao.getCollectionGenerator(listId)!!
+        assertEquals(albumB, afterPage2.currentEntryId)
+        assertEquals(serverGenHlc, afterPage2.hlc)
+        assertFalse(afterPage2.isLocalDirty)
+    }
+
+    @Test
+    fun `stale differing remote generator marks newer local generator dirty`() = runTest {
+        val dao = database.dao()
+        val catalog = CatalogStore(dao = dao, localPeerIdProvider = { "android-peer-1" })
+        catalog.ensureSystemSeeded()
+        val nowIso = "2026-11-18T19:46:10Z"
+        val newerLocalHlc = HlcTimestamp.create(1_795_031_100_001L, 0, "android-peer-1").encode()
+        val staleServerHlc = HlcTimestamp.create(1_795_031_050_000L, 0, "server").encode()
+        val (listId, albumA, albumB) = seedAlbumsGeneratorFixture(catalog, nowIso, newerLocalHlc)
+
+        reconcilePeerSyncResponse(
+            dao = dao,
+            response =
+                com.grayvines.roche.data.remote.PeerSyncResponseDto(
+                    serverPeerId = "server",
+                    serverHlc = newerLocalHlc,
+                    syncTimestamp = nowIso,
+                    hasMore = false,
+                    collectionGenerators =
+                        listOf(
+                            SyncCollectionGeneratorDto(
+                                collectionId = listId,
+                                enabled = true,
+                                currentEntryId = albumB,
+                                drawnAt = nowIso,
+                                updatedAt = nowIso,
+                                hlc = staleServerHlc,
+                            )
+                        ),
+                ),
+            localPeerId = "android-peer-1",
+            catalogStore = catalog,
+        )
+
+        val afterStaleRemote = dao.getCollectionGenerator(listId)!!
+        assertEquals(albumA, afterStaleRemote.currentEntryId)
+        assertTrue(afterStaleRemote.isLocalDirty)
+    }
 }

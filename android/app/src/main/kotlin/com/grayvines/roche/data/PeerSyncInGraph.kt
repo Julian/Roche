@@ -57,6 +57,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         serverNode = serverNode,
         localPeerId = localPeerId,
         nowIso = nowIso,
+        allowLocalAutoAdvance = !response.hasMore,
     )
 }
 
@@ -375,6 +376,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
     serverNode: String,
     localPeerId: String,
     nowIso: String,
+    allowLocalAutoAdvance: Boolean,
 ) {
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
@@ -399,6 +401,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
                 serverNode = serverNode,
                 localPeerId = localPeerId,
                 nowIso = nowIso,
+                allowLocalAutoAdvance = allowLocalAutoAdvance,
             )
         dao.upsertCollectionGenerator(merged)
     }
@@ -461,6 +464,7 @@ private suspend fun reconcileSingleGeneratorInDao(
     serverNode: String,
     localPeerId: String,
     nowIso: String,
+    allowLocalAutoAdvance: Boolean,
 ): CollectionGeneratorEntity {
     var base = selectBaseGeneratorEntity(colId, localGen, remoteGen, serverNode, nowIso)
     val activeId =
@@ -468,21 +472,24 @@ private suspend fun reconcileSingleGeneratorInDao(
     if (activeId != base.currentEntryId) {
         base = base.copy(currentEntryId = activeId)
     }
-    if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
-        val hlc = nextLocalHlc(dao, localPeerId)
-        base = base.copy(currentEntryId = null, updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
-    }
-    if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
-        val drawn = catalogStore.drawRandomRemainingId(colId)
-        val hlc = nextLocalHlc(dao, localPeerId)
-        base =
-            base.copy(
-                currentEntryId = drawn,
-                drawnAt = drawn?.let { nowIso },
-                updatedAt = nowIso,
-                hlc = hlc,
-                isLocalDirty = true,
-            )
+    if (allowLocalAutoAdvance) {
+        if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
+            val hlc = nextLocalHlc(dao, localPeerId)
+            base =
+                base.copy(currentEntryId = null, updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
+        }
+        if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
+            val drawn = catalogStore.drawRandomRemainingId(colId)
+            val hlc = nextLocalHlc(dao, localPeerId)
+            base =
+                base.copy(
+                    currentEntryId = drawn,
+                    drawnAt = drawn?.let { nowIso },
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = true,
+                )
+        }
     }
     return base
 }
@@ -494,27 +501,38 @@ private fun selectBaseGeneratorEntity(
     serverNode: String,
     nowIso: String,
 ): CollectionGeneratorEntity {
-    if (remoteGen != null) {
-        val remHlc = resolveOrSynthesizeHlc(remoteGen.hlc, remoteGen.updatedAt, nowIso, serverNode)
-        val preferRemote =
-            localGen == null ||
-                remHlc > localGen.hlc ||
-                remHlc == localGen.hlc &&
-                    localGen.currentEntryId.isNullOrBlank() &&
-                    !remoteGen.currentEntryId.isNullOrBlank()
-        if (preferRemote) {
-            return CollectionGeneratorEntity(
-                collectionId = collectionId,
-                enabled = remoteGen.enabled,
-                currentEntryId = remoteGen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() },
-                drawnAt = remoteGen.drawnAt,
-                updatedAt = remoteGen.updatedAt.ifBlank { nowIso },
-                hlc = remHlc,
-                isLocalDirty = false,
-            )
+    val selected =
+        if (remoteGen != null) {
+            val remHlc =
+                resolveOrSynthesizeHlc(remoteGen.hlc, remoteGen.updatedAt, nowIso, serverNode)
+            val remoteEntryId = remoteGen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
+            val localEntryId = localGen?.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
+            val preferRemote =
+                localGen == null ||
+                    remHlc > localGen.hlc ||
+                    remHlc == localGen.hlc &&
+                        localEntryId.isNullOrBlank() &&
+                        !remoteEntryId.isNullOrBlank()
+            when {
+                preferRemote ->
+                    CollectionGeneratorEntity(
+                        collectionId = collectionId,
+                        enabled = remoteGen.enabled,
+                        currentEntryId = remoteEntryId,
+                        drawnAt = remoteGen.drawnAt,
+                        updatedAt = remoteGen.updatedAt.ifBlank { nowIso },
+                        hlc = remHlc,
+                        isLocalDirty = false,
+                    )
+                remHlc < localGen.hlc &&
+                    (localGen.enabled != remoteGen.enabled || localEntryId != remoteEntryId) ->
+                    localGen.copy(isLocalDirty = true)
+                else -> localGen
+            }
+        } else {
+            localGen
         }
-    }
-    return localGen
+    return selected
         ?: CollectionGeneratorEntity(
             collectionId = collectionId,
             enabled = false,

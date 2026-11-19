@@ -122,6 +122,7 @@ impl CatalogRepo<'_> {
             clean_notes,
             event_ts,
             now,
+            true,
         )
         .await?;
         Ok((log_id, canon_id))
@@ -129,6 +130,10 @@ impl CatalogRepo<'_> {
 
     /// Replays a peer-synced `consumption_log` record while preserving custom/timestamped log IDs,
     /// canonicalizing merged entry IDs, and deduplicating auto-completion log IDs across devices.
+    ///
+    /// Intentionally defers generator advancement so `merge_incoming_generators_in_tx` can first
+    /// merge the peer's own generator state (with its HLC) before advancing any remaining terminal
+    /// local draws.
     pub(crate) async fn log_consumption_with_id_in_tx(
         tx: &mut SqliteConnection,
         incoming_log_id: &str,
@@ -147,9 +152,10 @@ impl CatalogRepo<'_> {
             && (trimmed_incoming == deterministic_auto_consumption_log_id(raw_entry_id.trim())
                 || trimmed_incoming == deterministic_auto_consumption_log_id(&canon_id));
         if is_auto_id
-            && let Some(auto_id) =
-                Self::ensure_auto_consumed_with_parents_in_tx(tx, &canon_id, notes, event_ts, now)
-                    .await?
+            && let Some(auto_id) = Self::ensure_auto_consumed_with_parents_inner_in_tx(
+                tx, &canon_id, notes, event_ts, now, false,
+            )
+            .await?
         {
             return Ok((auto_id, canon_id));
         }
@@ -181,6 +187,7 @@ impl CatalogRepo<'_> {
             clean_notes,
             event_ts,
             now,
+            false,
         )
         .await?;
         Ok((final_log_id, canon_id))
@@ -195,6 +202,20 @@ impl CatalogRepo<'_> {
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
+    ) -> CatalogResult<Option<String>> {
+        Self::ensure_auto_consumed_with_parents_inner_in_tx(
+            tx, entry_id, notes, event_ts, now, true,
+        )
+        .await
+    }
+
+    async fn ensure_auto_consumed_with_parents_inner_in_tx(
+        tx: &mut SqliteConnection,
+        entry_id: &str,
+        notes: Option<&str>,
+        event_ts: DateTime<Utc>,
+        now: DateTime<Utc>,
+        advance_generators: bool,
     ) -> CatalogResult<Option<String>> {
         let Some(canon_id) = Self::follow_merged_id_in_tx(tx, entry_id).await? else {
             return Ok(None);
@@ -232,11 +253,13 @@ impl CatalogRepo<'_> {
             clean_notes,
             event_ts,
             now,
+            advance_generators,
         )
         .await?;
         Ok(Some(auto_id))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_consumption_and_engage_in_tx(
         tx: &mut SqliteConnection,
         log_id: &str,
@@ -245,6 +268,7 @@ impl CatalogRepo<'_> {
         clean_notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
+        advance_generators: bool,
     ) -> CatalogResult<()> {
         sqlx::query!(
             "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
@@ -274,7 +298,9 @@ impl CatalogRepo<'_> {
             remove_from_want_queues_in_tx(tx, canon_id, now).await?;
             Self::engage_consumed_parents_in_tx(tx, canon_id, event_ts, now).await?;
         }
-        if matches!(status, ConsumptionStatus::Consumed | ConsumptionStatus::Abandoned) {
+        if advance_generators
+            && matches!(status, ConsumptionStatus::Consumed | ConsumptionStatus::Abandoned)
+        {
             Self::advance_generators_for_entry_in_tx(tx, canon_id, now).await?;
         }
         Ok(())
