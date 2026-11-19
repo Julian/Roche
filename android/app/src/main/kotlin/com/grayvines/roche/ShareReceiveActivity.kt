@@ -1,6 +1,7 @@
 package com.grayvines.roche
 
 import android.app.Activity
+import android.content.ContentResolver
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -8,7 +9,9 @@ import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.net.toUri
 import com.grayvines.roche.data.PeerSyncScheduler
+import com.grayvines.roche.data.runSuspendCatching
 import java.io.InputStream
+import java.io.PushbackInputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -65,7 +68,15 @@ class ShareReceiveActivity : Activity() {
         payload: SharedContentPayload,
     ) {
         val pdfStream = openPdfStreamIfPresent(payload.pdfStreamUri)
-        val saveResult = runCatching {
+        if (
+            payload.pdfStreamUri != null &&
+                pdfStream == null &&
+                payload.url.startsWith("localpdf://", ignoreCase = true)
+        ) {
+            showShareToast(appContext, "Could not open shared PDF")
+            return
+        }
+        val saveResult = runSuspendCatching {
             graph.repository.addUrlToWantToRead(
                 inputUrl = payload.url,
                 titleOverride = payload.title,
@@ -113,7 +124,8 @@ class ShareReceiveActivity : Activity() {
         appContext: android.content.Context,
         graph: AppGraph,
     ) {
-        val currentSettings = runCatching { graph.settings.settings.first() }.getOrNull() ?: return
+        val currentSettings =
+            runSuspendCatching { graph.settings.settings.first() }.getOrNull() ?: return
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             PeerSyncScheduler.scheduleImmediateSync(appContext, currentSettings.serverUrl)
         }
@@ -127,21 +139,42 @@ class ShareReceiveActivity : Activity() {
 
     private fun openPdfStreamIfPresent(rawUri: String?): InputStream? {
         if (rawUri.isNullOrBlank()) return null
-        return runCatching { contentResolver.openInputStream(rawUri.toUri()) }.getOrNull()
+        val uri = runCatching { rawUri.toUri() }.getOrNull() ?: return null
+        if (!isAllowedSharedUri(uri)) return null
+        return runCatching {
+                val rawStream = contentResolver.openInputStream(uri) ?: return null
+                openValidatedPdfStream(rawStream)
+            }
+            .getOrNull()
     }
 
-    private fun queryStreamDisplayName(uri: Uri): String? = runCatching {
-        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-            cursor ->
-            val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (colIdx >= 0 && cursor.moveToFirst()) {
-                cursor.getString(colIdx)
-            } else {
-                null
+    private fun queryStreamDisplayName(uri: Uri): String? {
+        if (!isAllowedSharedUri(uri)) return null
+        return runCatching {
+                contentResolver
+                    .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor ->
+                        val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (colIdx >= 0 && cursor.moveToFirst()) {
+                            cursor.getString(colIdx)
+                        } else {
+                            null
+                        }
+                    }
             }
-        }
+            .getOrNull()
     }
-        .getOrNull()
+
+    private fun isAllowedSharedUri(uri: Uri): Boolean =
+        isAllowedSharedContentUri(
+            scheme = uri.scheme,
+            authority = uri.authority,
+            ownPackageName = packageName,
+            resolveProviderPackage = { auth ->
+                runCatching { packageManager.resolveContentProvider(auth, 0)?.packageName }
+                    .getOrNull()
+            },
+        )
 
     private fun finishQuietly() {
         if (!isFinishing) {
@@ -155,4 +188,40 @@ class ShareReceiveActivity : Activity() {
         internal const val WANT_TO_READ_ALIAS_SUFFIX = ".ShareWantToReadAlias"
         internal const val SUBSCRIBE_FEED_ALIAS_SUFFIX = ".ShareSubscribeFeedAlias"
     }
+}
+
+private val PDF_MAGIC_HEADER = byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D) // %PDF-
+
+internal fun isAllowedSharedContentUri(
+    scheme: String?,
+    authority: String?,
+    ownPackageName: String,
+    resolveProviderPackage: (String) -> String? = { null },
+): Boolean {
+    if (!scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true)) return false
+    val cleanAuthority = authority?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+    if (
+        cleanAuthority.equals(ownPackageName, ignoreCase = true) ||
+            cleanAuthority.startsWith("$ownPackageName.", ignoreCase = true)
+    ) {
+        return false
+    }
+    return resolveProviderPackage(cleanAuthority) != ownPackageName
+}
+
+internal fun openValidatedPdfStream(stream: InputStream): InputStream? {
+    val pushback = PushbackInputStream(stream, PDF_MAGIC_HEADER.size)
+    val header = ByteArray(PDF_MAGIC_HEADER.size)
+    var totalRead = 0
+    while (totalRead < PDF_MAGIC_HEADER.size) {
+        val read = pushback.read(header, totalRead, PDF_MAGIC_HEADER.size - totalRead)
+        if (read == -1) break
+        totalRead += read
+    }
+    if (totalRead != PDF_MAGIC_HEADER.size || !header.contentEquals(PDF_MAGIC_HEADER)) {
+        runCatching { pushback.close() }
+        return null
+    }
+    pushback.unread(header, 0, totalRead)
+    return pushback
 }

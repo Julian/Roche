@@ -19,8 +19,11 @@ suspend fun CatalogStore.attachEntryIdentifiers(
 ): Boolean {
     if (entryId.isBlank() || identifiers.isEmpty()) return false
     val nowIso = nowUtcIso()
+    val nodeId = resolveLocalPeerId()
     var attachedNew = false
-    withMutationLock { attachedNew = attachIdentifiersInDao(dao, entryId, identifiers, nowIso) }
+    withMutationLock {
+        attachedNew = attachIdentifiersInDao(dao, entryId, identifiers, nowIso, nodeId)
+    }
     if (attachedNew) {
         notifyLocalMutation()
     }
@@ -32,6 +35,7 @@ internal suspend fun attachIdentifiersInDao(
     entryId: String,
     identifiers: Map<String, String>,
     nowIso: String = nowUtcIso(),
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): Boolean {
     val resolvedId = followMergedIdInDao(dao, entryId) ?: return false
     val entry = dao.getEntryById(resolvedId) ?: return false
@@ -55,7 +59,7 @@ internal suspend fun attachIdentifiersInDao(
     dao.insertEntryIdentifiersIgnore(newRows)
     val attached = dao.getIdentifiersForEntry(resolvedId).size > existingPairs.size
     if (attached) {
-        val hlc = nextLocalHlc(dao)
+        val hlc = nextLocalHlc(dao, nodeId)
         dao.upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true))
     }
     return attached
@@ -65,14 +69,15 @@ internal suspend fun logFeedItemConsumedInDao(
     dao: RocheDao,
     itemId: String,
     nowIso: String,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): String {
     val resolvedId = followMergedIdInDao(dao, itemId) ?: itemId
     val itemEntry = dao.getEntryById(resolvedId)
     if (itemEntry != null && !isSyncablePublicUrl(itemEntry.url.orEmpty())) {
-        val hlc = nextLocalHlc(dao)
+        val hlc = nextLocalHlc(dao, nodeId)
         dao.upsertEntry(itemEntry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true))
     }
-    ensureConsumedOnceInDao(dao, resolvedId, nowIso)
+    ensureConsumedOnceInDao(dao, resolvedId, nowIso, nodeId)
 
     val feedSourcesById = dao.getAllFeedSources().associateBy { it.collectionId }
     val parentFeedIds =
@@ -85,18 +90,23 @@ internal suspend fun logFeedItemConsumedInDao(
         if (parentKind != EntryKind.COLLECTION) {
             val feedUrl = feedSourcesById[parentId]?.feedUrl.orEmpty()
             if (!isSyncablePublicUrl(feedUrl)) {
-                val hlc = nextLocalHlc(dao)
+                val hlc = nextLocalHlc(dao, nodeId)
                 dao.upsertEntry(
                     parentEntry.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
                 )
             }
-            ensureConsumedOnceInDao(dao, parentId, nowIso)
+            ensureConsumedOnceInDao(dao, parentId, nowIso, nodeId)
         }
     }
     return resolvedId
 }
 
-private suspend fun ensureConsumedOnceInDao(dao: RocheDao, entryId: String, nowIso: String) {
+private suspend fun ensureConsumedOnceInDao(
+    dao: RocheDao,
+    entryId: String,
+    nowIso: String,
+    nodeId: String,
+) {
     val alreadyConsumed =
         dao.getConsumptionLogsForEntry(entryId).any {
             ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED
@@ -111,6 +121,7 @@ private suspend fun ensureConsumedOnceInDao(dao: RocheDao, entryId: String, nowI
             nowIso = nowIso,
             markDirty = true,
             explicitLogId = deterministicAutoLogId(entryId),
+            nodeId = nodeId,
         )
     }
 }
@@ -120,6 +131,7 @@ internal suspend fun upsertEntryInDao(
     input: UpsertCatalogEntryInput,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): String {
     val cleanTitle = input.title.trim()
     require(cleanTitle.isNotEmpty()) { "Entry title cannot be empty" }
@@ -130,10 +142,10 @@ internal suspend fun upsertEntryInDao(
     val existing = dao.getEntryById(resolvedId)
     val hlc =
         if (markDirty) {
-            nextLocalHlc(dao)
+            nextLocalHlc(dao, nodeId)
         } else {
             existing?.hlc?.takeIf { it.isNotBlank() }
-                ?: HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+                ?: HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
         }
     val entity =
         mergeEntryEntity(
@@ -152,7 +164,7 @@ internal suspend fun upsertEntryInDao(
         )
     }
     if (input.kind == EntryKind.ALBUM || input.kind == EntryKind.SONG) {
-        synthesizeArtistsInDao(dao, resolvedId, input.creators, nowIso, markDirty)
+        synthesizeArtistsInDao(dao, resolvedId, input.creators, nowIso, markDirty, nodeId)
     }
     return resolvedId
 }
@@ -209,12 +221,14 @@ private suspend fun findEntryIdByIdentifiers(
     return null
 }
 
+@Suppress("LongParameterList")
 private suspend fun synthesizeArtistsInDao(
     dao: RocheDao,
     childEntryId: String,
     creators: List<String>,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String,
 ) {
     val allArtists =
         dao.getAllEntries().filter {
@@ -224,12 +238,12 @@ private suspend fun synthesizeArtistsInDao(
         val clean = rawArtist.trim()
         if (clean.isEmpty()) continue
         val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
-        val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty)
+        val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
         val hlc =
             if (markDirty) {
-                nextLocalHlc(dao)
+                nextLocalHlc(dao, nodeId)
             } else {
-                HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+                HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
             }
         dao.upsertCollectionEntry(
             CollectionEntryEntity(
@@ -249,6 +263,7 @@ private suspend fun ensureSynthesizedArtist(
     cleanArtistName: String,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String,
 ): String {
     val detId = deterministicTitleEntryId("artist", cleanArtistName.lowercase())
     val mergedTarget = followMergedIdInDao(dao, detId)
@@ -257,9 +272,9 @@ private suspend fun ensureSynthesizedArtist(
     }
     val hlc =
         if (markDirty) {
-            nextLocalHlc(dao)
+            nextLocalHlc(dao, nodeId)
         } else {
-            HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
         }
     dao.upsertEntry(
         EntryEntity(
@@ -303,6 +318,7 @@ internal suspend fun appendConsumptionInDao(
     nowIso: String,
     markDirty: Boolean,
     explicitLogId: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): String {
     val tsMillis = runCatching {
         Instant.parse(tsIso).toEpochMilli()
@@ -313,9 +329,9 @@ internal suspend fun appendConsumptionInDao(
             ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
     val hlc =
         if (markDirty) {
-            nextLocalHlc(dao)
+            nextLocalHlc(dao, nodeId)
         } else {
-            HlcTimestamp.fromIsoOrEpoch(tsIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()
         }
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
@@ -330,7 +346,7 @@ internal suspend fun appendConsumptionInDao(
         )
     )
     if (status == ConsumptionStatus.CONSUMED) {
-        removeFromWantQueuesInDao(dao, entryId, nowIso)
+        removeFromWantQueuesInDao(dao, entryId, nowIso, nodeId)
         dao.getEntryStateById(entryId)?.let { st ->
             if (st.readAt == null) {
                 dao.upsertEntryState(
@@ -344,24 +360,26 @@ internal suspend fun appendConsumptionInDao(
                 )
             }
         }
-        engageParentArtistsInDao(dao, entryId, tsIso, nowIso, markDirty)
+        engageParentArtistsInDao(dao, entryId, tsIso, nowIso, markDirty, nodeId)
     }
     return logId
 }
 
+@Suppress("LongParameterList")
 private suspend fun engageParentArtistsInDao(
     dao: RocheDao,
     entryId: String,
     tsIso: String,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String,
 ) {
     val entry = dao.getEntryById(entryId) ?: return
     val kind = EntryKind.fromWireValue(entry.kind)
     if (kind != EntryKind.ALBUM && kind != EntryKind.SONG) return
     val creators = decodeCreatorsJson(entry.creatorsJson)
     if (creators.isNotEmpty()) {
-        synthesizeArtistsInDao(dao, entryId, creators, nowIso, markDirty)
+        synthesizeArtistsInDao(dao, entryId, creators, nowIso, markDirty, nodeId)
     }
     val parentIds = dao.getCollectionEntriesForEntry(entryId).map { it.collectionId }
     for (pid in parentIds) {
@@ -370,17 +388,19 @@ private suspend fun engageParentArtistsInDao(
             parent.mergedIntoId.isNullOrBlank() &&
                 EntryKind.fromWireValue(parent.kind) == EntryKind.ARTIST
         if (isActiveArtist) {
-            engageSingleArtistInDao(dao, pid, tsIso, nowIso, markDirty)
+            engageSingleArtistInDao(dao, pid, tsIso, nowIso, markDirty, nodeId)
         }
     }
 }
 
+@Suppress("LongParameterList")
 private suspend fun engageSingleArtistInDao(
     dao: RocheDao,
     artistId: String,
     tsIso: String,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String,
 ) {
     val alreadyLogged =
         dao.getConsumptionLogsForEntry(artistId).any {
@@ -390,9 +410,9 @@ private suspend fun engageSingleArtistInDao(
     val logId = deterministicAutoLogId(artistId)
     val hlc =
         if (markDirty) {
-            nextLocalHlc(dao)
+            nextLocalHlc(dao, nodeId)
         } else {
-            HlcTimestamp.fromIsoOrEpoch(tsIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()
         }
     dao.insertConsumptionLogIgnore(
         ConsumptionLogEntity(
@@ -408,7 +428,12 @@ private suspend fun engageSingleArtistInDao(
     )
 }
 
-private suspend fun removeFromWantQueuesInDao(dao: RocheDao, entryId: String, nowIso: String) {
+private suspend fun removeFromWantQueuesInDao(
+    dao: RocheDao,
+    entryId: String,
+    nowIso: String,
+    nodeId: String,
+) {
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val memberships = dao.getCollectionEntriesForEntry(entryId)
     for (mem in memberships) {
@@ -418,7 +443,7 @@ private suspend fun removeFromWantQueuesInDao(dao: RocheDao, entryId: String, no
                 mem.collectionId == WANT_TO_READ_COLLECTION_ID ||
                 spec?.let { CollectionRole.fromWireValue(it.role) == CollectionRole.WANT } == true
         if (isWant) {
-            val hlc = nextLocalHlc(dao)
+            val hlc = nextLocalHlc(dao, nodeId)
             dao.deleteCollectionEntry(mem.collectionId, entryId)
             dao.upsertTombstone(
                 TombstoneEntity(
@@ -461,6 +486,7 @@ internal suspend fun ensureWantCollectionInDao(
     kind: EntryKind,
     targetQueueIdOrSlug: String?,
     nowIso: String,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ): CollectionSpecEntity {
     val explicit = targetQueueIdOrSlug?.trim()?.takeIf { it.isNotEmpty() }
     val rawBase =
@@ -481,7 +507,7 @@ internal suspend fun ensureWantCollectionInDao(
             ?: dao.getCollectionSpecBySlug(wantSlug)
     if (existing != null) {
         if (dao.getEntryById(existing.collectionId) == null) {
-            val hlc = nextLocalHlc(dao)
+            val hlc = nextLocalHlc(dao, nodeId)
             dao.upsertEntry(
                 EntryEntity(
                     id = existing.collectionId,
@@ -498,7 +524,7 @@ internal suspend fun ensureWantCollectionInDao(
     }
 
     val id = systemCollectionUuid(wantSlug)
-    val hlc = nextLocalHlc(dao)
+    val hlc = nextLocalHlc(dao, nodeId)
     val spec =
         CollectionSpecEntity(
             collectionId = id,
@@ -531,6 +557,7 @@ internal suspend fun addCollectionMemberInDao(
     position: Double?,
     nowIso: String,
     markDirty: Boolean,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     val specTitle = dao.getEntryById(spec.collectionId)?.title ?: spec.slug ?: spec.collectionId
     val mode = CollectionMode.fromWireValue(spec.mode)
@@ -549,9 +576,9 @@ internal suspend fun addCollectionMemberInDao(
     )
     val hlc =
         if (markDirty) {
-            nextLocalHlc(dao)
+            nextLocalHlc(dao, nodeId)
         } else {
-            HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+            HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
         }
     dao.upsertCollectionEntry(
         CollectionEntryEntity(

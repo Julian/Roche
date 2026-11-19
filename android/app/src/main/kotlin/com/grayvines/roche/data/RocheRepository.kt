@@ -26,6 +26,7 @@ import com.grayvines.roche.data.remote.PublicUrlValidator
 import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.data.settings.keepTokenOnDiscovery
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
@@ -118,6 +119,7 @@ class RocheRepository(
         CatalogStore(
             dao = dao,
             onLocalMutation = ::triggerBackgroundSync,
+            localPeerIdProvider = ::currentLocalPeerId,
         )
     @Volatile
     internal var latestSnapshot: RepositorySnapshot? = null
@@ -419,15 +421,7 @@ class RocheRepository(
     }
 
     suspend fun setFeedPlaybackSpeed(feedId: String, speed: Float?) {
-        val clamped =
-            speed
-                ?.takeIf { it.isFinite() }
-                ?.let {
-                    (kotlin.math.round(it * PLAYBACK_SPEED_STEP) / PLAYBACK_SPEED_STEP).coerceIn(
-                        MIN_SPEED,
-                        MAX_SPEED,
-                    )
-                }
+        val clamped = speed?.takeIf { it.isFinite() }?.let(::clampPlaybackSpeed)
         dao.updateFeedPlaybackSpeed(feedId = feedId, speed = clamped)
     }
 
@@ -1165,9 +1159,6 @@ private const val MIN_READ_PROGRESS = 0.0
 private const val MAX_READ_PROGRESS = 1.0
 private const val ARCHIVE_COMPLETE_PROGRESS_THRESHOLD = 0.9
 private const val AUDIO_COMPLETE_PROGRESS_THRESHOLD = 0.98
-private const val PLAYBACK_SPEED_STEP = 20f
-private const val MIN_SPEED = 0.50f
-private const val MAX_SPEED = 3.50f
 
 internal suspend fun resolveArchiveBatchTargetIds(
     dao: RocheDao,
@@ -1183,45 +1174,4 @@ internal suspend fun resolveArchiveBatchTargetIds(
             .mapTo(HashSet()) { it.id }
     }
     return emptySet()
-}
-
-internal suspend fun finalizeOnlineSavedItem(
-    dao: RocheDao,
-    localEntity: InboxItemRow,
-    remoteSaved: RemoteItemDto,
-    initialTags: List<String>,
-): InboxItemRow {
-    val currentLocal = dao.getItemById(localEntity.id) ?: localEntity
-    val currentLocalTags = dao.getTagNamesForItem(localEntity.id)
-    val stateChangedInFlight =
-        currentLocal.status != localEntity.status ||
-            currentLocal.isFavorite != localEntity.isFavorite ||
-            currentLocal.readProgress != localEntity.readProgress ||
-            currentLocal.readAt != localEntity.readAt ||
-            currentLocalTags.sorted() != initialTags.sorted()
-    val reconciled = reconcileSavedItemEntity(currentLocal, remoteSaved)
-    dao.executeInTransaction {
-        if (remoteSaved.id != localEntity.id) {
-            dao.deleteEntryCascade(localEntity.id)
-        }
-        dao.upsertItem(reconciled, markDirty = stateChangedInFlight)
-        val tombstones =
-            dao.getAllTombstones()
-                .filter { it.entityType.equals(COLLECTION_ENTRY_ENTITY, ignoreCase = true) }
-                .mapTo(HashSet()) { it.naturalKey }
-        val effectiveTags =
-            (currentLocalTags + remoteSaved.tagNames).map(::normalizeTagName).distinct().filter {
-                norm ->
-                norm.isNotBlank() &&
-                    collectionEntryNaturalKey(deterministicTagId(norm), localEntity.id) !in
-                        tombstones
-            }
-        attachTagsLocally(
-            dao = dao,
-            itemId = reconciled.id,
-            tagNames = effectiveTags,
-            markDirty = stateChangedInFlight,
-        )
-    }
-    return reconciled
 }

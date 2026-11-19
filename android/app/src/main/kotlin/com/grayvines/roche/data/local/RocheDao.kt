@@ -8,6 +8,9 @@ import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
 import androidx.room3.Update
+import com.grayvines.roche.data.STARRED_COLLECTION_ID
+import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import kotlinx.coroutines.flow.Flow
 
 private const val FEED_ID_SUBQUERY =
@@ -15,9 +18,9 @@ private const val FEED_ID_SUBQUERY =
         "LEFT JOIN collection_specs cs_f ON cs_f.collectionId = ce_f.collectionId " +
         "WHERE ce_f.entryId = e.id " +
         "AND ce_f.collectionId NOT IN (" +
-        "'533b1315-6e2e-57d3-ba85-dc88531c5a0b', " +
-        "'3864ff37-5ed3-5256-9380-f85ff8054f1c', " +
-        "'2ef71101-a716-5331-9515-cb7b5ce8b3c3'" +
+        "'$STARRED_COLLECTION_ID', " +
+        "'$UP_NEXT_COLLECTION_ID', " +
+        "'$WANT_TO_READ_COLLECTION_ID'" +
         ") " +
         "AND (EXISTS (SELECT 1 FROM feed_sources fs_x WHERE fs_x.collectionId = ce_f.collectionId) " +
         "OR cs_f.role = 'feed' " +
@@ -49,14 +52,14 @@ private const val AUTHOR_SUBQUERY =
 
 private const val IS_FAVORITE_EXPR =
     "EXISTS (SELECT 1 FROM collection_entries ce_fav " +
-        "WHERE ce_fav.collectionId = '533b1315-6e2e-57d3-ba85-dc88531c5a0b' " +
+        "WHERE ce_fav.collectionId = '$STARRED_COLLECTION_ID' " +
         "AND ce_fav.entryId = e.id)"
 
 private const val STATUS_EXPR =
     "CASE WHEN es.inboxState = 'dismissed' " +
         "OR (es.inboxState = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
         "SELECT 1 FROM collection_entries ce_wtr " +
-        "WHERE ce_wtr.collectionId = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' " +
+        "WHERE ce_wtr.collectionId = '$WANT_TO_READ_COLLECTION_ID' " +
         "AND ce_wtr.entryId = e.id)) " +
         "THEN 'archived' ELSE 'unread' END"
 
@@ -850,6 +853,14 @@ interface RocheDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertLocalSyncFlag(flag: LocalSyncFlagEntity)
+
+    @Query(
+        "INSERT INTO local_sync_flags(flagKey, flagValue) VALUES (:key, :value) " +
+            "ON CONFLICT(flagKey) DO UPDATE SET flagValue = " +
+            "CASE WHEN excluded.flagValue > local_sync_flags.flagValue " +
+            "THEN excluded.flagValue ELSE local_sync_flags.flagValue END"
+    )
+    suspend fun upsertLocalSyncFlagIfGreater(key: String, value: String)
 
     @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
     suspend fun deleteLocalSyncFlag(key: String)

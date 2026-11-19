@@ -9,6 +9,7 @@ import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.deleteCollectionGeneratorWithTombstone
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -29,9 +30,13 @@ class CatalogStore(
     internal val dao: RocheDao,
     private val random: Random = Random.Default,
     private val onLocalMutation: () -> Unit = {},
+    private val localPeerIdProvider: suspend () -> String = { DEFAULT_LOCAL_HLC_NODE },
 ) {
-    private val seeder = CatalogSeeder(dao = dao)
+    private val seeder = CatalogSeeder(dao = dao, localPeerIdProvider = ::resolveLocalPeerId)
     private val mutationMutex = Mutex()
+
+    internal suspend fun resolveLocalPeerId(): String =
+        localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val snapshot: Flow<CatalogSnapshot> =
@@ -84,7 +89,9 @@ class CatalogStore(
                         current?.drawnAt
                     }
                 drawnActiveId = activeId
-                val hlc = nextLocalHlc(dao)
+                val nodeId = resolveLocalPeerId()
+                val hlc = nextLocalHlc(dao, nodeId)
+                dao.deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, spec.collectionId)
                 dao.upsertCollectionGenerator(
                     CollectionGeneratorEntity(
                         collectionId = spec.collectionId,
@@ -101,6 +108,25 @@ class CatalogStore(
         }
         onLocalMutation()
         return result
+    }
+
+    suspend fun removeCollectionGenerator(collectionIdOrSlug: String): Boolean {
+        val removed = mutationMutex.withLock {
+            ensureSystemSeeded()
+            val spec = resolveCollectionSpec(collectionIdOrSlug) ?: return@withLock false
+            val existing = dao.getCollectionGenerator(spec.collectionId) ?: return@withLock false
+            val nodeId = resolveLocalPeerId()
+            dao.deleteCollectionGeneratorWithTombstone(
+                collectionId = existing.collectionId,
+                recordTombstone = true,
+                nodeId = nodeId,
+            )
+            true
+        }
+        if (removed) {
+            onLocalMutation()
+        }
+        return removed
     }
 
     suspend fun finishActiveDraw(
@@ -134,6 +160,7 @@ class CatalogStore(
                 gen.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedId(it) }
                     ?: error("No active item to $verb in '$specTitle'")
             val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
             dao.executeInTransaction {
                 appendConsumptionInDao(
                     dao = dao,
@@ -143,8 +170,9 @@ class CatalogStore(
                     tsIso = nowIso,
                     nowIso = nowIso,
                     markDirty = true,
+                    nodeId = nodeId,
                 )
-                advanceActiveDrawsLocked(currentId, status, nowIso)
+                advanceActiveDrawsLocked(currentId, status, nowIso, nodeId)
             }
             val updatedGen = dao.getCollectionGenerator(spec.collectionId)
             val nextId = updatedGen?.currentEntryId?.takeIf { it.isNotBlank() }
@@ -165,6 +193,7 @@ class CatalogStore(
     ): String {
         val entryId = mutationMutex.withLock {
             ensureSystemSeeded()
+            val nodeId = resolveLocalPeerId()
             var resolved = ""
             dao.executeInTransaction {
                 resolved =
@@ -173,6 +202,7 @@ class CatalogStore(
                         input = input,
                         nowIso = nowUtcIso(),
                         markDirty = markDirty,
+                        nodeId = nodeId,
                     )
             }
             resolved
@@ -191,6 +221,7 @@ class CatalogStore(
         val entryId = mutationMutex.withLock {
             ensureSystemSeeded()
             val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
             var resolved = ""
             dao.executeInTransaction {
                 resolved =
@@ -199,6 +230,7 @@ class CatalogStore(
                         input = input,
                         nowIso = nowIso,
                         markDirty = true,
+                        nodeId = nodeId,
                     )
                 appendConsumptionInDao(
                     dao = dao,
@@ -208,8 +240,9 @@ class CatalogStore(
                     tsIso = nowIso,
                     nowIso = nowIso,
                     markDirty = true,
+                    nodeId = nodeId,
                 )
-                advanceActiveDrawsLocked(resolved, status, nowIso)
+                advanceActiveDrawsLocked(resolved, status, nowIso, nodeId)
             }
             resolved
         }
@@ -226,6 +259,7 @@ class CatalogStore(
             ensureSystemSeeded()
             followMergedId(entryId)?.also { resolved ->
                 val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
                 dao.executeInTransaction {
                     appendConsumptionInDao(
                         dao = dao,
@@ -235,8 +269,9 @@ class CatalogStore(
                         tsIso = nowIso,
                         nowIso = nowIso,
                         markDirty = true,
+                        nodeId = nodeId,
                     )
-                    advanceActiveDrawsLocked(resolved, status, nowIso)
+                    advanceActiveDrawsLocked(resolved, status, nowIso, nodeId)
                 }
             }
         }
@@ -253,6 +288,7 @@ class CatalogStore(
         val entryId = mutationMutex.withLock {
             ensureSystemSeeded()
             val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
             var resolved = ""
             dao.executeInTransaction {
                 resolved =
@@ -261,9 +297,10 @@ class CatalogStore(
                         input = input,
                         nowIso = nowIso,
                         markDirty = true,
+                        nodeId = nodeId,
                     )
                 val queueSpec =
-                    ensureWantCollectionInDao(dao, input.kind, targetQueueIdOrSlug, nowIso)
+                    ensureWantCollectionInDao(dao, input.kind, targetQueueIdOrSlug, nowIso, nodeId)
                 addCollectionMemberInDao(
                     dao = dao,
                     spec = queueSpec,
@@ -271,6 +308,7 @@ class CatalogStore(
                     position = null,
                     nowIso = nowIso,
                     markDirty = true,
+                    nodeId = nodeId,
                 )
             }
             resolved
@@ -315,7 +353,7 @@ class CatalogStore(
     private suspend fun ensureCollectionEntryRow(collectionId: String, cleanTitle: String) {
         if (dao.getEntryById(collectionId) != null) return
         val nowIso = nowUtcIso()
-        val hlc = nextLocalHlc(dao)
+        val hlc = nextLocalHlc(dao, resolveLocalPeerId())
         dao.upsertEntry(
             EntryEntity(
                 id = collectionId,
@@ -336,6 +374,7 @@ class CatalogStore(
         role: CollectionRole,
     ) {
         val nowIso = nowUtcIso()
+        val nodeId = resolveLocalPeerId()
         val newSpec =
             CollectionSpecEntity(
                 collectionId = newId,
@@ -345,7 +384,7 @@ class CatalogStore(
                 showInLists = role == CollectionRole.LIST,
             )
         dao.executeInTransaction {
-            val hlc = nextLocalHlc(dao)
+            val hlc = nextLocalHlc(dao, nodeId)
             dao.upsertEntry(
                 EntryEntity(
                     id = newId,
@@ -374,6 +413,7 @@ class CatalogStore(
                     ?: error("Collection not found: $collectionIdOrSlug")
             val resolvedEntry =
                 followMergedId(entryId) ?: error("Catalog entry not found: $entryId")
+            val nodeId = resolveLocalPeerId()
             dao.executeInTransaction {
                 addCollectionMemberInDao(
                     dao = dao,
@@ -382,6 +422,7 @@ class CatalogStore(
                     position = position,
                     nowIso = nowUtcIso(),
                     markDirty = true,
+                    nodeId = nodeId,
                 )
             }
         }
@@ -409,8 +450,9 @@ class CatalogStore(
                 }
             if (existing) {
                 val nowIso = nowUtcIso()
+                val nodeId = resolveLocalPeerId()
                 dao.executeInTransaction {
-                    val hlc = nextLocalHlc(dao)
+                    val hlc = nextLocalHlc(dao, nodeId)
                     dao.deleteCollectionEntry(spec.collectionId, resolvedEntry)
                     dao.upsertTombstone(
                         TombstoneEntity(
@@ -446,6 +488,7 @@ class CatalogStore(
             val cleanScope = scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
             val now = Instant.now()
             val nowIso = now.toString()
+            val nodeId = resolveLocalPeerId()
             val id =
                 deterministicComparisonId(
                     scopeCollectionId = cleanScope,
@@ -453,7 +496,7 @@ class CatalogStore(
                     ordering = resolvedGroups,
                 )
             dao.executeInTransaction {
-                val hlc = nextLocalHlc(dao)
+                val hlc = nextLocalHlc(dao, nodeId)
                 dao.insertComparisonIgnore(
                     ComparisonEntity(
                         id = id,
@@ -580,10 +623,17 @@ class CatalogStore(
         val resolvedId = mutationMutex.withLock {
             ensureSystemSeeded()
             val nowIso = nowUtcIso()
+            val nodeId = resolveLocalPeerId()
             var id = itemId
             dao.executeInTransaction {
-                id = logFeedItemConsumedInDao(dao = dao, itemId = itemId, nowIso = nowIso)
-                advanceActiveDrawsLocked(id, ConsumptionStatus.CONSUMED, nowIso)
+                id =
+                    logFeedItemConsumedInDao(
+                        dao = dao,
+                        itemId = itemId,
+                        nowIso = nowIso,
+                        nodeId = nodeId,
+                    )
+                advanceActiveDrawsLocked(id, ConsumptionStatus.CONSUMED, nowIso, nodeId)
             }
             id
         }
@@ -620,6 +670,7 @@ class CatalogStore(
         entryId: String,
         status: ConsumptionStatus,
         nowIso: String,
+        nodeId: String,
     ) {
         if (status != ConsumptionStatus.CONSUMED && status != ConsumptionStatus.ABANDONED) return
         for (gen in dao.getAllCollectionGenerators()) {
@@ -631,6 +682,7 @@ class CatalogStore(
                     enabled = gen.enabled,
                     nowIso = nowIso,
                     markDirty = true,
+                    nodeId = nodeId,
                 )
             }
         }
@@ -641,14 +693,18 @@ class CatalogStore(
         enabled: Boolean,
         nowIso: String,
         markDirty: Boolean,
+        nodeId: String,
     ): String? {
         val nextId = if (enabled) drawRandomRemainingId(collectionId) else null
         val hlc =
             if (markDirty) {
-                nextLocalHlc(dao)
+                nextLocalHlc(dao, nodeId)
             } else {
-                HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+                HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
             }
+        if (markDirty) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, collectionId)
+        }
         dao.upsertCollectionGenerator(
             CollectionGeneratorEntity(
                 collectionId = collectionId,

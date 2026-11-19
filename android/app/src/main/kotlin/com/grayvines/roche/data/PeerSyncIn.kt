@@ -54,6 +54,7 @@ internal suspend fun reconcilePeerSyncResponse(
                 response = response,
                 redirects = redirects,
                 serverNode = serverNode,
+                localPeerId = localPeerId.ifBlank { DEFAULT_LOCAL_HLC_NODE },
                 nowIso = nowIso,
             )
         }
@@ -123,6 +124,7 @@ private const val TOMBSTONE_ENTITY_ENTRY = "entry"
 private const val TOMBSTONE_ENTITY_FEED = "feed"
 private const val TOMBSTONE_ENTITY_ITEM = "item"
 private const val TOMBSTONE_ENTITY_TAG = "tag"
+internal const val TOMBSTONE_ENTITY_COLLECTION_GENERATOR = "collection_generator"
 
 private suspend fun applyIncomingTombstonesInTx(
     dao: RocheDao,
@@ -142,6 +144,8 @@ private suspend fun applyIncomingTombstonesInTx(
             "collection" -> applyCollectionTombstone(dao, rawKey, deletedAt, tombHlc)
             COLLECTION_ENTRY_ENTITY ->
                 applyCollectionEntryTombstone(dao, rawKey, deletedAt, tombHlc)
+            TOMBSTONE_ENTITY_COLLECTION_GENERATOR ->
+                applyCollectionGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
         }
     }
@@ -220,11 +224,17 @@ private fun doesInboxEntryMatchTombstone(
     entryColIds: List<String>,
     feedUrlsByColId: Map<String, String>,
 ): Boolean {
-    val inInbox = state != null && (state.inboxState == "unread" || state.inboxState == "dismissed")
-    if (!inInbox) return false
-    if (entry.id == detId) return true
-    if (canonicalizeSyncUrl(entry.url.orEmpty()) != canonItem) return false
+    val validInboxState =
+        state != null &&
+            (state.inboxState == "unread" ||
+                state.inboxState == "dismissed" ||
+                (canonFeed == null && state.inboxState == "none"))
+    if (!validInboxState) return false
     val entryFeeds = entryColIds.mapNotNull { feedUrlsByColId[it] }
+    if (entry.id == detId) {
+        return if (canonFeed == null) entryFeeds.isEmpty() else true
+    }
+    if (canonicalizeSyncUrl(entry.url.orEmpty()) != canonItem) return false
     return if (canonFeed == null) entryFeeds.isEmpty() else canonFeed in entryFeeds
 }
 
@@ -283,6 +293,20 @@ private suspend fun applyCollectionEntryTombstone(
     if (existing != null && existing.hlc > tombHlc) return
     dao.deleteCollectionEntry(colId, entryId)
     upsertCleanTombstone(dao, COLLECTION_ENTRY_ENTITY, canonKey, deletedAt, tombHlc)
+}
+
+private suspend fun applyCollectionGeneratorTombstone(
+    dao: RocheDao,
+    rawKey: String,
+    deletedAt: String,
+    tombHlc: String,
+) {
+    val colId = followMergedIdInDao(dao, rawKey) ?: rawKey.trim()
+    if (colId.isEmpty()) return
+    val existing = dao.getCollectionGenerator(colId)
+    if (existing != null && existing.hlc > tombHlc) return
+    dao.deleteCollectionGenerator(colId)
+    upsertCleanTombstone(dao, TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId, deletedAt, tombHlc)
 }
 
 private suspend fun applyEntryTombstone(

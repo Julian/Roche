@@ -32,6 +32,7 @@ internal data class SinglePeerSyncResult(
     val response: PeerSyncResponseDto,
     val sentEntryIds: Set<String> = emptySet(),
     val byteOverflowEntryIds: Set<String> = emptySet(),
+    val droppedEntriesOn413: Boolean = false,
 )
 
 internal fun parseSyncSeqCursor(rawCursor: String?): Long =
@@ -100,6 +101,7 @@ internal class PeerSyncCoordinator(
                 initialSettings = workingSettings,
                 initialSentIds = initialRound.sentEntryIds,
                 initialOverflowIds = initialRound.byteOverflowEntryIds,
+                initialDroppedOn413 = initialRound.droppedEntriesOn413,
                 weightOverride = initialWeightOverride,
             ) { peers ->
                 latestPeers = peers
@@ -219,26 +221,36 @@ internal class PeerSyncCoordinator(
         return response
     }
 
+    @Suppress("LongParameterList")
     private suspend fun drainOverflowEntryPushes(
         initialSettings: Settings,
         initialSentIds: Set<String>,
         initialOverflowIds: Set<String>,
+        initialDroppedOn413: Boolean,
         weightOverride: Double?,
         onPagePeers: (List<PeerNodeDto>) -> Unit,
     ): Settings {
         var settings = initialSettings
         var remainingIds = initialOverflowIds
         val alreadySentIds = initialSentIds.toMutableSet()
+        var currentMaxPayloadBytes =
+            if (initialDroppedOn413) {
+                (MAX_PEER_SYNC_PAYLOAD_BYTES / 2).coerceAtLeast(1)
+            } else {
+                MAX_PEER_SYNC_PAYLOAD_BYTES
+            }
         var roundIdx = 0
         var keepDraining = remainingIds.isNotEmpty()
         while (keepDraining && roundIdx < MAX_OVERFLOW_PUSH_ROUNDS) {
             val prevCount = remainingIds.size
+            val prevMaxPayloadBytes = currentMaxPayloadBytes
             val nextRound =
                 executeSinglePeerSyncRound(
                     currentSettings = settings,
                     weightOverride = weightOverride,
                     forcedEntryIds = remainingIds,
                     excludeEntryIds = alreadySentIds,
+                    maxPayloadBytes = currentMaxPayloadBytes,
                 )
             if (nextRound == null || nextRound.response.resetRequired) {
                 keepDraining = false
@@ -253,7 +265,12 @@ internal class PeerSyncCoordinator(
                         onPagePeers = onPagePeers,
                     )
                 remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds
-                keepDraining = remainingIds.isNotEmpty() && remainingIds.size < prevCount
+                if (nextRound.droppedEntriesOn413) {
+                    currentMaxPayloadBytes = (currentMaxPayloadBytes / 2).coerceAtLeast(1)
+                    keepDraining = remainingIds.isNotEmpty() && prevMaxPayloadBytes > 1
+                } else {
+                    keepDraining = remainingIds.isNotEmpty() && remainingIds.size < prevCount
+                }
                 roundIdx++
             }
         }
@@ -267,6 +284,7 @@ internal class PeerSyncCoordinator(
         sinceSeqOverride: Long? = null,
         forcedEntryIds: Set<String> = emptySet(),
         excludeEntryIds: Set<String> = emptySet(),
+        maxPayloadBytes: Int = MAX_PEER_SYNC_PAYLOAD_BYTES,
     ): SinglePeerSyncResult? {
         val effectiveSinceSeq =
             sinceSeqOverride ?: parseSyncSeqCursor(currentSettings.lastPeerSyncCursor)
@@ -282,20 +300,37 @@ internal class PeerSyncCoordinator(
                         weightOverride = weightOverride,
                         forcedEntryIds = forcedEntryIds,
                         excludeEntryIds = excludeEntryIds,
+                        maxPayloadBytes = maxPayloadBytes,
                     ),
             )
-        val (response, droppedEntriesOn413) =
+        val (response, retriedRequestAfter413) =
             callSyncPeerRound(currentSettings, tracked.request) ?: return null
         if (response.resetRequired) {
             return SinglePeerSyncResult(response = response)
         }
+        val droppedEntriesOn413 = retriedRequestAfter413 != null
         val effectiveTracked =
-            if (droppedEntriesOn413) {
+            if (retriedRequestAfter413 != null) {
+                val droppedEntryIds = tracked.sentEntryIds
+                val keptGenIds =
+                    retriedRequestAfter413.collectionGenerators.mapTo(HashSet()) { it.collectionId }
+                val keptLogIds = retriedRequestAfter413.consumptionLog.mapTo(HashSet()) { it.id }
+                val keptCompIds = retriedRequestAfter413.comparisons.mapTo(HashSet()) { it.id }
                 tracked.copy(
+                    request = retriedRequestAfter413,
                     sentEntryHlcById = emptyMap(),
                     sentStateHlcById = emptyMap(),
                     sentFeedSourceHlcById = emptyMap(),
-                    byteOverflowEntryIds = tracked.sentEntryIds + tracked.byteOverflowEntryIds,
+                    sentMembershipHlcByKey =
+                        tracked.sentMembershipHlcByKey.filterKeys { (colId, entryId) ->
+                            colId !in droppedEntryIds && entryId !in droppedEntryIds
+                        },
+                    sentGeneratorHlcById =
+                        tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
+                    sentLogIds = tracked.sentLogIds.filterTo(HashSet()) { it in keptLogIds },
+                    sentComparisonIds =
+                        tracked.sentComparisonIds.filterTo(HashSet()) { it in keptCompIds },
+                    byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
                 )
             } else {
                 tracked
@@ -311,13 +346,14 @@ internal class PeerSyncCoordinator(
             response = response,
             sentEntryIds = effectiveTracked.sentEntryIds,
             byteOverflowEntryIds = effectiveTracked.byteOverflowEntryIds,
+            droppedEntriesOn413 = droppedEntriesOn413,
         )
     }
 
     private suspend fun callSyncPeerRound(
         currentSettings: Settings,
         request: PeerSyncRequestDto,
-    ): Pair<PeerSyncResponseDto, Boolean>? {
+    ): Pair<PeerSyncResponseDto, PeerSyncRequestDto?>? {
         val primary = runSuspendCatching {
             apiClient.syncPeer(
                 serverUrl = currentSettings.serverUrl,
@@ -327,20 +363,43 @@ internal class PeerSyncCoordinator(
         }
         val error = primary.exceptionOrNull()
         return when {
-            error == null -> primary.getOrNull()?.let { it to false }
+            error == null -> primary.getOrNull()?.let { it to null }
             (error as? ProblemDetailsException)?.statusCode == HTTP_PAYLOAD_TOO_LARGE &&
-                request.entries.isNotEmpty() ->
+                request.entries.isNotEmpty() -> {
+                val strippedRequest = stripEntriesAndDependentEdgesFor413(request)
                 apiClient
                     .syncPeer(
                         serverUrl = currentSettings.serverUrl,
                         token = currentSettings.bearerToken,
-                        request = request.copy(entries = emptyList()),
+                        request = strippedRequest,
                     )
-                    ?.let { it to true }
+                    ?.let { it to strippedRequest }
+            }
             request.sinceSeq == 0L && isOversizedResponseError(error) -> null
             else -> throw error
         }
     }
+}
+
+internal fun stripEntriesAndDependentEdgesFor413(request: PeerSyncRequestDto): PeerSyncRequestDto {
+    val droppedEntryIds = request.entries.mapTo(HashSet()) { it.id }
+    return request.copy(
+        entries = emptyList(),
+        collectionEntries =
+            request.collectionEntries.filter {
+                it.collectionId !in droppedEntryIds && it.entryId !in droppedEntryIds
+            },
+        collectionGenerators =
+            request.collectionGenerators.filter {
+                it.collectionId !in droppedEntryIds && it.currentEntryId !in droppedEntryIds
+            },
+        consumptionLog = request.consumptionLog.filter { it.entryId !in droppedEntryIds },
+        comparisons =
+            request.comparisons.filter { comp ->
+                comp.scopeCollectionId !in droppedEntryIds &&
+                    comp.ordering.flatten().none { it in droppedEntryIds }
+            },
+    )
 }
 
 internal suspend fun pollCooperativeFeedsOnDevice(

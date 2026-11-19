@@ -10,7 +10,10 @@ import com.grayvines.roche.data.local.deleteEntryCascade
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-internal class CatalogSeeder(private val dao: RocheDao) {
+internal class CatalogSeeder(
+    private val dao: RocheDao,
+    private val localPeerIdProvider: suspend () -> String = { DEFAULT_LOCAL_HLC_NODE },
+) {
     private val seedMutex = Mutex()
     @Volatile private var systemSeeded = false
 
@@ -209,8 +212,9 @@ internal class CatalogSeeder(private val dao: RocheDao) {
         manualStates: List<com.grayvines.roche.data.local.EntryStateEntity>
     ) {
         val nowIso = nowUtcIso()
+        val nodeId = localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
         dao.executeInTransaction {
-            val hlc = nextLocalHlc(dao)
+            val hlc = nextLocalHlc(dao, nodeId)
             dao.getEntryById(WANT_TO_READ_COLLECTION_ID)?.let { wantCol ->
                 dao.upsertEntry(wantCol.copy(updatedAt = nowIso, hlc = hlc, isLocalDirty = true))
             }

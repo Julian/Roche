@@ -3,6 +3,7 @@
 package com.grayvines.roche.data.local
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import androidx.room3.Database
 import androidx.room3.Room
 import androidx.room3.RoomDatabase
@@ -172,29 +173,36 @@ abstract class RocheDatabase : RoomDatabase() {
                 }
             }
 
-        fun create(context: Context): RocheDatabase =
-            Room.databaseBuilder<RocheDatabase>(context.applicationContext, DATABASE_NAME)
-                .setDriver(BundledSQLiteDriver())
-                .addCallback(
-                    object : Callback() {
-                        override suspend fun onOpen(connection: SQLiteConnection) {
-                            connection.execSQL("PRAGMA recursive_triggers = ON")
+        fun create(context: Context): RocheDatabase {
+            val appContext = context.applicationContext
+            val isDebuggable =
+                (appContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+            val builder =
+                Room.databaseBuilder<RocheDatabase>(appContext, DATABASE_NAME)
+                    .setDriver(BundledSQLiteDriver())
+                    .addCallback(
+                        object : Callback() {
+                            override suspend fun onOpen(connection: SQLiteConnection) {
+                                connection.execSQL("PRAGMA recursive_triggers = ON")
+                            }
                         }
-                    }
-                )
-                .addMigrations(
-                    MIGRATION_1_2,
-                    MIGRATION_2_3,
-                    MIGRATION_3_4,
-                    MIGRATION_4_5,
-                    MIGRATION_5_6,
-                    MIGRATION_6_7,
-                    MIGRATION_7_8,
-                    MIGRATION_8_9,
-                    MIGRATION_9_10,
-                )
-                .fallbackToDestructiveMigration(dropAllTables = true)
-                .build()
+                    )
+                    .addMigrations(
+                        MIGRATION_1_2,
+                        MIGRATION_2_3,
+                        MIGRATION_3_4,
+                        MIGRATION_4_5,
+                        MIGRATION_5_6,
+                        MIGRATION_6_7,
+                        MIGRATION_7_8,
+                        MIGRATION_8_9,
+                        MIGRATION_9_10,
+                    )
+            if (isDebuggable) {
+                builder.fallbackToDestructiveMigration(dropAllTables = true)
+            }
+            return builder.build()
+        }
     }
 }
 

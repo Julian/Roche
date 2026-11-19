@@ -268,13 +268,14 @@ internal suspend fun RocheDao.upsertFeed(
     feed: FeedRow,
     markDirty: Boolean = false,
     hlcOverride: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
         val nowIso = feed.lastPolled ?: nowUtcIso()
         val existingEntry = getEntryById(feed.id)
         val existingSource = getFeedSourceById(feed.id)
         val effectiveHlc =
-            resolveFeedEffectiveHlc(feed, existingSource, nowIso, markDirty, hlcOverride)
+            resolveFeedEffectiveHlc(feed, existingSource, nowIso, markDirty, hlcOverride, nodeId)
         val cleanTitle = feed.title.ifBlank { feed.url }
         upsertEntry(
             buildUpsertFeedEntry(feed, existingEntry, cleanTitle, nowIso, effectiveHlc, markDirty)
@@ -301,20 +302,22 @@ internal suspend fun RocheDao.upsertFeed(
     }
 }
 
+@Suppress("LongParameterList")
 private suspend fun RocheDao.resolveFeedEffectiveHlc(
     feed: FeedRow,
     existingSource: FeedSourceEntity?,
     nowIso: String,
     markDirty: Boolean,
     hlcOverride: String?,
+    nodeId: String,
 ): String =
     hlcOverride
         ?: feed.hlc.takeIf { it.isNotBlank() }
         ?: if (markDirty) {
-            nextLocalHlc(this)
+            nextLocalHlc(this, nodeId)
         } else {
             existingSource?.hlc?.takeIf { it.isNotBlank() }
-                ?: HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+                ?: HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
         }
 
 @Suppress("LongParameterList")
@@ -383,17 +386,22 @@ internal suspend fun RocheDao.upsertItem(
     item: InboxItemRow,
     markDirty: Boolean = false,
     hlcOverride: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     val bounded = truncateInboxItemForStorage(item)
-    executeInTransaction { writeSingleInboxItemInTx(bounded, markDirty, hlcOverride) }
+    executeInTransaction { writeSingleInboxItemInTx(bounded, markDirty, hlcOverride, nodeId) }
 }
 
-internal suspend fun RocheDao.upsertItems(items: List<InboxItemRow>, markDirty: Boolean = false) {
+internal suspend fun RocheDao.upsertItems(
+    items: List<InboxItemRow>,
+    markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
     if (items.isEmpty()) return
     val deduped = items.associateBy { it.id }.values.map(::truncateInboxItemForStorage)
     executeInTransaction {
         for (item in deduped) {
-            writeSingleInboxItemInTx(item, markDirty = markDirty, hlcOverride = null)
+            writeSingleInboxItemInTx(item, markDirty = markDirty, hlcOverride = null, nodeId = nodeId)
         }
     }
 }
@@ -402,6 +410,7 @@ private suspend fun RocheDao.writeSingleInboxItemInTx(
     bounded: InboxItemRow,
     markDirty: Boolean,
     hlcOverride: String?,
+    nodeId: String,
 ) {
     val existingEntry = getEntryById(bounded.id)
     val existingState = getEntryStateById(bounded.id)
@@ -413,6 +422,7 @@ private suspend fun RocheDao.writeSingleInboxItemInTx(
             effectiveTs,
             markDirty,
             hlcOverride,
+            nodeId,
         )
     upsertEntry(buildUpsertInboxEntry(bounded, existingEntry, effectiveTs, hlc, markDirty))
     val hasKnownFeed = bounded.feedId?.let { getFeedSourceById(it) != null } == true
@@ -450,20 +460,22 @@ private suspend fun RocheDao.writeSingleInboxItemInTx(
     syncInboxItemLinksInTx(bounded, effectiveTs, hlc, markDirty)
 }
 
+@Suppress("LongParameterList")
 private suspend fun RocheDao.resolveInboxItemEffectiveHlc(
     existingEntry: EntryEntity?,
     existingState: EntryStateEntity?,
     effectiveTs: String,
     markDirty: Boolean,
     hlcOverride: String?,
+    nodeId: String,
 ): String =
     hlcOverride
         ?: if (markDirty) {
-            nextLocalHlc(this)
+            nextLocalHlc(this, nodeId)
         } else {
             existingState?.hlc?.takeIf { it.isNotBlank() }
                 ?: existingEntry?.hlc?.takeIf { it.isNotBlank() }
-                ?: HlcTimestamp.fromIsoOrEpoch(effectiveTs, DEFAULT_LOCAL_HLC_NODE).encode()
+                ?: HlcTimestamp.fromIsoOrEpoch(effectiveTs, nodeId).encode()
         }
 
 private fun buildUpsertInboxEntry(
@@ -545,6 +557,7 @@ internal suspend fun RocheDao.upsertTag(
     tag: TagRow,
     markDirty: Boolean = false,
     hlcOverride: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     val normName = normalizeTagName(tag.name)
     if (normName.isEmpty()) return
@@ -555,11 +568,10 @@ internal suspend fun RocheDao.upsertTag(
         val hlc =
             hlcOverride
                 ?: if (markDirty) {
-                    nextLocalHlc(this)
+                    nextLocalHlc(this, nodeId)
                 } else {
                     existingEntry?.hlc?.takeIf { it.isNotBlank() }
-                        ?: HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE)
-                            .encode()
+                        ?: HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, nodeId).encode()
                 }
         upsertEntry(
             EntryEntity(
@@ -587,11 +599,15 @@ internal suspend fun RocheDao.upsertTag(
     }
 }
 
-internal suspend fun RocheDao.upsertTags(tags: List<TagRow>, markDirty: Boolean = false) {
+internal suspend fun RocheDao.upsertTags(
+    tags: List<TagRow>,
+    markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
     if (tags.isEmpty()) return
     executeInTransaction {
         for (tag in tags) {
-            upsertTag(tag, markDirty = markDirty)
+            upsertTag(tag, markDirty = markDirty, nodeId = nodeId)
         }
     }
 }
@@ -600,14 +616,15 @@ internal suspend fun RocheDao.insertItemTag(
     itemTag: ItemTagRow,
     markDirty: Boolean = false,
     hlcOverride: String? = null,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     val nowIso = nowUtcIso()
     val hlc =
         hlcOverride
             ?: if (markDirty) {
-                nextLocalHlc(this)
+                nextLocalHlc(this, nodeId)
             } else {
-                HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode()
+                HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
             }
     if (markDirty) {
         deleteTombstone(
@@ -1005,6 +1022,31 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
 
 internal suspend fun RocheDao.entryHasCatalogHistory(entryId: String): Boolean =
     hasCatalogHistoryRaw(entryId, "%\"$entryId\"%") != 0
+
+internal suspend fun RocheDao.deleteCollectionGeneratorWithTombstone(
+    collectionId: String,
+    recordTombstone: Boolean = true,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
+    val cleanId = collectionId.trim()
+    if (cleanId.isEmpty()) return
+    executeInTransaction {
+        deleteCollectionGenerator(cleanId)
+        if (recordTombstone) {
+            val nowIso = nowUtcIso()
+            val hlc = nextLocalHlc(this, nodeId)
+            upsertTombstone(
+                TombstoneEntity(
+                    entityType = com.grayvines.roche.data.TOMBSTONE_ENTITY_COLLECTION_GENERATOR,
+                    naturalKey = cleanId,
+                    deletedAt = nowIso,
+                    hlc = hlc,
+                    isLocalDirty = true,
+                )
+            )
+        }
+    }
+}
 
 internal suspend fun RocheDao.deleteEntryCascade(entryId: String) {
     deleteEntryContentById(entryId)

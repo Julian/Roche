@@ -1,10 +1,12 @@
 package com.grayvines.roche.data.settings
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.security.Security
+import java.security.UnrecoverableKeyException
 import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -100,9 +102,14 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
     override fun encrypt(plaintext: String): String = runCatching {
         delegate.encrypt(plaintext)
     }
-        .getOrElse {
-            resetCorruptedKeystoreKey()
-            delegate.encrypt(plaintext)
+        .getOrElse { err ->
+            if (isPermanentKeystoreInvalidation(err)) {
+                resetCorruptedKeystoreKey()
+                delegate.encrypt(plaintext)
+            } else {
+                invalidateCachedKey()
+                throw err
+            }
         }
 
     override fun decrypt(stored: String): String {
@@ -113,6 +120,17 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
         invalidateCachedKey()
         return delegate.decrypt(stored)
     }
+}
+
+internal fun isPermanentKeystoreInvalidation(error: Throwable): Boolean {
+    var current: Throwable? = error
+    while (current != null) {
+        if (current is KeyPermanentlyInvalidatedException || current is UnrecoverableKeyException) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
 }
 
 internal fun createDefaultTokenCipher(): TokenCipher =

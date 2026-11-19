@@ -100,6 +100,31 @@ internal suspend fun buildTrackedPeerSyncRequest(
         slices.sentMemberships.filter {
             it.collectionId !in allOverflowIds && it.entryId !in allOverflowIds
         }
+    val nonOverflowGenerators =
+        if (allOverflowIds.isEmpty()) {
+            slices.sentGenerators
+        } else {
+            slices.sentGenerators.filter {
+                it.collectionId !in allOverflowIds && it.currentEntryId !in allOverflowIds
+            }
+        }
+    val nonOverflowLogs =
+        if (allOverflowIds.isEmpty()) {
+            slices.sentLogs
+        } else {
+            slices.sentLogs.filter { it.entryId !in allOverflowIds }
+        }
+    val nonOverflowComparisons =
+        if (allOverflowIds.isEmpty()) {
+            slices.sentComparisons
+        } else {
+            slices.sentComparisons.filter { comp ->
+                comp.scopeCollectionId !in allOverflowIds &&
+                    decodeComparisonOrdering(comp.orderingJson)?.flatten()?.none {
+                        it.trim() in allOverflowIds
+                    } != false
+            }
+        }
     return assembleTrackedBatch(
         config,
         snap,
@@ -107,9 +132,9 @@ internal suspend fun buildTrackedPeerSyncRequest(
         part.budgetEntries,
         slices.unsyncedFeedIds,
         nonOverflowMemberships,
-        slices.sentGenerators,
-        slices.sentLogs,
-        slices.sentComparisons,
+        nonOverflowGenerators,
+        nonOverflowLogs,
+        nonOverflowComparisons,
         slices.sentTombstones,
         part.byteOverflowIds,
         part.countOverflowIds,

@@ -299,22 +299,33 @@ internal suspend fun copySharedPdfStreamToCache(
         copied
     }
 
-private fun writeSharedPdfToItemDir(
+internal suspend fun writeSharedPdfToItemDir(
     rootDir: File,
     itemId: String,
     stream: InputStream,
-): Boolean = runCatching {
+): Boolean = runSuspendCatching {
     stream.use { input ->
-        val itemDir = File(File(rootDir, "items"), itemId).apply { mkdirs() }
-        val targetFile = File(itemDir, "shared_document.pdf")
-        val tempFile = File(itemDir, "shared_document.pdf.tmp")
-        val totalBytes = copyBoundedStreamToFile(input, tempFile)
-        if (totalBytes <= 0L) {
-            tempFile.delete()
-            false
-        } else {
-            moveFileAtomically(tempFile, targetFile)
-            true
+        val safeItemId = sanitizeCacheFileName(itemId)
+        if (safeItemId != itemId.trim()) return@use false
+        val itemsRoot = File(rootDir, ITEMS_SUBDIR).apply { mkdirs() }
+        val itemDir = resolveSafeChildFile(itemsRoot, safeItemId).apply { mkdirs() }
+        val targetFile = File(itemDir, SHARED_PDF_FILENAME).canonicalFile
+        check(targetFile.parentFile == itemDir.canonicalFile) {
+            "Resolved PDF path escapes item directory"
+        }
+        val tempFile = File(itemDir, "$SHARED_PDF_FILENAME.${System.nanoTime()}.tmp")
+        try {
+            val totalBytes = copyBoundedStreamToFile(input, tempFile)
+            if (totalBytes <= 0L) {
+                false
+            } else {
+                moveFileAtomically(tempFile, targetFile)
+                true
+            }
+        } finally {
+            if (tempFile.exists()) {
+                tempFile.delete()
+            }
         }
     }
 }
@@ -322,15 +333,31 @@ private fun writeSharedPdfToItemDir(
 
 private fun copyBoundedStreamToFile(input: InputStream, target: File): Long {
     var totalBytes = 0L
+    val header = ByteArray(PDF_MAGIC_BYTES.size)
+    var headerRead = 0
     target.outputStream().use { output ->
         val buffer = ByteArray(PDF_COPY_BUFFER_BYTES)
-        var read = input.read(buffer)
-        while (read > 0) {
+        while (true) {
+            val read = input.read(buffer)
+            if (read == -1) break
+            if (read == 0) continue
+            if (headerRead < PDF_MAGIC_BYTES.size) {
+                val take = minOf(read, PDF_MAGIC_BYTES.size - headerRead)
+                System.arraycopy(buffer, 0, header, headerRead, take)
+                headerRead += take
+                if (headerRead == PDF_MAGIC_BYTES.size) {
+                    check(header.contentEquals(PDF_MAGIC_BYTES)) {
+                        "Shared stream is not a valid PDF document"
+                    }
+                }
+            }
             totalBytes += read
             check(totalBytes <= MAX_SHARED_PDF_BYTES) { "Shared PDF exceeds maximum size" }
             output.write(buffer, 0, read)
-            read = input.read(buffer)
         }
+    }
+    check(headerRead == PDF_MAGIC_BYTES.size && header.contentEquals(PDF_MAGIC_BYTES)) {
+        "Shared stream is not a valid PDF document"
     }
     return totalBytes
 }
@@ -345,6 +372,8 @@ private fun isHttpOrHttpsCandidate(url: String): Boolean =
 
 private const val ATTR_CONTENT = "content"
 
+private const val SHARED_PDF_FILENAME = "shared_document.pdf"
+private val PDF_MAGIC_BYTES = byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D) // %PDF-
 private const val MAX_DISCOVERY_PROBES = 6
 private const val PDF_COPY_BUFFER_BYTES = 16 * 1024
 private const val MAX_SHARED_PDF_BYTES = 50L * 1024L * 1024L

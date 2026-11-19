@@ -1,12 +1,15 @@
 package com.grayvines.roche.data
 
-import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDao
 import java.time.Instant
 import java.util.Locale
+import java.util.WeakHashMap
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal const val MAX_HLC_WALL_MS = 999_999_999_999_999L
 internal const val MAX_HLC_COUNTER = 0xFFFF
+internal const val MAX_CLOCK_DRIFT_MS = 3_600_000L
 internal const val FLAG_LOCAL_HLC = "local_hlc"
 internal const val DEFAULT_LOCAL_HLC_NODE = "android"
 
@@ -119,12 +122,9 @@ internal class HlcClock(
                 prev == null || phys > prev.wallMs -> HlcTimestamp.create(phys, 0, nodeId)
                 prev.counter < MAX_HLC_COUNTER ->
                     HlcTimestamp.create(prev.wallMs, prev.counter + 1, nodeId)
-                else ->
-                    HlcTimestamp.create(
-                        (prev.wallMs + 1L).coerceAtMost(MAX_HLC_WALL_MS),
-                        0,
-                        nodeId,
-                    )
+                prev.wallMs < MAX_HLC_WALL_MS ->
+                    HlcTimestamp.create(prev.wallMs + 1L, 0, nodeId)
+                else -> HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, nodeId)
             }
         last = next
         return next
@@ -135,13 +135,22 @@ internal class HlcClock(
         nowMs: Long = System.currentTimeMillis(),
     ): HlcTimestamp {
         val phys = nowMs.coerceIn(0L, MAX_HLC_WALL_MS)
-        val remMs = remote.wallMs.coerceIn(0L, MAX_HLC_WALL_MS)
+        val maxAllowedWall =
+            if (phys > MAX_HLC_WALL_MS - MAX_CLOCK_DRIFT_MS) {
+                MAX_HLC_WALL_MS
+            } else {
+                phys + MAX_CLOCK_DRIFT_MS
+            }
+        val rawRemMs = remote.wallMs.coerceIn(0L, MAX_HLC_WALL_MS)
+        val clamped = rawRemMs > maxAllowedWall
+        val remMs = if (clamped) maxAllowedWall else rawRemMs
+        val remCounter = if (clamped) 0 else remote.counter.coerceIn(0, MAX_HLC_COUNTER)
         val prev = last
         val next =
             if (prev == null) {
-                witnessWithoutPrevious(phys, remMs, remote.counter)
+                witnessWithoutPrevious(phys, remMs, remCounter)
             } else {
-                witnessWithPrevious(phys, prev, remMs, remote.counter)
+                witnessWithPrevious(phys, prev, remMs, remCounter)
             }
         last = next
         return next
@@ -163,7 +172,8 @@ internal class HlcClock(
         when {
             phys > remMs -> HlcTimestamp.create(phys, 0, nodeId)
             remCounter < MAX_HLC_COUNTER -> HlcTimestamp.create(remMs, remCounter + 1, nodeId)
-            else -> HlcTimestamp.create((remMs + 1L).coerceAtMost(MAX_HLC_WALL_MS), 0, nodeId)
+            remMs < MAX_HLC_WALL_MS -> HlcTimestamp.create(remMs + 1L, 0, nodeId)
+            else -> HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, nodeId)
         }
 
     private fun witnessWithPrevious(
@@ -180,10 +190,10 @@ internal class HlcClock(
                 maxWall == remMs -> remCounter + 1
                 else -> 0
             }
-        return if (rawCounter <= MAX_HLC_COUNTER) {
-            HlcTimestamp.create(maxWall, rawCounter, nodeId)
-        } else {
-            HlcTimestamp.create((maxWall + 1L).coerceAtMost(MAX_HLC_WALL_MS), 0, nodeId)
+        return when {
+            rawCounter <= MAX_HLC_COUNTER -> HlcTimestamp.create(maxWall, rawCounter, nodeId)
+            maxWall < MAX_HLC_WALL_MS -> HlcTimestamp.create(maxWall + 1L, 0, nodeId)
+            else -> HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, nodeId)
         }
     }
 }
@@ -197,14 +207,34 @@ internal fun resolveOrSynthesizeHlc(
     HlcTimestamp.parse(rawHlc)?.encode()
         ?: HlcTimestamp.fromIsoOrEpoch(fallbackIso ?: nowIso, peerId).encode()
 
+private val hlcClockMutex = Mutex()
+private val lastHlcByDao = WeakHashMap<RocheDao, String>()
+
+private fun maxHlcRaw(first: String?, second: String?): String? {
+    val parsedFirst = HlcTimestamp.parse(first)
+    val parsedSecond = HlcTimestamp.parse(second)
+    return when {
+        parsedFirst == null -> parsedSecond?.encode()
+        parsedSecond == null -> parsedFirst.encode()
+        parsedFirst >= parsedSecond -> parsedFirst.encode()
+        else -> parsedSecond.encode()
+    }
+}
+
 internal suspend fun nextLocalHlc(
     dao: RocheDao,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
     nowMs: Long = System.currentTimeMillis(),
 ): String {
-    val prev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val next = HlcClock(nodeId, prev).tick(nowMs).encode()
-    dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LOCAL_HLC, next))
+    val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
+    val next =
+        hlcClockMutex.withLock {
+            val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
+            val ticked = HlcClock(nodeId, seed).tick(nowMs).encode()
+            lastHlcByDao[dao] = ticked
+            ticked
+        }
+    dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }
 
@@ -214,15 +244,23 @@ internal suspend fun witnessRemoteHlcInDao(
     remoteHlcValues: Iterable<String?>,
     nowMs: Long = System.currentTimeMillis(),
 ): String {
-    val prev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val clock = HlcClock(nodeId, prev)
-    var witnessedAny = false
-    for (raw in remoteHlcValues) {
-        val parsed = HlcTimestamp.parse(raw) ?: continue
-        clock.witness(parsed, nowMs)
-        witnessedAny = true
-    }
-    val next = (if (witnessedAny) clock.current() else null)?.encode() ?: clock.tick(nowMs).encode()
-    dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LOCAL_HLC, next))
+    val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
+    val next =
+        hlcClockMutex.withLock {
+            val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
+            val clock = HlcClock(nodeId, seed)
+            var witnessedAny = false
+            for (raw in remoteHlcValues) {
+                val parsed = HlcTimestamp.parse(raw) ?: continue
+                clock.witness(parsed, nowMs)
+                witnessedAny = true
+            }
+            val advanced =
+                (if (witnessedAny) clock.current() else null)?.encode()
+                    ?: clock.tick(nowMs).encode()
+            lastHlcByDao[dao] = advanced
+            advanced
+        }
+    dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }

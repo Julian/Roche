@@ -20,6 +20,8 @@ import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -170,32 +172,69 @@ internal class VpnTransportNetworkCallback(
     }
 }
 
-class PeerSyncJobService : JobService() {
-    private var runningJob: Job? = null
-    @Volatile private var stoppedBySystem: Boolean = false
+internal class PeerSyncJobTracker<P>(
+    private val jobIdOf: (P) -> Int,
+    private val onJobFinished: (P, Boolean) -> Unit,
+) {
+    private class RunningJobEntry(
+        val job: Job,
+        val stoppedBySystem: AtomicBoolean = AtomicBoolean(false),
+    )
 
-    override fun onStartJob(params: JobParameters?): Boolean {
-        val graph = (application as? RocheApp)?.graph ?: return false
-        stoppedBySystem = false
-        runningJob?.cancel()
-        runningJob =
-            graph.appScope.launch {
+    private val activeJobs = ConcurrentHashMap<Int, RunningJobEntry>()
+
+    fun start(scope: CoroutineScope, params: P, work: suspend () -> Unit): Boolean {
+        val jobId = jobIdOf(params)
+        val stoppedBySystem = AtomicBoolean(false)
+        var entryRef: RunningJobEntry? = null
+        val job =
+            scope.launch(start = CoroutineStart.LAZY) {
                 try {
-                    graph.repository.runBackgroundPeerSyncAndPoll()
+                    work()
                 } finally {
-                    if (!stoppedBySystem && params != null) {
-                        jobFinished(params, false)
+                    entryRef?.let { activeJobs.remove(jobId, it) }
+                    if (!stoppedBySystem.get()) {
+                        onJobFinished(params, false)
                     }
                 }
             }
+        val entry = RunningJobEntry(job = job, stoppedBySystem = stoppedBySystem)
+        entryRef = entry
+        activeJobs.put(jobId, entry)?.let { previous ->
+            previous.job.cancel()
+        }
+        job.start()
         return true
     }
 
-    override fun onStopJob(params: JobParameters?): Boolean {
-        stoppedBySystem = true
-        runningJob?.cancel()
-        runningJob = null
+    fun stop(params: P): Boolean {
+        val jobId = jobIdOf(params)
+        activeJobs.remove(jobId)?.let { entry ->
+            entry.stoppedBySystem.set(true)
+            entry.job.cancel()
+        }
         return true
+    }
+}
+
+class PeerSyncJobService : JobService() {
+    private val tracker =
+        PeerSyncJobTracker<JobParameters>(
+            jobIdOf = { it.jobId },
+            onJobFinished = { params, needsReschedule -> jobFinished(params, needsReschedule) },
+        )
+
+    override fun onStartJob(params: JobParameters?): Boolean {
+        val jobParams = params ?: return false
+        val graph = (application as? RocheApp)?.graph ?: return false
+        return tracker.start(graph.appScope, jobParams) {
+            graph.repository.runBackgroundPeerSyncAndPoll()
+        }
+    }
+
+    override fun onStopJob(params: JobParameters?): Boolean {
+        val jobParams = params ?: return false
+        return tracker.stop(jobParams)
     }
 }
 

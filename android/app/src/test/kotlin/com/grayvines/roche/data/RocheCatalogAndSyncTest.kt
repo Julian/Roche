@@ -1430,7 +1430,7 @@ class RocheCatalogAndSyncTest {
         val html = batch.items.single().contentHtml.orEmpty()
         assertTrue(html.contains("<p>Intro paragraph.</p>"))
         assertTrue(html.contains("<pre><code>fn a() {\n    b();\n}</code></pre>"))
-        assertTrue(html.contains("""<a href="/docs">Docs</a>"""))
+        assertTrue(html.contains("""<a href="https://blog.example.com/docs">Docs</a>"""))
         assertTrue(html.contains("""src="https://blog.example.com/img/pic.png""""))
 
         val cdataEntityRss =
@@ -1447,7 +1447,7 @@ class RocheCatalogAndSyncTest {
                 .items
                 .single()
         assertEquals("Example payload:", secItem.summary)
-        assertTrue(secItem.contentHtml.orEmpty().contains("<!ENTITY xxe SYSTEM"))
+        assertTrue(secItem.contentHtml.orEmpty().contains("Example payload:"))
         assertEquals("&lt;tag&gt; <ok>", decodeHtmlText("&amp;lt;tag&amp;gt;&nbsp;&lt;ok&gt;"))
     }
 

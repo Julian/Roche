@@ -22,6 +22,7 @@ import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
+import org.jsoup.safety.Safelist
 
 internal data class ParsedFeedCandidateItem(
     val title: String,
@@ -796,22 +797,8 @@ internal fun extractEnclosureImage(item: Element, baseUrl: String): String? =
         }
         ?.let { resolveRelativeUrl(baseUrl, it.attr(ATTR_URL).trim()) }
 
-internal fun sanitizeFeedHtml(rawHtml: String, baseUrl: String): String {
-    val withoutDangerousBlocks =
-        rawHtml
-            .replace(SCRIPT_BLOCK_REGEX, "")
-            .replace(STYLE_BLOCK_REGEX, "")
-            .replace(IFRAME_BLOCK_REGEX, "")
-            .replace(ON_EVENT_ATTR_REGEX, "")
-            .replace(JAVASCRIPT_HREF_REGEX, """$1="#"""")
-    return IMG_SRC_ATTR_REGEX.replace(withoutDangerousBlocks) { match ->
-            val quote = match.groupValues[1]
-            val rawSrc = match.groupValues[2].trim()
-            val resolved = resolveRelativeUrl(baseUrl, rawSrc).orEmpty()
-            """src=$quote$resolved$quote"""
-        }
-        .trim()
-}
+internal fun sanitizeFeedHtml(rawHtml: String, baseUrl: String): String =
+    Jsoup.clean(rawHtml, baseUrl.trim(), Safelist.relaxed()).trim()
 
 internal fun extractFirstImgUrl(html: String, baseUrl: String): String? =
     IMG_TAG_REGEX.findAll(html)
@@ -955,13 +942,6 @@ private val YOUTUBE_CHANNEL_EXTRACT_REGEX =
 private val SCRIPT_BLOCK_REGEX =
     Regex("""<script\b[^>]*>[\s\S]*?</script>""", RegexOption.IGNORE_CASE)
 private val STYLE_BLOCK_REGEX = Regex("""<style\b[^>]*>[\s\S]*?</style>""", RegexOption.IGNORE_CASE)
-private val IFRAME_BLOCK_REGEX =
-    Regex("""<iframe\b[^>]*>[\s\S]*?</iframe>""", RegexOption.IGNORE_CASE)
-private val ON_EVENT_ATTR_REGEX =
-    Regex("""\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", RegexOption.IGNORE_CASE)
-private val JAVASCRIPT_HREF_REGEX =
-    Regex("""(href|src)\s*=\s*["']\s*javascript:[^"']*["']""", RegexOption.IGNORE_CASE)
-private val IMG_SRC_ATTR_REGEX = Regex("""\bsrc\s*=\s*(["'])([^"']+)\1""", RegexOption.IGNORE_CASE)
 private val IMG_TAG_REGEX = Regex("""<img\b[^>]*>""", RegexOption.IGNORE_CASE)
 private val IMG_SRC_VALUE_REGEX = Regex("""\bsrc\s*=\s*(["'])([^"']+)\1""", RegexOption.IGNORE_CASE)
 private val HTML_TAG_REGEX = Regex("""<[^>]+>""")

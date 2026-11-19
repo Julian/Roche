@@ -12,6 +12,7 @@ import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
+import com.grayvines.roche.data.local.entryHasCatalogHistory
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.Instant
@@ -23,6 +24,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     response: PeerSyncResponseDto,
     redirects: Map<String, String>,
     serverNode: String,
+    localPeerId: String = DEFAULT_LOCAL_HLC_NODE,
     nowIso: String,
 ) {
     mergeCollectionEntriesInDao(
@@ -53,6 +55,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         incoming = response.collectionGenerators,
         redirects = redirects,
         serverNode = serverNode,
+        localPeerId = localPeerId,
         nowIso = nowIso,
     )
 }
@@ -91,10 +94,19 @@ private suspend fun reconcileLinkedInboxTombstone(
     feedUrlsByColId: Map<String, String>,
     itemTombstones: Map<String, TombstoneEntity>,
 ) {
-    val inInbox = state != null && (state.inboxState == "unread" || state.inboxState == "dismissed")
-    val itemUrl = if (inInbox) entry.url?.takeIf { it.isNotBlank() } else null
-    if (state == null || itemUrl == null) return
+    if (state == null) return
+    val itemUrl = entry.url?.takeIf { it.isNotBlank() } ?: return
     val feedUrls = entryColIds.mapNotNull { feedUrlsByColId[it] }
+    val isManualActive =
+        feedUrls.isEmpty() &&
+            (state.inboxState == "unread" ||
+                state.inboxState == "dismissed" ||
+                (state.inboxState == "none" &&
+                    (WANT_TO_READ_COLLECTION_ID in entryColIds ||
+                        !dao.entryHasCatalogHistory(entry.id))))
+    val isFeedActive =
+        feedUrls.isNotEmpty() && (state.inboxState == "unread" || state.inboxState == "dismissed")
+    if (!isManualActive && !isFeedActive) return
     val keys =
         if (feedUrls.isEmpty()) {
             listOf(itemNaturalKey(null, itemUrl))
@@ -361,11 +373,18 @@ private suspend fun mergeIncomingGeneratorsInDao(
     incoming: List<SyncCollectionGeneratorDto>,
     redirects: Map<String, String>,
     serverNode: String,
+    localPeerId: String,
     nowIso: String,
 ) {
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
-    val remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects)
+    val remoteByColId =
+        filterTombstonedRemoteGenerators(
+            dao = dao,
+            remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects),
+            serverNode = serverNode,
+            nowIso = nowIso,
+        )
     val candidateIds =
         (localByColId.keys + remoteByColId.keys).distinct().filter { it != STARRED_COLLECTION_ID }
     for (colId in candidateIds) {
@@ -378,10 +397,33 @@ private suspend fun mergeIncomingGeneratorsInDao(
                 remoteGen = remoteByColId[colId],
                 redirects = redirects,
                 serverNode = serverNode,
+                localPeerId = localPeerId,
                 nowIso = nowIso,
             )
         dao.upsertCollectionGenerator(merged)
     }
+}
+
+private suspend fun filterTombstonedRemoteGenerators(
+    dao: RocheDao,
+    remoteByColId: Map<String, SyncCollectionGeneratorDto>,
+    serverNode: String,
+    nowIso: String,
+): Map<String, SyncCollectionGeneratorDto> {
+    if (remoteByColId.isEmpty()) return remoteByColId
+    val filtered = LinkedHashMap<String, SyncCollectionGeneratorDto>(remoteByColId.size)
+    for ((colId, remote) in remoteByColId) {
+        val tomb = dao.getTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
+        if (tomb != null) {
+            val incHlc = resolveOrSynthesizeHlc(remote.hlc, remote.updatedAt, nowIso, serverNode)
+            if (tomb.hlc >= incHlc) {
+                continue
+            }
+            dao.deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
+        }
+        filtered[colId] = remote
+    }
+    return filtered
 }
 
 private fun indexEligibleRemoteGenerators(
@@ -417,6 +459,7 @@ private suspend fun reconcileSingleGeneratorInDao(
     remoteGen: SyncCollectionGeneratorDto?,
     redirects: Map<String, String>,
     serverNode: String,
+    localPeerId: String,
     nowIso: String,
 ): CollectionGeneratorEntity {
     var base = selectBaseGeneratorEntity(colId, localGen, remoteGen, serverNode, nowIso)
@@ -426,12 +469,12 @@ private suspend fun reconcileSingleGeneratorInDao(
         base = base.copy(currentEntryId = activeId)
     }
     if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
-        val hlc = nextLocalHlc(dao)
+        val hlc = nextLocalHlc(dao, localPeerId)
         base = base.copy(currentEntryId = null, updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
     }
     if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
         val drawn = catalogStore.drawRandomRemainingId(colId)
-        val hlc = nextLocalHlc(dao)
+        val hlc = nextLocalHlc(dao, localPeerId)
         base =
             base.copy(
                 currentEntryId = drawn,

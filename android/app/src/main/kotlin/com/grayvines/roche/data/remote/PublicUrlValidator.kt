@@ -110,7 +110,7 @@ internal object PublicUrlValidator {
 internal fun isCleartextAllowed(lookupHost: String): Boolean = runCatching {
     NetworkSecurityPolicy.getInstance().isCleartextTrafficPermitted(lookupHost)
 }
-    .getOrDefault(true)
+    .getOrDefault(false)
 
 internal fun serverEndpointViolation(
     scheme: String,

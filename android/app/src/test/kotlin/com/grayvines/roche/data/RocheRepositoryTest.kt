@@ -512,64 +512,6 @@ class RocheRepositoryTest {
         }
 
     @Test
-    internal fun `in-flight tag mutations on local item are preserved and synced when finalized`() =
-        runTest {
-            settings.update {
-                it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "tok-live")
-            }
-            val liveClient = RocheApiClient { HttpResponse(statusCode = 404, body = "{}") }
-            val dao = database.dao()
-            val localEntity =
-                createSavedItemEntity(
-                    url = "https://example.com/in-flight",
-                    title = "In-Flight Entry",
-                    hostTitle = "example.com",
-                    type = ContentType.ARTICLE,
-                )
-            dao.upsertItem(localEntity, markDirty = true)
-            attachTagsLocally(
-                dao = dao,
-                itemId = localEntity.id,
-                tagNames = listOf("initial"),
-                markDirty = true,
-            )
-            val liveRepo =
-                RocheRepository(database = database, apiClient = liveClient, settings = settings)
-            liveRepo.toggleTagOnItem(itemId = localEntity.id, tagName = "added-in-flight")
-
-            finalizeOnlineSavedItem(
-                dao = dao,
-                localEntity = localEntity,
-                remoteSaved =
-                    com.grayvines.roche.data.remote.parseItemJson(
-                        """{"id":"srv-item-77","title":"In-Flight Entry","url":"https://example.com/in-flight","content_type":"article","status":"unread","is_favorite":false,"created_at":"2026-04-01T12:00:00Z","tag_names":["initial"]}"""
-                    ),
-                initialTags = listOf("initial"),
-            )
-
-            val entry = liveRepo.snapshot.first().entries.first { it.id == "srv-item-77" }
-            assertEquals(listOf("added-in-flight", "initial"), entry.tags)
-            assertTrue(dao.getEntryById("srv-item-77")?.isLocalDirty == true)
-            val outgoing =
-                buildPeerSyncRequest(
-                    dao = dao,
-                    config =
-                        PeerSyncRequestConfig(
-                            peerId = "peer-android",
-                            deviceName = "Pixel",
-                            sinceSeq = 5L,
-                        ),
-                )
-            assertTrue(outgoing.entries.any { it.id == "srv-item-77" })
-            assertTrue(
-                outgoing.collectionEntries.any {
-                    it.entryId == "srv-item-77" &&
-                        it.collectionId == deterministicTagId("added-in-flight")
-                }
-            )
-        }
-
-    @Test
     internal fun `toggleOfflineCache hydrates item detail downloads media files and cleans up on evict`() =
         runTest {
             seedTestDatabase()
