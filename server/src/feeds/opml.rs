@@ -7,18 +7,12 @@ use quick_xml::{
 use url::Url;
 
 use crate::{
-    content::{SafeHttpClient, xml_util},
-    db::{Feed, FeedType},
+    content::xml_util,
+    domain::{FeedType, OpmlOutline},
+    util::url_guard::parse_public_url,
 };
 
 const MAX_OPML_OUTLINES: usize = 2_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpmlOutline {
-    pub feed_type: FeedType,
-    pub xml_url: Url,
-    pub title: Option<String>,
-}
 
 pub struct OpmlDocument;
 
@@ -53,7 +47,7 @@ impl OpmlDocument {
                     }
 
                     if let Some((feed_type, normalized_url)) = xml_url
-                        .and_then(|u| SafeHttpClient::parse_url(&u).ok())
+                        .and_then(|u| parse_public_url(&u).ok())
                         .and_then(Self::normalize_outline_url)
                     {
                         results.push(OpmlOutline {
@@ -72,7 +66,7 @@ impl OpmlDocument {
     }
 
     #[must_use]
-    pub fn to_xml(feeds: &[Feed]) -> String {
+    pub fn to_xml(outlines: &[OpmlOutline]) -> String {
         let mut writer = Writer::new_with_indent(Cursor::new(Vec::new()), b' ', 2);
         let _ = writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)));
 
@@ -87,13 +81,13 @@ impl OpmlDocument {
         let _ = writer.write_event(Event::End(BytesEnd::new("head")));
 
         let _ = writer.write_event(Event::Start(BytesStart::new("body")));
-        for feed in feeds {
-            let title = feed.title.as_deref().unwrap_or_else(|| feed.url.as_str());
+        for item in outlines {
+            let title = item.title.as_deref().unwrap_or_else(|| item.xml_url.as_str());
             let mut outline = BytesStart::new("outline");
             outline.push_attribute(("type", "rss"));
             outline.push_attribute(("text", title));
             outline.push_attribute(("title", title));
-            outline.push_attribute(("xmlUrl", feed.url.as_str()));
+            outline.push_attribute(("xmlUrl", item.xml_url.as_str()));
             let _ = writer.write_event(Event::Empty(outline));
         }
         let _ = writer.write_event(Event::End(BytesEnd::new("body")));

@@ -6,10 +6,10 @@ use std::{collections::HashSet, fmt::Write as _};
 
 use serde::Deserialize;
 
-use super::html::esc;
+use super::html::{FlashQuery, de_opt_from_str, esc};
 use crate::{
-    db::{CatalogEntry, ConsumptionStatus, EntryKind},
-    scheduler::FeedFetcher,
+    db::CatalogEntry,
+    domain::{ConsumptionStatus, EntryKind},
     service::RocheService,
 };
 
@@ -25,23 +25,25 @@ pub(super) use lists::{
 pub(super) struct ListsOverviewQuery {
     pub q: Option<String>,
     pub kind: Option<String>,
-    pub notice: Option<String>,
-    pub err: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ListPageQuery {
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
-    pub notice: Option<String>,
-    pub err: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct DiaryFilterQuery {
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub year: Option<i32>,
     pub status: Option<String>,
-    pub notice: Option<String>,
-    pub err: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,8 +176,8 @@ pub(super) fn parse_consumption_status(raw: &str) -> ConsumptionStatus {
     }
 }
 
-pub(super) async fn load_existing_reader_item_ids<'a, F: FeedFetcher>(
-    service: &RocheService<F>,
+pub(super) async fn load_existing_reader_item_ids<'a>(
+    service: &RocheService,
     entries: impl IntoIterator<Item = &'a CatalogEntry>,
 ) -> HashSet<String> {
     let candidate_ids: Vec<String> = entries

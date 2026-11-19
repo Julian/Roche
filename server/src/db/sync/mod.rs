@@ -10,7 +10,7 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use activity::{ActivityEntry, SyncTombstone};
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, Utc};
 #[allow(unused_imports)]
 pub use hlc::{
     HlcClock, HlcTimestamp, MAX_CLOCK_DRIFT_MS, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc,
@@ -59,6 +59,6 @@ impl<'a> SyncRepo<'a> {
     /// Returns the current UTC timestamp truncated to milliseconds (`YYYY-MM-DDTHH:MM:SS.sss+00:00`).
     #[must_use]
     pub fn now_utc() -> DateTime<Utc> {
-        Utc::now().trunc_subsecs(3)
+        crate::util::clock::now_utc()
     }
 }

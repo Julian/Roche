@@ -3,7 +3,11 @@ use std::collections::HashSet;
 use quick_xml::{Reader, events::Event};
 use url::Url;
 
-use super::{http::SafeHttpClient, xml_util};
+use super::xml_util;
+use crate::util::{
+    media_urls::{extract_youtube_channel_id, is_youtube_host, youtube_feed_url_for_channel_id},
+    url_guard::validate_public_url,
+};
 
 pub const MAX_SUMMARY_CHARS: usize = 320;
 
@@ -284,7 +288,7 @@ impl HtmlSanitizer {
             Err(url::ParseError::RelativeUrlWithoutBase) => base_url?.join(candidate).ok()?,
             Err(_) => return None,
         };
-        SafeHttpClient::validate_url(&parsed).ok()?;
+        validate_public_url(&parsed).ok()?;
         if Self::is_non_thumbnail_url(&parsed) {
             return None;
         }
@@ -523,7 +527,7 @@ impl HtmlSanitizer {
     /// 3. `<a href="...">` links pointing to feed paths (`/feed`, `/rss.xml`, `/atom.xml`, `/index.xml`)
     /// 4. Standard origin feed paths (`/feed.xml`, `/rss.xml`, `/atom.xml`, `/index.xml`, `/feed`, `/rss`)
     ///
-    /// Every candidate is validated through [`SafeHttpClient::validate_url`] to prevent SSRF.
+    /// Every candidate is validated through [`validate_public_url`] to prevent SSRF.
     #[must_use]
     pub fn discover_feed_candidates(raw_html: &str, base_url: &Url) -> Vec<Url> {
         let mut disc_builder = ammonia::Builder::new();
@@ -570,7 +574,7 @@ impl HtmlSanitizer {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut push_valid = |u: Url| {
-            if SafeHttpClient::validate_url(&u).is_ok() && seen.insert(u.as_str().to_owned()) {
+            if validate_public_url(&u).is_ok() && seen.insert(u.as_str().to_owned()) {
                 out.push(u);
             }
         };
@@ -579,7 +583,7 @@ impl HtmlSanitizer {
             push_valid(u);
         }
 
-        if !crate::feeds::YouTubeParser::is_youtube_host(base_url.host_str()) {
+        if !is_youtube_host(base_url.host_str()) {
             for rel_path in ["/feed.xml", "/rss.xml", "/atom.xml", "/index.xml", "/feed", "/rss"] {
                 if let Ok(u) = base_url.join(rel_path) {
                     push_valid(u);
@@ -616,8 +620,8 @@ impl HtmlSanitizer {
             return;
         };
 
-        if let Some(cid) = crate::feeds::YouTubeParser::extract_channel_id(resolved.as_str())
-            && let Ok(yt_url) = crate::feeds::YouTubeParser::feed_url_for_channel_id(&cid)
+        if let Some(cid) = extract_youtube_channel_id(resolved.as_str())
+            && let Ok(yt_url) = youtube_feed_url_for_channel_id(&cid)
         {
             yt_links.push(yt_url);
             return;
@@ -664,8 +668,8 @@ impl HtmlSanitizer {
         let Some(k) = key_name else { return };
         let Some(c) = content else { return };
         if (k.eq_ignore_ascii_case("channelId") || k.eq_ignore_ascii_case("og:url"))
-            && let Some(cid) = crate::feeds::YouTubeParser::extract_channel_id(c.trim())
-            && let Ok(yt_url) = crate::feeds::YouTubeParser::feed_url_for_channel_id(&cid)
+            && let Some(cid) = extract_youtube_channel_id(c.trim())
+            && let Ok(yt_url) = youtube_feed_url_for_channel_id(&cid)
         {
             yt_links.push(yt_url);
         }

@@ -1,17 +1,21 @@
 use std::{
     collections::HashMap,
     fmt::{self, Write as _},
+    str::FromStr,
 };
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
+use serde::Deserialize;
 
-use super::links::render_creator_links;
+use super::{auth::WebSession, links::render_creator_links};
 use crate::{
-    db::{ConsumptionLogView, ConsumptionStatus, ContentType, FeedType},
-    error::ApiError,
+    db::{CatalogError, ConflictError, ConsumptionLogView},
+    domain::{ConsumptionStatus, ContentType, FeedType},
+    service::AppError,
+    util::url_guard::SsrfBlockedError,
 };
 
 /// HTML-escapes interpolated text (`&`, `<`, `>`, `"`, `'`) with zero intermediate heap allocation.
@@ -42,17 +46,6 @@ pub(super) const fn esc(s: &str) -> Esc<'_> {
 #[must_use]
 pub(super) fn urlencode(raw: &str) -> String {
     url::form_urlencoded::byte_serialize(raw.as_bytes()).collect()
-}
-
-/// Ensures an external link uses `http://` or `https://` before rendering in an `href`.
-#[must_use]
-pub(super) fn safe_external_href(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
-        Some(trimmed)
-    } else {
-        None
-    }
 }
 
 /// Validates a relative redirect target so user-supplied `return_to` values cannot trigger open redirects.
@@ -100,6 +93,60 @@ pub(super) fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
     })
 }
 
+/// Parses an HTML form boolean field (`"1"`, `"true"`, `"on"`, case-insensitive).
+#[must_use]
+pub(super) fn parse_form_bool(raw: Option<&str>) -> bool {
+    raw.map(str::trim)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+}
+
+/// Deserializes a query boolean (`true`/`false`/`1`/`0`) safely inside `#[serde(flatten)]`
+/// structs where `serde_urlencoded` delivers values as strings via `FlatMapDeserializer`.
+pub(super) fn de_query_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrStr {
+        Bool(bool),
+        Str(String),
+    }
+
+    match Option::<BoolOrStr>::deserialize(deserializer)? {
+        None => Ok(false),
+        Some(BoolOrStr::Bool(b)) => Ok(b),
+        Some(BoolOrStr::Str(s)) => match s.trim() {
+            "true" | "1" => Ok(true),
+            "false" | "0" | "" => Ok(false),
+            other => {
+                Err(serde::de::Error::custom(format!("invalid boolean query value '{other}'")))
+            }
+        },
+    }
+}
+
+/// Deserializes an optional `FromStr` query parameter (e.g. `Option<usize>`, `Option<i32>`)
+/// safely inside `#[serde(flatten)]` structs under `serde_urlencoded`.
+pub(super) fn de_opt_from_str<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    Option::<String>::deserialize(deserializer)?.map_or_else(
+        || Ok(None),
+        |s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed.parse::<T>().map(Some).map_err(serde::de::Error::custom)
+            }
+        },
+    )
+}
+
 #[must_use]
 pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
     let normalized = if want { slug.strip_prefix("want:").unwrap_or(slug) } else { slug };
@@ -128,6 +175,71 @@ pub(super) const fn feed_type_label(ft: FeedType) -> &'static str {
         FeedType::Podcast => "Podcast",
         FeedType::Youtube => "YouTube",
         FeedType::Arxiv => "arXiv",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CreatorYearStyle {
+    /// Inline ` <span class="text-soft">&mdash; ...</span>` + optional ` <span class="text-faint">(YYYY)</span>`.
+    InlineSoft { open_new_tab: bool },
+    /// Ranked table cell `<span class="by">...</span>` + optional `<span class="year">(YYYY)</span>`.
+    TableByYear,
+    /// Inline Want queue ` <span class="by">&mdash; ...</span>`.
+    QueueDash,
+    /// Draw sleeve block `<div class="album-artist">... (YYYY)</div>\n`.
+    DrawArtistBlock,
+}
+
+/// Renders creator links and optional release year consistently across all catalog views.
+pub(super) fn render_creator_year_meta(
+    out: &mut String,
+    creators: &[String],
+    release_year: Option<i32>,
+    artist_links: &HashMap<String, String>,
+    style: CreatorYearStyle,
+) {
+    match style {
+        CreatorYearStyle::InlineSoft { open_new_tab } => {
+            if !creators.is_empty() {
+                out.push_str(" <span class=\"text-soft\">&mdash; ");
+                render_creator_links(out, creators, artist_links, open_new_tab);
+                out.push_str("</span>");
+            }
+            if let Some(yr) = release_year {
+                let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
+            }
+        }
+        CreatorYearStyle::TableByYear => {
+            if !creators.is_empty() {
+                out.push_str("<span class=\"by\">");
+                render_creator_links(out, creators, artist_links, false);
+                out.push_str("</span>");
+            }
+            if let Some(yr) = release_year {
+                let _ = write!(out, "<span class=\"year\">({yr})</span>");
+            }
+        }
+        CreatorYearStyle::QueueDash => {
+            if !creators.is_empty() {
+                out.push_str(" <span class=\"by\">&mdash; ");
+                render_creator_links(out, creators, artist_links, false);
+                out.push_str("</span>");
+            }
+        }
+        CreatorYearStyle::DrawArtistBlock => {
+            if !creators.is_empty() || release_year.is_some() {
+                out.push_str("<div class=\"album-artist\">");
+                render_creator_links(out, creators, artist_links, false);
+                if let Some(yr) = release_year {
+                    if creators.is_empty() {
+                        let _ = write!(out, "{yr}");
+                    } else {
+                        let _ = write!(out, " ({yr})");
+                    }
+                }
+                out.push_str("</div>\n");
+            }
+        }
     }
 }
 
@@ -194,11 +306,13 @@ pub(super) fn render_diary_row(
         esc(&urlencode(&row.entry.id)),
         esc(&row.entry.title),
     );
-    if !row.entry.creators.is_empty() {
-        out.push_str(" <span class=\"text-soft\">&mdash; ");
-        render_creator_links(out, &row.entry.creators, artist_links, false);
-        out.push_str("</span>");
-    }
+    render_creator_year_meta(
+        out,
+        &row.entry.creators,
+        None,
+        artist_links,
+        CreatorYearStyle::InlineSoft { open_new_tab: false },
+    );
     if row.status != ConsumptionStatus::Consumed {
         let _ = write!(out, " <span class=\"status-tag\">({})</span>", row.status.as_str());
     }
@@ -222,9 +336,11 @@ pub(super) enum NavSection {
     None,
 }
 
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(super) struct FlashQuery {
+    #[serde(default)]
     pub notice: Option<String>,
+    #[serde(default)]
     pub err: Option<String>,
 }
 
@@ -458,51 +574,132 @@ pub(super) fn render_error_page(
     (status, html).into_response()
 }
 
-pub(super) fn web_api_error_response(err: &ApiError, csrf_token: Option<&str>) -> Response {
-    let (status, heading, detail, retry_after) = match err {
-        ApiError::BadRequest(msg)
-        | ApiError::ImmutableCollection(msg)
-        | ApiError::SsrfBlocked(msg) => {
+/// Web view error type converting transport-agnostic [`AppError`] directly into an
+/// authenticated HTML error response (including `Retry-After` headers when rate-limited).
+#[derive(Debug)]
+pub(super) struct WebError {
+    err: AppError,
+    csrf_token: Option<String>,
+}
+
+impl WebError {
+    #[must_use]
+    pub(super) fn from_app(err: AppError, csrf_token: Option<&str>) -> Self {
+        Self { err, csrf_token: csrf_token.map(ToOwned::to_owned) }
+    }
+}
+
+pub(super) trait WithWebCsrf<T> {
+    fn web_err(self, session: &WebSession) -> Result<T, WebError>;
+}
+
+impl<T> WithWebCsrf<T> for Result<T, AppError> {
+    fn web_err(self, session: &WebSession) -> Result<T, WebError> {
+        self.map_err(|err| WebError::from_app(err, Some(&session.csrf_token)))
+    }
+}
+
+fn classify_web_app_error(err: &AppError) -> (StatusCode, &'static str, String, Option<u64>) {
+    match err {
+        AppError::BadRequest(msg)
+        | AppError::ImmutableCollection(msg)
+        | AppError::SsrfBlocked(msg) => {
             (StatusCode::BAD_REQUEST, "Invalid Request", msg.clone(), None)
         }
-        ApiError::UnsupportedMediaType(msg) => {
-            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Unsupported Media Type", msg.clone(), None)
-        }
-        ApiError::Unauthorized(msg)
-        | ApiError::TokenInvalid(msg)
-        | ApiError::PairingCodeInvalid(msg) => {
+        AppError::Unauthorized(msg)
+        | AppError::TokenInvalid(msg)
+        | AppError::PairingCodeInvalid(msg) => {
             (StatusCode::UNAUTHORIZED, "Unauthorized", msg.clone(), None)
         }
-        ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
-        ApiError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone(), None),
-        ApiError::AmbiguousLookup { detail, .. } => {
+        AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
+        AppError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone(), None),
+        AppError::AmbiguousLookup { detail, .. } => {
             (StatusCode::CONFLICT, "Ambiguous Lookup", detail.clone(), None)
         }
-        ApiError::PairingRateLimited { detail, retry_after_seconds } => (
+        AppError::PairingRateLimited { detail, retry_after_seconds } => (
             StatusCode::TOO_MANY_REQUESTS,
             "Too Many Attempts",
             detail.clone(),
             Some(*retry_after_seconds),
         ),
-        ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Upstream Error", msg.clone(), None),
-        ApiError::MethodNotAllowed(msg) => {
-            (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed", msg.clone(), None)
-        }
-        ApiError::PayloadTooLarge { detail, .. } => {
+        AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Upstream Error", msg.clone(), None),
+        AppError::PayloadTooLarge { detail, .. } => {
             (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", detail.clone(), None)
         }
-        ApiError::Database(_) | ApiError::Internal(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Server Error",
-            "An internal error occurred while processing your request.".to_owned(),
-            None,
-        ),
-    };
-    let mut resp = render_error_page(status, heading, &detail, csrf_token);
-    if let Some(secs) = retry_after
-        && let Ok(val) = HeaderValue::from_str(&secs.to_string())
-    {
-        resp.headers_mut().insert(header::RETRY_AFTER, val);
+        AppError::Database(sqlx_err) => classify_web_sqlx_error(sqlx_err),
+        AppError::Internal(inner) => classify_web_internal_error(inner),
     }
-    resp
+}
+
+fn classify_web_sqlx_error(
+    sqlx_err: &sqlx::Error,
+) -> (StatusCode, &'static str, String, Option<u64>) {
+    if let sqlx::Error::Database(db_err) = sqlx_err
+        && (db_err.is_unique_violation() || db_err.message().contains("UNIQUE constraint failed"))
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Conflict",
+            "A resource with the same unique identifier already exists.".to_owned(),
+            None,
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Server Error",
+        "An internal error occurred while processing your request.".to_owned(),
+        None,
+    )
+}
+
+fn classify_web_internal_error(
+    inner: &anyhow::Error,
+) -> (StatusCode, &'static str, String, Option<u64>) {
+    if let Some(conflict) = inner.downcast_ref::<ConflictError>() {
+        return (StatusCode::CONFLICT, "Conflict", conflict.0.clone(), None);
+    }
+    if let Some(ssrf) = inner.downcast_ref::<SsrfBlockedError>() {
+        return (StatusCode::BAD_REQUEST, "Invalid Request", ssrf.0.clone(), None);
+    }
+    if let Some(cat) = inner.downcast_ref::<CatalogError>() {
+        return match cat {
+            CatalogError::Db(db_err) => classify_web_sqlx_error(db_err),
+            CatalogError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
+            CatalogError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone(), None),
+            CatalogError::AmbiguousLookup { .. } => {
+                (StatusCode::CONFLICT, "Ambiguous Lookup", cat.to_string(), None)
+            }
+            CatalogError::ImmutableCollection { .. } | CatalogError::InvalidInput(_) => {
+                (StatusCode::BAD_REQUEST, "Invalid Request", cat.to_string(), None)
+            }
+            CatalogError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Server Error",
+                "An internal error occurred while processing your request.".to_owned(),
+                None,
+            ),
+        };
+    }
+    if let Some(sqlx_err) = inner.downcast_ref::<sqlx::Error>() {
+        return classify_web_sqlx_error(sqlx_err);
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Server Error",
+        "An internal error occurred while processing your request.".to_owned(),
+        None,
+    )
+}
+
+impl IntoResponse for WebError {
+    fn into_response(self) -> Response {
+        let (status, heading, detail, retry_after) = classify_web_app_error(&self.err);
+        let mut resp = render_error_page(status, heading, &detail, self.csrf_token.as_deref());
+        if let Some(secs) = retry_after
+            && let Ok(val) = HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers_mut().insert(header::RETRY_AFTER, val);
+        }
+        resp
+    }
 }

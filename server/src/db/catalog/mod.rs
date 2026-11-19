@@ -22,9 +22,10 @@ pub use identity_norm::{
 pub use models::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
-    CatalogError, CatalogResult, ClusterSelectFilter, CollectionGeneratorState, CollectionSummary,
-    ComparisonRecord, ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule,
-    EntryDetailView, EntryIdentifier, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    CatalogError, CatalogResult, ClusterSelectFilter, CollectionGeneratorState,
+    CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
+    ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
+    RankedCollectionView, RankedEntryRow, UpsertEntryInput,
 };
 
 #[derive(Clone, Copy)]

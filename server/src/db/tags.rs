@@ -99,7 +99,7 @@ impl<'a> TagRepo<'a> {
     pub async fn create(&self, name: &str, color: Option<&HexColor>) -> Result<Tag> {
         let id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Tag, &nat_key).await?;
@@ -162,7 +162,7 @@ impl<'a> TagRepo<'a> {
             return Ok(self.get(id).await?.is_some());
         }
 
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let exists = sqlx::query_scalar!(
@@ -253,7 +253,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
@@ -448,7 +448,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn add_to_item(&self, item_id: &str, tag_id: &str) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         Self::attach_in_tx(&mut tx, item_id, tag_id, now).await?;
         tx.commit().await?;
@@ -456,7 +456,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn add_named_to_item(&self, item_id: &str, name: &str) -> Result<Tag> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let tag = Self::get_or_create_and_attach_in_tx(&mut tx, item_id, name, now).await?;
         tx.commit().await?;
@@ -464,7 +464,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn remove_from_item(&self, item_id: &str, tag_id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query!(
             "DELETE FROM collection_entries

@@ -24,7 +24,7 @@ impl CatalogRepo<'_> {
         duplicate_id: &str,
         canonical_id: &str,
     ) -> CatalogResult<CatalogEntry> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let dup_resolved = Self::follow_merged_id_in_tx(&mut tx, duplicate_id)
             .await?

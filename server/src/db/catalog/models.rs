@@ -412,3 +412,12 @@ pub struct CatalogBatchResult {
     pub generators_updated: usize,
     pub dry_run: bool,
 }
+
+/// Pure database snapshot of a collection and its rankable members, consumed by
+/// `CatalogService` to run EP inference and cluster selection outside the DB layer.
+#[derive(Debug, Clone)]
+pub struct CollectionRankingInputs {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub members: Vec<CatalogEntry>,
+}

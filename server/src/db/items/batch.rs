@@ -6,9 +6,7 @@ use sqlx::QueryBuilder;
 use url::Url;
 
 use super::{ItemRepo, mutations::maybe_auto_log_feed_completion_in_tx};
-use crate::db::{
-    ActivityAction, ActivityEntityType, ArchiveBatchScope, EntryKind, InboxState, SyncRepo,
-};
+use crate::domain::{ActivityAction, ActivityEntityType, ArchiveBatchScope, EntryKind, InboxState};
 
 impl ItemRepo<'_> {
     #[allow(clippy::too_many_lines)]
@@ -97,7 +95,7 @@ impl ItemRepo<'_> {
             return Ok(0);
         }
 
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut archived_ids = Vec::with_capacity(candidate_ids.len());
         let mut high_progress: Vec<(String, f64, Option<DateTime<Utc>>)> = Vec::new();
@@ -272,7 +270,7 @@ impl ItemRepo<'_> {
     }
 
     pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
-        use crate::{content::HtmlSanitizer, feeds::youtube::YouTubeParser};
+        use crate::{content::HtmlSanitizer, util::media_urls::youtube_thumbnail_url};
 
         let candidates = sqlx::query!(
             "SELECT e.id,
@@ -319,12 +317,7 @@ impl ItemRepo<'_> {
                                 base_url.as_ref(),
                             )
                         })
-                        .or_else(|| {
-                            base_url
-                                .as_ref()
-                                .and_then(YouTubeParser::extract_video_id)
-                                .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"))
-                        });
+                        .or_else(|| base_url.as_ref().and_then(youtube_thumbnail_url));
                     (new_thumb != old_thumb).then_some((id, new_thumb))
                 })
                 .collect()

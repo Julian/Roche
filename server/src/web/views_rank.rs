@@ -14,15 +14,15 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
-        redirect_with_flash, render_page, urlencode, web_api_error_response,
+        CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _,
+        de_opt_from_str, de_query_bool, esc, parse_form_bool, rank_collection_href,
+        redirect_see_other, redirect_with_flash, render_creator_year_meta, render_page, urlencode,
     },
-    links::{load_artist_id_by_lower_name, render_creator_links, web_primary_open_url},
+    links::{load_artist_id_by_lower_name, web_primary_open_url},
 };
 use crate::{
-    db::{CatalogEntry, ClusterSelectFilter, CollectionRole, CollectionSummary},
-    error::ApiError,
-    scheduler::FeedFetcher,
+    db::{CatalogEntry, ClusterSelectFilter, CollectionSummary},
+    domain::CollectionRole,
     service::RocheService,
 };
 
@@ -31,27 +31,24 @@ const MAX_COVERED_CLUSTERS: usize = 12;
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct RankSessionQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_query_bool")]
     pub want: bool,
     pub focus: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub round: Option<usize>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub random: Option<usize>,
     pub covered: Option<String>,
-    pub notice: Option<String>,
-    pub err: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
 }
 
-pub(super) async fn rank_picker_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn rank_picker_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    let collections = match service.catalog().list_collections(true, false).await {
-        Ok(c) => c,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+) -> Result<Response, WebError> {
+    let collections = service.catalog().list_collections(true, false).await.web_err(&session)?;
 
     let quality_lists: Vec<&CollectionSummary> = collections
         .iter()
@@ -138,7 +135,7 @@ pub(super) async fn rank_picker_get<F: FeedFetcher>(
         }
     }
 
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: "Rank",
         active: NavSection::Rank,
         csrf_token: &session.csrf_token,
@@ -146,25 +143,21 @@ pub(super) async fn rank_picker_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
-pub(super) async fn rank_session_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn rank_session_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Query(q): Query<RankSessionQuery>,
-) -> Response {
+) -> Result<Response, WebError> {
     let round = q.round.unwrap_or(0);
     let focus_clean = q.focus.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let covered_sets = parse_covered_signatures(q.covered.as_deref());
 
-    let ranked_view = match service.catalog().get_ranked_collection(&slug, q.want).await {
-        Ok(v) => v,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+    let ranked_view =
+        service.catalog().get_ranked_collection(&slug, q.want).await.web_err(&session)?;
 
     let focus_is_member =
         focus_clean.is_some_and(|fid| ranked_view.rows.iter().any(|r| r.entry.id == fid));
@@ -186,18 +179,14 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
             focus_ids,
             ..ClusterSelectFilter::default()
         };
-        match service
+        service
             .catalog()
             .select_next_uncovered_cluster(&slug, q.want, &filter, |cand| {
                 is_cluster_covered(cand, &covered_sets)
             })
             .await
-        {
-            Ok((_, c, _)) => c,
-            Err(err) => {
-                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-            }
-        }
+            .web_err(&session)?
+            .1
     };
 
     let effective_want = q.want || ranked_view.is_priority_scope;
@@ -229,16 +218,15 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
         );
     }
 
-    let flash = FlashQuery { notice: q.notice, err: q.err };
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: &format!("Rank: {}", ranked_view.collection.title),
         active: NavSection::Rank,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn render_settled_rank_view(
@@ -416,14 +404,13 @@ fn render_cluster_card(
         id_enc = esc(&urlencode(&item.id)),
         title = esc(&item.title),
     );
-    if !item.creators.is_empty() {
-        out.push_str(" <span class=\"text-soft\">&mdash; ");
-        render_creator_links(out, &item.creators, artist_links, true);
-        out.push_str("</span>");
-    }
-    if let Some(yr) = item.release_year {
-        let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
-    }
+    render_creator_year_meta(
+        out,
+        &item.creators,
+        item.release_year,
+        artist_links,
+        CreatorYearStyle::InlineSoft { open_new_tab: true },
+    );
     out.push_str("</div>\n</div>\n<div class=\"rank-controls\">\n");
 
     let _ = write!(
@@ -449,12 +436,12 @@ fn render_cluster_card(
     );
 }
 
-pub(super) async fn rank_session_post<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn rank_session_post(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     body: Bytes,
-) -> Response {
+) -> Result<Response, WebError> {
     let pairs: Vec<(String, String)> =
         url::form_urlencoded::parse(&body).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
 
@@ -462,7 +449,7 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
         pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     };
 
-    let want = matches!(find_val("want"), Some("true" | "1"));
+    let want = parse_form_bool(find_val("want"));
     let focus = find_val("focus").map(str::trim).filter(|s| !s.is_empty());
     let round_opt = find_val("round").and_then(|r| r.parse::<usize>().ok());
     let round = round_opt.unwrap_or(0);
@@ -471,39 +458,30 @@ pub(super) async fn rank_session_post<F: FeedFetcher>(
     let ordering = parse_submitted_ordering(&pairs);
     let Some(groups) = ordering else {
         let base = build_rank_session_href(&slug, round_opt, want, focus, None);
-        return redirect_with_flash(&base, "err", "Invalid comparison ordering");
+        return Ok(redirect_with_flash(&base, "err", "Invalid comparison ordering"));
     };
 
     let (effective_want, scope_col_id) = if want {
-        match service.catalog().get_or_create_want_collection(&slug).await {
-            Ok(col) => (true, Some(col.id)),
-            Err(err) => {
-                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-            }
-        }
+        let col = service.catalog().get_or_create_want_collection(&slug).await.web_err(&session)?;
+        (true, Some(col.id))
     } else {
-        match service.catalog().get_ranked_collection(&slug, false).await {
-            Ok(view) if view.is_priority_scope => (true, Some(view.collection.id)),
-            Ok(_) => (false, None),
-            Err(err) => {
-                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-            }
-        }
+        let view = service.catalog().get_ranked_collection(&slug, false).await.web_err(&session)?;
+        if view.is_priority_scope { (true, Some(view.collection.id)) } else { (false, None) }
     };
 
-    if let Err(err) =
-        service.catalog().append_comparison(scope_col_id.as_deref(), &groups, None).await
-    {
-        return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-    }
+    service
+        .catalog()
+        .append_comparison(scope_col_id.as_deref(), &groups, None)
+        .await
+        .web_err(&session)?;
 
-    redirect_see_other(&build_rank_session_href(
+    Ok(redirect_see_other(&build_rank_session_href(
         &slug,
         Some(round + 1),
         effective_want,
         focus,
         Some(covered),
-    ))
+    )))
 }
 
 fn build_rank_session_href(

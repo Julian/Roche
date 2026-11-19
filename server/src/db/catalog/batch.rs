@@ -30,7 +30,7 @@ impl CatalogRepo<'_> {
         &self,
         batch: &CatalogBatchInput,
     ) -> CatalogResult<CatalogBatchResult> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut ref_map: HashMap<String, String> =
             HashMap::with_capacity(batch.entries.len() + batch.collections.len());
@@ -553,7 +553,10 @@ mod tests {
         assert_eq!(gen_state.remaining_count, 1);
         assert_eq!(gen_state.current_entry.as_ref().unwrap().title, "Elvis Presley");
 
-        let ranked = db.catalog().get_ranked_collection("album_canon", false).await.unwrap();
+        let ranked = crate::service::CatalogService::new(&db)
+            .get_ranked_collection("album_canon", false)
+            .await
+            .unwrap();
         assert_eq!(ranked.rows.len(), 2);
         assert_eq!(ranked.rows[0].entry.title, "In The Wee Small Hours");
         assert_eq!(ranked.rows[1].entry.title, "Ellington at Newport");

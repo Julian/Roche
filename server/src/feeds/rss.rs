@@ -4,7 +4,13 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::{HtmlSanitizer, SafeHttpClient, is_direct_audio_url};
+use crate::{
+    content::HtmlSanitizer,
+    util::{
+        media_urls::is_direct_audio_url,
+        url_guard::{parse_public_url, validate_public_url},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct RssFeed {
@@ -106,7 +112,7 @@ impl RssParser {
                     media_audio_url.or_else(|| supp.and_then(|s| s.enclosure_url.clone()));
                 let duration = media_duration.or_else(|| supp.and_then(|s| s.duration_secs));
                 let link = primary_link
-                    .or_else(|| SafeHttpClient::parse_url(&entry.id).ok())
+                    .or_else(|| parse_public_url(&entry.id).ok())
                     .or_else(|| audio_url.clone());
                 let base_for_thumb = link.as_ref().or(feed_base_url.as_ref());
                 let thumbnail_url = Self::extract_entry_thumbnail_url(&entry, base_for_thumb)
@@ -224,11 +230,11 @@ impl RssParser {
         if trimmed.is_empty() {
             return None;
         }
-        if let Ok(url) = SafeHttpClient::parse_url(trimmed) {
+        if let Ok(url) = parse_public_url(trimmed) {
             return Some(url.into());
         }
         let joined = base_url?.join(trimmed).ok()?;
-        SafeHttpClient::validate_url(&joined).ok()?;
+        validate_public_url(&joined).ok()?;
         Some(joined.into())
     }
 
@@ -249,7 +255,7 @@ impl RssParser {
                 if found_url.is_none()
                     && let Some(ref url) = content.url
                     && (is_audio_mime || is_direct_audio_url(url))
-                    && SafeHttpClient::validate_url(url).is_ok()
+                    && validate_public_url(url).is_ok()
                 {
                     found_url = Some(url.clone());
                     found_duration = content
@@ -270,7 +276,7 @@ impl RssParser {
                     .as_deref()
                     .is_some_and(|mt| mt.trim().to_ascii_lowercase().starts_with("audio/"));
                 if is_enclosure
-                    && let Ok(parsed) = SafeHttpClient::parse_url(&link.href)
+                    && let Ok(parsed) = parse_public_url(&link.href)
                     && (is_audio_mime || is_direct_audio_url(&parsed))
                 {
                     found_url = Some(parsed);
@@ -630,7 +636,7 @@ impl RssParser {
 
     fn inspect_enclosure_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<Url> {
         let url_str = Self::extract_attr(tag, "url").or_else(|| Self::extract_attr(tag, "href"))?;
-        let parsed = SafeHttpClient::parse_url(&url_str).ok()?;
+        let parsed = parse_public_url(&url_str).ok()?;
         let mime = Self::extract_attr(tag, "type").unwrap_or_default().to_ascii_lowercase();
         if mime.starts_with("audio/") || is_direct_audio_url(&parsed) { Some(parsed) } else { None }
     }
@@ -656,7 +662,7 @@ impl RssParser {
                     let has_img_ext = Self::has_image_extension(url.path());
                     if (is_image_mime || has_img_ext)
                         && !HtmlSanitizer::is_non_thumbnail_url(url)
-                        && SafeHttpClient::validate_url(url).is_ok()
+                        && validate_public_url(url).is_ok()
                     {
                         return Some(url.as_str().to_owned());
                     }

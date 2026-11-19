@@ -1,10 +1,9 @@
 use anyhow::Result;
 use rand::Rng;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::MIN_TOKEN_BYTES;
-use crate::db::AuthRepo;
+use crate::{db::AuthRepo, util::hash::sha256_hex};
 
 pub struct TokenManager<'a> {
     repo: AuthRepo<'a>,
@@ -26,8 +25,7 @@ impl<'a> TokenManager<'a> {
 
     #[must_use]
     pub fn hash_token(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
-        hex::encode(digest)
+        sha256_hex(token)
     }
 
     pub async fn create(&self, device_name: &str, token_length: usize) -> Result<String> {

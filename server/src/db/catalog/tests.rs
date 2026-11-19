@@ -124,12 +124,13 @@ async fn test_upfront_dedup_edition_merging_artist_synthesis_and_song_vs_album_r
         .unwrap();
     catalog.log_consumption(&track.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
 
-    let artists_ranked = catalog.get_ranked_collection("artists", false).await.unwrap();
+    let catalog_svc = crate::service::CatalogService::new(&db);
+    let artists_ranked = catalog_svc.get_ranked_collection("artists", false).await.unwrap();
     assert!(
         artists_ranked.rows.iter().any(|r| r.entry.title == "Duke Ellington"),
         "Consuming a song must engage its synthesized Artist entry"
     );
-    let albums_ranked = catalog.get_ranked_collection("albums", false).await.unwrap();
+    let albums_ranked = catalog_svc.get_ranked_collection("albums", false).await.unwrap();
     assert!(
         albums_ranked.rows.is_empty(),
         "Consuming a single song must NEVER mark its parent album as consumed"
@@ -248,7 +249,8 @@ async fn test_collection_mode_and_cycle_enforcement_on_add_and_upsert() {
         )
         .await
         .unwrap();
-    let want_view = catalog.get_ranked_collection("movies", true).await.unwrap();
+    let catalog_svc = crate::service::CatalogService::new(&db);
+    let want_view = catalog_svc.get_ranked_collection("movies", true).await.unwrap();
     assert!(want_view.is_priority_scope);
     assert_eq!(want_view.rows[0].entry.id, solaris.id);
     assert_eq!(want_view.rows[0].tier, None, "Priority queues must not emit S-D quality tiers");
@@ -258,7 +260,8 @@ async fn test_collection_mode_and_cycle_enforcement_on_add_and_upsert() {
         .append_comparison(None, &[vec![movie.id.clone()], vec![book.id.clone()]], None)
         .await
         .unwrap();
-    let custom_view = catalog.get_ranked_collection(&custom.slug.unwrap(), false).await.unwrap();
+    let custom_view =
+        catalog_svc.get_ranked_collection(&custom.slug.unwrap(), false).await.unwrap();
     assert!(!custom_view.is_priority_scope);
     assert_eq!(custom_view.rows[0].entry.id, movie.id);
     assert_eq!(custom_view.rows[0].tier, Some('S'));
@@ -270,7 +273,7 @@ async fn test_collection_mode_and_cycle_enforcement_on_add_and_upsert() {
         .log_consumption(&solaris.id, ConsumptionStatus::Consumed, Some("Masterpiece"), None)
         .await
         .unwrap();
-    let want_after = catalog.get_ranked_collection("movies", true).await.unwrap();
+    let want_after = catalog_svc.get_ranked_collection("movies", true).await.unwrap();
     assert_eq!(want_after.rows.len(), 1);
     assert_eq!(want_after.rows[0].entry.id, movie.id);
 }
@@ -764,7 +767,7 @@ async fn test_local_consumption_log_clears_stale_tombstone() {
         .await
         .unwrap();
 
-    let event_ts = crate::db::SyncRepo::now_utc();
+    let event_ts = crate::util::clock::now_utc();
     let log_id = crate::db::deterministic_consumption_log_id(
         &book.id,
         event_ts.timestamp_millis(),

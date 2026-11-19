@@ -1,15 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
-    net::IpAddr,
 };
 
+pub(in crate::web) use crate::util::url_guard::sanitize_public_http_href as sanitize_non_local_href;
 use crate::{
-    content::http::SafeHttpClient,
-    db::{CatalogEntry, EntryKind, canonicalize_sync_url},
-    scheduler::FeedFetcher,
+    db::{CatalogEntry, canonicalize_sync_url},
+    domain::EntryKind,
     service::RocheService,
-    web::html::{esc, safe_external_href, urlencode},
+    web::html::{esc, urlencode},
 };
 
 const IGNORED_WEB_MUSIC_SCHEMES: [&str; 7] =
@@ -135,40 +134,6 @@ fn classify_url_host(raw_url: &str) -> Option<UrlHostClass> {
     None
 }
 
-#[must_use]
-pub(in crate::web) fn sanitize_non_local_href(raw: &str) -> Option<&str> {
-    let href = safe_external_href(raw)?;
-    let parsed = url::Url::parse(href).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return None;
-    }
-    match parsed.host()? {
-        url::Host::Domain(domain) => {
-            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
-            if lower.is_empty()
-                || !lower.contains('.')
-                || SafeHttpClient::is_local_or_tailnet_domain(&lower)
-            {
-                return None;
-            }
-        }
-        url::Host::Ipv4(v4) => {
-            if !SafeHttpClient::is_global_ip(IpAddr::V4(v4)) {
-                return None;
-            }
-        }
-        url::Host::Ipv6(v6) => {
-            if !SafeHttpClient::is_global_ip(IpAddr::V6(v6)) {
-                return None;
-            }
-        }
-    }
-    Some(href)
-}
-
 fn has_valid_scheme(entry: &CatalogEntry, target_scheme: &str) -> bool {
     entry
         .identifiers
@@ -290,8 +255,8 @@ pub(super) fn web_primary_open_url(entry: &CatalogEntry) -> Option<String> {
     collect_web_external_links(entry, Some("Open Source")).into_iter().next().map(|l| l.href)
 }
 
-pub(in crate::web) async fn load_artist_id_by_lower_name<F: FeedFetcher>(
-    service: &RocheService<F>,
+pub(in crate::web) async fn load_artist_id_by_lower_name(
+    service: &RocheService,
     creator_names: &[String],
 ) -> HashMap<String, String> {
     service.catalog().find_artist_ids_by_names(creator_names).await.unwrap_or_default()

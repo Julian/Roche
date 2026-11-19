@@ -184,7 +184,7 @@ impl CatalogRepo<'_> {
         let (clean_title, derived_slug, id) =
             derive_manual_collection_slug_and_id(title, slug, role)?;
         let clean_title = clean_title.as_str();
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let show_in_lists = role == CollectionRole::List;
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
         let clean_color = color.map(str::trim).filter(|s| !s.is_empty());
@@ -308,7 +308,7 @@ impl CatalogRepo<'_> {
         }
 
         let id = deterministic_system_collection_id(&want_slug);
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query!(
             "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
@@ -360,7 +360,7 @@ impl CatalogRepo<'_> {
         entry_id: &str,
         position: Option<f64>,
     ) -> CatalogResult<()> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(&mut tx, slug_or_id, false).await?;
         if col.mode != CollectionMode::Manual {
@@ -427,7 +427,7 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
         entry_id: &str,
     ) -> CatalogResult<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(&mut tx, slug_or_id, false).await?;
         if col.mode != CollectionMode::Manual {

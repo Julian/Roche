@@ -11,8 +11,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     error::{ApiError, ProblemPath},
-    scheduler::FeedFetcher,
-    service::RocheService,
+    service::{AppError, RocheService},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,19 +33,19 @@ const fn media_csp_for_content_type(content_type: &str) -> &'static str {
     }
 }
 
-pub(super) async fn media_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn media_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    serve_media_stream(&service, &id, &headers).await
+    Ok(serve_media_stream(&service, &id, &headers).await?)
 }
 
-pub async fn serve_media_stream<F: FeedFetcher>(
-    service: &RocheService<F>,
+pub async fn serve_media_stream(
+    service: &RocheService,
     id: &str,
     headers: &HeaderMap,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AppError> {
     let stream = service.media().open_stream(id).await?;
     let disposition = format!("inline; filename=\"{}\"", stream.filename);
 
@@ -73,7 +72,7 @@ pub async fn serve_media_stream<F: FeedFetcher>(
                 let mut file = stream.file;
                 file.seek(SeekFrom::Start(start))
                     .await
-                    .map_err(|e| ApiError::Internal(e.into()))?;
+                    .map_err(|e| AppError::Internal(e.into()))?;
                 let body = Body::from_stream(ReaderStream::new(file.take(len)));
 
                 return Ok((
@@ -170,8 +169,8 @@ pub(super) fn parse_byte_range(range_header: &str, total_len: u64) -> ByteRangeP
     }
 }
 
-pub(super) async fn media_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn media_delete(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<StatusCode, ApiError> {
     service.media().delete(&id).await?;

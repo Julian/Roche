@@ -169,7 +169,7 @@ impl CatalogRepo<'_> {
         explicit_drawn_at: Option<DateTime<Utc>>,
     ) -> CatalogResult<CollectionGeneratorState> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         Self::update_collection_generator_in_tx(
             &mut tx,
@@ -187,7 +187,7 @@ impl CatalogRepo<'_> {
 
     pub async fn remove_collection_generator(&self, slug_or_id: &str) -> CatalogResult<bool> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
             .bind(&col.id)
@@ -238,7 +238,7 @@ impl CatalogRepo<'_> {
         notes: Option<&str>,
     ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let active_opt: Option<(Option<String>,)> = sqlx::query_as(

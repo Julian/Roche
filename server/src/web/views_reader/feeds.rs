@@ -9,29 +9,26 @@ use axum::{
 
 use super::{CreateFeedForm, FeedToggleForm, ImportOpmlForm, ItemReturnForm};
 use crate::{
-    db::{Feed, FeedType},
+    db::Feed,
+    domain::FeedType,
     feeds::FeedSource,
-    scheduler::FeedFetcher,
     service::RocheService,
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, feed_type_label, redirect_see_other,
-            redirect_with_flash, render_inline_csrf_form, render_page, safe_local_redirect,
-            urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc, feed_type_label,
+            parse_form_bool, redirect_see_other, redirect_with_flash, render_inline_csrf_form,
+            render_page, safe_local_redirect, urlencode,
         },
     },
 };
 
-pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn feeds_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    let feeds = match service.feeds().list().await {
-        Ok(f) => f,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
+) -> Result<Response, WebError> {
+    let feeds = service.feeds().list().await.web_err(&session)?;
 
     let mut body = String::with_capacity(6_144);
     body.push_str("<div class=\"page-head\"><h2>Feeds</h2><div class=\"flex-row flex-center\">");
@@ -94,7 +91,7 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
 
     render_feeds_table(&mut body, &feeds, &session.csrf_token);
 
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: "Feeds",
         active: NavSection::Feeds,
         csrf_token: &session.csrf_token,
@@ -102,7 +99,7 @@ pub(in crate::web) async fn feeds_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn render_feeds_table(out: &mut String, feeds: &[Feed], csrf: &str) {
@@ -175,15 +172,15 @@ fn render_feeds_table(out: &mut String, feeds: &[Feed], csrf: &str) {
     out.push_str("</ul>\n");
 }
 
-pub(in crate::web) async fn post_feed_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_create(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<CreateFeedForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let source = match FeedSource::parse(&form.url) {
         Ok(s) => s,
         Err(e) => {
-            return redirect_with_flash("/feeds", "err", &e.to_string());
+            return Ok(redirect_with_flash("/feeds", "err", &e.to_string()));
         }
     };
     let req_type = match form.feed_type.as_deref() {
@@ -192,96 +189,84 @@ pub(in crate::web) async fn post_feed_create<F: FeedFetcher>(
         Some("arxiv") => FeedType::Arxiv,
         _ => FeedType::Rss,
     };
-    match service.feeds().create(req_type, source, form.title.as_deref(), None).await {
-        Ok(feed) => {
-            let service_bg = Arc::clone(&service);
-            let feed_id = feed.id;
-            tokio::spawn(async move {
-                let _ = service_bg.feeds().refresh(&feed_id).await;
-            });
-            redirect_with_flash("/feeds", "notice", "Subscribed to feed (refreshing in background)")
-        }
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+    let feed = service
+        .feeds()
+        .create(req_type, source, form.title.as_deref(), None)
+        .await
+        .web_err(&session)?;
+    let service_bg = Arc::clone(&service);
+    let feed_id = feed.id;
+    tokio::spawn(async move {
+        let _ = service_bg.feeds().refresh(&feed_id).await;
+    });
+    Ok(redirect_with_flash("/feeds", "notice", "Subscribed to feed (refreshing in background)"))
 }
 
-pub(in crate::web) async fn post_feed_opml<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_opml(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<ImportOpmlForm>,
-) -> Response {
-    match service.feeds().import_opml(form.opml_xml).await {
-        Ok(imported) => {
-            let count = imported.len();
-            if !imported.is_empty() {
-                let service_bg = Arc::clone(&service);
-                tokio::spawn(async move {
-                    service_bg.feeds().poll_feeds_concurrently(imported).await;
-                });
-            }
-            redirect_with_flash("/feeds", "notice", &format!("Imported {count} feeds from OPML"))
-        }
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
+) -> Result<Response, WebError> {
+    let imported = service.feeds().import_opml(form.opml_xml).await.web_err(&session)?;
+    let count = imported.len();
+    if !imported.is_empty() {
+        let service_bg = Arc::clone(&service);
+        tokio::spawn(async move {
+            service_bg.feeds().poll_feeds_concurrently(imported).await;
+        });
     }
+    Ok(redirect_with_flash("/feeds", "notice", &format!("Imported {count} feeds from OPML")))
 }
 
-pub(in crate::web) async fn export_opml_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn export_opml_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
-) -> Response {
-    match service.feeds().export_opml().await {
-        Ok(xml) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, "text/x-opml; charset=utf-8"),
-                (header::CONTENT_DISPOSITION, "attachment; filename=\"roche-feeds.opml\""),
-            ],
-            xml,
-        )
-            .into_response(),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let xml = service.feeds().export_opml().await.web_err(&session)?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/x-opml; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"roche-feeds.opml\""),
+        ],
+        xml,
+    )
+        .into_response())
 }
 
-pub(in crate::web) async fn post_feed_refresh<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_refresh(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
-) -> Response {
-    if let Err(err) = service.feeds().get(&id).await {
-        return web_api_error_response(&err, Some(&session.csrf_token));
-    }
+) -> Result<Response, WebError> {
+    let _ = service.feeds().get(&id).await.web_err(&session)?;
     let service_bg = Arc::clone(&service);
     tokio::spawn(async move {
         let _ = service_bg.feeds().refresh(&id).await;
     });
-    redirect_with_flash("/feeds", "notice", "Refreshing feed in background…")
+    Ok(redirect_with_flash("/feeds", "notice", "Refreshing feed in background…"))
 }
 
-pub(in crate::web) async fn post_feed_refresh_all<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_refresh_all(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<ItemReturnForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let base = safe_local_redirect(form.return_to.as_deref(), "/feeds");
-    match service.feeds().refresh_all_in_background().await {
-        Ok(count) => {
-            let msg = if count == 0 {
-                "No active feeds to refresh".to_owned()
-            } else {
-                format!("Refreshing {count} feeds in background…")
-            };
-            redirect_with_flash(&base, "notice", &msg)
-        }
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+    let count = service.feeds().refresh_all_in_background().await.web_err(&session)?;
+    let msg = if count == 0 {
+        "No active feeds to refresh".to_owned()
+    } else {
+        format!("Refreshing {count} feeds in background…")
+    };
+    Ok(redirect_with_flash(&base, "notice", &msg))
 }
 
-pub(in crate::web) async fn refresh_status_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn refresh_status_get(
+    State(service): State<Arc<RocheService>>,
 ) -> Response {
     let active_count = service.active_refresh_count();
-    let unread = service.sync_status().await.map_or(0, |s| s.unread_items_count);
+    let unread = service.sync().status().await.map_or(0, |s| s.unread_items_count);
     Json(serde_json::json!({
         "is_refreshing": active_count > 0,
         "active_refresh_count": active_count,
@@ -290,35 +275,30 @@ pub(in crate::web) async fn refresh_status_get<F: FeedFetcher>(
     .into_response()
 }
 
-pub(in crate::web) async fn post_feed_toggle_active<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_toggle_active(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<FeedToggleForm>,
-) -> Response {
-    let want_active = matches!(form.active.trim(), "true" | "1" | "on");
-    let res = if want_active {
-        service.feeds().unarchive(&id).await
+) -> Result<Response, WebError> {
+    let want_active = parse_form_bool(Some(&form.active));
+    if want_active {
+        let _ = service.feeds().unarchive(&id).await.web_err(&session)?;
     } else {
-        service.feeds().archive(&id).await
-    };
-    match res {
-        Ok(_) => redirect_see_other("/feeds"),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
+        let _ = service.feeds().archive(&id).await.web_err(&session)?;
     }
+    Ok(redirect_see_other("/feeds"))
 }
 
-pub(in crate::web) async fn post_feed_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_feed_delete(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
-) -> Response {
-    match service.feeds().delete(&id).await {
-        Ok(()) => redirect_with_flash(
-            "/feeds",
-            "notice",
-            "Removed feed subscription (diary & rankings preserved)",
-        ),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    service.feeds().delete(&id).await.web_err(&session)?;
+    Ok(redirect_with_flash(
+        "/feeds",
+        "notice",
+        "Removed feed subscription (diary & rankings preserved)",
+    ))
 }

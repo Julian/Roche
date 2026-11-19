@@ -19,12 +19,12 @@ pub use catalog::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
     CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionGeneratorState,
-    CollectionSummary, ComparisonRecord, ConsumptionLogRow, ConsumptionLogView,
-    DynamicCollectionRule, EntryDetailView, EntryIdentifier, PREFERRED_IDENTIFIER_SCHEMES,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput, choose_deterministic_entry_id,
-    external_identifier_label, external_identifier_url, matches_dynamic_collection_rule,
-    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
-    strip_album_edition_suffix,
+    CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
+    ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
+    PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    choose_deterministic_entry_id, external_identifier_label, external_identifier_url,
+    matches_dynamic_collection_rule, normalize_identifier_scheme, normalize_identifier_value,
+    parse_dynamic_collection_rule, strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
@@ -131,9 +131,9 @@ impl Db {
                     if let Some(parent) = file_path.parent()
                         && !parent.as_os_str().is_empty()
                     {
-                        crate::media::MediaStore::ensure_private_dir(parent).await?;
+                        crate::util::fs_perms::ensure_private_dir(parent).await?;
                     }
-                    crate::media::MediaStore::precreate_or_tighten_private_file(file_path).await?;
+                    crate::util::fs_perms::precreate_or_tighten_private_file(file_path).await?;
                 }
                 SqliteConnectOptions::new().filename(path)
             }
@@ -300,7 +300,7 @@ impl Db {
     }
 
     async fn record_maintenance_completed(&self, task_name: &str) -> Result<()> {
-        let completed_at = SyncRepo::now_utc().to_rfc3339();
+        let completed_at = crate::util::clock::now_utc().to_rfc3339();
         sqlx::query!(
             "INSERT OR REPLACE INTO maintenance_runs (task_name, completed_at) VALUES (?, ?)",
             task_name,
@@ -478,11 +478,11 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
 }
 
 pub(crate) async fn tighten_sqlite_sidecar_permissions(db_path: &Path) {
-    crate::media::MediaStore::tighten_private_file_if_exists(db_path).await;
+    crate::util::fs_perms::tighten_private_file_if_exists(db_path).await;
     for suffix in ["-wal", "-shm"] {
         let mut os = db_path.as_os_str().to_os_string();
         os.push(suffix);
-        crate::media::MediaStore::tighten_private_file_if_exists(Path::new(&os)).await;
+        crate::util::fs_perms::tighten_private_file_if_exists(Path::new(&os)).await;
     }
 }
 

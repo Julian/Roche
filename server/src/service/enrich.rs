@@ -1,5 +1,3 @@
-#[cfg(not(test))]
-use std::sync::LazyLock;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -12,20 +10,24 @@ use std::{
 use serde_json::Value;
 use url::Url;
 
-use super::{html::urlencode, links::sanitize_non_local_href};
+use super::RocheService;
 use crate::{
+    content::http::SafeHttpClient,
     db::{
-        CatalogEntry, EntryDetailView, EntryIdentifier, EntryKind, UpsertEntryInput,
+        CatalogEntry, EntryDetailView, EntryIdentifier, UpsertEntryInput,
         strip_album_edition_suffix,
     },
-    scheduler::FeedFetcher,
-    service::RocheService,
+    domain::EntryKind,
+    util::url_guard::{decode_percent_utf8, sanitize_public_http_href},
 };
 
 const MAX_WIKIPEDIA_BYTES: usize = 128 * 1024;
 const MAX_SPOTIFY_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SUMMARY_CHARS: usize = 600;
 const MAX_LEAD_SENTENCE_CHARS: usize = 180;
+const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
+pub const MAX_CONCURRENT_ENRICH_TASKS: usize = 4;
+const FAILED_ENRICH_TTL: Duration = Duration::from_mins(30);
 
 const ARTIST_DISAMBIG_WORDS: &[&str] = &[
     "band",
@@ -148,18 +150,18 @@ const WORK_OPENING_PHRASES: &[&[&str]] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::web) struct WikipediaSearchHit {
+pub struct WikipediaSearchHit {
     pub title: String,
     pub snippet: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::web) struct WikipediaArtistSummary {
+pub struct WikipediaArtistSummary {
     pub thumbnail_url: Option<String>,
     pub extract: Option<String>,
 }
 
-pub(in crate::web) trait ArtistMetadataFetcher: Send + Sync {
+pub trait ArtistMetadataFetcher: Send + Sync {
     fn fetch_text<'a>(
         &'a self,
         url: &'a Url,
@@ -167,8 +169,7 @@ pub(in crate::web) trait ArtistMetadataFetcher: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 }
 
-#[cfg(not(test))]
-impl ArtistMetadataFetcher for crate::content::http::SafeHttpClient {
+impl ArtistMetadataFetcher for SafeHttpClient {
     fn fetch_text<'a>(
         &'a self,
         url: &'a Url,
@@ -193,23 +194,13 @@ where
     }
 }
 
-const MAX_ENRICH_ATTEMPT_CACHE: usize = 4_096;
-pub(in crate::web) const MAX_CONCURRENT_ENRICH_TASKS: usize = 4;
-#[cfg(not(test))]
-const FAILED_ENRICH_TTL: Duration = Duration::from_mins(30);
-
 #[derive(Debug, Default)]
-pub(in crate::web) struct EnrichAttemptCache {
+pub struct EnrichAttemptCache {
     entries: HashMap<String, Instant>,
 }
 
 impl EnrichAttemptCache {
-    pub(in crate::web) fn should_attempt_and_mark(
-        &mut self,
-        key: String,
-        now: Instant,
-        ttl: Duration,
-    ) -> bool {
+    pub fn should_attempt_and_mark(&mut self, key: String, now: Instant, ttl: Duration) -> bool {
         if let Some(&prev) = self.entries.get(&key)
             && now.saturating_duration_since(prev) < ttl
         {
@@ -226,83 +217,103 @@ impl EnrichAttemptCache {
     }
 }
 
-pub(in crate::web) fn try_reserve_enrichment_slot(
-    semaphore: &Arc<tokio::sync::Semaphore>,
-    cache: &Mutex<EnrichAttemptCache>,
-    attempt_key: String,
-    now: Instant,
-    ttl: Duration,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let permit = Arc::clone(semaphore).try_acquire_owned().ok()?;
-    let Ok(mut guard) = cache.lock() else {
-        return None;
-    };
-    if !guard.should_attempt_and_mark(attempt_key, now, ttl) {
-        return None;
+/// Instance-scoped background artist enrichment coordinator held on [`RocheService`]
+/// (replacing process-global `LazyLock` singletons so tests stay isolated and deterministic).
+#[derive(Debug)]
+pub struct ArtistEnricher {
+    enabled: bool,
+    http_client: Option<SafeHttpClient>,
+    attempt_cache: Mutex<EnrichAttemptCache>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    failed_ttl: Duration,
+}
+
+impl ArtistEnricher {
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        let http_client =
+            if enabled { SafeHttpClient::new(Duration::from_millis(2_500)).ok() } else { None };
+        Self {
+            enabled,
+            http_client,
+            attempt_cache: Mutex::new(EnrichAttemptCache::default()),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS)),
+            failed_ttl: FAILED_ENRICH_TTL,
+        }
     }
-    Some(permit)
-}
 
-#[cfg(not(test))]
-static ENRICH_HTTP_CLIENT: LazyLock<Option<crate::content::http::SafeHttpClient>> =
-    LazyLock::new(|| crate::content::http::SafeHttpClient::new(Duration::from_millis(2_500)).ok());
-
-#[cfg(not(test))]
-static ATTEMPTED_ARTIST_KEYS: LazyLock<Mutex<EnrichAttemptCache>> =
-    LazyLock::new(|| Mutex::new(EnrichAttemptCache::default()));
-
-#[cfg(not(test))]
-static ENRICH_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS)));
-
-#[cfg(not(test))]
-pub(in crate::web) fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
-    service: &Arc<RocheService<F>>,
-    detail: &EntryDetailView,
-) {
-    if !should_attempt_enrichment(detail) {
-        return;
+    #[must_use]
+    pub fn default_for_runtime() -> Self {
+        Self::new(!cfg!(test))
     }
-    let Some(client) = ENRICH_HTTP_CLIENT.as_ref() else {
-        return;
-    };
-    let can_resolve_spotify = detail.entry.identifier("spotify").is_none()
-        && detail.children.iter().any(|c| child_spotify_web_url(c).is_some());
-    let attempt_key = format!("{}|sp={can_resolve_spotify}", detail.entry.id);
-    let Some(permit) = try_reserve_enrichment_slot(
-        &ENRICH_SEMAPHORE,
-        &ATTEMPTED_ARTIST_KEYS,
-        attempt_key,
-        Instant::now(),
-        FAILED_ENRICH_TTL,
-    ) else {
-        return;
-    };
-    let svc = Arc::clone(service);
-    let mut detail_bg = detail.clone();
-    tokio::spawn(async move {
-        let _permit = permit;
-        let _ = tokio::time::timeout(
-            Duration::from_secs(4),
-            enrich_artist_detail_with_fetcher(&svc, &mut detail_bg, client),
-        )
-        .await;
-    });
+
+    /// Reserves a bounded concurrency permit and records `attempt_key` in the TTL cache
+    /// only after acquiring a permit, so back-pressured requests remain retryable once slots free.
+    pub fn try_reserve_slot(
+        &self,
+        attempt_key: String,
+        now: Instant,
+        ttl: Duration,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
+        let should_attempt = {
+            let Ok(mut guard) = self.attempt_cache.lock() else {
+                return None;
+            };
+            guard.should_attempt_and_mark(attempt_key, now, ttl)
+        };
+        should_attempt.then_some(permit)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
 }
 
-#[cfg(test)]
-pub(in crate::web) const fn spawn_artist_enrichment_if_needed<F: FeedFetcher>(
-    _service: &std::sync::Arc<RocheService<F>>,
-    _detail: &EntryDetailView,
-) {
+pub struct EnrichService<'a> {
+    pub(super) service: &'a RocheService,
 }
 
-pub(in crate::web) async fn enrich_artist_detail_with_fetcher<F, M>(
-    service: &RocheService<F>,
+impl EnrichService<'_> {
+    pub fn spawn_artist_enrichment_if_needed(&self, detail: &EntryDetailView) {
+        let enricher = &self.service.artist_enricher;
+        if !enricher.enabled || !should_attempt_enrichment(detail) {
+            return;
+        }
+        if enricher.http_client.is_none() {
+            return;
+        }
+        let can_resolve_spotify = detail.entry.identifier("spotify").is_none()
+            && detail.children.iter().any(|c| child_spotify_web_url(c).is_some());
+        let attempt_key = format!("{}|sp={can_resolve_spotify}", detail.entry.id);
+        let Some(permit) =
+            enricher.try_reserve_slot(attempt_key, Instant::now(), enricher.failed_ttl)
+        else {
+            return;
+        };
+        let svc = self.service.clone();
+        let mut detail_bg = detail.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(client) = svc.artist_enricher.http_client.as_ref() else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(4),
+                enrich_artist_detail_with_fetcher(&svc, &mut detail_bg, client),
+            )
+            .await;
+        });
+    }
+}
+
+pub async fn enrich_artist_detail_with_fetcher<M>(
+    service: &RocheService,
     detail: &mut EntryDetailView,
     fetcher: &M,
 ) where
-    F: FeedFetcher,
     M: ArtistMetadataFetcher,
 {
     if !should_attempt_enrichment(detail) {
@@ -312,7 +323,7 @@ pub(in crate::web) async fn enrich_artist_detail_with_fetcher<F, M>(
     let missing_wiki = detail.entry.identifier("wikipedia").is_none();
     let missing_spotify = detail.entry.identifier("spotify").is_none();
     let missing_thumb =
-        detail.entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href).is_none();
+        detail.entry.thumbnail_url.as_deref().and_then(sanitize_public_http_href).is_none();
     let missing_summary = detail.entry.summary.as_deref().map(str::trim).is_none_or(str::is_empty);
 
     let spotify_fut = async {
@@ -377,7 +388,8 @@ fn should_attempt_enrichment(detail: &EntryDetailView) -> bool {
     let missing_wiki = entry.identifier("wikipedia").is_none();
     let missing_spotify = entry.identifier("spotify").is_none()
         && detail.children.iter().any(|c| child_spotify_web_url(c).is_some());
-    let missing_thumb = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href).is_none();
+    let missing_thumb =
+        entry.thumbnail_url.as_deref().and_then(sanitize_public_http_href).is_none();
     let missing_summary = entry.summary.as_deref().map(str::trim).is_none_or(str::is_empty);
     missing_wiki || missing_spotify || missing_thumb || missing_summary
 }
@@ -447,7 +459,7 @@ async fn resolve_wikipedia_artist_bundle<M: ArtistMetadataFetcher>(
         .map_or((None, None), |summary| (Some(candidate_slug), Some(summary)))
 }
 
-pub(in crate::web) fn existing_wikipedia_slug(entry: &CatalogEntry) -> Option<String> {
+fn existing_wikipedia_slug(entry: &CatalogEntry) -> Option<String> {
     let raw = entry.identifier("wikipedia")?.trim();
     if raw.is_empty() {
         return None;
@@ -470,11 +482,18 @@ fn build_wikipedia_artist_search_url(artist_name: &str) -> Option<Url> {
     let srsearch = format!(
         "\"{trimmed}\" (band OR musician OR singer OR rapper OR composer OR songwriter OR vocalist OR duo OR group OR orchestra)"
     );
-    let full = format!(
-        "https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=8&utf8=1&format=json&srsearch={}",
-        urlencode(&srsearch)
-    );
-    Url::parse(&full).ok()
+    Url::parse_with_params(
+        "https://en.wikipedia.org/w/api.php",
+        [
+            ("action", "query"),
+            ("list", "search"),
+            ("srlimit", "8"),
+            ("utf8", "1"),
+            ("format", "json"),
+            ("srsearch", srsearch.as_str()),
+        ],
+    )
+    .ok()
 }
 
 async fn fetch_wikipedia_artist_summary<M: ArtistMetadataFetcher>(
@@ -494,7 +513,8 @@ async fn fetch_wikipedia_artist_summary<M: ArtistMetadataFetcher>(
     parse_wikipedia_artist_summary_json(&raw_json, require_music_context)
 }
 
-pub(in crate::web) fn encode_wiki_path_segment(slug: &str) -> String {
+#[must_use]
+pub fn encode_wiki_path_segment(slug: &str) -> String {
     let mut out = String::with_capacity(slug.len());
     for &b in slug.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'(' | b')' | b':')
@@ -507,33 +527,8 @@ pub(in crate::web) fn encode_wiki_path_segment(slug: &str) -> String {
     out
 }
 
-fn decode_percent_utf8(input: &str) -> String {
-    if !input.contains('%') {
-        return input.to_owned();
-    }
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) =
-                ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16))
-        {
-            if let Ok(val) = u8::try_from((hi << 4) | lo) {
-                out.push(val);
-            }
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[must_use]
-pub(in crate::web) fn parse_wikipedia_search_json(raw_json: &str) -> Vec<WikipediaSearchHit> {
+pub fn parse_wikipedia_search_json(raw_json: &str) -> Vec<WikipediaSearchHit> {
     let Ok(root) = serde_json::from_str::<Value>(raw_json) else {
         return Vec::new();
     };
@@ -554,7 +549,7 @@ pub(in crate::web) fn parse_wikipedia_search_json(raw_json: &str) -> Vec<Wikiped
 }
 
 #[must_use]
-pub(in crate::web) fn select_best_artist_wikipedia_slug(
+pub fn select_best_artist_wikipedia_slug(
     hits: &[WikipediaSearchHit],
     artist_name: &str,
     child_titles: &[String],
@@ -639,7 +634,7 @@ fn score_artist_wikipedia_hit(
 }
 
 #[must_use]
-pub(in crate::web) fn parse_wikipedia_artist_summary_json(
+pub fn parse_wikipedia_artist_summary_json(
     raw_json: &str,
     require_music_context: bool,
 ) -> Option<WikipediaArtistSummary> {
@@ -669,7 +664,7 @@ pub(in crate::web) fn parse_wikipedia_artist_summary_json(
         .get("thumbnail")
         .and_then(|t| t.get("source"))
         .and_then(Value::as_str)
-        .and_then(sanitize_non_local_href)
+        .and_then(sanitize_public_http_href)
         .filter(|u| u.to_ascii_lowercase().starts_with("https://"))
         .map(ToOwned::to_owned);
     let extract = (!extract_raw.is_empty()).then(|| truncate_summary(extract_raw));
@@ -702,7 +697,7 @@ fn contains_word_sequence(haystack: &[&str], needle: &[&str]) -> bool {
 }
 
 #[must_use]
-pub(in crate::web) fn extract_spotify_artist_uri_from_album_html(
+pub fn extract_spotify_artist_uri_from_album_html(
     html: &str,
     artist_name: &str,
     allow_single_fallback: bool,
@@ -844,7 +839,8 @@ fn strip_html_tags(raw: &str) -> String {
     out
 }
 
-pub(in crate::web) fn decode_html_entities(raw: &str) -> String {
+#[must_use]
+pub fn decode_html_entities(raw: &str) -> String {
     if !raw.contains('&') {
         return raw.to_owned();
     }
@@ -895,5 +891,31 @@ fn truncate_summary(raw: &str) -> String {
         format!("{sentence_prefix}.")
     } else {
         format!("{}…", collected.trim_end())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_artist_enricher_instances_have_isolated_state_and_ttl() {
+        let enricher_a = ArtistEnricher::new(false);
+        let enricher_b = ArtistEnricher::new(false);
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+
+        let permit_a = enricher_a.try_reserve_slot("artist-1|sp=false".to_owned(), now, ttl);
+        assert!(permit_a.is_some());
+        drop(permit_a);
+
+        // Same instance rejects duplicate within TTL
+        assert!(enricher_a.try_reserve_slot("artist-1|sp=false".to_owned(), now, ttl).is_none());
+
+        // Separate instance has independent cache (no process-global state)
+        assert!(enricher_b.try_reserve_slot("artist-1|sp=false".to_owned(), now, ttl).is_some());
+        assert_eq!(enricher_a.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
+        assert_eq!(enricher_b.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
     }
 }

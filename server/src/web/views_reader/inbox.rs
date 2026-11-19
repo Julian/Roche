@@ -9,24 +9,24 @@ use url::Url;
 
 use super::{ArchiveBatchForm, InboxQuery, ItemReturnForm, SaveUrlForm, render_audio_play_button};
 use crate::{
-    db::{ContentType, Item, ItemFilter, ItemStatus, ItemStatusFilter, ReadAtPatch},
-    scheduler::FeedFetcher,
+    db::{Item, ItemFilter},
+    domain::{ContentType, ItemStatus, ItemStatusFilter, ReadAtPatch},
     service::RocheService,
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, content_type_label, esc, parse_csv_list,
-            redirect_see_other, redirect_with_flash, render_inline_csrf_form, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, content_type_label, esc,
+            parse_csv_list, redirect_see_other, redirect_with_flash, render_inline_csrf_form,
+            render_page, safe_local_redirect, urlencode,
         },
     },
 };
 
-pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn inbox_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(q): Query<InboxQuery>,
-) -> Response {
+) -> Result<Response, WebError> {
     let status_filter = match q.status.as_deref() {
         Some("all") => ItemStatusFilter::All,
         Some("archived") => ItemStatusFilter::Archived,
@@ -61,10 +61,7 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         ..ItemFilter::default()
     };
 
-    let page = match service.items().query().with_filter(filter).list_page().await {
-        Ok(p) => p,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
+    let page = service.items().query().with_filter(filter).list_page().await.web_err(&session)?;
 
     let (feed_label, tag_label) = load_inbox_filter_labels(&service, clean_feed, clean_tag).await;
 
@@ -97,20 +94,19 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
     render_item_rows(&mut body, &page.items, &session.csrf_token, &return_url);
     render_inbox_pager(&mut body, &nav_ctx, page_num, page.has_more);
 
-    let flash = FlashQuery { notice: q.notice, err: q.err };
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: "Inbox",
         active: NavSection::Inbox,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
-async fn load_inbox_filter_labels<F: FeedFetcher>(
-    service: &RocheService<F>,
+async fn load_inbox_filter_labels(
+    service: &RocheService,
     clean_feed: Option<&str>,
     clean_tag: Option<&str>,
 ) -> (Option<String>, Option<String>) {
@@ -439,8 +435,8 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
     out.push_str("</ul>\n");
 }
 
-pub(in crate::web) async fn starred_get<F: FeedFetcher>(
-    State(_service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn starred_get(
+    State(_service): State<Arc<RocheService>>,
     Query(flash): Query<FlashQuery>,
 ) -> Response {
     if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
@@ -452,11 +448,11 @@ pub(in crate::web) async fn starred_get<F: FeedFetcher>(
     }
 }
 
-pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_save(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<SaveUrlForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let raw_trimmed = form.url.trim();
     let normalized = if !raw_trimmed.contains("://")
         && raw_trimmed.contains('.')
@@ -468,88 +464,80 @@ pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
     };
     let fallback_err_dest = safe_local_redirect(form.return_to.as_deref(), "/");
     let Ok(parsed_url) = Url::parse(&normalized) else {
-        return redirect_with_flash(&fallback_err_dest, "err", "Please enter a valid http(s) URL");
+        return Ok(redirect_with_flash(
+            &fallback_err_dest,
+            "err",
+            "Please enter a valid http(s) URL",
+        ));
     };
     let tags = parse_csv_list(form.tags.as_deref());
 
-    match service.items().save(&parsed_url, form.title.as_deref(), &tags).await {
-        Ok(saved) => {
-            if let Some(ret) = form.return_to.as_deref().filter(|s| !s.trim().is_empty()) {
-                redirect_with_flash(ret, "notice", "Added to Want to Read")
-            } else {
-                redirect_with_flash(
-                    &format!("/reader/{}", urlencode(&saved.item.id)),
-                    "notice",
-                    "Added to Want to Read",
-                )
-            }
-        }
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
+    let saved =
+        service.items().save(&parsed_url, form.title.as_deref(), &tags).await.web_err(&session)?;
+    if let Some(ret) = form.return_to.as_deref().filter(|s| !s.trim().is_empty()) {
+        Ok(redirect_with_flash(ret, "notice", "Added to Want to Read"))
+    } else {
+        Ok(redirect_with_flash(
+            &format!("/reader/{}", urlencode(&saved.item.id)),
+            "notice",
+            "Added to Want to Read",
+        ))
     }
 }
 
-pub(in crate::web) async fn post_item_archive_batch<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_archive_batch(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<ArchiveBatchForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let explicit_ids = parse_csv_list(form.ids.as_deref());
     let feed_id = form.feed_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let batch_res = if explicit_ids.is_empty() {
+    let count = if explicit_ids.is_empty() {
         service.items().archive_batch(&[], feed_id, true).await
     } else {
         service.items().archive_batch(&explicit_ids, None, false).await
-    };
-    match batch_res {
-        Ok(count) => {
-            let base = safe_local_redirect(form.return_to.as_deref(), "/inbox");
-            redirect_with_flash(&base, "notice", &format!("Archived {count} unread items"))
-        }
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
+    .web_err(&session)?;
+    let base = safe_local_redirect(form.return_to.as_deref(), "/inbox");
+    Ok(redirect_with_flash(&base, "notice", &format!("Archived {count} unread items")))
 }
 
-pub(in crate::web) async fn post_item_star<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_star(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
-) -> Response {
-    let cur = match service.items().get(&id).await {
-        Ok(d) => d.item.is_favorite,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
-    match service.items().update(&id, None, Some(!cur), None, ReadAtPatch::Unchanged).await {
-        Ok(_) => redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let cur = service.items().get(&id).await.web_err(&session)?.item.is_favorite;
+    let _ = service
+        .items()
+        .update(&id, None, Some(!cur), None, ReadAtPatch::Unchanged)
+        .await
+        .web_err(&session)?;
+    Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }
 
-pub(in crate::web) async fn post_item_archive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_archive(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let clamped_prog = form.progress.filter(|p| p.is_finite()).map(|p| p.clamp(0.0, 1.0));
-    let res = service
+    let _ = service
         .items()
         .update(&id, Some(ItemStatus::Archived), None, clamped_prog, ReadAtPatch::Unchanged)
-        .await;
-    match res {
-        Ok(_) => redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+        .await
+        .web_err(&session)?;
+    Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }
 
-pub(in crate::web) async fn post_item_unarchive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_unarchive(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
-) -> Response {
-    match service.items().unarchive(&id).await {
-        Ok(_) => redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let _ = service.items().unarchive(&id).await.web_err(&session)?;
+    Ok(redirect_see_other(&safe_local_redirect(form.return_to.as_deref(), "/inbox")))
 }

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Semaphore};
 use url::Url;
 
-use crate::config::TailscaleConfig;
+pub use crate::config::{is_valid_dns_label, is_valid_service_name, normalize_service_name};
+use crate::{config::TailscaleConfig, util::url_guard::bracket_ipv6_host};
 
 pub const DEFAULT_NODE_HTTPS_PORT: u16 = 443;
 pub const FALLBACK_NODE_HTTPS_PORT: u16 = 8443;
@@ -152,30 +153,6 @@ struct HealthProbeResponse {
     version: Option<String>,
     #[serde(default)]
     canonical_url: Option<String>,
-}
-
-#[must_use]
-pub fn normalize_service_name(raw: &str) -> String {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.starts_with("svc:") { trimmed } else { format!("svc:{trimmed}") }
-}
-
-#[must_use]
-pub fn is_valid_service_name(svc: &str) -> bool {
-    svc.strip_prefix("svc:").is_some_and(is_valid_dns_label)
-}
-
-#[must_use]
-pub fn is_valid_dns_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 63
-        && !label.starts_with('-')
-        && !label.starts_with('.')
-        && !label.ends_with('-')
-        && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[must_use]
@@ -410,19 +387,11 @@ fn format_target_arg(upstream_host: &str, port: u16) -> Result<String> {
     if host.starts_with('-') {
         anyhow::bail!("Invalid Tailscale upstream host (cannot start with '-'): {host}");
     }
-    if host.contains(':') && !host.starts_with('[') {
-        Ok(format!("[{host}]:{port}"))
-    } else {
-        Ok(format!("{host}:{port}"))
-    }
+    Ok(format!("{}:{port}", bracket_ipv6_host(host)))
 }
 
 fn format_target_origin(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("http://[{host}]:{port}")
-    } else {
-        format!("http://{host}:{port}")
-    }
+    format!("http://{}:{port}", bracket_ipv6_host(host))
 }
 
 /// Queries the local `tailscale` CLI for node identity.

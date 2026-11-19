@@ -12,7 +12,10 @@ use super::{
         deterministic_item_id, feed_natural_key, item_natural_key, normalize_consecutive_failures,
     },
 };
-use crate::feeds::{OpmlOutline, arxiv::ArxivParser};
+use crate::{
+    domain::OpmlOutline,
+    util::{clock::now_utc, media_urls::extract_arxiv_id},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
@@ -262,7 +265,7 @@ impl<'a> FeedRepo<'a> {
         let url_str = url.as_str();
         let id = deterministic_feed_id(url_str);
         let nat_key = feed_natural_key(url_str);
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Feed, &nat_key).await?;
@@ -464,7 +467,7 @@ impl<'a> FeedRepo<'a> {
         outlines: Vec<OpmlOutline>,
         default_interval: i64,
     ) -> Result<Vec<Feed>> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut imported = Vec::new();
 
@@ -627,7 +630,7 @@ impl<'a> FeedRepo<'a> {
             return Ok(self.get(id).await?.is_some());
         }
 
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let existing_url: Option<String> =
@@ -770,7 +773,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let deleted_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
@@ -823,7 +826,7 @@ impl<'a> FeedRepo<'a> {
         batch: &PollBatch,
         peer_id: &str,
     ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
 
         let new_title = batch.title.as_deref().filter(|s| !s.is_empty());
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
@@ -919,7 +922,7 @@ impl<'a> FeedRepo<'a> {
 
             let det_id = deterministic_item_id(feed_url.as_deref(), item_url_str);
             let canon_url = canonicalize_sync_url(item_url_str);
-            let arxiv_id = ArxivParser::extract_arxiv_id(item_url_str);
+            let arxiv_id = extract_arxiv_id(item_url_str);
             let clean_duration = item.duration.filter(|&d| d > 0);
 
             if let Some(existing_id) =
@@ -1273,7 +1276,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         sqlx::query(
             "UPDATE feed_sources
@@ -1305,7 +1308,7 @@ mod tests {
 
     use crate::{
         db::{ActivityAction, ActivityEntityType, ContentType, Db, FeedType, NewItem},
-        feeds::OpmlOutline,
+        domain::OpmlOutline,
     };
 
     #[tokio::test]

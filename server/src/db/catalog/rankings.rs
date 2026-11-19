@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
@@ -6,8 +6,7 @@ use sqlx::SqliteConnection;
 use super::{
     CatalogRepo,
     models::{
-        CatalogEntry, CatalogError, CatalogResult, ClusterSelectFilter, CollectionSummary,
-        ComparisonRecord, RankedCollectionView, RankedEntryRow,
+        CatalogError, CatalogResult, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
     },
 };
 use crate::{
@@ -15,13 +14,9 @@ use crate::{
         sync::{SyncRepo, canonical_ordering_json, deterministic_comparison_id},
         types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
     },
-    ranking::{
-        MAX_K_DEFAULT, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores, rescale_to_quantiles,
-        select_cluster, sort_by_score_with_ties, tier_label, validate_ordering,
-    },
+    ranking::validate_ordering,
+    util::clock::now_utc,
 };
-
-const SPAWN_BLOCKING_EP_THRESHOLD: usize = 150;
 
 impl CatalogRepo<'_> {
     pub async fn append_comparison(
@@ -52,7 +47,7 @@ impl CatalogRepo<'_> {
             None => None,
         };
 
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let event_ts = ts.unwrap_or(now);
         let mut tx = crate::db::begin_write(self.pool).await?;
         let (record, _) =
@@ -114,67 +109,20 @@ impl CatalogRepo<'_> {
         ))
     }
 
-    pub async fn get_ranked_collection(
+    /// Loads a collection and its rankable members without running EP inference.
+    pub async fn load_collection_ranking_inputs(
         &self,
         slug_or_id: &str,
         want: bool,
-    ) -> CatalogResult<RankedCollectionView> {
+    ) -> CatalogResult<CollectionRankingInputs> {
         let raw_col = if want {
             let summary = self.get_or_create_want_collection(slug_or_id).await?;
             self.lookup_collection_row(&summary.id, false).await?
         } else {
             self.lookup_collection_row(slug_or_id, true).await?
         };
-        let is_priority = raw_col.collection_role == CollectionRole::Want;
+        let is_priority_scope = raw_col.collection_role == CollectionRole::Want;
         let members = self.resolve_rankable_members(&raw_col).await?;
-        let member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
-        let member_count = member_ids.len();
-
-        let orderings = self
-            .load_orderings_for_scope(if is_priority { Some(raw_col.id.as_str()) } else { None })
-            .await?;
-        let member_set: HashSet<&str> = member_ids.iter().map(String::as_str).collect();
-        let relevant_comparison_count = orderings
-            .iter()
-            .filter(|ord| {
-                ord.iter().flat_map(|g| g.iter()).any(|id| member_set.contains(id.as_str()))
-            })
-            .count();
-
-        let scores = run_infer_scores(member_ids, orderings).await?;
-        let tiers_by_id = if !is_priority && relevant_comparison_count > 0 {
-            rescale_to_quantiles(&scores, N_QUANTILES)
-                .into_iter()
-                .map(|(id, q)| (id, tier_label(q)))
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
-
-        let mut sorted_members = members;
-        sort_by_score_with_ties(
-            &mut sorted_members,
-            &scores,
-            |entry| entry.id.as_str(),
-            |a, b| {
-                a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id))
-            },
-        );
-
-        let max_abs = scores.values().map(|s| s.mean.abs()).fold(0.0_f64, f64::max);
-        let scale = if max_abs > 0.0 { max_abs } else { 1.0 };
-
-        let rows: Vec<RankedEntryRow> = sorted_members
-            .into_iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                let score = scores.get(&entry.id).copied().unwrap_or_default();
-                let tier = tiers_by_id.get(&entry.id).copied();
-                let bar_pct = ((score.mean / scale + 1.0) * 50.0).clamp(2.0, 100.0);
-                RankedEntryRow { rank: idx + 1, entry, score, tier, bar_pct }
-            })
-            .collect();
-
         let summary = CollectionSummary {
             id: raw_col.id,
             slug: raw_col.slug,
@@ -186,18 +134,13 @@ impl CatalogRepo<'_> {
             rule_json: raw_col.rule_json,
             show_in_lists: raw_col.show_in_lists,
             color: raw_col.color,
-            member_count,
-            comparison_count: relevant_comparison_count,
+            member_count: members.len(),
+            comparison_count: 0,
             has_generator: raw_col.has_generator,
             created_at: raw_col.created_at,
             updated_at: raw_col.updated_at,
         };
-        Ok(RankedCollectionView {
-            collection: summary,
-            is_priority_scope: is_priority,
-            comparison_count: relevant_comparison_count,
-            rows,
-        })
+        Ok(CollectionRankingInputs { collection: summary, is_priority_scope, members })
     }
 
     /// Lightweight count of rankable members in `slug_or_id` without hydrating entries,
@@ -247,170 +190,54 @@ impl CatalogRepo<'_> {
         }
     }
 
-    pub async fn select_next_cluster(
+    /// Resolves `raw_parent_id` across merges and returns its member entry IDs.
+    pub async fn load_child_entry_ids_for_parent(
         &self,
-        slug_or_id: &str,
-        want: bool,
-        filter: &ClusterSelectFilter,
-    ) -> CatalogResult<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>)> {
-        self.select_next_cluster_with_retries(slug_or_id, want, filter, 0, |_| false).await
+        raw_parent_id: &str,
+    ) -> CatalogResult<HashSet<String>> {
+        let resolved_parent =
+            self.follow_merged_id(raw_parent_id).await?.unwrap_or_else(|| raw_parent_id.to_owned());
+        let child_ids = sqlx::query_scalar!(
+            r#"SELECT entry_id as "entry_id!" FROM collection_entries WHERE collection_id = ?"#,
+            &resolved_parent,
+        )
+        .fetch_all(self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        Ok(child_ids)
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub async fn select_next_cluster_with_retries<F>(
-        &self,
-        slug_or_id: &str,
-        want: bool,
-        filter: &ClusterSelectFilter,
-        max_covered_retries: usize,
-        is_covered: F,
-    ) -> CatalogResult<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>)>
-    where
-        F: Fn(&[CatalogEntry]) -> bool,
-    {
-        let raw_col = if want {
-            let summary = self.get_or_create_want_collection(slug_or_id).await?;
-            self.lookup_collection_row(&summary.id, false).await?
-        } else {
-            self.lookup_collection_row(slug_or_id, true).await?
-        };
-        let is_priority = raw_col.collection_role == CollectionRole::Want;
-        let all_members = self.resolve_rankable_members(&raw_col).await?;
-        let total_member_count = all_members.len();
-        let all_member_set: HashSet<&str> = all_members.iter().map(|m| m.id.as_str()).collect();
-
-        let orderings = self
-            .load_orderings_for_scope(if is_priority { Some(raw_col.id.as_str()) } else { None })
-            .await?;
-        let relevant_comparison_count = orderings
-            .iter()
-            .filter(|ord| {
-                ord.iter().flat_map(|g| g.iter()).any(|id| all_member_set.contains(id.as_str()))
-            })
-            .count();
-
-        let mut members = all_members;
-        if let Some(creator_q) =
-            filter.by_creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
-        {
-            let needle = creator_q.to_lowercase();
-            members.retain(|e| e.creators.iter().any(|c| c.to_lowercase().contains(&needle)));
-        }
-        if let Some(raw_parent_id) =
-            filter.from_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
-        {
-            let resolved_parent = self
-                .follow_merged_id(raw_parent_id)
-                .await?
-                .unwrap_or_else(|| raw_parent_id.to_owned());
-            let child_ids: HashSet<String> = sqlx::query_scalar!(
-                r#"SELECT entry_id as "entry_id!" FROM collection_entries WHERE collection_id = ?"#,
-                &resolved_parent,
-            )
-            .fetch_all(self.pool)
-            .await?
-            .into_iter()
-            .collect();
-            members.retain(|e| child_ids.contains(&e.id));
-        }
-
-        let member_ids: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
-        let scores = run_infer_scores(member_ids.clone(), orderings).await?;
-
-        let mut seed_pool: Option<Vec<String>> = None;
-        if !filter.focus_ids.is_empty() {
-            let mut resolved_focus = Vec::new();
-            for fid in &filter.focus_ids {
-                if let Some(canon) = self.follow_merged_id(fid).await? {
-                    resolved_focus.push(canon);
-                }
+    /// Resolves a list of entry IDs through any `merged_into_id` chains, dropping missing entries.
+    pub async fn resolve_canonical_ids(&self, ids: &[String]) -> CatalogResult<Vec<String>> {
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(canon) = self.follow_merged_id(id).await? {
+                resolved.push(canon);
             }
-            seed_pool = Some(resolved_focus);
-        } else if let Some(recent_n) = filter.recent_limit.filter(|&n| n > 0) {
-            let recent_cap = i64::try_from(recent_n).unwrap_or(50);
-            let recent_ids = sqlx::query_scalar!(
-                r#"SELECT entry_id as "entry_id!"
+        }
+        Ok(resolved)
+    }
+
+    /// Returns up to `limit` most recently consumed entry IDs ordered newest-first.
+    pub async fn load_recent_consumed_entry_ids(&self, limit: usize) -> CatalogResult<Vec<String>> {
+        let recent_cap = i64::try_from(limit).unwrap_or(50);
+        let recent_ids = sqlx::query_scalar!(
+            r#"SELECT entry_id as "entry_id!"
                    FROM consumption_log
                    WHERE status = 'consumed'
                    GROUP BY entry_id
                    ORDER BY MAX(strftime('%Y-%m-%dT%H:%M:%fZ', ts)) DESC
                    LIMIT ?"#,
-                recent_cap,
-            )
-            .fetch_all(self.pool)
-            .await?;
-            if !recent_ids.is_empty() {
-                seed_pool = Some(recent_ids);
-            }
-        }
-
-        let by_id: HashMap<String, CatalogEntry> =
-            members.into_iter().map(|e| (e.id.clone(), e)).collect();
-
-        let max_k = if filter.max_k == 0 { MAX_K_DEFAULT } else { filter.max_k };
-        let force_random = seed_pool.is_none()
-            && filter.iteration > 0
-            && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
-
-        let mut cluster_entries: Vec<CatalogEntry> = {
-            let mut rng = rand::rng();
-            let cluster_ids = select_cluster(
-                &scores,
-                &member_ids,
-                max_k,
-                force_random,
-                seed_pool.as_deref(),
-                &mut rng,
-            );
-            cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
-        };
-
-        if cluster_entries.len() >= 2 && is_covered(&cluster_entries) {
-            if filter.focus_ids.is_empty() && max_covered_retries > 0 {
-                let mut rng = rand::rng();
-                for _ in 0..max_covered_retries {
-                    let cand_ids = select_cluster(
-                        &scores,
-                        &member_ids,
-                        max_k,
-                        true,
-                        seed_pool.as_deref(),
-                        &mut rng,
-                    );
-                    let cand: Vec<CatalogEntry> =
-                        cand_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
-                    if cand.len() >= 2 && !is_covered(&cand) {
-                        cluster_entries = cand;
-                        break;
-                    }
-                }
-            }
-            if is_covered(&cluster_entries) {
-                cluster_entries.clear();
-            }
-        }
-
-        let summary = CollectionSummary {
-            id: raw_col.id,
-            slug: raw_col.slug,
-            title: raw_col.title,
-            summary: raw_col.summary,
-            kind: raw_col.kind,
-            mode: raw_col.mode,
-            role: raw_col.collection_role,
-            rule_json: raw_col.rule_json,
-            show_in_lists: raw_col.show_in_lists,
-            color: raw_col.color,
-            member_count: total_member_count,
-            comparison_count: relevant_comparison_count,
-            has_generator: raw_col.has_generator,
-            created_at: raw_col.created_at,
-            updated_at: raw_col.updated_at,
-        };
-        Ok((summary, cluster_entries, scores))
+            recent_cap,
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(recent_ids)
     }
 
-    pub(super) async fn load_orderings_for_scope(
+    /// Loads comparison orderings for a priority collection scope (`Some(id)`) or global scope (`None`).
+    pub async fn load_orderings_for_scope(
         &self,
         scope_collection_id: Option<&str>,
     ) -> CatalogResult<Vec<Vec<Vec<String>>>> {
@@ -436,20 +263,5 @@ impl CatalogRepo<'_> {
             .into_iter()
             .filter_map(|j| serde_json::from_str::<Vec<Vec<String>>>(&j).ok())
             .collect())
-    }
-}
-
-async fn run_infer_scores(
-    member_ids: Vec<String>,
-    orderings: Vec<Vec<Vec<String>>>,
-) -> CatalogResult<HashMap<String, Score>> {
-    if member_ids.len() >= SPAWN_BLOCKING_EP_THRESHOLD
-        || orderings.len() >= SPAWN_BLOCKING_EP_THRESHOLD
-    {
-        tokio::task::spawn_blocking(move || infer_scores(&member_ids, &orderings))
-            .await
-            .map_err(|e| CatalogError::Internal(format!("EP ranking worker failed: {e}")))
-    } else {
-        Ok(infer_scores(&member_ids, &orderings))
     }
 }

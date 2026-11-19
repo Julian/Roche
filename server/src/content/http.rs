@@ -1,24 +1,14 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use ip_network::IpNetwork;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use thiserror::Error;
-use url::{Host, Url};
+use url::Url;
 
 use super::classify::UrlClassifier;
-
-/// Typed error returned when [`SafeHttpClient::validate_url`] blocks an SSRF or disallowed URL target.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("{0}")]
-pub struct SsrfBlockedError(pub String);
+use crate::util::url_guard::{is_global_ip, validate_public_url};
 
 /// Custom DNS resolver for `reqwest` that validates every resolved IP address against
-/// [`SafeHttpClient::is_global_ip`] at socket connection time.
+/// [`is_global_ip`] at socket connection time.
 ///
 /// This eliminates both DNS-rebinding TOCTOU windows and redirect-target DNS-rebinding bypasses.
 #[derive(Debug, Default, Clone, Copy)]
@@ -37,7 +27,7 @@ impl Resolve for SafeDnsResolver {
                 )) as Box<dyn std::error::Error + Send + Sync>);
             }
             for addr in &addrs {
-                if !SafeHttpClient::is_global_ip(addr.ip()) {
+                if !is_global_ip(addr.ip()) {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!("Host '{host}' resolved to disallowed IP address {}", addr.ip()),
@@ -93,110 +83,6 @@ impl SafeHttpClient {
             .user_agent("Mozilla/5.0 (compatible; Roche/0.1)")
             .build()?;
         Ok(Self { client })
-    }
-
-    /// Parses and validates an external HTTP(S) [`Url`], rejecting SSRF targets.
-    pub fn parse_url(raw_url: &str) -> Result<Url> {
-        let parsed = Url::parse(raw_url.trim())?;
-        Self::validate_url(&parsed)?;
-        Ok(parsed)
-    }
-
-    /// Validates that a [`Url`] uses HTTP(S) on an allowed port and points to a public/global host.
-    pub fn validate_url(parsed: &Url) -> std::result::Result<(), SsrfBlockedError> {
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(SsrfBlockedError("URL scheme must be http or https".to_owned()));
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(SsrfBlockedError("URL must not contain embedded credentials".to_owned()));
-        }
-        if let Some(port) = parsed.port()
-            && !matches!(port, 80 | 443 | 8080 | 8443)
-        {
-            return Err(SsrfBlockedError(format!("Disallowed URL port: {port}")));
-        }
-
-        let Some(host) = parsed.host() else {
-            return Err(SsrfBlockedError("URL must include a valid host".to_owned()));
-        };
-
-        match host {
-            Host::Domain(domain) => {
-                let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
-                if normalized.is_empty() || !normalized.contains('.') {
-                    return Err(SsrfBlockedError(
-                        "Single-label or empty domain names are not allowed".to_owned(),
-                    ));
-                }
-                if Self::is_local_or_tailnet_domain(&normalized) {
-                    return Err(SsrfBlockedError(
-                        "Local or Tailnet domain names are not allowed".to_owned(),
-                    ));
-                }
-            }
-            Host::Ipv4(ipv4) => {
-                if !Self::is_global_ip(IpAddr::V4(ipv4)) {
-                    return Err(SsrfBlockedError(
-                        "Private, loopback, or reserved IPv4 addresses are not allowed".to_owned(),
-                    ));
-                }
-            }
-            Host::Ipv6(ipv6) => {
-                if !Self::is_global_ip(IpAddr::V6(ipv6)) {
-                    return Err(SsrfBlockedError(
-                        "Private, loopback, or reserved IPv6 addresses are not allowed".to_owned(),
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Returns `true` if a lowercased, trailing-dot-stripped domain name belongs to a
-    /// local, private, or Tailnet namespace.
-    #[must_use]
-    pub(crate) fn is_local_or_tailnet_domain(normalized_domain: &str) -> bool {
-        normalized_domain == "home.arpa"
-            || normalized_domain.ends_with(".home.arpa")
-            || normalized_domain.ends_with(".ts.net")
-            || normalized_domain.rsplit('.').next().is_some_and(|tld| {
-                matches!(tld, "localhost" | "local" | "internal" | "home" | "lan")
-            })
-    }
-
-    #[must_use]
-    pub(crate) fn is_global_ip(ip: IpAddr) -> bool {
-        if let IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return Self::is_global_ip(IpAddr::V4(v4));
-            }
-            let s = v6.segments();
-            // Deprecated IPv4-compatible (::/96, also covers :: and ::1)
-            // NAT64 Well-Known Prefix (64:ff9b::/96) and Local-Use NAT64 (64:ff9b:1::/48)
-            // SIIT IPv4-translated (::ffff:0:0/96)
-            // Discard-Only (100::/64)
-            // Teredo (2001:0000::/32)
-            // ORCHIDv2 (2001:20::/28)
-            // Documentation (2001:db8::/32)
-            // 6to4 (2002::/16) — can embed private/loopback IPv4 addresses
-            // ULA (fc00::/7), link-local (fe80::/10), deprecated site-local (fec0::/10)
-            if s[0..6] == [0, 0, 0, 0, 0, 0]
-                || (s[0] == 0x0064 && s[1] == 0xff9b)
-                || s[0..6] == [0, 0, 0, 0, 0xffff, 0]
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x2001 && s[1] == 0x0000)
-                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
-                || (s[0] == 0x2001 && s[1] == 0x0db8)
-                || s[0] == 0x2002
-                || (s[0] & 0xfe00) == 0xfc00
-                || (s[0] & 0xffc0) == 0xfe80
-                || (s[0] & 0xffc0) == 0xfec0
-            {
-                return false;
-            }
-        }
-        IpNetwork::from(ip).is_global()
     }
 
     pub async fn fetch_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
@@ -277,7 +163,7 @@ impl SafeHttpClient {
         max_bytes: usize,
         validation: FetchValidation,
     ) -> Result<Vec<u8>> {
-        Self::validate_url(url)?;
+        validate_public_url(url)?;
         let mut response = self.client.get(url.clone()).send().await?;
         let response_status = response.status();
         if !response_status.is_success() {
@@ -330,7 +216,7 @@ impl SafeHttpClient {
             if attempt.previous().len() >= 5 {
                 return attempt.error("Too many redirects");
             }
-            if let Err(err) = Self::validate_url(attempt.url()) {
+            if let Err(err) = validate_public_url(attempt.url()) {
                 return attempt.error(err);
             }
             attempt.follow()
@@ -344,45 +230,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_safe_http_client_blocks_ssrf_targets() {
-        assert!(SafeHttpClient::parse_url("https://example.com/feed.xml").is_ok());
-        assert!(SafeHttpClient::parse_url("ftp://example.com/feed.xml").is_err());
-        assert!(SafeHttpClient::parse_url("http://user:pass@example.com/feed.xml").is_err());
-        assert!(SafeHttpClient::parse_url("http://example.com:6379/").is_err());
-        assert!(SafeHttpClient::parse_url("http://localhost:8080/admin").is_err());
-        assert!(SafeHttpClient::parse_url("http://localhost.:8080/admin").is_err());
-        assert!(SafeHttpClient::parse_url("http://nas.local./").is_err());
-        assert!(SafeHttpClient::parse_url("http://home.arpa/").is_err());
-        assert!(SafeHttpClient::parse_url("http://router.home.arpa/").is_err());
-        assert!(SafeHttpClient::parse_url("http://router.home.arpa./").is_err());
-        assert!(SafeHttpClient::parse_url("http://my-node.tail1234.ts.net/").is_err());
-        assert!(SafeHttpClient::parse_url("http://singlelabel/").is_err());
-        assert!(SafeHttpClient::parse_url("http://127.0.0.1:8080/").is_err());
-        assert!(SafeHttpClient::parse_url("http://169.254.169.254/latest/meta-data").is_err());
-        assert!(SafeHttpClient::parse_url("http://192.168.1.1/").is_err());
-        assert!(SafeHttpClient::parse_url("http://192.0.2.1/").is_err());
-        assert!(SafeHttpClient::parse_url("http://198.18.0.1/").is_err());
-        assert!(SafeHttpClient::parse_url("http://100.100.100.100/").is_err());
-        assert!(SafeHttpClient::parse_url("http://100.64.0.5:8080/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[::1]:8080/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[::8.8.8.8]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[::ffff:127.0.0.1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[::ffff:0:127.0.0.1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[64:ff9b::127.0.0.1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[100::1]/").is_err());
-        assert!(
-            SafeHttpClient::parse_url("http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/").is_err()
-        );
-        assert!(SafeHttpClient::parse_url("http://[2001:20::1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[fc00::1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[fe80::1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[fec0::1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[2001:db8::1]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[2002:7f00:0001::]/").is_err());
-        assert!(SafeHttpClient::parse_url("http://[2002:c0a8:0101::1]/").is_err());
-    }
-
-    #[test]
     fn test_decode_xml_or_text_bytes_handles_utf16_bom_and_encoding_prolog() {
         let raw_xml = r#"<?xml version="1.0" encoding="utf-16"?><rss version="2.0"><channel><title>Petzold</title></channel></rss>"#;
         let mut utf16le = vec![0xFF, 0xFE];
@@ -391,7 +238,6 @@ mod tests {
         }
         let decoded = SafeHttpClient::decode_xml_or_text_bytes(&utf16le);
         assert!(decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
-        let (feed, _) = crate::feeds::RssParser::parse(&decoded).unwrap();
-        assert_eq!(feed.title, "Petzold");
+        assert!(decoded.contains("<title>Petzold</title>"));
     }
 }

@@ -1,7 +1,12 @@
 use super::models::EntryIdentifier;
-use crate::db::{
-    sync::{canonicalize_sync_url, deterministic_catalog_entry_id, deterministic_title_entry_id},
-    types::EntryKind,
+use crate::{
+    db::{
+        sync::{
+            canonicalize_sync_url, deterministic_catalog_entry_id, deterministic_title_entry_id,
+        },
+        types::EntryKind,
+    },
+    util::{media_urls::extract_arxiv_id, url_guard::decode_percent_utf8},
 };
 
 pub const EDITION_KEYWORDS: [&str; 15] = [
@@ -203,8 +208,7 @@ pub fn normalize_identifier_value(kind: EntryKind, scheme: &str, raw_value: &str
         "spotify" => normalize_spotify_identifier(kind, trimmed),
         "imdb" => normalize_imdb_identifier(trimmed),
         "wikipedia" => normalize_wikipedia_identifier(trimmed),
-        "arxiv" => crate::feeds::arxiv::ArxivParser::extract_arxiv_id(trimmed)
-            .unwrap_or_else(|| trimmed.to_owned()),
+        "arxiv" => extract_arxiv_id(trimmed).unwrap_or_else(|| trimmed.to_owned()),
         _ => trimmed.to_owned(),
     }
 }
@@ -284,34 +288,6 @@ fn normalize_wikipedia_identifier(raw: &str) -> String {
         }
     }
     decode_percent_utf8(raw).replace(' ', "_")
-}
-
-fn decode_percent_utf8(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
-        {
-            out.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.replace("%20", "_"))
-}
-
-const fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Strips trailing bracketed/parenthesized edition suffixes (e.g. `(Deluxe Edition)`, `[2019 Remaster]`).

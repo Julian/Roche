@@ -20,15 +20,16 @@ pub struct ItemDeleteOutcome {
 }
 use crate::{
     db::{
-        ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, EntryKind, InboxState,
-        ItemStatus, MediaRepo, ReadAtPatch, SyncRepo, Tag, TagRepo,
+        ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
+        ConsumptionLogView, ConsumptionStatus, EntryKind, InboxState, ItemStatus, MediaRepo,
+        ReadAtPatch, SyncRepo, Tag, TagRepo,
         feeds::resolve_dedup_entry_id,
         sync::{
             STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID,
             canonicalize_sync_url, deterministic_item_id, item_natural_key,
         },
     },
-    feeds::arxiv::ArxivParser,
+    util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
 /// Auto-logs feed / reader completion (`consumed`) when:
@@ -130,7 +131,7 @@ impl ItemRepo<'_> {
         let url_str = new_item.url.as_str();
         let id = deterministic_item_id(feed_url.as_deref(), url_str);
         let canon_url = canonicalize_sync_url(url_str);
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let entry_kind = EntryKind::from_content_type(new_item.content_type);
         let creators_json = new_item
             .author
@@ -279,8 +280,8 @@ impl ItemRepo<'_> {
         let trimmed_title = input.title.trim();
         let det_item_id = deterministic_item_id(None, url_str);
         let canon_url = canonicalize_sync_url(url_str);
-        let arxiv_id = ArxivParser::extract_arxiv_id(url_str);
-        let now = SyncRepo::now_utc();
+        let arxiv_id = extract_arxiv_id(url_str);
+        let now = now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
         let entry_kind = EntryKind::from_content_type(input.content_type);
         let mut tx = crate::db::begin_write(self.pool).await?;
@@ -530,7 +531,6 @@ impl ItemRepo<'_> {
         Ok((item, attached_tags))
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn update(
         &self,
         id: &str,
@@ -539,10 +539,83 @@ impl ItemRepo<'_> {
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
     ) -> Result<bool> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let found =
+            Self::update_in_tx(&mut tx, id, status, is_favorite, read_progress, read_at, now, true)
+                .await?;
+        if found {
+            tx.commit().await?;
+        }
+        Ok(found)
+    }
+
+    /// Atomically marks a live reader item finished (`Archived`, `read_progress = 1.0`, `read_at = now`)
+    /// and logs a `'consumed'` diary entry inside a single SQLite write transaction.
+    ///
+    /// Returns `Ok(None)` if `id` is not a live reader item, or `Ok(Some((has_feed, logged)))`.
+    pub async fn finish_reader_item(
+        &self,
+        id: &str,
+        notes: Option<&str>,
+    ) -> CatalogResult<Option<(bool, ConsumptionLogView)>> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
+        let has_feed = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM collection_entries ce
+             JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+             WHERE ce.entry_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            Some(ItemStatus::Archived),
+            None,
+            Some(1.0),
+            ReadAtPatch::MarkRead(now),
+            now,
+            false,
+        )
+        .await?;
+        if !found {
+            return Ok(None);
+        }
+
+        let (log_id, canon_id) = CatalogRepo::log_consumption_in_tx(
+            &mut tx,
+            id,
+            ConsumptionStatus::Consumed,
+            notes,
+            now,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let logged =
+            CatalogRepo::new(self.pool).load_consumption_log_view(&log_id, &canon_id).await?;
+        Ok(Some((has_feed, logged)))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn update_in_tx(
+        tx: &mut SqliteConnection,
+        id: &str,
+        status: Option<ItemStatus>,
+        is_favorite: Option<bool>,
+        read_progress: Option<f64>,
+        read_at: ReadAtPatch,
+        now: DateTime<Utc>,
+        allow_auto_log: bool,
+    ) -> std::result::Result<bool, sqlx::Error> {
         type ExistingItemStateTuple =
             (EntryKind, InboxState, bool, bool, f64, Option<DateTime<Utc>>);
-        let now = SyncRepo::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let mut check_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.kind,
@@ -669,11 +742,11 @@ impl ItemRepo<'_> {
             .await?;
 
         if fav_changed {
-            set_favorite_membership_in_tx(&mut tx, id, target_favorite, now).await?;
+            set_favorite_membership_in_tx(tx, id, target_favorite, now).await?;
         }
         if wtr_changed {
             set_collection_flag_membership_in_tx(
-                &mut tx,
+                tx,
                 WANT_TO_READ_COLLECTION_ID,
                 id,
                 target_in_wtr,
@@ -682,38 +755,40 @@ impl ItemRepo<'_> {
             .await?;
         }
 
-        let completion_signal = if target_status == ItemStatus::Archived {
-            InboxState::Dismissed
-        } else {
-            InboxState::Unread
-        };
-        maybe_auto_log_feed_completion_in_tx(
-            &mut tx,
-            id,
-            entry_kind,
-            completion_signal,
-            target_progress,
-            target_read_at.unwrap_or(now),
-        )
-        .await?;
+        if allow_auto_log {
+            let completion_signal = if target_status == ItemStatus::Archived {
+                InboxState::Dismissed
+            } else {
+                InboxState::Unread
+            };
+            maybe_auto_log_feed_completion_in_tx(
+                tx,
+                id,
+                entry_kind,
+                completion_signal,
+                target_progress,
+                target_read_at.unwrap_or(now),
+            )
+            .await?;
+        }
 
         if status_changed {
             let action = match target_status {
                 ItemStatus::Archived => ActivityAction::Archive,
                 ItemStatus::Unread => ActivityAction::Unarchive,
             };
-            SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
         if fav_changed {
             let action =
                 if target_favorite { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
-            SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
         if (read_at_changed && !status_changed) || progress_changed {
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::Item,
                 id,
                 ActivityAction::Update,
@@ -722,7 +797,6 @@ impl ItemRepo<'_> {
             .await?;
         }
 
-        tx.commit().await?;
         Ok(true)
     }
 
@@ -934,7 +1008,7 @@ impl ItemRepo<'_> {
     }
 
     pub(crate) async fn delete_returning_outcome(&self, id: &str) -> Result<ItemDeleteOutcome> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let mut key_qb = QueryBuilder::<Sqlite>::new(
@@ -1012,7 +1086,7 @@ impl ItemRepo<'_> {
         }
 
         let creators_ref = new_creators_json.as_deref();
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let live: Option<i64> = sqlx::query_scalar(
@@ -1110,7 +1184,7 @@ impl ItemRepo<'_> {
 
         let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
         let creators_ref = new_creators_json.as_deref();
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let result = sqlx::query!(
             "UPDATE entries

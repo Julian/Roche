@@ -24,15 +24,18 @@ use super::{
     },
 };
 use crate::{
-    content::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, is_direct_audio_url},
+    content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
         ConsumptionStatus, ContentType, EntryKind, FeedRepo, FeedType, HexColor, InboxState,
         ItemRepo, MediaRepo, PollItemCandidate, UpsertEntryInput,
         feeds::{NewFeedRow, entry_kind_for_feed_type, resolve_dedup_entry_id},
     },
-    feeds::arxiv::ArxivParser,
     ranking::validate_ordering,
+    util::{
+        media_urls::{extract_arxiv_id, is_direct_audio_url},
+        url_guard::parse_public_url,
+    },
 };
 
 type ExistingFeedTuple =
@@ -85,7 +88,7 @@ impl PreparedSyncEntry {
             .filter(|s| !s.is_empty())
             .map(canonicalize_sync_url)
             .filter(|s| !s.is_empty());
-        let arxiv_id = rec.url.as_deref().and_then(ArxivParser::extract_arxiv_id);
+        let arxiv_id = rec.url.as_deref().and_then(extract_arxiv_id);
 
         let raw_html = rec.content.as_ref().and_then(|c| c.content_html.as_deref());
         let clean_html = raw_html
@@ -114,7 +117,7 @@ impl PreparedSyncEntry {
             .filter(|s| !s.is_empty())
             .and_then(|u| {
                 HtmlSanitizer::resolve_and_validate_thumbnail_url(u, parsed_url.as_ref())
-                    .or_else(|| SafeHttpClient::parse_url(u).ok().map(String::from))
+                    .or_else(|| parse_public_url(u).ok().map(String::from))
             })
             .or_else(|| {
                 clean_html.as_deref().and_then(|h| {

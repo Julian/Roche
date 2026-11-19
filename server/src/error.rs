@@ -10,7 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::content::SsrfBlockedError;
+use crate::{service::AppError, util::url_guard::SsrfBlockedError};
 
 /// RFC 9457 §4.2.1 blank problem type URI for generic HTTP status responses.
 pub const PROBLEM_TYPE_BLANK: &str = "about:blank";
@@ -427,6 +427,33 @@ impl From<QueryRejection> for ApiError {
 impl From<PathRejection> for ApiError {
     fn from(rejection: PathRejection) -> Self {
         Self::BadRequest(rejection.body_text())
+    }
+}
+
+impl From<AppError> for ApiError {
+    fn from(err: AppError) -> Self {
+        match err {
+            AppError::BadRequest(msg) => Self::bad_request(msg),
+            AppError::Unauthorized(msg) => Self::unauthorized(msg),
+            AppError::TokenInvalid(msg) => Self::token_invalid(msg),
+            AppError::PairingCodeInvalid(msg) => Self::pairing_code_invalid(msg),
+            AppError::PairingRateLimited { detail, retry_after_seconds } => {
+                Self::pairing_rate_limited(detail, retry_after_seconds)
+            }
+            AppError::NotFound(msg) => Self::not_found(msg),
+            AppError::Conflict(msg) => Self::conflict(msg),
+            AppError::AmbiguousLookup { detail, candidates } => {
+                Self::ambiguous_lookup(detail, candidates)
+            }
+            AppError::ImmutableCollection(msg) => Self::immutable_collection(msg),
+            AppError::SsrfBlocked(msg) => Self::ssrf_blocked(msg),
+            AppError::PayloadTooLarge { detail, max_bytes } => {
+                Self::PayloadTooLarge { detail, max_bytes }
+            }
+            AppError::BadGateway(msg) => Self::bad_gateway(msg),
+            AppError::Database(err) => Self::Database(err),
+            AppError::Internal(err) => Self::Internal(err),
+        }
     }
 }
 

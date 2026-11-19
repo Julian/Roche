@@ -7,13 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::{
         CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter,
-        CollectionGeneratorState, CollectionRole, CollectionSummary, ComparisonRecord,
-        ConsumptionLogView, ConsumptionStatus, EntryDetailView, EntryKind, RankedCollectionView,
-        UpsertEntryInput,
+        CollectionGeneratorState, CollectionSummary, ComparisonRecord, ConsumptionLogView,
+        EntryDetailView, RankedCollectionView, UpsertEntryInput,
     },
+    domain::{CollectionRole, ConsumptionStatus, EntryKind},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
     ranking::Score,
-    scheduler::FeedFetcher,
     service::RocheService,
 };
 
@@ -152,16 +151,16 @@ pub(super) struct GeneratorAdvanceResponse {
     generator: CollectionGeneratorState,
 }
 
-pub(super) async fn catalog_lists<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_lists(
+    State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<ListsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let collections = service.catalog().list_collections(q.include_want, q.include_system).await?;
     Ok(Json(serde_json::json!({ "collections": collections })))
 }
 
-pub(super) async fn catalog_lists_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_lists_create(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<CreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<CollectionSummary>), ApiError> {
     let created = service
@@ -177,8 +176,8 @@ pub(super) async fn catalog_lists_create<F: FeedFetcher>(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-pub(super) async fn catalog_list_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemQuery(q): ProblemQuery<RankedListQuery>,
 ) -> Result<Json<RankedCollectionView>, ApiError> {
@@ -186,8 +185,8 @@ pub(super) async fn catalog_list_get<F: FeedFetcher>(
     Ok(Json(view))
 }
 
-pub(super) async fn catalog_list_add_entry<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_add_entry(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<AddCollectionEntryRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -195,8 +194,8 @@ pub(super) async fn catalog_list_add_entry<F: FeedFetcher>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn catalog_list_remove_entry<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_remove_entry(
+    State(service): State<Arc<RocheService>>,
     ProblemPath((slug_or_id, entry_id)): ProblemPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     if !service.catalog().remove_collection_entry(&slug_or_id, &entry_id).await? {
@@ -205,8 +204,8 @@ pub(super) async fn catalog_list_remove_entry<F: FeedFetcher>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn catalog_entries_search<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_entries_search(
+    State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<SearchEntriesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let kind = match q.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -220,16 +219,16 @@ pub(super) async fn catalog_entries_search<F: FeedFetcher>(
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
-pub(super) async fn catalog_entries_upsert<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_entries_upsert(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(input): ProblemJson<UpsertEntryInput>,
 ) -> Result<(StatusCode, Json<CatalogEntry>), ApiError> {
     let entry = service.catalog().upsert_entry(&input).await?;
     Ok((StatusCode::CREATED, Json(entry)))
 }
 
-pub(super) async fn catalog_entry_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_entry_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<EntryDetailView>, ApiError> {
     let detail = service
@@ -240,8 +239,8 @@ pub(super) async fn catalog_entry_get<F: FeedFetcher>(
     Ok(Json(detail))
 }
 
-pub(super) async fn catalog_entry_merge<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_entry_merge(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<MergeEntryRequest>,
 ) -> Result<Json<CatalogEntry>, ApiError> {
@@ -249,62 +248,50 @@ pub(super) async fn catalog_entry_merge<F: FeedFetcher>(
     Ok(Json(merged))
 }
 
-pub(super) async fn catalog_diary_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_diary_list(
+    State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<DiaryQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let entries = service.catalog().list_diary(q.year, q.status, q.limit.unwrap_or(100)).await?;
     Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
-pub(super) async fn catalog_log_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_log_create(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<LogConsumptionRequest>,
 ) -> Result<(StatusCode, Json<ConsumptionLogView>), ApiError> {
-    let target_entry_id =
-        if let Some(eid) = req.entry_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            eid.to_owned()
-        } else if let Some(ref inline_entry) = req.entry {
-            service.catalog().upsert_entry(inline_entry).await?.id
-        } else {
-            return Err(ApiError::bad_request(
-                "Provide either `entry_id` or inline `entry` to log consumption",
-            ));
-        };
-
     let logged = service
         .catalog()
-        .log_consumption(&target_entry_id, req.status, req.notes.as_deref(), req.ts)
+        .log_entry_resolved_or_upsert(
+            req.entry_id.as_deref(),
+            req.entry.as_ref(),
+            req.status,
+            req.notes.as_deref(),
+            req.ts,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(logged)))
 }
 
-pub(super) async fn catalog_want_add<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_want_add(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<WantEntryRequest>,
 ) -> Result<(StatusCode, Json<WantEntryResponse>), ApiError> {
-    let has_explicit_metadata = req.entry.id.is_some()
-        || req.entry.url.is_some()
-        || !req.entry.identifiers.is_empty()
-        || !req.entry.creators.is_empty()
-        || req.entry.release_year.is_some();
-    let (queue, entry) = service
-        .catalog()
-        .want_resolved_or_upsert(&req.entry, has_explicit_metadata, None, req.queue.as_deref())
-        .await?;
+    let (queue, entry) =
+        service.catalog().want_resolved_or_upsert(&req.entry, None, req.queue.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(WantEntryResponse { queue, entry })))
 }
 
-pub(super) async fn catalog_want_remove<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_want_remove(
+    State(service): State<Arc<RocheService>>,
     ProblemPath((queue, entry_id_or_query)): ProblemPath<(String, String)>,
 ) -> Result<Json<CatalogEntry>, ApiError> {
     let removed = service.catalog().unwant_entry(&queue, &entry_id_or_query).await?;
     Ok(Json(removed))
 }
 
-pub(super) async fn catalog_rank_cluster<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_rank_cluster(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemQuery(q): ProblemQuery<ClusterQuery>,
 ) -> Result<Json<ClusterResponse>, ApiError> {
@@ -324,8 +311,8 @@ pub(super) async fn catalog_rank_cluster<F: FeedFetcher>(
     Ok(Json(ClusterResponse { collection, cluster, scores }))
 }
 
-pub(super) async fn catalog_comparisons_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_comparisons_create(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<CreateComparisonRequest>,
 ) -> Result<(StatusCode, Json<ComparisonRecord>), ApiError> {
     let record = service
@@ -335,32 +322,32 @@ pub(super) async fn catalog_comparisons_create<F: FeedFetcher>(
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-pub(super) async fn catalog_batch_apply<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_batch_apply(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(batch): ProblemJson<CatalogBatchInput>,
 ) -> Result<Json<CatalogBatchResult>, ApiError> {
     let result = service.catalog().apply_batch(&batch).await?;
     Ok(Json(result))
 }
 
-pub(super) async fn catalog_generators_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_generators_list(
+    State(service): State<Arc<RocheService>>,
     ProblemQuery(q): ProblemQuery<GeneratorsListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let generators = service.catalog().list_collection_generators(q.enabled).await?;
     Ok(Json(serde_json::json!({ "generators": generators })))
 }
 
-pub(super) async fn catalog_list_generator_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_generator_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
 ) -> Result<Json<CollectionGeneratorState>, ApiError> {
     let state = service.catalog().get_collection_generator(&slug_or_id).await?;
     Ok(Json(state))
 }
 
-pub(super) async fn catalog_list_generator_patch<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_generator_patch(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorUpdateRequest>,
 ) -> Result<Json<CollectionGeneratorState>, ApiError> {
@@ -376,16 +363,16 @@ pub(super) async fn catalog_list_generator_patch<F: FeedFetcher>(
     Ok(Json(state))
 }
 
-pub(super) async fn catalog_list_generator_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_generator_delete(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let _ = service.catalog().remove_collection_generator(&slug_or_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn catalog_list_generator_finish<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_generator_finish(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorAdvanceRequest>,
 ) -> Result<Json<GeneratorAdvanceResponse>, ApiError> {
@@ -394,8 +381,8 @@ pub(super) async fn catalog_list_generator_finish<F: FeedFetcher>(
     Ok(Json(GeneratorAdvanceResponse { completed_entry, generator }))
 }
 
-pub(super) async fn catalog_list_generator_abandon<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn catalog_list_generator_abandon(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(slug_or_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<GeneratorAdvanceRequest>,
 ) -> Result<Json<GeneratorAdvanceResponse>, ApiError> {

@@ -11,9 +11,13 @@ use url::Url;
 
 use crate::{
     config::MediaConfig,
-    db::{Media, MediaRepo, MediaType},
-    feeds::YouTubeParser,
+    db::{Media, MediaRepo},
+    domain::MediaType,
     media::MediaStore,
+    util::{
+        fs_perms::{ensure_private_dir, tighten_private_file_if_exists},
+        media_urls::canonical_youtube_watch_url,
+    },
 };
 
 const YTDLP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -70,7 +74,7 @@ impl YtDlpWorker {
         max_video_size_mb: u64,
     ) -> Result<Vec<String>> {
         Self::validate_item_id(item_id)?;
-        let canonical_url = YouTubeParser::canonical_watch_url(url)
+        let canonical_url = canonical_youtube_watch_url(url)
             .ok_or_else(|| anyhow::anyhow!("URL is not a valid YouTube watch URL: {url}"))?;
         let output_template = output_dir.join("video.%(ext)s");
         let template_str = output_template
@@ -138,9 +142,9 @@ impl YtDlpWorker {
         let args =
             Self::build_args_with_limit(item_id, url, &staging_dir, self.config.max_video_size_mb)?;
 
-        MediaStore::ensure_private_dir(self.media_store.base_dir()).await?;
-        MediaStore::ensure_private_dir(&base_downloads).await?;
-        MediaStore::ensure_private_dir(&staging_dir).await?;
+        ensure_private_dir(self.media_store.base_dir()).await?;
+        ensure_private_dir(&base_downloads).await?;
+        ensure_private_dir(&staging_dir).await?;
         let verified_staging_dir = self.media_store.validate_path_async(&staging_dir).await?;
 
         let result = self
@@ -349,9 +353,9 @@ impl YtDlpWorker {
             );
         }
 
-        MediaStore::tighten_private_file_if_exists(&video_path).await;
+        tighten_private_file_if_exists(&video_path).await;
         if let Some((ref thumb_path, _)) = thumbnail_file {
-            MediaStore::tighten_private_file_if_exists(thumb_path).await;
+            tighten_private_file_if_exists(thumb_path).await;
         }
 
         Ok(ValidatedDownload { video_path, video_size, thumbnail_file, duration, metadata })
@@ -411,7 +415,10 @@ impl YtDlpWorker {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::db::{ContentType, Db, NewItem};
+    use crate::{
+        db::{Db, NewItem},
+        domain::ContentType,
+    };
 
     #[test]
     fn test_build_args_enforces_canonical_youtube_url_and_safe_item_id() {

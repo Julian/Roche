@@ -299,7 +299,7 @@ impl CatalogRepo<'_> {
             return Err(CatalogError::InvalidInput("Entry title cannot be empty".to_owned()));
         }
 
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let entry_id = Self::upsert_entry_in_tx(&mut tx, input, kind, title, now).await?;
         tx.commit().await?;
@@ -334,7 +334,7 @@ impl CatalogRepo<'_> {
             if !val.is_empty() && seen_idents.insert(("url".to_owned(), val.clone())) {
                 normalized_idents.push(EntryIdentifier { scheme: "url".to_owned(), value: val });
             }
-            if let Some(arxiv_id) = crate::feeds::arxiv::ArxivParser::extract_arxiv_id(u) {
+            if let Some(arxiv_id) = crate::util::media_urls::extract_arxiv_id(u) {
                 let norm_arxiv = normalize_identifier_value(kind, "arxiv", &arxiv_id);
                 if !norm_arxiv.is_empty()
                     && seen_idents.insert(("arxiv".to_owned(), norm_arxiv.clone()))

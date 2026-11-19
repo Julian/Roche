@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 mod content;
 pub mod db;
+pub mod domain;
 mod error;
 mod feeds;
 mod media;
@@ -12,6 +13,7 @@ mod scheduler;
 mod service;
 pub mod tailscale;
 mod tui_rank;
+mod util;
 mod web;
 mod workers;
 
@@ -146,8 +148,8 @@ impl RocheServer {
         }
     }
 
-    async fn maybe_issue_bootstrap_code<F: scheduler::FeedFetcher>(
-        roche_service: &service::RocheService<F>,
+    async fn maybe_issue_bootstrap_code(
+        roche_service: &service::RocheService,
         canonical_url: Option<&str>,
         pairing_code_ttl: u64,
     ) {
@@ -161,8 +163,8 @@ impl RocheServer {
         .await;
     }
 
-    async fn maybe_issue_bootstrap_code_with_tty<F: scheduler::FeedFetcher>(
-        roche_service: &service::RocheService<F>,
+    async fn maybe_issue_bootstrap_code_with_tty(
+        roche_service: &service::RocheService,
         canonical_url: Option<&str>,
         pairing_code_ttl: u64,
         stderr_is_tty: bool,
@@ -259,7 +261,7 @@ impl RocheServer {
         let service = Self::connect_service(cfg).await?;
         match service.auth().revoke_device(device_id).await {
             Ok(()) => Ok(true),
-            Err(error::ApiError::NotFound(_)) => Ok(false),
+            Err(service::AppError::NotFound(_)) => Ok(false),
             Err(other) => Err(other.into()),
         }
     }

@@ -4,9 +4,9 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 
 use crate::{
-    db::{HexColor, Tag},
+    db::Tag,
+    domain::HexColor,
     error::{ApiError, ProblemJson, ProblemPath},
-    scheduler::FeedFetcher,
     service::RocheService,
 };
 
@@ -22,23 +22,23 @@ pub(super) struct UpdateTagRequest {
     color: Option<HexColor>,
 }
 
-pub(super) async fn tags_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn tags_list(
+    State(service): State<Arc<RocheService>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tags = service.tags().list().await?;
     Ok(Json(serde_json::json!({ "tags": tags })))
 }
 
-pub(super) async fn tags_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn tags_create(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<CreateTagRequest>,
 ) -> Result<(StatusCode, Json<Tag>), ApiError> {
     let tag = service.tags().create(&req.name, req.color.as_ref()).await?;
     Ok((StatusCode::CREATED, Json(tag)))
 }
 
-pub(super) async fn tags_update<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn tags_update(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<UpdateTagRequest>,
 ) -> Result<Json<Tag>, ApiError> {
@@ -46,8 +46,8 @@ pub(super) async fn tags_update<F: FeedFetcher>(
     Ok(Json(updated))
 }
 
-pub(super) async fn tags_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn tags_delete(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<StatusCode, ApiError> {
     service.tags().delete(&id).await?;

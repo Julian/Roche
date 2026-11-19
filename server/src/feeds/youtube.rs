@@ -6,7 +6,10 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::extract_entry_timestamp;
-use crate::content::{SafeHttpClient, xml_util};
+use crate::{
+    content::xml_util,
+    util::{media_urls, url_guard::parse_public_url},
+};
 
 #[derive(Debug, Clone)]
 pub struct YouTubeFeed {
@@ -25,54 +28,32 @@ pub struct YouTubeVideo {
 pub struct YouTubeParser;
 
 impl YouTubeParser {
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_youtube_host(host: Option<&str>) -> bool {
-        matches!(host, Some("youtube.com" | "www.youtube.com" | "m.youtube.com"))
+        media_urls::is_youtube_host(host)
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_youtube_feed_url(url: &Url) -> bool {
-        Self::is_youtube_host(url.host_str()) && url.path() == "/feeds/videos.xml"
+        media_urls::is_youtube_feed_url(url)
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn extract_video_id(url: &Url) -> Option<String> {
-        let host = url.host_str()?;
-        if Self::is_youtube_host(Some(host)) {
-            if url.path() == "/watch" {
-                for (key, value) in url.query_pairs() {
-                    if key == "v" && Self::is_valid_video_id(&value) {
-                        return Some(value.into_owned());
-                    }
-                }
-            } else if let Some(mut segments) = url.path_segments()
-                && let Some(prefix) = segments.next()
-                && matches!(prefix, "shorts" | "embed" | "v")
-                && let Some(candidate) = segments.next()
-                && Self::is_valid_video_id(candidate)
-            {
-                return Some(candidate.to_string());
-            }
-        } else if host.eq_ignore_ascii_case("youtu.be")
-            && let Some(mut segments) = url.path_segments()
-            && let Some(candidate) = segments.next()
-            && Self::is_valid_video_id(candidate)
-        {
-            return Some(candidate.to_string());
-        }
-        None
+        media_urls::extract_youtube_video_id(url)
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn canonical_watch_url(url: &Url) -> Option<Url> {
-        let video_id = Self::extract_video_id(url)?;
-        Url::parse(&format!("https://www.youtube.com/watch?v={video_id}")).ok()
+        media_urls::canonical_youtube_watch_url(url)
     }
 
     pub fn feed_url_for_channel_id(channel_id: &str) -> Result<Url> {
-        SafeHttpClient::parse_url(&format!(
-            "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        ))
+        media_urls::youtube_feed_url_for_channel_id(channel_id)
     }
 
     pub fn parse(content: &str) -> Result<YouTubeFeed> {
@@ -88,14 +69,13 @@ impl YouTubeParser {
                 let published_at = extract_entry_timestamp(&entry);
                 let video_id =
                     entry.id.strip_prefix("yt:video:").unwrap_or(&entry.id).trim().to_string();
-                if !Self::is_valid_video_id(&video_id) {
+                if !media_urls::is_valid_youtube_video_id(&video_id) {
                     return None;
                 }
 
-                let watch_url = SafeHttpClient::parse_url(&format!(
-                    "https://www.youtube.com/watch?v={video_id}"
-                ))
-                .ok()?;
+                let watch_url =
+                    parse_public_url(&format!("https://www.youtube.com/watch?v={video_id}"))
+                        .ok()?;
                 let title = entry.title.map_or_default(|t| t.content);
 
                 let mut description = entry
@@ -120,49 +100,7 @@ impl YouTubeParser {
 
     #[must_use]
     pub fn extract_channel_id(input: &str) -> Option<String> {
-        let trimmed = input.trim();
-
-        // Direct channel ID: starts with UC, 24 chars, valid YouTube ID alphabet
-        if Self::is_valid_channel_id(trimmed) {
-            return Some(trimmed.to_string());
-        }
-
-        let parsed = Url::parse(trimmed).ok()?;
-        if !Self::is_youtube_host(parsed.host_str()) {
-            return None;
-        }
-
-        // URL with channel_id= query parameter
-        for (key, value) in parsed.query_pairs() {
-            if key == "channel_id" && Self::is_valid_channel_id(&value) {
-                return Some(value.into_owned());
-            }
-        }
-
-        // /channel/UC... path
-        let mut segments = parsed.path_segments()?;
-        while let Some(seg) = segments.next() {
-            if seg == "channel"
-                && let Some(candidate) = segments.next()
-                && Self::is_valid_channel_id(candidate)
-            {
-                return Some(candidate.to_string());
-            }
-        }
-
-        None
-    }
-
-    fn is_valid_channel_id(candidate: &str) -> bool {
-        candidate.len() == 24
-            && candidate.starts_with("UC")
-            && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }
-
-    fn is_valid_video_id(candidate: &str) -> bool {
-        !candidate.is_empty()
-            && candidate.len() <= 64
-            && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        media_urls::extract_youtube_channel_id(input)
     }
 
     fn extract_all_media_descriptions(xml: &str) -> HashMap<String, String> {
@@ -204,7 +142,7 @@ impl YouTubeParser {
                 },
                 Ok(Event::End(tag)) if tag.name().as_ref() == "entry" => {
                     if let (Some(vid), Some(desc)) = (current_video_id.take(), current_desc.take())
-                        && Self::is_valid_video_id(&vid)
+                        && media_urls::is_valid_youtube_video_id(&vid)
                     {
                         map.insert(vid, desc);
                     }
