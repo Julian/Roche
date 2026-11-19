@@ -461,6 +461,8 @@ impl CatalogRepo<'_> {
         .await?;
         let removed = res.rows_affected() > 0;
         if removed {
+            Self::advance_generator_if_drawing_in_tx(&mut tx, &col.id, &target_entry_id, now)
+                .await?;
             let nat_key = collection_entry_natural_key(&col.id, &target_entry_id);
             SyncRepo::record_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key, now)
                 .await?;

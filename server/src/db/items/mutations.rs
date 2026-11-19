@@ -738,25 +738,37 @@ impl ItemRepo<'_> {
         conn: &mut SqliteConnection,
         entry_id: &str,
     ) -> std::result::Result<bool, sqlx::Error> {
-        let quoted_id_pattern = format!("%\"{entry_id}\"%");
-        let preserved: Option<i64> = sqlx::query_scalar!(
-            "SELECT 1 AS \"found!: i64\"
+        let non_comp_preserved: Option<i64> = sqlx::query_scalar(
+            "SELECT 1
              WHERE EXISTS (SELECT 1 FROM consumption_log WHERE entry_id = ?)
-                OR EXISTS (SELECT 1 FROM comparisons WHERE ordering_json LIKE ?)
                 OR EXISTS (
                     SELECT 1 FROM collection_entries ce
                     JOIN collection_specs cs ON cs.collection_id = ce.collection_id
                     WHERE ce.entry_id = ? AND cs.collection_role IN ('list', 'want')
                 )
                 OR EXISTS (SELECT 1 FROM collection_generators WHERE current_entry_id = ?)",
-            entry_id,
-            quoted_id_pattern,
-            entry_id,
-            entry_id,
         )
+        .bind(entry_id)
+        .bind(entry_id)
+        .bind(entry_id)
         .fetch_optional(&mut *conn)
         .await?;
-        Ok(preserved.is_some())
+        if non_comp_preserved.is_some() {
+            return Ok(true);
+        }
+
+        let quoted_id_pattern = crate::db::json_string_like_pattern(entry_id);
+        let candidate_orderings: Vec<String> = sqlx::query_scalar(
+            "SELECT ordering_json FROM comparisons WHERE ordering_json LIKE ? ESCAPE '\\'",
+        )
+        .bind(&quoted_id_pattern)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(candidate_orderings.iter().any(|raw| {
+            serde_json::from_str::<Vec<Vec<String>>>(raw)
+                .ok()
+                .is_some_and(|groups| groups.iter().flatten().any(|id| id == entry_id))
+        }))
     }
 
     /// Removes an item from Inbox (or deletes a saved item) while preserving its `entries` record
@@ -905,13 +917,13 @@ impl ItemRepo<'_> {
     pub(crate) async fn delete_inbox_item_preserving_history_in_tx(
         conn: &mut SqliteConnection,
         item_id: &str,
-        detach_feed_sources: bool,
+        detach_want_queues: bool,
         now: DateTime<Utc>,
     ) -> std::result::Result<bool, sqlx::Error> {
         Ok(Self::delete_inbox_item_preserving_history_outcome_in_tx(
             conn,
             item_id,
-            detach_feed_sources,
+            detach_want_queues,
             now,
         )
         .await?

@@ -557,3 +557,320 @@ async fn test_merge_entries_rejects_collection_target_and_indirect_cycles() {
         "CatalogRepo::upsert_entry must extract normalized arxiv identifier from arXiv URL"
     );
 }
+
+#[tokio::test]
+async fn test_remove_collection_entry_advances_or_clears_generator() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let col = catalog
+        .create_manual_collection(
+            "Removal Pool",
+            Some("removal-pool"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let book1 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book 1".to_owned(),
+            parent_collection_id: Some(col.id.clone()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let book2 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book 2".to_owned(),
+            parent_collection_id: Some(col.id.clone()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    catalog.update_collection_generator(&col.id, Some(true), Some(&book1.id), None).await.unwrap();
+
+    // Removing the currently drawn entry must redraw the remaining entry
+    assert!(catalog.remove_collection_entry(&col.id, &book1.id).await.unwrap());
+    let after_first = catalog.get_collection_generator(&col.id).await.unwrap();
+    assert_eq!(after_first.current_entry.as_ref().map(|e| e.id.as_str()), Some(book2.id.as_str()));
+
+    // Removing the last entry must clear current_entry_id to None
+    assert!(catalog.remove_collection_entry(&col.id, &book2.id).await.unwrap());
+    let after_second = catalog.get_collection_generator(&col.id).await.unwrap();
+    assert!(after_second.current_entry.is_none());
+    assert!(after_second.drawn_at.is_none());
+
+    // Disabled generator holding an entry must also clear on removal
+    let book3 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book 3".to_owned(),
+            parent_collection_id: Some(col.id.clone()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.update_collection_generator(&col.id, Some(false), Some(&book3.id), None).await.unwrap();
+    assert!(catalog.remove_collection_entry(&col.id, &book3.id).await.unwrap());
+    let after_disabled = catalog.get_collection_generator(&col.id).await.unwrap();
+    assert!(after_disabled.current_entry.is_none());
+}
+
+#[tokio::test]
+async fn test_merge_manual_collections_migrates_or_tombstones_generators() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    // Case 1: duplicate has generator, canonical has none -> migrate generator to canonical
+    let dup1 = catalog
+        .create_manual_collection(
+            "Dup List 1",
+            Some("dup-list-1"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let canon1 = catalog
+        .create_manual_collection(
+            "Canon List 1",
+            Some("canon-list-1"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let book1 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Migrated Book".to_owned(),
+            parent_collection_id: Some(dup1.id.clone()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.update_collection_generator(&dup1.id, Some(true), Some(&book1.id), None).await.unwrap();
+
+    catalog.merge_entries(&dup1.id, &canon1.id).await.unwrap();
+
+    let dup1_gen_row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+            .bind(&dup1.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(dup1_gen_row.is_none(), "duplicate generator row must not remain orphaned");
+    let canon1_gen = catalog.get_collection_generator(&canon1.id).await.unwrap();
+    assert!(canon1_gen.enabled);
+    assert_eq!(canon1_gen.current_entry.as_ref().map(|e| e.id.as_str()), Some(book1.id.as_str()));
+
+    // Case 2: both duplicate and canonical have generators -> delete dup generator + record tombstone
+    let dup2 = catalog
+        .create_manual_collection(
+            "Dup List 2",
+            Some("dup-list-2"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    catalog.set_collection_generator_enabled(&dup2.id, true).await.unwrap();
+    catalog.merge_entries(&dup2.id, &canon1.id).await.unwrap();
+
+    let dup2_gen_row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+            .bind(&dup2.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(dup2_gen_row.is_none());
+    let dup2_tomb_hlc: Option<String> = sqlx::query_scalar(
+        "SELECT hlc FROM sync_tombstones
+         WHERE entity_type = 'collection_generator' AND natural_key = ?",
+    )
+    .bind(&dup2.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    let dup2_tomb_hlc = dup2_tomb_hlc.expect("expected CollectionGenerator tombstone for dup2");
+    let canon1_hlc: String =
+        sqlx::query_scalar("SELECT hlc FROM collection_generators WHERE collection_id = ?")
+            .bind(&canon1.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        canon1_hlc > dup2_tomb_hlc,
+        "canonical generator HLC must exceed duplicate tombstone HLC"
+    );
+
+    // Case 3: merging into ineligible `STARRED` deletes dup generator + records tombstone
+    let dup3 = catalog
+        .create_manual_collection(
+            "Dup List 3",
+            Some("dup-list-3"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    catalog.set_collection_generator_enabled(&dup3.id, true).await.unwrap();
+    catalog.merge_entries(&dup3.id, crate::db::STARRED_COLLECTION_ID).await.unwrap();
+
+    let dup3_gen_row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+            .bind(&dup3.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(dup3_gen_row.is_none());
+    let starred_gen_row: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+            .bind(crate::db::STARRED_COLLECTION_ID)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(starred_gen_row.is_none());
+    let dup3_tomb: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones
+         WHERE entity_type = 'collection_generator' AND natural_key = ?",
+    )
+    .bind(&dup3.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(dup3_tomb.is_some());
+}
+
+#[tokio::test]
+async fn test_local_consumption_log_clears_stale_tombstone() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+    let book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Re-logged Book".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    let event_ts = crate::db::SyncRepo::now_utc();
+    let log_id = crate::db::deterministic_consumption_log_id(
+        &book.id,
+        event_ts.timestamp_millis(),
+        ConsumptionStatus::Consumed.as_str(),
+    );
+    let mut tx = crate::db::begin_write(db.pool()).await.unwrap();
+    crate::db::SyncRepo::record_tombstone(
+        &mut tx,
+        crate::db::ActivityEntityType::ConsumptionLog,
+        &log_id,
+        event_ts,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    catalog
+        .log_consumption(&book.id, ConsumptionStatus::Consumed, None, Some(event_ts))
+        .await
+        .unwrap();
+
+    let tomb: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'consumption_log' AND natural_key = ?",
+    )
+    .bind(&log_id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        tomb.is_none(),
+        "local consumption log write must clear stale ConsumptionLog tombstone"
+    );
+}
+
+#[tokio::test]
+async fn test_merge_entries_escapes_like_wildcards_in_comparisons() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    for (id, title) in [
+        ("work_a", "Work A Dup"),
+        ("work_canon", "Work Canon"),
+        ("workXa", "Work Lookalike"),
+        ("other_b", "Other B"),
+    ] {
+        catalog
+            .upsert_entry(&UpsertEntryInput {
+                id: Some(id.to_owned()),
+                kind: Some(EntryKind::Book),
+                title: title.to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let comp_ts = chrono::Utc::now() - chrono::Duration::hours(2);
+    let unrelated_comp = catalog
+        .append_comparison(
+            None,
+            &[vec!["workXa".to_owned()], vec!["other_b".to_owned()]],
+            Some(comp_ts),
+        )
+        .await
+        .unwrap();
+    let related_comp = catalog
+        .append_comparison(
+            None,
+            &[vec!["work_a".to_owned()], vec!["other_b".to_owned()]],
+            Some(comp_ts),
+        )
+        .await
+        .unwrap();
+
+    // Stamp an old `created_at` on the unrelated comparison so we can prove it isn't rewritten
+    let old_created = comp_ts;
+    sqlx::query("UPDATE comparisons SET created_at = ? WHERE id = ?")
+        .bind(old_created)
+        .bind(&unrelated_comp.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    catalog.merge_entries("work_a", "work_canon").await.unwrap();
+
+    // Unrelated comparison containing "workXa" must be completely untouched
+    let unrelated_created: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT created_at FROM comparisons WHERE id = ?")
+            .bind(&unrelated_comp.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(unrelated_created, Some(old_created));
+
+    // Related comparison containing "work_a" must be replaced with "work_canon"
+    let old_related: Option<i64> = sqlx::query_scalar("SELECT 1 FROM comparisons WHERE id = ?")
+        .bind(&related_comp.id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+    assert!(old_related.is_none());
+    let rewritten_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM comparisons WHERE ordering_json LIKE '%\"work_canon\"%'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rewritten_count, 1);
+}

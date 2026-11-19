@@ -340,10 +340,18 @@ impl CatalogRepo<'_> {
             None => None,
         };
 
-        if let Some(cid) = &current_id
-            && Self::is_entry_terminal_in_tx(tx, cid).await?
-        {
-            current_id = None;
+        if let Some(cid) = &current_id {
+            let in_pool: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+            )
+            .bind(collection_id)
+            .bind(cid)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if in_pool.is_none() || Self::is_entry_terminal_in_tx(tx, cid).await? {
+                current_id = None;
+                drawn_at = None;
+            }
         }
 
         Self::apply_explicit_generator_entry_in_tx(
@@ -492,6 +500,56 @@ impl CatalogRepo<'_> {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    /// Clears or redraws a collection's generator if `current_entry_id` points to `removed_entry_id`.
+    pub(crate) async fn advance_generator_if_drawing_in_tx(
+        tx: &mut SqliteConnection,
+        collection_id: &str,
+        removed_entry_id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let enabled_opt: Option<bool> = sqlx::query_scalar(
+            "SELECT enabled
+             FROM collection_generators
+             WHERE collection_id = ? AND current_entry_id = ?",
+        )
+        .bind(collection_id)
+        .bind(removed_entry_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(enabled) = enabled_opt else {
+            return Ok(());
+        };
+
+        let next_id = if enabled {
+            Self::draw_random_remaining_in_tx(tx, collection_id).await?
+        } else {
+            None
+        };
+        let next_drawn = next_id.as_ref().map(|_| now);
+        sqlx::query(
+            "UPDATE collection_generators
+             SET current_entry_id = ?, drawn_at = ?, updated_at = ?
+             WHERE collection_id = ?",
+        )
+        .bind(next_id.as_deref())
+        .bind(next_drawn)
+        .bind(now)
+        .bind(collection_id)
+        .execute(&mut *tx)
+        .await?;
+
+        SyncRepo::record_activity(
+            tx,
+            ActivityEntityType::CollectionGenerator,
+            collection_id,
+            ActivityAction::Update,
+            now,
+        )
+        .await?;
         Ok(())
     }
 

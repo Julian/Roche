@@ -12,7 +12,8 @@ use super::{
     hrw::{NetworkTier, SERVER_PEER_ID},
     identity::{
         canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
-        deterministic_comparison_id, deterministic_entity_uuid, deterministic_feed_id,
+        deterministic_auto_consumption_log_id, deterministic_comparison_id,
+        deterministic_consumption_log_id, deterministic_entity_uuid, deterministic_feed_id,
         deterministic_item_id, deterministic_system_collection_id, deterministic_tag_id,
         feed_natural_key, item_natural_key, tag_natural_key,
     },
@@ -26,8 +27,8 @@ use crate::{
     content::fetcher::{HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, is_direct_audio_url},
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
-        ContentType, EntryKind, FeedRepo, FeedType, HexColor, InboxState, ItemRepo, MediaRepo,
-        PollItemCandidate, UpsertEntryInput,
+        ConsumptionStatus, ContentType, EntryKind, FeedRepo, FeedType, HexColor, InboxState,
+        ItemRepo, MediaRepo, PollItemCandidate, UpsertEntryInput,
         feeds::{NewFeedRow, entry_kind_for_feed_type, resolve_dedup_entry_id},
     },
     feeds::arxiv::ArxivParser,
@@ -299,6 +300,34 @@ impl SyncRepo<'_> {
         Ok((response, inserted_candidates))
     }
 
+    /// Checks whether an incoming record with `incoming_hlc` is suppressed by an existing
+    /// tombstone for `(entity_type, natural_key)`.
+    ///
+    /// Returns `Ok(true)` when the tombstone wins (`incoming_hlc <= tomb_hlc`) and the incoming
+    /// record must be skipped; otherwise clears any stale tombstone and returns `Ok(false)`.
+    async fn check_and_clear_tombstone_in_tx(
+        tx: &mut SqliteConnection,
+        entity_type: ActivityEntityType,
+        natural_key: &str,
+        incoming_hlc: &str,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        let tomb_hlc: Option<String> = sqlx::query_scalar(
+            "SELECT hlc FROM sync_tombstones WHERE entity_type = ? AND natural_key = ?",
+        )
+        .bind(entity_type)
+        .bind(natural_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(th) = tomb_hlc {
+            if incoming_hlc <= th.as_str() {
+                return Ok(true);
+            }
+            Self::clear_tombstone(tx, entity_type, natural_key).await?;
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn apply_incoming_tombstones(
         conn: &mut SqliteConnection,
@@ -516,6 +545,10 @@ impl SyncRepo<'_> {
                     if existing_hlc.as_deref().is_some_and(|h| h > tomb_hlc.as_str()) {
                         continue;
                     }
+                    // Generator advancement for any collection whose `current_entry_id` was removed
+                    // is intentionally deferred to `merge_incoming_generators_in_tx` (after peer
+                    // generator state merges) so peer-drawn replacements are not overwritten by
+                    // server `now` HLCs.
                     sqlx::query(
                         "DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
                     )
@@ -829,17 +862,15 @@ impl SyncRepo<'_> {
         };
         let effective_hlc = if entry_hlc > fs_hlc { &entry_hlc } else { &fs_hlc };
 
-        let tomb_hlc: Option<String> = sqlx::query_scalar(
-            "SELECT hlc FROM sync_tombstones WHERE entity_type = 'feed' AND natural_key = ?",
+        if Self::check_and_clear_tombstone_in_tx(
+            tx,
+            ActivityEntityType::Feed,
+            &nat_key,
+            effective_hlc,
         )
-        .bind(&nat_key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(ref th) = tomb_hlc {
-            if effective_hlc.as_str() <= th.as_str() {
-                return Ok(None);
-            }
-            Self::clear_tombstone(tx, ActivityEntityType::Feed, &nat_key).await?;
+        .await?
+        {
+            return Ok(None);
         }
 
         let existing: Option<ExistingFeedTuple> = sqlx::query_as(
@@ -1040,21 +1071,15 @@ impl SyncRepo<'_> {
         let entry_hlc =
             resolve_or_synthesize_hlc(&rec.hlc, rec.updated_at.or(rec.created_at), now, peer_id);
 
-        let tomb_hlc: Option<String> = sqlx::query_scalar(
-            "SELECT hlc FROM sync_tombstones WHERE entity_type = 'tag' AND natural_key = ?",
-        )
-        .bind(&nat_key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(ref th) = tomb_hlc {
-            if entry_hlc.as_str() <= th.as_str() {
-                return Ok(());
-            }
-            Self::clear_tombstone(tx, ActivityEntityType::Tag, &nat_key).await?;
+        if Self::check_and_clear_tombstone_in_tx(tx, ActivityEntityType::Tag, &nat_key, &entry_hlc)
+            .await?
+        {
+            return Ok(());
         }
 
         let det_id = deterministic_tag_id(clean_name);
         let tag_slug = format!("tag:{nat_key}");
+        let rec_id = rec.id.trim();
         let parsed_color_str: Option<String> = cs
             .color
             .as_deref()
@@ -1072,13 +1097,17 @@ impl SyncRepo<'_> {
         .fetch_all(&mut *tx)
         .await?;
 
-        let found = existing_tags.into_iter().find(|(id, title, slug, _, _)| {
+        let by_name_or_slug = existing_tags.iter().find(|(id, title, slug, _, _)| {
             id == &det_id
                 || slug.as_deref().is_some_and(|s| s.trim().to_lowercase() == tag_slug)
                 || title.trim().to_lowercase() == nat_key
         });
+        let by_id = (!rec_id.is_empty())
+            .then(|| existing_tags.iter().find(|(id, _, _, _, _)| id == rec_id))
+            .flatten();
+        let found = by_name_or_slug.or(by_id).cloned();
 
-        if let Some((local_id, _, _, existing_color, existing_hlc)) = found {
+        if let Some((local_id, _, existing_slug, existing_color, existing_hlc)) = found {
             if entry_hlc.as_str() > existing_hlc.as_str() {
                 let color_str = parsed_color_str.as_deref();
                 if color_str.is_some() && color_str != existing_color.as_deref() {
@@ -1088,15 +1117,56 @@ impl SyncRepo<'_> {
                         .execute(&mut *tx)
                         .await?;
                 }
-                sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                let slug_conflict: Option<String> = sqlx::query_scalar(
+                    "SELECT collection_id FROM collection_specs WHERE slug = ? AND collection_id != ?",
+                )
+                .bind(&tag_slug)
+                .bind(&local_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if slug_conflict.is_none() {
+                    let slug_changed = existing_slug.as_deref() != Some(tag_slug.as_str());
+                    if slug_changed {
+                        sqlx::query("UPDATE collection_specs SET slug = ? WHERE collection_id = ?")
+                            .bind(&tag_slug)
+                            .bind(&local_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query(
+                            "DELETE FROM entry_identifiers WHERE scheme = 'tag' AND entry_id = ?",
+                        )
+                        .bind(&local_id)
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query(
+                            "INSERT OR REPLACE INTO entry_identifiers (scheme, value, entry_id)
+                             VALUES ('tag', ?, ?)",
+                        )
+                        .bind(&nat_key)
+                        .bind(&local_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    sqlx::query(
+                        "UPDATE entries SET title = ?, updated_at = ?, hlc = ? WHERE id = ?",
+                    )
+                    .bind(clean_name)
                     .bind(now)
                     .bind(&entry_hlc)
                     .bind(&local_id)
                     .execute(&mut *tx)
                     .await?;
+                } else {
+                    sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(&entry_hlc)
+                        .bind(&local_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             }
-            if !rec.id.trim().is_empty() {
-                id_remap.insert(rec.id.trim().to_owned(), local_id.clone());
+            if !rec_id.is_empty() {
+                id_remap.insert(rec_id.to_owned(), local_id.clone());
             }
             id_remap.insert(local_id.clone(), local_id);
         } else {
@@ -1222,19 +1292,16 @@ impl SyncRepo<'_> {
             resolve_or_synthesize_hlc(&rec.hlc, rec.updated_at.or(rec.created_at), now, peer_id);
 
         // Check `'entry'` tombstone before upserting manual collection
-        if !super::is_protected_system_collection_id(&target_id) {
-            let entry_tomb: Option<String> = sqlx::query_scalar(
-                "SELECT hlc FROM sync_tombstones WHERE entity_type = 'entry' AND natural_key = ?",
+        if !super::is_protected_system_collection_id(&target_id)
+            && Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::Entry,
+                &target_id,
+                &entry_hlc,
             )
-            .bind(&target_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(ref th) = entry_tomb {
-                if entry_hlc.as_str() <= th.as_str() {
-                    return Ok(());
-                }
-                Self::clear_tombstone(tx, ActivityEntityType::Entry, &target_id).await?;
-            }
+            .await?
+        {
+            return Ok(());
         }
 
         let clean_color = cs.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -1347,58 +1414,77 @@ impl SyncRepo<'_> {
             .state
             .as_ref()
             .is_some_and(|s| matches!(s.inbox_state, InboxState::Unread | InboxState::Dismissed));
+        let carries_item_payload = rec.state.is_some() || rec.content.is_some();
 
         // Check `'entry'` tombstone
-        if !rec.id.trim().is_empty() {
-            let entry_tomb: Option<String> = sqlx::query_scalar(
-                "SELECT hlc FROM sync_tombstones WHERE entity_type = 'entry' AND natural_key = ?",
+        if !rec.id.trim().is_empty()
+            && Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::Entry,
+                rec.id.trim(),
+                &entry_hlc,
             )
-            .bind(rec.id.trim())
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(ref th) = entry_tomb {
-                if entry_hlc.as_str() <= th.as_str() {
-                    return Ok(None);
-                }
-                Self::clear_tombstone(tx, ActivityEntityType::Entry, rec.id.trim()).await?;
-            }
+            .await?
+        {
+            return Ok(None);
         }
 
-        // Check `'item'` tombstone when incoming carries active Inbox state
+        // Check `'item'` tombstone whenever incoming carries item state or content
         let mut effective_state = rec.state.clone();
-        if is_active_inbox && let Some(ref item_url) = prep.canon_url {
+        let mut suppress_content = false;
+        if carries_item_payload && let Some(ref item_url) = prep.canon_url {
             let nat_feed = item_natural_key(resolved_feed_url.as_deref(), item_url);
             let nat_manual = item_natural_key(None, item_url);
-            let item_tombs: Vec<(String, String)> = sqlx::query_as(
-                "SELECT natural_key, hlc FROM sync_tombstones
-                 WHERE entity_type = 'item' AND natural_key IN (?, ?)",
-            )
-            .bind(&nat_feed)
-            .bind(&nat_manual)
-            .fetch_all(&mut *tx)
-            .await?;
+            let item_tombs: Vec<(String, String)> = if resolved_feed_url.is_some() {
+                sqlx::query_as(
+                    "SELECT natural_key, hlc FROM sync_tombstones
+                     WHERE entity_type = 'item' AND natural_key IN (?, ?)",
+                )
+                .bind(&nat_feed)
+                .bind(&nat_manual)
+                .fetch_all(&mut *tx)
+                .await?
+            } else {
+                let suffix_like = format!("%\0{}", crate::db::escape_like_literal(item_url));
+                sqlx::query_as(
+                    "SELECT natural_key, hlc FROM sync_tombstones
+                     WHERE entity_type = 'item'
+                       AND (natural_key = ? OR natural_key LIKE ? ESCAPE '\\')",
+                )
+                .bind(&nat_manual)
+                .bind(&suffix_like)
+                .fetch_all(&mut *tx)
+                .await?
+            };
 
             let max_inc_hlc = state_hlc_opt
                 .as_deref()
                 .map_or(entry_hlc.as_str(), |sh| sh.max(entry_hlc.as_str()));
+            let rec_id = rec.id.trim();
+            let det_manual_id = deterministic_entity_uuid("item", &nat_manual);
+            let exact_suffix = format!("\0{item_url}");
 
             let mut suppressed = false;
             for (tk, th) in item_tombs {
-                let matches_scope = tk == nat_feed
+                if tk != nat_feed && tk != nat_manual && !tk.ends_with(&exact_suffix) {
+                    continue;
+                }
+                let exact_scope = tk == nat_feed
                     || (resolved_feed_url.is_none() && tk == nat_manual)
-                    || (!rec.id.trim().is_empty()
-                        && deterministic_entity_uuid("item", &tk) == rec.id.trim());
-                if !matches_scope {
+                    || (!rec_id.is_empty() && deterministic_entity_uuid("item", &tk) == rec_id);
+                let legacy_feed_fallback =
+                    resolved_feed_url.is_none() && is_active_inbox && rec_id != det_manual_id;
+                if !exact_scope && !legacy_feed_fallback {
                     continue;
                 }
                 if max_inc_hlc <= th.as_str() {
                     suppressed = true;
-                } else {
+                } else if exact_scope {
                     Self::clear_tombstone(tx, ActivityEntityType::Item, &tk).await?;
                 }
             }
             if suppressed {
-                // Suppress inbox resurrection; if pure inbox item with no catalog metadata, skip entirely
+                // Suppress item resurrection; if pure reader item with no catalog metadata, skip entirely
                 if rec.identifiers.iter().all(|id| matches!(id.scheme.as_str(), "url" | "arxiv"))
                     && rec.release_year.is_none()
                     && rec.metadata.is_none()
@@ -1406,6 +1492,7 @@ impl SyncRepo<'_> {
                     return Ok(None);
                 }
                 effective_state = None;
+                suppress_content = true;
             }
         }
 
@@ -1534,7 +1621,11 @@ impl SyncRepo<'_> {
         id_remap.insert(target_id.clone(), target_id.clone());
 
         // Merge `entry_content` + remote audio enclosure if present
-        if rec.content.is_some() || prep.clean_html.is_some() || prep.clean_audio_url.is_some() {
+        if !suppress_content
+            && (rec.content.is_some()
+                || prep.clean_html.is_some()
+                || prep.clean_audio_url.is_some())
+        {
             let existing_content: Option<(Option<String>, ContentType)> = sqlx::query_as(
                 "SELECT content_html, content_type FROM entry_content WHERE entry_id = ?",
             )
@@ -1931,18 +2022,15 @@ impl SyncRepo<'_> {
 
             let ce_hlc = resolve_or_synthesize_hlc(&ce.hlc, Some(ce.added_at), now, peer_id);
             let nat_key = collection_entry_natural_key(&col_id, &entry_id);
-            let tomb_hlc: Option<String> = sqlx::query_scalar(
-                "SELECT hlc FROM sync_tombstones
-                 WHERE entity_type = 'collection_entry' AND natural_key = ?",
+            if Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::CollectionEntry,
+                &nat_key,
+                &ce_hlc,
             )
-            .bind(&nat_key)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(ref th) = tomb_hlc {
-                if ce_hlc.as_str() <= th.as_str() {
-                    continue;
-                }
-                Self::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
+            .await?
+            {
+                continue;
             }
 
             sqlx::query(
@@ -2021,22 +2109,55 @@ impl SyncRepo<'_> {
             let log_hlc =
                 resolve_or_synthesize_hlc(&log.hlc, log.created_at.or(Some(log.ts)), now, peer_id);
 
-            if !log.id.trim().is_empty() {
-                let tomb_hlc: Option<String> = sqlx::query_scalar(
-                    "SELECT hlc FROM sync_tombstones
-                     WHERE entity_type = 'consumption_log' AND natural_key = ?",
+            let trimmed_id = log.id.trim();
+            if !trimmed_id.is_empty()
+                && Self::check_and_clear_tombstone_in_tx(
+                    tx,
+                    ActivityEntityType::ConsumptionLog,
+                    trimmed_id,
+                    &log_hlc,
                 )
-                .bind(log.id.trim())
-                .fetch_optional(&mut *tx)
-                .await?;
-                if tomb_hlc.as_deref().is_some_and(|th| log_hlc.as_str() <= th) {
-                    continue;
-                }
+                .await?
+            {
+                continue;
+            }
+            let is_auto_id = log.status == ConsumptionStatus::Consumed
+                && (trimmed_id == deterministic_auto_consumption_log_id(raw_ent)
+                    || trimmed_id == deterministic_auto_consumption_log_id(&entry_id));
+            let resolved_log_id = if is_auto_id {
+                deterministic_auto_consumption_log_id(&entry_id)
+            } else if trimmed_id.is_empty()
+                || (raw_ent != entry_id
+                    && trimmed_id
+                        == deterministic_consumption_log_id(
+                            raw_ent,
+                            log.ts.timestamp_millis(),
+                            log.status.as_str(),
+                        ))
+            {
+                deterministic_consumption_log_id(
+                    &entry_id,
+                    log.ts.timestamp_millis(),
+                    log.status.as_str(),
+                )
+            } else {
+                trimmed_id.to_owned()
+            };
+            if resolved_log_id != trimmed_id
+                && Self::check_and_clear_tombstone_in_tx(
+                    tx,
+                    ActivityEntityType::ConsumptionLog,
+                    &resolved_log_id,
+                    &log_hlc,
+                )
+                .await?
+            {
+                continue;
             }
 
             let saved = CatalogRepo::log_consumption_with_id_in_tx(
                 tx,
-                &log.id,
+                &resolved_log_id,
                 &entry_id,
                 log.status,
                 log.notes.as_deref(),
@@ -2184,18 +2305,15 @@ impl SyncRepo<'_> {
 
             let inc_hlc = resolve_or_synthesize_hlc(&inc.hlc, Some(inc.updated_at), now, peer_id);
 
-            let gen_tomb: Option<String> = sqlx::query_scalar(
-                "SELECT hlc FROM sync_tombstones
-                 WHERE entity_type = 'collection_generator' AND natural_key = ?",
+            if Self::check_and_clear_tombstone_in_tx(
+                tx,
+                ActivityEntityType::CollectionGenerator,
+                &col_id,
+                &inc_hlc,
             )
-            .bind(&col_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(ref th) = gen_tomb {
-                if inc_hlc.as_str() <= th.as_str() {
-                    continue;
-                }
-                Self::clear_tombstone(tx, ActivityEntityType::CollectionGenerator, &col_id).await?;
+            .await?
+            {
+                continue;
             }
 
             let local_gen: Option<ExistingGeneratorTuple> = sqlx::query_as(
@@ -2220,7 +2338,7 @@ impl SyncRepo<'_> {
                 mut target_updated,
                 mut target_hlc,
                 local_won_conflict,
-            ) = match local_gen {
+            ) = match &local_gen {
                 None => {
                     (inc.enabled, mapped_inc_entry, inc.drawn_at, inc.updated_at, inc_hlc, false)
                 }
@@ -2235,8 +2353,8 @@ impl SyncRepo<'_> {
                             false,
                         )
                     } else {
-                        let differs = inc.enabled != l_en || mapped_inc_entry != l_eid;
-                        (l_en, l_eid, l_drawn, l_upd, l_hlc, differs)
+                        let differs = inc.enabled != *l_en || mapped_inc_entry != *l_eid;
+                        (*l_en, l_eid.clone(), *l_drawn, *l_upd, l_hlc.clone(), differs)
                     }
                 }
             };
@@ -2252,45 +2370,66 @@ impl SyncRepo<'_> {
                     .await?;
                     if in_pool.is_none() || CatalogRepo::is_entry_terminal_in_tx(tx, &cid).await? {
                         target_entry_id = None;
+                        target_drawn_at = None;
                         target_updated = now;
                         target_hlc = clock.tick(now_ms).encode();
-                    } else {
+                    } else if cid.as_str() != cur_id.as_str() {
                         target_entry_id = Some(cid);
+                        target_updated = now;
+                        target_hlc = clock.tick(now_ms).encode();
                     }
                 } else {
                     target_entry_id = None;
+                    target_drawn_at = None;
+                    target_updated = now;
                     target_hlc = clock.tick(now_ms).encode();
                 }
             }
 
             if target_enabled && target_entry_id.is_none() {
-                target_entry_id = CatalogRepo::draw_random_remaining_in_tx(tx, &col_id).await?;
-                target_drawn_at = target_entry_id.as_ref().map(|_| now);
-                target_updated = now;
-                target_hlc = clock.tick(now_ms).encode();
+                if let Some(drawn_id) =
+                    CatalogRepo::draw_random_remaining_in_tx(tx, &col_id).await?
+                {
+                    target_entry_id = Some(drawn_id);
+                    target_drawn_at = Some(now);
+                    target_updated = now;
+                    target_hlc = clock.tick(now_ms).encode();
+                } else if target_drawn_at.is_some() {
+                    target_drawn_at = None;
+                    target_updated = now;
+                    target_hlc = clock.tick(now_ms).encode();
+                }
             }
 
-            sqlx::query(
-                "INSERT INTO collection_generators
-                 (collection_id, enabled, current_entry_id, drawn_at, updated_at, hlc)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(collection_id) DO UPDATE SET
-                     enabled = excluded.enabled,
-                     current_entry_id = excluded.current_entry_id,
-                     drawn_at = excluded.drawn_at,
-                     updated_at = excluded.updated_at,
-                     hlc = excluded.hlc",
-            )
-            .bind(&col_id)
-            .bind(target_enabled)
-            .bind(target_entry_id.as_deref())
-            .bind(target_drawn_at)
-            .bind(target_updated)
-            .bind(&target_hlc)
-            .execute(&mut *tx)
-            .await?;
+            let needs_upsert =
+                local_gen.as_ref().is_none_or(|(l_en, l_eid, l_drawn, _l_upd, l_hlc)| {
+                    target_enabled != *l_en
+                        || target_entry_id != *l_eid
+                        || target_drawn_at != *l_drawn
+                        || target_hlc != *l_hlc
+                });
 
-            if local_won_conflict {
+            if needs_upsert {
+                sqlx::query(
+                    "INSERT INTO collection_generators
+                     (collection_id, enabled, current_entry_id, drawn_at, updated_at, hlc)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(collection_id) DO UPDATE SET
+                         enabled = excluded.enabled,
+                         current_entry_id = excluded.current_entry_id,
+                         drawn_at = excluded.drawn_at,
+                         updated_at = excluded.updated_at,
+                         hlc = excluded.hlc",
+                )
+                .bind(&col_id)
+                .bind(target_enabled)
+                .bind(target_entry_id.as_deref())
+                .bind(target_drawn_at)
+                .bind(target_updated)
+                .bind(&target_hlc)
+                .execute(&mut *tx)
+                .await?;
+            } else if local_won_conflict {
                 sqlx::query("UPDATE sync_clock SET current_seq = current_seq + 1 WHERE id = 1")
                     .execute(&mut *tx)
                     .await?;
@@ -2305,7 +2444,8 @@ impl SyncRepo<'_> {
             }
         }
 
-        // Advance any active local generator whose drawn entry became terminal during this sync
+        // Advance any active local generator whose drawn entry became terminal or was removed from
+        // its collection pool during this sync
         let active: Vec<(String, bool, String)> = sqlx::query_as(
             "SELECT collection_id, enabled, current_entry_id
              FROM collection_generators WHERE current_entry_id IS NOT NULL",
@@ -2313,7 +2453,16 @@ impl SyncRepo<'_> {
         .fetch_all(&mut *tx)
         .await?;
         for (col_id, enabled, cur_id) in active {
-            if CatalogRepo::is_entry_terminal_in_tx(tx, &cur_id).await? {
+            let in_pool: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM collection_entries ce
+                 JOIN entries e ON e.id = ce.entry_id
+                 WHERE ce.collection_id = ? AND ce.entry_id = ? AND e.merged_into_id IS NULL",
+            )
+            .bind(&col_id)
+            .bind(&cur_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if in_pool.is_none() || CatalogRepo::is_entry_terminal_in_tx(tx, &cur_id).await? {
                 let next_id = if enabled {
                     CatalogRepo::draw_random_remaining_in_tx(tx, &col_id).await?
                 } else {

@@ -432,35 +432,38 @@ impl CatalogRepo<'_> {
 
         // Rewrite comparisons involving `dup_resolved` (in ordering OR scope_collection_id)
         // using new deterministic comparison IDs + `created_at = now` so additive peer sync converges!
-        let like_dup = format!("%{dup_resolved}%");
-        let comp_rows = sqlx::query!(
-            r#"SELECT id as "id!", ts as "ts!: DateTime<Utc>",
-                      scope_collection_id as "scope_collection_id?",
-                      ordering_json as "ordering_json!"
-               FROM comparisons
-               WHERE ordering_json LIKE ? OR scope_collection_id = ?"#,
-            &like_dup,
-            dup_resolved,
+        let like_dup = crate::db::json_string_like_pattern(dup_resolved);
+        let comp_rows: Vec<(String, DateTime<Utc>, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, ts, scope_collection_id, ordering_json
+             FROM comparisons
+             WHERE ordering_json LIKE ? ESCAPE '\\' OR scope_collection_id = ?",
         )
+        .bind(&like_dup)
+        .bind(dup_resolved)
         .fetch_all(&mut *tx)
         .await?;
 
-        for comp in comp_rows {
-            sqlx::query!("DELETE FROM comparisons WHERE id = ?", &comp.id)
+        for (comp_id, comp_ts, scope_collection_id, ordering_json) in comp_rows {
+            let scope_matches = scope_collection_id.as_deref() == Some(dup_resolved);
+            let parsed: Vec<Vec<String>> = serde_json::from_str(&ordering_json).unwrap_or_default();
+            let ordering_matches =
+                parsed.iter().any(|group| group.iter().any(|id| id == dup_resolved));
+            if !scope_matches && !ordering_matches {
+                continue;
+            }
+
+            sqlx::query!("DELETE FROM comparisons WHERE id = ?", &comp_id)
                 .execute(&mut *tx)
                 .await?;
 
-            let new_scope = comp
-                .scope_collection_id
+            let new_scope = scope_collection_id
                 .map(|sc| if sc == dup_resolved { canon_resolved.to_owned() } else { sc });
-            let parsed: Vec<Vec<String>> =
-                serde_json::from_str(&comp.ordering_json).unwrap_or_default();
             let rewritten = rewrite_ordering_after_merge(&parsed, dup_resolved, canon_resolved);
             let total_items: usize = rewritten.iter().map(Vec::len).sum();
             if total_items >= 2 {
                 let new_comp_id = deterministic_comparison_id(
                     new_scope.as_deref(),
-                    comp.ts.timestamp_millis(),
+                    comp_ts.timestamp_millis(),
                     &rewritten,
                 );
                 let new_json = canonical_ordering_json(&rewritten);
@@ -469,7 +472,7 @@ impl CatalogRepo<'_> {
                     "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
                      VALUES (?, ?, ?, ?, ?)",
                     &new_comp_id,
-                    comp.ts as _,
+                    comp_ts as _,
                     new_scope_ref,
                     &new_json,
                     now as _,
@@ -490,6 +493,105 @@ impl CatalogRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
+
+        // Migrate or delete any `collection_generators` row owned by `dup_resolved`
+        let dup_gen: Option<(bool, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT enabled, current_entry_id, drawn_at
+             FROM collection_generators
+             WHERE collection_id = ?",
+        )
+        .bind(dup_resolved)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some((dup_enabled, mut dup_cur_entry, mut dup_drawn_at)) = dup_gen {
+            let canon_eligible = canon_resolved != crate::db::STARRED_COLLECTION_ID
+                && sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM collection_specs
+                     WHERE collection_id = ? AND mode = 'manual' AND collection_role = 'list'",
+                )
+                .bind(canon_resolved)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            let canon_gen_updated: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT updated_at FROM collection_generators WHERE collection_id = ?",
+            )
+            .bind(canon_resolved)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
+                .bind(dup_resolved)
+                .execute(&mut *tx)
+                .await?;
+
+            if canon_eligible && canon_gen_updated.is_none() {
+                if let Some(ref cur_id) = dup_cur_entry {
+                    let in_pool: Option<i64> = sqlx::query_scalar(
+                        "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+                    )
+                    .bind(canon_resolved)
+                    .bind(cur_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if in_pool.is_none() || Self::is_entry_terminal_in_tx(tx, cur_id).await? {
+                        dup_cur_entry = None;
+                        dup_drawn_at = None;
+                    }
+                }
+                if dup_enabled && dup_cur_entry.is_none() {
+                    dup_cur_entry = Self::draw_random_remaining_in_tx(tx, canon_resolved).await?;
+                    dup_drawn_at = dup_cur_entry.as_ref().map(|_| now);
+                }
+                SyncRepo::clear_tombstone(
+                    tx,
+                    ActivityEntityType::CollectionGenerator,
+                    canon_resolved,
+                )
+                .await?;
+                sqlx::query(
+                    "INSERT INTO collection_generators
+                     (collection_id, enabled, current_entry_id, drawn_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(canon_resolved)
+                .bind(dup_enabled)
+                .bind(dup_cur_entry.as_deref())
+                .bind(dup_drawn_at)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                SyncRepo::record_tombstone(
+                    tx,
+                    ActivityEntityType::CollectionGenerator,
+                    dup_resolved,
+                    now,
+                )
+                .await?;
+                SyncRepo::record_activity(
+                    tx,
+                    ActivityEntityType::CollectionGenerator,
+                    dup_resolved,
+                    ActivityAction::Delete,
+                    now,
+                )
+                .await?;
+                // Ensure canonical's existing generator HLC strictly exceeds `dup_resolved`'s
+                // tombstone HLC in case a peer resolves merged IDs when applying tombstones.
+                if let Some(canon_upd) = canon_gen_updated {
+                    let bump_ts = canon_upd.max(now) + chrono::Duration::milliseconds(1);
+                    sqlx::query(
+                        "UPDATE collection_generators SET updated_at = ? WHERE collection_id = ?",
+                    )
+                    .bind(bump_ts)
+                    .bind(canon_resolved)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
 
         // Mark duplicate as merged tombstone (`entries_fts_au` removes it from FTS automatically)
         sqlx::query!(

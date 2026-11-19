@@ -2,7 +2,7 @@ pub mod catalog;
 pub use catalog::CatalogService;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
@@ -996,6 +996,10 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         Ok(ItemDetail { item, tags, media })
     }
 
+    pub async fn existing_ids(&self, ids: &[String]) -> Result<HashSet<String>, ApiError> {
+        Ok(self.service.db.items().existing_ids(ids).await?)
+    }
+
     pub async fn save(
         &self,
         url: &Url,
@@ -1422,5 +1426,46 @@ mod tests {
             active_hash,
             PairingClientKey::TailscaleLogin("bob@tailnet.ts.net".to_owned()),
         ));
+    }
+
+    struct DummyServiceFetcher;
+
+    impl FeedFetcher for DummyServiceFetcher {
+        fn fetch_feed(
+            &self,
+            _url: &Url,
+        ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send {
+            std::future::ready(Ok(String::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_item_service_existing_ids() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let service = RocheService::new(db.clone(), DummyServiceFetcher, Config::default());
+        let url = Url::parse("https://example.com/service-existing-id").unwrap();
+        let (saved, _) = db
+            .items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &url,
+                title: "Service Existing Item",
+                summary: None,
+                content_html: Some("<p>body</p>"),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                tags: &[],
+            })
+            .await
+            .unwrap();
+
+        let existing = service
+            .items()
+            .existing_ids(&[saved.id.clone(), "missing-item-id".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(existing.len(), 1);
+        assert!(existing.contains(&saved.id));
     }
 }

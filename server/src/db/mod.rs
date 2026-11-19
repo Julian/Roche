@@ -55,6 +55,24 @@ pub use types::{
 #[error("{0}")]
 pub struct ConflictError(pub String);
 
+/// Escapes SQLite `LIKE` wildcard characters (`\`, `%`, `_`) for use with `ESCAPE '\'`.
+pub(crate) fn escape_like_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Builds a SQLite `LIKE` pattern (for use with `ESCAPE '\'`) matching a JSON-encoded string literal.
+pub(crate) fn json_string_like_pattern(value: &str) -> String {
+    let json_quoted = serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""));
+    format!("%{}%", escape_like_literal(&json_quoted))
+}
+
 /// Begins a SQLite write transaction using `BEGIN IMMEDIATE` so WAL-mode writers
 /// acquire the RESERVED lock up-front and respect `busy_timeout` instead of failing
 /// immediately with `SQLITE_BUSY` on a read-to-write lock upgrade.
