@@ -103,7 +103,7 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
         delegate.encrypt(plaintext)
     }
         .getOrElse { err ->
-            if (isPermanentKeystoreInvalidation(err)) {
+            if (isPermanentKeyInvalidation(err)) {
                 resetCorruptedKeystoreKey()
                 delegate.encrypt(plaintext)
             } else {
@@ -122,7 +122,7 @@ internal class AndroidKeystoreTokenCipher(private val keyAlias: String = KEYSTOR
     }
 }
 
-internal fun isPermanentKeystoreInvalidation(error: Throwable): Boolean {
+internal fun isPermanentKeyInvalidation(error: Throwable): Boolean {
     var current: Throwable? = error
     while (current != null) {
         if (current is KeyPermanentlyInvalidatedException || current is UnrecoverableKeyException) {

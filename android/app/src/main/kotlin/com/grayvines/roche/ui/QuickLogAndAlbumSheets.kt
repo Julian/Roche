@@ -151,14 +151,15 @@ private fun DrawNoteSheetFooter(
             style = RocheButtonStyle.PRIMARY,
             enabled = canConfirm,
             onClick = {
-                if (!canConfirm) return@HeaderActionButton
-                val action =
-                    if (isAbandon) {
-                        MainAction.ConfirmAbandonDraw(collectionId, notes)
-                    } else {
-                        MainAction.ConfirmFinishDraw(collectionId, notes)
-                    }
-                onAction(action)
+                if (canConfirm) {
+                    val action =
+                        if (isAbandon) {
+                            MainAction.ConfirmAbandonDraw(collectionId, notes)
+                        } else {
+                            MainAction.ConfirmFinishDraw(collectionId, notes)
+                        }
+                    onAction(action)
+                }
             },
             modifier = Modifier.testTag("draw_confirm_action_btn"),
         )

@@ -69,6 +69,30 @@ class RocheThemeContrastTest {
         }
 
         // Alpha-composited tier/status pill backgrounds (16% over surface) and tie pill (20% ecru).
+        assertBadgePillContrast(themeName, colors)
+
+        // Filled custom primary buttons (HeaderActionButton / CompactCardActionButton / Save FAB).
+        assertContrastAtLeast(
+            label = "$themeName white text on accentBlueFilled",
+            foreground = Color.White,
+            background = colors.accentBlueFilled,
+            minimumRatio = WCAG_AA_NORMAL_TEXT,
+        )
+
+        // Non-text control outlines (Switch, OutlinedTextField, slider track) >= 3.0:1 (SC 1.4.11).
+        for ((bgName, bg) in surfaces) {
+            assertContrastAtLeast(
+                label = "$themeName controlOutline on $bgName",
+                foreground = colors.controlOutline,
+                background = bg,
+                minimumRatio = WCAG_AA_UI_COMPONENT,
+            )
+        }
+
+        assertMaterialSchemeContrast(themeName, colors)
+    }
+
+    private fun assertBadgePillContrast(themeName: String, colors: RocheColors) {
         val badgeTokens =
             listOf(
                 "accentBlue" to colors.accentBlue,
@@ -94,26 +118,6 @@ class RocheThemeContrastTest {
             background = tiePillSurface,
             minimumRatio = WCAG_AA_NORMAL_TEXT,
         )
-
-        // Filled custom primary buttons (HeaderActionButton / CompactCardActionButton / Save FAB).
-        assertContrastAtLeast(
-            label = "$themeName white text on accentBlueFilled",
-            foreground = Color.White,
-            background = colors.accentBlueFilled,
-            minimumRatio = WCAG_AA_NORMAL_TEXT,
-        )
-
-        // Non-text control outlines (Switch, OutlinedTextField, slider track) >= 3.0:1 (SC 1.4.11).
-        for ((bgName, bg) in surfaces) {
-            assertContrastAtLeast(
-                label = "$themeName controlOutline on $bgName",
-                foreground = colors.controlOutline,
-                background = bg,
-                minimumRatio = WCAG_AA_UI_COMPONENT,
-            )
-        }
-
-        assertMaterialSchemeContrast(themeName, colors)
     }
 
     private fun assertMaterialSchemeContrast(themeName: String, colors: RocheColors) {

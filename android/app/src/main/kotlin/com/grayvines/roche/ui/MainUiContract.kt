@@ -612,7 +612,7 @@ internal fun reduceUiAction(
         else -> reduceOverlayUiAction(state, action)
     }
 
-private fun InboxEntry.mergeReaderContent(full: ReaderItemContent?): InboxEntry {
+internal fun InboxEntry.mergeReaderContent(full: ReaderItemContent?): InboxEntry {
     if (full == null) return this
     val mergedHtml = pickLongerReaderText(full.contentHtml, contentHtml)
     val mergedText = pickLongerReaderText(full.contentText, contentText)

@@ -425,29 +425,30 @@ internal fun RocheInteractiveSlider(
                     }
                 }
     ) {
-        if (size.width <= 0f) return@Canvas
-        val trackHeight = 4.dp.toPx()
-        val thumbRadius = 7.dp.toPx()
-        val centerY = size.height * 0.5f
-        val activeWidth = (size.width * displayFraction).coerceIn(0f, size.width)
-        val thumbCenterX = computeSliderThumbCenterX(size.width, displayFraction, thumbRadius)
-        val corner = CornerRadius(trackHeight * 0.5f, trackHeight * 0.5f)
-        drawRoundRect(
-            color = colors.controlOutline,
-            topLeft = Offset(0f, centerY - trackHeight * 0.5f),
-            size = Size(size.width, trackHeight),
-            cornerRadius = corner,
-        )
-        drawRoundRect(
-            color = colors.accentBlue,
-            topLeft = Offset(0f, centerY - trackHeight * 0.5f),
-            size = Size(activeWidth, trackHeight),
-            cornerRadius = corner,
-        )
-        drawCircle(
-            color = colors.accentBlue,
-            radius = thumbRadius,
-            center = Offset(thumbCenterX, centerY),
-        )
+        if (size.width > 0f) {
+            val trackHeight = 4.dp.toPx()
+            val thumbRadius = 7.dp.toPx()
+            val centerY = size.height * 0.5f
+            val activeWidth = (size.width * displayFraction).coerceIn(0f, size.width)
+            val thumbCenterX = computeSliderThumbCenterX(size.width, displayFraction, thumbRadius)
+            val corner = CornerRadius(trackHeight * 0.5f, trackHeight * 0.5f)
+            drawRoundRect(
+                color = colors.controlOutline,
+                topLeft = Offset(0f, centerY - trackHeight * 0.5f),
+                size = Size(size.width, trackHeight),
+                cornerRadius = corner,
+            )
+            drawRoundRect(
+                color = colors.accentBlue,
+                topLeft = Offset(0f, centerY - trackHeight * 0.5f),
+                size = Size(activeWidth, trackHeight),
+                cornerRadius = corner,
+            )
+            drawCircle(
+                color = colors.accentBlue,
+                radius = thumbRadius,
+                center = Offset(thumbCenterX, centerY),
+            )
+        }
     }
 }

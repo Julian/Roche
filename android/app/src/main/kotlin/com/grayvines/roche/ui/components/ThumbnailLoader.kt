@@ -33,12 +33,12 @@ internal class KeyMutex {
     var waiters: Int = 0
 }
 
-private enum class ImageSourcePolicy {
+internal enum class ImageSourcePolicy {
     SERVER_MEDIA_OR_HTTPS,
     EXTERNAL_HTTPS_ONLY,
 }
 
-private sealed interface FetchedImagePayload {
+internal sealed interface FetchedImagePayload {
     data class FromFile(val file: File) : FetchedImagePayload
 
     data class FromBytes(val bytes: ByteArray) : FetchedImagePayload
@@ -440,7 +440,7 @@ class ThumbnailLoader(
     }
 }
 
-private suspend fun streamRemoteSourceToFile(
+internal suspend fun streamRemoteSourceToFile(
     apiClient: RocheApiClient,
     settings: SettingsRepository,
     mediaId: String,
@@ -476,7 +476,7 @@ private suspend fun streamRemoteSourceToFile(
         }
     }
 
-private fun findDiskCachedFile(cacheDir: File?, mediaId: String): File? = runCatching {
+internal fun findDiskCachedFile(cacheDir: File?, mediaId: String): File? = runCatching {
     val rootDir = cacheDir ?: return null
     val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
     if (!thumbsDir.exists()) return null
@@ -489,7 +489,7 @@ private fun findDiskCachedFile(cacheDir: File?, mediaId: String): File? = runCat
 }
     .getOrNull()
 
-private fun decodeImagePayload(
+internal fun decodeImagePayload(
     payload: FetchedImagePayload?,
     decodeBytes: (ByteArray) -> ImageBitmap?,
     decodeFile: (File) -> ImageBitmap?,
@@ -554,7 +554,7 @@ private fun decodeBitmapBytesAtSize(bytes: ByteArray, targetPx: Int): ImageBitma
     return decodeImageSourceAtSize(ImageDecoder.createSource(ByteBuffer.wrap(bytes)), targetPx)
 }
 
-private fun decodeBitmapFileAtSize(file: File, targetPx: Int): ImageBitmap? {
+internal fun decodeBitmapFileAtSize(file: File, targetPx: Int): ImageBitmap? {
     if (!file.isFile || file.length() <= 0L) return null
     return decodeImageSourceAtSize(ImageDecoder.createSource(file), targetPx)
 }

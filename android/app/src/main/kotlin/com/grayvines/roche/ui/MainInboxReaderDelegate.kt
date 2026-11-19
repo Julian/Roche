@@ -3,13 +3,13 @@ package com.grayvines.roche.ui
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.isLikelyFeedUrl
 import com.grayvines.roche.data.normalizeUserSubmittedUrl
+import com.grayvines.roche.data.runSuspendCatching
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.extractCleanDomain
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 
@@ -192,15 +192,18 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
     ) {
         var failed = false
         try {
-            val starred =
+            runSuspendCatching {
                 vm.repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
-            if (!bannerAlreadyShown) {
-                vm.showStatusMessage(if (starred) "Starred" else "Removed star")
             }
-        } catch (err: Throwable) {
-            if (err is CancellationException) throw err
-            failed = true
-            vm.showStatusMessage("Could not update star (${err.message ?: "error"})")
+                .onSuccess { starred ->
+                    if (!bannerAlreadyShown) {
+                        vm.showStatusMessage(if (starred) "Starred" else "Removed star")
+                    }
+                }
+                .onFailure { err ->
+                    failed = true
+                    vm.showStatusMessage("Could not update star (${err.message ?: "error"})")
+                }
         } finally {
             if (bannerAlreadyShown) {
                 clearSettledOptimisticStar(entryId, forceClear = failed)

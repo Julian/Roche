@@ -35,9 +35,6 @@ class CatalogStore(
     private val seeder = CatalogSeeder(dao = dao, localPeerIdProvider = ::resolveLocalPeerId)
     private val mutationMutex = Mutex()
 
-    internal suspend fun resolveLocalPeerId(): String =
-        localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
-
     @OptIn(ExperimentalCoroutinesApi::class)
     val snapshot: Flow<CatalogSnapshot> =
         combine(
@@ -60,6 +57,9 @@ class CatalogStore(
             .distinctUntilChanged()
             .map(::buildCatalogSnapshot)
             .flowOn(Dispatchers.Default)
+
+    internal suspend fun resolveLocalPeerId(): String =
+        localPeerIdProvider().ifBlank { DEFAULT_LOCAL_HLC_NODE }
 
     suspend fun ensureSystemSeeded() = seeder.ensureSystemSeeded()
 
@@ -113,15 +113,21 @@ class CatalogStore(
     suspend fun removeCollectionGenerator(collectionIdOrSlug: String): Boolean {
         val removed = mutationMutex.withLock {
             ensureSystemSeeded()
-            val spec = resolveCollectionSpec(collectionIdOrSlug) ?: return@withLock false
-            val existing = dao.getCollectionGenerator(spec.collectionId) ?: return@withLock false
-            val nodeId = resolveLocalPeerId()
-            dao.deleteCollectionGeneratorWithTombstone(
-                collectionId = existing.collectionId,
-                recordTombstone = true,
-                nodeId = nodeId,
-            )
-            true
+            val existing =
+                resolveCollectionSpec(collectionIdOrSlug)?.let { spec ->
+                    dao.getCollectionGenerator(spec.collectionId)
+                }
+            if (existing == null) {
+                false
+            } else {
+                val nodeId = resolveLocalPeerId()
+                dao.deleteCollectionGeneratorWithTombstone(
+                    collectionId = existing.collectionId,
+                    recordTombstone = true,
+                    nodeId = nodeId,
+                )
+                true
+            }
         }
         if (removed) {
             onLocalMutation()

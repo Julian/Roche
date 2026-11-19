@@ -217,14 +217,8 @@ private fun ContextSheetActionsList(
     onOpenExternalUrl: () -> Unit,
 ) {
     val isAudio = entry.contentType == ContentType.AUDIO
-    val readToggleLabel = if (entry.isRead) "Mark as Unread" else "Mark as Read"
-    val offlineLabel =
-        when {
-            isAudio && entry.isCachedOffline -> "Delete Local Episode Download"
-            isAudio -> "Download Episode for Offline Playback"
-            entry.isCachedOffline -> "Remove Local Offline Copy"
-            else -> "Download Local Offline Copy"
-        }
+    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
+    var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
 
     ContextSheetPrimaryActions(entry = entry, isAudio = isAudio, onAction = onAction)
     ContextActionItem(
@@ -235,18 +229,15 @@ private fun ContextSheetActionsList(
         label = if (isInQueue) "Remove from Queue" else "Add to Queue",
         onClick = { onAction(MainAction.ToggleQueueMembership(entry.id)) },
     )
-    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
     ContextActionItem(
-        label = readToggleLabel,
+        label = if (entry.isRead) "Mark as Unread" else "Mark as Read",
         onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
     )
     if (!isLocalPdfUrl) {
         ContextActionItem(label = "Share…", onClick = onShare)
     }
-    var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
-    val colors = LocalRocheColors.current
     ContextActionItem(
-        label = offlineLabel,
+        label = resolveOfflineActionLabel(entry = entry, isAudio = isAudio),
         onClick = {
             onAction(MainAction.CloseContextSheet)
             onAction(MainAction.ToggleOfflineCache(entry.id))
@@ -263,38 +254,30 @@ private fun ContextSheetActionsList(
     }
     ContextActionItem(
         label = "Delete Entry",
-        textColor = colors.accentIndianRed,
+        textColor = LocalRocheColors.current.accentIndianRed,
         onClick = { confirmDeleteEntry = true },
     )
     if (confirmDeleteEntry) {
-        AlertDialog(
-            onDismissRequest = { confirmDeleteEntry = false },
-            containerColor = colors.surfaceElevated,
-            title = { Text("Delete entry?", color = colors.textPrimary) },
-            text = {
-                Text(
-                    text = "Permanently delete \"${entry.title}\" from your library?",
-                    color = colors.textSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        confirmDeleteEntry = false
-                        onAction(MainAction.DeleteEntry(entry.id))
-                    }
-                ) {
-                    Text("Delete", color = colors.accentIndianRed)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDeleteEntry = false }) {
-                    Text("Cancel", color = colors.textSecondary)
-                }
+        DestructiveConfirmDialog(
+            title = "Delete entry?",
+            message = "Permanently delete \"${entry.title}\" from your library?",
+            confirmLabel = "Delete",
+            onDismiss = { confirmDeleteEntry = false },
+            onConfirm = {
+                confirmDeleteEntry = false
+                onAction(MainAction.DeleteEntry(entry.id))
             },
         )
     }
 }
+
+private fun resolveOfflineActionLabel(entry: InboxEntry, isAudio: Boolean): String =
+    when {
+        isAudio && entry.isCachedOffline -> "Delete Local Episode Download"
+        isAudio -> "Download Episode for Offline Playback"
+        entry.isCachedOffline -> "Remove Local Offline Copy"
+        else -> "Download Local Offline Copy"
+    }
 
 @Composable
 private fun ContextSheetPrimaryActions(
@@ -549,6 +532,7 @@ internal fun FeedContextActionsList(
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    var confirmDeleteFeed by rememberSaveable(feed.id) { mutableStateOf(false) }
     ContextActionItem(
         label = "View Feed Items (${feed.unreadCount} unread)",
         onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
@@ -581,7 +565,6 @@ internal fun FeedContextActionsList(
         onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
         modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
     )
-    var confirmDeleteFeed by rememberSaveable(feed.id) { mutableStateOf(false) }
     ContextActionItem(
         label = "Unsubscribe from Feed",
         textColor = colors.accentIndianRed,
@@ -589,35 +572,45 @@ internal fun FeedContextActionsList(
         modifier = Modifier.testTag("delete_feed_${feed.id}"),
     )
     if (confirmDeleteFeed) {
-        AlertDialog(
-            onDismissRequest = { confirmDeleteFeed = false },
-            containerColor = colors.surfaceElevated,
-            title = { Text("Unsubscribe from feed?", color = colors.textPrimary) },
-            text = {
-                Text(
-                    text =
-                        "Unsubscribe from \"${feed.title}\" and remove its entries from your Inbox?",
-                    color = colors.textSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        confirmDeleteFeed = false
-                        onAction(MainAction.DeleteFeed(feed.id))
-                    },
-                    modifier = Modifier.testTag("confirm_delete_feed_${feed.id}"),
-                ) {
-                    Text("Unsubscribe", color = colors.accentIndianRed)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDeleteFeed = false }) {
-                    Text("Cancel", color = colors.textSecondary)
-                }
+        DestructiveConfirmDialog(
+            title = "Unsubscribe from feed?",
+            message = "Unsubscribe from \"${feed.title}\" and remove its entries from your Inbox?",
+            confirmLabel = "Unsubscribe",
+            confirmTestTag = "confirm_delete_feed_${feed.id}",
+            onDismiss = { confirmDeleteFeed = false },
+            onConfirm = {
+                confirmDeleteFeed = false
+                onAction(MainAction.DeleteFeed(feed.id))
             },
         )
     }
+}
+
+@Composable
+private fun DestructiveConfirmDialog(
+    title: String,
+    message: String,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+    confirmTestTag: String? = null,
+) {
+    val colors = LocalRocheColors.current
+    val confirmModifier = if (confirmTestTag != null) Modifier.testTag(confirmTestTag) else Modifier
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surfaceElevated,
+        title = { Text(title, color = colors.textPrimary) },
+        text = { Text(text = message, color = colors.textSecondary) },
+        confirmButton = {
+            TextButton(onClick = onConfirm, modifier = confirmModifier) {
+                Text(confirmLabel, color = colors.accentIndianRed)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = colors.textSecondary) }
+        },
+    )
 }
 
 @Composable

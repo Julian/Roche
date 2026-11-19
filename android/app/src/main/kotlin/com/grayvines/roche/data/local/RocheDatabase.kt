@@ -190,7 +190,7 @@ abstract class RocheDatabase : RoomDatabase() {
         fun create(context: Context): RocheDatabase {
             val appContext = context.applicationContext
             val isDebuggable =
-                (appContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                appContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
             val builder =
                 Room.databaseBuilder<RocheDatabase>(appContext, DATABASE_NAME)
                     .setDriver(BundledSQLiteDriver())

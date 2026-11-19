@@ -49,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -78,6 +79,7 @@ import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.RocheColors
 import kotlinx.coroutines.CancellationException
 
 @Composable
@@ -543,29 +545,9 @@ private fun InboxEntryRowSurface(
 ) {
     val colors = LocalRocheColors.current
     val verticalPadding = if (ultraDense) 9.dp else 12.dp
-    val rowBackground =
-        when {
-            isPlayingAudio -> colors.accentBlue.copy(alpha = 0.12f)
-            isQueuedNextAudio -> colors.accentVerdigris.copy(alpha = 0.11f)
-            else -> colors.background
-        }
-    val leftAccentColor =
-        when {
-            isPlayingAudio -> colors.accentBlue
-            isQueuedNextAudio -> colors.accentVerdigris
-            else -> null
-        }
-    val rowStateLabel = buildList {
-        when {
-            isPlayingAudio -> add("Now playing")
-            isQueuedNextAudio -> add("Queued next")
-        }
-        when {
-            entry.isArchived -> add("Archived")
-            entry.isUnread -> add("Unread")
-        }
-    }
-        .joinToString(", ")
+    val (rowBackground, leftAccentColor) =
+        resolveInboxRowHighlight(colors, isPlayingAudio, isQueuedNextAudio)
+    val rowStateLabel = buildInboxRowStateLabel(entry, isPlayingAudio, isQueuedNextAudio)
 
     Row(
         modifier =
@@ -596,10 +578,7 @@ private fun InboxEntryRowSurface(
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        EntryLeadingStarButton(
-            entry = entry,
-            onToggleStar = onToggleStar,
-        )
+        EntryLeadingStarButton(entry = entry, onToggleStar = onToggleStar)
 
         if (entry.showsThumbnailPreview) {
             EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
@@ -618,6 +597,37 @@ private fun InboxEntryRowSurface(
         )
     }
 }
+
+private fun resolveInboxRowHighlight(
+    colors: RocheColors,
+    isPlayingAudio: Boolean,
+    isQueuedNextAudio: Boolean,
+): Pair<Color, Color?> =
+    when {
+        isPlayingAudio -> colors.accentBlue.copy(alpha = PLAYING_ROW_BG_ALPHA) to colors.accentBlue
+        isQueuedNextAudio ->
+            colors.accentVerdigris.copy(alpha = QUEUED_ROW_BG_ALPHA) to colors.accentVerdigris
+        else -> colors.background to null
+    }
+
+private fun buildInboxRowStateLabel(
+    entry: InboxEntry,
+    isPlayingAudio: Boolean,
+    isQueuedNextAudio: Boolean,
+): String = buildList {
+    when {
+        isPlayingAudio -> add("Now playing")
+        isQueuedNextAudio -> add("Queued next")
+    }
+    when {
+        entry.isArchived -> add("Archived")
+        entry.isUnread -> add("Unread")
+    }
+}
+    .joinToString(", ")
+
+private const val PLAYING_ROW_BG_ALPHA = 0.12f
+private const val QUEUED_ROW_BG_ALPHA = 0.11f
 
 @Composable
 private fun EntryLeadingStarButton(

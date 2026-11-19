@@ -236,36 +236,35 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                     vm.cleanupRemovedEntries(feedEntryIds)
                 }
                 vm.transientState.update { current ->
-                    val deletingScopedFeed = current.selectedFeedId == feedId
-                    val nextFeedId = if (deletingScopedFeed) null else current.selectedFeedId
-                    val nextScopeOriginTab =
-                        if (deletingScopedFeed) null else current.scopeOriginTab
-                    val nextActiveTab =
-                        if (deletingScopedFeed) {
-                            current.scopeOriginTab ?: AppTab.FEEDS
-                        } else {
-                            current.activeTab
-                        }
-                    val nextFeedSheetId =
-                        if (current.feedContextSheetId == feedId) {
-                            null
-                        } else {
-                            current.feedContextSheetId
-                        }
-                    current.copy(
-                        activeTab = nextActiveTab,
-                        selectedFeedId = nextFeedId,
-                        scopeOriginTab = nextScopeOriginTab,
-                        feedContextSheetId = nextFeedSheetId,
-                        undoEvent = null,
-                        statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
-                        messageSequence = current.messageSequence + 1,
-                    )
+                    applyDeletedFeedState(current = current, feedId = feedId, title = title)
                 }
             }
             .onFailure { error ->
                 vm.showStatusMessage("Unsubscribe failed (${error.message ?: "error"})")
             }
+    }
+
+    private fun applyDeletedFeedState(
+        current: TransientUiState,
+        feedId: String,
+        title: String,
+    ): TransientUiState {
+        val deletingScopedFeed = current.selectedFeedId == feedId
+        return current.copy(
+            activeTab =
+                if (deletingScopedFeed) {
+                    current.scopeOriginTab ?: AppTab.FEEDS
+                } else {
+                    current.activeTab
+                },
+            selectedFeedId = if (deletingScopedFeed) null else current.selectedFeedId,
+            scopeOriginTab = if (deletingScopedFeed) null else current.scopeOriginTab,
+            feedContextSheetId =
+                if (current.feedContextSheetId == feedId) null else current.feedContextSheetId,
+            undoEvent = null,
+            statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",
+            messageSequence = current.messageSequence + 1,
+        )
     }
 
     private suspend fun performSyncWithServerConfig(action: MainAction.SyncWithServerConfig) {

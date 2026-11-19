@@ -273,9 +273,10 @@ internal fun formatLatexAltToHtml(rawLatex: String): String {
     val formatted =
         LATEX_COMMAND_REGEX.replace(trimmed) { match ->
             val cmd = match.value
-            when {
-                cmd in LATEX_FONT_COMMANDS -> ""
-                else -> LATEX_SYMBOL_REPLACEMENTS[cmd] ?: cmd
+            if (cmd in LATEX_FONT_COMMANDS) {
+                ""
+            } else {
+                LATEX_SYMBOL_REPLACEMENTS[cmd] ?: cmd
             }
         }
     return convertLatexScripts(formatted)

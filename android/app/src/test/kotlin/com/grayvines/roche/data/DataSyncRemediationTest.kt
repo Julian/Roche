@@ -7,13 +7,15 @@ import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
+import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpResponse
+import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.isCleartextAllowed
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.data.settings.Settings
-import com.grayvines.roche.data.settings.isPermanentKeystoreInvalidation
+import com.grayvines.roche.data.settings.isPermanentKeyInvalidation
 import com.grayvines.roche.isAllowedSharedContentUri
 import com.grayvines.roche.openValidatedPdfStream
 import java.io.ByteArrayInputStream
@@ -79,7 +81,10 @@ class DataSyncRemediationTest {
 
     @Test
     fun `openValidatedPdfStream accepts PDF header and rejects non-PDF streams`() {
-        val pdfPayload = "%PDF-1.7\n1 0 obj\n<<>>\nendobj\n".toByteArray(Charsets.UTF_8)
+        val pdfPayload =
+            listOf("%PDF-1.7", "1 0 obj", "<<>>", "endobj", "")
+                .joinToString("\n")
+                .toByteArray(Charsets.UTF_8)
         val valid = openValidatedPdfStream(ByteArrayInputStream(pdfPayload))
         assertNotNull(valid)
         assertEquals(
@@ -144,95 +149,11 @@ class DataSyncRemediationTest {
             catalog.ensureSystemSeeded()
             val listId = catalog.createCustomList("413 Test List")
             val nowIso = "2026-11-18T12:00:00Z"
-
-            // Create 4 dirty entries with large bodies so initial payload exceeds server limit,
-            // plus a child membership and consumption log referencing entry-0.
-            val entryIds = (0 until 4).map { "entry-413-$it" }
-            val body = "x".repeat(400_000)
-            for ((idx, id) in entryIds.withIndex()) {
-                val hlc = nextLocalHlc(dao, "android-test")
-                dao.upsertEntry(
-                    EntryEntity(
-                        id = id,
-                        kind = EntryKind.ARTICLE.wireValue,
-                        title = "Entry $idx",
-                        url = "https://example.com/413/$idx",
-                        summary = body,
-                        createdAt = nowIso,
-                        updatedAt = nowIso,
-                        hlc = hlc,
-                        isLocalDirty = true,
-                    )
-                )
-                dao.upsertEntryState(
-                    EntryStateEntity(
-                        entryId = id,
-                        inboxState = "unread",
-                        updatedAt = nowIso,
-                        hlc = hlc,
-                        isLocalDirty = true,
-                    )
-                )
-            }
-            val edgeHlc = nextLocalHlc(dao, "android-test")
-            dao.upsertCollectionEntry(
-                CollectionEntryEntity(
-                    collectionId = listId,
-                    entryId = entryIds[0],
-                    position = null,
-                    addedAt = nowIso,
-                    hlc = edgeHlc,
-                    isLocalDirty = true,
-                )
-            )
-            dao.insertConsumptionLogIgnore(
-                ConsumptionLogEntity(
-                    id = "log-413-0",
-                    entryId = entryIds[0],
-                    ts = nowIso,
-                    status = ConsumptionStatus.CONSUMED.wireValue,
-                    notes = null,
-                    createdAt = nowIso,
-                    hlc = edgeHlc,
-                    isLocalDirty = true,
-                )
-            )
-            dao.insertComparisonIgnore(
-                ComparisonEntity(
-                    id = "comp-413-0",
-                    ts = nowIso,
-                    scopeCollectionId = listId,
-                    orderingJson = """[["${entryIds[0]}"],["${entryIds[1]}"]]""",
-                    createdAt = nowIso,
-                    hlc = edgeHlc,
-                    isLocalDirty = true,
-                )
-            )
+            val entryIds = seedPayloadTooLargeFixture(dao, listId, nowIso)
 
             val receivedRequests = CopyOnWriteArrayList<JsonObject>()
             val uploadedEntryIds = LinkedHashSet<String>()
-            var seq = 10L
-            val apiClient = RocheApiClient { req ->
-                val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
-                receivedRequests.add(parsed)
-                val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
-                if (entriesArr.size > 1) {
-                    HttpResponse(
-                        statusCode = 413,
-                        body = """{"title":"Payload Too Large","status":413}""",
-                    )
-                } else {
-                    entriesArr.forEach { el ->
-                        uploadedEntryIds.add(el.jsonObject["id"]!!.jsonPrimitive.content)
-                    }
-                    seq += 1L
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
-                    )
-                }
-            }
+            val apiClient = buildHalving413ApiClient(nowIso, receivedRequests, uploadedEntryIds)
 
             val coordinator =
                 PeerSyncCoordinator(
@@ -359,34 +280,7 @@ class DataSyncRemediationTest {
             val itemUrl = "https://example.com/want-to-read-doc"
             val itemId = deterministicItemId(null, canonicalizeSyncUrl(itemUrl))
             val oldHlc = HlcTimestamp.create(1_700_000_000_000L, 0, "android-peer-1").encode()
-            dao.upsertEntry(
-                EntryEntity(
-                    id = itemId,
-                    kind = EntryKind.ARTICLE.wireValue,
-                    title = "WTR Article",
-                    url = itemUrl,
-                    createdAt = nowIso,
-                    updatedAt = nowIso,
-                    hlc = oldHlc,
-                )
-            )
-            dao.upsertEntryState(
-                EntryStateEntity(
-                    entryId = itemId,
-                    inboxState = "none",
-                    updatedAt = nowIso,
-                    hlc = oldHlc,
-                )
-            )
-            dao.upsertCollectionEntry(
-                CollectionEntryEntity(
-                    collectionId = WANT_TO_READ_COLLECTION_ID,
-                    entryId = itemId,
-                    position = null,
-                    addedAt = nowIso,
-                    hlc = oldHlc,
-                )
-            )
+            seedManualWantToReadItem(dao, itemId, itemUrl, nowIso, oldHlc)
 
             // 2. Collection generator lifecycle + tombstone
             val listId = catalog.createCustomList("Gen List")
@@ -402,12 +296,7 @@ class DataSyncRemediationTest {
             val outgoing =
                 buildPeerSyncRequest(
                     dao = dao,
-                    config =
-                        PeerSyncRequestConfig(
-                            peerId = "android-peer-1",
-                            deviceName = "P",
-                            sinceSeq = 1L,
-                        ),
+                    config = PeerSyncRequestConfig("android-peer-1", "P", sinceSeq = 1L),
                 )
             assertTrue(
                 outgoing.tombstones.any {
@@ -420,62 +309,15 @@ class DataSyncRemediationTest {
             // and an older incoming generator does NOT resurrect the tombstoned generator.
             val newerHlc = HlcTimestamp.create(1_800_000_000_000L, 0, "server").encode()
             val olderGenHlc = HlcTimestamp.create(1_600_000_000_000L, 0, "server").encode()
-            reconcilePeerSyncResponse(
-                dao = dao,
-                response =
-                    com.grayvines.roche.data.remote.PeerSyncResponseDto(
-                        serverPeerId = "server",
-                        syncTimestamp = nowIso,
-                        tombstones =
-                            listOf(
-                                SyncTombstoneDto(
-                                    entityType = "item",
-                                    naturalKey = itemNaturalKey(null, itemUrl),
-                                    deletedAt = nowIso,
-                                    hlc = newerHlc,
-                                )
-                            ),
-                        collectionGenerators =
-                            listOf(
-                                SyncCollectionGeneratorDto(
-                                    collectionId = listId,
-                                    enabled = true,
-                                    currentEntryId = null,
-                                    drawnAt = null,
-                                    updatedAt = nowIso,
-                                    hlc = olderGenHlc,
-                                )
-                            ),
-                    ),
-                localPeerId = "android-peer-1",
-                catalogStore = catalog,
-            )
+            val itemTombstone =
+                SyncTombstoneDto("item", itemNaturalKey(null, itemUrl), nowIso, newerHlc)
+            reconcileGeneratorSync(catalog, listId, nowIso, olderGenHlc, listOf(itemTombstone))
             assertNull(dao.getEntryById(itemId))
             assertNull(dao.getCollectionGenerator(listId))
 
             // A newer incoming generator clears the tombstone and resurrects cleanly
             val resurrectHlc = HlcTimestamp.create(1_900_000_000_000L, 0, "server").encode()
-            reconcilePeerSyncResponse(
-                dao = dao,
-                response =
-                    com.grayvines.roche.data.remote.PeerSyncResponseDto(
-                        serverPeerId = "server",
-                        syncTimestamp = nowIso,
-                        collectionGenerators =
-                            listOf(
-                                SyncCollectionGeneratorDto(
-                                    collectionId = listId,
-                                    enabled = true,
-                                    currentEntryId = null,
-                                    drawnAt = null,
-                                    updatedAt = nowIso,
-                                    hlc = resurrectHlc,
-                                )
-                            ),
-                    ),
-                localPeerId = "android-peer-1",
-                catalogStore = catalog,
-            )
+            reconcileGeneratorSync(catalog, listId, nowIso, resurrectHlc)
             assertNotNull(dao.getCollectionGenerator(listId))
             assertNull(dao.getTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, listId))
         }
@@ -483,18 +325,18 @@ class DataSyncRemediationTest {
     @Test
     fun `sanitizeFeedHtml strips XSS vectors via Jsoup safelist`() {
         val malicious =
-            """
-            <p>Hello</p>
-            <svg onload="alert(1)"></svg>
-            <object data="evil.swf"></object>
-            <embed src="evil.swf">
-            <meta http-equiv="refresh" content="0;url=javascript:alert(1)">
-            <a href="&#106;avascript:alert(1)">bad1</a>
-            <a href=javascript:alert(2)>bad2</a>
-            <script>alert(3)</script >
-            <img src="/images/pic.png">
-            """
-                .trimIndent()
+            listOf(
+                    "<p>Hello</p>",
+                    """<svg onload="alert(1)"></svg>""",
+                    """<object data="evil.swf"></object>""",
+                    """<embed src="evil.swf">""",
+                    """<meta http-equiv="refresh" content="0;url=javascript:alert(1)">""",
+                    """<a href="&#106;avascript:alert(1)">bad1</a>""",
+                    "<a href=javascript:alert(2)>bad2</a>",
+                    "<script>alert(3)</script >",
+                    """<img src="/images/pic.png">""",
+                )
+                .joinToString("\n")
         val cleaned = sanitizeFeedHtml(malicious, "https://blog.example.com/posts/1")
         assertTrue(cleaned.contains("<p>Hello</p>"))
         assertTrue(cleaned.contains("https://blog.example.com/images/pic.png"))
@@ -509,13 +351,13 @@ class DataSyncRemediationTest {
 
     @Test
     fun `TokenCipher permanent invalidation check and PublicUrlValidator fail-closed cleartext`() {
-        assertTrue(isPermanentKeystoreInvalidation(UnrecoverableKeyException("wiped")))
+        assertTrue(isPermanentKeyInvalidation(UnrecoverableKeyException("wiped")))
         assertTrue(
-            isPermanentKeystoreInvalidation(
+            isPermanentKeyInvalidation(
                 RuntimeException("wrapped", UnrecoverableKeyException("wiped"))
             )
         )
-        assertFalse(isPermanentKeystoreInvalidation(IllegalStateException("device locked")))
+        assertFalse(isPermanentKeyInvalidation(IllegalStateException("device locked")))
         assertFalse(isCleartextAllowed("example.com"))
     }
 
@@ -643,4 +485,142 @@ class DataSyncRemediationTest {
         assertEquals(albumA, afterStaleRemote.currentEntryId)
         assertTrue(afterStaleRemote.isLocalDirty)
     }
+}
+
+private suspend fun seedPayloadTooLargeFixture(
+    dao: RocheDao,
+    listId: String,
+    nowIso: String,
+): List<String> {
+    val entryIds = (0 until 4).map { "entry-413-$it" }
+    val body = "x".repeat(400_000)
+    for ((idx, id) in entryIds.withIndex()) {
+        val hlc = nextLocalHlc(dao, "android-test")
+        dao.upsertEntry(
+            EntryEntity(
+                id = id,
+                kind = EntryKind.ARTICLE.wireValue,
+                title = "Entry $idx",
+                url = "https://example.com/413/$idx",
+                summary = body,
+                createdAt = nowIso,
+                updatedAt = nowIso,
+                hlc = hlc,
+                isLocalDirty = true,
+            )
+        )
+        dao.upsertEntryState(
+            EntryStateEntity(id, "unread", updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
+        )
+    }
+    val edgeHlc = nextLocalHlc(dao, "android-test")
+    dao.upsertCollectionEntry(
+        CollectionEntryEntity(listId, entryIds[0], null, nowIso, edgeHlc, isLocalDirty = true)
+    )
+    dao.insertConsumptionLogIgnore(
+        ConsumptionLogEntity(
+            id = "log-413-0",
+            entryId = entryIds[0],
+            ts = nowIso,
+            status = ConsumptionStatus.CONSUMED.wireValue,
+            createdAt = nowIso,
+            hlc = edgeHlc,
+            isLocalDirty = true,
+        )
+    )
+    dao.insertComparisonIgnore(
+        ComparisonEntity(
+            id = "comp-413-0",
+            ts = nowIso,
+            scopeCollectionId = listId,
+            orderingJson = """[["${entryIds[0]}"],["${entryIds[1]}"]]""",
+            createdAt = nowIso,
+            hlc = edgeHlc,
+            isLocalDirty = true,
+        )
+    )
+    return entryIds
+}
+
+private fun buildHalving413ApiClient(
+    nowIso: String,
+    receivedRequests: CopyOnWriteArrayList<JsonObject>,
+    uploadedEntryIds: LinkedHashSet<String>,
+): RocheApiClient {
+    var seq = 10L
+    return RocheApiClient { req ->
+        val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
+        receivedRequests.add(parsed)
+        val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
+        if (entriesArr.size > 1) {
+            HttpResponse(statusCode = 413, body = """{"title":"Payload Too Large","status":413}""")
+        } else {
+            entriesArr.forEach { el ->
+                uploadedEntryIds.add(el.jsonObject["id"]!!.jsonPrimitive.content)
+            }
+            seq += 1L
+            HttpResponse(
+                statusCode = 200,
+                body =
+                    """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
+            )
+        }
+    }
+}
+
+private suspend fun seedManualWantToReadItem(
+    dao: RocheDao,
+    itemId: String,
+    itemUrl: String,
+    nowIso: String,
+    hlc: String,
+) {
+    dao.upsertEntry(
+        EntryEntity(
+            id = itemId,
+            kind = EntryKind.ARTICLE.wireValue,
+            title = "WTR Article",
+            url = itemUrl,
+            createdAt = nowIso,
+            updatedAt = nowIso,
+            hlc = hlc,
+        )
+    )
+    dao.upsertEntryState(
+        EntryStateEntity(entryId = itemId, inboxState = "none", updatedAt = nowIso, hlc = hlc)
+    )
+    dao.upsertCollectionEntry(
+        CollectionEntryEntity(WANT_TO_READ_COLLECTION_ID, itemId, null, nowIso, hlc)
+    )
+}
+
+private suspend fun reconcileGeneratorSync(
+    catalog: CatalogStore,
+    listId: String,
+    nowIso: String,
+    generatorHlc: String,
+    tombstones: List<SyncTombstoneDto> = emptyList(),
+) {
+    reconcilePeerSyncResponse(
+        dao = catalog.dao,
+        response =
+            PeerSyncResponseDto(
+                serverPeerId = "server",
+                syncTimestamp = nowIso,
+                tombstones = tombstones,
+                collectionGenerators =
+                    listOf(
+                        SyncCollectionGeneratorDto(
+                            collectionId = listId,
+                            enabled = true,
+                            currentEntryId = null,
+                            drawnAt = null,
+                            updatedAt = nowIso,
+                            hlc = generatorHlc,
+                        )
+                    ),
+            ),
+        localPeerId = "android-peer-1",
+        catalogStore = catalog,
+    )
 }

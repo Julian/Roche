@@ -308,8 +308,6 @@ private fun FullscreenPlayerTopBar(
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    var showOverflowMenu by rememberSaveable { mutableStateOf(false) }
-    var showSleepMenu by rememberSaveable { mutableStateOf(false) }
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
 
     Row(
@@ -336,58 +334,10 @@ private fun FullscreenPlayerTopBar(
                 StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
             }
 
-            Box {
-                HeaderActionButton(
-                    label = playerState.sleepTimerRemainingMinutes?.let { "Zz ${it}m" } ?: "Zz",
-                    contentDescription =
-                        playerState.sleepTimerRemainingMinutes?.let {
-                            "Sleep timer, $it minutes remaining"
-                        } ?: "Sleep timer",
-                    onClick = { showSleepMenu = true },
-                    modifier = Modifier.testTag("player_sleep_btn"),
-                )
-                DropdownMenu(
-                    expanded = showSleepMenu,
-                    onDismissRequest = { showSleepMenu = false },
-                ) {
-                    val activeRemaining = playerState.sleepTimerRemainingMinutes
-                    listOf(
-                            null to "Sleep timer off",
-                            15 to "15 minutes",
-                            30 to "30 minutes",
-                            45 to "45 minutes",
-                            60 to "60 minutes",
-                        )
-                        .forEach { (mins, label) ->
-                            val isSelected =
-                                (mins == null && activeRemaining == null) ||
-                                    (mins != null && activeRemaining == mins)
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        text = label,
-                                        color =
-                                            if (isSelected) {
-                                                colors.accentEcru
-                                            } else {
-                                                colors.textPrimary
-                                            },
-                                        fontWeight =
-                                            if (isSelected) {
-                                                FontWeight.SemiBold
-                                            } else {
-                                                FontWeight.Normal
-                                            },
-                                    )
-                                },
-                                onClick = {
-                                    showSleepMenu = false
-                                    onAction(MainAction.SetSleepTimerMinutes(mins))
-                                },
-                            )
-                        }
-                }
-            }
+            PlayerSleepTimerMenuButton(
+                activeRemaining = playerState.sleepTimerRemainingMinutes,
+                onSelectMinutes = { mins -> onAction(MainAction.SetSleepTimerMinutes(mins)) },
+            )
 
             HeaderActionButton(
                 label = "Cast",
@@ -401,114 +351,184 @@ private fun FullscreenPlayerTopBar(
                 modifier = Modifier.testTag("player_share_btn"),
             )
 
-            Box {
-                HeaderActionButton(
-                    label = "•••",
-                    contentDescription = "More player options",
-                    onClick = { showOverflowMenu = true },
-                    modifier = Modifier.testTag("player_overflow_btn"),
+            PlayerOverflowMenuButton(
+                entry = entry,
+                playerState = playerState,
+                onAction = onAction,
+                onShareEntry = onShareEntry,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
+        }
+    }
+}
+
+@Composable
+private fun PlayerSleepTimerMenuButton(
+    activeRemaining: Int?,
+    onSelectMinutes: (Int?) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var showSleepMenu by rememberSaveable { mutableStateOf(false) }
+
+    Box {
+        HeaderActionButton(
+            label = activeRemaining?.let { "Zz ${it}m" } ?: "Zz",
+            contentDescription =
+                activeRemaining?.let { "Sleep timer, $it minutes remaining" } ?: "Sleep timer",
+            onClick = { showSleepMenu = true },
+            modifier = Modifier.testTag("player_sleep_btn"),
+        )
+        DropdownMenu(
+            expanded = showSleepMenu,
+            onDismissRequest = { showSleepMenu = false },
+        ) {
+            listOf(
+                    null to "Sleep timer off",
+                    15 to "15 minutes",
+                    30 to "30 minutes",
+                    45 to "45 minutes",
+                    60 to "60 minutes",
                 )
-                DropdownMenu(
-                    expanded = showOverflowMenu,
-                    onDismissRequest = { showOverflowMenu = false },
-                ) {
-                    DropdownMenuItem(
-                        text = { Text("Open Full Show Notes in Reader") },
-                        onClick = {
-                            showOverflowMenu = false
-                            onAction(MainAction.OpenReader(entry.id, forceArticleView = true))
-                        },
-                        modifier = Modifier.testTag("player_open_reader_btn"),
-                    )
-                    if (entry.feedId != null) {
-                        DropdownMenuItem(
-                            text = { Text("Open Podcast (${entry.feedTitle})") },
-                            onClick = {
-                                showOverflowMenu = false
-                                onAction(MainAction.CloseFullscreenPlayer)
-                                onAction(MainAction.FilterByFeed(entry.feedId))
-                            },
-                        )
-                    }
-                    DropdownMenuItem(
-                        text = { Text("Finish & Rank Episode") },
-                        onClick = {
-                            showOverflowMenu = false
-                            onAction(MainAction.CloseFullscreenPlayer)
-                            onAction(
-                                MainAction.MarkFeedEntryFinished(
-                                    entryId = entry.id,
-                                    rankImmediately = true,
-                                )
-                            )
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Visit Episode Website ↗") },
-                        onClick = {
-                            showOverflowMenu = false
-                            onOpenExternalUrl(entry.url)
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Show Transcript") },
-                        onClick = {
-                            showOverflowMenu = false
-                            onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT))
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Share at ${playerState.elapsedFormatted}…") },
-                        onClick = {
-                            showOverflowMenu = false
-                            onShareEntry(
-                                entry.copy(
-                                    title = "${entry.title} (at ${playerState.elapsedFormatted})"
-                                )
-                            )
-                        },
-                    )
-                    if (entry.isArchived && entry.isCachedOffline) {
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    "Delete Download",
-                                    color = colors.accentIndianRed,
-                                )
-                            },
-                            onClick = {
-                                showOverflowMenu = false
-                                onAction(MainAction.ToggleOfflineCache(entry.id))
-                            },
-                        )
-                    }
+                .forEach { (mins, label) ->
+                    val isSelected = mins == activeRemaining
                     DropdownMenuItem(
                         text = {
                             Text(
-                                text =
-                                    if (entry.isArchived) {
-                                        "Unarchive Episode"
-                                    } else {
-                                        "Archive & Delete Download"
-                                    },
+                                text = label,
                                 color =
-                                    if (entry.isArchived) {
-                                        colors.textPrimary
+                                    if (isSelected) {
+                                        colors.accentEcru
                                     } else {
-                                        colors.accentIndianRed
+                                        colors.textPrimary
+                                    },
+                                fontWeight =
+                                    if (isSelected) {
+                                        FontWeight.SemiBold
+                                    } else {
+                                        FontWeight.Normal
                                     },
                             )
                         },
                         onClick = {
-                            showOverflowMenu = false
-                            if (!entry.isArchived) {
-                                onAction(MainAction.CloseFullscreenPlayer)
-                            }
-                            onAction(MainAction.ToggleArchive(entry))
+                            showSleepMenu = false
+                            onSelectMinutes(mins)
                         },
                     )
                 }
+        }
+    }
+}
+
+@Composable
+private fun PlayerOverflowMenuButton(
+    entry: InboxEntry,
+    playerState: PodcastPlayerState,
+    onAction: (MainAction) -> Unit,
+    onShareEntry: (InboxEntry) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    var showOverflowMenu by rememberSaveable { mutableStateOf(false) }
+
+    Box {
+        HeaderActionButton(
+            label = "•••",
+            contentDescription = "More player options",
+            onClick = { showOverflowMenu = true },
+            modifier = Modifier.testTag("player_overflow_btn"),
+        )
+        DropdownMenu(
+            expanded = showOverflowMenu,
+            onDismissRequest = { showOverflowMenu = false },
+        ) {
+            DropdownMenuItem(
+                text = { Text("Open Full Show Notes in Reader") },
+                onClick = {
+                    showOverflowMenu = false
+                    onAction(MainAction.OpenReader(entry.id, forceArticleView = true))
+                },
+                modifier = Modifier.testTag("player_open_reader_btn"),
+            )
+            if (entry.feedId != null) {
+                DropdownMenuItem(
+                    text = { Text("Open Podcast (${entry.feedTitle})") },
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.CloseFullscreenPlayer)
+                        onAction(MainAction.FilterByFeed(entry.feedId))
+                    },
+                )
             }
+            DropdownMenuItem(
+                text = { Text("Finish & Rank Episode") },
+                onClick = {
+                    showOverflowMenu = false
+                    onAction(MainAction.CloseFullscreenPlayer)
+                    onAction(
+                        MainAction.MarkFeedEntryFinished(
+                            entryId = entry.id,
+                            rankImmediately = true,
+                        )
+                    )
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Visit Episode Website ↗") },
+                onClick = {
+                    showOverflowMenu = false
+                    onOpenExternalUrl(entry.url)
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Show Transcript") },
+                onClick = {
+                    showOverflowMenu = false
+                    onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT))
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Share at ${playerState.elapsedFormatted}…") },
+                onClick = {
+                    showOverflowMenu = false
+                    onShareEntry(
+                        entry.copy(title = "${entry.title} (at ${playerState.elapsedFormatted})")
+                    )
+                },
+            )
+            if (entry.isArchived && entry.isCachedOffline) {
+                DropdownMenuItem(
+                    text = { Text("Delete Download", color = colors.accentIndianRed) },
+                    onClick = {
+                        showOverflowMenu = false
+                        onAction(MainAction.ToggleOfflineCache(entry.id))
+                    },
+                )
+            }
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        text =
+                            if (entry.isArchived) {
+                                "Unarchive Episode"
+                            } else {
+                                "Archive & Delete Download"
+                            },
+                        color =
+                            if (entry.isArchived) {
+                                colors.textPrimary
+                            } else {
+                                colors.accentIndianRed
+                            },
+                    )
+                },
+                onClick = {
+                    showOverflowMenu = false
+                    if (!entry.isArchived) {
+                        onAction(MainAction.CloseFullscreenPlayer)
+                    }
+                    onAction(MainAction.ToggleArchive(entry))
+                },
+            )
         }
     }
 }

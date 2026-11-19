@@ -357,7 +357,7 @@ internal class SafeRedirectHttpDataSource(
     }
 }
 
-private data class ResponseMetadata(
+internal data class ResponseMetadata(
     val responseCode: Int,
     val responseMessage: String?,
     val headers: Map<String, List<String>>,
@@ -367,7 +367,7 @@ private data class ResponseMetadata(
 
 private val CONTENT_RANGE_WITH_SIZE_REGEX = Regex("""bytes (?:\d+-\d+|\*)/(\d+)""")
 
-private fun readResponseMetadata(
+internal fun readResponseMetadata(
     conn: HttpURLConnection,
     onError: () -> Unit,
 ): ResponseMetadata =
@@ -385,7 +385,7 @@ private fun readResponseMetadata(
     }
 
 @OptIn(UnstableApi::class)
-private fun computeBytesToRead(
+internal fun computeBytesToRead(
     requestedLength: Long,
     meta: ResponseMetadata,
     bytesToSkip: Long,
@@ -399,7 +399,7 @@ private fun computeBytesToRead(
     }
 }
 
-private fun parseDocumentSize(contentRangeHeader: String?): Long {
+internal fun parseDocumentSize(contentRangeHeader: String?): Long {
     if (contentRangeHeader.isNullOrBlank()) return C.LENGTH_UNSET.toLong()
     val match = CONTENT_RANGE_WITH_SIZE_REGEX.matchEntire(contentRangeHeader.trim())
     return match?.groupValues?.getOrNull(1)?.toLongOrNull() ?: C.LENGTH_UNSET.toLong()
