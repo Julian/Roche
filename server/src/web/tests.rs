@@ -1821,3 +1821,343 @@ async fn test_web_filters_labels_and_destructive_confirmations() {
     assert!(entry_html.contains("data-confirm=\"Merge this duplicate"));
     assert!(entry_html.contains("aria-label=\"Canonical entry UUID, URL, or exact title\""));
 }
+
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start + 2..].find("*/") {
+            rest = &rest[start + 2 + end + 2..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_css_root_vars(css: &str) -> std::collections::HashMap<String, String> {
+    let cleaned = strip_css_comments(css);
+    let mut vars = std::collections::HashMap::new();
+    let mut search = cleaned.as_str();
+    while let Some(root_start) = search.find(":root") {
+        let rest = &search[root_start + ":root".len()..];
+        let Some(open) = rest.find('{') else {
+            break;
+        };
+        let Some(close) = rest[open + 1..].find('}') else {
+            break;
+        };
+        for decl in rest[open + 1..open + 1 + close].split(';') {
+            let trimmed = decl.trim();
+            if let Some(prop) = trimmed.strip_prefix("--")
+                && let Some((name, value)) = prop.split_once(':')
+            {
+                vars.insert(format!("--{}", name.trim()), value.trim().to_string());
+            }
+        }
+        search = &rest[open + 1 + close + 1..];
+    }
+    vars
+}
+
+fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
+    let h = hex.strip_prefix('#').expect("hex color starts with #");
+    assert_eq!(h.len(), 6, "expected 6-digit hex color, got {hex}");
+    let r = u8::from_str_radix(&h[0..2], 16).unwrap();
+    let g = u8::from_str_radix(&h[2..4], 16).unwrap();
+    let b = u8::from_str_radix(&h[4..6], 16).unwrap();
+    (f64::from(r) / 255.0, f64::from(g) / 255.0, f64::from(b) / 255.0)
+}
+
+fn wcag_relative_luminance(hex: &str) -> f64 {
+    fn linearize(channel: f64) -> f64 {
+        if channel <= 0.04045 { channel / 12.92 } else { ((channel + 0.055) / 1.055).powf(2.4) }
+    }
+    let (r, g, b) = parse_hex_rgb(hex);
+    0.2126_f64.mul_add(linearize(r), 0.7152_f64.mul_add(linearize(g), 0.0722 * linearize(b)))
+}
+
+fn wcag_contrast_ratio(foreground_hex: &str, background_hex: &str) -> f64 {
+    let lum_a = wcag_relative_luminance(foreground_hex);
+    let lum_b = wcag_relative_luminance(background_hex);
+    let (lighter, darker) = if lum_a >= lum_b { (lum_a, lum_b) } else { (lum_b, lum_a) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn extract_heading_levels(html: &str) -> Vec<usize> {
+    let mut levels = Vec::new();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<'
+            && (bytes[i + 1] == b'h' || bytes[i + 1] == b'H')
+            && bytes[i + 2].is_ascii_digit()
+        {
+            let level = usize::from(bytes[i + 2] - b'0');
+            let next = bytes.get(i + 3).copied();
+            if (1..=6).contains(&level)
+                && matches!(next, Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/'))
+            {
+                levels.push(level);
+            }
+        }
+        i += 1;
+    }
+    levels
+}
+
+fn assert_valid_heading_hierarchy(route: &str, html: &str) {
+    let levels = extract_heading_levels(html);
+    let h1_count = levels.iter().filter(|&&l| l == 1).count();
+    assert_eq!(h1_count, 1, "{route} must contain exactly one <h1>, got levels {levels:?}");
+    for pair in levels.windows(2) {
+        assert!(
+            pair[1] <= pair[0] + 1,
+            "{route} skips heading levels (h{} -> h{}) in sequence {levels:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
+fn web_css_palette_meets_wcag_aa_contrast() {
+    let vars = parse_css_root_vars(super::ROCHE_CSS);
+    let get = |name: &str| -> &str {
+        vars.get(name).unwrap_or_else(|| panic!("missing CSS token {name} in roche.css"))
+    };
+
+    // All three editorial surfaces: main paper, recessed paper, and input/card paper (#fffdf7).
+    let surfaces = [
+        ("--paper", get("--paper")),
+        ("--paper-deep", get("--paper-deep")),
+        ("input/card #fffdf7", "#fffdf7"),
+    ];
+    let normal_text_tokens = [
+        "--ink",
+        "--ink-soft",
+        "--ink-faint",
+        "--link",
+        "--link-hover",
+        "--accent",
+        "--tier-S",
+        "--tier-A",
+        "--tier-B",
+        "--tier-C",
+        "--tier-D",
+    ];
+
+    for (surface_label, surface_hex) in surfaces {
+        for text_token in normal_text_tokens {
+            let text_hex = get(text_token);
+            let ratio = wcag_contrast_ratio(text_hex, surface_hex);
+            assert!(
+                ratio >= 4.5,
+                "roche.css {text_token} ({text_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+            );
+        }
+
+        // WCAG 2.1 AA SC 1.4.11 non-text contrast (>= 3.0:1) for interactive borders and focus ring.
+        for ui_token in ["--control-border", "--accent"] {
+            let ui_hex = get(ui_token);
+            let ratio = wcag_contrast_ratio(ui_hex, surface_hex);
+            assert!(
+                ratio >= 3.0,
+                "roche.css {ui_token} ({ui_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG 1.4.11 requires >= 3.0:1)"
+            );
+        }
+    }
+
+    // Inverted button / skip-link surfaces (--paper on --ink, --accent, and --link-hover).
+    for (foreground_token, background_token) in
+        [("--paper", "--ink"), ("--paper", "--accent"), ("--paper", "--link-hover")]
+    {
+        let ratio = wcag_contrast_ratio(get(foreground_token), get(background_token));
+        assert!(
+            ratio >= 4.5,
+            "roche.css {foreground_token} on {background_token} has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+        );
+    }
+
+    // Guard against missing placeholder, disabled, and sticky-player scroll-padding styles.
+    assert!(
+        super::ROCHE_CSS.contains("::placeholder"),
+        "roche.css must explicitly style ::placeholder"
+    );
+    assert!(
+        super::ROCHE_CSS.contains(":disabled"),
+        "roche.css must explicitly style :disabled controls"
+    );
+    assert!(
+        super::ROCHE_CSS.contains("scroll-padding-bottom"),
+        "roche.css must reserve scroll-padding-bottom when fixed player bar is visible"
+    );
+}
+
+async fn seed_a11y_landmark_fixtures(db: &Db) -> (String, String, String) {
+    let feed_url = Url::parse("https://editorial.example/rss.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Editorial Feed"), None).await.unwrap();
+    let item_url = Url::parse("https://editorial.example/a11y-essay").unwrap();
+    let item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Accessibility in Editorial Web Design",
+            url: &item_url,
+            author: Some("Ada Lovelace"),
+            published_at: None,
+            summary: Some("A short summary."),
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.items()
+        .apply_background_enrichment(
+            &item.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(
+                "<h1>Embedded Article Heading</h1><p>Body</p><pre><code>fn main() {}</code></pre><img src=\"https://editorial.example/fig.png\">",
+            ),
+        )
+        .await
+        .unwrap();
+
+    let col = db
+        .catalog()
+        .create_manual_collection(
+            "A11y Classics",
+            None,
+            crate::db::CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let col_slug = col.slug.as_deref().unwrap_or(&col.id).to_owned();
+    let entry_a = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "The Design of Everyday Things".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let entry_b = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Inclusive Components".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&col_slug, &entry_a.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&col_slug, &entry_b.id, None).await.unwrap();
+
+    (col_slug, entry_a.id, item.id)
+}
+
+#[tokio::test]
+async fn web_pages_include_core_accessibility_landmarks() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let login_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(login_resp.status(), StatusCode::OK);
+    let login_html = read_body_html(login_resp).await;
+    assert!(login_html.contains("<html lang=\"en\""), "/login missing lang attribute");
+    assert!(login_html.contains("<main"), "/login missing <main> landmark");
+    assert_valid_heading_hierarchy("/login", &login_html);
+
+    let login_err_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header(header::HOST, "127.0.0.1")
+                .header(header::ORIGIN, "http://127.0.0.1")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("pairing_code=invalid-code"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_err_resp.status(), StatusCode::UNAUTHORIZED);
+    let login_err_html = read_body_html(login_err_resp).await;
+    assert!(login_err_html.contains("aria-invalid=\"true\""), "/login error missing aria-invalid");
+    assert!(
+        login_err_html.contains("aria-describedby=\"login-error\""),
+        "/login error missing aria-describedby"
+    );
+    assert_valid_heading_hierarchy("/login (401)", &login_err_html);
+
+    let unauthed_err_resp =
+        super::html::render_error_page(StatusCode::FORBIDDEN, "Forbidden", "Access denied", None);
+    assert_eq!(unauthed_err_resp.status(), StatusCode::FORBIDDEN);
+    assert_valid_heading_hierarchy(
+        "unauthenticated error page",
+        &read_body_html(unauthed_err_resp).await,
+    );
+
+    let (col_slug, entry_id, item_id) = seed_a11y_landmark_fixtures(&db).await;
+    let routes = [
+        "/".to_owned(),
+        "/inbox".to_owned(),
+        "/inbox?kind=article&q=Editorial".to_owned(),
+        "/lists/starred".to_owned(),
+        "/feeds".to_owned(),
+        "/lists".to_owned(),
+        format!("/lists/{col_slug}"),
+        format!("/entries/{entry_id}"),
+        format!("/reader/{item_id}"),
+        "/diary".to_owned(),
+        "/queue".to_owned(),
+        "/rank".to_owned(),
+        format!("/rank/{col_slug}"),
+    ];
+
+    for path in routes {
+        let resp = get_authed(&app, &path, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::OK, "expected HTTP 200 on {path}");
+        let html = read_body_html(resp).await;
+        assert!(html.contains("<html lang=\"en\""), "{path} missing lang attribute");
+        assert!(html.contains("class=\"skip-link\""), "{path} missing skip link");
+        assert!(
+            html.contains("<main id=\"roche-main\""),
+            "{path} missing <main id=\"roche-main\">"
+        );
+        assert!(
+            html.contains("<aside id=\"roche-player-bar\""),
+            "{path} missing <aside> landmark for player bar"
+        );
+        assert_valid_heading_hierarchy(&path, &html);
+
+        if path.starts_with("/reader/") {
+            assert!(
+                html.contains("<h3>Embedded Article Heading</h3>"),
+                "{path} should demote embedded article <h1> to <h3>"
+            );
+            assert!(
+                html.contains("<pre tabindex=\"0\">"),
+                "{path} should add tabindex=\"0\" on <pre> blocks"
+            );
+            assert!(
+                html.contains("alt=\"\""),
+                "{path} should add empty alt=\"\" on untitled sanitized images"
+            );
+        }
+    }
+}

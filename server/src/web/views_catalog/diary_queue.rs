@@ -85,6 +85,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
     {
         let is_cur = q.status.as_deref().unwrap_or("") == slug;
         let cls = if is_cur { "pill is-active" } else { "pill" };
+        let aria_cur = if is_cur { " aria-current=\"page\"" } else { "" };
         let mut params = Vec::new();
         if let Some(yr) = q.year {
             params.push(format!("year={yr}"));
@@ -97,7 +98,7 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
         } else {
             format!("/diary?{}", params.join("&"))
         };
-        let _ = writeln!(body, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
+        let _ = writeln!(body, "<a class=\"{cls}\" href=\"{}\"{aria_cur}>{label}</a>", esc(&href));
     }
     body.push_str("</div>\n");
 

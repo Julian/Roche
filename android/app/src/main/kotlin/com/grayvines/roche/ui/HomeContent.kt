@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -29,6 +30,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -72,9 +74,9 @@ import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
-import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @Composable
 fun HomeTabContent(
@@ -584,30 +586,38 @@ internal fun CompactCardActionButton(
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
     val isPrimary = style == RocheButtonStyle.PRIMARY
-    val bg = if (isPrimary) colors.accentBlue else colors.surfaceElevated
-    val border = if (isPrimary) colors.accentBlue else colors.border
+    val bg = if (isPrimary) colors.accentBlueFilled else colors.surfaceElevated
+    val border = if (isPrimary) colors.accentBlueFilled else colors.controlOutline
     val textColor = if (isPrimary) Color.White else colors.textPrimary
 
     Box(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .height(33.dp)
+                .minimumInteractiveComponentSize()
                 .clip(shape)
-                .background(bg)
-                .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
-                .semantics { role = Role.Button }
-                .padding(horizontal = 8.dp),
+                .semantics { role = Role.Button },
     ) {
-        Text(
-            text = label,
-            color = textColor,
-            fontSize = 11.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.fillMaxWidth()
+                    .heightIn(min = 33.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .border(1.dp, border, shape)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = label,
+                color = textColor,
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -688,6 +698,7 @@ internal fun HomeMediaCompanionWidget(
                         color = colors.textSecondary,
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.5.sp,
+                        modifier = Modifier.weight(1f).padding(end = 8.dp),
                     )
                     HeaderActionButton(
                         label = "+ Log",
@@ -882,11 +893,13 @@ private fun HomeInboxPreviewList(
     if (totalCount > previewEntries.size) {
         HorizontalDivider(color = colors.border, thickness = 1.dp)
         Box(
+            contentAlignment = Alignment.CenterStart,
             modifier =
                 Modifier.fillMaxWidth()
+                    .heightIn(min = 48.dp)
                     .clickable(onClick = onOpenInbox)
                     .padding(horizontal = 13.dp, vertical = 10.dp)
-                    .testTag("home_inbox_view_all_btn")
+                    .testTag("home_inbox_view_all_btn"),
         ) {
             Text(
                 text = "View all $totalCount feed items in Inbox →",
@@ -1262,6 +1275,7 @@ internal fun HomeFeedShortcutRow(
     Row(
         modifier =
             Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
                 .clickable(onClick = onClick)
                 .padding(horizontal = 11.dp, vertical = 10.dp)
                 .testTag("home_feed_${feed.id}"),

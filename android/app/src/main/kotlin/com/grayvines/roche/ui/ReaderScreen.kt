@@ -468,6 +468,7 @@ private fun ReaderTopToolbar(
             HeaderActionButton(label = "Share", horizontalPadding = 9.dp, onClick = onShare)
             HeaderActionButton(
                 label = "•••",
+                contentDescription = "More entry actions",
                 horizontalPadding = 9.dp,
                 onClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
             )

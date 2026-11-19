@@ -25,6 +25,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
@@ -597,7 +599,7 @@ internal fun RenderHeadingBlock(
         fontSize = (baseFontSize * scale).sp,
         lineHeight = (baseLineHeight * scale).sp,
         fontWeight = FontWeight.SemiBold,
-        modifier = modifier.padding(top = 4.dp),
+        modifier = modifier.padding(top = 4.dp).semantics { heading() },
     )
 }
 

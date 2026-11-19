@@ -152,14 +152,14 @@ fn render_reader_article(
         arch_ret = esc(arch_return),
     );
 
-    let star_label = if item.is_favorite { "&#9733; Starred" } else { "&#9734; Star" };
-    let star_pressed = if item.is_favorite { "true" } else { "false" };
+    let (star_glyph, star_pressed) =
+        if item.is_favorite { ("&#9733;", "true") } else { ("&#9734;", "false") };
     let _ = write!(
         out,
         "<form method=\"post\" action=\"/web/items/{id}/star\" class=\"inline-form\">\
            <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-           <button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\">{star_label}</button>\
+           <button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span> Star</button>\
          </form>\
          <a class=\"btn btn-small btn-ghost\" href=\"/entries/{id}\">Catalog Entry</a>",
         id = esc(&urlencode(&item.id)),
@@ -207,7 +207,8 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
 
     out.push_str("<div class=\"reader-prose\">\n");
     if let Some(raw_html) = item.content_html.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push_str(&HtmlSanitizer::clean_with_base(raw_html, Some(&item.url)));
+        let cleaned = HtmlSanitizer::clean_with_base(raw_html, Some(&item.url));
+        out.push_str(&harden_reader_prose_html(&cleaned));
     } else if let Some(summary) = item.summary.as_deref().filter(|s| !s.trim().is_empty()) {
         for para in summary.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
             let _ = writeln!(out, "<p>{}</p>", esc(para));
@@ -224,7 +225,7 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
             "<span class=\"pill\">#{tag_name} \
                <form method=\"post\" action=\"/web/items/{item_id}/tags/{tag_id}/remove\" class=\"inline-form\">\
                  <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                 <button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {tag_name}\" title=\"Remove tag\">&times;</button>\
+                 <button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {tag_name}\" title=\"Remove tag\"><span aria-hidden=\"true\">&times;</span></button>\
                </form>\
              </span>",
             tag_name = esc(&tag.name),
@@ -369,4 +370,77 @@ pub(in crate::web) async fn post_item_tag_remove<F: FeedFetcher>(
         Ok(()) => redirect_see_other(&format!("/reader/{}", urlencode(&id))),
         Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
     }
+}
+
+/// Normalizes already-sanitized article HTML for embedding under the Reader's `<h2>` title:
+/// - Demotes embedded `<h1>`..`<h4>` headings by 2 levels (capped at `<h6>`) so the page retains
+///   a single `<h1>` and a valid heading hierarchy.
+/// - Ensures `<pre>` blocks carry `tabindex="0"` for keyboard scrolling.
+/// - Ensures `<img>` tags without an `alt` attribute default to `alt=""`.
+fn harden_reader_prose_html(clean_html: &str) -> String {
+    let mut out = String::with_capacity(clean_html.len() + 64);
+    let mut rest = clean_html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after_lt = &rest[lt + 1..];
+        let Some(gt) = after_lt.find('>') else {
+            out.push('<');
+            out.push_str(after_lt);
+            return out;
+        };
+        let raw_tag = &after_lt[..gt];
+        rest = &after_lt[gt + 1..];
+
+        let (is_closing, tag_body) =
+            raw_tag.strip_prefix('/').map_or((false, raw_tag), |stripped| (true, stripped));
+        let name_end =
+            tag_body.find(|c: char| c.is_ascii_whitespace() || c == '/').unwrap_or(tag_body.len());
+        let tag_name = &tag_body[..name_end];
+        let attrs = &tag_body[name_end..];
+
+        let demoted_heading = match tag_name.to_ascii_lowercase().as_str() {
+            "h1" => Some("h3"),
+            "h2" => Some("h4"),
+            "h3" => Some("h5"),
+            "h4" | "h5" | "h6" => Some("h6"),
+            _ => None,
+        };
+
+        out.push('<');
+        if is_closing {
+            out.push('/');
+            out.push_str(demoted_heading.unwrap_or(tag_name));
+            out.push_str(attrs);
+        } else if let Some(new_tag) = demoted_heading {
+            out.push_str(new_tag);
+            out.push_str(attrs);
+        } else if tag_name.eq_ignore_ascii_case("pre") {
+            out.push_str(tag_name);
+            out.push_str(attrs);
+            if !attrs.to_ascii_lowercase().contains("tabindex=") {
+                out.push_str(" tabindex=\"0\"");
+            }
+        } else if tag_name.eq_ignore_ascii_case("img") {
+            out.push_str(tag_name);
+            let has_alt = attrs.to_ascii_lowercase().contains(" alt=")
+                || attrs.to_ascii_lowercase().starts_with("alt=");
+            if let Some(before_slash) = attrs.strip_suffix('/') {
+                out.push_str(before_slash);
+                if !has_alt {
+                    out.push_str(" alt=\"\"");
+                }
+                out.push('/');
+            } else {
+                out.push_str(attrs);
+                if !has_alt {
+                    out.push_str(" alt=\"\"");
+                }
+            }
+        } else {
+            out.push_str(tag_body);
+        }
+        out.push('>');
+    }
+    out.push_str(rest);
+    out
 }

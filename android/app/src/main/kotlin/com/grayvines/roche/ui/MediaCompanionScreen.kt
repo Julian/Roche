@@ -688,6 +688,7 @@ private fun RankedEntryHeaderRow(
         if (onRemoveFromList != null) {
             HeaderActionButton(
                 label = "✕",
+                contentDescription = "Remove ${item.entry.title} from list",
                 onClick = onRemoveFromList,
                 modifier = Modifier.testTag("companion_remove_list_entry_${item.entry.id}"),
             )
@@ -1087,6 +1088,7 @@ private fun WantQueueRowCard(
             Spacer(modifier = Modifier.width(2.dp))
             HeaderActionButton(
                 label = "✕",
+                contentDescription = "Remove ${item.entry.title} from want queue",
                 onClick = onRemove,
             )
         }

@@ -195,18 +195,21 @@ fn render_inbox_filter_bar(
 ) {
     out.push_str("<div class=\"pill-bar\">\n");
     for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
-        let cls = if p.status == slug { "pill is-active" } else { "pill" };
+        let is_cur = p.status == slug;
+        let cls = if is_cur { "pill is-active" } else { "pill" };
+        let aria_cur = if is_cur { " aria-current=\"page\"" } else { "" };
         let href = build_inbox_href(&InboxNavParams { status: slug, page: 1, ..*p });
-        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
+        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\"{aria_cur}>{label}</a>", esc(&href));
     }
     for (k_slug, label) in
         [("article", "Articles"), ("audio", "Audio"), ("video", "Video"), ("paper", "Papers")]
     {
         let is_cur = p.kind == Some(k_slug);
         let cls = if is_cur { "pill is-active" } else { "pill" };
+        let aria_cur = if is_cur { " aria-current=\"page\"" } else { "" };
         let next_kind = if is_cur { None } else { Some(k_slug) };
         let href = build_inbox_href(&InboxNavParams { kind: next_kind, page: 1, ..*p });
-        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\">{label}</a>", esc(&href));
+        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\"{aria_cur}>{label}</a>", esc(&href));
     }
     out.push_str("</div>\n");
 
@@ -218,7 +221,7 @@ fn render_inbox_filter_bar(
             let clear_href = build_inbox_href(&InboxNavParams { feed: None, page: 1, ..*p });
             let _ = writeln!(
                 out,
-                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear feed filter\">Feed: {} &times;</a>",
+                "<a class=\"pill is-active\" href=\"{}\">Feed: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear feed filter)</span></a>",
                 esc(&clear_href),
                 esc(label),
             );
@@ -227,7 +230,7 @@ fn render_inbox_filter_bar(
             let clear_href = build_inbox_href(&InboxNavParams { tag: None, page: 1, ..*p });
             let _ = writeln!(
                 out,
-                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear tag filter\">Tag: #{} &times;</a>",
+                "<a class=\"pill is-active\" href=\"{}\">Tag: #{} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear tag filter)</span></a>",
                 esc(&clear_href),
                 esc(label),
             );
@@ -236,7 +239,7 @@ fn render_inbox_filter_bar(
             let clear_href = build_inbox_href(&InboxNavParams { kind: None, page: 1, ..*p });
             let _ = writeln!(
                 out,
-                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear kind filter\">Kind: {} &times;</a>",
+                "<a class=\"pill is-active\" href=\"{}\">Kind: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear kind filter)</span></a>",
                 esc(&clear_href),
                 esc(k),
             );
@@ -245,7 +248,7 @@ fn render_inbox_filter_bar(
             let clear_href = build_inbox_href(&InboxNavParams { q: None, page: 1, ..*p });
             let _ = writeln!(
                 out,
-                "<a class=\"pill is-active\" href=\"{}\" aria-label=\"Clear search filter\">Search: &ldquo;{}&rdquo; &times;</a>",
+                "<a class=\"pill is-active\" href=\"{}\">Search: &ldquo;{}&rdquo; <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear search filter)</span></a>",
                 esc(&clear_href),
                 esc(search),
             );
@@ -388,13 +391,10 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
         render_audio_play_button(out, item);
 
         let id_enc = urlencode(&item.id);
-        let (star_glyph, star_pressed, star_action_lbl) = if item.is_favorite {
-            ("&#9733;", "true", "Unstar")
-        } else {
-            ("&#9734;", "false", "Star")
-        };
+        let (star_glyph, star_pressed) =
+            if item.is_favorite { ("&#9733;", "true") } else { ("&#9734;", "false") };
         let star_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Toggle Star\" aria-label=\"{star_action_lbl} {}\" aria-pressed=\"{star_pressed}\">{star_glyph}</button>",
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
             esc(&item.title),
         );
         render_inline_csrf_form(

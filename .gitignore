@@ -22,3 +22,8 @@ local.properties
 .idea/
 *.iml
 android/app/src/release/generated/baselineProfiles/
+
+# Web accessibility (Playwright) artifacts
+/web-a11y/node_modules/
+/web-a11y/playwright-report/
+/web-a11y/test-results/

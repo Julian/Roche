@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -333,15 +334,17 @@ internal fun SearchMatchContextBanner(
         }
 
     Box(
+        contentAlignment = Alignment.CenterStart,
         modifier =
             Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
                 .clickable(onClick = onClick)
                 .semantics { role = Role.Button }
                 .padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
                 .clip(RoundedCornerShape(6.dp))
                 .background(colors.surface)
                 .padding(horizontal = 10.dp, vertical = 6.dp)
-                .testTag("search_match_snippet_$entryId")
+                .testTag("search_match_snippet_$entryId"),
     ) {
         Text(
             text = highlighted,

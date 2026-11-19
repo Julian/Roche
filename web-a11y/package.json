@@ -1,0 +1,20 @@
+{
+  "name": "roche-web-a11y",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Automated Playwright + axe-core WCAG 2.1/2.2 AA accessibility and contrast checks for the Roche web client",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "test": "playwright test",
+    "test:desktop": "playwright test --project=desktop",
+    "test:mobile": "playwright test --project=mobile",
+    "test:reflow": "playwright test --project=reflow"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
+    "@playwright/test": "^1.65.1"
+  }
+}

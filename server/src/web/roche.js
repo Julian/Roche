@@ -124,6 +124,18 @@
       } catch {}
     };
 
+    let lastPlayTrigger = null;
+
+    const syncPlayButtons = () => {
+      const playingId = activeItem && !audio.paused ? activeItem.itemId : null;
+      for (const btn of document.querySelectorAll(".js-play-audio")) {
+        const isCurrent = Boolean(playingId && btn.getAttribute("data-item-id") === playingId);
+        const title = btn.getAttribute("data-title") || "Audio";
+        btn.setAttribute("aria-pressed", isCurrent ? "true" : "false");
+        btn.setAttribute("aria-label", `${isCurrent ? "Pause" : "Play"} ${title}`);
+      }
+    };
+
     const loadTrack = (meta, autoplay) => {
       clearPendingSeekListener();
       if (activeItem?.itemId && activeItem.itemId !== meta.itemId) {
@@ -133,16 +145,23 @@
       completionSent = false;
       bar.hidden = false;
       document.body?.classList.add("has-player-bar");
+      document.documentElement?.classList.add("has-player-bar");
       if (titleEl) titleEl.textContent = meta.title || "Episode";
       if (subEl) subEl.textContent = meta.feed || "Podcast";
-      if (readerLink) readerLink.href = `/reader/${encodeURIComponent(meta.itemId)}`;
+      if (readerLink) {
+        readerLink.href = `/reader/${encodeURIComponent(meta.itemId)}`;
+        readerLink.setAttribute("aria-label", `Open notes for ${meta.title || "Episode"}`);
+      }
 
       const nextRate = meta.rate || desiredRate || 1;
       if (audio.getAttribute("src") !== meta.src) {
         audio.src = meta.src;
       }
       applyPlaybackRate(nextRate);
-      if (speedBtn) speedBtn.textContent = `${desiredRate}x`;
+      if (speedBtn) {
+        speedBtn.textContent = `${desiredRate}x`;
+        speedBtn.setAttribute("aria-label", `Playback speed: ${desiredRate}x`);
+      }
 
       const applyInitialSeek = () => {
         pendingSeekListener = null;
@@ -192,9 +211,14 @@
       }
     });
 
+    audio.addEventListener("play", () => {
+      syncPlayButtons();
+    });
+
     audio.addEventListener("pause", () => {
       flushActiveProgress(true);
       saveSession();
+      syncPlayButtons();
     });
 
     audio.addEventListener("ended", () => {
@@ -202,6 +226,7 @@
       completionSent = true;
       postProgress(activeItem.itemId, 1.0, true);
       saveSession();
+      syncPlayButtons();
     });
 
     window.addEventListener("pagehide", () => {
@@ -215,6 +240,7 @@
       const next = SPEEDS[(idx + 1) % SPEEDS.length];
       applyPlaybackRate(next);
       speedBtn.textContent = `${next}x`;
+      speedBtn.setAttribute("aria-label", `Playback speed: ${next}x`);
       saveSession();
     });
 
@@ -227,13 +253,21 @@
       activeItem = null;
       bar.hidden = true;
       document.body?.classList.remove("has-player-bar");
+      document.documentElement?.classList.remove("has-player-bar");
       saveSession();
+      syncPlayButtons();
+      if (lastPlayTrigger && lastPlayTrigger.isConnected) {
+        lastPlayTrigger.focus({ preventScroll: true });
+      } else {
+        document.getElementById("roche-main")?.focus({ preventScroll: true });
+      }
     });
 
     document.addEventListener("click", (ev) => {
       const btn = ev.target?.closest?.(".js-play-audio");
       if (!btn) return;
       ev.preventDefault();
+      lastPlayTrigger = btn;
       const clickedId = btn.getAttribute("data-item-id") || "";
       if (activeItem && clickedId && activeItem.itemId === clickedId && audio.getAttribute("src")) {
         if (audio.paused) {
@@ -603,7 +637,21 @@
       return null;
     };
 
-    const syncBoard = () => {
+    const liveStatus = document.getElementById("rank-live-status");
+    const announce = (msg) => {
+      if (!liveStatus || !msg) return;
+      liveStatus.textContent = "";
+      requestAnimationFrame(() => {
+        liveStatus.textContent = msg;
+      });
+    };
+
+    const cardTitle = (card) =>
+      card?.getAttribute("data-title") || card?.querySelector("strong")?.textContent?.trim() || "Item";
+
+    const syncBoard = (announcement = "") => {
+      const previouslyFocused = document.activeElement;
+      const shouldRestoreFocus = Boolean(previouslyFocused && list.contains(previouslyFocused));
       const groups = [];
       let flatIdx = 0;
       for (const bucket of buckets) {
@@ -615,15 +663,32 @@
             list.insertBefore(card, list.children[flatIdx] || null);
           }
           const tied = idxInBucket > 0;
+          const isSelected = card === selectedCard;
           card.setAttribute("data-tied", tied ? "1" : "0");
           card.classList.toggle("is-tied", tied);
-          card.classList.toggle("is-selected", card === selectedCard);
+          card.classList.toggle("is-selected", isSelected);
+          if (isSelected) {
+            card.setAttribute("aria-current", "true");
+          } else {
+            card.removeAttribute("aria-current");
+          }
           const posEl = card.querySelector(".js-rank-pos");
           if (posEl) posEl.textContent = `${tied ? "= " : ""}#${displayRank}`;
           const tieBtn = card.querySelector(".js-card-tie");
           if (tieBtn) {
+            const title = cardTitle(card);
             tieBtn.disabled = flatIdx === 0;
-            tieBtn.textContent = tied ? "Untie" : "= Tie";
+            tieBtn.replaceChildren();
+            if (tied) {
+              tieBtn.append(document.createTextNode("Untie"));
+              tieBtn.setAttribute("aria-label", `Untie ${title} from above`);
+            } else {
+              const eqSpan = document.createElement("span");
+              eqSpan.setAttribute("aria-hidden", "true");
+              eqSpan.textContent = "=";
+              tieBtn.append(eqSpan, document.createTextNode(" Tie"));
+              tieBtn.setAttribute("aria-label", `Tie ${title} with above`);
+            }
             tieBtn.setAttribute("aria-pressed", tied ? "true" : "false");
           }
           ids.push(card.getAttribute("data-entry-id"));
@@ -631,7 +696,28 @@
         }
         groups.push(ids);
       }
+      if (tieAllBtn) {
+        const allTied = buckets.length === 1 && flatIdx > 1;
+        tieAllBtn.setAttribute("aria-pressed", allTied ? "true" : "false");
+        tieAllBtn.replaceChildren();
+        if (allTied) {
+          tieAllBtn.append(document.createTextNode("Untie All"));
+        } else {
+          const eqSpan = document.createElement("span");
+          eqSpan.setAttribute("aria-hidden", "true");
+          eqSpan.textContent = "=";
+          tieAllBtn.append(eqSpan, document.createTextNode(" Tie All"));
+        }
+      }
       hiddenInput.value = JSON.stringify(groups);
+      if (shouldRestoreFocus && document.activeElement !== previouslyFocused) {
+        if (!previouslyFocused.disabled && previouslyFocused.isConnected) {
+          previouslyFocused.focus({ preventScroll: true });
+        } else if (selectedCard?.isConnected) {
+          selectedCard.focus({ preventScroll: true });
+        }
+      }
+      if (announcement) announce(announcement);
     };
 
     const moveUp = (card) => {
@@ -646,7 +732,8 @@
         buckets[coords.b] = tmp;
       }
       selectedCard = card;
-      syncBoard();
+      const newPos = flatCards().indexOf(card) + 1;
+      syncBoard(`Moved ${cardTitle(card)} to position ${newPos}`);
     };
 
     const moveDown = (card) => {
@@ -661,7 +748,8 @@
         buckets[coords.b] = tmp;
       }
       selectedCard = card;
-      syncBoard();
+      const newPos = flatCards().indexOf(card) + 1;
+      syncBoard(`Moved ${cardTitle(card)} to position ${newPos}`);
     };
 
     const moveToRankSlot = (card, targetZeroBased) => {
@@ -693,29 +781,41 @@
       }
       buckets.splice(insertIdx, 0, [card]);
       selectedCard = card;
-      syncBoard();
+      syncBoard(`Moved ${cardTitle(card)} to position ${target + 1}`);
     };
 
     const toggleTieWithAbove = (card) => {
       const coords = findCoords(card);
       if (!coords) return;
+      let msg = "";
       if (coords.i > 0) {
         const tail = buckets[coords.b].splice(coords.i);
         buckets.splice(coords.b + 1, 0, tail);
+        msg = `Untied ${cardTitle(card)} from above`;
       } else if (coords.b > 0) {
         const [cur] = buckets.splice(coords.b, 1);
         buckets[coords.b - 1] = buckets[coords.b - 1].concat(cur);
+        msg = `Tied ${cardTitle(card)} with above`;
       }
       selectedCard = card;
-      syncBoard();
+      syncBoard(msg);
     };
 
     const tieAll = () => {
       const all = flatCards();
       if (all.length <= 1) return;
-      buckets = buckets.length === 1 ? all.map((c) => [c]) : [all];
-      syncBoard();
+      const untying = buckets.length === 1;
+      buckets = untying ? all.map((c) => [c]) : [all];
+      syncBoard(untying ? "Untied all items" : "Tied all items");
     };
+
+    list.addEventListener("focusin", (ev) => {
+      const card = ev.target?.closest?.(".js-rank-card");
+      if (card && card !== selectedCard) {
+        selectedCard = card;
+        syncBoard();
+      }
+    });
 
     list.addEventListener("click", (ev) => {
       const card = ev.target?.closest?.(".js-rank-card");
@@ -742,6 +842,7 @@
     });
 
     const onKeyDown = (ev) => {
+      if (!form.contains(ev.target)) return;
       if (ev.target?.closest?.("input, textarea, select, [contenteditable]")) return;
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
 
@@ -756,11 +857,17 @@
       if (ev.key === "j" || (ev.key === "ArrowDown" && !ev.shiftKey)) {
         ev.preventDefault();
         selectedCard = cards[Math.min(cards.length - 1, curIdx + 1)];
-        syncBoard();
+        syncBoard(`Selected ${cardTitle(selectedCard)}`);
+        if (ev.target.classList?.contains("js-rank-card")) {
+          selectedCard.focus({ preventScroll: true });
+        }
       } else if (ev.key === "k" || (ev.key === "ArrowUp" && !ev.shiftKey)) {
         ev.preventDefault();
         selectedCard = cards[Math.max(0, curIdx - 1)];
-        syncBoard();
+        syncBoard(`Selected ${cardTitle(selectedCard)}`);
+        if (ev.target.classList?.contains("js-rank-card")) {
+          selectedCard.focus({ preventScroll: true });
+        }
       } else if (ev.key === "J" || (ev.key === "ArrowDown" && ev.shiftKey)) {
         ev.preventDefault();
         moveDown(selectedCard);
@@ -839,11 +946,15 @@
   };
 
   const hasDirtyFormOrOpenDetails = () => {
-    if (document.activeElement?.matches?.("input, textarea, select, [contenteditable]")) {
+    const active = document.activeElement;
+    if (active?.matches?.("input, textarea, select, [contenteditable]")) {
       return true;
     }
     const curMain = document.getElementById("roche-main");
     if (!curMain) return false;
+    if (active && active !== curMain && curMain.contains(active)) {
+      return true;
+    }
     if (curMain.querySelector("details[open]")) return true;
     for (const el of curMain.querySelectorAll("input, textarea, select")) {
       if (el.type === "hidden" || el.type === "submit" || el.type === "button") continue;

@@ -38,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalAccessibilityManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
@@ -388,9 +389,17 @@ internal fun MainSnackbarOverlay(
 ) {
     val undo = state.undoEvent
     val banner = state.statusBanner
-    LaunchedEffect(undo, banner, state.messageSequence) {
+    val accessibilityManager = LocalAccessibilityManager.current
+    LaunchedEffect(undo, banner, state.messageSequence, accessibilityManager) {
         if (undo != null || banner != null) {
-            delay(SNACKBAR_AUTO_DISMISS_MS)
+            val timeoutMs =
+                accessibilityManager?.calculateRecommendedTimeoutMillis(
+                    originalTimeoutMillis = SNACKBAR_AUTO_DISMISS_MS,
+                    containsIcons = false,
+                    containsText = true,
+                    containsControls = undo != null,
+                ) ?: SNACKBAR_AUTO_DISMISS_MS
+            delay(timeoutMs)
             onAction(MainAction.DismissMessages)
         }
     }
@@ -416,8 +425,8 @@ internal fun SearchFloatingActionButton(onClick: () -> Unit) {
         containerColor = colors.surfaceElevated,
         contentColor = colors.textPrimary,
         modifier =
-            Modifier.size(46.dp)
-                .border(width = 1.dp, color = colors.border, shape = CircleShape)
+            Modifier.size(48.dp)
+                .border(width = 1.dp, color = colors.controlOutline, shape = CircleShape)
                 .semantics { contentDescription = "Search" }
                 .testTag("search_fab"),
     ) {
@@ -431,7 +440,7 @@ internal fun SaveFloatingActionButton(onClick: () -> Unit) {
     FloatingActionButton(
         onClick = onClick,
         shape = CircleShape,
-        containerColor = colors.accentBlue,
+        containerColor = colors.accentBlueFilled,
         contentColor = Color.White,
         modifier =
             Modifier.size(52.dp)
@@ -909,7 +918,8 @@ internal class MainScrollStateHolder(
             lazyPositions =
                 lazyStates
                     .filterKeys { key ->
-                        key != SEARCH_SCROLL_STATE_KEY && !key.startsWith("$SEARCH_SCROLL_STATE_KEY:")
+                        key != SEARCH_SCROLL_STATE_KEY &&
+                            !key.startsWith("$SEARCH_SCROLL_STATE_KEY:")
                     }
                     .mapValues { (_, state) ->
                         SavedLazyListPosition(

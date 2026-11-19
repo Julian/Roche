@@ -45,13 +45,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -541,7 +543,6 @@ private fun InboxEntryRowSurface(
 ) {
     val colors = LocalRocheColors.current
     val verticalPadding = if (ultraDense) 9.dp else 12.dp
-    val rowAlpha = if (entry.isArchived) ARCHIVED_ROW_ALPHA else 1f
     val rowBackground =
         when {
             isPlayingAudio -> colors.accentBlue.copy(alpha = 0.12f)
@@ -554,6 +555,17 @@ private fun InboxEntryRowSurface(
             isQueuedNextAudio -> colors.accentVerdigris
             else -> null
         }
+    val rowStateLabel = buildList {
+        when {
+            isPlayingAudio -> add("Now playing")
+            isQueuedNextAudio -> add("Queued next")
+        }
+        when {
+            entry.isArchived -> add("Archived")
+            entry.isUnread -> add("Unread")
+        }
+    }
+        .joinToString(", ")
 
     Row(
         modifier =
@@ -569,13 +581,17 @@ private fun InboxEntryRowSurface(
                     }
                 }
                 .combinedClickable(onClick = onOpen, onLongClick = onLongPress)
+                .semantics {
+                    if (rowStateLabel.isNotEmpty()) {
+                        stateDescription = rowStateLabel
+                    }
+                }
                 .padding(
                     start = 10.dp,
                     end = 12.dp,
                     top = verticalPadding,
                     bottom = verticalPadding,
                 )
-                .alpha(rowAlpha)
                 .testTag("entry_row_${entry.id}"),
         verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -777,9 +793,8 @@ private fun EntrySourceMetaRow(entry: InboxEntry) {
                 color = colors.accentVerdigris,
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
+                modifier = Modifier.semantics { contentDescription = "Cached offline" },
             )
         }
     }
 }
-
-private const val ARCHIVED_ROW_ALPHA = 0.55f

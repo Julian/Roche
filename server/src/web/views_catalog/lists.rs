@@ -198,7 +198,16 @@ fn render_lists_overview_table(out: &mut String, collections: &[crate::db::Colle
         out.push_str("<p class=\"empty\">No lists yet.</p>\n");
         return;
     }
-    out.push_str("<table class=\"lists\">\n<tbody>\n");
+    out.push_str(
+        "<table class=\"lists\">\n\
+         <thead class=\"sr-only\"><tr>\
+           <th scope=\"col\">List</th>\
+           <th scope=\"col\">Works</th>\
+           <th scope=\"col\">Comparisons</th>\
+           <th scope=\"col\">Actions</th>\
+         </tr></thead>\n\
+         <tbody>\n",
+    );
     for col in collections {
         let slug = col.slug.as_deref().unwrap_or(&col.id);
         let _ = write!(
@@ -388,7 +397,7 @@ fn render_ranked_list_body(
     }
 
     if total_pages > 1 {
-        render_list_pager(out, slug, page_num, total_pages);
+        render_list_pager(out, slug, page_num, total_pages, "Pagination (top)");
     }
 
     if view.rows.is_empty() {
@@ -403,13 +412,13 @@ fn render_ranked_list_body(
     out.push_str(
         "<table class=\"ranked\">\n\
          <thead><tr>\
-           <th class=\"num\">#</th>\
-           <th>Tier</th>\
-           <th>Work</th>\
-           <th class=\"score num\">Score</th>",
+           <th scope=\"col\" class=\"num\">#</th>\
+           <th scope=\"col\">Tier</th>\
+           <th scope=\"col\">Work</th>\
+           <th scope=\"col\" class=\"score num\">Score</th>",
     );
     if is_editable_manual {
-        out.push_str("<th><span class=\"sr-only\">Actions</span></th>");
+        out.push_str("<th scope=\"col\"><span class=\"sr-only\">Actions</span></th>");
     }
     out.push_str("</tr></thead>\n<tbody>\n");
 
@@ -431,7 +440,7 @@ fn render_ranked_list_body(
     out.push_str("</tbody>\n</table>\n");
 
     if total_pages > 1 {
-        render_list_pager(out, slug, page_num, total_pages);
+        render_list_pager(out, slug, page_num, total_pages, "Pagination (bottom)");
     }
 }
 
@@ -489,7 +498,7 @@ fn render_ranked_table_row(
         let remove_action =
             format!("/web/lists/{}/remove/{}", urlencode(slug), urlencode(&row.entry.id));
         let remove_btn = format!(
-            "<button type=\"submit\" class=\"link-btn\" title=\"Remove from list\" aria-label=\"Remove {} from list\">&times;</button>",
+            "<button type=\"submit\" class=\"link-btn\" title=\"Remove from list\" aria-label=\"Remove {} from list\"><span aria-hidden=\"true\">&times;</span></button>",
             esc(&row.entry.title)
         );
         out.push_str("<td class=\"num\">");
@@ -525,12 +534,18 @@ fn render_manual_list_add_panel(out: &mut String, slug: &str, csrf: &str) {
     );
 }
 
-fn render_list_pager(out: &mut String, slug: &str, page_num: usize, total_pages: usize) {
-    out.push_str("<nav class=\"pager\" aria-label=\"Pagination\">");
+fn render_list_pager(
+    out: &mut String,
+    slug: &str,
+    page_num: usize,
+    total_pages: usize,
+    aria_label: &str,
+) {
+    let _ = write!(out, "<nav class=\"pager\" aria-label=\"{}\">", esc(aria_label));
     if page_num > 1 {
         let _ = write!(
             out,
-            "<a href=\"/lists/{}?page={}\">&larr; Prev</a>",
+            "<a href=\"/lists/{}?page={}\"><span aria-hidden=\"true\">&larr;</span> Prev</a>",
             esc(&urlencode(slug)),
             page_num - 1
         );
@@ -541,13 +556,13 @@ fn render_list_pager(out: &mut String, slug: &str, page_num: usize, total_pages:
         } else if p == 1 || p == total_pages || p.abs_diff(page_num) <= 2 {
             let _ = write!(out, "<a href=\"/lists/{}?page={p}\">{p}</a>", esc(&urlencode(slug)));
         } else if p.abs_diff(page_num) == 3 {
-            out.push_str("<span>&hellip;</span>");
+            out.push_str("<span aria-hidden=\"true\">&hellip;</span>");
         }
     }
     if page_num < total_pages {
         let _ = write!(
             out,
-            "<a href=\"/lists/{}?page={}\">Next &rarr;</a>",
+            "<a href=\"/lists/{}?page={}\">Next <span aria-hidden=\"true\">&rarr;</span></a>",
             esc(&urlencode(slug)),
             page_num + 1
         );

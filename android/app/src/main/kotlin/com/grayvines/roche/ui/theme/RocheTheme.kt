@@ -42,45 +42,54 @@ data class RocheColors(
     val surface: Color,
     val surfaceElevated: Color,
     val border: Color,
+    val controlOutline: Color,
     val textPrimary: Color,
     val textSecondary: Color,
     val textMuted: Color,
     val accentBlue: Color,
+    val accentBlueFilled: Color,
     val accentVerdigris: Color,
     val accentEcru: Color,
     val accentIndianRed: Color,
+    val tierSGold: Color,
     val isDark: Boolean,
 )
 
-private val DarkRocheColors =
+internal val DarkRocheColors =
     RocheColors(
         background = Color(0xFF141413),
         surface = Color(0xFF1B1B19),
         surfaceElevated = Color(0xFF232220),
         border = Color(0xFF272624),
+        controlOutline = Color(0xFF8C8780),
         textPrimary = RochePalette.Timberwolf,
         textSecondary = Color(0xFFA8A39D),
         textMuted = Color(0xFF94908A),
-        accentBlue = RochePalette.SteelBlue,
-        accentVerdigris = RochePalette.Verdigris,
+        accentBlue = Color(0xFF62A9CF),
+        accentBlueFilled = Color(0xFF3A7696),
+        accentVerdigris = Color(0xFF54B8B5),
         accentEcru = RochePalette.Ecru,
-        accentIndianRed = RochePalette.IndianRed,
+        accentIndianRed = Color(0xFFDC8387),
+        tierSGold = Color(0xFFE0B44C),
         isDark = true,
     )
 
-private val LightRocheColors =
+internal val LightRocheColors =
     RocheColors(
         background = Color(0xFFEFECE8),
         surface = RochePalette.Timberwolf,
         surfaceElevated = Color(0xFFD8D2CC),
         border = Color(0xFFD2CBC3),
+        controlOutline = Color(0xFF6B655E),
         textPrimary = Color(0xFF182024),
         textSecondary = Color(0xFF424A4E),
         textMuted = Color(0xFF53595C),
-        accentBlue = Color(0xFF336B8A),
-        accentVerdigris = Color(0xFF358784),
-        accentEcru = Color(0xFF6E5122),
-        accentIndianRed = Color(0xFFA84C51),
+        accentBlue = Color(0xFF235978),
+        accentBlueFilled = Color(0xFF2B607E),
+        accentVerdigris = Color(0xFF195855),
+        accentEcru = Color(0xFF64491D),
+        accentIndianRed = Color(0xFF8D3338),
+        tierSGold = Color(0xFF704E09),
         isDark = false,
     )
 
@@ -91,8 +100,7 @@ val LocalReaderFontScale = staticCompositionLocalOf { 1.0f }
 fun HeadlineFont.toFontFamily(): FontFamily =
     if (this == HeadlineFont.SERIF) FontFamily.Serif else FontFamily.SansSerif
 
-@Composable
-fun currentHeadlineFontFamily(): FontFamily = LocalHeadlineFont.current.toFontFamily()
+@Composable fun currentHeadlineFontFamily(): FontFamily = LocalHeadlineFont.current.toFontFamily()
 
 @Composable
 fun RocheTheme(
@@ -137,36 +145,54 @@ private tailrec fun Context.findActivity(): Activity? =
         else -> null
     }
 
-private fun buildMaterialScheme(rocheColors: RocheColors): ColorScheme =
+internal fun buildMaterialScheme(rocheColors: RocheColors): ColorScheme =
     if (rocheColors.isDark) {
         darkColorScheme(
             primary = rocheColors.accentBlue,
+            onPrimary = rocheColors.background,
             secondary = rocheColors.accentVerdigris,
+            onSecondary = rocheColors.background,
             tertiary = rocheColors.accentEcru,
+            onTertiary = rocheColors.background,
             error = rocheColors.accentIndianRed,
+            onError = rocheColors.background,
             background = rocheColors.background,
-            surface = rocheColors.surface,
-            surfaceVariant = rocheColors.surfaceElevated,
-            onPrimary = Color.White,
             onBackground = rocheColors.textPrimary,
+            surface = rocheColors.surface,
             onSurface = rocheColors.textPrimary,
+            surfaceVariant = rocheColors.surfaceElevated,
             onSurfaceVariant = rocheColors.textSecondary,
-            outline = rocheColors.border,
+            surfaceContainerLowest = rocheColors.background,
+            surfaceContainerLow = rocheColors.background,
+            surfaceContainer = rocheColors.surface,
+            surfaceContainerHigh = rocheColors.surfaceElevated,
+            surfaceContainerHighest = rocheColors.surfaceElevated,
+            outline = rocheColors.controlOutline,
+            outlineVariant = rocheColors.border,
         )
     } else {
         lightColorScheme(
             primary = rocheColors.accentBlue,
-            secondary = rocheColors.accentVerdigris,
-            tertiary = rocheColors.accentEcru,
-            error = rocheColors.accentIndianRed,
-            background = rocheColors.background,
-            surface = rocheColors.surface,
-            surfaceVariant = rocheColors.surfaceElevated,
             onPrimary = Color.White,
+            secondary = rocheColors.accentVerdigris,
+            onSecondary = Color.White,
+            tertiary = rocheColors.accentEcru,
+            onTertiary = Color.White,
+            error = rocheColors.accentIndianRed,
+            onError = Color.White,
+            background = rocheColors.background,
             onBackground = rocheColors.textPrimary,
+            surface = rocheColors.surface,
             onSurface = rocheColors.textPrimary,
+            surfaceVariant = rocheColors.surfaceElevated,
             onSurfaceVariant = rocheColors.textSecondary,
-            outline = rocheColors.border,
+            surfaceContainerLowest = rocheColors.background,
+            surfaceContainerLow = rocheColors.background,
+            surfaceContainer = rocheColors.surface,
+            surfaceContainerHigh = rocheColors.surfaceElevated,
+            surfaceContainerHighest = rocheColors.surfaceElevated,
+            outline = rocheColors.controlOutline,
+            outlineVariant = rocheColors.border,
         )
     }
 

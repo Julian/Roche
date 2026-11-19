@@ -125,6 +125,7 @@ fun PlaybackSpeedAndPodcastSheet(
             ) {
                 HeaderActionButton(
                     label = "−0.05",
+                    contentDescription = "Decrease playback speed by 0.05x",
                     onClick = {
                         onAction(
                             MainAction.SetPlaybackSpeed(
@@ -146,6 +147,7 @@ fun PlaybackSpeedAndPodcastSheet(
 
                 HeaderActionButton(
                     label = "+0.05",
+                    contentDescription = "Increase playback speed by 0.05x",
                     onClick = {
                         onAction(
                             MainAction.SetPlaybackSpeed(
@@ -431,7 +433,7 @@ internal fun RocheInteractiveSlider(
         val thumbCenterX = computeSliderThumbCenterX(size.width, displayFraction, thumbRadius)
         val corner = CornerRadius(trackHeight * 0.5f, trackHeight * 0.5f)
         drawRoundRect(
-            color = colors.border,
+            color = colors.controlOutline,
             topLeft = Offset(0f, centerY - trackHeight * 0.5f),
             size = Size(size.width, trackHeight),
             cornerRadius = corner,

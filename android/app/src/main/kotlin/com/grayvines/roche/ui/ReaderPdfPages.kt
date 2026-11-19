@@ -37,6 +37,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.createBitmap
+import com.grayvines.roche.ui.theme.LightRocheColors
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -88,7 +89,10 @@ internal class PdfRendererSession(
                         cached.page
                     } else {
                         renderSinglePageLocked(pageIndex, clampedWidthPx)?.also { rendered ->
-                            pageCache.put(pageIndex, CachedRenderedPdfPage(clampedWidthPx, rendered))
+                            pageCache.put(
+                                pageIndex,
+                                CachedRenderedPdfPage(clampedWidthPx, rendered),
+                            )
                         }
                     }
                 }
@@ -159,12 +163,19 @@ internal fun rememberCachedPdfSession(
         val candidate =
             withContext(Dispatchers.IO) {
                 findCachedPdfFileForEntry(cacheRoot, entryId)?.let { file ->
-                    val canonical = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+                    val canonical = runCatching {
+                        file.canonicalPath
+                    }
+                        .getOrDefault(file.absolutePath)
                     file to canonical
                 }
             }
         val currentSession = session
-        if (candidate != null && currentSession != null && currentSession.canonicalPath == candidate.second) {
+        if (
+            candidate != null &&
+                currentSession != null &&
+                currentSession.canonicalPath == candidate.second
+        ) {
             return@LaunchedEffect
         }
         var opened: PdfRendererSession? = null
@@ -260,7 +271,7 @@ internal fun PdfPageCardItem(
                 PdfPageRenderState.Loading -> {
                     Text(
                         text = "Rendering page ${pageIndex + 1}…",
-                        color = colors.textMuted,
+                        color = LightRocheColors.textMuted,
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                     )
@@ -268,7 +279,7 @@ internal fun PdfPageCardItem(
                 PdfPageRenderState.Error -> {
                     Text(
                         text = "Unable to render page ${pageIndex + 1}",
-                        color = colors.textMuted,
+                        color = LightRocheColors.textMuted,
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                     )
@@ -316,10 +327,11 @@ private fun isValidPdfFile(file: File): Boolean {
 private fun openPdfRendererSession(file: File, canonicalPath: String): PdfRendererSession? =
     runCatching {
         val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer =
-            runCatching { PdfRenderer(pfd) }
-                .onFailure { runCatching { pfd.close() } }
-                .getOrThrow()
+        val renderer = runCatching {
+            PdfRenderer(pfd)
+        }
+            .onFailure { runCatching { pfd.close() } }
+            .getOrThrow()
         if (renderer.pageCount <= 0) {
             renderer.close()
             pfd.close()

@@ -273,21 +273,21 @@ pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
     out.push_str(
         "\n</main>\n\
          <footer class=\"colophon\">\n\
-           <span>&#10086;</span>\n\
+           <span aria-hidden=\"true\">&#10086;</span>\n\
            <span>Roche &middot; Reader, Podcasts &amp; Ranked Library</span>\n\
          </footer>\n\
-         <div id=\"roche-player-bar\" class=\"player-bar\" hidden>\n\
+         <aside id=\"roche-player-bar\" class=\"player-bar\" aria-label=\"Audio player\" hidden>\n\
            <div class=\"player-inner\">\n\
              <div class=\"player-meta\">\n\
                <div id=\"roche-player-title\" class=\"player-title\">Episode</div>\n\
                <div id=\"roche-player-sub\" class=\"player-sub\">Podcast</div>\n\
              </div>\n\
-             <audio id=\"roche-audio\" controls preload=\"metadata\"></audio>\n\
-             <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\">1x</button>\n\
-             <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\">Notes</a>\n\
-             <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\">&times;</button>\n\
+             <audio id=\"roche-audio\" controls preload=\"metadata\" aria-label=\"Podcast audio player\"></audio>\n\
+             <button type=\"button\" id=\"roche-player-speed\" class=\"btn btn-small\" aria-label=\"Playback speed: 1x\">1x</button>\n\
+             <a id=\"roche-player-link\" href=\"/\" class=\"btn btn-small\" aria-label=\"Open episode notes\">Notes</a>\n\
+             <button type=\"button\" id=\"roche-player-close\" class=\"btn btn-small btn-ghost\" aria-label=\"Close player\"><span aria-hidden=\"true\">&times;</span></button>\n\
            </div>\n\
-         </div>\n\
+         </aside>\n\
          <script src=\"/static/roche.js\" defer></script>\n\
          </body>\n\
          </html>\n",
@@ -321,9 +321,13 @@ pub(super) fn render_login_page(
            <p class=\"lede\">Run <code>roche pair</code> on your server and enter the one-time pairing code below.</p>\n",
     );
 
-    if let Some(err) = error_msg.map(str::trim).filter(|s| !s.is_empty()) {
-        let _ =
-            writeln!(out, "<div class=\"notice notice-error\" role=\"alert\">{}</div>", esc(err));
+    let trimmed_err = error_msg.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(err) = trimmed_err {
+        let _ = writeln!(
+            out,
+            "<div id=\"login-error\" class=\"notice notice-error\" role=\"alert\">{}</div>",
+            esc(err)
+        );
     }
 
     if let Some(ts_login) = tailscale_user.map(str::trim).filter(|s| !s.is_empty()) {
@@ -336,11 +340,17 @@ pub(super) fn render_login_page(
         );
     }
 
-    out.push_str(
+    let pairing_attrs = if trimmed_err.is_some() {
+        "aria-invalid=\"true\" aria-describedby=\"login-error\""
+    } else {
+        "autofocus"
+    };
+    let _ = write!(
+        out,
         "<form method=\"post\" action=\"/login\">\n\
            <div class=\"field mb-md\">\n\
              <label for=\"pairing_code\">Pairing Code</label>\n\
-             <input id=\"pairing_code\" name=\"pairing_code\" type=\"password\" required autocomplete=\"one-time-code\" autofocus placeholder=\"e.g. 4f9a-82c1\">\n\
+             <input id=\"pairing_code\" name=\"pairing_code\" type=\"password\" required autocomplete=\"one-time-code\" {pairing_attrs} placeholder=\"e.g. 4f9a-82c1\">\n\
            </div>\n\
            <div class=\"field mb-lg\">\n\
              <label for=\"device_name\">Browser Label (optional)</label>\n\
@@ -379,13 +389,20 @@ pub(super) fn render_error_page(
     );
     let html = csrf_token.map_or_else(
         || {
+            let mut unauthed_body = String::with_capacity(512);
+            let _ = write!(
+                unauthed_body,
+                "<h1>{}</h1>\n<p class=\"lede\">{}</p>\n<p><a class=\"btn\" href=\"/\">Return Home</a></p>",
+                esc(heading),
+                esc(detail)
+            );
             Html(format!(
                 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
                  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
                  <title>{}</title><link rel=\"stylesheet\" href=\"/static/roche.css\"></head>\
                  <body><main>{}</main></body></html>",
                 esc(heading),
-                body
+                unauthed_body
             ))
         },
         |csrf| {

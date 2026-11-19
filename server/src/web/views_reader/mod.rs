@@ -112,12 +112,14 @@ pub(super) fn render_audio_play_button(out: &mut String, item: &Item) {
         out,
         "<button type=\"button\" class=\"btn btn-small js-play-audio\" \
          data-item-id=\"{}\" data-title=\"{}\" data-feed=\"{}\" \
-         data-src=\"/web/items/{}/audio\" data-progress=\"{:.4}\" data-duration=\"{dur}\">\
-         &#9654; Play</button>",
+         data-src=\"/web/items/{}/audio\" data-progress=\"{:.4}\" data-duration=\"{dur}\" \
+         aria-label=\"Play {}\" aria-pressed=\"false\">\
+         <span aria-hidden=\"true\">&#9654;</span> Play</button>",
         esc(&item.id),
         esc(&item.title),
         esc(feed_label),
         esc(&urlencode(&item.id)),
         item.read_progress.clamp(0.0, 1.0),
+        esc(&item.title),
     );
 }

@@ -35,6 +35,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
@@ -205,7 +206,7 @@ internal fun TierBadgePill(
 
 internal fun resolveTierColor(tier: Char, colors: RocheColors): Color =
     when (tier.uppercaseChar()) {
-        'S' -> Color(0xFFD4A037)
+        'S' -> colors.tierSGold
         'A' -> colors.accentVerdigris
         'B' -> colors.accentBlue
         'C' -> colors.accentEcru
@@ -620,6 +621,7 @@ private fun SmallReorderPill(
                 color = if (enabled) colors.textPrimary else colors.textMuted.copy(alpha = 0.4f),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
+                modifier = Modifier.clearAndSetSemantics {},
             )
         }
     }

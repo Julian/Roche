@@ -75,7 +75,17 @@ pub(super) async fn rank_picker_get<F: FeedFetcher>(
         );
     } else {
         if !quality_lists.is_empty() {
-            body.push_str("<h3>Global Quality Lists</h3>\n<table class=\"lists\">\n<tbody>\n");
+            body.push_str(
+                "<h3>Global Quality Lists</h3>\n\
+                 <table class=\"lists\">\n\
+                 <thead class=\"sr-only\"><tr>\
+                   <th scope=\"col\">List</th>\
+                   <th scope=\"col\">Works</th>\
+                   <th scope=\"col\">Comparisons</th>\
+                   <th scope=\"col\">Actions</th>\
+                 </tr></thead>\n\
+                 <tbody>\n",
+            );
             for col in quality_lists {
                 let slug = col.slug.as_deref().unwrap_or(&col.id);
                 let _ = writeln!(
@@ -97,7 +107,15 @@ pub(super) async fn rank_picker_get<F: FeedFetcher>(
 
         if !want_queues.is_empty() {
             body.push_str(
-                "<h3>Want Queues (Local Priority)</h3>\n<table class=\"lists\">\n<tbody>\n",
+                "<h3>Want Queues (Local Priority)</h3>\n\
+                 <table class=\"lists\">\n\
+                 <thead class=\"sr-only\"><tr>\
+                   <th scope=\"col\">Queue</th>\
+                   <th scope=\"col\">Queued</th>\
+                   <th scope=\"col\">Comparisons</th>\
+                   <th scope=\"col\">Actions</th>\
+                 </tr></thead>\n\
+                 <tbody>\n",
             );
             for col in want_queues {
                 let raw_slug = col.slug.as_deref().unwrap_or(&col.id);
@@ -330,7 +348,8 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
            <input type=\"hidden\" name=\"round\" value=\"{round}\">\n\
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
            <input type=\"hidden\" name=\"ordering_json\" value=\"{ord_json}\">\n\
-           <ul class=\"rank-board js-rank-list\">\n",
+           <div id=\"rank-live-status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></div>\n\
+           <ul class=\"rank-board js-rank-list\" aria-label=\"Ranking comparison board\">\n",
         slug_enc = esc(&urlencode(ctx.slug)),
         csrf = esc(ctx.csrf),
         want = if ctx.is_want { "true" } else { "false" },
@@ -347,7 +366,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
         "</ul>\n\
          <div class=\"flex-row flex-center\">\n\
            <button type=\"submit\" class=\"btn btn-primary\">Submit Comparison</button>\n\
-           <button type=\"button\" class=\"btn js-rank-tie-all\">= Tie All</button>\n\
+           <button type=\"button\" class=\"btn js-rank-tie-all\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie All</button>\n\
          </div>\n\
          </form>\n",
     );
@@ -363,7 +382,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
            <button type=\"submit\" class=\"btn btn-small btn-ghost\">Skip Cluster (s)</button>\n\
          </form>\n\
-         <p class=\"rank-shortcuts\">Shortcuts: j/k select &middot; J/K move &middot; 1&ndash;{k} jump &middot; = tie &middot; t tie all &middot; s skip &middot; o open link &middot; Enter submit</p>\n",
+         <p class=\"rank-shortcuts\">Shortcuts (when board focused): j/k select &middot; J/K move &middot; 1&ndash;{k} jump &middot; = tie &middot; t tie all &middot; s skip &middot; o open link &middot; Enter submit</p>\n",
         slug_enc = esc(&urlencode(ctx.slug)),
         want = if ctx.is_want { "true" } else { "false" },
         focus = esc(ctx.q.focus.as_deref().unwrap_or("")),
@@ -382,11 +401,12 @@ fn render_cluster_card(
 ) {
     let rank_num = idx + 1;
     let sel_cls = if idx == 0 { " is-selected" } else { "" };
+    let aria_cur = if idx == 0 { " aria-current=\"true\"" } else { "" };
     let open_url = web_primary_open_url(item).unwrap_or_default();
 
     let _ = write!(
         out,
-        "<li class=\"rank-card js-rank-card{sel_cls}\" data-entry-id=\"{id}\" data-tied=\"0\" data-open-url=\"{open_url}\">\n\
+        "<li class=\"rank-card js-rank-card{sel_cls}\" tabindex=\"0\"{aria_cur} data-entry-id=\"{id}\" data-title=\"{title}\" data-tied=\"0\" data-open-url=\"{open_url}\">\n\
            <div class=\"rank-left\">\n\
              <span class=\"rank-pos js-rank-pos\">#{rank_num}</span>\n\
              <div>\n\
@@ -421,9 +441,9 @@ fn render_cluster_card(
     let tie_disabled = if idx == 0 { " disabled" } else { "" };
     let _ = writeln!(
         out,
-        "<button type=\"button\" class=\"btn btn-small js-card-up\" title=\"Move Up (K)\" aria-label=\"Move {title} up\">&uarr;</button>\
-         <button type=\"button\" class=\"btn btn-small js-card-down\" title=\"Move Down (J)\" aria-label=\"Move {title} down\">&darr;</button>\
-         <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\" aria-label=\"Tie {title} with above\" aria-pressed=\"false\">= Tie</button>\
+        "<button type=\"button\" class=\"btn btn-small js-card-up\" title=\"Move Up (K)\" aria-label=\"Move {title} up\"><span aria-hidden=\"true\">&uarr;</span></button>\
+         <button type=\"button\" class=\"btn btn-small js-card-down\" title=\"Move Down (J)\" aria-label=\"Move {title} down\"><span aria-hidden=\"true\">&darr;</span></button>\
+         <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\" aria-label=\"Tie {title} with above\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie</button>\
          </div>\n</li>",
         title = esc(&item.title),
     );

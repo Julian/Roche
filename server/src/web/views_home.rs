@@ -137,7 +137,7 @@ async fn render_home_inner<F: FeedFetcher>(
     if other_want_total > 0 {
         let _ = writeln!(
             body,
-            "<div class=\"section-head\"><h3>Up Next Queues ({other_want_total})</h3>\
+            "<div class=\"section-head\"><h2>Up Next Queues ({other_want_total})</h2>\
              <a class=\"section-action\" href=\"/queue\">Manage Queues &rarr;</a></div>\n\
              <p class=\"meta\">You have <em>{other_want_total}</em> queued movies, books, albums, or games in your Want lists.</p>"
         );
@@ -192,12 +192,11 @@ pub(in crate::web) fn render_collection_draw_section(
     if let Some(cover) = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
         let _ = writeln!(
             out,
-            "<img class=\"album-cover\" src=\"{}\" alt=\"{}\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+            "<img class=\"album-cover\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
             esc(cover),
-            esc(&entry.title)
         );
     } else {
-        out.push_str("<div class=\"album-cover-placeholder\">&#9835;</div>\n");
+        out.push_str("<div class=\"album-cover-placeholder\" aria-hidden=\"true\">&#9835;</div>\n");
     }
     out.push_str("</div>\n<div>\n");
 
@@ -300,7 +299,7 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     }
 
     out.push_str(
-        "<div class=\"section-head\"><h3>Continue Reading &amp; Listening</h3>\
+        "<div class=\"section-head\"><h2>Continue Reading &amp; Listening</h2>\
          <a class=\"section-action\" href=\"/inbox\">Inbox &rarr;</a></div>\n\
          <ul class=\"inbox-list\">\n",
     );
@@ -341,7 +340,7 @@ fn render_home_quick_actions_bar(out: &mut String, csrf: &str) {
            <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\n\
              <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
              <input type=\"hidden\" name=\"return_to\" value=\"/\">\n\
-             <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>\n\
+             <button type=\"submit\" class=\"btn btn-small\"><span aria-hidden=\"true\">&#8635;</span> Refresh Feeds</button>\n\
            </form>\n\
          </div>\n",
         csrf = esc(csrf),
@@ -351,7 +350,7 @@ fn render_home_quick_actions_bar(out: &mut String, csrf: &str) {
 fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: usize, csrf: &str) {
     let _ = writeln!(
         out,
-        "<div class=\"section-head\"><h3>Want to Read ({total_count})</h3>\
+        "<div class=\"section-head\"><h2>Want to Read ({total_count})</h2>\
          <a class=\"section-action\" href=\"/queue\">Full Queue &rarr;</a></div>"
     );
     if items.is_empty() {
@@ -387,7 +386,10 @@ fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: us
             csrf,
             &[("return_to", "/")],
             None,
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">&#10003; Done</button>",
+            &format!(
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-label=\"Mark {} as done\"><span aria-hidden=\"true\">&#10003;</span> Done</button>",
+                esc(&item.title),
+            ),
         );
         out.push_str("</div></li>\n");
     }
@@ -397,7 +399,7 @@ fn render_want_to_read_section(out: &mut String, items: &[Item], total_count: us
 fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64) {
     let _ = writeln!(
         out,
-        "<div class=\"section-head\"><h3>Feed Inbox ({total_unread})</h3>\
+        "<div class=\"section-head\"><h2>Feed Inbox ({total_unread})</h2>\
          <a class=\"section-action\" href=\"/inbox\">Open Feed Inbox &rarr;</a></div>"
     );
     if items.is_empty() {
@@ -437,7 +439,7 @@ fn render_recent_diary_section(
     artist_links: &HashMap<String, String>,
 ) {
     out.push_str(
-        "<div class=\"section-head\"><h3>Recent Diary</h3>\
+        "<div class=\"section-head\"><h2>Recent Diary</h2>\
          <a class=\"section-action\" href=\"/diary\">Full Diary &rarr;</a></div>\n",
     );
     if diary.is_empty() {

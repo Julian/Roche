@@ -15,9 +15,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,6 +41,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
@@ -582,24 +584,29 @@ private fun FullscreenPlayerArtworkAndMeta(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Text(
-            text = entry.feedTitle,
-            color = colors.accentBlue,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        Box(
+            contentAlignment = Alignment.Center,
             modifier =
-                Modifier.clip(RoundedCornerShape(6.dp))
+                Modifier.minimumInteractiveComponentSize()
+                    .clip(RoundedCornerShape(6.dp))
                     .clickable(enabled = entry.feedId != null) {
                         entry.feedId?.let { fid ->
                             onAction(MainAction.CloseFullscreenPlayer)
                             onAction(MainAction.FilterByFeed(fid))
                         }
                     }
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
-        )
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            Text(
+                text = entry.feedTitle,
+                color = colors.accentBlue,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
 
         Spacer(modifier = Modifier.height(4.dp))
 
@@ -619,15 +626,17 @@ private fun FullscreenPlayerArtworkAndMeta(
         if (currentChapter != null) {
             Spacer(modifier = Modifier.height(10.dp))
             Box(
+                contentAlignment = Alignment.Center,
                 modifier =
-                    Modifier.clip(RoundedCornerShape(99.dp))
+                    Modifier.minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(99.dp))
                         .background(colors.surfaceElevated)
-                        .border(1.dp, colors.border, RoundedCornerShape(99.dp))
+                        .border(1.dp, colors.controlOutline, RoundedCornerShape(99.dp))
                         .clickable {
                             onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.CHAPTERS))
                         }
-                        .padding(horizontal = 14.dp, vertical = 5.dp)
-                        .testTag("player_chapter_pill")
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                        .testTag("player_chapter_pill"),
             ) {
                 Text(
                     text = "Ch. ${currentChapter.index} · ${currentChapter.title} ›",
@@ -729,11 +738,12 @@ private fun FullscreenPlayerTransportRow(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier =
-                    Modifier.height(42.dp)
-                        .width(62.dp)
+                    Modifier.heightIn(min = 42.dp)
+                        .widthIn(min = 62.dp)
                         .clip(speedPillShape)
                         .background(colors.surfaceElevated)
-                        .border(1.dp, colors.accentBlue.copy(alpha = 0.7f), speedPillShape),
+                        .border(1.dp, colors.accentBlue, speedPillShape)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
             ) {
                 Text(
                     text = speedLabel,
@@ -741,6 +751,7 @@ private fun FullscreenPlayerTransportRow(
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.5.sp,
                     fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clearAndSetSemantics {},
                 )
             }
         }

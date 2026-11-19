@@ -10,7 +10,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,10 +19,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
@@ -45,9 +46,13 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -198,6 +203,7 @@ private fun RowScope.BottomBarTabItem(tab: AppTab, isSelected: Boolean, onClick:
             fontSize = 11.5.sp,
             fontWeight = labelWeight,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -238,6 +244,7 @@ fun RocheTopHeader(
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.semantics { heading() },
                 )
                 if (!subtitle.isNullOrBlank()) {
                     Text(
@@ -295,11 +302,11 @@ fun FilterChipPill(
         Box(
             contentAlignment = Alignment.Center,
             modifier =
-                Modifier.height(32.dp)
+                Modifier.heightIn(min = 32.dp)
                     .clip(shape)
                     .background(bg)
                     .border(width = 1.dp, color = border, shape = shape)
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
         ) {
             Text(
                 text = label,
@@ -307,6 +314,7 @@ fun FilterChipPill(
                 fontSize = 12.sp,
                 fontWeight = weight,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -332,21 +340,20 @@ fun HeaderActionButton(
     val bg =
         when (style) {
             RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
+                if (enabled) colors.accentBlueFilled else colors.accentBlueFilled.copy(alpha = 0.4f)
             RocheButtonStyle.SECONDARY ->
                 if (enabled) colors.surfaceElevated else colors.surfaceElevated.copy(alpha = 0.5f)
         }
     val border =
         when (style) {
             RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
-            RocheButtonStyle.SECONDARY -> colors.border
+                if (enabled) colors.accentBlueFilled else colors.accentBlueFilled.copy(alpha = 0.4f)
+            RocheButtonStyle.SECONDARY -> colors.controlOutline
         }
     val textColor =
         when (style) {
             RocheButtonStyle.PRIMARY -> if (enabled) Color.White else Color.White.copy(alpha = 0.6f)
-            RocheButtonStyle.SECONDARY ->
-                if (enabled) colors.textPrimary else colors.textMuted
+            RocheButtonStyle.SECONDARY -> if (enabled) colors.textPrimary else colors.textMuted
         }
 
     Box(
@@ -369,11 +376,11 @@ fun HeaderActionButton(
         Box(
             contentAlignment = Alignment.Center,
             modifier =
-                Modifier.height(36.dp)
+                Modifier.heightIn(min = 36.dp)
                     .clip(shape)
                     .background(bg)
                     .border(1.dp, border, shape)
-                    .padding(horizontal = horizontalPadding),
+                    .padding(horizontal = horizontalPadding, vertical = 8.dp),
         ) {
             Text(
                 text = label,
@@ -382,6 +389,8 @@ fun HeaderActionButton(
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier =
+                    if (contentDescription != null) Modifier.clearAndSetSemantics {} else Modifier,
             )
         }
     }
@@ -436,6 +445,7 @@ fun SettingToggleRow(
         modifier =
             modifier
                 .fillMaxWidth()
+                .heightIn(min = 48.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .toggleable(
                     value = checked,
@@ -470,7 +480,8 @@ fun UndoOrStatusSnackbar(
                 .fillMaxWidth()
                 .clip(shape)
                 .background(colors.surfaceElevated)
-                .border(1.dp, colors.border, shape)
+                .border(1.dp, colors.controlOutline, shape)
+                .semantics { liveRegion = LiveRegionMode.Polite }
                 .padding(horizontal = 14.dp, vertical = 8.dp)
                 .testTag("status_snackbar"),
         verticalAlignment = Alignment.CenterVertically,
@@ -500,7 +511,12 @@ fun UndoOrStatusSnackbar(
                 onClick = onDismiss,
                 modifier = Modifier.semantics { contentDescription = "Dismiss message" },
             ) {
-                Text(text = "✕", color = colors.textMuted, fontSize = 12.sp)
+                Text(
+                    text = "✕",
+                    color = colors.textMuted,
+                    fontSize = 12.sp,
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
             }
         }
     }
@@ -523,7 +539,7 @@ internal fun RocheSectionHeader(
             fontWeight = FontWeight.SemiBold,
             fontSize = 10.5.sp,
             letterSpacing = 0.7.sp,
-            modifier = modifier.padding(horizontal = 4.dp),
+            modifier = modifier.padding(horizontal = 4.dp).semantics { heading() },
         )
         return
     }
@@ -546,6 +562,7 @@ internal fun RocheSectionHeader(
             fontWeight = FontWeight.SemiBold,
             fontSize = 10.5.sp,
             letterSpacing = 0.7.sp,
+            modifier = Modifier.semantics { heading() },
         )
         Text(
             text = actionLabel.uppercase(),

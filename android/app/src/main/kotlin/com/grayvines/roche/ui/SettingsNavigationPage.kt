@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -34,6 +35,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
@@ -271,6 +273,7 @@ internal fun RowScope.DockPreviewSlot(
             fontSize = 10.5.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -289,7 +292,7 @@ internal fun DockCandidateOption(
         when {
             isCurrentInSlot -> colors.accentBlue
             isUnpinned -> colors.accentEcru
-            else -> colors.border
+            else -> colors.controlOutline
         }
     val suffix =
         when {
@@ -302,7 +305,8 @@ internal fun DockCandidateOption(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         modifier =
-            Modifier.clip(shape)
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
                 .background(bg)
                 .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
