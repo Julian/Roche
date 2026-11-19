@@ -47,7 +47,7 @@ impl NodeIdentity {
         if !is_valid_dns_name(dns) {
             return None;
         }
-        let port = self.node_https_port.unwrap_or(DEFAULT_NODE_HTTPS_PORT);
+        let port = self.node_https_port?;
         if port == DEFAULT_NODE_HTTPS_PORT {
             Some(format!("https://{dns}"))
         } else {
@@ -191,8 +191,10 @@ pub fn validate_canonical_url(raw_canonical: &str, probed_base_url: &str) -> Opt
     let parsed = Url::parse(raw_canonical.trim()).ok()?;
     let probed = Url::parse(probed_base_url.trim()).ok()?;
     let probed_host = probed.host_str()?.to_ascii_lowercase();
-    let is_local_probe = probed_host == "127.0.0.1" || probed_host == "localhost";
-    if parsed.scheme() != "https" && !(is_local_probe && parsed.scheme() == "http") {
+    let canonical_host = parsed.host_str()?.to_ascii_lowercase();
+    let is_local_probe = matches!(probed_host.as_str(), "127.0.0.1" | "localhost" | "[::1]");
+    let allows_http = is_local_probe && canonical_host == probed_host;
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && allows_http) {
         return None;
     }
     if probed.scheme() == "https" && parsed.scheme() != "https" {
@@ -207,7 +209,6 @@ pub fn validate_canonical_url(raw_canonical: &str, probed_base_url: &str) -> Opt
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return None;
     }
-    let canonical_host = parsed.host_str()?.to_ascii_lowercase();
     if !is_trusted_canonical_host(&canonical_host, &probed_host) {
         return None;
     }
@@ -226,6 +227,7 @@ fn is_trusted_canonical_host(canonical_host: &str, probed_host: &str) -> bool {
     if probed_host == "roche"
         || probed_host == "127.0.0.1"
         || probed_host == "localhost"
+        || probed_host == "[::1]"
         || is_tailscale_cgnat_ipv4(probed_host)
     {
         return true;
@@ -442,12 +444,19 @@ pub async fn resolve_live_canonical_url(
     port: u16,
 ) -> Option<String> {
     let mut identity = inspect_local_node(cfg).await?;
+    let effective_host = if listen_host.trim().eq_ignore_ascii_case("tailscale") {
+        identity.ipv4.as_deref()?
+    } else {
+        listen_host
+    };
     if let Ok(serve_json) = run_tailscale_serve_status(&cfg.tailscale_bin).await {
-        let active =
-            inspect_active_serve(&serve_json, listen_host, port, cfg.advertise_service.as_deref());
-        if let Some(active_port) = active.node_https_port {
-            identity.node_https_port = Some(active_port);
-        }
+        let active = inspect_active_serve(
+            &serve_json,
+            effective_host,
+            port,
+            cfg.advertise_service.as_deref(),
+        );
+        identity.node_https_port = active.node_https_port;
         if !active.service_configured {
             identity.service_name = None;
         }
@@ -829,6 +838,17 @@ mod tests {
             identity.canonical_url().as_deref(),
             Some("https://mac-mini.tail9876.ts.net:8443")
         );
+
+        // When node HTTPS is not active/configured, node_https_url() must return None.
+        identity.node_https_port = None;
+        assert!(identity.node_https_url().is_none());
+        assert_eq!(identity.candidate_urls(), Vec::<String>::new());
+        assert!(identity.canonical_url().is_none());
+
+        // Service URL can still be advertised independently if configured.
+        identity.service_name = Some("svc:roche".to_string());
+        assert!(identity.node_https_url().is_none());
+        assert_eq!(identity.candidate_urls(), vec!["https://roche.tail9876.ts.net"]);
     }
 
     #[test]
@@ -907,6 +927,19 @@ mod tests {
                 .as_deref(),
             Some("https://roche.tail9876.ts.net")
         );
+        assert_eq!(
+            validate_canonical_url("https://roche.tail9876.ts.net", "http://[::1]:8080").as_deref(),
+            Some("https://roche.tail9876.ts.net")
+        );
+        // Valid: local loopback probe returning its own cleartext HTTP host
+        assert_eq!(
+            validate_canonical_url("http://127.0.0.1:8080", "http://127.0.0.1:8080").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            validate_canonical_url("http://[::1]:8080", "http://[::1]:8080").as_deref(),
+            Some("http://[::1]:8080")
+        );
         // Valid: same tailnet suffix (`tail9876.ts.net`) over HTTPS
         assert_eq!(
             validate_canonical_url(
@@ -917,7 +950,21 @@ mod tests {
             Some("https://roche.tail9876.ts.net")
         );
 
-        // Rejected: cleartext HTTP canonical URL on Tailnet
+        // Rejected: cleartext HTTP canonical URL on Tailnet, even when probing localhost/127.0.0.1/[::1]
+        assert!(
+            validate_canonical_url("http://roche.tail9876.ts.net:8080", "http://127.0.0.1:8080")
+                .is_none()
+        );
+        assert!(
+            validate_canonical_url("http://roche.tail9876.ts.net:8080", "http://localhost:8080")
+                .is_none()
+        );
+        assert!(
+            validate_canonical_url("http://roche.tail9876.ts.net:8080", "http://[::1]:8080")
+                .is_none()
+        );
+        assert!(validate_canonical_url("http://localhost:8080", "http://127.0.0.1:8080").is_none());
+        assert!(validate_canonical_url("http://[::1]:8080", "https://[::1]:8443").is_none());
         assert!(
             validate_canonical_url(
                 "http://roche.tail9876.ts.net:8080",
@@ -1010,5 +1057,108 @@ mod tests {
 
         assert!(proxy_matches_upstream("http://[::1]:8080", "::1", 8080));
         assert!(!proxy_matches_upstream("http://127.0.0.1:8080", "::1", 8080));
+    }
+
+    #[cfg(unix)]
+    async fn write_fake_tailscale_script(
+        dir: &Path,
+        name: &str,
+        status_json: &str,
+        serve_status_json: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = dir.join(name);
+        let status_file = dir.join(format!("{name}.status.json"));
+        let serve_file = dir.join(format!("{name}.serve.json"));
+        tokio::fs::write(&status_file, status_json).await.unwrap();
+        tokio::fs::write(&serve_file, serve_status_json).await.unwrap();
+
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"status\" ]; then\n\
+               cat \"{}\"\n\
+               exit 0\n\
+             elif [ \"$1\" = \"serve\" ] && [ \"$2\" = \"status\" ]; then\n\
+               cat \"{}\"\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            status_file.display(),
+            serve_file.display()
+        );
+        tokio::fs::write(&script_path, script).await.unwrap();
+        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        script_path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_resolve_live_canonical_url_handles_inactive_serve_and_tailscale_host_alias() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-ts-resolve-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        // 1. Inactive `tailscale serve` must clear node_https_port and return None.
+        let inactive_bin =
+            write_fake_tailscale_script(&temp_dir, "ts-inactive", SAMPLE_STATUS_JSON, "{}").await;
+        let inactive_cfg = TailscaleConfig {
+            enabled: true,
+            tailscale_bin: inactive_bin,
+            advertise_service: Some("svc:roche".to_string()),
+            auto_auth_users: Vec::new(),
+        };
+        assert_eq!(resolve_live_canonical_url(&inactive_cfg, "127.0.0.1", 8080).await, None);
+
+        // 2. `--host tailscale` (case-insensitive) resolves to node's Tailscale IPv4 before matching serve handlers.
+        let serve_on_ts_ip = r#"{
+          "Web": {
+            "mac-mini.tail9876.ts.net:8443": {
+              "Handlers": { "/": { "Proxy": "http://100.64.0.12:8080" } }
+            }
+          }
+        }"#;
+        let active_bin =
+            write_fake_tailscale_script(&temp_dir, "ts-active", SAMPLE_STATUS_JSON, serve_on_ts_ip)
+                .await;
+        let active_cfg = TailscaleConfig {
+            enabled: true,
+            tailscale_bin: active_bin,
+            advertise_service: Some("svc:roche".to_string()),
+            auto_auth_users: Vec::new(),
+        };
+        assert_eq!(
+            resolve_live_canonical_url(&active_cfg, "tailscale", 8080).await.as_deref(),
+            Some("https://mac-mini.tail9876.ts.net:8443")
+        );
+        assert_eq!(
+            resolve_live_canonical_url(&active_cfg, " TAILSCALE ", 8080).await.as_deref(),
+            Some("https://mac-mini.tail9876.ts.net:8443")
+        );
+
+        // 3. `--host tailscale` with no IPv4 on local node returns None.
+        let no_v4_status = r#"{
+          "BackendState": "Running",
+          "MagicDNSSuffix": "tail9876.ts.net",
+          "Self": {
+            "HostName": "mac-mini",
+            "DNSName": "mac-mini.tail9876.ts.net.",
+            "TailscaleIPs": ["fd7a:115c:a1e0::12"],
+            "Online": true
+          }
+        }"#;
+        let no_v4_bin =
+            write_fake_tailscale_script(&temp_dir, "ts-nov4", no_v4_status, serve_on_ts_ip).await;
+        let no_v4_cfg = TailscaleConfig {
+            enabled: true,
+            tailscale_bin: no_v4_bin,
+            advertise_service: None,
+            auto_auth_users: Vec::new(),
+        };
+        assert_eq!(resolve_live_canonical_url(&no_v4_cfg, "tailscale", 8080).await, None);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

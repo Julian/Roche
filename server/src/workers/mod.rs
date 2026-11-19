@@ -47,6 +47,9 @@ impl WorkerManager {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
+            if *shutdown.borrow_and_update() {
+                break;
+            }
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.run_once().await {
@@ -54,7 +57,7 @@ impl WorkerManager {
                     }
                 }
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
                         break;
                     }
                 }
@@ -153,5 +156,33 @@ mod tests {
         .unwrap();
         assert_eq!(remaining, 1);
         assert!(db.media().get(&media.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_run_all_until_shutdown_exits_immediately_when_already_true() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO activity_log (entity_type, entity_id, action, timestamp)
+             VALUES ('item', 'stale-1', 'archive', strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 days'))",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let workers = WorkerManager::new(db.clone(), 30, "/tmp/roche-test-media-shutdown");
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        let res =
+            tokio::time::timeout(Duration::from_secs(1), workers.run_all_until_shutdown(rx)).await;
+        assert!(res.is_ok(), "shutdown loop must exit immediately when shutdown starts as true");
+        assert!(res.unwrap().is_ok());
+        drop(tx);
+
+        // Must exit before executing the initial maintenance tick.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM activity_log WHERE entity_id = 'stale-1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
     }
 }

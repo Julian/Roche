@@ -238,10 +238,7 @@ impl HtmlSanitizer {
     /// XML parsing.
     #[must_use]
     pub fn extract_first_image_url_with_base(html: &str, base_url: Option<&Url>) -> Option<String> {
-        if !html.contains("<img")
-            && !html.contains("<IMG")
-            && !html.to_ascii_lowercase().contains("<img")
-        {
+        if !html.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"<img")) {
             return None;
         }
         let mut img_builder = ammonia::Builder::new();
@@ -702,5 +699,41 @@ impl HtmlSanitizer {
         if looks_like_feed && !path.contains("/comments/feed") {
             anchor_links.push(resolved);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_first_image_url_handles_mixed_case_and_image_free_html() {
+        let base = Url::parse("https://blog.example.com/posts/demo/").unwrap();
+        assert!(HtmlSanitizer::extract_first_image_url_with_base("", Some(&base)).is_none());
+        assert!(HtmlSanitizer::extract_first_image_url_with_base("<p>", Some(&base)).is_none());
+        assert!(
+            HtmlSanitizer::extract_first_image_url_with_base(
+                "<article><p>No images in this article at all.</p></article>",
+                Some(&base),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            HtmlSanitizer::extract_first_image_url_with_base(
+                r#"<p><Img src="https://cdn.example.com/mixed.jpg" width="640"></p>"#,
+                Some(&base),
+            )
+            .as_deref(),
+            Some("https://cdn.example.com/mixed.jpg")
+        );
+        assert_eq!(
+            HtmlSanitizer::extract_first_image_url_with_base(
+                r#"<p><iMg SRC="/hero.webp"></p>"#,
+                Some(&base),
+            )
+            .as_deref(),
+            Some("https://blog.example.com/hero.webp")
+        );
     }
 }

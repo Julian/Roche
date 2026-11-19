@@ -202,6 +202,9 @@ impl<F: FeedFetcher> PollScheduler<F> {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
+            if *shutdown.borrow_and_update() {
+                break;
+            }
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.check_and_poll().await {
@@ -209,7 +212,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
                     }
                 }
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
                         break;
                     }
                 }
@@ -261,7 +264,15 @@ impl<F: FeedFetcher> PollScheduler<F> {
             if !self.in_flight.lock().is_ok_and(|mut set| set.insert(feed.id.clone())) {
                 continue;
             }
-            due_feeds.push(feed);
+            if let Some(ref counter) = self.active_counter {
+                counter.fetch_add(1, Ordering::AcqRel);
+            }
+            let in_flight_guard = InFlightGuard {
+                in_flight: Arc::clone(&self.in_flight),
+                active_counter: self.active_counter.clone(),
+                feed_id: feed.id.clone(),
+            };
+            due_feeds.push((feed, in_flight_guard));
         }
 
         let batch_total = due_feeds.len();
@@ -272,10 +283,11 @@ impl<F: FeedFetcher> PollScheduler<F> {
         let batch_started_at = Instant::now();
         let batch_progress = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
         let mut tasks = self.tasks.lock().await;
-        for feed in due_feeds {
+        for (feed, in_flight_guard) in due_feeds {
             self.spawn_feed_poll_task(
                 &mut tasks,
                 feed,
+                in_flight_guard,
                 batch_total,
                 batch_started_at,
                 &batch_progress,
@@ -289,6 +301,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
         &self,
         tasks: &mut tokio::task::JoinSet<()>,
         feed: Feed,
+        in_flight_guard: InFlightGuard,
         batch_total: usize,
         batch_started_at: Instant,
         batch_progress: &Arc<Mutex<(usize, usize, usize)>>,
@@ -299,26 +312,18 @@ impl<F: FeedFetcher> PollScheduler<F> {
         let ytdlp_worker = self.ytdlp_worker.clone();
         let download_semaphore = Arc::clone(&self.download_semaphore);
         let semaphore = Arc::clone(&self.semaphore);
-        let in_flight = Arc::clone(&self.in_flight);
-        let active_counter = self.active_counter.clone();
         let measured_weight = Arc::clone(&self.measured_weight);
         let batch_progress = Arc::clone(batch_progress);
 
-        if let Some(ref counter) = active_counter {
-            counter.fetch_add(1, Ordering::AcqRel);
-        }
+        let mut progress_guard = BatchProgressGuard {
+            batch_progress,
+            batch_total,
+            batch_started_at,
+            measured_weight,
+            recorded: false,
+        };
 
         tasks.spawn(async move {
-            let in_flight_guard =
-                InFlightGuard { in_flight, active_counter, feed_id: feed.id.clone() };
-            let mut progress_guard = BatchProgressGuard {
-                batch_progress,
-                batch_total,
-                batch_started_at,
-                measured_weight,
-                recorded: false,
-            };
-
             let poll_res = {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return;
@@ -1042,5 +1047,90 @@ mod tests {
         tx.send(true).unwrap();
         let res = tokio::time::timeout(Duration::from_secs(2), handle).await.unwrap().unwrap();
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_feed_poll_task_drops_guards_when_aborted_before_first_poll() {
+        struct CountingFetcher {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for CountingFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(String::new()))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/abort-before-poll.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let active_counter = Arc::new(AtomicUsize::new(0));
+        let scheduler = PollScheduler::with_arc_fetcher(
+            db,
+            Arc::new(CountingFetcher { calls: Arc::clone(&fetch_calls) }),
+        )
+        .with_active_counter(Arc::clone(&active_counter));
+
+        let feed_id = feed.id.clone();
+        assert!(scheduler.in_flight.lock().unwrap().insert(feed_id.clone()));
+        active_counter.fetch_add(1, Ordering::AcqRel);
+        let in_flight_guard = InFlightGuard {
+            in_flight: Arc::clone(&scheduler.in_flight),
+            active_counter: scheduler.active_counter.clone(),
+            feed_id: feed_id.clone(),
+        };
+        let batch_progress = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        scheduler.spawn_feed_poll_task(
+            &mut tasks,
+            feed,
+            in_flight_guard,
+            1,
+            Instant::now(),
+            &batch_progress,
+        );
+        // Abort synchronously before yielding so the spawned future is dropped unpolled.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(active_counter.load(Ordering::Acquire), 0);
+        assert!(!scheduler.in_flight.lock().unwrap().contains(&feed_id));
+        assert_eq!(batch_progress.lock().unwrap().0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_until_shutdown_exits_immediately_when_already_true() {
+        struct CountingFetcher {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for CountingFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(String::new()))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/pre-shutdown.xml").unwrap();
+        db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = PollScheduler::with_arc_fetcher(
+            db,
+            Arc::new(CountingFetcher { calls: Arc::clone(&fetch_calls) }),
+        );
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        let res =
+            tokio::time::timeout(Duration::from_secs(1), scheduler.run_until_shutdown(rx)).await;
+        assert!(res.is_ok(), "shutdown loop must exit immediately when shutdown starts as true");
+        assert!(res.unwrap().is_ok());
+        drop(tx);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
     }
 }
