@@ -13,7 +13,8 @@ pub use activity::{ActivityEntry, SyncTombstone};
 use chrono::{DateTime, SubsecRound, Utc};
 #[allow(unused_imports)]
 pub use hlc::{
-    HlcClock, HlcTimestamp, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc, sanitize_hlc_node_id,
+    HlcClock, HlcTimestamp, MAX_CLOCK_DRIFT_MS, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc,
+    sanitize_hlc_node_id,
 };
 #[allow(unused_imports)]
 pub use hrw::{

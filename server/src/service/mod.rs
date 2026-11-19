@@ -361,11 +361,16 @@ impl<F: FeedFetcher> RocheService<F> {
 
     pub async fn export_data(&self) -> Result<ExportBundle, ApiError> {
         const MAX_EXPORT_ROWS: usize = 5_000;
-        let feeds = self.db.feeds().list().await?;
-        let items = self.db.items().list(None, None, Some(MAX_EXPORT_ROWS)).await?;
-        let tags = self.db.tags().list().await?;
-        let item_tags = self.db.tags().list_all_item_tags().await?;
-        let activity = self.db.sync().list_activity().await?;
+        let mut tx = self.db.begin_read().await?;
+        let feeds = crate::db::FeedRepo::list_in_tx(&mut tx).await?;
+        let items =
+            crate::db::ItemRepo::list_in_tx(&mut tx, None, None, Some(MAX_EXPORT_ROWS)).await?;
+        let tags = crate::db::TagRepo::list_in_tx(&mut tx).await?;
+        let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        let item_tags =
+            crate::db::TagRepo::list_item_tags_for_items_in_tx(&mut tx, &item_ids).await?;
+        let activity = SyncRepo::list_activity_in_tx(&mut tx).await?;
+        tx.commit().await?;
 
         Ok(ExportBundle {
             version: "1.0",
@@ -494,16 +499,18 @@ impl<F: FeedFetcher> RocheService<F> {
             }
 
             if let Some(ref mut ct) = entry.content
-                && ct
-                    .audio_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .is_some_and(|u| !Url::parse(u).as_ref().is_ok_and(is_valid_sync_item_url))
+                && ct.audio_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some_and(
+                    |u| {
+                        Url::parse(u).map_or(true, |parsed| {
+                            !is_valid_sync_item_url(&parsed)
+                                || SafeHttpClient::validate_url(&parsed).is_err()
+                        })
+                    },
+                )
             {
                 tracing::warn!(
                     id = %entry.id,
-                    "Clearing invalid audio_url on synced entry in peer_sync"
+                    "Clearing invalid or disallowed audio_url on synced entry in peer_sync"
                 );
                 ct.audio_url = None;
             }
@@ -1189,11 +1196,14 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         let item_repo = self.service.db.items();
         let media_repo = self.service.db.media();
         let media_list = media_repo.list_for_item(id).await?;
-        if !item_repo.delete(id).await? {
+        let outcome = item_repo.delete_returning_outcome(id).await?;
+        if !outcome.deleted {
             return Err(ApiError::not_found("Item not found"));
         }
 
-        media_repo.delete_with_files(&self.service.media_store, media_list).await?;
+        if outcome.readable_content_removed {
+            media_repo.delete_with_files(&self.service.media_store, media_list).await?;
+        }
         Ok(())
     }
 

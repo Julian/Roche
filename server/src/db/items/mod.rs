@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use url::Url;
 
 mod batch;
@@ -14,7 +14,10 @@ mod tests;
 #[allow(unused_imports)]
 pub use fts::SearchTerm;
 
-use super::{ContentType, InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
+use super::{
+    ContentType, InboxState, ItemSortField, ItemStatus, ItemStatusFilter, STARRED_COLLECTION_ID,
+    SortOrder, WANT_TO_READ_COLLECTION_ID,
+};
 
 pub const IS_LIVE_ITEM_SQL: &str = "(
     es.inbox_state IN ('unread', 'dismissed')
@@ -39,36 +42,36 @@ pub const IS_FEED_INBOX_ITEM_SQL: &str = "(
     )
 )";
 
-macro_rules! item_select_sql {
-    ($content_html_expr:literal) => {
-        concat!(
-            "SELECT i.id,
-       (SELECT ce_f.collection_id
-        FROM collection_entries ce_f
-        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
-        WHERE ce_f.entry_id = i.id
-        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
-        LIMIT 1) AS feed_id,
-       (SELECT fs_f.feed_url
-        FROM collection_entries ce_f
-        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
-        WHERE ce_f.entry_id = i.id
-        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
-        LIMIT 1) AS feed_url,
-       (SELECT fs_f.feed_title
-        FROM collection_entries ce_f
-        JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
-        WHERE ce_f.entry_id = i.id
-        ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
-        LIMIT 1) AS feed_title,
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ItemContentProjection {
+    Full,
+    List,
+    MetadataOnly,
+}
+
+pub(super) fn item_select_query_builder(proj: ItemContentProjection) -> QueryBuilder<Sqlite> {
+    let content_html_expr = match proj {
+        ItemContentProjection::Full => "ec.content_html",
+        ItemContentProjection::List => {
+            "CASE WHEN length(ec.content_html) <= 65536 THEN ec.content_html ELSE NULL END"
+        }
+        ItemContentProjection::MetadataOnly => "NULL",
+    };
+
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT i.id,
+       fs_primary.collection_id AS feed_id,
+       fs_primary.feed_url AS feed_url,
+       fs_primary.feed_title AS feed_title,
        i.title,
        COALESCE(i.url, 'https://roche.local/entry/' || i.id) AS url,
        (SELECT group_concat(value, ', ') FROM json_each(i.creators_json)) AS author,
        i.published_at,
        i.created_at,
        i.summary, ",
-            $content_html_expr,
-            " AS content_html,
+    );
+    qb.push(content_html_expr).push(
+        " AS content_html,
        i.thumbnail_url,
        (SELECT m.remote_url
         FROM entry_media m
@@ -85,24 +88,12 @@ macro_rules! item_select_sql {
            WHEN es.inbox_state = 'dismissed' THEN 'archived'
            WHEN COALESCE(es.inbox_state, 'none') = 'none'
                 AND es.read_at IS NOT NULL
-                AND NOT EXISTS (
-                    SELECT 1 FROM collection_entries ce_wtr_s
-                    WHERE ce_wtr_s.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
-                      AND ce_wtr_s.entry_id = i.id
-                ) THEN 'archived'
+                AND ce_wtr.entry_id IS NULL THEN 'archived'
            ELSE 'unread'
        END AS status,
        COALESCE(es.inbox_state, 'none') AS inbox_state,
-       EXISTS (
-           SELECT 1 FROM collection_entries ce_wtr
-           WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
-             AND ce_wtr.entry_id = i.id
-       ) AS in_want_to_read,
-       EXISTS (
-           SELECT 1 FROM collection_entries ce_fav
-           WHERE ce_fav.collection_id = '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
-             AND ce_fav.entry_id = i.id
-       ) AS is_favorite,
+       (ce_wtr.entry_id IS NOT NULL) AS in_want_to_read,
+       (ce_fav.entry_id IS NOT NULL) AS is_favorite,
        es.read_at,
        COALESCE(es.progress, 0.0) AS read_progress,
        es.interaction_updated_at,
@@ -130,16 +121,23 @@ macro_rules! item_select_sql {
        ), '[]') AS tag_names
 FROM entries i
 LEFT JOIN entry_state es ON es.entry_id = i.id
-LEFT JOIN entry_content ec ON ec.entry_id = i.id"
-        )
-    };
+LEFT JOIN entry_content ec ON ec.entry_id = i.id
+LEFT JOIN feed_sources fs_primary ON fs_primary.collection_id = (
+    SELECT ce_f.collection_id
+    FROM collection_entries ce_f
+    JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
+    WHERE ce_f.entry_id = i.id
+    ORDER BY ce_f.added_at ASC, ce_f.collection_id ASC
+    LIMIT 1
+)
+LEFT JOIN collection_entries ce_wtr ON ce_wtr.collection_id = ",
+    );
+    qb.push_bind(WANT_TO_READ_COLLECTION_ID)
+        .push(" AND ce_wtr.entry_id = i.id LEFT JOIN collection_entries ce_fav ON ce_fav.collection_id = ")
+        .push_bind(STARRED_COLLECTION_ID)
+        .push(" AND ce_fav.entry_id = i.id");
+    qb
 }
-
-const ITEM_SELECT_FULL: &str = item_select_sql!("ec.content_html");
-const ITEM_SELECT_LIST: &str = item_select_sql!(
-    "CASE WHEN length(ec.content_html) <= 65536 THEN ec.content_html ELSE NULL END"
-);
-const ITEM_SELECT_METADATA_ONLY: &str = item_select_sql!("NULL");
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

@@ -67,7 +67,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<ConsumptionLogView> {
         let now = SyncRepo::now_utc();
         let event_ts = ts.unwrap_or(now);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let (log_id, canon_id) =
             Self::log_consumption_in_tx(&mut tx, entry_id, status, notes, event_ts, now).await?;
         tx.commit().await?;

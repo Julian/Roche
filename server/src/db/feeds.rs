@@ -35,6 +35,48 @@ pub struct Feed {
     pub unread_count: i64,
 }
 
+macro_rules! feed_select_sql {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT fs.collection_id AS id,
+       fs.source_type AS feed_type,
+       fs.feed_url AS url,
+       fs.feed_title AS title,
+       e.summary AS description,
+       fs.language,
+       fs.poll_interval,
+       fs.last_polled_at AS last_polled,
+       fs.last_polled_by,
+       fs.last_error,
+       fs.last_error_by,
+       fs.is_active,
+       e.created_at,
+       (SELECT COUNT(*)
+        FROM collection_entries ce
+        JOIN entry_state es ON es.entry_id = ce.entry_id
+        JOIN entries ie ON ie.id = ce.entry_id
+        WHERE ce.collection_id = fs.collection_id
+          AND ie.merged_into_id IS NULL
+          AND es.inbox_state = 'unread') AS unread_count
+FROM feed_sources fs
+JOIN entries e ON e.id = fs.collection_id ",
+            $suffix
+        )
+    };
+}
+
+const FEED_SELECT_BY_ID_SQL: &str = feed_select_sql!("WHERE fs.collection_id = ?");
+const FEED_SELECT_ALL_SQL: &str = feed_select_sql!("ORDER BY e.created_at DESC");
+const FEED_SELECT_ACTIVE_POLL_SQL: &str = feed_select_sql!(
+    "WHERE fs.is_active = 1
+       AND (
+           fs.last_polled_at IS NULL
+           OR datetime(fs.last_polled_at) < datetime('now', '-' || fs.poll_interval || ' minutes')
+           OR (fs.last_error IS NOT NULL AND fs.last_error_by IS NOT NULL AND fs.last_error_by != ?)
+       )"
+);
+
+#[derive(sqlx::FromRow)]
 struct RawFeedRow {
     id: String,
     feed_type: FeedType,
@@ -203,7 +245,7 @@ impl<'a> FeedRepo<'a> {
         let id = deterministic_feed_id(url_str);
         let nat_key = feed_natural_key(url_str);
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Feed, &nat_key).await?;
 
@@ -396,7 +438,7 @@ impl<'a> FeedRepo<'a> {
         default_interval: i64,
     ) -> Result<Vec<Feed>> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let mut imported = Vec::new();
 
         for outline in outlines {
@@ -467,35 +509,10 @@ impl<'a> FeedRepo<'a> {
             )
             .await?;
 
-            let raw = sqlx::query_as!(
-                RawFeedRow,
-                "SELECT fs.collection_id AS id,
-                        fs.source_type AS \"feed_type: FeedType\",
-                        fs.feed_url AS url,
-                        fs.feed_title AS title,
-                        e.summary AS description,
-                        fs.language,
-                        fs.poll_interval,
-                        fs.last_polled_at AS \"last_polled: DateTime<Utc>\",
-                        fs.last_polled_by,
-                        fs.last_error,
-                        fs.last_error_by,
-                        fs.is_active AS \"is_active: bool\",
-                        e.created_at AS \"created_at: DateTime<Utc>\",
-                        (SELECT COUNT(*)
-                         FROM collection_entries ce
-                         JOIN entry_state es ON es.entry_id = ce.entry_id
-                         JOIN entries ie ON ie.id = ce.entry_id
-                         WHERE ce.collection_id = fs.collection_id
-                           AND ie.merged_into_id IS NULL
-                           AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-                 FROM feed_sources fs
-                 JOIN entries e ON e.id = fs.collection_id
-                 WHERE fs.collection_id = ?",
-                existing_id,
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
+            let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
+                .bind(&existing_id)
+                .fetch_optional(&mut *tx)
+                .await?;
             return Ok(raw.map(Feed::try_from).transpose()?);
         }
 
@@ -550,67 +567,20 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Feed>> {
-        let raw = sqlx::query_as!(
-            RawFeedRow,
-            "SELECT fs.collection_id AS id,
-                    fs.source_type AS \"feed_type: FeedType\",
-                    fs.feed_url AS url,
-                    fs.feed_title AS title,
-                    e.summary AS description,
-                    fs.language,
-                    fs.poll_interval,
-                    fs.last_polled_at AS \"last_polled: DateTime<Utc>\",
-                    fs.last_polled_by,
-                    fs.last_error,
-                    fs.last_error_by,
-                    fs.is_active AS \"is_active: bool\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = fs.collection_id
-                       AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-             FROM feed_sources fs
-             JOIN entries e ON e.id = fs.collection_id
-             WHERE fs.collection_id = ?",
-            id,
-        )
-        .fetch_optional(self.pool)
-        .await?;
+        let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
+            .bind(id)
+            .fetch_optional(self.pool)
+            .await?;
         Ok(raw.map(Feed::try_from).transpose()?)
     }
 
     pub async fn list(&self) -> Result<Vec<Feed>> {
-        let rows = sqlx::query_as!(
-            RawFeedRow,
-            "SELECT fs.collection_id AS id,
-                    fs.source_type AS \"feed_type: FeedType\",
-                    fs.feed_url AS url,
-                    fs.feed_title AS title,
-                    e.summary AS description,
-                    fs.language,
-                    fs.poll_interval,
-                    fs.last_polled_at AS \"last_polled: DateTime<Utc>\",
-                    fs.last_polled_by,
-                    fs.last_error,
-                    fs.last_error_by,
-                    fs.is_active AS \"is_active: bool\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = fs.collection_id
-                       AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-             FROM feed_sources fs
-             JOIN entries e ON e.id = fs.collection_id
-             ORDER BY e.created_at DESC",
-        )
-        .fetch_all(self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        Self::list_in_tx(&mut conn).await
+    }
+
+    pub(crate) async fn list_in_tx(conn: &mut SqliteConnection) -> Result<Vec<Feed>> {
+        let rows = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_ALL_SQL).fetch_all(conn).await?;
         Ok(rows.into_iter().map(Feed::try_from).collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -626,7 +596,7 @@ impl<'a> FeedRepo<'a> {
         }
 
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let existing_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
@@ -758,7 +728,7 @@ impl<'a> FeedRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let deleted_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
                 .fetch_optional(&mut *tx)
@@ -792,40 +762,10 @@ impl<'a> FeedRepo<'a> {
         &self,
         local_peer_id: &str,
     ) -> Result<Vec<Feed>> {
-        let rows = sqlx::query_as!(
-            RawFeedRow,
-            "SELECT fs.collection_id AS id,
-                    fs.source_type AS \"feed_type: FeedType\",
-                    fs.feed_url AS url,
-                    fs.feed_title AS title,
-                    e.summary AS description,
-                    fs.language,
-                    fs.poll_interval,
-                    fs.last_polled_at AS \"last_polled: DateTime<Utc>\",
-                    fs.last_polled_by,
-                    fs.last_error,
-                    fs.last_error_by,
-                    fs.is_active AS \"is_active: bool\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = fs.collection_id
-                       AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-             FROM feed_sources fs
-             JOIN entries e ON e.id = fs.collection_id
-             WHERE fs.is_active = 1
-               AND (
-                   fs.last_polled_at IS NULL
-                   OR datetime(fs.last_polled_at) < datetime('now', '-' || fs.poll_interval || ' minutes')
-                   OR (fs.last_error IS NOT NULL AND fs.last_error_by IS NOT NULL AND fs.last_error_by != ?)
-               )",
-            local_peer_id,
-        )
-        .fetch_all(self.pool)
-        .await?;
+        let rows = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_ACTIVE_POLL_SQL)
+            .bind(local_peer_id)
+            .fetch_all(self.pool)
+            .await?;
         Ok(rows.into_iter().map(Feed::try_from).collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -850,6 +790,13 @@ impl<'a> FeedRepo<'a> {
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
         let new_lang = batch.language.as_deref().filter(|s| !s.is_empty());
 
+        let has_audio_items = batch
+            .items
+            .iter()
+            .any(|it| it.content_type == ContentType::Audio || it.audio_url.is_some());
+
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
         let existing_meta = sqlx::query!(
             "SELECT fs.feed_url, fs.feed_title, e.summary, fs.language
              FROM feed_sources fs
@@ -857,7 +804,7 @@ impl<'a> FeedRepo<'a> {
              WHERE fs.collection_id = ?",
             feed_id,
         )
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         let feed_url = existing_meta.as_ref().map(|r| r.feed_url.clone());
@@ -866,12 +813,6 @@ impl<'a> FeedRepo<'a> {
                 || (r.summary.is_none() && new_desc.is_some())
                 || (r.language.is_none() && new_lang.is_some())
         });
-        let has_audio_items = batch
-            .items
-            .iter()
-            .any(|it| it.content_type == ContentType::Audio || it.audio_url.is_some());
-
-        let mut tx = self.pool.begin().await?;
 
         sqlx::query!(
             "UPDATE feed_sources
@@ -1303,7 +1244,7 @@ impl<'a> FeedRepo<'a> {
 
     pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         sqlx::query!(
             "UPDATE feed_sources
              SET last_error = ?, last_error_by = ?, last_polled_at = ?

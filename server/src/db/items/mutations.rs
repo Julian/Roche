@@ -6,9 +6,18 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 #[cfg(test)]
 use url::Url;
 
-use super::{IS_LIVE_ITEM_SQL, ITEM_SELECT_FULL, Item, ItemRepo, ManualItemInput};
+use super::{
+    IS_LIVE_ITEM_SQL, Item, ItemContentProjection, ItemRepo, ManualItemInput,
+    item_select_query_builder,
+};
 #[cfg(test)]
 use super::{NewItem, TagNames};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemDeleteOutcome {
+    pub deleted: bool,
+    pub readable_content_removed: bool,
+}
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, EntryKind, InboxState,
@@ -130,7 +139,7 @@ impl ItemRepo<'_> {
             .and_then(|a| serde_json::to_string(&[a]).ok())
             .unwrap_or_else(|| "[]".to_owned());
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         Self::insert_created_item_rows_in_tx(
             &mut tx,
             &id,
@@ -274,7 +283,7 @@ impl ItemRepo<'_> {
         let now = SyncRepo::now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
         let entry_kind = EntryKind::from_content_type(input.content_type);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(
             &mut tx,
@@ -513,7 +522,7 @@ impl ItemRepo<'_> {
             attached_tags.push(tag);
         }
 
-        let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_FULL);
+        let mut qb = item_select_query_builder(ItemContentProjection::Full);
         qb.push(" WHERE i.id = ").push_bind(&final_item_id);
         let item: Item = qb.build_query_as().fetch_one(&mut *tx).await?;
 
@@ -533,6 +542,7 @@ impl ItemRepo<'_> {
         type ExistingItemStateTuple =
             (EntryKind, InboxState, bool, bool, f64, Option<DateTime<Utc>>);
         let now = SyncRepo::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let mut check_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.kind,
@@ -566,7 +576,7 @@ impl ItemRepo<'_> {
             .push(IS_LIVE_ITEM_SQL);
 
         let existing: Option<ExistingItemStateTuple> =
-            check_qb.build_query_as().fetch_optional(self.pool).await?;
+            check_qb.build_query_as().fetch_optional(&mut *tx).await?;
 
         let Some((
             entry_kind,
@@ -632,8 +642,6 @@ impl ItemRepo<'_> {
         {
             return Ok(true);
         }
-
-        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
@@ -755,12 +763,12 @@ impl ItemRepo<'_> {
     /// when catalog history (consumption log, comparisons, lists/want queues, or active generator)
     /// references it.
     #[allow(clippy::too_many_lines)]
-    pub(crate) async fn delete_inbox_item_preserving_history_in_tx(
+    pub(crate) async fn delete_inbox_item_preserving_history_outcome_in_tx(
         conn: &mut SqliteConnection,
         item_id: &str,
         detach_want_queues: bool,
         now: DateTime<Utc>,
-    ) -> std::result::Result<bool, sqlx::Error> {
+    ) -> std::result::Result<ItemDeleteOutcome, sqlx::Error> {
         if detach_want_queues {
             let detached_item_cols: Vec<String> = sqlx::query_scalar(
                 "SELECT ce.collection_id
@@ -806,7 +814,7 @@ impl ItemRepo<'_> {
                 .execute(&mut *conn)
                 .await?;
             if res.rows_affected() == 0 {
-                return Ok(false);
+                return Ok(ItemDeleteOutcome { deleted: false, readable_content_removed: false });
             }
             sqlx::query(
                 "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
@@ -880,17 +888,44 @@ impl ItemRepo<'_> {
                 )
                 .await?;
             }
-            Ok(true)
+            Ok(ItemDeleteOutcome {
+                deleted: true,
+                readable_content_removed: keep_readable_content.is_none(),
+            })
         } else {
             let res = sqlx::query("DELETE FROM entries WHERE id = ?")
                 .bind(item_id)
                 .execute(&mut *conn)
                 .await?;
-            Ok(res.rows_affected() > 0)
+            let deleted = res.rows_affected() > 0;
+            Ok(ItemDeleteOutcome { deleted, readable_content_removed: deleted })
         }
     }
 
+    pub(crate) async fn delete_inbox_item_preserving_history_in_tx(
+        conn: &mut SqliteConnection,
+        item_id: &str,
+        detach_feed_sources: bool,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        Ok(Self::delete_inbox_item_preserving_history_outcome_in_tx(
+            conn,
+            item_id,
+            detach_feed_sources,
+            now,
+        )
+        .await?
+        .deleted)
+    }
+
     pub async fn delete(&self, id: &str) -> Result<bool> {
+        Ok(self.delete_returning_outcome(id).await?.deleted)
+    }
+
+    pub(crate) async fn delete_returning_outcome(&self, id: &str) -> Result<ItemDeleteOutcome> {
+        let now = SyncRepo::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
         let mut key_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.url,
                     (SELECT fs.feed_url
@@ -906,16 +941,17 @@ impl ItemRepo<'_> {
         );
         key_qb.push_bind(id).push(" AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
         let existing_keys: Option<(Option<String>, Option<String>)> =
-            key_qb.build_query_as().fetch_optional(self.pool).await?;
+            key_qb.build_query_as().fetch_optional(&mut *tx).await?;
         let Some((item_url_opt, feed_url)) = existing_keys else {
-            return Ok(false);
+            return Ok(ItemDeleteOutcome { deleted: false, readable_content_removed: false });
         };
         let item_url = item_url_opt.unwrap_or_default();
 
-        let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
-        if !Self::delete_inbox_item_preserving_history_in_tx(&mut tx, id, true, now).await? {
-            return Ok(false);
+        let outcome =
+            Self::delete_inbox_item_preserving_history_outcome_in_tx(&mut tx, id, true, now)
+                .await?;
+        if !outcome.deleted {
+            return Ok(outcome);
         }
         if !item_url.is_empty() {
             SyncRepo::record_tombstone(
@@ -935,7 +971,7 @@ impl ItemRepo<'_> {
         )
         .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -967,7 +1003,7 @@ impl ItemRepo<'_> {
         let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
         let creators_ref = new_creators_json.as_deref();
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let live: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM entries e
@@ -1065,7 +1101,7 @@ impl ItemRepo<'_> {
         let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
         let creators_ref = new_creators_json.as_deref();
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let result = sqlx::query!(
             "UPDATE entries
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,

@@ -143,6 +143,13 @@ impl SyncRepo<'_> {
     }
 
     pub async fn list_activity(&self) -> Result<Vec<ActivityEntry>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::list_activity_in_tx(&mut conn).await
+    }
+
+    pub(crate) async fn list_activity_in_tx(
+        conn: &mut SqliteConnection,
+    ) -> Result<Vec<ActivityEntry>> {
         Ok(sqlx::query_as!(
             ActivityEntry,
             "SELECT id AS \"id!: i64\",
@@ -154,7 +161,7 @@ impl SyncRepo<'_> {
              ORDER BY id DESC
              LIMIT 5000",
         )
-        .fetch_all(self.pool)
+        .fetch_all(conn)
         .await?)
     }
 
@@ -191,7 +198,7 @@ impl SyncRepo<'_> {
 
     pub async fn prune_activity_older_than_days(&self, days: i64) -> Result<u64> {
         let cutoff = Self::now_utc() - chrono::Duration::days(days.max(0));
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let pruned_max_seq: Option<i64> = sqlx::query_scalar(
             "SELECT MAX(sync_seq) FROM sync_tombstones
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",

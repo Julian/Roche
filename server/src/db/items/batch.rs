@@ -98,8 +98,9 @@ impl ItemRepo<'_> {
         }
 
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let mut archived_ids = Vec::with_capacity(candidate_ids.len());
+        let mut high_progress: Vec<(String, f64, Option<DateTime<Utc>>)> = Vec::new();
 
         for chunk in candidate_ids.chunks(CHUNK_SIZE) {
             let mut qb = QueryBuilder::new(
@@ -115,9 +116,15 @@ impl ItemRepo<'_> {
             for id in chunk {
                 sep.push_bind(id.as_str());
             }
-            sep.push_unseparated(") RETURNING entry_id");
-            let updated: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
-            archived_ids.extend(updated);
+            sep.push_unseparated(") RETURNING entry_id, progress, read_at");
+            let updated: Vec<(String, f64, Option<DateTime<Utc>>)> =
+                qb.build_query_as().fetch_all(&mut *tx).await?;
+            for (id, progress, read_at) in updated {
+                if progress >= 0.9 {
+                    high_progress.push((id.clone(), progress, read_at));
+                }
+                archived_ids.push(id);
+            }
         }
 
         for chunk in archived_ids.chunks(CHUNK_SIZE) {
@@ -133,30 +140,33 @@ impl ItemRepo<'_> {
 
         // Batch-archived items whose progress had already reached >= 0.9 are auto-logged,
         // while unopened / skimmed bulk-archived items (progress < 0.9) never touch consumption_log.
-        for id in &archived_ids {
-            let row = sqlx::query!(
-                "SELECT e.kind AS \"kind: EntryKind\",
-                        es.progress,
-                        es.read_at AS \"read_at: DateTime<Utc>\"
-                 FROM entries e
-                 JOIN entry_state es ON es.entry_id = e.id
-                 WHERE e.id = ?",
-                id,
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(row) = row
-                && row.progress >= 0.9
-            {
-                maybe_auto_log_feed_completion_in_tx(
-                    &mut tx,
-                    id,
-                    row.kind,
-                    InboxState::Dismissed,
-                    row.progress,
-                    row.read_at.unwrap_or(now),
-                )
-                .await?;
+        if !high_progress.is_empty() {
+            let mut kind_map = std::collections::HashMap::with_capacity(high_progress.len());
+            for chunk in high_progress.chunks(CHUNK_SIZE) {
+                let mut qb = QueryBuilder::new("SELECT id, kind FROM entries WHERE id IN (");
+                let mut sep = qb.separated(", ");
+                for (id, _, _) in chunk {
+                    sep.push_bind(id.as_str());
+                }
+                sep.push_unseparated(")");
+                let kinds: Vec<(String, EntryKind)> =
+                    qb.build_query_as().fetch_all(&mut *tx).await?;
+                for (id, kind) in kinds {
+                    kind_map.insert(id, kind);
+                }
+            }
+            for (id, progress, read_at) in high_progress {
+                if let Some(&kind) = kind_map.get(&id) {
+                    maybe_auto_log_feed_completion_in_tx(
+                        &mut tx,
+                        &id,
+                        kind,
+                        InboxState::Dismissed,
+                        progress,
+                        read_at.unwrap_or(now),
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -232,7 +242,7 @@ impl ItemRepo<'_> {
         }
 
         let count = u64::try_from(normalized.len()).unwrap_or(0);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         for (id, excerpt, thumb) in normalized {
             sqlx::query!(
                 "INSERT INTO entry_content (entry_id, content_html, content_type)
@@ -326,7 +336,7 @@ impl ItemRepo<'_> {
         }
 
         let count = u64::try_from(updates.len()).unwrap_or(0);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         for (id, thumb) in updates {
             sqlx::query!("UPDATE entries SET thumbnail_url = ? WHERE id = ?", thumb, id)
                 .execute(&mut *tx)

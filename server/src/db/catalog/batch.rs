@@ -31,7 +31,7 @@ impl CatalogRepo<'_> {
         batch: &CatalogBatchInput,
     ) -> CatalogResult<CatalogBatchResult> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let mut ref_map: HashMap<String, String> =
             HashMap::with_capacity(batch.entries.len() + batch.collections.len());
 
@@ -312,9 +312,12 @@ impl CatalogRepo<'_> {
             let (col_id, col_title, mode, role) =
                 Self::resolve_batch_collection_ref_in_tx(tx, ref_map, &gen_input.collection_ref)
                     .await?;
-            if mode != CollectionMode::Manual || role != CollectionRole::List {
+            if col_id == crate::db::STARRED_COLLECTION_ID
+                || mode != CollectionMode::Manual
+                || role != CollectionRole::List
+            {
                 return Err(CatalogError::InvalidInput(format!(
-                    "Collection '{col_title}' cannot use a generator (must be a manual list)"
+                    "Collection '{col_title}' cannot use a generator (must be a custom manual list)"
                 )));
             }
             let explicit_entry_id = match gen_input

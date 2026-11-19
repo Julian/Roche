@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
     SyncRepo,
@@ -69,9 +69,11 @@ impl SyncRepo<'_> {
         server_hlc: String,
         now: DateTime<Utc>,
     ) -> Result<PeerSyncResponse> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
+
         let (current_seq, min_retained_seq): (i64, i64) =
             sqlx::query_as("SELECT current_seq, min_retained_seq FROM sync_clock WHERE id = 1")
-                .fetch_one(self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
 
         let clamped_since = requested_since_seq.max(0);
@@ -82,7 +84,7 @@ impl SyncRepo<'_> {
                 (false, clamped_since)
             };
 
-        let active_peers = self.list_active_peers(now).await?;
+        let active_peers = Self::list_active_peers_in_tx(&mut tx, now).await?;
 
         if effective_since >= current_seq {
             return Ok(PeerSyncResponse {
@@ -140,7 +142,7 @@ impl SyncRepo<'_> {
         .bind(effective_since)
         .bind(effective_since)
         .bind(probe_limit)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         if candidates.is_empty() {
@@ -191,7 +193,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let collection_generators: Vec<SyncCollectionGeneratorRecord> = sqlx::query_as(
@@ -202,7 +204,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let consumption_log: Vec<SyncConsumptionLogRecord> = sqlx::query_as(
@@ -213,7 +215,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let raw_comparisons: Vec<RawComparisonTuple> = sqlx::query_as(
@@ -224,7 +226,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let comparisons: Vec<SyncComparisonRecord> = raw_comparisons
@@ -250,7 +252,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut raw_entries: Vec<RawEntryRow> = sqlx::query_as(
@@ -268,7 +270,7 @@ impl SyncRepo<'_> {
         )
         .bind(effective_since)
         .bind(cutoff_seq)
-        .fetch_all(self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         // Ensure every outgoing child record on this page has its referenced `entries` present
@@ -281,11 +283,13 @@ impl SyncRepo<'_> {
             &comparisons,
         );
         if !missing_refs.is_empty() {
-            let extra = self.fetch_future_referenced_entries(&missing_refs, cutoff_seq).await?;
+            let extra =
+                Self::fetch_future_referenced_entries(&mut tx, &missing_refs, cutoff_seq).await?;
             raw_entries.extend(extra);
         }
 
-        let entries = self.hydrate_outgoing_entries(raw_entries).await?;
+        let entries = Self::hydrate_outgoing_entries(&mut tx, raw_entries).await?;
+        tx.commit().await?;
 
         Ok(PeerSyncResponse {
             server_peer_id: SERVER_PEER_ID.to_owned(),
@@ -305,7 +309,7 @@ impl SyncRepo<'_> {
     }
 
     async fn fetch_future_referenced_entries(
-        &self,
+        conn: &mut SqliteConnection,
         candidate_ids: &[String],
         cutoff_seq: i64,
     ) -> Result<Vec<RawEntryRow>> {
@@ -330,7 +334,7 @@ impl SyncRepo<'_> {
                       AND (cs.mode = 'dynamic' OR cs.collection_role = 'system')
                 )",
             );
-            let rows: Vec<RawEntryRow> = qb.build_query_as().fetch_all(self.pool).await?;
+            let rows: Vec<RawEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
             out.extend(rows);
         }
         Ok(out)
@@ -338,7 +342,7 @@ impl SyncRepo<'_> {
 
     #[allow(clippy::too_many_lines)]
     async fn hydrate_outgoing_entries(
-        &self,
+        conn: &mut SqliteConnection,
         raw_entries: Vec<RawEntryRow>,
     ) -> Result<Vec<SyncEntryRecord>> {
         if raw_entries.is_empty() {
@@ -363,7 +367,7 @@ impl SyncRepo<'_> {
             }
             sep.push_unseparated(") ORDER BY scheme ASC, value ASC");
             let id_rows: Vec<(String, String, String)> =
-                id_qb.build_query_as().fetch_all(self.pool).await?;
+                id_qb.build_query_as().fetch_all(&mut *conn).await?;
             for (eid, scheme, value) in id_rows {
                 idents_map.entry(eid).or_default().push(EntryIdentifier { scheme, value });
             }
@@ -387,7 +391,7 @@ impl SyncRepo<'_> {
                 ct_sep.push_bind(id);
             }
             ct_sep.push_unseparated(")");
-            let ct_rows: Vec<RawContentRow> = ct_qb.build_query_as().fetch_all(self.pool).await?;
+            let ct_rows: Vec<RawContentRow> = ct_qb.build_query_as().fetch_all(&mut *conn).await?;
             for (eid, html, content_type, audio_url, duration) in ct_rows {
                 let bounded_html = html.map(|h| {
                     if h.len() <= MAX_SYNC_INLINE_HTML_BYTES {
@@ -418,7 +422,7 @@ impl SyncRepo<'_> {
                 st_sep.push_bind(id);
             }
             st_sep.push_unseparated(")");
-            let st_rows: Vec<RawStateRow> = st_qb.build_query_as().fetch_all(self.pool).await?;
+            let st_rows: Vec<RawStateRow> = st_qb.build_query_as().fetch_all(&mut *conn).await?;
             for (eid, inbox_state, read_at, progress, interaction_updated_at, hlc) in st_rows {
                 state_map.insert(
                     eid,
@@ -436,7 +440,7 @@ impl SyncRepo<'_> {
                 spec_sep.push_bind(id);
             }
             spec_sep.push_unseparated(")");
-            let spec_rows: Vec<RawSpecRow> = spec_qb.build_query_as().fetch_all(self.pool).await?;
+            let spec_rows: Vec<RawSpecRow> = spec_qb.build_query_as().fetch_all(&mut *conn).await?;
             for (cid, slug, mode, role, rule_json, show_in_lists, color) in spec_rows {
                 spec_map.insert(
                     cid,
@@ -457,7 +461,7 @@ impl SyncRepo<'_> {
             }
             fs_sep.push_unseparated(")");
             let fs_rows: Vec<RawFeedSourceRow> =
-                fs_qb.build_query_as().fetch_all(self.pool).await?;
+                fs_qb.build_query_as().fetch_all(&mut *conn).await?;
             for (
                 cid,
                 feed_url,

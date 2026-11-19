@@ -393,12 +393,24 @@ fn ep_pairwise_component(
             let f_var = cov[a * n_items + a] + cov[b * n_items + b] - 2.0 * cov[a * n_items + b];
             let f_mean = mean[a] - mean[b];
             if f_var <= 0.0 || !f_var.is_finite() {
+                tracing::warn!(
+                    n_items,
+                    n_pairs = pairs.len(),
+                    f_var,
+                    "EP pairwise inference aborted due to non-positive or non-finite cavity variance"
+                );
                 return None;
             }
             let tau_tot = 1.0 / f_var;
             let nu_tot = tau_tot * f_mean;
             let tau_cav = tau_tot - tau[i];
             if tau_cav <= 0.0 || !tau_cav.is_finite() {
+                tracing::warn!(
+                    n_items,
+                    n_pairs = pairs.len(),
+                    tau_cav,
+                    "EP pairwise inference aborted due to non-positive or non-finite cavity precision"
+                );
                 return None;
             }
             let nu_cav = nu_tot - nu[i];
@@ -439,7 +451,15 @@ fn ep_pairwise_component(
         for d in 0..n_items {
             sys_mat[d * n_items + d] += alpha;
         }
-        cov = cholesky_invert(&sys_mat, n_items)?;
+        let Some(inv_cov) = cholesky_invert(&sys_mat, n_items) else {
+            tracing::warn!(
+                n_items,
+                n_pairs = pairs.len(),
+                "EP pairwise inference aborted due to non-positive-definite precision matrix"
+            );
+            return None;
+        };
+        cov = inv_cov;
         mat_vec_mul(&cov, &xs, &mut mean, n_items);
 
         let max_dt = tau.iter().zip(&tau_old).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max);
@@ -449,6 +469,12 @@ fn ep_pairwise_component(
             return Some((mean, variances));
         }
     }
+    tracing::warn!(
+        n_items,
+        n_pairs = pairs.len(),
+        max_iter,
+        "EP pairwise inference did not converge within max_iter; falling back to prior scores"
+    );
     None
 }
 

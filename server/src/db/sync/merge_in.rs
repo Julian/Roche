@@ -206,7 +206,7 @@ impl SyncRepo<'_> {
             .await?
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         Self::ensure_server_peer_in_tx(&mut tx, now).await?;
         if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
@@ -405,7 +405,7 @@ impl SyncRepo<'_> {
                             "SELECT e.id, es.hlc
                              FROM entries e
                              JOIN entry_state es ON es.entry_id = e.id
-                             WHERE es.inbox_state IN ('unread', 'dismissed')
+                             WHERE es.inbox_state IN ('unread', 'dismissed', 'none')
                                AND (e.id = ? OR (e.url = ? AND NOT EXISTS (
                                    SELECT 1 FROM collection_entries ce
                                    JOIN feed_sources fs ON fs.collection_id = ce.collection_id
@@ -564,6 +564,43 @@ impl SyncRepo<'_> {
                         &mut *conn,
                         ActivityEntityType::Entry,
                         key,
+                        tomb.deleted_at,
+                        &tomb_hlc,
+                    )
+                    .await?;
+                }
+                ActivityEntityType::CollectionGenerator => {
+                    let col_id = CatalogRepo::follow_merged_id_in_tx(&mut *conn, key)
+                        .await?
+                        .unwrap_or_else(|| key.to_owned());
+                    let existing_hlc: Option<String> = sqlx::query_scalar(
+                        "SELECT hlc FROM collection_generators WHERE collection_id = ?",
+                    )
+                    .bind(&col_id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    if existing_hlc.as_deref().is_some_and(|h| h > tomb_hlc.as_str()) {
+                        continue;
+                    }
+                    let res =
+                        sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
+                            .bind(&col_id)
+                            .execute(&mut *conn)
+                            .await?;
+                    if res.rows_affected() > 0 {
+                        Self::record_activity(
+                            &mut *conn,
+                            ActivityEntityType::CollectionGenerator,
+                            &col_id,
+                            ActivityAction::Delete,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Self::record_tombstone_with_hlc(
+                        &mut *conn,
+                        ActivityEntityType::CollectionGenerator,
+                        &col_id,
                         tomb.deleted_at,
                         &tomb_hlc,
                     )
@@ -1183,6 +1220,23 @@ impl SyncRepo<'_> {
         let created = rec.created_at.unwrap_or(now);
         let entry_hlc =
             resolve_or_synthesize_hlc(&rec.hlc, rec.updated_at.or(rec.created_at), now, peer_id);
+
+        // Check `'entry'` tombstone before upserting manual collection
+        if !super::is_protected_system_collection_id(&target_id) {
+            let entry_tomb: Option<String> = sqlx::query_scalar(
+                "SELECT hlc FROM sync_tombstones WHERE entity_type = 'entry' AND natural_key = ?",
+            )
+            .bind(&target_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(ref th) = entry_tomb {
+                if entry_hlc.as_str() <= th.as_str() {
+                    return Ok(());
+                }
+                Self::clear_tombstone(tx, ActivityEntityType::Entry, &target_id).await?;
+            }
+        }
+
         let clean_color = cs.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
         sqlx::query(
@@ -2129,6 +2183,21 @@ impl SyncRepo<'_> {
             }
 
             let inc_hlc = resolve_or_synthesize_hlc(&inc.hlc, Some(inc.updated_at), now, peer_id);
+
+            let gen_tomb: Option<String> = sqlx::query_scalar(
+                "SELECT hlc FROM sync_tombstones
+                 WHERE entity_type = 'collection_generator' AND natural_key = ?",
+            )
+            .bind(&col_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(ref th) = gen_tomb {
+                if inc_hlc.as_str() <= th.as_str() {
+                    continue;
+                }
+                Self::clear_tombstone(tx, ActivityEntityType::CollectionGenerator, &col_id).await?;
+            }
+
             let local_gen: Option<ExistingGeneratorTuple> = sqlx::query_as(
                 "SELECT enabled, current_entry_id, drawn_at, updated_at, hlc
                      FROM collection_generators WHERE collection_id = ?",

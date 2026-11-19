@@ -298,7 +298,7 @@ impl CatalogRepo<'_> {
         }
 
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let entry_id = Self::upsert_entry_in_tx(&mut tx, input, kind, title, now).await?;
         tx.commit().await?;
 
@@ -404,25 +404,31 @@ impl CatalogRepo<'_> {
         {
             let target_artist = primary_artist.to_lowercase();
             let target_stripped = strip_album_edition_suffix(title).to_lowercase();
-            let existing_albums = sqlx::query!(
-                r#"SELECT id as "id!", title as "title!", creators_json as "creators_json!"
-                   FROM entries
-                   WHERE kind = 'album' AND merged_into_id IS NULL"#,
+            let escaped_prefix =
+                target_stripped.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let title_like = format!("{escaped_prefix}%");
+            let existing_albums: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT id, title, creators_json
+                 FROM entries
+                 WHERE kind = 'album'
+                   AND merged_into_id IS NULL
+                   AND LOWER(TRIM(title)) LIKE ? ESCAPE '\\'",
             )
+            .bind(&title_like)
             .fetch_all(&mut *tx)
             .await?;
-            for cand in existing_albums {
+            for (cand_id, cand_title, cand_creators_json) in existing_albums {
                 let cand_creators: Vec<String> =
-                    serde_json::from_str(&cand.creators_json).unwrap_or_default();
+                    serde_json::from_str(&cand_creators_json).unwrap_or_default();
                 let same_artist = cand_creators
                     .first()
                     .map(|a| a.trim())
                     .filter(|a| !a.is_empty())
                     .is_some_and(|a| a.to_lowercase() == target_artist);
                 if same_artist
-                    && strip_album_edition_suffix(&cand.title).to_lowercase() == target_stripped
+                    && strip_album_edition_suffix(&cand_title).to_lowercase() == target_stripped
                 {
-                    matched_id = Some(cand.id);
+                    matched_id = Some(cand_id);
                     break;
                 }
             }
@@ -742,7 +748,11 @@ impl CatalogRepo<'_> {
         if cur.is_empty() {
             return Ok(None);
         }
-        for _ in 0..8 {
+        let mut visited = HashSet::with_capacity(4);
+        for _ in 0..32 {
+            if !visited.insert(cur.clone()) {
+                return Ok(None);
+            }
             let row = sqlx::query!(
                 r#"SELECT id as "id!", merged_into_id as "merged_into_id?" FROM entries WHERE id = ?"#,
                 &cur,
@@ -757,7 +767,7 @@ impl CatalogRepo<'_> {
                 },
             }
         }
-        Ok(Some(cur))
+        Ok(None)
     }
 
     pub(super) async fn load_identifiers_for_one(

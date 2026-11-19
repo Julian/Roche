@@ -13,7 +13,7 @@ use super::{
 use crate::{
     db::{
         sync::{SyncRepo, canonical_ordering_json, deterministic_comparison_id},
-        types::{ActivityAction, ActivityEntityType, CollectionRole},
+        types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
     },
     ranking::{
         MAX_K_DEFAULT, MEAN_TIE_EPSILON, N_QUANTILES, RANDOM_SEED_EVERY, Score, infer_scores,
@@ -54,7 +54,7 @@ impl CatalogRepo<'_> {
 
         let now = SyncRepo::now_utc();
         let event_ts = ts.unwrap_or(now);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let (record, _) =
             Self::append_comparison_in_tx(&mut tx, clean_scope, resolved_ordering, event_ts, now)
                 .await?;
@@ -223,13 +223,74 @@ impl CatalogRepo<'_> {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Lightweight count of rankable members in `slug_or_id` without hydrating entries,
+    /// loading comparisons, or running EP inference.
+    pub async fn count_rankable_members(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+    ) -> CatalogResult<usize> {
+        let raw_col = if want {
+            let summary = self.get_or_create_want_collection(slug_or_id).await?;
+            self.lookup_collection_row(&summary.id, false).await?
+        } else {
+            self.lookup_collection_row(slug_or_id, true).await?
+        };
+        match raw_col.mode {
+            CollectionMode::Manual | CollectionMode::Feed => {
+                let count: i64 = if raw_col.has_generator {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*)
+                         FROM collection_entries ce
+                         JOIN entries e ON e.id = ce.entry_id
+                         WHERE ce.collection_id = ?
+                           AND e.merged_into_id IS NULL
+                           AND EXISTS (
+                               SELECT 1 FROM consumption_log cl
+                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                           )",
+                    )
+                    .bind(&raw_col.id)
+                    .fetch_one(self.pool)
+                    .await?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*)
+                         FROM collection_entries ce
+                         JOIN entries e ON e.id = ce.entry_id
+                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
+                    )
+                    .bind(&raw_col.id)
+                    .fetch_one(self.pool)
+                    .await?
+                };
+                Ok(usize::try_from(count).unwrap_or(0))
+            }
+            CollectionMode::Dynamic => Ok(self.resolve_rankable_member_ids(&raw_col).await?.len()),
+        }
+    }
+
     pub async fn select_next_cluster(
         &self,
         slug_or_id: &str,
         want: bool,
         filter: &ClusterSelectFilter,
     ) -> CatalogResult<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>)> {
+        self.select_next_cluster_with_retries(slug_or_id, want, filter, 0, |_| false).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn select_next_cluster_with_retries<F>(
+        &self,
+        slug_or_id: &str,
+        want: bool,
+        filter: &ClusterSelectFilter,
+        max_covered_retries: usize,
+        is_covered: F,
+    ) -> CatalogResult<(CollectionSummary, Vec<CatalogEntry>, HashMap<String, Score>)>
+    where
+        F: Fn(&[CatalogEntry]) -> bool,
+    {
         let raw_col = if want {
             let summary = self.get_or_create_want_collection(slug_or_id).await?;
             self.lookup_collection_row(&summary.id, false).await?
@@ -258,12 +319,16 @@ impl CatalogRepo<'_> {
             let needle = creator_q.to_lowercase();
             members.retain(|e| e.creators.iter().any(|c| c.to_lowercase().contains(&needle)));
         }
-        if let Some(parent_id) =
+        if let Some(raw_parent_id) =
             filter.from_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
         {
+            let resolved_parent = self
+                .follow_merged_id(raw_parent_id)
+                .await?
+                .unwrap_or_else(|| raw_parent_id.to_owned());
             let child_ids: HashSet<String> = sqlx::query_scalar!(
                 r#"SELECT entry_id as "entry_id!" FROM collection_entries WHERE collection_id = ?"#,
-                parent_id,
+                &resolved_parent,
             )
             .fetch_all(self.pool)
             .await?
@@ -302,26 +367,52 @@ impl CatalogRepo<'_> {
             }
         }
 
+        let by_id: HashMap<String, CatalogEntry> =
+            members.into_iter().map(|e| (e.id.clone(), e)).collect();
+
         let max_k = if filter.max_k == 0 { MAX_K_DEFAULT } else { filter.max_k };
         let force_random = seed_pool.is_none()
             && filter.iteration > 0
             && filter.iteration.is_multiple_of(RANDOM_SEED_EVERY);
-        let cluster_ids = {
+
+        let mut cluster_entries: Vec<CatalogEntry> = {
             let mut rng = rand::rng();
-            select_cluster(
+            let cluster_ids = select_cluster(
                 &scores,
                 &member_ids,
                 max_k,
                 force_random,
                 seed_pool.as_deref(),
                 &mut rng,
-            )
+            );
+            cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect()
         };
 
-        let by_id: HashMap<String, CatalogEntry> =
-            members.into_iter().map(|e| (e.id.clone(), e)).collect();
-        let cluster_entries: Vec<CatalogEntry> =
-            cluster_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
+        if cluster_entries.len() >= 2 && is_covered(&cluster_entries) {
+            if filter.focus_ids.is_empty() && max_covered_retries > 0 {
+                let mut rng = rand::rng();
+                for _ in 0..max_covered_retries {
+                    let cand_ids = select_cluster(
+                        &scores,
+                        &member_ids,
+                        max_k,
+                        true,
+                        seed_pool.as_deref(),
+                        &mut rng,
+                    );
+                    let cand: Vec<CatalogEntry> =
+                        cand_ids.iter().filter_map(|id| by_id.get(id).cloned()).collect();
+                    if cand.len() >= 2 && !is_covered(&cand) {
+                        cluster_entries = cand;
+                        break;
+                    }
+                }
+            }
+            if is_covered(&cluster_entries) {
+                cluster_entries.clear();
+            }
+        }
+
         let summary = CollectionSummary {
             id: raw_col.id,
             slug: raw_col.slug,

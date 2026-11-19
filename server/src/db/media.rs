@@ -46,7 +46,7 @@ impl<'a> MediaRepo<'a> {
             return Ok(Vec::new());
         }
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let mut out = Vec::with_capacity(specs.len());
 
         for spec in specs {
@@ -128,7 +128,7 @@ impl<'a> MediaRepo<'a> {
     ) -> Result<Media> {
         let id = Uuid::new_v4().to_string();
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         sqlx::query!(
             "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
@@ -259,7 +259,7 @@ impl<'a> MediaRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let res =
             sqlx::query!("DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL", id,)
                 .execute(&mut *tx)

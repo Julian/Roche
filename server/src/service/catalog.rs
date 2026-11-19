@@ -5,7 +5,7 @@ use crate::{
         CatalogEntry, CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter,
         CollectionSummary, Db, EntryIdentifier, UpsertEntryInput,
     },
-    ranking::{RANDOM_SEED_EVERY, Score},
+    ranking::Score,
 };
 
 const MAX_COVERED_CLUSTER_RETRIES: usize = 4;
@@ -25,8 +25,7 @@ impl<'a> CatalogService<'a> {
 
     /// Returns `true` when `slug_or_id` contains at least 2 rankable entries.
     pub async fn can_rank_collection(&self, slug_or_id: &str, want: bool) -> CatalogResult<bool> {
-        let view = self.repo.get_ranked_collection(slug_or_id, want).await?;
-        Ok(view.rows.len() >= 2)
+        Ok(self.repo.count_rankable_members(slug_or_id, want).await? >= 2)
     }
 
     /// Determines whether an entry just logged as `consumed` can immediately enter a
@@ -58,27 +57,15 @@ impl<'a> CatalogService<'a> {
     where
         F: Fn(&[CatalogEntry]) -> bool,
     {
-        let (summary, mut cluster, mut scores) =
-            self.repo.select_next_cluster(slug_or_id, want, base_filter).await?;
-        if cluster.len() >= 2 && is_covered(&cluster) {
-            if base_filter.focus_ids.is_empty() {
-                for _ in 0..MAX_COVERED_CLUSTER_RETRIES {
-                    let mut retry_filter = base_filter.clone();
-                    retry_filter.iteration = RANDOM_SEED_EVERY;
-                    let (_, cand, cand_scores) =
-                        self.repo.select_next_cluster(slug_or_id, want, &retry_filter).await?;
-                    if cand.len() >= 2 && !is_covered(&cand) {
-                        cluster = cand;
-                        scores = cand_scores;
-                        break;
-                    }
-                }
-            }
-            if is_covered(&cluster) {
-                cluster.clear();
-            }
-        }
-        Ok((summary, cluster, scores))
+        self.repo
+            .select_next_cluster_with_retries(
+                slug_or_id,
+                want,
+                base_filter,
+                MAX_COVERED_CLUSTER_RETRIES,
+                is_covered,
+            )
+            .await
     }
 
     /// Adds an entry to a Want queue, first attempting to resolve an existing catalog entry

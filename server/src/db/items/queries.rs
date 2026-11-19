@@ -1,18 +1,16 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
-    IS_FEED_INBOX_ITEM_SQL, IS_LIVE_ITEM_SQL, ITEM_SELECT_FULL, ITEM_SELECT_LIST,
-    ITEM_SELECT_METADATA_ONLY, Item, ItemFilter, ItemPage, ItemRepo,
+    IS_FEED_INBOX_ITEM_SQL, IS_LIVE_ITEM_SQL, Item, ItemContentProjection, ItemFilter, ItemPage,
+    ItemRepo, item_select_query_builder,
 };
-use crate::db::{
-    InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder, sync::STARRED_COLLECTION_ID,
-};
+use crate::db::{InboxState, ItemSortField, ItemStatus, ItemStatusFilter, SortOrder};
 
 impl ItemRepo<'_> {
     pub async fn get(&self, id: &str) -> Result<Option<Item>> {
-        let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_FULL);
+        let mut qb = item_select_query_builder(ItemContentProjection::Full);
         qb.push(" WHERE i.id = ")
             .push_bind(id)
             .push(" AND i.merged_into_id IS NULL AND ")
@@ -26,7 +24,17 @@ impl ItemRepo<'_> {
         feed_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<Item>> {
-        let mut qb = QueryBuilder::<Sqlite>::new(ITEM_SELECT_LIST);
+        let mut conn = self.pool.acquire().await?;
+        Self::list_in_tx(&mut conn, status, feed_id, limit).await
+    }
+
+    pub(crate) async fn list_in_tx(
+        conn: &mut SqliteConnection,
+        status: Option<ItemStatus>,
+        feed_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Item>> {
+        let mut qb = item_select_query_builder(ItemContentProjection::List);
         qb.push(" WHERE i.merged_into_id IS NULL AND ");
         if status.is_some() || feed_id.is_some() {
             qb.push("es.inbox_state IN ('unread', 'dismissed')");
@@ -48,7 +56,7 @@ impl ItemRepo<'_> {
             qb.push(" LIMIT ").push_bind(i64::try_from(l).unwrap_or(i64::MAX));
         }
 
-        Ok(qb.build_query_as::<Item>().fetch_all(self.pool).await?)
+        Ok(qb.build_query_as::<Item>().fetch_all(conn).await?)
     }
 
     #[cfg(test)]
@@ -62,12 +70,12 @@ impl ItemRepo<'_> {
         let search_terms = trimmed_search.map_or_default(ItemFilter::tokenize_search_terms);
         let fts_query = trimmed_search.and_then(ItemFilter::build_fts_query);
 
-        let base_select = if filter.include_content == Some(false) {
-            ITEM_SELECT_METADATA_ONLY
+        let proj = if filter.include_content == Some(false) {
+            ItemContentProjection::MetadataOnly
         } else {
-            ITEM_SELECT_LIST
+            ItemContentProjection::List
         };
-        let mut qb = QueryBuilder::<Sqlite>::new(base_select);
+        let mut qb = item_select_query_builder(proj);
         if let Some(fts_match) = &fts_query {
             qb.push(
                 " LEFT JOIN (SELECT rowid AS fts_rowid, bm25(entries_fts, 0.0, 10.0, 5.0, 2.0, 1.0) AS fts_rank FROM entries_fts WHERE entries_fts MATCH ",
@@ -89,12 +97,12 @@ impl ItemRepo<'_> {
                 match s {
                     ItemStatus::Unread => {
                         qb.push(
-                            " AND (es.inbox_state = 'unread' OR (COALESCE(es.inbox_state, 'none') = 'none' AND (es.read_at IS NULL OR EXISTS (SELECT 1 FROM collection_entries ce_wtr_u WHERE ce_wtr_u.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' AND ce_wtr_u.entry_id = i.id))))",
+                            " AND (es.inbox_state = 'unread' OR (COALESCE(es.inbox_state, 'none') = 'none' AND (es.read_at IS NULL OR ce_wtr.entry_id IS NOT NULL)))",
                         );
                     }
                     ItemStatus::Archived => {
                         qb.push(
-                            " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM collection_entries ce_wtr_a WHERE ce_wtr_a.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3' AND ce_wtr_a.entry_id = i.id)))",
+                            " AND (es.inbox_state = 'dismissed' OR (COALESCE(es.inbox_state, 'none') = 'none' AND es.read_at IS NOT NULL AND ce_wtr.entry_id IS NULL))",
                         );
                     }
                 }
@@ -136,17 +144,9 @@ impl ItemRepo<'_> {
         }
         if let Some(fav) = filter.is_favorite {
             if fav {
-                qb.push(
-                    " AND EXISTS (SELECT 1 FROM collection_entries ce_fav WHERE ce_fav.collection_id = ",
-                )
-                .push_bind(STARRED_COLLECTION_ID)
-                .push(" AND ce_fav.entry_id = i.id)");
+                qb.push(" AND ce_fav.entry_id IS NOT NULL");
             } else {
-                qb.push(
-                    " AND NOT EXISTS (SELECT 1 FROM collection_entries ce_fav WHERE ce_fav.collection_id = ",
-                )
-                .push_bind(STARRED_COLLECTION_ID)
-                .push(" AND ce_fav.entry_id = i.id)");
+                qb.push(" AND ce_fav.entry_id IS NULL");
             }
         }
         Self::append_updated_after_where_clause(

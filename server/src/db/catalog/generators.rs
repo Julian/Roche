@@ -24,6 +24,9 @@ struct RawGeneratorRow {
     current_entry_id: Option<String>,
     drawn_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
+    total_pool: i64,
+    consumed_count: i64,
+    abandoned_count: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -35,36 +38,60 @@ struct RawExistingGenRow {
 
 type GeneratorStateTuple = (bool, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>);
 
+macro_rules! list_generators_sql {
+    ($extra_where:literal, $order_by:literal) => {
+        concat!(
+            "SELECT cg.collection_id, cs.slug AS collection_slug, e.title AS collection_title,
+                    cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at,
+                    COALESCE(stats.total_pool, 0) AS total_pool,
+                    COALESCE(stats.consumed_count, 0) AS consumed_count,
+                    COALESCE(stats.abandoned_count, 0) AS abandoned_count
+             FROM collection_generators cg
+             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
+             JOIN entries e ON e.id = cg.collection_id
+             LEFT JOIN (
+                 SELECT ce.collection_id,
+                        COUNT(*) AS total_pool,
+                        COALESCE(SUM(CASE WHEN EXISTS (
+                            SELECT 1 FROM consumption_log cl
+                            WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+                        ) THEN 1 ELSE 0 END), 0) AS consumed_count,
+                        COALESCE(SUM(CASE WHEN NOT EXISTS (
+                            SELECT 1 FROM consumption_log cl
+                            WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+                        ) AND EXISTS (
+                            SELECT 1 FROM consumption_log cl
+                            WHERE cl.entry_id = ce.entry_id AND cl.status = 'abandoned'
+                        ) THEN 1 ELSE 0 END), 0) AS abandoned_count
+                 FROM collection_entries ce
+                 JOIN entries m ON m.id = ce.entry_id
+                 WHERE m.merged_into_id IS NULL
+                 GROUP BY ce.collection_id
+             ) stats ON stats.collection_id = cg.collection_id
+             WHERE e.merged_into_id IS NULL
+               AND cs.mode = 'manual'
+               AND cs.collection_role = 'list'
+               AND cg.collection_id != ? ",
+            $extra_where,
+            " ",
+            $order_by
+        )
+    };
+}
+
+const LIST_ENABLED_GENERATORS_SQL: &str =
+    list_generators_sql!("AND cg.enabled = 1", "ORDER BY LOWER(e.title) ASC, cg.collection_id ASC");
+const LIST_ALL_GENERATORS_SQL: &str =
+    list_generators_sql!("", "ORDER BY cg.enabled DESC, LOWER(e.title) ASC, cg.collection_id ASC");
+
 impl CatalogRepo<'_> {
     pub async fn list_collection_generators(
         &self,
         only_enabled: bool,
     ) -> CatalogResult<Vec<CollectionGeneratorState>> {
-        let sql = if only_enabled {
-            "SELECT cg.collection_id, cs.slug AS collection_slug, e.title AS collection_title,
-                    cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at
-             FROM collection_generators cg
-             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
-             JOIN entries e ON e.id = cg.collection_id
-             WHERE e.merged_into_id IS NULL
-               AND cs.mode = 'manual'
-               AND cs.collection_role = 'list'
-               AND cg.collection_id != '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
-               AND cg.enabled = 1
-             ORDER BY LOWER(e.title) ASC, cg.collection_id ASC"
-        } else {
-            "SELECT cg.collection_id, cs.slug AS collection_slug, e.title AS collection_title,
-                    cg.enabled, cg.current_entry_id, cg.drawn_at, cg.updated_at
-             FROM collection_generators cg
-             JOIN collection_specs cs ON cs.collection_id = cg.collection_id
-             JOIN entries e ON e.id = cg.collection_id
-             WHERE e.merged_into_id IS NULL
-               AND cs.mode = 'manual'
-               AND cs.collection_role = 'list'
-               AND cg.collection_id != '533b1315-6e2e-57d3-ba85-dc88531c5a0b'
-             ORDER BY cg.enabled DESC, LOWER(e.title) ASC, cg.collection_id ASC"
-        };
-        let rows: Vec<RawGeneratorRow> = sqlx::query_as(sql).fetch_all(self.pool).await?;
+        let sql = if only_enabled { LIST_ENABLED_GENERATORS_SQL } else { LIST_ALL_GENERATORS_SQL };
+        let rows: Vec<RawGeneratorRow> =
+            sqlx::query_as(sql).bind(crate::db::STARRED_COLLECTION_ID).fetch_all(self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(self.hydrate_generator_state(row).await?);
@@ -89,6 +116,28 @@ impl CatalogRepo<'_> {
         let (enabled, current_entry_id, drawn_at, updated_at) =
             gen_row.unwrap_or((false, None, None, col.updated_at));
 
+        let (total_pool, consumed_count, abandoned_count): (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 COUNT(*),
+                 COALESCE(SUM(CASE WHEN EXISTS (
+                     SELECT 1 FROM consumption_log cl
+                     WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+                 ) THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN NOT EXISTS (
+                     SELECT 1 FROM consumption_log cl
+                     WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
+                 ) AND EXISTS (
+                     SELECT 1 FROM consumption_log cl
+                     WHERE cl.entry_id = ce.entry_id AND cl.status = 'abandoned'
+                 ) THEN 1 ELSE 0 END), 0)
+             FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
+        )
+        .bind(&col.id)
+        .fetch_one(self.pool)
+        .await?;
+
         self.hydrate_generator_state(RawGeneratorRow {
             collection_id: col.id,
             collection_slug: col.slug,
@@ -97,6 +146,9 @@ impl CatalogRepo<'_> {
             current_entry_id,
             drawn_at,
             updated_at,
+            total_pool,
+            consumed_count,
+            abandoned_count,
         })
         .await
     }
@@ -118,7 +170,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<CollectionGeneratorState> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         Self::update_collection_generator_in_tx(
             &mut tx,
             &col.id,
@@ -136,18 +188,25 @@ impl CatalogRepo<'_> {
     pub async fn remove_collection_generator(&self, slug_or_id: &str) -> CatalogResult<bool> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
             .bind(&col.id)
             .execute(&mut *tx)
             .await?;
         let removed = res.rows_affected() > 0;
         if removed {
+            SyncRepo::record_tombstone(
+                &mut tx,
+                ActivityEntityType::CollectionGenerator,
+                &col.id,
+                now,
+            )
+            .await?;
             SyncRepo::record_activity(
                 &mut tx,
-                ActivityEntityType::Entry,
+                ActivityEntityType::CollectionGenerator,
                 &col.id,
-                ActivityAction::Update,
+                ActivityAction::Delete,
                 now,
             )
             .await?;
@@ -180,7 +239,7 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let active_opt: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT current_entry_id FROM collection_generators WHERE collection_id = ?",
@@ -236,53 +295,9 @@ impl CatalogRepo<'_> {
             None => None,
         };
 
-        let total_pool: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM collection_entries ce
-             JOIN entries e ON e.id = ce.entry_id
-             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
-        )
-        .bind(&raw.collection_id)
-        .fetch_one(self.pool)
-        .await?;
-
-        let consumed_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT ce.entry_id)
-             FROM collection_entries ce
-             JOIN entries e ON e.id = ce.entry_id
-             WHERE ce.collection_id = ?
-               AND e.merged_into_id IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM consumption_log cl
-                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
-               )",
-        )
-        .bind(&raw.collection_id)
-        .fetch_one(self.pool)
-        .await?;
-
-        let abandoned_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT ce.entry_id)
-             FROM collection_entries ce
-             JOIN entries e ON e.id = ce.entry_id
-             WHERE ce.collection_id = ?
-               AND e.merged_into_id IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM consumption_log cl
-                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'consumed'
-               )
-               AND EXISTS (
-                   SELECT 1 FROM consumption_log cl
-                   WHERE cl.entry_id = ce.entry_id AND cl.status = 'abandoned'
-               )",
-        )
-        .bind(&raw.collection_id)
-        .fetch_one(self.pool)
-        .await?;
-
-        let total = usize::try_from(total_pool).unwrap_or(0);
-        let consumed = usize::try_from(consumed_count).unwrap_or(0);
-        let abandoned = usize::try_from(abandoned_count).unwrap_or(0);
+        let total = usize::try_from(raw.total_pool).unwrap_or(0);
+        let consumed = usize::try_from(raw.consumed_count).unwrap_or(0);
+        let abandoned = usize::try_from(raw.abandoned_count).unwrap_or(0);
         let remaining = total.saturating_sub(consumed + abandoned);
 
         Ok(CollectionGeneratorState {
@@ -349,6 +364,9 @@ impl CatalogRepo<'_> {
                 drawn_at = Some(now);
             }
         }
+
+        SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionGenerator, collection_id)
+            .await?;
 
         sqlx::query(
             "INSERT INTO collection_generators

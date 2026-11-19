@@ -427,6 +427,7 @@ pub enum ActivityEntityType {
     Entry,
     Collection,
     CollectionEntry,
+    CollectionGenerator,
     ConsumptionLog,
     Comparison,
 }

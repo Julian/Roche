@@ -255,6 +255,14 @@ impl SyncRepo<'_> {
     }
 
     pub async fn list_active_peers(&self, now: DateTime<Utc>) -> Result<Vec<PeerNode>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::list_active_peers_in_tx(&mut conn, now).await
+    }
+
+    pub(super) async fn list_active_peers_in_tx(
+        conn: &mut SqliteConnection,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<PeerNode>> {
         let cutoff = now - chrono::Duration::minutes(PEER_LEASE_TTL_MINUTES);
         Ok(sqlx::query_as!(
             PeerNode,
@@ -268,7 +276,7 @@ impl SyncRepo<'_> {
              ORDER BY peer_id ASC",
             cutoff as _,
         )
-        .fetch_all(self.pool)
+        .fetch_all(conn)
         .await?)
     }
 

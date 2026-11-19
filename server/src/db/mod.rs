@@ -55,12 +55,35 @@ pub use types::{
 #[error("{0}")]
 pub struct ConflictError(pub String);
 
+/// Begins a SQLite write transaction using `BEGIN IMMEDIATE` so WAL-mode writers
+/// acquire the RESERVED lock up-front and respect `busy_timeout` instead of failing
+/// immediately with `SQLITE_BUSY` on a read-to-write lock upgrade.
+pub(crate) async fn begin_write(
+    pool: &SqlitePool,
+) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
+/// Begins a SQLite read-snapshot transaction (`BEGIN DEFERRED`) so multiple SELECT
+/// queries observe a single consistent WAL point-in-time snapshot.
+pub(crate) async fn begin_read(
+    pool: &SqlitePool,
+) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
+    pool.begin().await
+}
+
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
 }
 
 impl Db {
+    pub(crate) async fn begin_read(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
+        begin_read(&self.pool).await
+    }
+
     /// Connects to the SQLite database at `database_path` and runs all embedded migrations.
     pub async fn connect(database_path: impl AsRef<Path>) -> Result<Self> {
         let path = database_path.as_ref();
@@ -141,7 +164,7 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = begin_write(&self.pool).await?;
         for row in entry_urls {
             let entry_id = row.id;
             let raw_url = row.url;
@@ -331,7 +354,7 @@ pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Resu
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
     for (_, mut group) in groups {
         if group.len() < 2 {
             continue;
@@ -407,7 +430,7 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
     tracing::warn!(
         "entries_fts integrity/rowid check failed (likely after external VACUUM); rebuilding FTS5 index"
     );
-    let mut tx = pool.begin().await?;
+    let mut tx = begin_write(pool).await?;
     sqlx::query!("DELETE FROM entries_fts").execute(&mut *tx).await?;
     sqlx::query!(
         "INSERT INTO entries_fts (rowid, entry_id, title, creators, summary, content_html)

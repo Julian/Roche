@@ -1,12 +1,59 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::{
-    ActivityAction, ActivityEntityType, HexColor, SyncRepo,
+    ActivityAction, ActivityEntityType, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
     sync::{deterministic_tag_id, tag_natural_key},
 };
+
+macro_rules! tag_select_sql {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT e.id,
+       e.title AS name,
+       cs.color,
+       e.created_at,
+       (SELECT COUNT(*)
+        FROM collection_entries ce
+        LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
+        JOIN entries ie ON ie.id = ce.entry_id
+        WHERE ce.collection_id = e.id
+          AND ie.merged_into_id IS NULL
+          AND (
+              es.inbox_state = 'unread'
+              OR (
+                  COALESCE(es.inbox_state, 'none') = 'none'
+                  AND es.read_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM collection_entries ce_wtr
+                      WHERE ce_wtr.collection_id = ?
+                        AND ce_wtr.entry_id = ie.id
+                  )
+              )
+          )) AS unread_count
+FROM entries e
+JOIN collection_specs cs ON cs.collection_id = e.id ",
+            $suffix
+        )
+    };
+}
+
+const TAG_SELECT_BY_ID_SQL: &str =
+    tag_select_sql!("WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL AND e.id = ?");
+const TAG_SELECT_ALL_SQL: &str = tag_select_sql!(
+    "WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL ORDER BY e.title"
+);
+const TAG_SELECT_FOR_ITEM_SQL: &str = tag_select_sql!(
+    "WHERE cs.collection_role = 'tag'
+       AND e.merged_into_id IS NULL
+       AND EXISTS (
+           SELECT 1 FROM collection_entries ce_item
+           WHERE ce_item.collection_id = e.id AND ce_item.entry_id = ?
+       )
+     ORDER BY e.title"
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Tag {
@@ -17,7 +64,7 @@ pub struct Tag {
     pub unread_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ItemTag {
     pub item_id: String,
     pub tag_id: String,
@@ -37,7 +84,7 @@ impl<'a> TagRepo<'a> {
         let id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Tag, &nat_key).await?;
 
@@ -70,69 +117,23 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Tag>> {
-        Ok(sqlx::query_as::<_, Tag>(
-            "SELECT e.id,
-                    e.title AS name,
-                    cs.color,
-                    e.created_at,
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = e.id
-                       AND ie.merged_into_id IS NULL
-                       AND (
-                           es.inbox_state = 'unread'
-                           OR (
-                               COALESCE(es.inbox_state, 'none') = 'none'
-                               AND es.read_at IS NULL
-                               AND EXISTS (
-                                   SELECT 1 FROM collection_entries ce_wtr
-                                   WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
-                                     AND ce_wtr.entry_id = ie.id
-                               )
-                           )
-                       )) AS unread_count
-             FROM entries e
-             JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL AND e.id = ?",
-        )
-        .bind(id)
-        .fetch_optional(self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, Tag>(TAG_SELECT_BY_ID_SQL)
+            .bind(WANT_TO_READ_COLLECTION_ID)
+            .bind(id)
+            .fetch_optional(self.pool)
+            .await?)
     }
 
     pub async fn list(&self) -> Result<Vec<Tag>> {
-        Ok(sqlx::query_as::<_, Tag>(
-            "SELECT e.id,
-                    e.title AS name,
-                    cs.color,
-                    e.created_at,
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = e.id
-                       AND ie.merged_into_id IS NULL
-                       AND (
-                           es.inbox_state = 'unread'
-                           OR (
-                               COALESCE(es.inbox_state, 'none') = 'none'
-                               AND es.read_at IS NULL
-                               AND EXISTS (
-                                   SELECT 1 FROM collection_entries ce_wtr
-                                   WHERE ce_wtr.collection_id = '2ef71101-a716-5331-9515-cb7b5ce8b3c3'
-                                     AND ce_wtr.entry_id = ie.id
-                               )
-                           )
-                       )) AS unread_count
-             FROM entries e
-             JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL
-             ORDER BY e.title",
-        )
-        .fetch_all(self.pool)
-        .await?)
+        let mut conn = self.pool.acquire().await?;
+        Self::list_in_tx(&mut conn).await
+    }
+
+    pub(crate) async fn list_in_tx(conn: &mut SqliteConnection) -> Result<Vec<Tag>> {
+        Ok(sqlx::query_as::<_, Tag>(TAG_SELECT_ALL_SQL)
+            .bind(WANT_TO_READ_COLLECTION_ID)
+            .fetch_all(conn)
+            .await?)
     }
 
     pub async fn update(
@@ -146,7 +147,7 @@ impl<'a> TagRepo<'a> {
         }
 
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
@@ -237,7 +238,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
             id,
@@ -378,26 +379,11 @@ impl<'a> TagRepo<'a> {
         let tag_id = Self::get_or_create_in_tx(&mut *conn, name, None, now, now).await?;
         Self::attach_in_tx(&mut *conn, item_id, &tag_id, now).await?;
 
-        let tag = sqlx::query_as!(
-            Tag,
-            "SELECT e.id,
-                    e.title AS name,
-                    cs.color AS \"color: HexColor\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = e.id
-                       AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-             FROM entries e
-             JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE cs.collection_role = 'tag' AND e.merged_into_id IS NULL AND e.id = ?",
-            tag_id,
-        )
-        .fetch_one(&mut *conn)
-        .await?;
+        let tag = sqlx::query_as::<_, Tag>(TAG_SELECT_BY_ID_SQL)
+            .bind(WANT_TO_READ_COLLECTION_ID)
+            .bind(&tag_id)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(tag)
     }
 
@@ -447,7 +433,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn add_to_item(&self, item_id: &str, tag_id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         Self::attach_in_tx(&mut tx, item_id, tag_id, now).await?;
         tx.commit().await?;
         Ok(())
@@ -455,7 +441,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn add_named_to_item(&self, item_id: &str, name: &str) -> Result<Tag> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let tag = Self::get_or_create_and_attach_in_tx(&mut tx, item_id, name, now).await?;
         tx.commit().await?;
         Ok(tag)
@@ -463,7 +449,7 @@ impl<'a> TagRepo<'a> {
 
     pub async fn remove_from_item(&self, item_id: &str, tag_id: &str) -> Result<bool> {
         let now = SyncRepo::now_utc();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query!(
             "DELETE FROM collection_entries
              WHERE collection_id = ?
@@ -508,32 +494,11 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn list_for_item(&self, item_id: &str) -> Result<Vec<Tag>> {
-        Ok(sqlx::query_as!(
-            Tag,
-            "SELECT e.id,
-                    e.title AS name,
-                    cs.color AS \"color: HexColor\",
-                    e.created_at AS \"created_at: DateTime<Utc>\",
-                    (SELECT COUNT(*)
-                     FROM collection_entries ce
-                     JOIN entry_state es ON es.entry_id = ce.entry_id
-                     JOIN entries ie ON ie.id = ce.entry_id
-                     WHERE ce.collection_id = e.id
-                       AND ie.merged_into_id IS NULL
-                       AND es.inbox_state = 'unread') AS \"unread_count!: i64\"
-             FROM entries e
-             JOIN collection_specs cs ON cs.collection_id = e.id
-             WHERE cs.collection_role = 'tag'
-               AND e.merged_into_id IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM collection_entries ce_item
-                   WHERE ce_item.collection_id = e.id AND ce_item.entry_id = ?
-               )
-             ORDER BY e.title",
-            item_id,
-        )
-        .fetch_all(self.pool)
-        .await?)
+        Ok(sqlx::query_as::<_, Tag>(TAG_SELECT_FOR_ITEM_SQL)
+            .bind(WANT_TO_READ_COLLECTION_ID)
+            .bind(item_id)
+            .fetch_all(self.pool)
+            .await?)
     }
 
     pub async fn list_all_item_tags(&self) -> Result<Vec<ItemTag>> {
@@ -547,5 +512,32 @@ impl<'a> TagRepo<'a> {
         )
         .fetch_all(self.pool)
         .await?)
+    }
+
+    pub(crate) async fn list_item_tags_for_items_in_tx(
+        conn: &mut SqliteConnection,
+        item_ids: &[String],
+    ) -> Result<Vec<ItemTag>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for chunk in item_ids.chunks(450) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT ce.entry_id AS item_id, ce.collection_id AS tag_id
+                 FROM collection_entries ce
+                 JOIN collection_specs cs ON cs.collection_id = ce.collection_id
+                 WHERE cs.collection_role = 'tag' AND ce.entry_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            sep.push_unseparated(") ORDER BY ce.entry_id, ce.collection_id");
+            let rows: Vec<ItemTag> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            out.extend(rows);
+        }
+        out.sort_by(|a, b| a.item_id.cmp(&b.item_id).then_with(|| a.tag_id.cmp(&b.tag_id)));
+        Ok(out)
     }
 }

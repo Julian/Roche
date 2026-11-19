@@ -29,7 +29,7 @@ impl<'a> AuthRepo<'a> {
         let now = SyncRepo::now_utc();
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
         sqlx::query!("DELETE FROM pairing_codes").execute(&mut *tx).await?;
 
         sqlx::query!(
@@ -61,7 +61,7 @@ impl<'a> AuthRepo<'a> {
         let now = SyncRepo::now_utc();
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::db::begin_write(self.pool).await?;
 
         sqlx::query!(
             "DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)",

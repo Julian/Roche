@@ -2065,3 +2065,372 @@ fn test_sync_entry_state_defaults_missing_inbox_state_to_none() {
     assert!((parsed.progress - 0.0).abs() < f64::EPSILON);
     assert_eq!(parsed.hlc, "001780000001000-0000-peer-android");
 }
+
+#[tokio::test]
+async fn test_manual_item_tombstone_deletes_want_to_read_item() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let url = Url::parse("https://example.com/saved-article").unwrap();
+    let (saved, _) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &url,
+            title: "Saved WTR Article",
+            summary: None,
+            content_html: Some("<p>body</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.inbox_state, InboxState::None);
+    assert!(db.items().get(&saved.id).await.unwrap().is_some());
+
+    let future_ts = Utc::now() + chrono::Duration::seconds(30);
+    let tomb_hlc = HlcTimestamp::from_datetime(future_ts, "peer-android").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-android".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::Item,
+                natural_key: item_natural_key(None, url.as_str()),
+                deleted_at: future_ts,
+                hlc: tomb_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(db.items().get(&saved.id).await.unwrap().is_none());
+}
+
+#[test]
+fn test_hlc_drift_cap_and_saturation_without_wrap() {
+    use super::hlc::{MAX_CLOCK_DRIFT_MS, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc};
+
+    let now_ms: i64 = 1_794_920_000_000;
+    let far_future = HlcTimestamp::new(now_ms + 365 * 86_400_000, 42, "skewed-peer");
+    let mut clock = HlcClock::new("server", None);
+    let witnessed = clock.witness(&far_future, now_ms);
+    assert!(witnessed.wall_ms <= now_ms + MAX_CLOCK_DRIFT_MS);
+
+    let now_dt = DateTime::from_timestamp_millis(now_ms).unwrap();
+    let resolved = resolve_or_synthesize_hlc(&far_future.encode(), None, now_dt, "skewed-peer");
+    let parsed = HlcTimestamp::parse(&resolved).unwrap();
+    assert_eq!(parsed.wall_ms, now_ms + MAX_CLOCK_DRIFT_MS);
+    assert_eq!(parsed.counter, 0);
+
+    // Saturation at MAX_HLC_WALL_MS with counter == u16::MAX must not wrap to 0
+    let max_ts = HlcTimestamp::new(MAX_HLC_WALL_MS, u16::MAX, "server");
+    let mut sat_clock = HlcClock::new("server", Some(&max_ts.encode()));
+    let next = sat_clock.tick(MAX_HLC_WALL_MS);
+    assert_eq!(next.wall_ms, MAX_HLC_WALL_MS);
+    assert_eq!(next.counter, u16::MAX);
+
+    let remote_max = HlcTimestamp::new(MAX_HLC_WALL_MS, u16::MAX, "peer-a");
+    let next_w = sat_clock.witness(&remote_max, MAX_HLC_WALL_MS);
+    assert_eq!(next_w.wall_ms, MAX_HLC_WALL_MS);
+    assert_eq!(next_w.counter, u16::MAX);
+}
+
+#[tokio::test]
+async fn test_collection_generator_tombstone_prevents_resurrection_and_syncs_deletion() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let col = db
+        .catalog()
+        .create_manual_collection(
+            "Weekend Picks",
+            Some("weekend-picks"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    db.catalog().set_collection_generator_enabled(&col.id, true).await.unwrap();
+    assert_eq!(db.catalog().list_collection_generators(false).await.unwrap().len(), 1);
+
+    let (before_del, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "probe".to_owned(),
+            since_seq: 0,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(db.catalog().remove_collection_generator(&col.id).await.unwrap());
+    assert_eq!(db.catalog().list_collection_generators(false).await.unwrap().len(), 0);
+
+    let (after_del, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "probe".to_owned(),
+            since_seq: before_del.sync_seq,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(after_del.tombstones.iter().any(|t| {
+        t.entity_type == ActivityEntityType::CollectionGenerator && t.natural_key == col.id
+    }));
+
+    // Stale incoming generator with older HLC must NOT resurrect deleted generator
+    let stale_ts = Utc::now() - chrono::Duration::minutes(5);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "stale-peer").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "stale-peer".to_owned(),
+            collection_generators: vec![crate::db::SyncCollectionGeneratorRecord {
+                collection_id: col.id.clone(),
+                enabled: true,
+                current_entry_id: None,
+                drawn_at: None,
+                updated_at: stale_ts,
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.catalog().list_collection_generators(false).await.unwrap().len(), 0);
+
+    // Newer incoming generator clears tombstone and restores generator
+    let newer_ts = Utc::now() + chrono::Duration::seconds(30);
+    let newer_hlc = HlcTimestamp::from_datetime(newer_ts, "peer-a").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            collection_generators: vec![crate::db::SyncCollectionGeneratorRecord {
+                collection_id: col.id.clone(),
+                enabled: true,
+                current_entry_id: None,
+                drawn_at: None,
+                updated_at: newer_ts,
+                hlc: newer_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.catalog().list_collection_generators(false).await.unwrap().len(), 1);
+
+    // Incoming CollectionGenerator tombstone with even newer HLC deletes local generator
+    let del_ts = Utc::now() + chrono::Duration::seconds(60);
+    let del_hlc = HlcTimestamp::from_datetime(del_ts, "peer-b").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::CollectionGenerator,
+                natural_key: col.id.clone(),
+                deleted_at: del_ts,
+                hlc: del_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.catalog().list_collection_generators(false).await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_tag_unread_count_unified_and_entry_merge_bumps_log_sync_seq() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let url = Url::parse("https://example.com/tagged-wtr").unwrap();
+    let (item, tags) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &url,
+            title: "Tagged WTR",
+            summary: None,
+            content_html: Some("<p>hi</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &["essays".to_owned()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(tags.len(), 1);
+    let tag_id = &tags[0].id;
+    assert_eq!(tags[0].unread_count, 1);
+    assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 1);
+    assert_eq!(db.tags().list().await.unwrap()[0].unread_count, 1);
+    assert_eq!(db.tags().list_for_item(&item.id).await.unwrap()[0].unread_count, 1);
+
+    // Entry merge must bump consumption_log.sync_seq via consumption_log_sync_seq_au
+    let canon = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Canonical Film".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let dup = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Duplicate Film".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let log = db
+        .catalog()
+        .log_consumption(&dup.id, ConsumptionStatus::Consumed, Some("Great"), None)
+        .await
+        .unwrap();
+
+    let (before_merge, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "probe".to_owned(),
+            since_seq: 0,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    db.catalog().merge_entries(&dup.id, &canon.id).await.unwrap();
+
+    let (after_merge, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "probe".to_owned(),
+            since_seq: before_merge.sync_seq,
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let expected_entry_id = canon.id.as_str();
+    assert!(
+        after_merge
+            .consumption_log
+            .iter()
+            .any(|l| l.id == log.id && l.entry_id == expected_entry_id),
+        "re-pointed consumption_log row must appear in incremental sync after entry merge"
+    );
+}
+
+#[tokio::test]
+async fn test_starred_batch_generator_rejected_and_collection_tombstone_enforced() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+
+    // #10: Reject attaching a generator to Starred in apply_batch
+    let err = db
+        .catalog()
+        .apply_batch(&crate::db::CatalogBatchInput {
+            generators: vec![crate::db::BatchGeneratorInput {
+                collection_ref: "starred".to_owned(),
+                enabled: Some(true),
+                current_entry_ref: None,
+                drawn_at: None,
+            }],
+            ..crate::db::CatalogBatchInput::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::db::CatalogError::InvalidInput(_)));
+
+    // #11: Entry tombstone blocks stale manual collection resurrection
+    let tomb_id = deterministic_system_collection_id("custom:deleted-list");
+    let tomb_ts = Utc::now() + chrono::Duration::seconds(60);
+    let tomb_hlc = HlcTimestamp::from_datetime(tomb_ts, "peer-a").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::Entry,
+                natural_key: tomb_id.clone(),
+                deleted_at: tomb_ts,
+                hlc: tomb_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let stale_ts = Utc::now() - chrono::Duration::minutes(5);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "peer-b").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-b".to_owned(),
+            entries: vec![crate::db::SyncEntryRecord {
+                id: tomb_id.clone(),
+                kind: EntryKind::Collection,
+                title: "Deleted List".to_owned(),
+                creators: vec![],
+                url: None,
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                merged_into_id: None,
+                identifiers: vec![],
+                content: None,
+                state: None,
+                collection_spec: Some(crate::db::SyncCollectionSpec {
+                    slug: Some("deleted-list".to_owned()),
+                    mode: CollectionMode::Manual,
+                    role: CollectionRole::List,
+                    rule_json: None,
+                    show_in_lists: true,
+                    color: None,
+                }),
+                feed_source: None,
+                created_at: Some(stale_ts),
+                updated_at: Some(stale_ts),
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.catalog().get_collection_summary(&tomb_id).await.is_err());
+
+    // #5: ItemRepo::delete_returning_outcome preserves readable content when in a manual list
+    let list_col = db
+        .catalog()
+        .create_manual_collection(
+            "Reading List",
+            Some("reading-list"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let url = Url::parse("https://example.com/list-preserved").unwrap();
+    let (saved, _) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &url,
+            title: "Preserved In List",
+            summary: None,
+            content_html: Some("<p>keep me</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&list_col.id, &saved.id, None).await.unwrap();
+    let outcome = db.items().delete_returning_outcome(&saved.id).await.unwrap();
+    assert!(outcome.deleted);
+    assert!(!outcome.readable_content_removed);
+
+    // #12: count_rankable_members matches actual member count
+    assert_eq!(db.catalog().count_rankable_members(&list_col.id, false).await.unwrap(), 1);
+}

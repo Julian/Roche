@@ -4,8 +4,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_HLC_WALL_MS: i64 = 999_999_999_999_999;
+pub const MAX_CLOCK_DRIFT_MS: i64 = 3_600_000;
 const WALL_WIDTH: usize = 15;
 const COUNTER_WIDTH: usize = 4;
+
+const fn advance_on_counter_overflow(wall_ms: i64) -> (i64, u16) {
+    if wall_ms < MAX_HLC_WALL_MS { (wall_ms + 1, 0) } else { (MAX_HLC_WALL_MS, u16::MAX) }
+}
 
 /// Hybrid Logical Clock timestamp formatted as `<15-digit-utc-ms>-<4-hex-counter>-<node_id>`.
 ///
@@ -114,11 +119,8 @@ impl HlcClock {
                 if let Some(c) = prev.counter.checked_add(1) {
                     HlcTimestamp::new(prev.wall_ms, c, self.node_id.clone())
                 } else {
-                    HlcTimestamp::new(
-                        (prev.wall_ms + 1).min(MAX_HLC_WALL_MS),
-                        0,
-                        self.node_id.clone(),
-                    )
+                    let (w, c) = advance_on_counter_overflow(prev.wall_ms);
+                    HlcTimestamp::new(w, c, self.node_id.clone())
                 }
             }
         };
@@ -127,35 +129,42 @@ impl HlcClock {
     }
 
     /// Witnesses a remote HLC timestamp and advances the local clock causally beyond both
-    /// `self.last` and `remote` at wall-clock `now_ms`.
+    /// `self.last` and `remote` at wall-clock `now_ms`, enforcing `MAX_CLOCK_DRIFT_MS`.
     pub fn witness(&mut self, remote: &HlcTimestamp, now_ms: i64) -> HlcTimestamp {
         let phys = now_ms.clamp(0, MAX_HLC_WALL_MS);
-        let rem_ms = remote.wall_ms.clamp(0, MAX_HLC_WALL_MS);
+        let max_allowed_wall = phys.saturating_add(MAX_CLOCK_DRIFT_MS).min(MAX_HLC_WALL_MS);
+        let (rem_ms, rem_counter) = if remote.wall_ms > max_allowed_wall {
+            (max_allowed_wall, 0)
+        } else {
+            (remote.wall_ms.clamp(0, MAX_HLC_WALL_MS), remote.counter)
+        };
         let next = match &self.last {
             None => {
                 if phys > rem_ms {
                     HlcTimestamp::new(phys, 0, self.node_id.clone())
-                } else if let Some(c) = remote.counter.checked_add(1) {
+                } else if let Some(c) = rem_counter.checked_add(1) {
                     HlcTimestamp::new(rem_ms, c, self.node_id.clone())
                 } else {
-                    HlcTimestamp::new((rem_ms + 1).min(MAX_HLC_WALL_MS), 0, self.node_id.clone())
+                    let (w, c) = advance_on_counter_overflow(rem_ms);
+                    HlcTimestamp::new(w, c, self.node_id.clone())
                 }
             }
             Some(prev) => {
                 let max_wall = phys.max(prev.wall_ms).max(rem_ms);
                 let next_counter = if max_wall == prev.wall_ms && max_wall == rem_ms {
-                    prev.counter.max(remote.counter).checked_add(1)
+                    prev.counter.max(rem_counter).checked_add(1)
                 } else if max_wall == prev.wall_ms {
                     prev.counter.checked_add(1)
                 } else if max_wall == rem_ms {
-                    remote.counter.checked_add(1)
+                    rem_counter.checked_add(1)
                 } else {
                     Some(0)
                 };
                 if let Some(c) = next_counter {
                     HlcTimestamp::new(max_wall, c, self.node_id.clone())
                 } else {
-                    HlcTimestamp::new((max_wall + 1).min(MAX_HLC_WALL_MS), 0, self.node_id.clone())
+                    let (w, c) = advance_on_counter_overflow(max_wall);
+                    HlcTimestamp::new(w, c, self.node_id.clone())
                 }
             }
         };
@@ -173,7 +182,8 @@ impl HlcClock {
 }
 
 /// Normalizes an incoming HLC string or synthesizes a deterministic fallback from `fallback_ts`
-/// and `peer_id` when a client omits `hlc`.
+/// and `peer_id` when a client omits `hlc`, clamping future wall-clock drift to
+/// `now + MAX_CLOCK_DRIFT_MS`.
 #[must_use]
 pub fn resolve_or_synthesize_hlc(
     raw_hlc: &str,
@@ -181,8 +191,16 @@ pub fn resolve_or_synthesize_hlc(
     now: DateTime<Utc>,
     peer_id: &str,
 ) -> String {
-    HlcTimestamp::parse(raw_hlc).map_or_else(
-        || HlcTimestamp::from_datetime(fallback_ts.unwrap_or(now), peer_id).encode(),
-        |parsed| parsed.encode(),
-    )
+    let max_allowed_wall = now
+        .timestamp_millis()
+        .clamp(0, MAX_HLC_WALL_MS)
+        .saturating_add(MAX_CLOCK_DRIFT_MS)
+        .min(MAX_HLC_WALL_MS);
+    let ts = HlcTimestamp::parse(raw_hlc)
+        .unwrap_or_else(|| HlcTimestamp::from_datetime(fallback_ts.unwrap_or(now), peer_id));
+    if ts.wall_ms > max_allowed_wall {
+        HlcTimestamp::new(max_allowed_wall, 0, ts.node_id).encode()
+    } else {
+        ts.encode()
+    }
 }
