@@ -339,6 +339,7 @@ internal suspend fun attachTagsLocally(
     itemId: String,
     tagNames: List<String>,
     markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     for (tagName in tagNames) {
         val normalized = normalizeTagName(tagName)
@@ -346,11 +347,12 @@ internal suspend fun attachTagsLocally(
             val tag =
                 dao.getTagByName(normalized)
                     ?: TagRow(id = deterministicTagId(normalized), name = normalized).also {
-                        dao.upsertTag(it, markDirty = markDirty)
+                        dao.upsertTag(it, markDirty = markDirty, nodeId = nodeId)
                     }
             dao.insertItemTag(
                 ItemTagRow(itemId = itemId, tagId = tag.id),
                 markDirty = markDirty,
+                nodeId = nodeId,
             )
         }
     }

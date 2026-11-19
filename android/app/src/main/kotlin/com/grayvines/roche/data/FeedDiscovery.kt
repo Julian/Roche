@@ -173,31 +173,35 @@ private fun buildOriginFallbackFeedUrls(baseUrl: String): List<String> {
     return COMMON_FEED_PATHS.map { path -> "$origin$path" }
 }
 
+@Suppress("LongParameterList")
 internal suspend fun enrichWantToReadItemOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
     itemId: String,
     url: String,
     hasUserTitleOverride: Boolean,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     if (!isHttpOrHttpsCandidate(url)) return
     val arxivId = extractArxivIdentifier(url)
     if (arxivId != null) {
-        enrichArxivItemOnDevice(dao, apiClient, itemId, arxivId, hasUserTitleOverride)
+        enrichArxivItemOnDevice(dao, apiClient, itemId, arxivId, hasUserTitleOverride, nodeId)
         return
     }
     if (inferContentType(url) != ContentType.ARTICLE) return
     val html = apiClient.fetchExternalFeedXml(url).getOrNull() ?: return
     val snapshot = withContext(Dispatchers.Default) { extractWebPageSnapshot(html, url) }
-    applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride)
+    applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride, nodeId)
 }
 
+@Suppress("LongParameterList")
 private suspend fun enrichArxivItemOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
     itemId: String,
     arxivId: String,
     hasUserTitleOverride: Boolean,
+    nodeId: String,
 ) {
     val queryUrl = "https://export.arxiv.org/api/query?id_list=$arxivId"
     val xml = apiClient.fetchExternalFeedXml(queryUrl).getOrNull() ?: return
@@ -219,6 +223,7 @@ private suspend fun enrichArxivItemOnDevice(
         author = candidate.author,
         summary = candidate.summary,
         publishedAt = candidate.publishedAt,
+        nodeId = nodeId,
     )
 }
 
@@ -267,6 +272,7 @@ private suspend fun applyWebPageSnapshotToItem(
     itemId: String,
     snapshot: ExtractedWebPageSnapshot,
     hasUserTitleOverride: Boolean,
+    nodeId: String,
 ) {
     dao.enrichEntryMetadataIfPresent(
         itemId = itemId,
@@ -276,6 +282,7 @@ private suspend fun applyWebPageSnapshotToItem(
         summary = snapshot.summary,
         thumbnailUrl = snapshot.thumbnailUrl,
         contentHtml = snapshot.contentHtml,
+        nodeId = nodeId,
     )
 }
 

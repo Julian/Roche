@@ -142,39 +142,42 @@ class ShareReceiveActivity : Activity() {
         val uri = runCatching { rawUri.toUri() }.getOrNull() ?: return null
         if (!isAllowedSharedUri(uri)) return null
         return runCatching {
-                val rawStream = contentResolver.openInputStream(uri) ?: return null
-                openValidatedPdfStream(rawStream)
-            }
+            val rawStream = contentResolver.openInputStream(uri) ?: return null
+            openValidatedPdfStream(rawStream)
+        }
             .getOrNull()
     }
 
     private fun queryStreamDisplayName(uri: Uri): String? {
         if (!isAllowedSharedUri(uri)) return null
         return runCatching {
-                contentResolver
-                    .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { cursor ->
-                        val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (colIdx >= 0 && cursor.moveToFirst()) {
-                            cursor.getString(colIdx)
-                        } else {
-                            null
-                        }
+            contentResolver
+                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (colIdx >= 0 && cursor.moveToFirst()) {
+                        cursor.getString(colIdx)
+                    } else {
+                        null
                     }
-            }
+                }
+        }
             .getOrNull()
     }
 
     private fun isAllowedSharedUri(uri: Uri): Boolean =
-        isAllowedSharedContentUri(
-            scheme = uri.scheme,
-            authority = uri.authority,
-            ownPackageName = packageName,
-            resolveProviderPackage = { auth ->
-                runCatching { packageManager.resolveContentProvider(auth, 0)?.packageName }
-                    .getOrNull()
-            },
-        )
+        uri.userInfo == null &&
+            uri.port == -1 &&
+            uri.encodedAuthority?.let { '@' !in it && ':' !in it && '%' !in it } == true &&
+            isAllowedSharedContentUri(
+                scheme = uri.scheme,
+                authority = uri.authority,
+                ownPackageName = packageName,
+                resolveProviderPackage = { auth ->
+                    runCatching { packageManager.resolveContentProvider(auth, 0)?.packageName }
+                        .getOrNull()
+                },
+            )
 
     private fun finishQuietly() {
         if (!isFinishing) {
@@ -200,13 +203,17 @@ internal fun isAllowedSharedContentUri(
 ): Boolean {
     if (!scheme.equals(ContentResolver.SCHEME_CONTENT, ignoreCase = true)) return false
     val cleanAuthority = authority?.trim()?.takeIf { it.isNotEmpty() } ?: return false
-    if (
-        cleanAuthority.equals(ownPackageName, ignoreCase = true) ||
+    val hasUnsafeAuthorityChars =
+        '@' in cleanAuthority ||
+            ':' in cleanAuthority ||
+            '%' in cleanAuthority ||
+            cleanAuthority.any { it.isWhitespace() || it.isISOControl() }
+    val isOwnAuthority =
+        hasUnsafeAuthorityChars ||
+            cleanAuthority.equals(ownPackageName, ignoreCase = true) ||
             cleanAuthority.startsWith("$ownPackageName.", ignoreCase = true)
-    ) {
-        return false
-    }
-    return resolveProviderPackage(cleanAuthority) != ownPackageName
+    return !isOwnAuthority &&
+        !ownPackageName.equals(resolveProviderPackage(cleanAuthority), ignoreCase = true)
 }
 
 internal fun openValidatedPdfStream(stream: InputStream): InputStream? {

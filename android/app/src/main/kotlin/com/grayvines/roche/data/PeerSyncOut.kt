@@ -18,7 +18,7 @@ import com.grayvines.roche.data.remote.rocheJson
 import kotlinx.serialization.json.JsonObject
 
 internal const val MAX_PEER_SYNC_PAYLOAD_BYTES = 4 * 1024 * 1024
-private const val MAX_PEER_SYNC_ENTRIES = 2_000
+internal const val MAX_PEER_SYNC_ENTRIES = 2_000
 private const val MAX_SYNC_COLLECTION_ENTRIES = 8_000
 private const val MAX_SYNC_CONSUMPTION_LOG = 8_000
 private const val MAX_SYNC_COMPARISONS = 8_000
@@ -30,6 +30,7 @@ private const val HH_MM_SS_PART_COUNT = 3
 private const val SECONDS_PER_MINUTE = 60L
 private const val SECONDS_PER_HOUR = 3_600L
 
+@Suppress("LongParameterList")
 internal data class PeerSyncRequestConfig(
     val peerId: String,
     val deviceName: String,
@@ -38,7 +39,9 @@ internal data class PeerSyncRequestConfig(
     val weightOverride: Double? = null,
     val forcedEntryIds: Set<String> = emptySet(),
     val excludeEntryIds: Set<String> = emptySet(),
+    val quarantinedEntryIds: Set<String> = emptySet(),
     val maxPayloadBytes: Int = MAX_PEER_SYNC_PAYLOAD_BYTES,
+    val maxEntries: Int = MAX_PEER_SYNC_ENTRIES,
 )
 
 @Suppress("LongParameterList")
@@ -94,8 +97,9 @@ internal suspend fun buildTrackedPeerSyncRequest(
             contentsById,
             slices.unsyncedFeedIds,
             config.maxPayloadBytes,
+            config.maxEntries,
         )
-    val allOverflowIds = part.countOverflowIds + part.byteOverflowIds
+    val allOverflowIds = part.countOverflowIds + part.byteOverflowIds + config.quarantinedEntryIds
     val nonOverflowMemberships =
         slices.sentMemberships.filter {
             it.collectionId !in allOverflowIds && it.entryId !in allOverflowIds
@@ -243,18 +247,26 @@ private suspend fun loadEntryContentsByIds(
     return result
 }
 
+@Suppress("LongParameterList")
 private fun partitionOutgoingEntries(
     eligibleEntries: List<EntryEntity>,
     snap: OutgoingGraphSnapshot,
     contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
     maxPayloadBytes: Int,
+    maxEntries: Int,
 ): PartitionedOutgoingEntries {
     val cappedEntries = eligibleEntries.take(MAX_PEER_SYNC_ENTRIES)
     val countOverflowIds =
         eligibleEntries.drop(MAX_PEER_SYNC_ENTRIES).mapTo(LinkedHashSet()) { it.id }
     val (budgetEntries, byteOverflowIds) =
-        splitEntriesByByteBudget(cappedEntries, contentsById, unsyncedFeedIds, maxPayloadBytes)
+        splitEntriesByByteBudget(
+            cappedEntries = cappedEntries,
+            contentsById = contentsById,
+            unsyncedFeedIds = unsyncedFeedIds,
+            maxBytes = maxPayloadBytes,
+            maxEntries = maxEntries,
+        )
     val wireEntries = budgetEntries.map {
         toSyncEntryRecordDto(it, snap, contentsById, unsyncedFeedIds)
     }
@@ -453,7 +465,13 @@ private fun isEntryEligibleForPush(
     catalogRefIds: Set<String>,
     outgoingChildRefs: Set<String>,
 ): Boolean {
-    if (entry.id in config.excludeEntryIds || entry.id in unsyncedInboxOnlyIds) return false
+    if (
+        entry.id in config.excludeEntryIds ||
+            entry.id in config.quarantinedEntryIds ||
+            entry.id in unsyncedInboxOnlyIds
+    ) {
+        return false
+    }
     val spec = snap.specsById[entry.id]
     val isSeededSystemOrDynamic =
         spec != null &&
@@ -481,13 +499,16 @@ private fun splitEntriesByByteBudget(
     contentsById: Map<String, EntryContentEntity>,
     unsyncedFeedIds: Set<String>,
     maxBytes: Int,
+    maxEntries: Int = MAX_PEER_SYNC_ENTRIES,
 ): Pair<List<EntryEntity>, Set<String>> {
     val sent = ArrayList<EntryEntity>(cappedEntries.size)
     val overflow = LinkedHashSet<String>()
     var usedBytes = 0
+    val safeMaxEntries = maxEntries.coerceAtLeast(1)
     for (entry in cappedEntries) {
         val estBytes = estimateSyncEntryBytes(entry, contentsById, unsyncedFeedIds)
-        val fits = sent.isEmpty() || usedBytes + estBytes <= maxBytes
+        val fits =
+            sent.isEmpty() || (sent.size < safeMaxEntries && usedBytes + estBytes <= maxBytes)
         if (fits) {
             sent.add(entry)
             usedBytes += estBytes
@@ -508,6 +529,7 @@ internal fun estimateSyncEntryBytes(
             (entry.url?.length ?: 0) +
             entry.creatorsJson.length +
             (entry.summary?.length ?: 0) +
+            entry.metadataJson.length +
             (contentHtml?.length ?: 0) +
             (entry.thumbnailUrl?.length ?: 0) +
             (audioUrl?.length ?: 0)

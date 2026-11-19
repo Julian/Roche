@@ -762,6 +762,9 @@ interface RocheDao {
     @Query("SELECT * FROM consumption_log WHERE isLocalDirty = 1")
     suspend fun getDirtyConsumptionLogs(): List<ConsumptionLogEntity>
 
+    @Query("SELECT * FROM consumption_log WHERE id = :id LIMIT 1")
+    suspend fun getConsumptionLogById(id: String): ConsumptionLogEntity?
+
     @Query("SELECT * FROM consumption_log WHERE entryId = :entryId ORDER BY ts DESC")
     suspend fun getConsumptionLogsForEntry(entryId: String): List<ConsumptionLogEntity>
 

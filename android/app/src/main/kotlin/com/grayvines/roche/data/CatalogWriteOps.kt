@@ -238,7 +238,8 @@ private suspend fun synthesizeArtistsInDao(
         val clean = rawArtist.trim()
         if (clean.isEmpty()) continue
         val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
-        val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
+        val artistId =
+            existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
         val hlc =
             if (markDirty) {
                 nextLocalHlc(dao, nodeId)
@@ -329,6 +330,7 @@ internal suspend fun appendConsumptionInDao(
             ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
     val hlc =
         if (markDirty) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId)
             nextLocalHlc(dao, nodeId)
         } else {
             HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()
@@ -410,6 +412,7 @@ private suspend fun engageSingleArtistInDao(
     val logId = deterministicAutoLogId(artistId)
     val hlc =
         if (markDirty) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId)
             nextLocalHlc(dao, nodeId)
         } else {
             HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()

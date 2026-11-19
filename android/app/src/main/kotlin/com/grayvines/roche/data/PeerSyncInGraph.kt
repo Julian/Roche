@@ -23,16 +23,20 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
     catalogStore: CatalogStore?,
     response: PeerSyncResponseDto,
     redirects: Map<String, String>,
+    suppressedEntryIds: Set<String> = emptySet(),
     serverNode: String,
     localPeerId: String = DEFAULT_LOCAL_HLC_NODE,
     nowIso: String,
+    nowMs: Long = System.currentTimeMillis(),
 ) {
     mergeCollectionEntriesInDao(
         dao = dao,
         incoming = response.collectionEntries,
         redirects = redirects,
+        suppressedEntryIds = suppressedEntryIds,
         serverNode = serverNode,
         nowIso = nowIso,
+        nowMs = nowMs,
     )
     enforceLinkedItemTombstones(dao)
     mergeConsumptionLogsInDao(
@@ -41,6 +45,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         redirects = redirects,
         serverNode = serverNode,
         nowIso = nowIso,
+        nowMs = nowMs,
     )
     mergeIncomingComparisonsInDao(
         dao = dao,
@@ -48,6 +53,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         redirects = redirects,
         serverNode = serverNode,
         nowIso = nowIso,
+        nowMs = nowMs,
     )
     mergeIncomingGeneratorsInDao(
         dao = dao,
@@ -57,6 +63,7 @@ internal suspend fun mergeIncomingGraphEdgesInTx(
         serverNode = serverNode,
         localPeerId = localPeerId,
         nowIso = nowIso,
+        nowMs = nowMs,
         allowLocalAutoAdvance = !response.hasMore,
     )
 }
@@ -104,6 +111,7 @@ private suspend fun reconcileLinkedInboxTombstone(
                 state.inboxState == "dismissed" ||
                 (state.inboxState == "none" &&
                     (WANT_TO_READ_COLLECTION_ID in entryColIds ||
+                        dao.getEntryContentById(entry.id) != null ||
                         !dao.entryHasCatalogHistory(entry.id))))
     val isFeedActive =
         feedUrls.isNotEmpty() && (state.inboxState == "unread" || state.inboxState == "dismissed")
@@ -118,16 +126,23 @@ private suspend fun reconcileLinkedInboxTombstone(
     if (state.hlc > activeTomb.hlc) {
         dao.deleteTombstone("item", activeTomb.naturalKey)
     } else {
-        dao.deleteItemPreservingHistory(entry.id, recordTombstones = false)
+        dao.deleteItemPreservingHistory(
+            itemId = entry.id,
+            recordTombstones = false,
+            hlcOverride = activeTomb.hlc,
+        )
     }
 }
 
+@Suppress("LongParameterList")
 private suspend fun mergeCollectionEntriesInDao(
     dao: RocheDao,
     incoming: List<SyncCollectionEntryDto>,
     redirects: Map<String, String>,
+    suppressedEntryIds: Set<String>,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
     val existingMemberships =
@@ -141,7 +156,15 @@ private suspend fun mergeCollectionEntriesInDao(
         dao.getAllTombstones()
             .filter { it.entityType.equals(COLLECTION_ENTRY_ENTITY, ignoreCase = true) }
             .associateBy { it.naturalKey }
-    val ctx = IncomingMembershipCtx(redirects, existingMemberships, tombstones, childrenByParent)
+    val ctx =
+        IncomingMembershipCtx(
+            redirects = redirects,
+            suppressedEntryIds = suppressedEntryIds,
+            existingMemberships = existingMemberships,
+            tombstones = tombstones,
+            childrenByParent = childrenByParent,
+            nowMs = nowMs,
+        )
     val upserts = ArrayList<CollectionEntryEntity>()
     val linkedFeedIds = HashSet<String>()
 
@@ -163,11 +186,14 @@ private suspend fun mergeCollectionEntriesInDao(
     }
 }
 
+@Suppress("LongParameterList")
 private data class IncomingMembershipCtx(
     val redirects: Map<String, String>,
+    val suppressedEntryIds: Set<String>,
     val existingMemberships: Map<Pair<String, String>, CollectionEntryEntity>,
     val tombstones: Map<String, TombstoneEntity>,
     val childrenByParent: Map<String, Set<String>>,
+    val nowMs: Long,
 )
 
 private fun resolveIncomingMembershipDto(
@@ -176,10 +202,22 @@ private fun resolveIncomingMembershipDto(
     serverNode: String,
     nowIso: String,
 ): Pair<CollectionEntryEntity, String?>? {
-    val colId = followMergedInMap(ce.collectionId, ctx.redirects)
-    val entryId = followMergedInMap(ce.entryId, ctx.redirects)
-    if (colId.isEmpty() || entryId.isEmpty() || colId == entryId) return null
-    val memHlc = resolveOrSynthesizeHlc(ce.hlc, ce.addedAt, nowIso, serverNode)
+    val rawColId = ce.collectionId.trim()
+    val rawEntryId = ce.entryId.trim()
+    val colId = followMergedInMap(rawColId, ctx.redirects)
+    val entryId = followMergedInMap(rawEntryId, ctx.redirects)
+    if (
+        colId.isEmpty() ||
+            entryId.isEmpty() ||
+            colId == entryId ||
+            rawColId in ctx.suppressedEntryIds ||
+            rawEntryId in ctx.suppressedEntryIds ||
+            colId in ctx.suppressedEntryIds ||
+            entryId in ctx.suppressedEntryIds
+    ) {
+        return null
+    }
+    val memHlc = resolveOrSynthesizeHlc(ce.hlc, ce.addedAt, nowIso, serverNode, ctx.nowMs)
     val natKey = collectionEntryNaturalKey(colId, entryId)
     val tomb = ctx.tombstones[natKey]
     if (tomb != null && tomb.hlc >= memHlc) return null
@@ -205,21 +243,28 @@ private data class IncomingLogsMergePlan(
     val toInsert: List<ConsumptionLogEntity>,
     val maxConsumedHlcByEntry: Map<String, String>,
     val replacedAutoLogIds: Set<String>,
+    val clearedTombstoneIds: Set<String>,
 )
 
+@Suppress("LongParameterList")
 private suspend fun mergeConsumptionLogsInDao(
     dao: RocheDao,
     incoming: List<SyncConsumptionLogDto>,
     redirects: Map<String, String>,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
+    val tombstonesById =
+        dao.getAllTombstones()
+            .filter { it.entityType.equals(TOMBSTONE_ENTITY_CONSUMPTION_LOG, ignoreCase = true) }
+            .associateBy { it.naturalKey }
     val existingConsumedByEntry =
         dao.getAllConsumptionLogs()
             .filter { ConsumptionStatus.fromWireValue(it.status) == ConsumptionStatus.CONSUMED }
             .groupBy { it.entryId }
-    val acc = IncomingLogsAcc(existingConsumedByEntry, serverNode, nowIso)
+    val acc = IncomingLogsAcc(existingConsumedByEntry, tombstonesById, serverNode, nowIso, nowMs)
     for (log in incoming) {
         val entryId = followMergedInMap(log.entryId, redirects)
         if (entryId.isNotEmpty()) {
@@ -227,6 +272,9 @@ private suspend fun mergeConsumptionLogsInDao(
         }
     }
     val plan = acc.toPlan()
+    plan.clearedTombstoneIds.forEach {
+        dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, it)
+    }
     plan.replacedAutoLogIds.forEach { dao.deleteConsumptionLogById(it) }
     if (plan.toInsert.isNotEmpty()) {
         dao.insertConsumptionLogsIgnore(plan.toInsert)
@@ -238,13 +286,16 @@ private suspend fun mergeConsumptionLogsInDao(
 
 private class IncomingLogsAcc(
     private val existingConsumedByEntry: Map<String, List<ConsumptionLogEntity>>,
+    private val tombstonesById: Map<String, TombstoneEntity>,
     private val serverNode: String,
     private val nowIso: String,
+    private val nowMs: Long,
 ) {
     private val consumedInBatch = HashSet<String>(existingConsumedByEntry.keys)
     private val toInsert = ArrayList<ConsumptionLogEntity>()
     private val maxConsumedHlcByEntry = HashMap<String, String>()
     private val replacedAutoIds = HashSet<String>()
+    private val clearedTombstoneIds = HashSet<String>()
 
     fun accept(log: SyncConsumptionLogDto, entryId: String) {
         val status = ConsumptionStatus.fromWireValue(log.status)
@@ -254,7 +305,12 @@ private class IncomingLogsAcc(
                 ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
         val autoLogId = deterministicAutoLogId(entryId)
         val isConsumed = status == ConsumptionStatus.CONSUMED
-        val logHlc = resolveOrSynthesizeHlc(log.hlc, log.ts, nowIso, serverNode)
+        val logHlc = resolveOrSynthesizeHlc(log.hlc, log.ts, nowIso, serverNode, nowMs)
+        val tomb = tombstonesById[id]
+        if (tomb != null && tomb.hlc >= logHlc) return
+        if (tomb != null) {
+            clearedTombstoneIds.add(id)
+        }
 
         if (isConsumed && id == autoLogId && entryId in consumedInBatch) {
             recordConsumedHlc(entryId, logHlc)
@@ -292,7 +348,12 @@ private class IncomingLogsAcc(
     }
 
     fun toPlan(): IncomingLogsMergePlan =
-        IncomingLogsMergePlan(toInsert, maxConsumedHlcByEntry, replacedAutoIds)
+        IncomingLogsMergePlan(
+            toInsert = toInsert,
+            maxConsumedHlcByEntry = maxConsumedHlcByEntry,
+            replacedAutoLogIds = replacedAutoIds,
+            clearedTombstoneIds = clearedTombstoneIds,
+        )
 }
 
 private suspend fun prunePromotedWantMemberships(
@@ -316,12 +377,14 @@ private suspend fun prunePromotedWantMemberships(
     }
 }
 
+@Suppress("LongParameterList")
 private suspend fun mergeIncomingComparisonsInDao(
     dao: RocheDao,
     incoming: List<SyncComparisonDto>,
     redirects: Map<String, String>,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     if (incoming.isEmpty()) return
     val toInsert = ArrayList<ComparisonEntity>()
@@ -335,7 +398,7 @@ private suspend fun mergeIncomingComparisonsInDao(
         val id =
             comp.id.trim().takeIf { it.isNotEmpty() && !wasRewritten }
                 ?: deterministicComparisonId(scope, tsMillis, canonicalOrdering)
-        val compHlc = resolveOrSynthesizeHlc(comp.hlc, comp.ts, nowIso, serverNode)
+        val compHlc = resolveOrSynthesizeHlc(comp.hlc, comp.ts, nowIso, serverNode, nowMs)
         toInsert.add(
             ComparisonEntity(
                 id = id,
@@ -376,6 +439,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
     serverNode: String,
     localPeerId: String,
     nowIso: String,
+    nowMs: Long,
     allowLocalAutoAdvance: Boolean,
 ) {
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
@@ -386,6 +450,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
             remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects),
             serverNode = serverNode,
             nowIso = nowIso,
+            nowMs = nowMs,
         )
     val candidateIds =
         (localByColId.keys + remoteByColId.keys).distinct().filter { it != STARRED_COLLECTION_ID }
@@ -401,6 +466,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
                 serverNode = serverNode,
                 localPeerId = localPeerId,
                 nowIso = nowIso,
+                nowMs = nowMs,
                 allowLocalAutoAdvance = allowLocalAutoAdvance,
             )
         dao.upsertCollectionGenerator(merged)
@@ -412,13 +478,15 @@ private suspend fun filterTombstonedRemoteGenerators(
     remoteByColId: Map<String, SyncCollectionGeneratorDto>,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ): Map<String, SyncCollectionGeneratorDto> {
     if (remoteByColId.isEmpty()) return remoteByColId
     val filtered = LinkedHashMap<String, SyncCollectionGeneratorDto>(remoteByColId.size)
     for ((colId, remote) in remoteByColId) {
         val tomb = dao.getTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId)
         if (tomb != null) {
-            val incHlc = resolveOrSynthesizeHlc(remote.hlc, remote.updatedAt, nowIso, serverNode)
+            val incHlc =
+                resolveOrSynthesizeHlc(remote.hlc, remote.updatedAt, nowIso, serverNode, nowMs)
             if (tomb.hlc >= incHlc) {
                 continue
             }
@@ -464,9 +532,19 @@ private suspend fun reconcileSingleGeneratorInDao(
     serverNode: String,
     localPeerId: String,
     nowIso: String,
+    nowMs: Long,
     allowLocalAutoAdvance: Boolean,
 ): CollectionGeneratorEntity {
-    var base = selectBaseGeneratorEntity(colId, localGen, remoteGen, serverNode, nowIso)
+    var base =
+        selectBaseGeneratorEntity(
+            colId,
+            localGen,
+            remoteGen,
+            serverNode,
+            localPeerId,
+            nowIso,
+            nowMs,
+        )
     val activeId =
         base.currentEntryId?.takeIf { it.isNotBlank() }?.let { followMergedInMap(it, redirects) }
     if (activeId != base.currentEntryId) {
@@ -476,35 +554,52 @@ private suspend fun reconcileSingleGeneratorInDao(
         if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
             val hlc = nextLocalHlc(dao, localPeerId)
             base =
-                base.copy(currentEntryId = null, updatedAt = nowIso, hlc = hlc, isLocalDirty = true)
-        }
-        if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
-            val drawn = catalogStore.drawRandomRemainingId(colId)
-            val hlc = nextLocalHlc(dao, localPeerId)
-            base =
                 base.copy(
-                    currentEntryId = drawn,
-                    drawnAt = drawn?.let { nowIso },
+                    currentEntryId = null,
+                    drawnAt = null,
                     updatedAt = nowIso,
                     hlc = hlc,
                     isLocalDirty = true,
                 )
         }
+        if (base.enabled && base.currentEntryId.isNullOrBlank() && catalogStore != null) {
+            val drawn = catalogStore.drawRandomRemainingId(colId)
+            if (drawn != null) {
+                val hlc = nextLocalHlc(dao, localPeerId)
+                base =
+                    base.copy(
+                        currentEntryId = drawn,
+                        drawnAt = nowIso,
+                        updatedAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = true,
+                    )
+            }
+        }
     }
     return base
 }
 
+@Suppress("LongParameterList")
 private fun selectBaseGeneratorEntity(
     collectionId: String,
     localGen: CollectionGeneratorEntity?,
     remoteGen: SyncCollectionGeneratorDto?,
     serverNode: String,
+    localPeerId: String,
     nowIso: String,
+    nowMs: Long,
 ): CollectionGeneratorEntity {
     val selected =
         if (remoteGen != null) {
             val remHlc =
-                resolveOrSynthesizeHlc(remoteGen.hlc, remoteGen.updatedAt, nowIso, serverNode)
+                resolveOrSynthesizeHlc(
+                    remoteGen.hlc,
+                    remoteGen.updatedAt,
+                    nowIso,
+                    serverNode,
+                    nowMs,
+                )
             val remoteEntryId = remoteGen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
             val localEntryId = localGen?.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }
             val preferRemote =
@@ -539,7 +634,7 @@ private fun selectBaseGeneratorEntity(
             currentEntryId = null,
             drawnAt = null,
             updatedAt = nowIso,
-            hlc = HlcTimestamp.fromIsoOrEpoch(nowIso, DEFAULT_LOCAL_HLC_NODE).encode(),
+            hlc = HlcTimestamp.fromIsoOrEpoch(nowIso, localPeerId).encode(),
             isLocalDirty = false,
         )
 }
