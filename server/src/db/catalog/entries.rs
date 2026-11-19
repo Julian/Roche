@@ -275,12 +275,14 @@ impl CatalogRepo<'_> {
             return Err(CatalogError::NotFound(format!("Entry '{q}'")));
         }
         if candidates.len() > 1 {
-            let matches = candidates
+            let matched_candidates = candidates
                 .iter()
                 .map(|c| format!("'{}' (kind={}, id={})", c.title, c.kind.as_str(), c.id))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(CatalogError::AmbiguousLookup { query: q.to_owned(), matches });
+                .collect();
+            return Err(CatalogError::AmbiguousLookup {
+                query: q.to_owned(),
+                candidates: matched_candidates,
+            });
         }
         let hydrated = self.hydrate_entries(candidates).await?;
         hydrated.into_iter().next().ok_or_else(|| CatalogError::NotFound(format!("Entry '{q}'")))

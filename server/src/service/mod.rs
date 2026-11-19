@@ -24,7 +24,7 @@ use url::Url;
 use crate::{
     auth::{pairing::PairingManager, tokens::TokenManager},
     config::Config,
-    content::fetcher::{HtmlSanitizer, SafeHttpClient, classify_url},
+    content::fetcher::{HtmlSanitizer, SafeHttpClient, SsrfBlockedError, classify_url},
     db::{
         ActivityEntry, ArchiveBatchScope, ContentType, Db, DeviceToken, Feed, FeedType, HexColor,
         Item, ItemFilter, ItemPage, ItemStatus, ItemTag, ManualItemInput, Media, PeerSyncRequest,
@@ -70,7 +70,7 @@ struct PairingRateLimiter {
 }
 
 impl PairingRateLimiter {
-    fn check_and_record(&self, active_hash: &str, client: PairingClientKey) -> bool {
+    fn check_and_record(&self, active_hash: &str, client: PairingClientKey) -> Result<(), u64> {
         let now = Instant::now();
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.active_hash.as_deref() != Some(active_hash) {
@@ -83,10 +83,24 @@ impl PairingRateLimiter {
         });
         if let Some(timestamps) = guard.by_client.get_mut(&client) {
             if timestamps.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
-                return false;
+                let remaining = timestamps
+                    .iter()
+                    .copied()
+                    .min()
+                    .and_then(|oldest| {
+                        PAIR_RATE_LIMIT_WINDOW.checked_sub(now.duration_since(oldest))
+                    })
+                    .unwrap_or(Duration::ZERO);
+                let retry_after_secs = if remaining.subsec_nanos() > 0 {
+                    remaining.as_secs().saturating_add(1)
+                } else {
+                    remaining.as_secs()
+                }
+                .clamp(1, PAIR_RATE_LIMIT_WINDOW.as_secs());
+                return Err(retry_after_secs);
             }
             timestamps.push(now);
-            return true;
+            return Ok(());
         }
         if guard.by_client.len() >= MAX_TRACKED_PAIRING_IPS
             && let Some(oldest_key) = guard
@@ -98,7 +112,8 @@ impl PairingRateLimiter {
             guard.by_client.remove(&oldest_key);
         }
         guard.by_client.insert(client, vec![now]);
-        true
+        drop(guard);
+        Ok(())
     }
 
     fn reset(&self) {
@@ -592,18 +607,21 @@ impl<F: FeedFetcher> AuthService<'_, F> {
         }
 
         let Some(active_hash) = self.service.db.auth().active_pairing_code_hash().await? else {
-            return Err(ApiError::unauthorized("Invalid or expired pairing code"));
+            return Err(ApiError::pairing_code_invalid("Invalid or expired pairing code"));
         };
 
-        if !self.service.pairing_limiter.check_and_record(&active_hash, client_key) {
-            return Err(ApiError::too_many_requests(
+        if let Err(retry_after_secs) =
+            self.service.pairing_limiter.check_and_record(&active_hash, client_key)
+        {
+            return Err(ApiError::pairing_rate_limited(
                 "Too many failed pairing attempts; please wait before retrying",
+                retry_after_secs,
             ));
         }
 
         let pairing = PairingManager::new(self.service.db.auth());
         if !pairing.consume_valid_code(pairing_code.trim()).await? {
-            return Err(ApiError::unauthorized("Invalid or expired pairing code"));
+            return Err(ApiError::pairing_code_invalid("Invalid or expired pairing code"));
         }
 
         self.service.pairing_limiter.reset();
@@ -616,7 +634,7 @@ impl<F: FeedFetcher> AuthService<'_, F> {
     pub async fn authenticate(&self, bearer_token: &str) -> Result<(), ApiError> {
         let tokens = TokenManager::new(self.service.db.auth());
         if !tokens.validate(bearer_token).await? {
-            return Err(ApiError::unauthorized("Invalid or revoked bearer token"));
+            return Err(ApiError::token_invalid("Invalid or revoked bearer token"));
         }
         Ok(())
     }
@@ -721,6 +739,16 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         self.service.db.feeds().get(id).await?.ok_or_else(|| ApiError::not_found("Feed not found"))
     }
 
+    pub fn parse_source(raw: &str) -> Result<FeedSource, ApiError> {
+        FeedSource::parse(raw).map_err(|err| {
+            if err.downcast_ref::<SsrfBlockedError>().is_some() {
+                ApiError::ssrf_blocked(format!("Invalid feed URL: {err}"))
+            } else {
+                ApiError::bad_request(format!("Invalid feed URL: {err}"))
+            }
+        })
+    }
+
     pub async fn create(
         &self,
         feed_type: FeedType,
@@ -728,9 +756,15 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         title: Option<&str>,
         description: Option<&str>,
     ) -> Result<Feed, ApiError> {
-        let (initial_type, validated_url) = source
-            .into_feed_url(feed_type)
-            .map_err(|e| ApiError::bad_request(format!("Invalid feed URL: {e}")))?;
+        let (initial_type, validated_url) = source.into_feed_url(feed_type).map_err(|e| {
+            if e.downcast_ref::<SsrfBlockedError>().is_some() {
+                ApiError::ssrf_blocked(format!("Invalid feed URL: {e}"))
+            } else {
+                ApiError::bad_request(format!("Invalid feed URL: {e}"))
+            }
+        })?;
+        SafeHttpClient::validate_url(&validated_url)
+            .map_err(|e| ApiError::ssrf_blocked(format!("Invalid feed URL: {e}")))?;
 
         let (resolved_type, final_url) =
             self.discover_feed_url_if_needed(initial_type, validated_url).await?;
@@ -1045,7 +1079,7 @@ impl<'a, F: FeedFetcher> ItemService<'a, F> {
         tags: &[String],
     ) -> Result<ItemDetail, ApiError> {
         SafeHttpClient::validate_url(url)
-            .map_err(|e| ApiError::bad_request(format!("Invalid item URL: {e}")))?;
+            .map_err(|e| ApiError::ssrf_blocked(format!("Invalid item URL: {e}")))?;
 
         let arxiv_id = crate::feeds::ArxivParser::extract_arxiv_id(url.as_str());
         let content_type = if arxiv_id.is_some() { ContentType::Paper } else { classify_url(url) };
@@ -1435,7 +1469,7 @@ mod tests {
             let hi = u8::try_from((idx >> 8) & 0xff).unwrap();
             let lo = u8::try_from(idx & 0xff).unwrap();
             let ip = IpAddr::V4(Ipv4Addr::new(198, 51, hi, lo));
-            assert!(limiter.check_and_record(active_hash, PairingClientKey::DirectIp(ip)));
+            assert!(limiter.check_and_record(active_hash, PairingClientKey::DirectIp(ip)).is_ok());
         }
 
         let guard = limiter.state.lock().unwrap();
@@ -1448,21 +1482,32 @@ mod tests {
         let active_hash = "hash-ts";
 
         for _ in 0..PAIR_RATE_LIMIT_MAX_FAILURES {
-            assert!(limiter.check_and_record(
+            assert!(
+                limiter
+                    .check_and_record(
+                        active_hash,
+                        PairingClientKey::TailscaleLogin("alice@tailnet.ts.net".to_owned()),
+                    )
+                    .is_ok()
+            );
+        }
+        let retry_after = limiter
+            .check_and_record(
                 active_hash,
                 PairingClientKey::TailscaleLogin("alice@tailnet.ts.net".to_owned()),
-            ));
-        }
-        assert!(!limiter.check_and_record(
-            active_hash,
-            PairingClientKey::TailscaleLogin("alice@tailnet.ts.net".to_owned()),
-        ));
+            )
+            .unwrap_err();
+        assert!((1..=PAIR_RATE_LIMIT_WINDOW.as_secs()).contains(&retry_after));
 
         // Another Tailscale user behind the same 127.0.0.1 `tailscale serve` proxy is unaffected.
-        assert!(limiter.check_and_record(
-            active_hash,
-            PairingClientKey::TailscaleLogin("bob@tailnet.ts.net".to_owned()),
-        ));
+        assert!(
+            limiter
+                .check_and_record(
+                    active_hash,
+                    PairingClientKey::TailscaleLogin("bob@tailnet.ts.net".to_owned()),
+                )
+                .is_ok()
+        );
     }
 
     struct DummyServiceFetcher;

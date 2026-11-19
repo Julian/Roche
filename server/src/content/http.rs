@@ -7,9 +7,15 @@ use std::{
 use anyhow::Result;
 use ip_network::IpNetwork;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use thiserror::Error;
 use url::{Host, Url};
 
 use super::classify::UrlClassifier;
+
+/// Typed error returned when [`SafeHttpClient::validate_url`] blocks an SSRF or disallowed URL target.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0}")]
+pub struct SsrfBlockedError(pub String);
 
 /// Custom DNS resolver for `reqwest` that validates every resolved IP address against
 /// [`SafeHttpClient::is_global_ip`] at socket connection time.
@@ -97,41 +103,49 @@ impl SafeHttpClient {
     }
 
     /// Validates that a [`Url`] uses HTTP(S) on an allowed port and points to a public/global host.
-    pub fn validate_url(parsed: &Url) -> Result<()> {
+    pub fn validate_url(parsed: &Url) -> std::result::Result<(), SsrfBlockedError> {
         if !matches!(parsed.scheme(), "http" | "https") {
-            anyhow::bail!("URL scheme must be http or https");
+            return Err(SsrfBlockedError("URL scheme must be http or https".to_owned()));
         }
         if !parsed.username().is_empty() || parsed.password().is_some() {
-            anyhow::bail!("URL must not contain embedded credentials");
+            return Err(SsrfBlockedError("URL must not contain embedded credentials".to_owned()));
         }
         if let Some(port) = parsed.port()
             && !matches!(port, 80 | 443 | 8080 | 8443)
         {
-            anyhow::bail!("Disallowed URL port: {port}");
+            return Err(SsrfBlockedError(format!("Disallowed URL port: {port}")));
         }
 
         let Some(host) = parsed.host() else {
-            anyhow::bail!("URL must include a valid host");
+            return Err(SsrfBlockedError("URL must include a valid host".to_owned()));
         };
 
         match host {
             Host::Domain(domain) => {
                 let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
                 if normalized.is_empty() || !normalized.contains('.') {
-                    anyhow::bail!("Single-label or empty domain names are not allowed");
+                    return Err(SsrfBlockedError(
+                        "Single-label or empty domain names are not allowed".to_owned(),
+                    ));
                 }
                 if Self::is_local_or_tailnet_domain(&normalized) {
-                    anyhow::bail!("Local or Tailnet domain names are not allowed");
+                    return Err(SsrfBlockedError(
+                        "Local or Tailnet domain names are not allowed".to_owned(),
+                    ));
                 }
             }
             Host::Ipv4(ipv4) => {
                 if !Self::is_global_ip(IpAddr::V4(ipv4)) {
-                    anyhow::bail!("Private, loopback, or reserved IPv4 addresses are not allowed");
+                    return Err(SsrfBlockedError(
+                        "Private, loopback, or reserved IPv4 addresses are not allowed".to_owned(),
+                    ));
                 }
             }
             Host::Ipv6(ipv6) => {
                 if !Self::is_global_ip(IpAddr::V6(ipv6)) {
-                    anyhow::bail!("Private, loopback, or reserved IPv6 addresses are not allowed");
+                    return Err(SsrfBlockedError(
+                        "Private, loopback, or reserved IPv6 addresses are not allowed".to_owned(),
+                    ));
                 }
             }
         }

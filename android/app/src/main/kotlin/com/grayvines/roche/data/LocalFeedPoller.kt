@@ -7,6 +7,7 @@ import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertItems
+import com.grayvines.roche.data.remote.HttpStatusException
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.model.ItemStatus
@@ -174,17 +175,25 @@ internal object LocalFeedPoller {
         )
     }
 
-    private fun sanitizeFeedFetchError(error: Throwable): String {
-        if (error is ProblemDetailsException) return "HTTP ${error.statusCode}"
-        val clean =
-            error.message
-                ?.lineSequence()
-                ?.firstOrNull()
-                ?.trim()
-                ?.take(MAX_FEED_ERROR_CHARS)
-                ?.takeIf { it.isNotEmpty() }
-        return clean ?: "Feed fetch failed"
-    }
+    private fun sanitizeFeedFetchError(error: Throwable): String =
+        when (error) {
+            is HttpStatusException -> {
+                "HTTP ${error.statusCode}"
+            }
+            is ProblemDetailsException -> {
+                "HTTP ${error.statusCode}"
+            }
+            else -> {
+                val firstLine =
+                    error.message
+                        ?.lineSequence()
+                        ?.firstOrNull()
+                        ?.trim()
+                        ?.take(MAX_FEED_ERROR_CHARS)
+                        ?.takeIf { it.isNotEmpty() }
+                firstLine ?: "Feed fetch failed"
+            }
+        }
 
     private fun buildUpdatedPolledFeed(
         feed: FeedRow,

@@ -322,7 +322,7 @@ class RocheApiClient(
                         requirePublicIp = true,
                     )
                 )
-            ensureSuccess(response)
+            ensureExternalSuccess(response)
             response.body
         }
 

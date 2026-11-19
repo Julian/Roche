@@ -237,13 +237,21 @@ pub(super) async fn login_post<F: FeedFetcher>(
             resp
         }
         Err(err) => {
-            let (status, msg) = match &err {
-                ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.as_str()),
-                ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.as_str()),
-                ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.as_str()),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Unable to complete browser pairing."),
+            let (status, msg, retry_after) = match &err {
+                ApiError::PairingRateLimited { detail, retry_after_seconds } => {
+                    (StatusCode::TOO_MANY_REQUESTS, detail.as_str(), Some(*retry_after_seconds))
+                }
+                ApiError::Unauthorized(m)
+                | ApiError::TokenInvalid(m)
+                | ApiError::PairingCodeInvalid(m) => (StatusCode::UNAUTHORIZED, m.as_str(), None),
+                ApiError::BadRequest(m) | ApiError::SsrfBlocked(m) => {
+                    (StatusCode::BAD_REQUEST, m.as_str(), None)
+                }
+                _ => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Unable to complete browser pairing.", None)
+                }
             };
-            (
+            let mut resp = (
                 status,
                 render_login_page(
                     Some(msg),
@@ -251,7 +259,13 @@ pub(super) async fn login_post<F: FeedFetcher>(
                     ts_login.as_deref(),
                 ),
             )
-                .into_response()
+                .into_response();
+            if let Some(secs) = retry_after
+                && let Ok(val) = HeaderValue::from_str(&secs.to_string())
+            {
+                resp.headers_mut().insert(header::RETRY_AFTER, val);
+            }
+            resp
         }
     }
 }

@@ -472,10 +472,7 @@ internal class BufferedUrlRequestCallback(
         maxAllowedBytes = bound
         val declaredLength = parseResponseContentLength(info)
         if (declaredLength != null && declaredLength > bound.toLong()) {
-            abortError.compareAndSet(
-                null,
-                IOException("Response exceeds maximum allowed size of $bound bytes"),
-            )
+            abortError.compareAndSet(null, ResponseTooLargeException(maxBytes = bound.toLong()))
             watchdog.cancel()
             request.cancel()
         } else {
@@ -505,10 +502,7 @@ internal class BufferedUrlRequestCallback(
         val incoming = byteBuffer.remaining()
         val bound = maxAllowedBytes
         return if (incoming > bound - output.size()) {
-            abortError.compareAndSet(
-                null,
-                IOException("Response exceeds maximum allowed size of $bound bytes"),
-            )
+            abortError.compareAndSet(null, ResponseTooLargeException(maxBytes = bound.toLong()))
             false
         } else {
             while (byteBuffer.hasRemaining()) {
@@ -860,6 +854,7 @@ private const val HEADER_COOKIE = "Cookie"
 private const val HEADER_PROXY_AUTHORIZATION = "Proxy-Authorization"
 private const val HEADER_CONTENT_TYPE = "Content-Type"
 private const val HEADER_CONTENT_LENGTH = "Content-Length"
+internal const val HEADER_RETRY_AFTER = "Retry-After"
 private const val CONTENT_TYPE_JSON = "application/json"
 private val CROSS_ORIGIN_SENSITIVE_HEADERS =
     listOf(HEADER_AUTHORIZATION, HEADER_COOKIE, HEADER_PROXY_AUTHORIZATION)
@@ -1003,7 +998,7 @@ internal fun readBoundedBytes(
         val read = stream.read(buffer, 0, maxReadLen)
         if (read == -1) break
         if (read > maxBytes - total) {
-            throw IOException("Response exceeds maximum allowed size of $maxBytes bytes")
+            throw ResponseTooLargeException(maxBytes = maxBytes.toLong())
         }
         total += read
         out.write(buffer, 0, read)
@@ -1102,6 +1097,20 @@ internal fun authHeaders(token: String): Map<String, String> =
 
 internal fun ensureSuccess(response: HttpResponse) {
     if (response.statusCode in HTTP_OK_START..HTTP_OK_END) return
-    val (title, detail) = parseProblemDetails(response.body, response.statusCode)
-    throw ProblemDetailsException(statusCode = response.statusCode, title = title, detail = detail)
+    val problem = parseProblemDetails(response.body, response.statusCode, response.headers)
+    throw ProblemDetailsException(
+        statusCode = response.statusCode,
+        title = problem.title,
+        detail = problem.detail,
+        problemType = problem.problemType,
+        retryAfterSeconds = problem.retryAfterSeconds,
+        maxBytes = problem.maxBytes,
+        candidates = problem.candidates,
+    )
+}
+
+internal fun ensureExternalSuccess(response: HttpResponse) {
+    if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) {
+        throw HttpStatusException(response.statusCode)
+    }
 }

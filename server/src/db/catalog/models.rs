@@ -18,8 +18,8 @@ pub enum CatalogError {
     #[error("{0} not found")]
     NotFound(String),
 
-    #[error("Ambiguous lookup for '{query}': matches {matches}")]
-    AmbiguousLookup { query: String, matches: String },
+    #[error("Ambiguous lookup for '{query}': matches {}", .candidates.join(", "))]
+    AmbiguousLookup { query: String, candidates: Vec<String> },
 
     #[error("Cannot manually modify entries of {mode:?} collection '{title}'")]
     ImmutableCollection { title: String, mode: CollectionMode },

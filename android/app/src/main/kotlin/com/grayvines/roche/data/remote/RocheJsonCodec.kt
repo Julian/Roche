@@ -269,10 +269,26 @@ internal data class WireMediaDto(
 @Serializable
 internal data class MediaEnvelopeWireResponse(val media: List<WireMediaDto> = emptyList())
 
+@Suppress("LongParameterList")
 @Serializable
 internal data class ProblemDetailsWireResponse(
+    val type: String? = null,
     val title: String? = null,
     val detail: String? = null,
+    val status: Int? = null,
+    @SerialName("retry_after_seconds") val retryAfterSeconds: Long? = null,
+    @SerialName("max_bytes") val maxBytes: Long? = null,
+    val candidates: List<String>? = null,
+)
+
+@Suppress("LongParameterList")
+internal data class ParsedProblemDetails(
+    val problemType: String,
+    val title: String,
+    val detail: String,
+    val retryAfterSeconds: Long? = null,
+    val maxBytes: Long? = null,
+    val candidates: List<String> = emptyList(),
 )
 
 @Serializable
@@ -508,19 +524,14 @@ internal fun parsePeerSyncResponseJson(raw: String): PeerSyncResponseDto {
         rocheJson.decodeFromString(PeerSyncWireResponse.serializer(), raw)
     }
         .getOrElse { err ->
-            throw ProblemDetailsException(
-                statusCode = 200,
-                title = "Invalid Peer Sync Payload",
-                detail = err.message ?: "Malformed JSON in /api/v1/sync/peer response",
+            throw ApiProtocolException(
+                message = err.message ?: "Malformed JSON in /api/v1/sync/peer response",
+                cause = err,
             )
         }
     val serverPeerId =
         wire.serverPeerId.nullIfBlank()
-            ?: throw ProblemDetailsException(
-                statusCode = 200,
-                title = "Invalid Peer Sync Payload",
-                detail = "Missing server_peer_id in /api/v1/sync/peer response",
-            )
+            ?: throw ApiProtocolException("Missing server_peer_id in /api/v1/sync/peer response")
     return PeerSyncResponseDto(
         serverPeerId = serverPeerId,
         syncSeq = wire.syncSeq,
@@ -554,13 +565,44 @@ internal fun parseMediaJsonArray(raw: String): List<RemoteMediaDto> {
     return wireMedia.map { it.toRemoteMediaDto() }.filter { it.id.isNotBlank() }
 }
 
-internal fun parseProblemDetails(raw: String, statusCode: Int): Pair<String, String> = runCatching {
-    val parsed = rocheJson.decodeFromString(ProblemDetailsWireResponse.serializer(), raw)
-    val parsedTitle = parsed.title.nullIfBlank() ?: DEFAULT_ERROR_TITLE
-    val parsedDetail = parsed.detail.nullIfBlank() ?: raw.ifBlank { "Request failed" }
-    parsedTitle to parsedDetail
+internal fun parseRetryAfterHeader(headers: Map<String, String>): Long? =
+    headers.entries
+        .firstOrNull { (name, _) -> name.equals(HEADER_RETRY_AFTER, ignoreCase = true) }
+        ?.value
+        ?.trim()
+        ?.toLongOrNull()
+        ?.takeIf { it >= 0L }
+
+internal fun parseProblemDetails(
+    raw: String,
+    statusCode: Int,
+    headers: Map<String, String> = emptyMap(),
+): ParsedProblemDetails {
+    val headerRetryAfter = parseRetryAfterHeader(headers)
+    return runCatching {
+        val parsed = rocheJson.decodeFromString(ProblemDetailsWireResponse.serializer(), raw)
+        val parsedType = parsed.type.nullIfBlank() ?: RocheProblemTypes.BLANK
+        val parsedTitle = parsed.title.nullIfBlank() ?: DEFAULT_ERROR_TITLE
+        val parsedDetail = parsed.detail.nullIfBlank() ?: raw.ifBlank { "Request failed" }
+        val parsedRetryAfter = parsed.retryAfterSeconds ?: headerRetryAfter
+        ParsedProblemDetails(
+            problemType = parsedType,
+            title = parsedTitle,
+            detail = parsedDetail,
+            retryAfterSeconds = parsedRetryAfter,
+            maxBytes = parsed.maxBytes,
+            candidates = parsed.candidates.orEmpty().filter { it.isNotBlank() },
+        )
+    }
+        .getOrElse {
+            ParsedProblemDetails(
+                problemType = RocheProblemTypes.BLANK,
+                title = DEFAULT_ERROR_TITLE,
+                detail = raw.ifBlank { "Status $statusCode" },
+                retryAfterSeconds = headerRetryAfter,
+            )
+        }
 }
-    .getOrElse { DEFAULT_ERROR_TITLE to raw.ifBlank { "Status $statusCode" } }
 
 internal fun parseHealthDiscoveryJson(
     raw: String,

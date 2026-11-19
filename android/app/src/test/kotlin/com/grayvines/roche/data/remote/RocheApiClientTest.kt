@@ -803,15 +803,179 @@ class RocheApiClientTest {
             assertEquals(storagePath, prepareHttpEngineStoragePath(tempDir, activePaths))
             releaseHttpEngineStoragePath(storagePath, activePaths)
         }
+
+    @Test
+    internal fun `RFC 9457 ProblemDetails parses type retry_after_seconds Retry-After header max_bytes and candidates`() =
+        runTest {
+            val rateLimitedClient = RocheApiClient {
+                HttpResponse(
+                    statusCode = TEST_HTTP_429,
+                    body =
+                        """{"type":"urn:roche:problem:pairing-rate-limited","title":"Too Many Requests","status":429,"detail":"Slow down","retry_after_seconds":42}""",
+                    headers = mapOf("Retry-After" to "99"),
+                )
+            }
+            val rateErr = runCatching {
+                rateLimitedClient.pairDevice("http://localhost:8080", "123456", "P")
+            }
+                .exceptionOrNull()
+            assertTrue(rateErr is ProblemDetailsException)
+            val rateProblem = rateErr as ProblemDetailsException
+            assertEquals(TEST_HTTP_429, rateProblem.statusCode)
+            assertEquals(RocheProblemTypes.PAIRING_RATE_LIMITED, rateProblem.problemType)
+            assertEquals(TEST_RETRY_AFTER_JSON, rateProblem.retryAfterSeconds)
+
+            val headerFallback =
+                parseProblemDetails(
+                    raw =
+                        """{"type":"urn:roche:problem:pairing-rate-limited","title":"Rate Limited","status":429,"detail":"Wait"}""",
+                    statusCode = TEST_HTTP_429,
+                    headers = mapOf("Retry-After" to "17"),
+                )
+            assertEquals(TEST_RETRY_AFTER_HEADER, headerFallback.retryAfterSeconds)
+            val lowerFallback =
+                parseProblemDetails(
+                    raw = "rate limited",
+                    statusCode = TEST_HTTP_429,
+                    headers = mapOf("retry-after" to "23"),
+                )
+            assertEquals(RocheProblemTypes.BLANK, lowerFallback.problemType)
+            assertEquals(TEST_RETRY_AFTER_LOWER, lowerFallback.retryAfterSeconds)
+
+            val tooLarge =
+                parseProblemDetails(
+                    raw =
+                        """{"type":"urn:roche:problem:payload-too-large","title":"Payload Too Large","status":413,"detail":"Too big","max_bytes":67108864}""",
+                    statusCode = TEST_HTTP_413,
+                )
+            assertEquals(RocheProblemTypes.PAYLOAD_TOO_LARGE, tooLarge.problemType)
+            assertEquals(TEST_MAX_PAYLOAD_BYTES, tooLarge.maxBytes)
+
+            val ambiguous =
+                parseProblemDetails(
+                    raw =
+                        """{"type":"urn:roche:problem:ambiguous-lookup","title":"Ambiguous","status":409,"detail":"Multiple matches","candidates":["entry-a","entry-b"]}""",
+                    statusCode = TEST_HTTP_409,
+                )
+            assertEquals(RocheProblemTypes.AMBIGUOUS_LOOKUP, ambiguous.problemType)
+            assertEquals(listOf("entry-a", "entry-b"), ambiguous.candidates)
+        }
+
+    @Test
+    internal fun `malformed peer sync 200 throws ApiProtocolException and external HTTP 500 throws HttpStatusException`() =
+        runTest {
+            val malformedClient = RocheApiClient {
+                HttpResponse(statusCode = TEST_HTTP_200, body = "{not valid json")
+            }
+            val malformedErr = runCatching {
+                malformedClient.syncPeer(
+                    serverUrl = "http://localhost:8080",
+                    token = "tok",
+                    request = PeerSyncRequestDto(peerId = "p1"),
+                )
+            }
+                .exceptionOrNull()
+            assertTrue(malformedErr is ApiProtocolException)
+            assertFalse(malformedErr is ProblemDetailsException)
+
+            val missingPeerIdErr = runCatching {
+                parsePeerSyncResponseJson("""{"sync_seq":1}""")
+            }
+                .exceptionOrNull()
+            assertTrue(missingPeerIdErr is ApiProtocolException)
+            assertFalse(missingPeerIdErr is ProblemDetailsException)
+
+            val external500Client = RocheApiClient {
+                HttpResponse(statusCode = TEST_HTTP_500, body = "<html>500 Error</html>")
+            }
+            val feedErr =
+                external500Client
+                    .fetchExternalFeedXml("https://feeds.example.com/rss.xml")
+                    .exceptionOrNull()
+            assertTrue(feedErr is HttpStatusException)
+            assertFalse(feedErr is ProblemDetailsException)
+            assertEquals(TEST_HTTP_500, (feedErr as HttpStatusException).statusCode)
+
+            val overflowErr = runCatching {
+                readBoundedBytes(
+                    java.io.ByteArrayInputStream(ByteArray(TEST_BOUNDED_OVERFLOW)),
+                    maxBytes = TEST_BOUNDED_LIMIT,
+                )
+            }
+                .exceptionOrNull()
+            assertTrue(overflowErr is ResponseTooLargeException)
+            assertEquals(
+                TEST_BOUNDED_LIMIT.toLong(),
+                (overflowErr as ResponseTooLargeException).maxBytes,
+            )
+        }
+
+    @Test
+    internal fun `formatProblemDetailsMessage formats token-invalid rate-limited pairing-code-invalid and ssrf-blocked`() {
+        val revoked = formatProblem(TEST_HTTP_401, "Token revoked", RocheProblemTypes.TOKEN_INVALID)
+        assertTrue(revoked.contains("re-pair", ignoreCase = true) && revoked.contains("Settings"))
+
+        val limited =
+            formatProblem(
+                TEST_HTTP_429,
+                "Slow down",
+                RocheProblemTypes.PAIRING_RATE_LIMITED,
+                retryAfter = TEST_RETRY_AFTER_JSON,
+            )
+        assertTrue(limited.contains("Try again in 42s"))
+
+        val limitedNoRetry =
+            formatProblem(TEST_HTTP_429, "Slow down", RocheProblemTypes.PAIRING_RATE_LIMITED)
+        assertTrue(limitedNoRetry.contains("Try again shortly"))
+
+        val badCode =
+            formatProblem(TEST_HTTP_401, "Bad code", RocheProblemTypes.PAIRING_CODE_INVALID)
+        assertTrue(badCode.contains("invalid or expired", ignoreCase = true))
+
+        val ssrf =
+            formatProblem(TEST_HTTP_400, "Private IP blocked", RocheProblemTypes.SSRF_BLOCKED)
+        assertEquals("Private IP blocked", ssrf)
+
+        val generic = formatProblem(TEST_HTTP_500, "Upstream timeout", RocheProblemTypes.BLANK)
+        assertEquals("Upstream timeout", generic)
+    }
 }
 
 private const val TEST_HTTP_200 = 200
 private const val TEST_HTTP_301 = 301
 private const val TEST_HTTP_302 = 302
 private const val TEST_HTTP_303 = 303
+private const val TEST_HTTP_400 = 400
+private const val TEST_HTTP_401 = 401
+private const val TEST_HTTP_409 = 409
+private const val TEST_HTTP_413 = 413
+private const val TEST_HTTP_429 = 429
+private const val TEST_HTTP_500 = 500
+private const val TEST_RETRY_AFTER_JSON = 42L
+private const val TEST_RETRY_AFTER_HEADER = 17L
+private const val TEST_RETRY_AFTER_LOWER = 23L
+private const val TEST_MAX_PAYLOAD_BYTES = 67_108_864L
+private const val TEST_BOUNDED_LIMIT = 16
+private const val TEST_BOUNDED_OVERFLOW = 17
 private const val TEST_WRITTEN_BYTES = 16L
 private const val TEST_SAFE_INCOMING_BYTES = 84L
 private const val TEST_MAX_BUDGET_BYTES = 100L
+
+internal fun formatProblem(
+    statusCode: Int,
+    detail: String,
+    problemType: String,
+    retryAfter: Long? = null,
+): String =
+    formatProblemDetailsMessage(
+        ProblemDetailsException(
+            statusCode = statusCode,
+            title = "Error",
+            detail = detail,
+            problemType = problemType,
+            retryAfterSeconds = retryAfter,
+        )
+    )
 
 private fun assertPayloadStrippedGetRedirect(redirected: HttpRequest) {
     assertEquals("GET", redirected.method)

@@ -459,29 +459,50 @@ pub(super) fn render_error_page(
 }
 
 pub(super) fn web_api_error_response(err: &ApiError, csrf_token: Option<&str>) -> Response {
-    let (status, heading, detail) = match err {
-        ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Invalid Request", msg.clone()),
+    let (status, heading, detail, retry_after) = match err {
+        ApiError::BadRequest(msg)
+        | ApiError::ImmutableCollection(msg)
+        | ApiError::SsrfBlocked(msg) => {
+            (StatusCode::BAD_REQUEST, "Invalid Request", msg.clone(), None)
+        }
         ApiError::UnsupportedMediaType(msg) => {
-            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Unsupported Media Type", msg.clone())
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Unsupported Media Type", msg.clone(), None)
         }
-        ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "Unauthorized", msg.clone()),
-        ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone()),
-        ApiError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone()),
-        ApiError::TooManyRequests(msg) => {
-            (StatusCode::TOO_MANY_REQUESTS, "Too Many Attempts", msg.clone())
+        ApiError::Unauthorized(msg)
+        | ApiError::TokenInvalid(msg)
+        | ApiError::PairingCodeInvalid(msg) => {
+            (StatusCode::UNAUTHORIZED, "Unauthorized", msg.clone(), None)
         }
-        ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Upstream Error", msg.clone()),
+        ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg.clone(), None),
+        ApiError::Conflict(msg) => (StatusCode::CONFLICT, "Conflict", msg.clone(), None),
+        ApiError::AmbiguousLookup { detail, .. } => {
+            (StatusCode::CONFLICT, "Ambiguous Lookup", detail.clone(), None)
+        }
+        ApiError::PairingRateLimited { detail, retry_after_seconds } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too Many Attempts",
+            detail.clone(),
+            Some(*retry_after_seconds),
+        ),
+        ApiError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Upstream Error", msg.clone(), None),
         ApiError::MethodNotAllowed(msg) => {
-            (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed", msg.clone())
+            (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed", msg.clone(), None)
         }
-        ApiError::PayloadTooLarge(msg) => {
-            (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", msg.clone())
+        ApiError::PayloadTooLarge { detail, .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large", detail.clone(), None)
         }
         ApiError::Database(_) | ApiError::Internal(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Server Error",
             "An internal error occurred while processing your request.".to_owned(),
+            None,
         ),
     };
-    render_error_page(status, heading, &detail, csrf_token)
+    let mut resp = render_error_page(status, heading, &detail, csrf_token);
+    if let Some(secs) = retry_after
+        && let Ok(val) = HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, val);
+    }
+    resp
 }

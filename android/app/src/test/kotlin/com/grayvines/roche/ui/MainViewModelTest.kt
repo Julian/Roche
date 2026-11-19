@@ -2225,6 +2225,110 @@ class MainViewModelTest {
             }
         }
 
+    @Test
+    fun `PairWithServer and SyncNow surface RFC 9457 rate-limit invalid-code and token-invalid banners`() =
+        runTest {
+            var pairAttempt = 0
+            val problemClient = RocheApiClient { request ->
+                when (request.url) {
+                    "https://100.64.0.12:8080/auth/pair" -> {
+                        pairAttempt++
+                        if (pairAttempt == 1) {
+                            HttpResponse(
+                                statusCode = 429,
+                                body =
+                                    """{"type":"urn:roche:problem:pairing-rate-limited","title":"Too Many Requests","status":429,"detail":"Rate limited"}""",
+                                headers = mapOf("Retry-After" to "42"),
+                            )
+                        } else {
+                            HttpResponse(
+                                statusCode = 401,
+                                body =
+                                    """{"type":"urn:roche:problem:pairing-code-invalid","title":"Unauthorized","status":401,"detail":"Code expired"}""",
+                            )
+                        }
+                    }
+                    "https://100.64.0.12:8080/api/v1/sync/peer" -> {
+                        HttpResponse(
+                            statusCode = 401,
+                            body =
+                                """{"type":"urn:roche:problem:token-invalid","title":"Unauthorized","status":401,"detail":"Token revoked"}""",
+                        )
+                    }
+                    else -> {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                }
+            }
+            val problemRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = problemClient,
+                    settings = settings,
+                )
+            val problemVm =
+                MainViewModel(
+                    repository = problemRepo,
+                    settingsRepository = settings,
+                    playerBackend = playerBackend,
+                    mediaSessionBridge = mediaSessionBridge,
+                )
+            try {
+                val collectJob = collectInBackground(problemVm.uiState)
+                problemVm.uiState.first { !it.isInitialLoading }
+
+                problemVm.dispatch(
+                    MainAction.PairWithServer(
+                        serverUrl = "https://100.64.0.12:8080",
+                        pairingCode = "123456",
+                    )
+                )
+                val rateLimitedBanner =
+                    problemVm.uiState
+                        .first { it.statusBanner?.contains("Try again in 42s") == true }
+                        .statusBanner
+                assertTrue(rateLimitedBanner?.startsWith("Pairing failed") == true)
+
+                problemVm.dispatch(MainAction.DismissMessages)
+                problemVm.uiState.first { it.statusBanner == null }
+
+                problemVm.dispatch(
+                    MainAction.PairWithServer(
+                        serverUrl = "https://100.64.0.12:8080",
+                        pairingCode = "654321",
+                    )
+                )
+                val invalidCodeBanner =
+                    problemVm.uiState
+                        .first {
+                            it.statusBanner?.contains("invalid or expired", ignoreCase = true) ==
+                                true
+                        }
+                        .statusBanner
+                assertTrue(invalidCodeBanner?.startsWith("Pairing failed") == true)
+
+                problemVm.dispatch(MainAction.DismissMessages)
+                problemVm.uiState.first { it.statusBanner == null }
+                settings.update {
+                    it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "revoked-tok")
+                }
+                problemVm.dispatch(MainAction.SyncNow)
+                val tokenRevokedBanner =
+                    problemVm.uiState
+                        .first {
+                            !it.isSyncing &&
+                                it.statusBanner?.contains("re-pair", ignoreCase = true) == true
+                        }
+                        .statusBanner
+                assertTrue(tokenRevokedBanner?.contains("Settings") == true)
+
+                collectJob.cancel()
+            } finally {
+                problemVm.playerController.releaseController()
+                problemVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
     private fun testFeed(id: String, title: String) =
         FeedRow(id, title, "https://example.com/$id.xml", "https://example.com", "rss")
 

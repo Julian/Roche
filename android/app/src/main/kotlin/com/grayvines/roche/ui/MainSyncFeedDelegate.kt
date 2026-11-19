@@ -1,6 +1,9 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.RocheProblemTypes
+import com.grayvines.roche.data.remote.formatProblemDetailsMessage
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.AppTab
 import kotlinx.coroutines.flow.first
@@ -126,7 +129,9 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                     vm.showStatusMessage("Imported $importedCount $noun from OPML")
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("OPML import failed (${error.message ?: "error"})")
+                    vm.showStatusMessage(
+                        "OPML import failed (${formatErrorDetail(error, "error")})"
+                    )
                 }
         } finally {
             vm.transientState.update { it.copy(isSyncing = false) }
@@ -142,7 +147,9 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                     vm.showStatusMessage("Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("Refresh failed (${error.message ?: "unreachable"})")
+                    vm.showStatusMessage(
+                        "Refresh failed (${formatErrorDetail(error, "unreachable")})"
+                    )
                 }
         } finally {
             vm.transientState.update { it.copy(isSyncing = false) }
@@ -223,7 +230,7 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 }
             }
             .onFailure { error ->
-                vm.showStatusMessage("Feed update failed (${error.message ?: "error"})")
+                vm.showStatusMessage("Feed update failed (${formatErrorDetail(error, "error")})")
             }
     }
 
@@ -240,7 +247,7 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 }
             }
             .onFailure { error ->
-                vm.showStatusMessage("Unsubscribe failed (${error.message ?: "error"})")
+                vm.showStatusMessage("Unsubscribe failed (${formatErrorDetail(error, "error")})")
             }
     }
 
@@ -307,7 +314,9 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 .discoverServer()
                 .fold(
                     onSuccess = { url -> "Discovered Roche server at $url" },
-                    onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
+                    onFailure = { err ->
+                        "Discovery failed (${formatErrorDetail(err, "not found")})"
+                    },
                 )
         vm.showStatusMessage(message)
     }
@@ -332,7 +341,7 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
             }
             .onFailure { error ->
                 vm.refreshLocalNetworkTier()
-                vm.showStatusMessage("Pairing failed (${error.message ?: "error"})")
+                vm.showStatusMessage("Pairing failed (${formatErrorDetail(error, "error")})")
             }
     }
 
@@ -364,7 +373,9 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                     vm.showStatusMessage(msg)
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("On-device poll skipped (${error.message ?: "offline"})")
+                    vm.showStatusMessage(
+                        "On-device poll skipped (${formatErrorDetail(error, "offline")})"
+                    )
                 }
         } finally {
             vm.refreshLocalNetworkTier()
@@ -391,7 +402,17 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 }
                 .onFailure { error ->
                     if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
-                        vm.showStatusMessage("Sync offline (${error.message ?: "unreachable"})")
+                        val detail = formatErrorDetail(error, "unreachable")
+                        val banner =
+                            if (
+                                error is ProblemDetailsException &&
+                                    error.problemType == RocheProblemTypes.TOKEN_INVALID
+                            ) {
+                                detail
+                            } else {
+                                "Sync offline ($detail)"
+                            }
+                        vm.showStatusMessage(banner)
                     }
                 }
         } finally {
@@ -399,4 +420,11 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
             vm.transientState.update { it.copy(isSyncing = false) }
         }
     }
+
+    private fun formatErrorDetail(error: Throwable, fallback: String): String =
+        if (error is ProblemDetailsException) {
+            formatProblemDetailsMessage(error)
+        } else {
+            error.message?.takeIf { it.isNotBlank() } ?: fallback
+        }
 }

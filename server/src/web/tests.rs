@@ -2309,7 +2309,7 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
 
-    // 1. Standard form POST > 128 KiB with known body length is rejected with 413
+    // 1. Standard form POST > 128 KiB with known body length is rejected with HTML 413 + security headers
     let big_summary = "a".repeat(140 * 1024);
     let oversized_regular = post_form(
         &app,
@@ -2319,8 +2319,17 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
     )
     .await;
     assert_eq!(oversized_regular.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized_regular.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(oversized_regular.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(oversized_regular.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
+    let oversized_html = read_body_html(oversized_regular).await;
+    assert!(oversized_html.contains("<!doctype html>"));
+    assert!(oversized_html.contains("Payload Too Large"));
 
-    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB
+    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB with HTML 413
     let raw_form =
         encode_form(&[("_csrf", &csrf), ("title", "Streamed"), ("summary", &big_summary)]);
     let stream_body =
@@ -2339,6 +2348,12 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
         .await
         .unwrap();
     assert_eq!(streamed_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        streamed_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let streamed_html = read_body_html(streamed_resp).await;
+    assert!(streamed_html.contains("Payload Too Large"));
 
     // 3. Authenticated OPML upload > 128 KiB (within 4 MiB) is accepted
     let padding = " ".repeat(160 * 1024);

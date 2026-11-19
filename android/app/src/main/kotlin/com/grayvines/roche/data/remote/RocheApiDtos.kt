@@ -8,9 +8,55 @@ import com.grayvines.roche.data.SyncComparisonDto
 import com.grayvines.roche.data.SyncConsumptionLogDto
 import com.grayvines.roche.data.SyncEntryRecordDto
 import com.grayvines.roche.data.SyncTombstoneDto
+import java.io.IOException
 
-class ProblemDetailsException(val statusCode: Int, val title: String, val detail: String) :
-    Exception("$title ($statusCode): $detail")
+object RocheProblemTypes {
+    const val BLANK = "about:blank"
+    const val TOKEN_INVALID = "urn:roche:problem:token-invalid"
+    const val PAIRING_CODE_INVALID = "urn:roche:problem:pairing-code-invalid"
+    const val PAIRING_RATE_LIMITED = "urn:roche:problem:pairing-rate-limited"
+    const val PAYLOAD_TOO_LARGE = "urn:roche:problem:payload-too-large"
+    const val AMBIGUOUS_LOOKUP = "urn:roche:problem:ambiguous-lookup"
+    const val IMMUTABLE_COLLECTION = "urn:roche:problem:immutable-collection"
+    const val SSRF_BLOCKED = "urn:roche:problem:ssrf-blocked"
+    const val CONFLICT = "urn:roche:problem:conflict"
+}
+
+@Suppress("LongParameterList")
+class ProblemDetailsException(
+    val statusCode: Int,
+    val title: String,
+    val detail: String,
+    val problemType: String = RocheProblemTypes.BLANK,
+    val retryAfterSeconds: Long? = null,
+    val maxBytes: Long? = null,
+    val candidates: List<String> = emptyList(),
+) : Exception("$title ($statusCode): $detail")
+
+class ApiProtocolException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
+class HttpStatusException(val statusCode: Int, message: String = "HTTP $statusCode") :
+    IOException(message)
+
+class ResponseTooLargeException(
+    val maxBytes: Long,
+    message: String = "Response exceeds maximum allowed size of $maxBytes bytes",
+) : IOException(message)
+
+fun formatProblemDetailsMessage(error: ProblemDetailsException): String =
+    when (error.problemType) {
+        RocheProblemTypes.TOKEN_INVALID -> "Device token revoked or expired — re-pair in Settings"
+        RocheProblemTypes.PAIRING_RATE_LIMITED ->
+            error.retryAfterSeconds
+                ?.takeIf { it > 0L }
+                ?.let { seconds -> "Too many pairing attempts. Try again in ${seconds}s" }
+                ?: "Too many pairing attempts. Try again shortly"
+        RocheProblemTypes.PAIRING_CODE_INVALID ->
+            "Pairing code is invalid or expired — generate a new code on the server"
+        RocheProblemTypes.SSRF_BLOCKED ->
+            error.detail.ifBlank { error.message ?: "URL blocked by server security policy" }
+        else -> error.detail.ifBlank { error.message ?: "${error.title} (${error.statusCode})" }
+    }
 
 @Suppress("LongParameterList")
 data class RemoteFeedDto(

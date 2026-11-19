@@ -6,9 +6,10 @@ import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.ResponseTooLargeException
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.RocheProblemTypes
 import com.grayvines.roche.data.settings.Settings
-import java.io.IOException
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.Dispatchers
@@ -19,6 +20,7 @@ import kotlinx.coroutines.withContext
 
 internal const val MAX_DELTA_CONTINUATION_PAGES = 20
 internal const val FLAG_LOCAL_THROUGHPUT_WEIGHT = "local_throughput_weight"
+internal const val MIN_SERVER_PAYLOAD_BYTES = 1_024
 private const val MAX_OVERFLOW_PUSH_ROUNDS = 25
 private const val HTTP_PAYLOAD_TOO_LARGE = 413
 private const val COOPERATIVE_POLL_SLICE_SIZE = 4
@@ -40,6 +42,7 @@ internal data class SinglePeerSyncResult(
     val sentEntryIds: Set<String> = emptySet(),
     val byteOverflowEntryIds: Set<String> = emptySet(),
     val droppedEntryIdsOn413: Set<String> = emptySet(),
+    val serverMaxPayloadBytes: Long? = null,
 ) {
     val droppedEntriesOn413: Boolean
         get() = droppedEntryIdsOn413.isNotEmpty()
@@ -74,6 +77,12 @@ internal class PeerSyncCoordinator(
     private data class SyncCycleOutcome(
         val settings: Settings,
         val latestPeers: List<PeerNodeDto>,
+    )
+
+    private data class SyncRoundCallResult(
+        val response: PeerSyncResponseDto,
+        val retriedRequestAfter413: PeerSyncRequestDto? = null,
+        val serverMaxPayloadBytes: Long? = null,
     )
 
     private suspend fun syncAndPollInternal(
@@ -156,9 +165,7 @@ internal class PeerSyncCoordinator(
         workingSettings =
             drainOverflowEntryPushes(
                 initialSettings = workingSettings,
-                initialSentIds = initialRound.sentEntryIds,
-                initialOverflowIds = initialRound.byteOverflowEntryIds,
-                initialDroppedEntryIdsOn413 = initialRound.droppedEntryIdsOn413,
+                initialRound = initialRound,
                 weightOverride = weightOverride,
             ) { peers ->
                 latestPeers = peers
@@ -246,6 +253,7 @@ internal class PeerSyncCoordinator(
         return response
     }
 
+    @Suppress("LongParameterList")
     private class OverflowDrainState(
         var settings: Settings,
         val alreadySentIds: MutableSet<String>,
@@ -253,6 +261,7 @@ internal class PeerSyncCoordinator(
         var remainingIds: Set<String>,
         var maxPayloadBytes: Int,
         var maxEntries: Int,
+        var serverMaxPayloadBytes: Int?,
     ) {
         fun updateAfterRound(
             nextRound: SinglePeerSyncResult,
@@ -260,17 +269,22 @@ internal class PeerSyncCoordinator(
             prevMaxPayloadBytes: Int,
             prevMaxEntries: Int,
         ): Boolean {
+            updateServerPayloadCap(nextRound.serverMaxPayloadBytes)
             val dropped = nextRound.droppedEntryIdsOn413
             return when {
                 dropped.size == 1 -> {
                     quarantinedIds.addAll(dropped)
-                    maxPayloadBytes = MAX_PEER_SYNC_PAYLOAD_BYTES
+                    maxPayloadBytes = serverMaxPayloadBytes ?: MAX_PEER_SYNC_PAYLOAD_BYTES
                     maxEntries = MAX_PEER_SYNC_ENTRIES
                     remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
                     remainingIds.isNotEmpty()
                 }
                 dropped.size > 1 -> {
-                    maxPayloadBytes = (maxPayloadBytes / 2).coerceAtLeast(1)
+                    maxPayloadBytes =
+                        compute413RetryPayloadBudget(
+                            currentBudget = maxPayloadBytes,
+                            serverMaxBytes = nextRound.serverMaxPayloadBytes,
+                        )
                     maxEntries = minOf(maxEntries, dropped.size / 2).coerceAtLeast(1)
                     remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
                     remainingIds.isNotEmpty() && (prevMaxPayloadBytes > 1 || prevMaxEntries > 1)
@@ -282,27 +296,39 @@ internal class PeerSyncCoordinator(
             }
         }
 
+        private fun updateServerPayloadCap(reportedMaxBytes: Long?) {
+            val normalized = clampServerMaxPayloadBytes(reportedMaxBytes) ?: return
+            serverMaxPayloadBytes =
+                serverMaxPayloadBytes?.let { existing -> minOf(existing, normalized) } ?: normalized
+        }
+
         companion object {
             fun create(
                 initialSettings: Settings,
-                initialSentIds: Set<String>,
-                initialOverflowIds: Set<String>,
-                initialDroppedEntryIdsOn413: Set<String>,
+                initialRound: SinglePeerSyncResult,
             ): OverflowDrainState {
-                val alreadySentIds = initialSentIds.toMutableSet()
+                val alreadySentIds = initialRound.sentEntryIds.toMutableSet()
                 val quarantinedIds = LinkedHashSet<String>()
-                var maxPayloadBytes = MAX_PEER_SYNC_PAYLOAD_BYTES
+                val initialServerCap =
+                    clampServerMaxPayloadBytes(initialRound.serverMaxPayloadBytes)
+                var maxPayloadBytes = initialServerCap ?: MAX_PEER_SYNC_PAYLOAD_BYTES
                 var maxEntries = MAX_PEER_SYNC_ENTRIES
+                val initialDropped = initialRound.droppedEntryIdsOn413
                 when {
-                    initialDroppedEntryIdsOn413.size == 1 -> {
-                        quarantinedIds.addAll(initialDroppedEntryIdsOn413)
+                    initialDropped.size == 1 -> {
+                        quarantinedIds.addAll(initialDropped)
                     }
-                    initialDroppedEntryIdsOn413.size > 1 -> {
-                        maxPayloadBytes = (MAX_PEER_SYNC_PAYLOAD_BYTES / 2).coerceAtLeast(1)
-                        maxEntries = (initialDroppedEntryIdsOn413.size / 2).coerceAtLeast(1)
+                    initialDropped.size > 1 -> {
+                        maxPayloadBytes =
+                            compute413RetryPayloadBudget(
+                                currentBudget = MAX_PEER_SYNC_PAYLOAD_BYTES,
+                                serverMaxBytes = initialRound.serverMaxPayloadBytes,
+                            )
+                        maxEntries = (initialDropped.size / 2).coerceAtLeast(1)
                     }
                 }
-                val remainingIds = initialOverflowIds - alreadySentIds - quarantinedIds
+                val remainingIds =
+                    initialRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
                 return OverflowDrainState(
                     settings = initialSettings,
                     alreadySentIds = alreadySentIds,
@@ -310,27 +336,19 @@ internal class PeerSyncCoordinator(
                     remainingIds = remainingIds,
                     maxPayloadBytes = maxPayloadBytes,
                     maxEntries = maxEntries,
+                    serverMaxPayloadBytes = initialServerCap,
                 )
             }
         }
     }
 
-    @Suppress("LongParameterList")
     private suspend fun drainOverflowEntryPushes(
         initialSettings: Settings,
-        initialSentIds: Set<String>,
-        initialOverflowIds: Set<String>,
-        initialDroppedEntryIdsOn413: Set<String>,
+        initialRound: SinglePeerSyncResult,
         weightOverride: Double?,
         onPagePeers: (List<PeerNodeDto>) -> Unit,
     ): Settings {
-        val state =
-            OverflowDrainState.create(
-                initialSettings = initialSettings,
-                initialSentIds = initialSentIds,
-                initialOverflowIds = initialOverflowIds,
-                initialDroppedEntryIdsOn413 = initialDroppedEntryIdsOn413,
-            )
+        val state = OverflowDrainState.create(initialSettings, initialRound)
         var roundIdx = 0
         var keepDraining = state.remainingIds.isNotEmpty()
         while (keepDraining && roundIdx < MAX_OVERFLOW_PUSH_ROUNDS) {
@@ -401,8 +419,9 @@ internal class PeerSyncCoordinator(
                         maxEntries = maxEntries,
                     ),
             )
-        val (response, retriedRequestAfter413) =
-            callSyncPeerRound(currentSettings, tracked.request) ?: return null
+        val roundCall = callSyncPeerRound(currentSettings, tracked.request) ?: return null
+        val response = roundCall.response
+        val retriedRequestAfter413 = roundCall.retriedRequestAfter413
         if (response.resetRequired) {
             return SinglePeerSyncResult(response = response)
         }
@@ -426,6 +445,7 @@ internal class PeerSyncCoordinator(
             sentEntryIds = effectiveTracked.sentEntryIds,
             byteOverflowEntryIds = effectiveTracked.byteOverflowEntryIds,
             droppedEntryIdsOn413 = droppedEntryIdsOn413,
+            serverMaxPayloadBytes = roundCall.serverMaxPayloadBytes,
         )
     }
 
@@ -457,7 +477,7 @@ internal class PeerSyncCoordinator(
     private suspend fun callSyncPeerRound(
         currentSettings: Settings,
         request: PeerSyncRequestDto,
-    ): Pair<PeerSyncResponseDto, PeerSyncRequestDto?>? {
+    ): SyncRoundCallResult? {
         val primary = runSuspendCatching {
             apiClient.syncPeer(
                 serverUrl = currentSettings.serverUrl,
@@ -466,12 +486,12 @@ internal class PeerSyncCoordinator(
             )
         }
         val error = primary.exceptionOrNull()
+        val payloadProblem = (error as? ProblemDetailsException)?.takeIf(::isPayloadTooLargeProblem)
         return when {
             error == null -> {
-                primary.getOrNull()?.let { it to null }
+                primary.getOrNull()?.let { SyncRoundCallResult(response = it) }
             }
-            (error as? ProblemDetailsException)?.statusCode == HTTP_PAYLOAD_TOO_LARGE &&
-                request.entries.isNotEmpty() -> {
+            payloadProblem != null && request.entries.isNotEmpty() -> {
                 val strippedRequest = stripEntriesFor413Retry(request)
                 apiClient
                     .syncPeer(
@@ -479,7 +499,13 @@ internal class PeerSyncCoordinator(
                         token = currentSettings.bearerToken,
                         request = strippedRequest,
                     )
-                    ?.let { it to strippedRequest }
+                    ?.let {
+                        SyncRoundCallResult(
+                            response = it,
+                            retriedRequestAfter413 = strippedRequest,
+                            serverMaxPayloadBytes = payloadProblem.maxBytes,
+                        )
+                    }
             }
             request.sinceSeq == 0L && isOversizedResponseError(error) -> {
                 null
@@ -637,6 +663,22 @@ internal suspend fun pollCooperativeSlice(
         .filterNotNull()
 }
 
+internal fun isPayloadTooLargeProblem(error: ProblemDetailsException): Boolean =
+    error.problemType == RocheProblemTypes.PAYLOAD_TOO_LARGE ||
+        error.statusCode == HTTP_PAYLOAD_TOO_LARGE
+
+internal fun clampServerMaxPayloadBytes(serverMaxBytes: Long?): Int? =
+    serverMaxBytes
+        ?.takeIf { it > 0L }
+        ?.coerceIn(MIN_SERVER_PAYLOAD_BYTES.toLong(), MAX_PEER_SYNC_PAYLOAD_BYTES.toLong())
+        ?.toInt()
+
+internal fun compute413RetryPayloadBudget(currentBudget: Int, serverMaxBytes: Long?): Int {
+    val halved = (currentBudget / 2).coerceAtLeast(1)
+    return clampServerMaxPayloadBytes(serverMaxBytes)?.let { cap ->
+        minOf(halved, cap).coerceAtLeast(1)
+    } ?: halved
+}
+
 internal fun isOversizedResponseError(error: Throwable): Boolean =
-    error is IOException &&
-        error.message?.contains("exceeds maximum allowed size", ignoreCase = true) == true
+    error is ResponseTooLargeException

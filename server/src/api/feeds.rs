@@ -11,14 +11,13 @@ use serde::Deserialize;
 use crate::{
     db::{Feed, FeedType, ItemFilter, ItemPage},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
-    feeds::FeedSource,
     scheduler::FeedFetcher,
-    service::{ExportBundle, RocheService},
+    service::{ExportBundle, FeedService, RocheService},
 };
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateFeedRequest {
-    url: FeedSource,
+    url: String,
     #[serde(default)]
     feed_type: FeedType,
     title: Option<String>,
@@ -48,9 +47,10 @@ pub(super) async fn feeds_create<F: FeedFetcher>(
     State(service): State<Arc<RocheService<F>>>,
     ProblemJson(req): ProblemJson<CreateFeedRequest>,
 ) -> Result<(StatusCode, Json<Feed>), ApiError> {
+    let source = FeedService::<F>::parse_source(&req.url)?;
     let feed = service
         .feeds()
-        .create(req.feed_type, req.url, req.title.as_deref(), req.description.as_deref())
+        .create(req.feed_type, source, req.title.as_deref(), req.description.as_deref())
         .await?;
     Ok((StatusCode::CREATED, Json(feed)))
 }

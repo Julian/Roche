@@ -5,7 +5,7 @@ pub use super::{
         resolve_pdf_url,
     },
     html::{ExtractedSnapshot, HtmlSanitizer, MAX_SUMMARY_CHARS},
-    http::{SafeDnsResolver, SafeHttpClient},
+    http::{SafeDnsResolver, SafeHttpClient, SsrfBlockedError},
 };
 
 #[cfg(test)]

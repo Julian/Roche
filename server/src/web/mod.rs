@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Request},
-    http::{HeaderValue, header},
+    http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -147,8 +147,7 @@ async fn serve_js() -> Response {
 
 const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: http: data:; media-src 'self' https: http:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'sameorigin'";
 
-async fn attach_web_security_headers(req: Request, next: Next) -> Response {
-    let mut resp = next.run(req).await;
+fn apply_web_security_headers(resp: &mut Response) {
     let headers = resp.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("SAMEORIGIN"));
@@ -164,5 +163,38 @@ async fn attach_web_security_headers(req: Request, next: Next) -> Response {
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
     }
+}
+
+/// Renders a browser-friendly HTML 404 page with full web security headers.
+#[must_use]
+pub fn render_not_found_html() -> Response {
+    let mut resp = html::render_error_page(
+        StatusCode::NOT_FOUND,
+        "Not Found",
+        "The requested page could not be found.",
+        None,
+    );
+    apply_web_security_headers(&mut resp);
+    resp
+}
+
+async fn attach_web_security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let is_html = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/html"));
+        if !is_html {
+            resp = html::render_error_page(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload Too Large",
+                "The submitted request exceeded the maximum allowed size.",
+                None,
+            );
+        }
+    }
+    apply_web_security_headers(&mut resp);
     resp
 }
