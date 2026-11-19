@@ -15,9 +15,9 @@ use crate::{
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, content_type_label, esc, redirect_see_other,
-            redirect_with_flash, render_inline_csrf_form, render_page, safe_local_redirect,
-            urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, content_type_label, esc, parse_csv_list,
+            redirect_see_other, redirect_with_flash, render_inline_csrf_form, render_page,
+            safe_local_redirect, urlencode, web_api_error_response,
         },
     },
 };
@@ -37,17 +37,16 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         ItemStatusFilter::Archived => "archived",
         ItemStatusFilter::Unread => "unread",
     };
-    let content_type = match q.kind.as_deref() {
-        Some("article") => Some(ContentType::Article),
-        Some("audio") => Some(ContentType::Audio),
-        Some("video") => Some(ContentType::Video),
-        Some("paper") => Some(ContentType::Paper),
-        _ => None,
+    let (content_type, clean_kind) = match q.kind.as_deref().map(str::trim) {
+        Some("article") => (Some(ContentType::Article), Some("article")),
+        Some("audio") => (Some(ContentType::Audio), Some("audio")),
+        Some("video") => (Some(ContentType::Video), Some("video")),
+        Some("paper") => (Some(ContentType::Paper), Some("paper")),
+        _ => (None, None),
     };
     let clean_feed = q.feed.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_tag = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let clean_search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let clean_kind = q.kind.as_deref().filter(|s| !s.is_empty());
     let page_num = q.page.unwrap_or(1).max(1);
     let filter = ItemFilter {
         status: Some(status_filter),
@@ -80,19 +79,18 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
     let return_url = build_inbox_href(&nav_ctx);
 
     let mut body = String::with_capacity(8_192);
-    let _ = writeln!(
-        body,
-        "<div class=\"page-head\">\
-           <h2>Feed Inbox</h2>\
-           <form method=\"post\" action=\"/web/feeds/refresh-all\" class=\"inline-form\">\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-             <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-             <button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>\
-           </form>\
-         </div>\n\
-         <p class=\"lede\">Read-only chronological stream from your subscribed feeds. Save standalone links or PDFs to <a href=\"/\">Want to Read</a>.</p>",
-        csrf = esc(&session.csrf_token),
-        ret = esc(&return_url),
+    body.push_str("<div class=\"page-head\"><h2>Feed Inbox</h2>");
+    render_inline_csrf_form(
+        &mut body,
+        "/web/feeds/refresh-all",
+        &session.csrf_token,
+        &[("return_to", &return_url)],
+        None,
+        "<button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>",
+    );
+    body.push_str(
+        "</div>\n\
+         <p class=\"lede\">Read-only chronological stream from your subscribed feeds. Save standalone links or PDFs to <a href=\"/\">Want to Read</a>.</p>\n",
     );
     render_inbox_filter_bar(&mut body, &nav_ctx, feed_label.as_deref(), tag_label.as_deref());
     render_inbox_batch_controls(&mut body, &session.csrf_token, &nav_ctx, &page.items, &return_url);
@@ -195,78 +193,33 @@ fn render_inbox_filter_bar(
 ) {
     out.push_str("<div class=\"pill-bar\">\n");
     for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
-        let is_cur = p.status == slug;
-        let cls = if is_cur { "pill is-active" } else { "pill" };
-        let aria_cur = if is_cur { " aria-current=\"page\"" } else { "" };
+        let attrs = if p.status == slug {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
         let href = build_inbox_href(&InboxNavParams { status: slug, page: 1, ..*p });
-        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\"{aria_cur}>{label}</a>", esc(&href));
+        let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
     for (k_slug, label) in
         [("article", "Articles"), ("audio", "Audio"), ("video", "Video"), ("paper", "Papers")]
     {
         let is_cur = p.kind == Some(k_slug);
-        let cls = if is_cur { "pill is-active" } else { "pill" };
-        let aria_cur = if is_cur { " aria-current=\"page\"" } else { "" };
+        let attrs = if is_cur {
+            "class=\"pill is-active\" aria-current=\"true\""
+        } else {
+            "class=\"pill\""
+        };
         let next_kind = if is_cur { None } else { Some(k_slug) };
         let href = build_inbox_href(&InboxNavParams { kind: next_kind, page: 1, ..*p });
-        let _ = writeln!(out, "<a class=\"{cls}\" href=\"{}\"{aria_cur}>{label}</a>", esc(&href));
+        let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
     out.push_str("</div>\n");
 
     let has_active_filters =
         p.feed.is_some() || p.tag.is_some() || p.kind.is_some() || p.q.is_some();
     if has_active_filters {
-        out.push_str("<div class=\"pill-bar active-filters\">\n");
-        if let Some(label) = feed_label {
-            let clear_href = build_inbox_href(&InboxNavParams { feed: None, page: 1, ..*p });
-            let _ = writeln!(
-                out,
-                "<a class=\"pill is-active\" href=\"{}\">Feed: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear feed filter)</span></a>",
-                esc(&clear_href),
-                esc(label),
-            );
-        }
-        if let Some(label) = tag_label {
-            let clear_href = build_inbox_href(&InboxNavParams { tag: None, page: 1, ..*p });
-            let _ = writeln!(
-                out,
-                "<a class=\"pill is-active\" href=\"{}\">Tag: #{} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear tag filter)</span></a>",
-                esc(&clear_href),
-                esc(label),
-            );
-        }
-        if let Some(k) = p.kind {
-            let clear_href = build_inbox_href(&InboxNavParams { kind: None, page: 1, ..*p });
-            let _ = writeln!(
-                out,
-                "<a class=\"pill is-active\" href=\"{}\">Kind: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear kind filter)</span></a>",
-                esc(&clear_href),
-                esc(k),
-            );
-        }
-        if let Some(search) = p.q {
-            let clear_href = build_inbox_href(&InboxNavParams { q: None, page: 1, ..*p });
-            let _ = writeln!(
-                out,
-                "<a class=\"pill is-active\" href=\"{}\">Search: &ldquo;{}&rdquo; <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear search filter)</span></a>",
-                esc(&clear_href),
-                esc(search),
-            );
-        }
-        let reset_href = build_inbox_href(&InboxNavParams {
-            status: p.status,
-            kind: None,
-            feed: None,
-            tag: None,
-            q: None,
-            page: 1,
-        });
-        let _ = writeln!(
-            out,
-            "<a class=\"btn btn-small btn-ghost\" href=\"{}\">Clear filters</a>",
-            esc(&reset_href),
-        );
-        out.push_str("</div>\n");
+        render_inbox_active_filters(out, p, feed_label, tag_label);
     }
 
     let _ = writeln!(
@@ -291,6 +244,65 @@ fn render_inbox_filter_bar(
          </form>\n",
         esc(p.q.unwrap_or("")),
     );
+}
+
+fn render_inbox_active_filters(
+    out: &mut String,
+    p: &InboxNavParams<'_>,
+    feed_label: Option<&str>,
+    tag_label: Option<&str>,
+) {
+    out.push_str("<div class=\"pill-bar active-filters\">\n");
+    if let Some(label) = feed_label {
+        let clear_href = build_inbox_href(&InboxNavParams { feed: None, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<a class=\"pill is-active\" href=\"{}\">Feed: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear feed filter)</span></a>",
+            esc(&clear_href),
+            esc(label),
+        );
+    }
+    if let Some(label) = tag_label {
+        let clear_href = build_inbox_href(&InboxNavParams { tag: None, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<a class=\"pill is-active\" href=\"{}\">Tag: #{} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear tag filter)</span></a>",
+            esc(&clear_href),
+            esc(label),
+        );
+    }
+    if let Some(k) = p.kind {
+        let clear_href = build_inbox_href(&InboxNavParams { kind: None, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<a class=\"pill is-active\" href=\"{}\">Kind: {} <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear kind filter)</span></a>",
+            esc(&clear_href),
+            esc(k),
+        );
+    }
+    if let Some(search) = p.q {
+        let clear_href = build_inbox_href(&InboxNavParams { q: None, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<a class=\"pill is-active\" href=\"{}\">Search: &ldquo;{}&rdquo; <span aria-hidden=\"true\">&times;</span><span class=\"sr-only\"> (clear search filter)</span></a>",
+            esc(&clear_href),
+            esc(search),
+        );
+    }
+    let reset_href = build_inbox_href(&InboxNavParams {
+        status: p.status,
+        kind: None,
+        feed: None,
+        tag: None,
+        q: None,
+        page: 1,
+    });
+    let _ = writeln!(
+        out,
+        "<a class=\"btn btn-small btn-ghost\" href=\"{}\">Clear filters</a>",
+        esc(&reset_href),
+    );
+    out.push_str("</div>\n");
 }
 
 fn render_inbox_batch_controls(
@@ -432,9 +444,9 @@ pub(in crate::web) async fn starred_get<F: FeedFetcher>(
     Query(flash): Query<FlashQuery>,
 ) -> Response {
     if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
-        redirect_see_other(&format!("/lists/starred?err={}", urlencode(err)))
+        redirect_with_flash("/lists/starred", "err", err)
     } else if let Some(notice) = flash.notice.as_deref().filter(|s| !s.is_empty()) {
-        redirect_see_other(&format!("/lists/starred?notice={}", urlencode(notice)))
+        redirect_with_flash("/lists/starred", "notice", notice)
     } else {
         redirect_see_other("/lists/starred")
     }
@@ -458,9 +470,7 @@ pub(in crate::web) async fn post_item_save<F: FeedFetcher>(
     let Ok(parsed_url) = Url::parse(&normalized) else {
         return redirect_with_flash(&fallback_err_dest, "err", "Please enter a valid http(s) URL");
     };
-    let tags: Vec<String> = form.tags.as_deref().map_or_default(|s| {
-        s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(ToOwned::to_owned).collect()
-    });
+    let tags = parse_csv_list(form.tags.as_deref());
 
     match service.items().save(&parsed_url, form.title.as_deref(), &tags).await {
         Ok(saved) => {
@@ -483,9 +493,7 @@ pub(in crate::web) async fn post_item_archive_batch<F: FeedFetcher>(
     Extension(session): Extension<WebSession>,
     Form(form): Form<ArchiveBatchForm>,
 ) -> Response {
-    let explicit_ids: Vec<String> = form.ids.as_deref().map_or_default(|raw| {
-        raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect()
-    });
+    let explicit_ids = parse_csv_list(form.ids.as_deref());
     let feed_id = form.feed_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let batch_res = if explicit_ids.is_empty() {
         service.items().archive_batch(&[], feed_id, true).await

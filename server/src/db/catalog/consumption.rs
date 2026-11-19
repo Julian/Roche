@@ -270,6 +270,8 @@ impl CatalogRepo<'_> {
         now: DateTime<Utc>,
         advance_generators: bool,
     ) -> CatalogResult<()> {
+        SyncRepo::clear_tombstone(tx, ActivityEntityType::ConsumptionLog, log_id).await?;
+
         sqlx::query!(
             "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
              VALUES (?, ?, ?, ?, ?, ?)
@@ -386,6 +388,7 @@ impl CatalogRepo<'_> {
             .execute(&mut *tx)
             .await?;
             if res.rows_affected() > 0 {
+                SyncRepo::clear_tombstone(tx, ActivityEntityType::ConsumptionLog, &log_id).await?;
                 SyncRepo::record_activity(
                     tx,
                     ActivityEntityType::ConsumptionLog,

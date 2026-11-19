@@ -37,6 +37,7 @@ internal suspend fun reconcilePeerSyncResponse(
     catalogStore?.ensureSystemSeeded()
     val serverNode = response.serverPeerId.ifBlank { SERVER_PEER_ID }
     val nowIso = response.syncTimestamp.ifBlank { nowUtcIso() }
+    val syncNowMs = System.currentTimeMillis()
     val allRemoteHlcs = collectResponseHlcs(response)
 
     val runTx: suspend () -> Unit = {
@@ -46,18 +47,22 @@ internal suspend fun reconcilePeerSyncResponse(
                 dao = dao,
                 nodeId = localPeerId.ifBlank { DEFAULT_LOCAL_HLC_NODE },
                 remoteHlcValues = allRemoteHlcs,
+                nowMs = syncNowMs,
             )
             acknowledgeSentDirtyRows(dao, sentBatch)
-            applyIncomingTombstonesInTx(dao, response.tombstones, serverNode, nowIso)
-            val redirects = mergeIncomingEntriesInTx(dao, response.entries, serverNode, nowIso)
+            applyIncomingTombstonesInTx(dao, response.tombstones, serverNode, nowIso, syncNowMs)
+            val mergedEntries =
+                mergeIncomingEntriesInTx(dao, response, serverNode, nowIso, syncNowMs)
             mergeIncomingGraphEdgesInTx(
                 dao = dao,
                 catalogStore = catalogStore,
                 response = response,
-                redirects = redirects,
+                redirects = mergedEntries.redirects,
+                suppressedEntryIds = mergedEntries.suppressedEntryIds,
                 serverNode = serverNode,
                 localPeerId = localPeerId.ifBlank { DEFAULT_LOCAL_HLC_NODE },
                 nowIso = nowIso,
+                nowMs = syncNowMs,
             )
         }
     }
@@ -126,18 +131,23 @@ private const val TOMBSTONE_ENTITY_ENTRY = "entry"
 private const val TOMBSTONE_ENTITY_FEED = "feed"
 private const val TOMBSTONE_ENTITY_ITEM = "item"
 private const val TOMBSTONE_ENTITY_TAG = "tag"
+private const val INBOX_STATE_UNREAD = "unread"
+private const val INBOX_STATE_DISMISSED = "dismissed"
+private const val INBOX_STATE_NONE = "none"
 internal const val TOMBSTONE_ENTITY_COLLECTION_GENERATOR = "collection_generator"
+internal const val TOMBSTONE_ENTITY_CONSUMPTION_LOG = "consumption_log"
 
 private suspend fun applyIncomingTombstonesInTx(
     dao: RocheDao,
     tombstones: List<SyncTombstoneDto>,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     for (tomb in tombstones) {
         val rawKey = tomb.naturalKey.trim()
         if (rawKey.isEmpty()) continue
-        val tombHlc = resolveOrSynthesizeHlc(tomb.hlc, tomb.deletedAt, nowIso, serverNode)
+        val tombHlc = resolveOrSynthesizeHlc(tomb.hlc, tomb.deletedAt, nowIso, serverNode, nowMs)
         val deletedAt = tomb.deletedAt.ifBlank { nowIso }
         when (tomb.entityType.trim().lowercase()) {
             TOMBSTONE_ENTITY_FEED -> applyFeedTombstone(dao, rawKey, deletedAt, tombHlc)
@@ -147,7 +157,9 @@ private suspend fun applyIncomingTombstonesInTx(
             COLLECTION_ENTRY_ENTITY ->
                 applyCollectionEntryTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COLLECTION_GENERATOR ->
-                applyCollectionGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
+                applyGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
+            TOMBSTONE_ENTITY_CONSUMPTION_LOG ->
+                applyConsumptionLogTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
         }
     }
@@ -169,7 +181,11 @@ private suspend fun applyFeedTombstone(
         val entryHlc = dao.getEntryById(match.collectionId)?.hlc.orEmpty()
         val liveHlc = maxOf(match.hlc, entryHlc)
         if (liveHlc > tombHlc) return
-        dao.deleteFeedPreservingHistory(match.collectionId, recordTombstones = false)
+        dao.deleteFeedPreservingHistory(
+            feedId = match.collectionId,
+            recordTombstones = false,
+            hlcOverride = tombHlc,
+        )
     }
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_FEED, canonKey, deletedAt, tombHlc)
 }
@@ -211,7 +227,11 @@ private suspend fun applyItemTombstone(
 
     if (candidates.any { statesById[it.id]?.hlc.orEmpty() > tombHlc }) return
     for (cand in candidates) {
-        dao.deleteItemPreservingHistory(cand.id, recordTombstones = false)
+        dao.deleteItemPreservingHistory(
+            itemId = cand.id,
+            recordTombstones = false,
+            hlcOverride = tombHlc,
+        )
     }
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_ITEM, canonKey, deletedAt, tombHlc)
 }
@@ -228,9 +248,9 @@ private fun doesInboxEntryMatchTombstone(
 ): Boolean {
     val validInboxState =
         state != null &&
-            (state.inboxState == "unread" ||
-                state.inboxState == "dismissed" ||
-                (canonFeed == null && state.inboxState == "none"))
+            (state.inboxState == INBOX_STATE_UNREAD ||
+                state.inboxState == INBOX_STATE_DISMISSED ||
+                canonFeed == null && state.inboxState == INBOX_STATE_NONE)
     if (!validInboxState) return false
     val entryFeeds = entryColIds.mapNotNull { feedUrlsByColId[it] }
     if (entry.id == detId) {
@@ -297,7 +317,7 @@ private suspend fun applyCollectionEntryTombstone(
     upsertCleanTombstone(dao, COLLECTION_ENTRY_ENTITY, canonKey, deletedAt, tombHlc)
 }
 
-private suspend fun applyCollectionGeneratorTombstone(
+private suspend fun applyGeneratorTombstone(
     dao: RocheDao,
     rawKey: String,
     deletedAt: String,
@@ -309,6 +329,20 @@ private suspend fun applyCollectionGeneratorTombstone(
     if (existing != null && existing.hlc > tombHlc) return
     dao.deleteCollectionGenerator(colId)
     upsertCleanTombstone(dao, TOMBSTONE_ENTITY_COLLECTION_GENERATOR, colId, deletedAt, tombHlc)
+}
+
+private suspend fun applyConsumptionLogTombstone(
+    dao: RocheDao,
+    rawKey: String,
+    deletedAt: String,
+    tombHlc: String,
+) {
+    val logId = rawKey.trim()
+    if (logId.isEmpty()) return
+    val existing = dao.getConsumptionLogById(logId)
+    if (existing != null && existing.hlc > tombHlc) return
+    dao.deleteConsumptionLogById(logId)
+    upsertCleanTombstone(dao, TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId, deletedAt, tombHlc)
 }
 
 private suspend fun applyEntryTombstone(
@@ -355,59 +389,184 @@ internal suspend fun upsertCleanTombstone(
     )
 }
 
+private enum class ItemTombstoneAction {
+    ALLOW,
+    SUPPRESS_INBOX_ONLY,
+    SUPPRESS_ENTRY,
+}
+
+private data class MergedIncomingEntriesResult(
+    val redirects: Map<String, String>,
+    val suppressedEntryIds: Set<String>,
+)
+
+@Suppress("LongParameterList")
+private data class IncomingEntriesMergeCtx(
+    val tombstonesByKey: MutableMap<Pair<String, String>, TombstoneEntity>,
+    val itemDetIdToNatKey: Map<String, String>,
+    val parentFeedsByEntryId: Map<String, Set<String>>,
+    val incomingWtrEntryIds: Set<String>,
+    val incomingCatalogReferencedIds: Set<String>,
+    val idRemap: MutableMap<String, String>,
+    val suppressedEntryIds: MutableSet<String>,
+    val serverNode: String,
+    val nowIso: String,
+    val nowMs: Long,
+)
+
 private suspend fun mergeIncomingEntriesInTx(
     dao: RocheDao,
-    incoming: List<SyncEntryRecordDto>,
+    response: PeerSyncResponseDto,
     serverNode: String,
     nowIso: String,
-): Map<String, String> {
-    val idRemap = HashMap<String, String>()
+    nowMs: Long,
+): MergedIncomingEntriesResult {
+    val ctx = buildIncomingEntriesMergeCtx(dao, response, serverNode, nowIso, nowMs)
     val explicitMerges = ArrayList<Pair<String, String>>()
-    val tombstonesByKey =
-        dao.getAllTombstones()
-            .associateBy { it.entityType.lowercase() to it.naturalKey }
-            .toMutableMap()
 
-    for (rec in incoming) {
-        val mergedPair =
-            mergeSingleIncomingEntry(dao, rec, tombstonesByKey, idRemap, serverNode, nowIso)
+    for (rec in response.entries) {
+        val mergedPair = mergeSingleIncomingEntry(dao, rec, ctx)
         if (mergedPair != null) {
             explicitMerges.add(mergedPair)
         }
     }
     val allEntries = dao.getAllEntries()
     val mergeRedirects = buildMergeRedirectMap(allEntries)
-    val combinedRedirects = idRemap + mergeRedirects
+    val combinedRedirects = ctx.idRemap + mergeRedirects
     for ((dupId, rawCanonId) in explicitMerges) {
         val canonId = followMergedInMap(rawCanonId, combinedRedirects)
         if (canonId.isNotEmpty() && canonId != dupId) {
             foldMergedDuplicateInDao(dao, dupId, canonId, nowIso)
         }
     }
-    return combinedRedirects
+    return MergedIncomingEntriesResult(
+        redirects = combinedRedirects,
+        suppressedEntryIds = ctx.suppressedEntryIds,
+    )
+}
+
+private suspend fun buildIncomingEntriesMergeCtx(
+    dao: RocheDao,
+    response: PeerSyncResponseDto,
+    serverNode: String,
+    nowIso: String,
+    nowMs: Long,
+): IncomingEntriesMergeCtx {
+    val tombstonesByKey =
+        dao.getAllTombstones()
+            .associateBy { it.entityType.lowercase() to it.naturalKey }
+            .toMutableMap()
+    val feedUrlsByColId = buildFeedUrlLookup(dao, response.entries)
+    val parentFeedsByEntryId =
+        buildParentFeedUrlsByEntry(dao, response.collectionEntries, feedUrlsByColId)
+    val incomingWtrEntryIds =
+        response.collectionEntries
+            .filter { it.collectionId.trim() == WANT_TO_READ_COLLECTION_ID }
+            .mapTo(HashSet()) { it.entryId.trim() }
+    return IncomingEntriesMergeCtx(
+        tombstonesByKey = tombstonesByKey,
+        itemDetIdToNatKey = buildItemTombstoneDetIdMap(tombstonesByKey),
+        parentFeedsByEntryId = parentFeedsByEntryId,
+        incomingWtrEntryIds = incomingWtrEntryIds,
+        incomingCatalogReferencedIds = collectIncomingCatalogRefIds(response),
+        idRemap = HashMap(),
+        suppressedEntryIds = HashSet(),
+        serverNode = serverNode,
+        nowIso = nowIso,
+        nowMs = nowMs,
+    )
+}
+
+private fun buildItemTombstoneDetIdMap(
+    tombstonesByKey: Map<Pair<String, String>, TombstoneEntity>
+): Map<String, String> = buildMap {
+    for ((type, natKey) in tombstonesByKey.keys) {
+        if (type != TOMBSTONE_ENTITY_ITEM) continue
+        val parts = natKey.split('\u0000')
+        if (parts.size == 2) {
+            val canonFeed = if (parts[0] == "manual") null else canonicalizeSyncUrl(parts[0])
+            val canonItem = canonicalizeSyncUrl(parts[1])
+            put(deterministicItemId(canonFeed, canonItem), natKey)
+        }
+    }
+}
+
+private suspend fun buildFeedUrlLookup(
+    dao: RocheDao,
+    incomingEntries: List<SyncEntryRecordDto>,
+): Map<String, String> = buildMap {
+    for (src in dao.getAllFeedSources()) {
+        put(src.collectionId, canonicalizeSyncUrl(src.feedUrl))
+    }
+    for (rec in incomingEntries) {
+        val fs = rec.feedSource ?: continue
+        val cleanId = rec.id.trim()
+        val canonUrl = canonicalizeSyncUrl(fs.feedUrl)
+        if (cleanId.isNotEmpty() && canonUrl.isNotEmpty()) {
+            put(cleanId, canonUrl)
+        }
+    }
+}
+
+private suspend fun buildParentFeedUrlsByEntry(
+    dao: RocheDao,
+    incomingMemberships: List<SyncCollectionEntryDto>,
+    feedUrlsByColId: Map<String, String>,
+): Map<String, Set<String>> {
+    val result = HashMap<String, MutableSet<String>>()
+    for (mem in dao.getAllCollectionEntries()) {
+        val feedUrl = feedUrlsByColId[mem.collectionId] ?: continue
+        result.getOrPut(mem.entryId) { HashSet() }.add(feedUrl)
+    }
+    for (ce in incomingMemberships) {
+        val feedUrl = feedUrlsByColId[ce.collectionId.trim()] ?: continue
+        val entryId = ce.entryId.trim()
+        if (entryId.isNotEmpty()) {
+            result.getOrPut(entryId) { HashSet() }.add(feedUrl)
+        }
+    }
+    return result
+}
+
+private fun collectIncomingCatalogRefIds(response: PeerSyncResponseDto): Set<String> = buildSet {
+    response.consumptionLog.forEach { log ->
+        log.entryId.trim().takeIf { it.isNotEmpty() }?.let(::add)
+    }
+    response.collectionGenerators.forEach { gen ->
+        gen.currentEntryId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+    }
+    response.comparisons.forEach { comp ->
+        comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+        comp.ordering.flatten().forEach { id -> id.trim().takeIf { it.isNotEmpty() }?.let(::add) }
+    }
 }
 
 private suspend fun mergeSingleIncomingEntry(
     dao: RocheDao,
     rec: SyncEntryRecordDto,
-    tombstonesByKey: MutableMap<Pair<String, String>, TombstoneEntity>,
-    idRemap: MutableMap<String, String>,
-    serverNode: String,
-    nowIso: String,
+    ctx: IncomingEntriesMergeCtx,
 ): Pair<String, String>? {
     val cleanTitle = rec.title.trim()
     val resolvedKind = EntryKind.fromWireValue(rec.kind)
     if (cleanTitle.isEmpty() && rec.feedSource == null) return null
 
     val entryHlc =
-        resolveOrSynthesizeHlc(rec.hlc, rec.updatedAt ?: rec.createdAt, nowIso, serverNode)
-    if (isSuppressedByTombstone(dao, rec, entryHlc, serverNode, nowIso, tombstonesByKey)) {
+        resolveOrSynthesizeHlc(
+            rec.hlc,
+            rec.updatedAt ?: rec.createdAt,
+            ctx.nowIso,
+            ctx.serverNode,
+            ctx.nowMs,
+        )
+    val itemAction = resolveEntrySuppression(dao, rec, entryHlc, ctx)
+    if (itemAction == ItemTombstoneAction.SUPPRESS_ENTRY) {
+        rec.id.trim().takeIf { it.isNotEmpty() }?.let { ctx.suppressedEntryIds.add(it) }
         return null
     }
     val targetId = resolveIncomingTargetEntryId(dao, rec, resolvedKind, cleanTitle)
     val rawId = rec.id.trim()
     if (rawId.isNotEmpty() && rawId != targetId) {
-        idRemap[rawId] = targetId
+        ctx.idRemap[rawId] = targetId
     }
     val mergedInto = rec.mergedIntoId?.trim()?.takeIf { it.isNotEmpty() && it != targetId }
 
@@ -421,63 +580,221 @@ private suspend fun mergeSingleIncomingEntry(
             mergedInto,
             entryHlc,
             existingEntry,
-            nowIso,
+            ctx.nowIso,
         )
     dao.upsertEntry(updatedEntry)
+    mergeIncomingEntrySubtables(
+        dao = dao,
+        targetId = targetId,
+        mergedInto = mergedInto,
+        resolvedKind = resolvedKind,
+        rec = rec,
+        updatedEntry = updatedEntry,
+        entryHlc = entryHlc,
+        itemAction = itemAction,
+        ctx = ctx,
+    )
+    return mergedInto?.let { targetId to it }
+}
 
+@Suppress("LongParameterList")
+private suspend fun mergeIncomingEntrySubtables(
+    dao: RocheDao,
+    targetId: String,
+    mergedInto: String?,
+    resolvedKind: EntryKind,
+    rec: SyncEntryRecordDto,
+    updatedEntry: EntryEntity,
+    entryHlc: String,
+    itemAction: ItemTombstoneAction,
+    ctx: IncomingEntriesMergeCtx,
+) {
     rec.collectionSpec?.let { specDto ->
         mergeIncomingSpecInDao(dao, targetId, specDto, resolvedKind)
     }
     rec.feedSource?.let { fsDto ->
-        mergeIncomingFeedSourceInDao(dao, targetId, fsDto, entryHlc, serverNode, nowIso)
+        mergeIncomingFeedSourceInDao(
+            dao,
+            targetId,
+            fsDto,
+            entryHlc,
+            ctx.serverNode,
+            ctx.nowIso,
+            ctx.nowMs,
+        )
     }
-    mergeContentAndStateInDao(
-        dao,
-        targetId,
-        rec,
-        updatedEntry,
-        entryHlc,
-        serverNode,
-        nowIso,
-    )
+    if (itemAction != ItemTombstoneAction.SUPPRESS_INBOX_ONLY) {
+        mergeContentAndStateInDao(
+            dao,
+            targetId,
+            rec,
+            updatedEntry,
+            entryHlc,
+            ctx.serverNode,
+            ctx.nowIso,
+            ctx.nowMs,
+        )
+    }
     mergeIncomingIdentifiersInDao(dao, targetId, mergedInto, resolvedKind, rec)
-
-    return mergedInto?.let { targetId to it }
 }
+
+private suspend fun resolveEntrySuppression(
+    dao: RocheDao,
+    rec: SyncEntryRecordDto,
+    entryHlc: String,
+    ctx: IncomingEntriesMergeCtx,
+): ItemTombstoneAction =
+    if (isSuppressedByTombstone(dao, rec, entryHlc, ctx)) {
+        ItemTombstoneAction.SUPPRESS_ENTRY
+    } else {
+        resolveItemTombstoneAction(dao, rec, entryHlc, ctx)
+    }
+
+private suspend fun resolveItemTombstoneAction(
+    dao: RocheDao,
+    rec: SyncEntryRecordDto,
+    entryHlc: String,
+    ctx: IncomingEntriesMergeCtx,
+): ItemTombstoneAction {
+    if (rec.feedSource != null || rec.collectionSpec != null) return ItemTombstoneAction.ALLOW
+    if (rec.state == null && rec.content == null) return ItemTombstoneAction.ALLOW
+    val rawId = rec.id.trim()
+    val parentFeeds = ctx.parentFeedsByEntryId[rawId].orEmpty()
+    val inboxState = rec.state?.inboxState?.trim()?.lowercase()
+    val eligibleForCheck =
+        parentFeeds.isEmpty() ||
+            inboxState == INBOX_STATE_UNREAD ||
+            inboxState == INBOX_STATE_DISMISSED ||
+            rec.content != null
+    val matchingTombs =
+        if (eligibleForCheck) {
+            findMatchingItemTombstones(rec, rawId, parentFeeds, ctx)
+        } else {
+            emptyList()
+        }
+    return if (matchingTombs.isEmpty()) {
+        ItemTombstoneAction.ALLOW
+    } else {
+        applyItemTombstoneDecision(dao, rec, entryHlc, matchingTombs, ctx)
+    }
+}
+
+private fun findMatchingItemTombstones(
+    rec: SyncEntryRecordDto,
+    rawId: String,
+    parentFeeds: Set<String>,
+    ctx: IncomingEntriesMergeCtx,
+): List<TombstoneEntity> {
+    val canonUrl = rec.url?.trim()?.takeIf { it.isNotEmpty() }?.let(::canonicalizeSyncUrl)
+    val keys = LinkedHashSet<String>()
+    if (canonUrl != null) {
+        if (parentFeeds.isEmpty()) {
+            keys.add(itemNaturalKey(null, canonUrl))
+        } else {
+            parentFeeds.forEach { feedUrl -> keys.add(itemNaturalKey(feedUrl, canonUrl)) }
+        }
+    }
+    ctx.itemDetIdToNatKey[rawId]?.let { keys.add(it) }
+    return keys.mapNotNull { key -> ctx.tombstonesByKey[TOMBSTONE_ENTITY_ITEM to key] }
+}
+
+private suspend fun applyItemTombstoneDecision(
+    dao: RocheDao,
+    rec: SyncEntryRecordDto,
+    entryHlc: String,
+    matchingTombs: List<TombstoneEntity>,
+    ctx: IncomingEntriesMergeCtx,
+): ItemTombstoneAction {
+    val rawId = rec.id.trim()
+    val stateHlc =
+        rec.state?.let { st ->
+            resolveOrSynthesizeHlc(
+                st.hlc.ifBlank { entryHlc },
+                st.interactionUpdatedAt ?: rec.updatedAt,
+                ctx.nowIso,
+                ctx.serverNode,
+                ctx.nowMs,
+            )
+        }
+    val maxIncHlc = maxOf(entryHlc, stateHlc.orEmpty())
+    val inboxState = rec.state?.inboxState?.trim()?.lowercase()
+    val carriesLiveInbox =
+        inboxState == INBOX_STATE_UNREAD ||
+            inboxState == INBOX_STATE_DISMISSED ||
+            rec.content != null ||
+            rawId in ctx.incomingWtrEntryIds
+    var suppressed = false
+    for (tomb in matchingTombs) {
+        if (maxIncHlc <= tomb.hlc) {
+            suppressed = true
+        } else if (carriesLiveInbox) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_ITEM, tomb.naturalKey)
+            ctx.tombstonesByKey.remove(TOMBSTONE_ENTITY_ITEM to tomb.naturalKey)
+        }
+    }
+    return when {
+        !suppressed -> ItemTombstoneAction.ALLOW
+        isPureInboxRecord(dao, rec, rawId, ctx.incomingCatalogReferencedIds) ->
+            ItemTombstoneAction.SUPPRESS_ENTRY
+        else -> ItemTombstoneAction.SUPPRESS_INBOX_ONLY
+    }
+}
+
+private suspend fun isPureInboxRecord(
+    dao: RocheDao,
+    rec: SyncEntryRecordDto,
+    rawId: String,
+    incomingCatalogReferencedIds: Set<String>,
+): Boolean =
+    rec.releaseYear == null &&
+        rec.metadata == null &&
+        rec.identifiers.all {
+            val scheme = normalizeIdentifierScheme(it.scheme)
+            scheme == "url" || scheme == "arxiv"
+        } &&
+        rawId !in incomingCatalogReferencedIds &&
+        (rawId.isEmpty() || !dao.entryHasCatalogHistory(rawId))
 
 private suspend fun isSuppressedByTombstone(
     dao: RocheDao,
     rec: SyncEntryRecordDto,
     entryHlc: String,
-    serverNode: String,
-    nowIso: String,
-    tombstonesByKey: MutableMap<Pair<String, String>, TombstoneEntity>,
+    ctx: IncomingEntriesMergeCtx,
 ): Boolean {
     val rawId = rec.id.trim()
+    val entryTomb =
+        rawId.takeIf { it.isNotEmpty() }?.let { ctx.tombstonesByKey[TOMBSTONE_ENTITY_ENTRY to it] }
     val suppressedById =
-        rawId.isNotEmpty() &&
-            tombstonesByKey[TOMBSTONE_ENTITY_ENTRY to rawId]?.let { it.hlc >= entryHlc } == true
+        if (entryTomb != null) {
+            if (entryTomb.hlc >= entryHlc) {
+                true
+            } else {
+                dao.deleteTombstone(TOMBSTONE_ENTITY_ENTRY, rawId)
+                ctx.tombstonesByKey.remove(TOMBSTONE_ENTITY_ENTRY to rawId)
+                false
+            }
+        } else {
+            false
+        }
     return suppressedById ||
-        isSuppressedByFeedTombstone(dao, rec, entryHlc, serverNode, nowIso, tombstonesByKey) ||
-        isSuppressedByTagTombstone(dao, rec, entryHlc, tombstonesByKey)
+        isSuppressedByFeedTombstone(dao, rec, entryHlc, ctx) ||
+        isSuppressedByTagTombstone(dao, rec, entryHlc, ctx.tombstonesByKey)
 }
 
 private suspend fun isSuppressedByFeedTombstone(
     dao: RocheDao,
     rec: SyncEntryRecordDto,
     entryHlc: String,
-    serverNode: String,
-    nowIso: String,
-    tombstonesByKey: MutableMap<Pair<String, String>, TombstoneEntity>,
+    ctx: IncomingEntriesMergeCtx,
 ): Boolean {
     val fs = rec.feedSource ?: return false
     val feedKey = feedNaturalKey(fs.feedUrl)
-    val fsHlc = resolveOrSynthesizeHlc(fs.hlc, rec.updatedAt, nowIso, serverNode)
+    val fsHlc = resolveOrSynthesizeHlc(fs.hlc, rec.updatedAt, ctx.nowIso, ctx.serverNode, ctx.nowMs)
     val liveHlc = maxOf(entryHlc, fsHlc)
-    val tomb = tombstonesByKey[TOMBSTONE_ENTITY_FEED to feedKey] ?: return false
+    val tomb = ctx.tombstonesByKey[TOMBSTONE_ENTITY_FEED to feedKey] ?: return false
     if (tomb.hlc >= liveHlc) return true
     dao.deleteTombstone(TOMBSTONE_ENTITY_FEED, feedKey)
-    tombstonesByKey.remove(TOMBSTONE_ENTITY_FEED to feedKey)
+    ctx.tombstonesByKey.remove(TOMBSTONE_ENTITY_FEED to feedKey)
     return false
 }
 
@@ -757,6 +1074,7 @@ private suspend fun mergeProtectedSystemSpecInDao(
     return true
 }
 
+@Suppress("LongParameterList")
 private suspend fun mergeIncomingFeedSourceInDao(
     dao: RocheDao,
     targetId: String,
@@ -764,6 +1082,7 @@ private suspend fun mergeIncomingFeedSourceInDao(
     entryHlc: String,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     val existing = dao.getFeedSourceById(targetId)
     val fsHlc =
@@ -772,6 +1091,7 @@ private suspend fun mergeIncomingFeedSourceInDao(
             fsDto.lastPolledAt,
             nowIso,
             serverNode,
+            nowMs,
         )
     val merged = buildMergedFeedSourceEntity(targetId, fsDto, existing, fsHlc)
     if (dao.getCollectionSpecById(targetId) == null) {
@@ -930,6 +1250,7 @@ private suspend fun mergeContentAndStateInDao(
     entryHlc: String,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     mergeEntryContentRowInDao(dao, targetId, rec.content, mergedEntry.summary)
     rec.state?.let { stateDto ->
@@ -942,6 +1263,7 @@ private suspend fun mergeContentAndStateInDao(
             entryHlc,
             serverNode,
             nowIso,
+            nowMs,
         )
     }
 }
@@ -1000,6 +1322,7 @@ private suspend fun mergeEntryStateRowInDao(
     entryHlc: String,
     serverNode: String,
     nowIso: String,
+    nowMs: Long,
 ) {
     val existingState = dao.getEntryStateById(targetId)
     val stateHlc =
@@ -1008,13 +1331,14 @@ private suspend fun mergeEntryStateRowInDao(
             stateDto.interactionUpdatedAt ?: rec.updatedAt,
             nowIso,
             serverNode,
+            nowMs,
         )
     val stateWins =
         shouldIncomingWinHlc(stateHlc, existingState?.hlc, existingState?.isLocalDirty == true)
     if (existingState != null && !stateWins) return
 
     val resolvedReadAt =
-        if (stateDto.inboxState.equals("dismissed", ignoreCase = true)) {
+        if (stateDto.inboxState.equals(INBOX_STATE_DISMISSED, ignoreCase = true)) {
             stateDto.readAt?.takeIf { it.isNotBlank() }
                 ?: existingState?.readAt?.takeIf { it.isNotBlank() }
                 ?: mergedEntry.createdAt.ifBlank { nowIso }
@@ -1024,7 +1348,7 @@ private suspend fun mergeEntryStateRowInDao(
     dao.upsertEntryState(
         EntryStateEntity(
             entryId = targetId,
-            inboxState = stateDto.inboxState.ifBlank { "unread" },
+            inboxState = stateDto.inboxState.ifBlank { INBOX_STATE_UNREAD },
             readAt = resolvedReadAt,
             progress = stateDto.progress,
             interactionUpdatedAt =

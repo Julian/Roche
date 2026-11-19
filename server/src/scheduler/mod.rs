@@ -266,6 +266,9 @@ impl<F: FeedFetcher> PollScheduler<F> {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
+            if *shutdown.borrow_and_update() {
+                break;
+            }
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.check_and_poll().await {
@@ -273,7 +276,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
                     }
                 }
                 changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
                         break;
                     }
                 }
@@ -1376,5 +1379,84 @@ mod tests {
         let items = db.items().list(None, Some(&feed.id), None).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Fresh Post");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn test_spawn_feed_poll_task_drops_guards_when_aborted_before_first_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFetcher {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for CountingFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(String::new()))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/abort-before-poll.xml").unwrap();
+        let feed = db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let shared_locks = FeedPollLocks::new();
+        let scheduler = PollScheduler::with_arc_fetcher(
+            db,
+            Arc::new(CountingFetcher { calls: Arc::clone(&fetch_calls) }),
+        )
+        .with_feed_poll_locks(shared_locks.clone());
+
+        let feed_id = feed.id.clone();
+        let poll_guard =
+            shared_locks.try_acquire(&feed_id).expect("initial feed lock acquire must succeed");
+        assert!(shared_locks.try_acquire(&feed_id).is_none());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        scheduler.spawn_feed_poll_task(&mut tasks, feed, poll_guard);
+        // Abort synchronously before yielding so the spawned future is dropped unpolled.
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+        let reacquired = shared_locks.try_acquire(&feed_id);
+        assert!(reacquired.is_some(), "poll_guard must be dropped when unpolled task is aborted");
+        drop(reacquired);
+        assert_eq!(shared_locks.tracked_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_until_shutdown_exits_immediately_when_already_true() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFetcher {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FeedFetcher for CountingFetcher {
+            fn fetch_feed(&self, _url: &Url) -> impl std::future::Future<Output = Result<String>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(String::new()))
+            }
+        }
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url = Url::parse("https://example.com/pre-shutdown.xml").unwrap();
+        db.feeds().create(FeedType::Rss, &feed_url, None, None).await.unwrap();
+
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let scheduler = PollScheduler::with_arc_fetcher(
+            db,
+            Arc::new(CountingFetcher { calls: Arc::clone(&fetch_calls) }),
+        );
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        let res =
+            tokio::time::timeout(Duration::from_secs(1), scheduler.run_until_shutdown(rx)).await;
+        assert!(res.is_ok(), "shutdown loop must exit immediately when shutdown starts as true");
+        assert!(res.unwrap().is_ok());
+        drop(tx);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
     }
 }

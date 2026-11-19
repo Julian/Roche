@@ -502,7 +502,7 @@ class RocheRepository(
         val existingTag =
             dao.getTagByName(normalized)
                 ?: TagRow(id = deterministicTagId(normalized), name = normalized).also {
-                    dao.upsertTag(it, markDirty = true)
+                    dao.upsertTag(it, markDirty = true, nodeId = nodeId)
                 }
         val alreadyAssigned = dao.hasCollectionMembership(existingTag.id, itemId) > 0
         if (alreadyAssigned) {
@@ -513,7 +513,11 @@ class RocheRepository(
                 nodeId = nodeId,
             )
         } else {
-            dao.insertItemTag(ItemTagRow(itemId = itemId, tagId = existingTag.id), markDirty = true)
+            dao.insertItemTag(
+                ItemTagRow(itemId = itemId, tagId = existingTag.id),
+                markDirty = true,
+                nodeId = nodeId,
+            )
         }
         triggerBackgroundSync()
     }
@@ -553,10 +557,11 @@ class RocheRepository(
         if (normalized.isBlank()) return 0
         val itemIds = dao.getUnarchivedItemIdsForFeed(feedId)
         if (itemIds.isEmpty()) return 0
+        val nodeId = currentLocalPeerId()
         val existingTag =
             dao.getTagByName(normalized)
                 ?: TagRow(id = deterministicTagId(normalized), name = normalized).also {
-                    dao.upsertTag(it, markDirty = true)
+                    dao.upsertTag(it, markDirty = true, nodeId = nodeId)
                 }
         var taggedCount = 0
         dao.executeInTransaction {
@@ -565,6 +570,7 @@ class RocheRepository(
                     dao.insertItemTag(
                         ItemTagRow(itemId = itemId, tagId = existingTag.id),
                         markDirty = true,
+                        nodeId = nodeId,
                     )
                     taggedCount++
                 }
@@ -670,6 +676,11 @@ class RocheRepository(
             }
         }
 
+    private data class PersistedWantItem(
+        val row: InboxItemRow,
+        val wasNewlyInserted: Boolean,
+    )
+
     suspend fun addUrlToWantToRead(
         inputUrl: String,
         titleOverride: String? = null,
@@ -710,33 +721,55 @@ class RocheRepository(
                 )
             val remainingPdfStream =
                 if (awaitPdfCacheCopy && pdfInputStream != null) {
-                    copySharedPdfStreamToCache(dao, cacheDir, persisted.id, pdfInputStream)
+                    val copied =
+                        copySharedPdfStreamToCache(dao, cacheDir, persisted.row.id, pdfInputStream)
+                    if (!copied && isLocalPdf) {
+                        rollbackFailedLocalPdfSave(persisted)
+                        error("Could not save shared PDF to offline cache")
+                    }
                     null
                 } else {
                     pdfInputStream
                 }
             launchWantToReadEnrichment(
-                itemId = persisted.id,
+                itemId = persisted.row.id,
                 url = normalizedUrl,
                 hasUserTitleOverride = cleanTitleOverride != null,
                 pdfInputStream = remainingPdfStream,
             )
-            SaveUrlResult(title = persisted.title, kind = SavedResourceKind.ITEM)
+            SaveUrlResult(title = persisted.row.title, kind = SavedResourceKind.ITEM)
         }
+
+    private suspend fun rollbackFailedLocalPdfSave(persisted: PersistedWantItem) {
+        if (persisted.wasNewlyInserted) {
+            val nodeId = currentLocalPeerId()
+            dao.executeInTransaction {
+                dao.deleteItemPreservingHistory(
+                    itemId = persisted.row.id,
+                    recordTombstones = false,
+                    detachWantQueues = true,
+                    nodeId = nodeId,
+                )
+            }
+        }
+        offlineCacheManager.evictCachedItemFiles(persisted.row.id)
+    }
 
     private suspend fun persistWantToReadItemLocally(
         localEntity: InboxItemRow,
         normalizedUrl: String,
         cleanTitleOverride: String?,
         tags: List<String>,
-    ): InboxItemRow {
+    ): PersistedWantItem {
         val nodeId = currentLocalPeerId()
         val isSyncable = isSyncableItemUrl(normalizedUrl)
         var targetEntity = localEntity
+        var wasNewlyInserted = true
         dao.executeInTransaction {
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(dao, nodeId)
             val existingItem = findExistingItemForSavedUrl(localEntity.id, normalizedUrl)
+            wasNewlyInserted = existingItem == null
             targetEntity =
                 if (existingItem != null) {
                     mergeExistingItemOnResave(existingItem, cleanTitleOverride)
@@ -756,7 +789,7 @@ class RocheRepository(
                 COLLECTION_ENTRY_ENTITY,
                 collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, targetEntity.id),
             )
-            dao.upsertItem(targetEntity, markDirty = isSyncable, hlcOverride = hlc)
+            dao.upsertItem(targetEntity, markDirty = isSyncable, hlcOverride = hlc, nodeId = nodeId)
             dao.upsertCollectionEntry(
                 CollectionEntryEntity(
                     collectionId = WANT_TO_READ_COLLECTION_ID,
@@ -772,9 +805,10 @@ class RocheRepository(
                 itemId = targetEntity.id,
                 tagNames = tags,
                 markDirty = isSyncable,
+                nodeId = nodeId,
             )
         }
-        return targetEntity
+        return PersistedWantItem(row = targetEntity, wasNewlyInserted = wasNewlyInserted)
     }
 
     private suspend fun findExistingItemForSavedUrl(
@@ -822,6 +856,7 @@ class RocheRepository(
                         itemId = itemId,
                         url = url,
                         hasUserTitleOverride = hasUserTitleOverride,
+                        nodeId = currentLocalPeerId(),
                     )
                 }
                 triggerBackgroundSync()

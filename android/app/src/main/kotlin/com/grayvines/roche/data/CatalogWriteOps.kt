@@ -330,6 +330,7 @@ internal suspend fun appendConsumptionInDao(
             ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
     val hlc =
         if (markDirty) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId)
             nextLocalHlc(dao, nodeId)
         } else {
             HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()
@@ -411,6 +412,7 @@ private suspend fun engageSingleArtistInDao(
     val logId = deterministicAutoLogId(artistId)
     val hlc =
         if (markDirty) {
+            dao.deleteTombstone(TOMBSTONE_ENTITY_CONSUMPTION_LOG, logId)
             nextLocalHlc(dao, nodeId)
         } else {
             HlcTimestamp.fromIsoOrEpoch(tsIso, nodeId).encode()

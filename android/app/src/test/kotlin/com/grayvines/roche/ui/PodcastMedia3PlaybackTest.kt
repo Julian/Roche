@@ -4,8 +4,10 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.MediaController
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.google.common.util.concurrent.ListenableFuture
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedRow
@@ -17,10 +19,17 @@ import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.InputStream
 import java.lang.reflect.Proxy
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
@@ -144,8 +153,8 @@ class PodcastMedia3PlaybackTest {
     }
 
     @Test
-    fun `audio redirect walker upgrades http hops caches target and blocks private IP redirect SSRF`() {
-        verifyAudioRedirectCacheAndRebind()
+    fun `SafeRedirectHttpDataSource upgrades http redirect hops blocks DNS rebinding and blocks private IP SSRF`() {
+        verifySafeRedirectUpgradeAndRebind()
         verifyBlockedPrivateRedirectHop()
     }
 
@@ -344,6 +353,66 @@ class PodcastMedia3PlaybackTest {
             assertEquals(1, harness.stopCalls.get())
             assertFalse(backend.isPlaying())
             assertNull(bridge.currentSnapshot())
+        } finally {
+            parentScope.coroutineContext[Job]?.cancel()
+        }
+    }
+
+    @Test
+    fun `owned-scope media session bridge release cleans up controllerFuture even when updatePlaybackSession races`() {
+        val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
+        val bridge =
+            AndroidPodcastMediaSessionBridge(
+                appContext = null,
+                backend = null,
+                scope = null,
+                mainDispatcher = mainDispatcher,
+            )
+        val controllerFuture = FakeControllerFuture()
+        bridge.updatePlaybackSession(sampleSessionSnapshot("ep-1", "Episode One"))
+        bridge.controllerFuture = controllerFuture
+
+        runOffMain {
+            bridge.release()
+            bridge.updatePlaybackSession(sampleSessionSnapshot("ep-2", "Episode Two"))
+        }
+        mainDispatcher.drainQueue()
+
+        assertNull(bridge.controllerFuture)
+        assertTrue(controllerFuture.isCancelled)
+        assertNull(bridge.currentSnapshot())
+
+        // Subsequent updates after terminal release on an owned-scope bridge are ignored.
+        bridge.updatePlaybackSession(sampleSessionSnapshot("ep-3", "Episode Three"))
+        mainDispatcher.drainQueue()
+        assertNull(bridge.currentSnapshot())
+    }
+
+    @Test
+    fun `controller disconnect clears and releases active controllerFuture without clobbering reconnect`() {
+        val mainDispatcher = EventLoopMainDispatcher(mainThread = Thread.currentThread())
+        val parentScope = CoroutineScope(SupervisorJob() + mainDispatcher)
+        val bridge =
+            AndroidPodcastMediaSessionBridge(
+                appContext = null,
+                backend = null,
+                scope = parentScope,
+                mainDispatcher = mainDispatcher,
+            )
+        try {
+            val firstFuture = FakeControllerFuture()
+            val secondFuture = FakeControllerFuture()
+            assertNotNull(bridge.createControllerListener { firstFuture })
+            bridge.controllerFuture = firstFuture
+
+            bridge.clearControllerOnDisconnect(firstFuture)
+            assertNull(bridge.controllerFuture)
+            assertTrue(firstFuture.isCancelled)
+
+            bridge.controllerFuture = secondFuture
+            bridge.clearControllerOnDisconnect(firstFuture)
+            assertEquals(secondFuture, bridge.controllerFuture)
+            assertFalse(secondFuture.isCancelled)
         } finally {
             parentScope.coroutineContext[Job]?.cancel()
         }
@@ -665,92 +734,148 @@ private fun defaultPrimitiveReturn(returnType: Class<*>): Any? =
 private const val PEER_SYNC_OK_BODY =
     """{"server_peer_id":"server","sync_seq":1,"server_hlc":"001780000000000-0001-server","sync_timestamp":"2026-06-01T12:00:00Z","active_peers":[]}"""
 
-private fun verifyAudioRedirectCacheAndRebind() {
+private class FakeControllerFuture : ListenableFuture<MediaController> {
+    private val cancelled = AtomicBoolean(false)
+
+    override fun cancel(mayInterruptIfRunning: Boolean): Boolean =
+        cancelled.compareAndSet(false, true)
+
+    override fun isCancelled(): Boolean = cancelled.get()
+
+    override fun isDone(): Boolean = cancelled.get()
+
+    override fun get(): MediaController = error("FakeControllerFuture never resolves")
+
+    override fun get(timeout: Long, unit: TimeUnit): MediaController =
+        error("FakeControllerFuture never resolves")
+
+    override fun addListener(listener: Runnable, executor: Executor) = Unit
+}
+
+private class TestAudioHttpURLConnection(
+    url: URL,
+    private val code: Int,
+    private val headers: Map<String, List<String>> = emptyMap(),
+) : HttpURLConnection(url) {
+    override fun connect() {
+        connected = true
+    }
+
+    override fun disconnect() = Unit
+
+    override fun usingProxy(): Boolean = false
+
+    override fun getResponseCode(): Int = code
+
+    override fun getResponseMessage(): String = "OK"
+
+    override fun getHeaderField(name: String?): String? =
+        headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
+
+    override fun getHeaderFields(): MutableMap<String, MutableList<String>> =
+        headers.mapValues { it.value.toMutableList() }.toMutableMap()
+
+    override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private fun verifySafeRedirectUpgradeAndRebind() {
     val publicAddr =
         java.net.InetAddress.getByAddress("cdn.example.com", byteArrayOf(93, -72, -40, 34))
     val loopbackAddr =
         java.net.InetAddress.getByAddress("cdn.example.com", byteArrayOf(127, 0, 0, 1))
     var cdnReboundToLoopback = false
-    val validateUrl: (String) -> String = { url ->
-        resolveSafeHttpPlaybackUrl(
-            rawUrl = url,
-            resolveAddresses = { host ->
-                if (host == "cdn.example.com" && cdnReboundToLoopback) {
-                    arrayOf(loopbackAddr)
+    val connectedUrls = mutableListOf<String>()
+    val dataSource =
+        SafeRedirectHttpDataSource(
+            openConnection = { url ->
+                val urlStr = url.toString()
+                connectedUrls += urlStr
+                if (urlStr == "https://pod.example.com/track/ep1.mp3") {
+                    TestAudioHttpURLConnection(
+                        url = url,
+                        code = 302,
+                        headers =
+                            mapOf("Location" to listOf("http://cdn.example.com/media/ep1.mp3")),
+                    )
                 } else {
-                    arrayOf(publicAddr)
+                    TestAudioHttpURLConnection(url = url, code = 200)
                 }
             },
-            isCleartextPermitted = { false },
-        )
-    }
-    var probes = 0
-    val cache = AudioRedirectCache()
-    val resolved =
-        resolveCachedAudioUrl(
-            rawUrl = "http://pod.example.com/track/ep1.mp3",
-            cache = cache,
-            validateUrl = validateUrl,
-            probeHop = { hopUrl ->
-                probes++
-                if (hopUrl == "https://pod.example.com/track/ep1.mp3") {
-                    AudioHopOutcome.Redirect("http://cdn.example.com/media/ep1.mp3")
-                } else {
-                    AudioHopOutcome.Final
-                }
+            validateUrl = { url ->
+                resolveSafeHttpPlaybackUrl(
+                    rawUrl = url,
+                    resolveAddresses = { host ->
+                        if (host == "cdn.example.com" && cdnReboundToLoopback) {
+                            arrayOf(loopbackAddr)
+                        } else {
+                            arrayOf(publicAddr)
+                        }
+                    },
+                    isCleartextPermitted = { false },
+                )
             },
         )
+    val (_, resolved) = dataSource.openValidatedUrl("http://pod.example.com/track/ep1.mp3")
     assertEquals("https://cdn.example.com/media/ep1.mp3", resolved)
-    assertEquals(2, probes)
     assertEquals(
-        "https://cdn.example.com/media/ep1.mp3",
-        resolveCachedAudioUrl("http://pod.example.com/track/ep1.mp3", cache, validateUrl) {
-            probes++
-            AudioHopOutcome.Final
-        },
+        listOf(
+            "https://pod.example.com/track/ep1.mp3",
+            "https://cdn.example.com/media/ep1.mp3",
+        ),
+        connectedUrls,
     )
-    assertEquals(2, probes)
+
     cdnReboundToLoopback = true
+    connectedUrls.clear()
     val rebindErr = runCatching {
-        resolveCachedAudioUrl(
-            "http://pod.example.com/track/ep1.mp3",
-            cache,
-            validateUrl,
-        ) {
-            AudioHopOutcome.Final
-        }
+        dataSource.openValidatedUrl("http://pod.example.com/track/ep1.mp3")
     }
         .exceptionOrNull()
     assertTrue(rebindErr is java.io.IOException)
+    assertEquals(listOf("https://pod.example.com/track/ep1.mp3"), connectedUrls)
 }
 
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 private fun verifyBlockedPrivateRedirectHop() {
     val publicAddr =
         java.net.InetAddress.getByAddress("pod.example.com", byteArrayOf(93, -72, -40, 34))
     val privateAddr =
         java.net.InetAddress.getByAddress("lan.internal.test", byteArrayOf(10, 0, 0, 5))
-    val validateUrl: (String) -> String = { url ->
-        resolveSafeHttpPlaybackUrl(
-            rawUrl = url,
-            resolveAddresses = { host ->
-                if (host.contains("lan.internal")) arrayOf(privateAddr) else arrayOf(publicAddr)
-            },
-            isCleartextPermitted = { false },
-        )
-    }
-    val ssrfErr = runCatching {
-        resolveAudioRedirectChain(
-            initialUrl = "https://pod.example.com/evil.mp3",
-            validateUrl = validateUrl,
-            probeHop = { hopUrl ->
-                if (hopUrl == "https://pod.example.com/evil.mp3") {
-                    AudioHopOutcome.Redirect("https://lan.internal.test/admin")
+    val connectedUrls = mutableListOf<String>()
+    val dataSource =
+        SafeRedirectHttpDataSource(
+            openConnection = { url ->
+                val urlStr = url.toString()
+                connectedUrls += urlStr
+                if (urlStr == "https://pod.example.com/evil.mp3") {
+                    TestAudioHttpURLConnection(
+                        url = url,
+                        code = 302,
+                        headers = mapOf("Location" to listOf("https://lan.internal.test/admin")),
+                    )
                 } else {
-                    error("Should never probe private redirect target: $hopUrl")
+                    error("Should never connect to private redirect target: $urlStr")
                 }
             },
+            validateUrl = { url ->
+                resolveSafeHttpPlaybackUrl(
+                    rawUrl = url,
+                    resolveAddresses = { host ->
+                        if (host.contains("lan.internal")) {
+                            arrayOf(privateAddr)
+                        } else {
+                            arrayOf(publicAddr)
+                        }
+                    },
+                    isCleartextPermitted = { false },
+                )
+            },
         )
+    val ssrfErr = runCatching {
+        dataSource.openValidatedUrl("https://pod.example.com/evil.mp3")
     }
         .exceptionOrNull()
     assertTrue(ssrfErr is java.io.IOException)
+    assertEquals(listOf("https://pod.example.com/evil.mp3"), connectedUrls)
 }

@@ -162,12 +162,6 @@ pub(super) fn render_search_kind_options(selected: Option<EntryKind>) -> String 
     out
 }
 
-pub(super) fn parse_csv_list(raw: Option<&str>) -> Vec<String> {
-    raw.map_or_default(|s| {
-        s.split(',').map(str::trim).filter(|c| !c.is_empty()).map(ToOwned::to_owned).collect()
-    })
-}
-
 pub(super) fn parse_optional_year(raw: Option<&str>) -> Option<i32> {
     raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok())
 }
@@ -184,17 +178,13 @@ pub(super) async fn load_existing_reader_item_ids<'a, F: FeedFetcher>(
     service: &RocheService<F>,
     entries: impl IntoIterator<Item = &'a CatalogEntry>,
 ) -> HashSet<String> {
-    let mut candidate_ids = HashSet::new();
-    for entry in entries {
-        if entry.kind.is_reader_openable() && entry.url.is_some() {
-            candidate_ids.insert(entry.id.clone());
-        }
+    let candidate_ids: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| entry.kind.is_reader_openable() && entry.url.is_some())
+        .map(|entry| entry.id.clone())
+        .collect();
+    if candidate_ids.is_empty() {
+        return HashSet::new();
     }
-    let mut existing = HashSet::new();
-    for id in candidate_ids {
-        if service.items().get(&id).await.is_ok() {
-            existing.insert(id);
-        }
-    }
-    existing
+    service.items().existing_ids(&candidate_ids).await.unwrap_or_default()
 }

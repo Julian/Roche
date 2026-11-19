@@ -19,7 +19,7 @@ use crate::{
         artist_enrich::spawn_artist_enrichment_if_needed,
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_see_other, render_page, urlencode,
+            FlashQuery, NavSection, PageShell, esc, redirect_with_flash, render_page, urlencode,
             web_api_error_response,
         },
         links::{
@@ -387,18 +387,17 @@ pub(in crate::web) async fn post_entry_log<F: FeedFetcher>(
                 && let Ok(Some(slug)) =
                     service.catalog().rank_target_after_consumption(&logged.entry).await
             {
-                redirect_see_other(&format!(
-                    "/rank/{}?focus={}&notice={}",
-                    urlencode(&slug),
-                    urlencode(&logged.entry.id),
-                    urlencode("Logged to Diary")
-                ))
+                redirect_with_flash(
+                    &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
+                    "notice",
+                    "Logged to Diary",
+                )
             } else {
-                redirect_see_other(&format!(
-                    "/entries/{}?notice={}",
-                    urlencode(&logged.entry.id),
-                    urlencode("Logged to Diary")
-                ))
+                redirect_with_flash(
+                    &format!("/entries/{}", urlencode(&logged.entry.id)),
+                    "notice",
+                    "Logged to Diary",
+                )
             }
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
@@ -412,11 +411,9 @@ pub(in crate::web) async fn post_entry_list_add<F: FeedFetcher>(
     Form(form): Form<EntryAddToListForm>,
 ) -> Response {
     match service.catalog().add_collection_entry(&form.list_slug_or_id, &id, None).await {
-        Ok(()) => redirect_see_other(&format!(
-            "/entries/{}?notice={}",
-            urlencode(&id),
-            urlencode("Added to list")
-        )),
+        Ok(()) => {
+            redirect_with_flash(&format!("/entries/{}", urlencode(&id)), "notice", "Added to list")
+        }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }
@@ -434,11 +431,11 @@ pub(in crate::web) async fn post_entry_merge<F: FeedFetcher>(
         }
     };
     match service.catalog().merge_entries(&id, &target.id).await {
-        Ok(canon) => redirect_see_other(&format!(
-            "/entries/{}?notice={}",
-            urlencode(&canon.id),
-            urlencode("Merged duplicate into canonical entry")
-        )),
+        Ok(canon) => redirect_with_flash(
+            &format!("/entries/{}", urlencode(&canon.id)),
+            "notice",
+            "Merged duplicate into canonical entry",
+        ),
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }
 }

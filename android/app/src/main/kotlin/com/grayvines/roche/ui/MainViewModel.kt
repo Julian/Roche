@@ -22,6 +22,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -222,33 +223,35 @@ class MainViewModel(
             playerController.state
                 .map { it.currentEntryId }
                 .distinctUntilChanged()
-                .collect { entryId ->
-                    if (entryId == null) {
-                        transientState.update { current ->
-                            if (current.activePlayerNotesContent != null) {
-                                current.copy(activePlayerNotesContent = null)
-                            } else {
-                                current
-                            }
-                        }
-                        return@collect
-                    }
-                    transientState.update { current ->
-                        val kept = current.activePlayerNotesContent?.takeIf { it.itemId == entryId }
-                        if (kept !== current.activePlayerNotesContent) {
-                            current.copy(activePlayerNotesContent = kept)
-                        } else {
-                            current
-                        }
-                    }
-                    val hydrated =
-                        repository.hydrateItemContentIfNeeded(entryId) { localContent ->
-                            applyReaderContentIfActive(entryId, localContent)
-                        }
-                    if (hydrated != null) {
-                        applyReaderContentIfActive(entryId, hydrated)
-                    }
+                .collectLatest(::refreshActiveEpisodeNotes)
+        }
+    }
+
+    private suspend fun refreshActiveEpisodeNotes(entryId: String?) {
+        if (entryId == null) {
+            transientState.update { current ->
+                if (current.activePlayerNotesContent != null) {
+                    current.copy(activePlayerNotesContent = null)
+                } else {
+                    current
                 }
+            }
+            return
+        }
+        transientState.update { current ->
+            val kept = current.activePlayerNotesContent?.takeIf { it.itemId == entryId }
+            if (kept !== current.activePlayerNotesContent) {
+                current.copy(activePlayerNotesContent = kept)
+            } else {
+                current
+            }
+        }
+        val hydrated =
+            repository.hydrateItemContentIfNeeded(entryId) { localContent ->
+                applyReaderContentIfActive(entryId, localContent)
+            }
+        if (hydrated != null) {
+            applyReaderContentIfActive(entryId, hydrated)
         }
     }
 

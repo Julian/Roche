@@ -64,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.RocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 /** Crisp circular refresh arrow icon for feed rows and sync actions. */
@@ -325,6 +326,54 @@ enum class RocheButtonStyle {
     SECONDARY,
 }
 
+private const val DISABLED_PRIMARY_BG_ALPHA = 0.4f
+private const val DISABLED_SECONDARY_BG_ALPHA = 0.5f
+private const val DISABLED_PRIMARY_TEXT_ALPHA = 0.6f
+
+private data class HeaderActionColors(
+    val background: Color,
+    val border: Color,
+    val text: Color,
+)
+
+private fun resolveHeaderActionColors(
+    colors: RocheColors,
+    style: RocheButtonStyle,
+    enabled: Boolean,
+): HeaderActionColors =
+    when (style) {
+        RocheButtonStyle.PRIMARY -> {
+            val accent =
+                if (enabled) {
+                    colors.accentBlueFilled
+                } else {
+                    colors.accentBlueFilled.copy(alpha = DISABLED_PRIMARY_BG_ALPHA)
+                }
+            HeaderActionColors(
+                background = accent,
+                border = accent,
+                text =
+                    if (enabled) {
+                        Color.White
+                    } else {
+                        Color.White.copy(alpha = DISABLED_PRIMARY_TEXT_ALPHA)
+                    },
+            )
+        }
+        RocheButtonStyle.SECONDARY -> {
+            HeaderActionColors(
+                background =
+                    if (enabled) {
+                        colors.surfaceElevated
+                    } else {
+                        colors.surfaceElevated.copy(alpha = DISABLED_SECONDARY_BG_ALPHA)
+                    },
+                border = colors.controlOutline,
+                text = if (enabled) colors.textPrimary else colors.textMuted,
+            )
+        }
+    }
+
 @Composable
 fun HeaderActionButton(
     label: String,
@@ -335,26 +384,10 @@ fun HeaderActionButton(
     contentDescription: String? = null,
     enabled: Boolean = true,
 ) {
-    val colors = LocalRocheColors.current
+    val palette = resolveHeaderActionColors(LocalRocheColors.current, style, enabled)
     val shape = RoundedCornerShape(8.dp)
-    val bg =
-        when (style) {
-            RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlueFilled else colors.accentBlueFilled.copy(alpha = 0.4f)
-            RocheButtonStyle.SECONDARY ->
-                if (enabled) colors.surfaceElevated else colors.surfaceElevated.copy(alpha = 0.5f)
-        }
-    val border =
-        when (style) {
-            RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlueFilled else colors.accentBlueFilled.copy(alpha = 0.4f)
-            RocheButtonStyle.SECONDARY -> colors.controlOutline
-        }
-    val textColor =
-        when (style) {
-            RocheButtonStyle.PRIMARY -> if (enabled) Color.White else Color.White.copy(alpha = 0.6f)
-            RocheButtonStyle.SECONDARY -> if (enabled) colors.textPrimary else colors.textMuted
-        }
+    val labelModifier =
+        if (contentDescription != null) Modifier.clearAndSetSemantics {} else Modifier
 
     Box(
         contentAlignment = Alignment.Center,
@@ -378,19 +411,18 @@ fun HeaderActionButton(
             modifier =
                 Modifier.heightIn(min = 36.dp)
                     .clip(shape)
-                    .background(bg)
-                    .border(1.dp, border, shape)
+                    .background(palette.background)
+                    .border(1.dp, palette.border, shape)
                     .padding(horizontal = horizontalPadding, vertical = 8.dp),
         ) {
             Text(
                 text = label,
-                color = textColor,
+                color = palette.text,
                 fontSize = 12.5.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier =
-                    if (contentDescription != null) Modifier.clearAndSetSemantics {} else Modifier,
+                modifier = labelModifier,
             )
         }
     }
@@ -428,7 +460,12 @@ fun RocheIconActionButton(
                     this.contentDescription = contentDescription
                 },
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = visualModifier) { content() }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = visualModifier.clearAndSetSemantics {},
+        ) {
+            content()
+        }
     }
 }
 

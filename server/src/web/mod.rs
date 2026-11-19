@@ -25,6 +25,9 @@ use crate::{scheduler::FeedFetcher, service::RocheService};
 
 const ROCHE_CSS: &str = include_str!("roche.css");
 const ROCHE_JS: &str = include_str!("roche.js");
+const MAX_WEB_FORM_BODY_BYTES: usize = 128 * 1024;
+const MAX_WEB_OPML_BODY_BYTES: usize = 4 * 1024 * 1024;
+const OPML_UPLOAD_PATH: &str = "/web/feeds/opml";
 
 pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<RocheService<F>>> {
     let static_routes = Router::new()
@@ -38,9 +41,13 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
         .layer(RequestBodyLimitLayer::new(16 * 1024));
 
     let opml_upload = Router::new()
-        .route("/web/feeds/opml", post(views_reader::post_feed_opml::<F>))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
-        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024));
+        .route(OPML_UPLOAD_PATH, post(views_reader::post_feed_opml::<F>))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&service),
+            auth::require_web_auth_and_csrf::<F>,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_WEB_OPML_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(MAX_WEB_OPML_BODY_BYTES));
 
     let protected = Router::new()
         .route("/logout", post(auth::logout_post::<F>))
@@ -101,15 +108,15 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
             "/rank/{slug}",
             get(views_rank::rank_session_get::<F>).post(views_rank::rank_session_post::<F>),
         )
-        .layer(DefaultBodyLimit::max(128 * 1024))
-        .layer(RequestBodyLimitLayer::new(128 * 1024))
-        .merge(opml_upload)
-        .route_layer(middleware::from_fn_with_state(service, auth::require_web_auth_and_csrf::<F>));
+        .route_layer(middleware::from_fn_with_state(service, auth::require_web_auth_and_csrf::<F>))
+        .layer(DefaultBodyLimit::max(MAX_WEB_FORM_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(MAX_WEB_FORM_BODY_BYTES));
 
     Router::new()
         .merge(static_routes)
         .merge(public_login)
         .merge(protected)
+        .merge(opml_upload)
         .route_layer(middleware::from_fn(attach_web_security_headers))
 }
 

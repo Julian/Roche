@@ -41,8 +41,10 @@ import com.grayvines.roche.ui.theme.LightRocheColors
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -78,26 +80,23 @@ internal class PdfRendererSession(
 
     suspend fun renderPageBitmap(pageIndex: Int, targetWidthPx: Int): RenderedPdfPage? =
         withContext(Dispatchers.IO) {
-            if (closed || closeRequested.get()) return@withContext null
-            val clampedWidthPx = targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, MAX_RENDER_WIDTH_PX)
-            renderMutex.withLock {
-                if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) {
-                    null
-                } else {
-                    val cached = pageCache.get(pageIndex)
-                    if (cached != null && cached.widthPx == clampedWidthPx) {
-                        cached.page
-                    } else {
-                        renderSinglePageLocked(pageIndex, clampedWidthPx)?.also { rendered ->
-                            pageCache.put(
-                                pageIndex,
-                                CachedRenderedPdfPage(clampedWidthPx, rendered),
-                            )
-                        }
-                    }
-                }
+            if (closed || closeRequested.get()) {
+                null
+            } else {
+                val clampedWidthPx =
+                    targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, MAX_RENDER_WIDTH_PX)
+                renderMutex.withLock { getOrRenderPageLocked(pageIndex, clampedWidthPx) }
             }
         }
+
+    private fun getOrRenderPageLocked(pageIndex: Int, clampedWidthPx: Int): RenderedPdfPage? {
+        if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) return null
+        val cached = pageCache.get(pageIndex)
+        if (cached != null && cached.widthPx == clampedWidthPx) return cached.page
+        return renderSinglePageLocked(pageIndex, clampedWidthPx)?.also { rendered ->
+            pageCache.put(pageIndex, CachedRenderedPdfPage(clampedWidthPx, rendered))
+        }
+    }
 
     private fun renderSinglePageLocked(pageIndex: Int, widthPx: Int): RenderedPdfPage? =
         runCatching {
@@ -171,39 +170,27 @@ internal fun rememberCachedPdfSession(
                 }
             }
         val currentSession = session
-        if (
+        val isSameSession =
             candidate != null &&
                 currentSession != null &&
                 currentSession.canonicalPath == candidate.second
-        ) {
-            return@LaunchedEffect
-        }
-        var opened: PdfRendererSession? = null
-        try {
-            opened =
-                if (candidate != null) {
-                    withContext(Dispatchers.IO) {
-                        val created = openPdfRendererSession(candidate.first, candidate.second)
-                        if (!coroutineContext.isActive) {
-                            created?.close()
-                            null
-                        } else {
-                            created
+        if (!isSameSession) {
+            if (candidate != null) {
+                openSessionCancellably(
+                    openOnIo = { openPdfRendererSession(candidate.first, candidate.second) },
+                    publishOnCaller = { opened ->
+                        val previous = session
+                        session = opened
+                        if (previous !== opened) {
+                            previous?.close()
                         }
-                    }
-                } else {
-                    null
-                }
-            val previous = session
-            session = opened
-            if (previous !== opened) {
+                    },
+                )
+            } else {
+                val previous = session
+                session = null
                 previous?.close()
             }
-        } catch (ce: CancellationException) {
-            if (opened !== session) {
-                opened?.close()
-            }
-            throw ce
         }
     }
     DisposableEffect(cacheRoot, entryId) {
@@ -213,6 +200,32 @@ internal fun rememberCachedPdfSession(
         }
     }
     return session
+}
+
+internal suspend fun <T : AutoCloseable> openSessionCancellably(
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    openOnIo: () -> T?,
+    publishOnCaller: (T?) -> Unit,
+) {
+    val openedRef = AtomicReference<T?>(null)
+    try {
+        val opened =
+            withContext(ioDispatcher) {
+                val created = openOnIo()
+                if (!coroutineContext.isActive) {
+                    created?.close()
+                    null
+                } else {
+                    openedRef.set(created)
+                    created
+                }
+            }
+        openedRef.set(null)
+        publishOnCaller(opened)
+    } catch (ce: CancellationException) {
+        openedRef.getAndSet(null)?.close()
+        throw ce
+    }
 }
 
 @Composable
@@ -242,7 +255,6 @@ internal fun PdfPageCardItem(
                     PdfPageRenderState.Error
                 }
         }
-    val shape = RoundedCornerShape(6.dp)
     val aspect =
         (renderState as? PdfPageRenderState.Success)?.page?.aspectRatio ?: DEFAULT_LETTER_ASPECT
 
@@ -250,42 +262,12 @@ internal fun PdfPageCardItem(
         modifier = Modifier.fillMaxWidth().testTag("reader_pdf_page_${pageIndex + 1}"),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Box(
-            modifier =
-                Modifier.fillMaxWidth()
-                    .aspectRatio(aspect)
-                    .clip(shape)
-                    .background(Color.White)
-                    .border(1.dp, colors.border, shape),
-            contentAlignment = Alignment.Center,
-        ) {
-            when (val state = renderState) {
-                is PdfPageRenderState.Success -> {
-                    Image(
-                        bitmap = state.page.bitmap,
-                        contentDescription = "PDF page ${pageIndex + 1} of ${session.pageCount}",
-                        contentScale = ContentScale.FillWidth,
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                }
-                PdfPageRenderState.Loading -> {
-                    Text(
-                        text = "Rendering page ${pageIndex + 1}…",
-                        color = LightRocheColors.textMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                    )
-                }
-                PdfPageRenderState.Error -> {
-                    Text(
-                        text = "Unable to render page ${pageIndex + 1}",
-                        color = LightRocheColors.textMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                    )
-                }
-            }
-        }
+        PdfPageSurface(
+            renderState = renderState,
+            pageIndex = pageIndex,
+            pageCount = session.pageCount,
+            aspect = aspect,
+        )
         Text(
             text = "Page ${pageIndex + 1} of ${session.pageCount}",
             color = colors.textMuted,
@@ -293,6 +275,53 @@ internal fun PdfPageCardItem(
             fontSize = 10.5.sp,
             modifier = Modifier.align(Alignment.End).padding(end = 2.dp),
         )
+    }
+}
+
+@Composable
+private fun PdfPageSurface(
+    renderState: PdfPageRenderState,
+    pageIndex: Int,
+    pageCount: Int,
+    aspect: Float,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(6.dp)
+    Box(
+        modifier =
+            Modifier.fillMaxWidth()
+                .aspectRatio(aspect)
+                .clip(shape)
+                .background(Color.White)
+                .border(1.dp, colors.border, shape),
+        contentAlignment = Alignment.Center,
+    ) {
+        when (renderState) {
+            is PdfPageRenderState.Success -> {
+                Image(
+                    bitmap = renderState.page.bitmap,
+                    contentDescription = "PDF page ${pageIndex + 1} of $pageCount",
+                    contentScale = ContentScale.FillWidth,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            PdfPageRenderState.Loading -> {
+                Text(
+                    text = "Rendering page ${pageIndex + 1}…",
+                    color = LightRocheColors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                )
+            }
+            PdfPageRenderState.Error -> {
+                Text(
+                    text = "Unable to render page ${pageIndex + 1}",
+                    color = LightRocheColors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                )
+            }
+        }
     }
 }
 

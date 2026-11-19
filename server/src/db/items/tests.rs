@@ -447,3 +447,139 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
     assert_eq!(archive_changes.len(), 3);
     assert!(archive_changes.iter().all(|c| c.action == ActivityAction::Archive));
 }
+
+#[tokio::test]
+async fn test_existing_ids_matches_live_reader_items() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let items = db.items();
+
+    assert!(items.existing_ids(&[]).await.unwrap().is_empty());
+
+    // Live feed inbox item
+    let feed_url = Url::parse("https://example.com/existing-ids-feed.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Feed"), None).await.unwrap();
+    let feed_item_url = Url::parse("https://example.com/feed-live").unwrap();
+    let feed_item = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Feed Live",
+            url: &feed_item_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+
+    // Live manual Want-to-Read item
+    let manual_url = Url::parse("https://example.com/manual-live").unwrap();
+    let (manual_item, _) = items
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &manual_url,
+            title: "Manual Live",
+            summary: None,
+            content_html: Some("<p>body</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+
+    // Deleted item (must not be returned)
+    let del_url = Url::parse("https://example.com/deleted-item").unwrap();
+    let (deleted_item, _) = items
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &del_url,
+            title: "Deleted Item",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    assert!(items.delete(&deleted_item.id).await.unwrap());
+
+    // Pure catalog work (non-reader Movie entry, must not be returned)
+    let movie = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Movie),
+            title: "Pure Movie".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    // Merged feed item (must not be returned)
+    let dup_url = Url::parse("https://example.com/feed-dup").unwrap();
+    let dup_item = items
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Dup Live",
+            url: &dup_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    db.catalog().merge_entries(&dup_item.id, &feed_item.id).await.unwrap();
+
+    let query_ids = vec![
+        feed_item.id.clone(),
+        feed_item.id.clone(), // duplicate
+        manual_item.id.clone(),
+        deleted_item.id.clone(),
+        movie.id.clone(),
+        dup_item.id.clone(),
+        "nonexistent-id".to_owned(),
+        "   ".to_owned(),
+    ];
+    let found = items.existing_ids(&query_ids).await.unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(found.contains(&feed_item.id));
+    assert!(found.contains(&manual_item.id));
+    assert!(!found.contains(&deleted_item.id));
+    assert!(!found.contains(&movie.id));
+    assert!(!found.contains(&dup_item.id));
+}
+
+#[tokio::test]
+async fn test_entry_has_catalog_history_escapes_like_wildcards() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    for (id, title) in
+        [("item_1_a", "Item 1 A"), ("item_2_b", "Item 2 B"), ("item_1__", "Wildcard ID")]
+    {
+        catalog
+            .upsert_entry(&crate::db::UpsertEntryInput {
+                id: Some(id.to_owned()),
+                kind: Some(crate::db::EntryKind::Article),
+                title: title.to_owned(),
+                ..crate::db::UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+    }
+    catalog
+        .append_comparison(None, &[vec!["item_1_a".to_owned()], vec!["item_2_b".to_owned()]], None)
+        .await
+        .unwrap();
+
+    let mut conn = db.pool().acquire().await.unwrap();
+    assert!(ItemRepo::entry_has_catalog_history_in_tx(&mut conn, "item_1_a").await.unwrap());
+    assert!(
+        !ItemRepo::entry_has_catalog_history_in_tx(&mut conn, "item_1__").await.unwrap(),
+        "SQLite LIKE wildcards in custom entry IDs must not falsely match other comparison entries"
+    );
+}

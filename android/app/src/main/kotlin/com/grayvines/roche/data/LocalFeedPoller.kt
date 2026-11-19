@@ -92,6 +92,7 @@ internal object LocalFeedPoller {
     ): Result<Int> {
         val fetchUrl = canonicalizeFeedUrl(feed.url)
         val syncableFeed = isSyncablePublicUrl(feed.url)
+        val effectiveNodeId = localPeerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
         val batch =
             if (prefetchedBatch != null) {
                 prefetchedBatch
@@ -105,6 +106,7 @@ internal object LocalFeedPoller {
                             completedIso = resolveNow().toString(),
                             errorMessage = sanitizeFeedFetchError(error),
                             syncableFeed = syncableFeed,
+                            nodeId = effectiveNodeId,
                         )
                         return Result.failure(error)
                     }
@@ -119,6 +121,7 @@ internal object LocalFeedPoller {
                             completedIso = resolveNow().toString(),
                             errorMessage = "Feed XML parse failed",
                             syncableFeed = syncableFeed,
+                            nodeId = effectiveNodeId,
                         )
                         return Result.failure(error)
                     }
@@ -127,7 +130,11 @@ internal object LocalFeedPoller {
         val nowIso = resolveNow().toString()
         val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
         val configChanged = updatedFeed.title != feed.title || updatedFeed.feedType != feed.feedType
-        dao.upsertFeed(updatedFeed, markDirty = configChanged && syncableFeed)
+        dao.upsertFeed(
+            feed = updatedFeed,
+            markDirty = configChanged && syncableFeed,
+            nodeId = effectiveNodeId,
+        )
 
         val insertedOrUpdatedCount =
             upsertPolledItems(
@@ -136,6 +143,7 @@ internal object LocalFeedPoller {
                 candidates = batch.items,
                 nowIso = nowIso,
                 markDirty = syncableFeed,
+                nodeId = effectiveNodeId,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
     }
@@ -148,18 +156,21 @@ internal object LocalFeedPoller {
         completedIso: String,
         errorMessage: String,
         syncableFeed: Boolean,
+        nodeId: String,
     ) {
         val previousFailures =
             normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures)
         val nextFailures = (previousFailures + 1).coerceAtMost(MAX_CONSECUTIVE_FAILURES)
         dao.upsertFeed(
-            feed.copy(
-                lastPolled = completedIso,
-                lastError = errorMessage,
-                lastErrorBy = localPeerId,
-                consecutiveFailures = nextFailures,
-                isLocalDirty = syncableFeed || feed.isLocalDirty,
-            )
+            feed =
+                feed.copy(
+                    lastPolled = completedIso,
+                    lastError = errorMessage,
+                    lastErrorBy = localPeerId,
+                    consecutiveFailures = nextFailures,
+                    isLocalDirty = syncableFeed || feed.isLocalDirty,
+                ),
+            nodeId = nodeId,
         )
     }
 
@@ -211,12 +222,14 @@ internal object LocalFeedPoller {
         )
     }
 
+    @Suppress("LongParameterList")
     private suspend fun upsertPolledItems(
         dao: RocheDao,
         feed: FeedRow,
         candidates: List<ParsedFeedCandidateItem>,
         nowIso: String,
         markDirty: Boolean,
+        nodeId: String,
     ): Int {
         val existingItems = dao.getItemsForFeed(feedId = feed.id, feedUrl = feed.url)
         val tombstones =
@@ -252,7 +265,7 @@ internal object LocalFeedPoller {
             }
         }
         if (toUpsert.isNotEmpty()) {
-            dao.upsertItems(toUpsert, markDirty = markDirty)
+            dao.upsertItems(toUpsert, markDirty = markDirty, nodeId = nodeId)
         }
         return newCount
     }

@@ -3092,3 +3092,595 @@ async fn test_migration_017_backfill_and_trigger_hlc_separation() {
     drop(db);
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
+
+#[tokio::test]
+async fn test_manual_wtr_and_feed_items_cannot_resurrect_past_item_tombstones() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let url = Url::parse("https://example.com/manual-wtr-item").unwrap();
+    let (saved, _) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &url,
+            title: "Manual WTR Item",
+            summary: None,
+            content_html: Some("<p>saved body</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.inbox_state, InboxState::None);
+    assert!(db.items().delete(&saved.id).await.unwrap());
+    assert!(db.items().get(&saved.id).await.unwrap().is_none());
+
+    let stale_ts = Utc::now() - chrono::Duration::minutes(10);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "peer-stale").encode();
+
+    // 1. Stale manual/WTR item carrying `InboxState::None` + content must NOT resurrect
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: saved.id.clone(),
+                kind: EntryKind::Article,
+                title: "Manual WTR Item".to_owned(),
+                creators: Vec::new(),
+                url: Some(url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(stale_ts),
+                updated_at: Some(stale_ts),
+                hlc: stale_hlc.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>stale body</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::None,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(stale_ts),
+                    hlc: stale_hlc.clone(),
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&saved.id).await.unwrap().is_none());
+    let entry_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM entries WHERE id = ?")
+        .bind(&saved.id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+    assert!(entry_exists.is_none());
+
+    // 2. Stale content-only record (state = None, content = Some) must also be suppressed
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: saved.id.clone(),
+                kind: EntryKind::Article,
+                title: "Manual WTR Item".to_owned(),
+                creators: Vec::new(),
+                url: Some(url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(stale_ts),
+                updated_at: Some(stale_ts),
+                hlc: stale_hlc.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>stale content-only</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&saved.id).await.unwrap().is_none());
+
+    // 3. Stale feed-scoped item sent WITHOUT `collection_entries` (`resolved_feed_url == None`)
+    // must still match its feed-scoped tombstone via deterministic item ID.
+    let feed_url = Url::parse("https://example.com/feed-for-tomb.xml").unwrap();
+    let feed = db.feeds().create(FeedType::Rss, &feed_url, Some("Tomb Feed"), None).await.unwrap();
+    let post_url = Url::parse("https://example.com/feed-post-1").unwrap();
+    let feed_item = db
+        .items()
+        .create(&NewItem {
+            feed_id: Some(&feed.id),
+            title: "Feed Post 1",
+            url: &post_url,
+            author: None,
+            published_at: None,
+            summary: None,
+            content_type: ContentType::Article,
+        })
+        .await
+        .unwrap();
+    assert!(db.items().delete(&feed_item.id).await.unwrap());
+    assert!(db.items().get(&feed_item.id).await.unwrap().is_none());
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: feed_item.id.clone(),
+                kind: EntryKind::Article,
+                title: "Feed Post 1".to_owned(),
+                creators: Vec::new(),
+                url: Some(post_url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(stale_ts),
+                updated_at: Some(stale_ts),
+                hlc: stale_hlc.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>stale feed body</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::None,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(stale_ts),
+                    hlc: stale_hlc.clone(),
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&feed_item.id).await.unwrap().is_none());
+
+    // 4. Stale manual item WITH catalog metadata preserves metadata without resurrecting
+    // `entry_state` or `entry_content` as a live reader item.
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: saved.id.clone(),
+                kind: EntryKind::Article,
+                title: "Manual WTR Item".to_owned(),
+                creators: Vec::new(),
+                url: Some(url.to_string()),
+                published_at: None,
+                release_year: Some(2025),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(stale_ts),
+                updated_at: Some(stale_ts),
+                hlc: stale_hlc.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>should stay suppressed</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::None,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(stale_ts),
+                    hlc: stale_hlc,
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&saved.id).await.unwrap().is_none());
+
+    // 5. Newer manual item clears the `manual\0` tombstone and resurrects cleanly
+    let newer_ts = Utc::now() + chrono::Duration::seconds(30);
+    let newer_hlc = HlcTimestamp::from_datetime(newer_ts, "peer-fresh").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-fresh".to_owned(),
+            entries: vec![SyncEntryRecord {
+                id: saved.id.clone(),
+                kind: EntryKind::Article,
+                title: "Manual WTR Item Resurrected".to_owned(),
+                creators: Vec::new(),
+                url: Some(url.to_string()),
+                published_at: None,
+                release_year: None,
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                identifiers: Vec::new(),
+                merged_into_id: None,
+                created_at: Some(newer_ts),
+                updated_at: Some(newer_ts),
+                hlc: newer_hlc.clone(),
+                content: Some(SyncEntryContent {
+                    content_type: ContentType::Article,
+                    content_html: Some("<p>fresh body</p>".to_owned()),
+                    audio_url: None,
+                    duration: None,
+                }),
+                state: Some(SyncEntryState {
+                    inbox_state: InboxState::None,
+                    read_at: None,
+                    progress: 0.0,
+                    interaction_updated_at: Some(newer_ts),
+                    hlc: newer_hlc,
+                }),
+                collection_spec: None,
+                feed_source: None,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.items().get(&saved.id).await.unwrap().is_some());
+    let tomb_left: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ?",
+    )
+    .bind(item_natural_key(None, url.as_str()))
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(tomb_left.is_none());
+}
+
+#[tokio::test]
+async fn test_renamed_tag_sync_updates_in_place_without_duplication() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let old_color = crate::db::HexColor::parse("#112233").unwrap();
+    let tag = db.tags().create("OldTopic", Some(&old_color)).await.unwrap();
+    let item_url = Url::parse("https://example.com/tagged-article").unwrap();
+    let (item, _) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &item_url,
+            title: "Tagged Article",
+            summary: None,
+            content_html: None,
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    db.tags().add_to_item(&item.id, &tag.id).await.unwrap();
+
+    // Stale rename must be ignored
+    let stale_ts = Utc::now() - chrono::Duration::minutes(10);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "peer-stale").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            entries: vec![make_tag_sync_entry(&tag.id, "IgnoredName", Some("#999999"), &stale_hlc)],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let tags_after_stale = db.tags().list().await.unwrap();
+    assert_eq!(tags_after_stale.len(), 1);
+    assert_eq!(tags_after_stale[0].name, "OldTopic");
+
+    // Newer rename with the original tag ID updates title, slug, color, and entry_identifiers in-place
+    let newer_ts = Utc::now() + chrono::Duration::seconds(30);
+    let newer_hlc = HlcTimestamp::from_datetime(newer_ts, "peer-rename").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-rename".to_owned(),
+            entries: vec![make_tag_sync_entry(&tag.id, "NewTopic", Some("#445566"), &newer_hlc)],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let tags_after_rename = db.tags().list().await.unwrap();
+    assert_eq!(tags_after_rename.len(), 1, "renaming a tag over sync must not create a duplicate");
+    assert_eq!(tags_after_rename[0].id, tag.id);
+    assert_eq!(tags_after_rename[0].name, "NewTopic");
+    assert_eq!(tags_after_rename[0].color, Some(crate::db::HexColor::parse("#445566").unwrap()));
+
+    let slug: Option<String> =
+        sqlx::query_scalar("SELECT slug FROM collection_specs WHERE collection_id = ?")
+            .bind(&tag.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(slug.as_deref(), Some("tag:newtopic"));
+
+    let ident_vals: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM entry_identifiers WHERE scheme = 'tag' AND entry_id = ?",
+    )
+    .bind(&tag.id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(ident_vals, vec!["newtopic".to_owned()]);
+
+    let item_tags = db.tags().list_for_item(&item.id).await.unwrap();
+    assert_eq!(item_tags.len(), 1);
+    assert_eq!(item_tags[0].name, "NewTopic");
+}
+
+#[tokio::test]
+async fn test_collection_entry_tombstone_clears_or_redraws_dangling_generator() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let col = db
+        .catalog()
+        .create_manual_collection(
+            "Sync Gen Pool",
+            Some("sync-gen-pool"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let book_a = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book A".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let book_b = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book B".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&col.id, &book_a.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&col.id, &book_b.id, None).await.unwrap();
+    db.catalog()
+        .update_collection_generator(&col.id, Some(true), Some(&book_a.id), None)
+        .await
+        .unwrap();
+
+    // Incoming CollectionEntry tombstone removes Book A -> generator must redraw Book B
+    let first_delete_ts = Utc::now() + chrono::Duration::seconds(20);
+    let first_delete_hlc = HlcTimestamp::from_datetime(first_delete_ts, "peer-a").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::CollectionEntry,
+                natural_key: collection_entry_natural_key(&col.id, &book_a.id),
+                deleted_at: first_delete_ts,
+                hlc: first_delete_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let after_a = db.catalog().get_collection_generator(&col.id).await.unwrap();
+    assert_eq!(after_a.current_entry.as_ref().map(|e| e.id.as_str()), Some(book_b.id.as_str()));
+
+    // Incoming CollectionEntry tombstone removes Book B (last entry) -> generator must clear to None
+    let second_delete_ts = Utc::now() + chrono::Duration::seconds(40);
+    let second_delete_hlc = HlcTimestamp::from_datetime(second_delete_ts, "peer-a").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-a".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::CollectionEntry,
+                natural_key: collection_entry_natural_key(&col.id, &book_b.id),
+                deleted_at: second_delete_ts,
+                hlc: second_delete_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let after_b = db.catalog().get_collection_generator(&col.id).await.unwrap();
+    assert!(after_b.current_entry.is_none());
+}
+
+#[tokio::test]
+async fn test_generator_noop_sync_does_not_bump_sync_seq_or_overwrite_hlc() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let col = db
+        .catalog()
+        .create_manual_collection("Noop Gen", Some("noop-gen"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    let book_a = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book A".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&col.id, &book_a.id, None).await.unwrap();
+    db.catalog()
+        .update_collection_generator(&col.id, Some(true), Some(&book_a.id), None)
+        .await
+        .unwrap();
+
+    // Store a Z-formatted timestamp & explicit peer HLC so naive re-binding (+00:00) would trip the AU trigger
+    let local_ts = Utc::now() - chrono::Duration::minutes(1);
+    let local_hlc = HlcTimestamp::from_datetime(local_ts, "peer-winner").encode();
+    let z_formatted = local_ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    sqlx::query("UPDATE collection_generators SET updated_at = ?, hlc = ? WHERE collection_id = ?")
+        .bind(&z_formatted)
+        .bind(&local_hlc)
+        .bind(&col.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let (seq_before, hlc_before): (i64, String) =
+        sqlx::query_as("SELECT sync_seq, hlc FROM collection_generators WHERE collection_id = ?")
+            .bind(&col.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(hlc_before, local_hlc);
+
+    // Stale incoming generator with older HLC and identical (enabled, current_entry_id)
+    let stale_ts = local_ts - chrono::Duration::minutes(5);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "peer-stale").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            collection_generators: vec![crate::db::SyncCollectionGeneratorRecord {
+                collection_id: col.id.clone(),
+                enabled: true,
+                current_entry_id: Some(book_a.id.clone()),
+                drawn_at: Some(stale_ts),
+                updated_at: stale_ts,
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let (seq_after, hlc_after): (i64, String) =
+        sqlx::query_as("SELECT sync_seq, hlc FROM collection_generators WHERE collection_id = ?")
+            .bind(&col.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(seq_after, seq_before, "stale no-op generator sync must not bump sync_seq");
+    assert_eq!(hlc_after, hlc_before, "stale no-op generator sync must not overwrite hlc");
+}
+
+#[tokio::test]
+async fn test_consumption_log_tombstone_cleared_on_newer_sync_resurrection() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let book = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Resurrected Log Book".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let log_id = "custom-log-id-123";
+    let tomb_ts = Utc::now();
+    let tomb_hlc = HlcTimestamp::from_datetime(tomb_ts, "peer-del").encode();
+
+    // Apply incoming ConsumptionLog tombstone
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-del".to_owned(),
+            tombstones: vec![SyncTombstone {
+                entity_type: ActivityEntityType::ConsumptionLog,
+                natural_key: log_id.to_owned(),
+                deleted_at: tomb_ts,
+                hlc: tomb_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // Stale log must remain suppressed and tombstone must remain present
+    let stale_ts = tomb_ts - chrono::Duration::seconds(30);
+    let stale_hlc = HlcTimestamp::from_datetime(stale_ts, "peer-stale").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-stale".to_owned(),
+            consumption_log: vec![crate::db::SyncConsumptionLogRecord {
+                id: log_id.to_owned(),
+                entry_id: book.id.clone(),
+                ts: stale_ts,
+                status: ConsumptionStatus::Consumed,
+                notes: None,
+                created_at: Some(stale_ts),
+                hlc: stale_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let log_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM consumption_log WHERE id = ?")
+        .bind(log_id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+    assert!(log_exists.is_none());
+
+    // Newer log resurrects row AND clears the ConsumptionLog tombstone
+    let newer_ts = tomb_ts + chrono::Duration::seconds(30);
+    let newer_hlc = HlcTimestamp::from_datetime(newer_ts, "peer-new").encode();
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-new".to_owned(),
+            consumption_log: vec![crate::db::SyncConsumptionLogRecord {
+                id: log_id.to_owned(),
+                entry_id: book.id.clone(),
+                ts: newer_ts,
+                status: ConsumptionStatus::Consumed,
+                notes: Some("Logged again".to_owned()),
+                created_at: Some(newer_ts),
+                hlc: newer_hlc,
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let resurrected: Option<i64> = sqlx::query_scalar("SELECT 1 FROM consumption_log WHERE id = ?")
+        .bind(log_id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+    assert!(resurrected.is_some());
+
+    let tomb_remaining: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sync_tombstones WHERE entity_type = 'consumption_log' AND natural_key = ?",
+    )
+    .bind(log_id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        tomb_remaining.is_none(),
+        "ConsumptionLog tombstone must be cleared on newer resurrection"
+    );
+}

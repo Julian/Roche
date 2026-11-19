@@ -202,9 +202,23 @@ internal fun resolveOrSynthesizeHlc(
     fallbackIso: String?,
     nowIso: String,
     peerId: String,
-): String =
-    HlcTimestamp.parse(rawHlc)?.encode()
-        ?: HlcTimestamp.fromIsoOrEpoch(fallbackIso ?: nowIso, peerId).encode()
+    nowMs: Long = System.currentTimeMillis(),
+): String {
+    val phys = nowMs.coerceIn(0L, MAX_HLC_WALL_MS)
+    val maxAllowedWall =
+        if (phys > MAX_HLC_WALL_MS - MAX_CLOCK_DRIFT_MS) {
+            MAX_HLC_WALL_MS
+        } else {
+            phys + MAX_CLOCK_DRIFT_MS
+        }
+    val ts =
+        HlcTimestamp.parse(rawHlc) ?: HlcTimestamp.fromIsoOrEpoch(fallbackIso ?: nowIso, peerId)
+    return if (ts.wallMs > maxAllowedWall) {
+        HlcTimestamp.create(maxAllowedWall, 0, ts.nodeId).encode()
+    } else {
+        ts.encode()
+    }
+}
 
 private val hlcClockMutex = Mutex()
 private val lastHlcByDao = WeakHashMap<RocheDao, String>()

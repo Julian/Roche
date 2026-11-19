@@ -39,8 +39,11 @@ internal data class SinglePeerSyncResult(
     val response: PeerSyncResponseDto,
     val sentEntryIds: Set<String> = emptySet(),
     val byteOverflowEntryIds: Set<String> = emptySet(),
-    val droppedEntriesOn413: Boolean = false,
-)
+    val droppedEntryIdsOn413: Set<String> = emptySet(),
+) {
+    val droppedEntriesOn413: Boolean
+        get() = droppedEntryIdsOn413.isNotEmpty()
+}
 
 internal fun parseSyncSeqCursor(rawCursor: String?): Long =
     rawCursor?.trim()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
@@ -68,16 +71,60 @@ internal class PeerSyncCoordinator(
             syncAndPollInternal(currentSettings, initialWeightOverride, sinceSeqOverride)
         }
 
+    private data class SyncCycleOutcome(
+        val settings: Settings,
+        val latestPeers: List<PeerNodeDto>,
+    )
+
     private suspend fun syncAndPollInternal(
         currentSettings: Settings,
         initialWeightOverride: Double?,
         sinceSeqOverride: Long?,
     ): Int? {
+        val initialCycle =
+            runFullSyncCycle(
+                currentSettings = currentSettings,
+                weightOverride = initialWeightOverride,
+                sinceSeqOverride = sinceSeqOverride,
+            ) ?: return null
+
+        val pollOutcome =
+            if (networkTier != NetworkTier.OFFLINE) {
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = apiClient,
+                    localPeerId = initialCycle.settings.peerId,
+                    activePeers = initialCycle.latestPeers,
+                )
+            } else {
+                null
+            }
+        if (pollOutcome != null && pollOutcome.attemptedFeedsCount > 0) {
+            runPostPollPeerSync(initialCycle.settings, pollOutcome.measuredWeight)
+        }
+        return dao.countItems()
+    }
+
+    private suspend fun runPostPollPeerSync(
+        currentSettings: Settings,
+        measuredWeight: Double?,
+    ) {
+        runFullSyncCycle(
+            currentSettings = currentSettings,
+            weightOverride = measuredWeight,
+        )
+    }
+
+    private suspend fun runFullSyncCycle(
+        currentSettings: Settings,
+        weightOverride: Double?,
+        sinceSeqOverride: Long? = null,
+    ): SyncCycleOutcome? {
         var workingSettings = currentSettings
         var initialRound =
             executeSinglePeerSyncRound(
                 currentSettings = workingSettings,
-                weightOverride = initialWeightOverride,
+                weightOverride = weightOverride,
                 sinceSeqOverride = sinceSeqOverride,
             ) ?: return null
 
@@ -87,18 +134,21 @@ internal class PeerSyncCoordinator(
             initialRound =
                 executeSinglePeerSyncRound(
                     currentSettings = workingSettings,
-                    weightOverride = initialWeightOverride,
+                    weightOverride = weightOverride,
                     sinceSeqOverride = 0L,
                 ) ?: return null
         }
 
         var latestPeers = initialRound.response.activePeers
         onPeersUpdated(latestPeers)
+        if (initialRound.response.resetRequired) {
+            return SyncCycleOutcome(settings = workingSettings, latestPeers = latestPeers)
+        }
         workingSettings =
             applyCursorAndContinuePages(
                 baseSettings = workingSettings,
                 round = initialRound,
-                weightOverride = initialWeightOverride,
+                weightOverride = weightOverride,
             ) { peers ->
                 latestPeers = peers
                 onPeersUpdated(peers)
@@ -108,45 +158,13 @@ internal class PeerSyncCoordinator(
                 initialSettings = workingSettings,
                 initialSentIds = initialRound.sentEntryIds,
                 initialOverflowIds = initialRound.byteOverflowEntryIds,
-                initialDroppedOn413 = initialRound.droppedEntriesOn413,
-                weightOverride = initialWeightOverride,
+                initialDroppedEntryIdsOn413 = initialRound.droppedEntryIdsOn413,
+                weightOverride = weightOverride,
             ) { peers ->
                 latestPeers = peers
                 onPeersUpdated(peers)
             }
-
-        val pollOutcome =
-            if (networkTier != NetworkTier.OFFLINE) {
-                pollCooperativeFeedsOnDevice(
-                    dao = dao,
-                    apiClient = apiClient,
-                    localPeerId = workingSettings.peerId,
-                    activePeers = latestPeers,
-                )
-            } else {
-                null
-            }
-        if (pollOutcome != null && pollOutcome.attemptedFeedsCount > 0) {
-            runPostPollPeerSync(workingSettings, pollOutcome.measuredWeight)
-        }
-        return dao.countItems()
-    }
-
-    private suspend fun runPostPollPeerSync(
-        currentSettings: Settings,
-        measuredWeight: Double?,
-    ) {
-        val followUpRound =
-            executeSinglePeerSyncRound(
-                currentSettings = currentSettings,
-                weightOverride = measuredWeight,
-            ) ?: return
-        onPeersUpdated(followUpRound.response.activePeers)
-        applyCursorAndContinuePages(
-            baseSettings = currentSettings,
-            round = followUpRound,
-            weightOverride = measuredWeight,
-        )
+        return SyncCycleOutcome(settings = workingSettings, latestPeers = latestPeers)
     }
 
     private suspend fun applyCursorAndContinuePages(
@@ -228,60 +246,129 @@ internal class PeerSyncCoordinator(
         return response
     }
 
+    private class OverflowDrainState(
+        var settings: Settings,
+        val alreadySentIds: MutableSet<String>,
+        val quarantinedIds: MutableSet<String>,
+        var remainingIds: Set<String>,
+        var maxPayloadBytes: Int,
+        var maxEntries: Int,
+    ) {
+        fun updateAfterRound(
+            nextRound: SinglePeerSyncResult,
+            prevCount: Int,
+            prevMaxPayloadBytes: Int,
+            prevMaxEntries: Int,
+        ): Boolean {
+            val dropped = nextRound.droppedEntryIdsOn413
+            return when {
+                dropped.size == 1 -> {
+                    quarantinedIds.addAll(dropped)
+                    maxPayloadBytes = MAX_PEER_SYNC_PAYLOAD_BYTES
+                    maxEntries = MAX_PEER_SYNC_ENTRIES
+                    remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
+                    remainingIds.isNotEmpty()
+                }
+                dropped.size > 1 -> {
+                    maxPayloadBytes = (maxPayloadBytes / 2).coerceAtLeast(1)
+                    maxEntries = minOf(maxEntries, dropped.size / 2).coerceAtLeast(1)
+                    remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
+                    remainingIds.isNotEmpty() && (prevMaxPayloadBytes > 1 || prevMaxEntries > 1)
+                }
+                else -> {
+                    remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds - quarantinedIds
+                    remainingIds.isNotEmpty() && remainingIds.size < prevCount
+                }
+            }
+        }
+
+        companion object {
+            fun create(
+                initialSettings: Settings,
+                initialSentIds: Set<String>,
+                initialOverflowIds: Set<String>,
+                initialDroppedEntryIdsOn413: Set<String>,
+            ): OverflowDrainState {
+                val alreadySentIds = initialSentIds.toMutableSet()
+                val quarantinedIds = LinkedHashSet<String>()
+                var maxPayloadBytes = MAX_PEER_SYNC_PAYLOAD_BYTES
+                var maxEntries = MAX_PEER_SYNC_ENTRIES
+                when {
+                    initialDroppedEntryIdsOn413.size == 1 -> {
+                        quarantinedIds.addAll(initialDroppedEntryIdsOn413)
+                    }
+                    initialDroppedEntryIdsOn413.size > 1 -> {
+                        maxPayloadBytes = (MAX_PEER_SYNC_PAYLOAD_BYTES / 2).coerceAtLeast(1)
+                        maxEntries = (initialDroppedEntryIdsOn413.size / 2).coerceAtLeast(1)
+                    }
+                }
+                val remainingIds = initialOverflowIds - alreadySentIds - quarantinedIds
+                return OverflowDrainState(
+                    settings = initialSettings,
+                    alreadySentIds = alreadySentIds,
+                    quarantinedIds = quarantinedIds,
+                    remainingIds = remainingIds,
+                    maxPayloadBytes = maxPayloadBytes,
+                    maxEntries = maxEntries,
+                )
+            }
+        }
+    }
+
     @Suppress("LongParameterList")
     private suspend fun drainOverflowEntryPushes(
         initialSettings: Settings,
         initialSentIds: Set<String>,
         initialOverflowIds: Set<String>,
-        initialDroppedOn413: Boolean,
+        initialDroppedEntryIdsOn413: Set<String>,
         weightOverride: Double?,
         onPagePeers: (List<PeerNodeDto>) -> Unit,
     ): Settings {
-        var settings = initialSettings
-        var remainingIds = initialOverflowIds
-        val alreadySentIds = initialSentIds.toMutableSet()
-        var currentMaxPayloadBytes =
-            if (initialDroppedOn413) {
-                (MAX_PEER_SYNC_PAYLOAD_BYTES / 2).coerceAtLeast(1)
-            } else {
-                MAX_PEER_SYNC_PAYLOAD_BYTES
-            }
+        val state =
+            OverflowDrainState.create(
+                initialSettings = initialSettings,
+                initialSentIds = initialSentIds,
+                initialOverflowIds = initialOverflowIds,
+                initialDroppedEntryIdsOn413 = initialDroppedEntryIdsOn413,
+            )
         var roundIdx = 0
-        var keepDraining = remainingIds.isNotEmpty()
+        var keepDraining = state.remainingIds.isNotEmpty()
         while (keepDraining && roundIdx < MAX_OVERFLOW_PUSH_ROUNDS) {
-            val prevCount = remainingIds.size
-            val prevMaxPayloadBytes = currentMaxPayloadBytes
-            val nextRound =
-                executeSinglePeerSyncRound(
-                    currentSettings = settings,
-                    weightOverride = weightOverride,
-                    forcedEntryIds = remainingIds,
-                    excludeEntryIds = alreadySentIds,
-                    maxPayloadBytes = currentMaxPayloadBytes,
-                )
-            if (nextRound == null || nextRound.response.resetRequired) {
-                keepDraining = false
-            } else {
-                alreadySentIds.addAll(nextRound.sentEntryIds)
-                onPagePeers(nextRound.response.activePeers)
-                settings =
-                    applyCursorAndContinuePages(
-                        baseSettings = settings,
-                        round = nextRound,
-                        weightOverride = weightOverride,
-                        onPagePeers = onPagePeers,
-                    )
-                remainingIds = nextRound.byteOverflowEntryIds - alreadySentIds
-                if (nextRound.droppedEntriesOn413) {
-                    currentMaxPayloadBytes = (currentMaxPayloadBytes / 2).coerceAtLeast(1)
-                    keepDraining = remainingIds.isNotEmpty() && prevMaxPayloadBytes > 1
-                } else {
-                    keepDraining = remainingIds.isNotEmpty() && remainingIds.size < prevCount
-                }
-                roundIdx++
-            }
+            keepDraining = executeOverflowDrainStep(state, weightOverride, onPagePeers)
+            roundIdx++
         }
-        return settings
+        return state.settings
+    }
+
+    private suspend fun executeOverflowDrainStep(
+        state: OverflowDrainState,
+        weightOverride: Double?,
+        onPagePeers: (List<PeerNodeDto>) -> Unit,
+    ): Boolean {
+        val prevCount = state.remainingIds.size
+        val prevMaxPayloadBytes = state.maxPayloadBytes
+        val prevMaxEntries = state.maxEntries
+        val nextRound =
+            executeSinglePeerSyncRound(
+                currentSettings = state.settings,
+                weightOverride = weightOverride,
+                forcedEntryIds = state.remainingIds,
+                excludeEntryIds = state.alreadySentIds,
+                quarantinedEntryIds = state.quarantinedIds,
+                maxPayloadBytes = state.maxPayloadBytes,
+                maxEntries = state.maxEntries,
+            )
+        if (nextRound == null || nextRound.response.resetRequired) return false
+        state.alreadySentIds.addAll(nextRound.sentEntryIds)
+        onPagePeers(nextRound.response.activePeers)
+        state.settings =
+            applyCursorAndContinuePages(
+                baseSettings = state.settings,
+                round = nextRound,
+                weightOverride = weightOverride,
+                onPagePeers = onPagePeers,
+            )
+        return state.updateAfterRound(nextRound, prevCount, prevMaxPayloadBytes, prevMaxEntries)
     }
 
     @Suppress("LongParameterList")
@@ -291,7 +378,9 @@ internal class PeerSyncCoordinator(
         sinceSeqOverride: Long? = null,
         forcedEntryIds: Set<String> = emptySet(),
         excludeEntryIds: Set<String> = emptySet(),
+        quarantinedEntryIds: Set<String> = emptySet(),
         maxPayloadBytes: Int = MAX_PEER_SYNC_PAYLOAD_BYTES,
+        maxEntries: Int = MAX_PEER_SYNC_ENTRIES,
     ): SinglePeerSyncResult? {
         val effectiveSinceSeq =
             sinceSeqOverride ?: parseSyncSeqCursor(currentSettings.lastPeerSyncCursor)
@@ -307,7 +396,9 @@ internal class PeerSyncCoordinator(
                         weightOverride = weightOverride,
                         forcedEntryIds = forcedEntryIds,
                         excludeEntryIds = excludeEntryIds,
+                        quarantinedEntryIds = quarantinedEntryIds,
                         maxPayloadBytes = maxPayloadBytes,
+                        maxEntries = maxEntries,
                     ),
             )
         val (response, retriedRequestAfter413) =
@@ -315,30 +406,11 @@ internal class PeerSyncCoordinator(
         if (response.resetRequired) {
             return SinglePeerSyncResult(response = response)
         }
-        val droppedEntriesOn413 = retriedRequestAfter413 != null
+        val droppedEntryIdsOn413 =
+            if (retriedRequestAfter413 != null) tracked.sentEntryIds else emptySet()
         val effectiveTracked =
             if (retriedRequestAfter413 != null) {
-                val droppedEntryIds = tracked.sentEntryIds
-                val keptGenIds =
-                    retriedRequestAfter413.collectionGenerators.mapTo(HashSet()) { it.collectionId }
-                val keptLogIds = retriedRequestAfter413.consumptionLog.mapTo(HashSet()) { it.id }
-                val keptCompIds = retriedRequestAfter413.comparisons.mapTo(HashSet()) { it.id }
-                tracked.copy(
-                    request = retriedRequestAfter413,
-                    sentEntryHlcById = emptyMap(),
-                    sentStateHlcById = emptyMap(),
-                    sentFeedSourceHlcById = emptyMap(),
-                    sentMembershipHlcByKey =
-                        tracked.sentMembershipHlcByKey.filterKeys { (colId, entryId) ->
-                            colId !in droppedEntryIds && entryId !in droppedEntryIds
-                        },
-                    sentGeneratorHlcById =
-                        tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
-                    sentLogIds = tracked.sentLogIds.filterTo(HashSet()) { it in keptLogIds },
-                    sentComparisonIds =
-                        tracked.sentComparisonIds.filterTo(HashSet()) { it in keptCompIds },
-                    byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
-                )
+                buildRetriedTrackedRequest(tracked, retriedRequestAfter413)
             } else {
                 tracked
             }
@@ -353,7 +425,32 @@ internal class PeerSyncCoordinator(
             response = response,
             sentEntryIds = effectiveTracked.sentEntryIds,
             byteOverflowEntryIds = effectiveTracked.byteOverflowEntryIds,
-            droppedEntriesOn413 = droppedEntriesOn413,
+            droppedEntryIdsOn413 = droppedEntryIdsOn413,
+        )
+    }
+
+    private fun buildRetriedTrackedRequest(
+        tracked: TrackedOutgoingSyncBatch,
+        retriedRequestAfter413: PeerSyncRequestDto,
+    ): TrackedOutgoingSyncBatch {
+        val droppedEntryIds = tracked.sentEntryIds
+        val keptGenIds =
+            retriedRequestAfter413.collectionGenerators.mapTo(HashSet()) { it.collectionId }
+        val keptLogIds = retriedRequestAfter413.consumptionLog.mapTo(HashSet()) { it.id }
+        val keptCompIds = retriedRequestAfter413.comparisons.mapTo(HashSet()) { it.id }
+        return tracked.copy(
+            request = retriedRequestAfter413,
+            sentEntryHlcById = emptyMap(),
+            sentStateHlcById = emptyMap(),
+            sentFeedSourceHlcById = emptyMap(),
+            sentMembershipHlcByKey =
+                tracked.sentMembershipHlcByKey.filterKeys { (colId, entryId) ->
+                    colId !in droppedEntryIds && entryId !in droppedEntryIds
+                },
+            sentGeneratorHlcById = tracked.sentGeneratorHlcById.filterKeys { it in keptGenIds },
+            sentLogIds = tracked.sentLogIds.filterTo(HashSet()) { it in keptLogIds },
+            sentComparisonIds = tracked.sentComparisonIds.filterTo(HashSet()) { it in keptCompIds },
+            byteOverflowEntryIds = droppedEntryIds + tracked.byteOverflowEntryIds,
         )
     }
 
@@ -370,10 +467,12 @@ internal class PeerSyncCoordinator(
         }
         val error = primary.exceptionOrNull()
         return when {
-            error == null -> primary.getOrNull()?.let { it to null }
+            error == null -> {
+                primary.getOrNull()?.let { it to null }
+            }
             (error as? ProblemDetailsException)?.statusCode == HTTP_PAYLOAD_TOO_LARGE &&
                 request.entries.isNotEmpty() -> {
-                val strippedRequest = stripEntriesAndDependentEdgesFor413(request)
+                val strippedRequest = stripEntriesFor413Retry(request)
                 apiClient
                     .syncPeer(
                         serverUrl = currentSettings.serverUrl,
@@ -382,13 +481,17 @@ internal class PeerSyncCoordinator(
                     )
                     ?.let { it to strippedRequest }
             }
-            request.sinceSeq == 0L && isOversizedResponseError(error) -> null
-            else -> throw error
+            request.sinceSeq == 0L && isOversizedResponseError(error) -> {
+                null
+            }
+            else -> {
+                throw error
+            }
         }
     }
 }
 
-internal fun stripEntriesAndDependentEdgesFor413(request: PeerSyncRequestDto): PeerSyncRequestDto {
+internal fun stripEntriesFor413Retry(request: PeerSyncRequestDto): PeerSyncRequestDto {
     val droppedEntryIds = request.entries.mapTo(HashSet()) { it.id }
     return request.copy(
         entries = emptyList(),

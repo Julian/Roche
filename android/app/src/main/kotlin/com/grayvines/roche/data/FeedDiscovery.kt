@@ -173,31 +173,35 @@ private fun buildOriginFallbackFeedUrls(baseUrl: String): List<String> {
     return COMMON_FEED_PATHS.map { path -> "$origin$path" }
 }
 
+@Suppress("LongParameterList")
 internal suspend fun enrichWantToReadItemOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
     itemId: String,
     url: String,
     hasUserTitleOverride: Boolean,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     if (!isHttpOrHttpsCandidate(url)) return
     val arxivId = extractArxivIdentifier(url)
     if (arxivId != null) {
-        enrichArxivItemOnDevice(dao, apiClient, itemId, arxivId, hasUserTitleOverride)
+        enrichArxivItemOnDevice(dao, apiClient, itemId, arxivId, hasUserTitleOverride, nodeId)
         return
     }
     if (inferContentType(url) != ContentType.ARTICLE) return
     val html = apiClient.fetchExternalFeedXml(url).getOrNull() ?: return
     val snapshot = withContext(Dispatchers.Default) { extractWebPageSnapshot(html, url) }
-    applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride)
+    applyWebPageSnapshotToItem(dao, itemId, snapshot, hasUserTitleOverride, nodeId)
 }
 
+@Suppress("LongParameterList")
 private suspend fun enrichArxivItemOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
     itemId: String,
     arxivId: String,
     hasUserTitleOverride: Boolean,
+    nodeId: String,
 ) {
     val queryUrl = "https://export.arxiv.org/api/query?id_list=$arxivId"
     val xml = apiClient.fetchExternalFeedXml(queryUrl).getOrNull() ?: return
@@ -219,6 +223,7 @@ private suspend fun enrichArxivItemOnDevice(
         author = candidate.author,
         summary = candidate.summary,
         publishedAt = candidate.publishedAt,
+        nodeId = nodeId,
     )
 }
 
@@ -267,6 +272,7 @@ private suspend fun applyWebPageSnapshotToItem(
     itemId: String,
     snapshot: ExtractedWebPageSnapshot,
     hasUserTitleOverride: Boolean,
+    nodeId: String,
 ) {
     dao.enrichEntryMetadataIfPresent(
         itemId = itemId,
@@ -276,6 +282,7 @@ private suspend fun applyWebPageSnapshotToItem(
         summary = snapshot.summary,
         thumbnailUrl = snapshot.thumbnailUrl,
         contentHtml = snapshot.contentHtml,
+        nodeId = nodeId,
     )
 }
 
@@ -306,25 +313,28 @@ internal suspend fun writeSharedPdfToItemDir(
 ): Boolean = runSuspendCatching {
     stream.use { input ->
         val safeItemId = sanitizeCacheFileName(itemId)
-        if (safeItemId != itemId.trim()) return@use false
-        val itemsRoot = File(rootDir, ITEMS_SUBDIR).apply { mkdirs() }
-        val itemDir = resolveSafeChildFile(itemsRoot, safeItemId).apply { mkdirs() }
-        val targetFile = File(itemDir, SHARED_PDF_FILENAME).canonicalFile
-        check(targetFile.parentFile == itemDir.canonicalFile) {
-            "Resolved PDF path escapes item directory"
-        }
-        val tempFile = File(itemDir, "$SHARED_PDF_FILENAME.${System.nanoTime()}.tmp")
-        try {
-            val totalBytes = copyBoundedStreamToFile(input, tempFile)
-            if (totalBytes <= 0L) {
-                false
-            } else {
-                moveFileAtomically(tempFile, targetFile)
-                true
+        if (safeItemId != itemId.trim()) {
+            false
+        } else {
+            val itemsRoot = File(rootDir, ITEMS_SUBDIR).apply { mkdirs() }
+            val itemDir = resolveSafeChildFile(itemsRoot, safeItemId).apply { mkdirs() }
+            val targetFile = File(itemDir, SHARED_PDF_FILENAME).canonicalFile
+            check(targetFile.parentFile == itemDir.canonicalFile) {
+                "Resolved PDF path escapes item directory"
             }
-        } finally {
-            if (tempFile.exists()) {
-                tempFile.delete()
+            val tempFile = File(itemDir, "$SHARED_PDF_FILENAME.${System.nanoTime()}.tmp")
+            try {
+                val totalBytes = copyBoundedStreamToFile(input, tempFile)
+                if (totalBytes <= 0L) {
+                    false
+                } else {
+                    moveFileAtomically(tempFile, targetFile)
+                    true
+                }
+            } finally {
+                if (tempFile.exists()) {
+                    tempFile.delete()
+                }
             }
         }
     }
@@ -337,29 +347,39 @@ private fun copyBoundedStreamToFile(input: InputStream, target: File): Long {
     var headerRead = 0
     target.outputStream().use { output ->
         val buffer = ByteArray(PDF_COPY_BUFFER_BYTES)
-        while (true) {
-            val read = input.read(buffer)
-            if (read == -1) break
-            if (read == 0) continue
-            if (headerRead < PDF_MAGIC_BYTES.size) {
-                val take = minOf(read, PDF_MAGIC_BYTES.size - headerRead)
-                System.arraycopy(buffer, 0, header, headerRead, take)
-                headerRead += take
-                if (headerRead == PDF_MAGIC_BYTES.size) {
-                    check(header.contentEquals(PDF_MAGIC_BYTES)) {
-                        "Shared stream is not a valid PDF document"
-                    }
-                }
+        var read = input.read(buffer)
+        while (read != -1) {
+            if (read > 0) {
+                headerRead = accumulateAndVerifyPdfHeader(buffer, read, header, headerRead)
+                totalBytes += read
+                check(totalBytes <= MAX_SHARED_PDF_BYTES) { "Shared PDF exceeds maximum size" }
+                output.write(buffer, 0, read)
             }
-            totalBytes += read
-            check(totalBytes <= MAX_SHARED_PDF_BYTES) { "Shared PDF exceeds maximum size" }
-            output.write(buffer, 0, read)
+            read = input.read(buffer)
         }
     }
     check(headerRead == PDF_MAGIC_BYTES.size && header.contentEquals(PDF_MAGIC_BYTES)) {
         "Shared stream is not a valid PDF document"
     }
     return totalBytes
+}
+
+private fun accumulateAndVerifyPdfHeader(
+    buffer: ByteArray,
+    read: Int,
+    header: ByteArray,
+    headerRead: Int,
+): Int {
+    if (headerRead >= PDF_MAGIC_BYTES.size) return headerRead
+    val take = minOf(read, PDF_MAGIC_BYTES.size - headerRead)
+    System.arraycopy(buffer, 0, header, headerRead, take)
+    val nextHeaderRead = headerRead + take
+    if (nextHeaderRead == PDF_MAGIC_BYTES.size) {
+        check(header.contentEquals(PDF_MAGIC_BYTES)) {
+            "Shared stream is not a valid PDF document"
+        }
+    }
+    return nextHeaderRead
 }
 
 private fun extractCleanDocumentTitle(doc: Document): String? =

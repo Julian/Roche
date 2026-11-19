@@ -201,6 +201,7 @@ internal class PeerSyncJobTracker<P>(
         val entry = RunningJobEntry(job = job, stoppedBySystem = stoppedBySystem)
         entryRef = entry
         activeJobs.put(jobId, entry)?.let { previous ->
+            previous.stoppedBySystem.set(true)
             previous.job.cancel()
         }
         job.start()

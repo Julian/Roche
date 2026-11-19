@@ -47,7 +47,11 @@ internal suspend fun refreshFeedOnlineOrOnDevice(
         }
     return if (remoteRefreshed != null) {
         if (remoteRefreshed.id.isNotBlank()) {
-            dao.upsertFeed(toRemoteFeedEntity(remoteRefreshed, existingFeed), markDirty = false)
+            dao.upsertFeed(
+                feed = toRemoteFeedEntity(remoteRefreshed, existingFeed),
+                markDirty = false,
+                nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE },
+            )
         }
         onSyncWithServer()
         remoteRefreshed.title.ifBlank { existingTitle ?: feedId }
@@ -130,6 +134,7 @@ internal suspend fun subscribeFeedBestEffort(
         feed = entity,
         markDirty = remoteFeed == null && isPublic,
         hlcOverride = hlc,
+        nodeId = nodeId,
     )
     if (remoteFeed == null || prefetchedBatch != null) {
         LocalFeedPoller.pollFeed(

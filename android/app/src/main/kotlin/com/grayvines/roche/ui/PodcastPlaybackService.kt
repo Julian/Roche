@@ -82,6 +82,7 @@ internal constructor(
         scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sessionGeneration = AtomicLong(0L)
 
+    @Volatile private var released: Boolean = false
     @Volatile private var callbacks: PodcastMediaSessionCallbacks? = null
     @Volatile internal var latestSnapshot: MediaSessionMetadataSnapshot? = null
     @Volatile internal var cachedArtworkUrl: String? = null
@@ -127,32 +128,43 @@ internal constructor(
     override fun abandonAudioFocus() = Unit
 
     override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
+        if (released) return
         val generation = sessionGeneration.incrementAndGet()
         scope.launch(mainDispatcher) {
-            if (sessionGeneration.get() == generation) {
+            if (!released && sessionGeneration.get() == generation) {
                 updateSessionOnMain(snapshot)
             }
         }
     }
 
     override fun release() {
-        val generationAtRelease = sessionGeneration.get()
+        val generationAtRelease =
+            if (ownsScope) {
+                released = true
+                sessionGeneration.incrementAndGet()
+            } else {
+                sessionGeneration.get()
+            }
         scope.launch(mainDispatcher) {
-            if (sessionGeneration.get() == generationAtRelease) {
-                artworkLoadJob?.cancel()
-                artworkLoadJob = null
-                loadingArtworkUrl = null
-                cachedArtworkUrl = null
-                cachedArtworkBytes = null
-                latestSnapshot = null
-                lastMetadataKey = null
-                lastHasNextQueuedAudio = null
-                disconnectControllerOnMain()
+            if (ownsScope || sessionGeneration.get() == generationAtRelease) {
+                clearSessionStateOnMain()
             }
             if (ownsScope) {
                 scope.cancel()
             }
         }
+    }
+
+    private fun clearSessionStateOnMain() {
+        artworkLoadJob?.cancel()
+        artworkLoadJob = null
+        loadingArtworkUrl = null
+        cachedArtworkUrl = null
+        cachedArtworkBytes = null
+        latestSnapshot = null
+        lastMetadataKey = null
+        lastHasNextQueuedAudio = null
+        disconnectControllerOnMain()
     }
 
     internal fun attachServiceSessionOnMain(
@@ -177,6 +189,7 @@ internal constructor(
     }
 
     internal fun updateSessionOnMain(snapshot: MediaSessionMetadataSnapshot?) {
+        if (released) return
         latestSnapshot = snapshot
         if (snapshot == null) {
             artworkLoadJob?.cancel()
@@ -213,6 +226,25 @@ internal constructor(
         activeForwardingPlayer?.notifyAvailableCommandsChanged()
     }
 
+    internal fun createControllerListener(
+        futureProvider: () -> ListenableFuture<MediaController>?
+    ): MediaController.Listener =
+        object : MediaController.Listener {
+            override fun onDisconnected(controller: MediaController) {
+                clearControllerOnDisconnect(futureProvider())
+            }
+        }
+
+    internal fun clearControllerOnDisconnect(
+        disconnectedFuture: ListenableFuture<MediaController>?
+    ) {
+        val target = disconnectedFuture ?: controllerFuture ?: return
+        if (controllerFuture === target) {
+            controllerFuture = null
+            runCatching { MediaController.releaseFuture(target) }
+        }
+    }
+
     private fun connectControllerOnMain() {
         val context = appContext ?: return
         if (controllerFuture != null || backend == null) return
@@ -222,15 +254,19 @@ internal constructor(
                     context,
                     ComponentName(context, PodcastPlaybackService::class.java),
                 )
-            val future = MediaController.Builder(context, token).buildAsync()
+            var createdFuture: ListenableFuture<MediaController>? = null
+            val future =
+                MediaController.Builder(context, token)
+                    .setListener(createControllerListener { createdFuture })
+                    .buildAsync()
+            createdFuture = future
             controllerFuture = future
             future.addListener(
                 {
                     val failedOrCancelled =
                         future.isCancelled || runCatching { future.get() }.isFailure
-                    if (failedOrCancelled && controllerFuture === future) {
-                        controllerFuture = null
-                        runCatching { MediaController.releaseFuture(future) }
+                    if (failedOrCancelled) {
+                        clearControllerOnDisconnect(future)
                     }
                 },
                 context.mainExecutor,

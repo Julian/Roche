@@ -18,8 +18,8 @@ use crate::{
         auth::WebSession,
         html::{
             FlashQuery, NavSection, PageShell, esc, redirect_see_other, redirect_with_flash,
-            render_page, safe_external_href, safe_local_redirect, urlencode,
-            web_api_error_response,
+            render_inline_csrf_form, render_inline_csrf_form_with_class, render_page,
+            safe_local_redirect, urlencode, web_api_error_response,
         },
         links::sanitize_non_local_href,
     },
@@ -93,9 +93,7 @@ fn render_reader_article(
     if let Some(dt) = item.published_at {
         let _ = write!(out, "<span>{}</span>", dt.format("%B %d, %Y"));
     }
-    if let Some(ext_href) = safe_external_href(item.url.as_str())
-        && !ext_href.starts_with("https://roche.local/")
-    {
+    if let Some(ext_href) = sanitize_non_local_href(item.url.as_str()) {
         let _ = write!(
             out,
             "<a href=\"{}\" target=\"_blank\" rel=\"noopener\">Original &#8599;</a>",
@@ -109,22 +107,24 @@ fn render_reader_article(
     out.push_str("<div class=\"reader-toolbar\">\n");
     render_audio_play_button(out, item);
 
+    let id_enc = urlencode(&item.id);
+    let finish_action = format!("/web/items/{id_enc}/finish");
     // Explicit "Finished" & "Finished & Rank" controls (essential for Videos, available on all feed items)
-    let _ = write!(
+    render_inline_csrf_form(
         out,
-        "<form method=\"post\" action=\"/web/items/{id}/finish\" class=\"inline-form\">\
-           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-           <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-           <button type=\"submit\" class=\"btn btn-primary btn-small\">&#10003; Finished</button>\
-         </form>\
-         <form method=\"post\" action=\"/web/items/{id}/finish\" class=\"inline-form\">\
-           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-           <input type=\"hidden\" name=\"rank_after\" value=\"1\">\
-           <button type=\"submit\" class=\"btn btn-small\">Finished &amp; Rank</button>\
-         </form>",
-        id = esc(&urlencode(&item.id)),
-        csrf = esc(csrf),
-        ret = esc(&reader_path),
+        &finish_action,
+        csrf,
+        &[("return_to", &reader_path)],
+        None,
+        "<button type=\"submit\" class=\"btn btn-primary btn-small\">&#10003; Finished</button>",
+    );
+    render_inline_csrf_form(
+        out,
+        &finish_action,
+        csrf,
+        &[("rank_after", "1")],
+        None,
+        "<button type=\"submit\" class=\"btn btn-small\">Finished &amp; Rank</button>",
     );
 
     let (arch_action, arch_label, arch_return) = if item.feed_id.is_some() {
@@ -138,33 +138,35 @@ fn render_reader_article(
     } else {
         ("unarchive", "+ Want to Read", reader_path.as_str())
     };
-    let _ = write!(
+    let prog_str = format!("{:.4}", item.read_progress.clamp(0.0, 1.0));
+    let arch_btn = format!("<button type=\"submit\" class=\"btn btn-small\">{arch_label}</button>");
+    render_inline_csrf_form_with_class(
         out,
-        "<form method=\"post\" action=\"/web/items/{id}/{arch_action}\" class=\"inline-form js-reader-archive-form\">\
-           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-           <input type=\"hidden\" name=\"progress\" value=\"{prog:.4}\">\
-           <input type=\"hidden\" name=\"return_to\" value=\"{arch_ret}\">\
-           <button type=\"submit\" class=\"btn btn-small\">{arch_label}</button>\
-         </form>",
-        id = esc(&urlencode(&item.id)),
-        csrf = esc(csrf),
-        prog = item.read_progress.clamp(0.0, 1.0),
-        arch_ret = esc(arch_return),
+        &format!("/web/items/{id_enc}/{arch_action}"),
+        csrf,
+        Some("js-reader-archive-form"),
+        &[("progress", &prog_str), ("return_to", arch_return)],
+        None,
+        &arch_btn,
     );
 
     let (star_glyph, star_pressed) =
         if item.is_favorite { ("&#9733;", "true") } else { ("&#9734;", "false") };
+    let star_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span> Star</button>"
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/items/{id_enc}/star"),
+        csrf,
+        &[("return_to", &reader_path)],
+        None,
+        &star_btn,
+    );
     let _ = write!(
         out,
-        "<form method=\"post\" action=\"/web/items/{id}/star\" class=\"inline-form\">\
-           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-           <input type=\"hidden\" name=\"return_to\" value=\"{ret}\">\
-           <button type=\"submit\" class=\"btn btn-small btn-ghost\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span> Star</button>\
-         </form>\
-         <a class=\"btn btn-small btn-ghost\" href=\"/entries/{id}\">Catalog Entry</a>",
-        id = esc(&urlencode(&item.id)),
-        csrf = esc(csrf),
-        ret = esc(&reader_path),
+        "<a class=\"btn btn-small btn-ghost\" href=\"/entries/{}\">Catalog Entry</a>",
+        esc(&id_enc),
     );
     if let Some(slug) = rank_slug {
         let _ = write!(
@@ -219,20 +221,22 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
     out.push_str("</div>\n");
 
     out.push_str("<h3>Tags</h3>\n<div class=\"pill-bar\">\n");
+    let item_id_enc = urlencode(&item.id);
     for tag in &detail.tags {
-        let _ = writeln!(
-            out,
-            "<span class=\"pill\">#{tag_name} \
-               <form method=\"post\" action=\"/web/items/{item_id}/tags/{tag_id}/remove\" class=\"inline-form\">\
-                 <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\
-                 <button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {tag_name}\" title=\"Remove tag\"><span aria-hidden=\"true\">&times;</span></button>\
-               </form>\
-             </span>",
-            tag_name = esc(&tag.name),
-            item_id = esc(&urlencode(&item.id)),
-            tag_id = esc(&urlencode(&tag.id)),
-            csrf = esc(csrf),
+        let _ = write!(out, "<span class=\"pill\">#{} ", esc(&tag.name));
+        let remove_btn = format!(
+            "<button type=\"submit\" class=\"link-btn ml-xs\" aria-label=\"Remove tag {}\" title=\"Remove tag\"><span aria-hidden=\"true\">&times;</span></button>",
+            esc(&tag.name),
         );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/items/{item_id_enc}/tags/{}/remove", urlencode(&tag.id)),
+            csrf,
+            &[],
+            None,
+            &remove_btn,
+        );
+        out.push_str("</span>\n");
     }
     let _ = write!(
         out,
@@ -241,7 +245,7 @@ fn render_reader_media_and_tags(out: &mut String, detail: &ItemDetail, csrf: &st
            <input type=\"text\" name=\"name\" required aria-label=\"Add tag\" placeholder=\"Add tag...\" class=\"tag-add-input\">\
            <button type=\"submit\" class=\"btn btn-small\">+ Tag</button>\
          </form>\n</div>\n</article>\n",
-        esc(&urlencode(&item.id)),
+        esc(&item_id_enc),
         esc(csrf),
     );
 }
@@ -337,12 +341,11 @@ pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
         && let Ok(Some(list_slug)) =
             service.catalog().rank_target_after_consumption(&logged.entry).await
     {
-        redirect_see_other(&format!(
-            "/rank/{}?focus={}&notice={}",
-            urlencode(&list_slug),
-            urlencode(&logged.entry.id),
-            urlencode("Marked finished & logged to Diary")
-        ))
+        redirect_with_flash(
+            &format!("/rank/{}?focus={}", urlencode(&list_slug), urlencode(&logged.entry.id)),
+            "notice",
+            "Marked finished & logged to Diary",
+        )
     } else {
         let base = safe_local_redirect(form.return_to.as_deref(), default_return);
         redirect_with_flash(&base, "notice", "Marked finished & logged to Diary")

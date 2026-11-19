@@ -36,6 +36,14 @@ pub struct VideoMetadata {
     pub uploader: Option<String>,
 }
 
+struct ValidatedDownload {
+    video_path: PathBuf,
+    video_size: i64,
+    thumbnail_file: Option<(PathBuf, i64)>,
+    duration: Option<i64>,
+    metadata: VideoMetadata,
+}
+
 #[derive(Debug, Clone)]
 pub struct YtDlpWorker {
     config: MediaConfig,
@@ -122,26 +130,40 @@ impl YtDlpWorker {
         url: &Url,
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         Self::validate_item_id(item_id)?;
+        let base_downloads = self.media_store.resolve_download_dir(&self.config.download_dir);
+        let _ = self.media_store.validate_path_async(&base_downloads).await?;
         let item_dir = self.item_download_dir(item_id).await?;
+        let staging_dir = base_downloads.join(format!(".tmp-{}-{item_id}", uuid::Uuid::new_v4()));
+        let _ = self.media_store.validate_path_async(&staging_dir).await?;
         let args =
-            Self::build_args_with_limit(item_id, url, &item_dir, self.config.max_video_size_mb)?;
+            Self::build_args_with_limit(item_id, url, &staging_dir, self.config.max_video_size_mb)?;
 
         MediaStore::ensure_private_dir(self.media_store.base_dir()).await?;
-        MediaStore::ensure_private_dir(&item_dir).await?;
-        let verified_dir = self.media_store.validate_path_async(&item_dir).await?;
+        MediaStore::ensure_private_dir(&base_downloads).await?;
+        MediaStore::ensure_private_dir(&staging_dir).await?;
+        let verified_staging_dir = self.media_store.validate_path_async(&staging_dir).await?;
 
-        let result = self.spawn_and_register(media_repo, item_id, &verified_dir, &args).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_dir_all(&verified_dir).await;
-        }
+        let result = self
+            .download_stage_and_register(
+                media_repo,
+                item_id,
+                &verified_staging_dir,
+                &item_dir,
+                &args,
+            )
+            .await;
+        // Always clean up our unique staging directory (on failure or after per-file move into an
+        // existing item_dir); never delete `downloads/<item_id>` on download/validation failure.
+        let _ = tokio::fs::remove_dir_all(&verified_staging_dir).await;
         result
     }
 
-    async fn spawn_and_register(
+    async fn download_stage_and_register(
         &self,
         media_repo: &MediaRepo<'_>,
         item_id: &str,
-        verified_dir: &Path,
+        verified_staging_dir: &Path,
+        item_dir: &Path,
         args: &[String],
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         let mut cmd = Command::new(&self.config.ytdlp_path);
@@ -166,9 +188,98 @@ impl YtDlpWorker {
             anyhow::bail!("yt-dlp exited with {}: {}", output.status, stderr.trim());
         }
 
-        self.register_downloaded_files(media_repo, item_id, verified_dir).await
+        let validated = self.inspect_and_validate_dir(verified_staging_dir).await?;
+        let (installed, created_fresh_dir, verified_item_dir) =
+            self.install_validated_into_item_dir(verified_staging_dir, item_dir, validated).await?;
+
+        match self.record_validated_download(media_repo, item_id, installed).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                if created_fresh_dir
+                    && media_repo.list_for_item(item_id).await.is_ok_and(|rows| rows.is_empty())
+                {
+                    let _ = tokio::fs::remove_dir_all(&verified_item_dir).await;
+                }
+                Err(err)
+            }
+        }
     }
 
+    async fn install_validated_into_item_dir(
+        &self,
+        verified_staging_dir: &Path,
+        item_dir: &Path,
+        validated: ValidatedDownload,
+    ) -> Result<(ValidatedDownload, bool, PathBuf)> {
+        let verified_item_dir = self.media_store.validate_path_async(item_dir).await?;
+        let video_name = validated
+            .video_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Validated video path has no filename"))?
+            .to_owned();
+        let thumb_name = validated
+            .thumbnail_file
+            .as_ref()
+            .map(|(path, _)| {
+                path.file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Validated thumbnail path has no filename"))
+                    .map(std::ffi::OsStr::to_owned)
+            })
+            .transpose()?;
+
+        if let Err(rename_err) = tokio::fs::rename(verified_staging_dir, &verified_item_dir).await {
+            let verified_item_dir = self.media_store.validate_path_async(item_dir).await?;
+            let is_existing_dir = tokio::fs::symlink_metadata(&verified_item_dir)
+                .await
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
+            if !is_existing_dir {
+                return Err(rename_err.into());
+            }
+
+            let dest_video =
+                self.media_store.validate_path_async(&verified_item_dir.join(&video_name)).await?;
+            tokio::fs::rename(&validated.video_path, &dest_video).await?;
+            let installed_thumb = match (validated.thumbnail_file, thumb_name) {
+                (Some((src_thumb, size)), Some(name)) => {
+                    let dest_thumb =
+                        self.media_store.validate_path_async(&verified_item_dir.join(name)).await?;
+                    tokio::fs::rename(&src_thumb, &dest_thumb).await?;
+                    Some((dest_thumb, size))
+                }
+                _ => None,
+            };
+            return Ok((
+                ValidatedDownload {
+                    video_path: dest_video,
+                    video_size: validated.video_size,
+                    thumbnail_file: installed_thumb,
+                    duration: validated.duration,
+                    metadata: validated.metadata,
+                },
+                false,
+                verified_item_dir,
+            ));
+        }
+
+        let installed_video = verified_item_dir.join(video_name);
+        let installed_thumb = validated
+            .thumbnail_file
+            .zip(thumb_name)
+            .map(|((_, size), name)| (verified_item_dir.join(name), size));
+        Ok((
+            ValidatedDownload {
+                video_path: installed_video,
+                video_size: validated.video_size,
+                thumbnail_file: installed_thumb,
+                duration: validated.duration,
+                metadata: validated.metadata,
+            },
+            true,
+            verified_item_dir,
+        ))
+    }
+
+    #[cfg(test)]
     pub async fn register_downloaded_files(
         &self,
         media_repo: &MediaRepo<'_>,
@@ -177,7 +288,11 @@ impl YtDlpWorker {
     ) -> Result<(Vec<Media>, VideoMetadata)> {
         Self::validate_item_id(item_id)?;
         let verified_dir = self.media_store.validate_path_async(item_dir).await?;
+        let validated = self.inspect_and_validate_dir(&verified_dir).await?;
+        self.record_validated_download(media_repo, item_id, validated).await
+    }
 
+    async fn inspect_and_validate_dir(&self, verified_dir: &Path) -> Result<ValidatedDownload> {
         let info_path = verified_dir.join("video.info.json");
         let info = tokio::fs::read(&info_path).await.map_or_else(
             |_| YtDlpInfoJson::default(),
@@ -193,16 +308,17 @@ impl YtDlpWorker {
         };
         let _ = tokio::fs::remove_file(&info_path).await;
 
-        let mut entries = tokio::fs::read_dir(&verified_dir).await?;
+        let mut entries = tokio::fs::read_dir(verified_dir).await?;
         let mut video_file: Option<(PathBuf, i64)> = None;
         let mut thumbnail_file: Option<(PathBuf, i64)> = None;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            let meta = entry.metadata().await?;
-            if !meta.is_file() {
+            let ft = entry.file_type().await?;
+            if ft.is_symlink() || !ft.is_file() {
                 continue;
             }
+            let meta = entry.metadata().await?;
             let size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
             let ext =
                 path.extension().and_then(|e| e.to_str()).map_or_default(str::to_ascii_lowercase);
@@ -238,8 +354,17 @@ impl YtDlpWorker {
             MediaStore::tighten_private_file_if_exists(thumb_path).await;
         }
 
-        let video_rel = self.media_store.relative_path_async(&video_path).await?;
-        let thumb_rel_and_size = match thumbnail_file {
+        Ok(ValidatedDownload { video_path, video_size, thumbnail_file, duration, metadata })
+    }
+
+    async fn record_validated_download(
+        &self,
+        media_repo: &MediaRepo<'_>,
+        item_id: &str,
+        validated: ValidatedDownload,
+    ) -> Result<(Vec<Media>, VideoMetadata)> {
+        let video_rel = self.media_store.relative_path_async(&validated.video_path).await?;
+        let thumb_rel_and_size = match validated.thumbnail_file {
             Some((thumb_path, size)) => {
                 Some((self.media_store.relative_path_async(&thumb_path).await?, size))
             }
@@ -249,8 +374,8 @@ impl YtDlpWorker {
         let mut specs = vec![crate::db::NewMediaSpec {
             media_type: MediaType::Video,
             path: &video_rel,
-            file_size: Some(video_size),
-            duration,
+            file_size: Some(validated.video_size),
+            duration: validated.duration,
         }];
         if let Some((ref thumb_rel, size)) = thumb_rel_and_size {
             specs.push(crate::db::NewMediaSpec {
@@ -262,7 +387,7 @@ impl YtDlpWorker {
         }
         let registered = media_repo.create_batch(item_id, &specs).await?;
 
-        Ok((registered, metadata))
+        Ok((registered, validated.metadata))
     }
 
     async fn item_download_dir(&self, item_id: &str) -> Result<PathBuf> {
@@ -398,5 +523,154 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&temp_base).await;
         let _ = tokio::fs::remove_dir_all(&outside_dir).await;
+    }
+
+    #[cfg(unix)]
+    async fn write_fake_ytdlp_script(path: &Path, actions: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\n\
+             out=\"\"\n\
+             while [ $# -gt 0 ]; do\n\
+               if [ \"$1\" = \"--output\" ]; then\n\
+                 shift\n\
+                 out=\"$1\"\n\
+                 break\n\
+               fi\n\
+               shift\n\
+             done\n\
+             dir=$(dirname \"$out\")\n\
+             {actions}\n"
+        );
+        tokio::fs::write(path, script).await.unwrap();
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn assert_no_leftover_staging_dirs(downloads_dir: &Path) {
+        let mut entries = tokio::fs::read_dir(downloads_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry.file_name().to_string_lossy().starts_with(".tmp-"),
+                "Found leftover staging directory: {:?}",
+                entry.file_name()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn create_test_video_item(db: &Db, watch_url: &Url) -> String {
+        db.items()
+            .create(&NewItem {
+                feed_id: None,
+                title: "Staged Video",
+                url: watch_url,
+                author: None,
+                published_at: None,
+                summary: None,
+                content_type: ContentType::Video,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_download_for_item_stages_downloads_and_preserves_existing_files_on_failure() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let watch_url = Url::parse("https://www.youtube.com/watch?v=dQw4w9WgXcQ").unwrap();
+        let item_id = create_test_video_item(&db, &watch_url).await;
+
+        let temp_base =
+            std::env::temp_dir().join(format!("roche-ytdlp-stage-{}", uuid::Uuid::new_v4()));
+        let scripts_dir =
+            std::env::temp_dir().join(format!("roche-ytdlp-bin-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&scripts_dir).await.unwrap();
+
+        let ok_script = scripts_dir.join("ytdlp-ok.sh");
+        write_fake_ytdlp_script(
+            &ok_script,
+            "printf 'first-valid-video' > \"$dir/video.mp4\"\n\
+             printf 'first-valid-thumb' > \"$dir/video.webp\"\n\
+             printf '{\"duration\": 42.0, \"title\": \"Staged Title\"}' > \"$dir/video.info.json\"\n\
+             exit 0",
+        )
+        .await;
+        let fail_script = scripts_dir.join("ytdlp-fail.sh");
+        write_fake_ytdlp_script(
+            &fail_script,
+            "printf 'partial-broken-bytes' > \"$dir/video.mp4.part\"\nexit 1",
+        )
+        .await;
+        let oversized_script = scripts_dir.join("ytdlp-big.sh");
+        write_fake_ytdlp_script(
+            &oversized_script,
+            "dd if=/dev/zero of=\"$dir/video.mp4\" bs=1048576 count=2 2>/dev/null\nexit 0",
+        )
+        .await;
+
+        let store = MediaStore::new(&temp_base);
+        let downloads_dir = temp_base.join("downloads");
+        let make_worker = |script: PathBuf| {
+            YtDlpWorker::new(
+                MediaConfig {
+                    ytdlp_path: script,
+                    download_dir: downloads_dir.clone(),
+                    max_concurrent_downloads: 2,
+                    max_video_size_mb: 1,
+                },
+                store.clone(),
+            )
+        };
+
+        // 1. Initial staged download installs into downloads/<item_id>.
+        let ok_worker = make_worker(ok_script);
+        let (media, meta) =
+            ok_worker.download_for_item(&db.media(), &item_id, &watch_url).await.unwrap();
+        assert_eq!(media.len(), 2);
+        assert_eq!(meta.title.as_deref(), Some("Staged Title"));
+        let item_dir = downloads_dir.join(&item_id);
+        assert_eq!(
+            tokio::fs::read(item_dir.join("video.mp4")).await.unwrap(),
+            b"first-valid-video"
+        );
+        assert_eq!(
+            tokio::fs::read(item_dir.join("video.webp")).await.unwrap(),
+            b"first-valid-thumb"
+        );
+
+        // 2. Failed or oversized downloads never wipe already-registered files in downloads/<item_id>.
+        assert!(
+            make_worker(fail_script)
+                .download_for_item(&db.media(), &item_id, &watch_url)
+                .await
+                .is_err()
+        );
+        assert!(
+            make_worker(oversized_script)
+                .download_for_item(&db.media(), &item_id, &watch_url)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            tokio::fs::read(item_dir.join("video.mp4")).await.unwrap(),
+            b"first-valid-video"
+        );
+        assert_eq!(
+            tokio::fs::read(item_dir.join("video.webp")).await.unwrap(),
+            b"first-valid-thumb"
+        );
+
+        // 3. Re-download into an existing downloads/<item_id> preserves sibling files cleanly.
+        let keep_sibling = item_dir.join("existing.jpg");
+        tokio::fs::write(&keep_sibling, b"sibling-file").await.unwrap();
+        assert!(ok_worker.download_for_item(&db.media(), &item_id, &watch_url).await.is_ok());
+        assert!(keep_sibling.exists());
+
+        assert_no_leftover_staging_dirs(&downloads_dir).await;
+        let _ = tokio::fs::remove_dir_all(&temp_base).await;
+        let _ = tokio::fs::remove_dir_all(&scripts_dir).await;
     }
 }

@@ -313,11 +313,11 @@ private suspend fun RocheDao.resolveFeedEffectiveHlc(
     nodeId: String,
 ): String =
     hlcOverride
-        ?: feed.hlc.takeIf { it.isNotBlank() }
         ?: if (markDirty) {
             nextLocalHlc(this, nodeId)
         } else {
-            existingSource?.hlc?.takeIf { it.isNotBlank() }
+            feed.hlc.takeIf { it.isNotBlank() }
+                ?: existingSource?.hlc?.takeIf { it.isNotBlank() }
                 ?: HlcTimestamp.fromIsoOrEpoch(nowIso, nodeId).encode()
         }
 
@@ -376,11 +376,15 @@ private fun buildUpsertFeedSource(
         isLocalDirty = markDirty || feed.isLocalDirty || existingSource?.isLocalDirty == true,
     )
 
-internal suspend fun RocheDao.upsertFeeds(feeds: List<FeedRow>, markDirty: Boolean = false) {
+internal suspend fun RocheDao.upsertFeeds(
+    feeds: List<FeedRow>,
+    markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+) {
     if (feeds.isEmpty()) return
     executeInTransaction {
         for (feed in feeds) {
-            upsertFeed(feed, markDirty = markDirty)
+            upsertFeed(feed, markDirty = markDirty, nodeId = nodeId)
         }
     }
 }
@@ -655,11 +659,12 @@ internal suspend fun RocheDao.insertItemTag(
 internal suspend fun RocheDao.insertItemTags(
     itemTags: List<ItemTagRow>,
     markDirty: Boolean = false,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     if (itemTags.isEmpty()) return
     executeInTransaction {
         for (it in itemTags) {
-            insertItemTag(it, markDirty = markDirty)
+            insertItemTag(it, markDirty = markDirty, nodeId = nodeId)
         }
     }
 }
@@ -1042,6 +1047,7 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
 internal suspend fun RocheDao.entryHasCatalogHistory(entryId: String): Boolean =
     hasCatalogHistoryRaw(entryId, "%\"$entryId\"%") != 0
 
+@Suppress("FunctionNameMaxLength")
 internal suspend fun RocheDao.deleteCollectionGeneratorWithTombstone(
     collectionId: String,
     recordTombstone: Boolean = true,
@@ -1083,12 +1089,13 @@ internal suspend fun RocheDao.deleteItemPreservingHistory(
     recordTombstones: Boolean = true,
     detachWantQueues: Boolean = true,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    hlcOverride: String? = null,
 ): Boolean {
     val entry = getEntryById(itemId) ?: return false
     val isSyncable = entry.url?.startsWith("localpdf://", ignoreCase = true) != true
     val emitTombstones = recordTombstones && isSyncable
     val nowIso = nowUtcIso()
-    val hlc = nextLocalHlc(this, nodeId)
+    val hlc = hlcOverride ?: nextLocalHlc(this, nodeId)
     if (detachWantQueues) {
         detachWantMembershipsForItem(itemId, nowIso, hlc, emitTombstones)
     }
@@ -1106,7 +1113,8 @@ internal suspend fun RocheDao.deleteItemPreservingHistory(
                 updatedAt = nowIso,
                 isCachedOffline = keepReadable && prevState?.isCachedOffline == true,
                 hlc = hlc,
-                isLocalDirty = emitTombstones || prevState?.isLocalDirty == true,
+                isLocalDirty =
+                    emitTombstones || recordTombstones && prevState?.isLocalDirty == true,
             )
         )
         if (!keepReadable) {
@@ -1187,6 +1195,7 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
     feedId: String,
     recordTombstones: Boolean = true,
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    hlcOverride: String? = null,
 ): List<String> {
     val evictedItemIds = ArrayList<String>()
     val allSources = getAllFeedSources().map { it.collectionId }.toHashSet()
@@ -1204,6 +1213,7 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
                 recordTombstones = recordTombstones,
                 detachWantQueues = false,
                 nodeId = nodeId,
+                hlcOverride = hlcOverride,
             )
         }
     }
@@ -1213,7 +1223,7 @@ internal suspend fun RocheDao.deleteFeedPreservingHistory(
         deleteCollectionSpec(feedId)
         getEntryById(feedId)?.let { entry ->
             val nowIso = nowUtcIso()
-            val hlc = nextLocalHlc(this, nodeId)
+            val hlc = hlcOverride ?: nextLocalHlc(this, nodeId)
             upsertEntry(entry.copy(updatedAt = nowIso, hlc = hlc))
         }
     } else {

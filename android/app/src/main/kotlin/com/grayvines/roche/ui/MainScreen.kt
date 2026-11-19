@@ -25,9 +25,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -81,16 +81,15 @@ fun MainScreen(
     val scrollStates = rememberMainScrollStates()
     val activePlayerEntry = state.activePlayerEntry
     val activeReaderEntry = state.activeReaderEntry
-    var retainedSearchState by remember { mutableStateOf(state.takeIf { it.isSearchOpen }) }
-    if (state.isSearchOpen) {
-        retainedSearchState = state
+    val retainedSearchStateRef = remember { RetentionRef(state.takeIf { it.isSearchOpen }) }
+    val retainedScopedStates = remember { LinkedHashMap<RocheNavKey.ScopedInbox, MainUiState>() }
+    SideEffect {
+        if (state.isSearchOpen) {
+            retainedSearchStateRef.value = state
+        }
+        cacheActiveScopedState(state, retainedScopedStates)
     }
-    val retainedScopedStates = remember {
-        mutableStateMapOf<RocheNavKey.ScopedInbox, MainUiState>()
-    }
-    cacheActiveScopedState(state, retainedScopedStates)
     val currentState by rememberUpdatedState(state)
-    val currentRetainedSearch by rememberUpdatedState(retainedSearchState)
     val currentPlayerEntry by rememberUpdatedState(activePlayerEntry)
     val currentReaderEntry by rememberUpdatedState(activeReaderEntry)
     val currentOnAction by rememberUpdatedState(onAction)
@@ -173,7 +172,12 @@ fun MainScreen(
                         entry<RocheNavKey.Search> {
                             MainSearchDestination(
                                 state = currentState,
-                                retainedFromParent = currentRetainedSearch,
+                                retainedFromParent =
+                                    if (currentState.isSearchOpen) {
+                                        currentState
+                                    } else {
+                                        retainedSearchStateRef.value
+                                    },
                                 scrollStates = scrollStates,
                                 onAction = currentOnAction,
                             )
@@ -225,6 +229,8 @@ fun MainScreen(
         onOpenExternalUrl = onOpenExternalUrl,
     )
 }
+
+private class RetentionRef<T>(var value: T)
 
 private data class MainChromeFlags(
     val showChrome: Boolean,
@@ -540,18 +546,19 @@ private fun MainScopedInboxDestination(
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
 ) {
-    var retainedState by
+    val retainedStateRef =
         remember(scopedKey) {
-            mutableStateOf(resolveScopedInboxState(state, scopedKey, retainedFromParent))
+            RetentionRef(resolveScopedInboxState(state, scopedKey, retainedFromParent))
         }
-    retainedState =
+    val displayState =
         resolveScopedInboxState(
             state = state,
             scopedKey = scopedKey,
-            retainedState = retainedFromParent ?: retainedState,
+            retainedState = retainedFromParent ?: retainedStateRef.value,
         )
+    SideEffect { retainedStateRef.value = displayState }
     InboxTabContent(
-        state = retainedState,
+        state = displayState,
         onAction = onAction,
         listState = scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
     )
@@ -564,15 +571,17 @@ private fun MainSearchDestination(
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
 ) {
-    var retainedSearchState by remember {
-        mutableStateOf(resolveSearchOverlayState(state, retainedFromParent))
+    val retainedSearchStateRef = remember {
+        RetentionRef(resolveSearchOverlayState(state, retainedFromParent))
     }
-    if (state.isSearchOpen) {
-        retainedSearchState = state
-    } else if (retainedFromParent != null) {
-        retainedSearchState = retainedFromParent
-    }
-    val normalizedQuery = retainedSearchState.searchQuery.trim().lowercase()
+    val displayState =
+        when {
+            state.isSearchOpen -> state
+            retainedFromParent != null -> retainedFromParent
+            else -> retainedSearchStateRef.value
+        }
+    SideEffect { retainedSearchStateRef.value = displayState }
+    val normalizedQuery = displayState.searchQuery.trim().lowercase()
     val searchListState = scrollStates.lazyListState(SEARCH_SCROLL_STATE_KEY)
     var lastScrolledQuery by remember { mutableStateOf(normalizedQuery) }
     LaunchedEffect(normalizedQuery) {
@@ -582,7 +591,7 @@ private fun MainSearchDestination(
         }
     }
     SearchOverlay(
-        state = retainedSearchState,
+        state = displayState,
         onAction = onAction,
         listState = searchListState,
         isSearchActive = state.isSearchOpen,
@@ -601,15 +610,23 @@ private fun MainReaderDestination(
     val liveEntry =
         activeReaderEntry?.takeIf { it.id == readerKey.entryId }
             ?: state.allEntries.firstOrNull { it.id == readerKey.entryId }
-    var retainedEntry by remember(readerKey.entryId) { mutableStateOf(liveEntry) }
-    if (liveEntry != null) {
-        retainedEntry = liveEntry
+    val retainedEntryRef = remember(readerKey.entryId) { RetentionRef(liveEntry) }
+    val targetEntry = liveEntry ?: retainedEntryRef.value
+    val retainedBackLabelRef = remember(readerKey.entryId) { RetentionRef(readerBackLabel(state)) }
+    val backLabel =
+        if (activeReaderEntry?.id == readerKey.entryId) {
+            readerBackLabel(state)
+        } else {
+            retainedBackLabelRef.value
+        }
+    SideEffect {
+        if (liveEntry != null) {
+            retainedEntryRef.value = liveEntry
+        }
+        if (activeReaderEntry?.id == readerKey.entryId) {
+            retainedBackLabelRef.value = backLabel
+        }
     }
-    var retainedBackLabel by remember(readerKey.entryId) { mutableStateOf(readerBackLabel(state)) }
-    if (activeReaderEntry?.id == readerKey.entryId) {
-        retainedBackLabel = readerBackLabel(state)
-    }
-    val targetEntry = retainedEntry
     if (targetEntry != null) {
         CompositionLocalProvider(LocalReaderFontScale provides state.settings.readerFontScale) {
             ReaderView(
@@ -619,7 +636,7 @@ private fun MainReaderDestination(
                 onAction = onAction,
                 onShareEntry = onShareEntry,
                 onOpenExternalUrl = onOpenExternalUrl,
-                backLabel = retainedBackLabel,
+                backLabel = backLabel,
             )
         }
     }
@@ -637,11 +654,13 @@ private fun MainPlayerDestination(
     val liveEntry =
         activePlayerEntry?.takeIf { it.id == playerKey.entryId }
             ?: state.allEntries.firstOrNull { it.id == playerKey.entryId }
-    var retainedEntry by remember(playerKey.entryId) { mutableStateOf(liveEntry) }
-    if (liveEntry != null) {
-        retainedEntry = liveEntry
+    val retainedEntryRef = remember(playerKey.entryId) { RetentionRef(liveEntry) }
+    val targetEntry = liveEntry ?: retainedEntryRef.value
+    SideEffect {
+        if (liveEntry != null) {
+            retainedEntryRef.value = liveEntry
+        }
     }
-    val targetEntry = retainedEntry
     if (targetEntry != null) {
         val resolvedFeed =
             state.activePlayerFeed

@@ -52,10 +52,10 @@ impl OpmlDocument {
                         }
                     }
 
-                    if let Some(parsed_url) =
-                        xml_url.and_then(|u| SafeHttpClient::parse_url(&u).ok())
+                    if let Some((feed_type, normalized_url)) = xml_url
+                        .and_then(|u| SafeHttpClient::parse_url(&u).ok())
+                        .and_then(Self::normalize_outline_url)
                     {
-                        let (feed_type, normalized_url) = Self::normalize_outline_url(parsed_url);
                         results.push(OpmlOutline {
                             feed_type,
                             xml_url: normalized_url,
@@ -104,10 +104,8 @@ impl OpmlDocument {
         out
     }
 
-    fn normalize_outline_url(url: Url) -> (FeedType, Url) {
-        super::FeedSource::Url(url.clone())
-            .into_feed_url(FeedType::Rss)
-            .unwrap_or((FeedType::Rss, url))
+    fn normalize_outline_url(url: Url) -> Option<(FeedType, Url)> {
+        super::FeedSource::Url(url).into_feed_url(FeedType::Rss).ok()
     }
 }
 
@@ -132,5 +130,31 @@ mod tests {
         assert_eq!(outlines[0].xml_url.as_str(), "https://blog.rust-lang.org/feed.xml?a=1&b=2");
         assert_eq!(outlines[0].title.as_deref(), Some("Rust & Friends & &"));
         assert_eq!(outlines[0].feed_type, FeedType::Rss);
+    }
+
+    #[test]
+    fn test_opml_parser_skips_single_arxiv_paper_urls_and_keeps_valid_feeds() {
+        let opml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <opml version="2.0">
+          <body>
+            <outline type="rss" title="Rust Blog" xmlUrl="https://blog.rust-lang.org/feed.xml" />
+            <outline type="rss" title="arXiv cs.AI" xmlUrl="https://rss.arxiv.org/rss/cs.AI" />
+            <outline type="rss" title="Single arXiv Abs" xmlUrl="https://arxiv.org/abs/2301.07041" />
+            <outline type="rss" title="Single arXiv PDF" xmlUrl="https://arxiv.org/pdf/2301.07041.pdf" />
+            <outline type="rss" title="YouTube Channel" xmlUrl="https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA" />
+          </body>
+        </opml>"#;
+
+        let outlines = OpmlDocument::parse(opml);
+        assert_eq!(outlines.len(), 3);
+        assert_eq!(outlines[0].feed_type, FeedType::Rss);
+        assert_eq!(outlines[0].xml_url.as_str(), "https://blog.rust-lang.org/feed.xml");
+        assert_eq!(outlines[1].feed_type, FeedType::Arxiv);
+        assert_eq!(outlines[1].xml_url.as_str(), "https://rss.arxiv.org/rss/cs.AI");
+        assert_eq!(outlines[2].feed_type, FeedType::Youtube);
+        assert_eq!(
+            outlines[2].xml_url.as_str(),
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA"
+        );
     }
 }

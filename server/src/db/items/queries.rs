@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
@@ -16,6 +18,43 @@ impl ItemRepo<'_> {
             .push(" AND i.merged_into_id IS NULL AND ")
             .push(IS_LIVE_ITEM_SQL);
         Ok(qb.build_query_as::<Item>().fetch_optional(self.pool).await?)
+    }
+
+    /// Returns the subset of `ids` that currently exist as live reader items (matching `get`).
+    pub async fn existing_ids(&self, ids: &[String]) -> Result<HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut unique_ids: Vec<&str> = Vec::with_capacity(ids.len());
+        let mut seen = HashSet::with_capacity(ids.len());
+        for id in ids {
+            let trimmed = id.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed) {
+                unique_ids.push(trimmed);
+            }
+        }
+        if unique_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut existing = HashSet::with_capacity(unique_ids.len());
+        for chunk in unique_ids.chunks(500) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT i.id
+                 FROM entries i
+                 LEFT JOIN entry_state es ON es.entry_id = i.id
+                 LEFT JOIN entry_content ec ON ec.entry_id = i.id
+                 WHERE i.id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
+            qb.push(") AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
+            let found: Vec<String> = qb.build_query_scalar().fetch_all(self.pool).await?;
+            existing.extend(found);
+        }
+        Ok(existing)
     }
 
     pub async fn list(
