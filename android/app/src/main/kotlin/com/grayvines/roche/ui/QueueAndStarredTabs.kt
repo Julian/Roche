@@ -51,7 +51,6 @@ import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.RankedCatalogEntry
 import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.model.ContentType
-import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
@@ -63,7 +62,7 @@ import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
 private sealed interface StarredDisplayRow {
@@ -157,7 +156,7 @@ fun StarredTabContent(
             modifier = Modifier.fillMaxSize().testTag("starred_pull_to_refresh"),
         ) {
             if (visibleRows.isEmpty()) {
-                StarredEmptyPlaceholder()
+                StarredEmptyPlaceholder(selectedTypeFilter = selectedTypeFilter)
             } else {
                 StarredEntriesList(
                     rows = visibleRows,
@@ -172,15 +171,20 @@ fun StarredTabContent(
 }
 
 @Composable
-private fun StarredEmptyPlaceholder() {
+private fun StarredEmptyPlaceholder(selectedTypeFilter: ContentType?) {
     val colors = LocalRocheColors.current
+    val message =
+        if (selectedTypeFilter == null) {
+            "No entries in your Starred list yet. Tap ★ on any post or tap + Add to add items to Starred."
+        } else {
+            "No starred ${selectedTypeFilter.wireValue} items yet."
+        }
     Box(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text =
-                "No entries in your Starred list yet. Tap ★ on any post or tap + Add to add items to Starred.",
+            text = message,
             color = colors.textMuted,
             fontSize = 13.sp,
         )
@@ -312,12 +316,7 @@ private fun StarredCatalogEntryRow(
     onRank: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     val clickMod = if (onOpen != null) Modifier.clickable(onClick = onOpen) else Modifier
     Row(
         modifier =
@@ -605,12 +604,7 @@ private fun ListeningHistoryRowItem(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textMuted
     val historyLabel = entry.formattedListeningHistoryLabel ?: "Played"
     val rowBg =
@@ -779,12 +773,7 @@ private fun QueueEntryTextColumn(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     Column(modifier = modifier) {
         Row(
             verticalAlignment = Alignment.CenterVertically,

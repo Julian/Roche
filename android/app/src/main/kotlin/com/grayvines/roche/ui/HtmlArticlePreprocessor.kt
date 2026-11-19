@@ -269,13 +269,15 @@ internal fun isInlineEmojiSource(src: String, classAttr: String): Boolean =
         classAttr.contains("smiley")
 
 internal fun formatLatexAltToHtml(rawLatex: String): String {
-    var formatted = rawLatex.trim().removeSurrounding("$")
-    for (cmd in LATEX_FONT_COMMANDS) {
-        formatted = formatted.replace(cmd, "")
-    }
-    for ((command, symbol) in LATEX_SYMBOL_REPLACEMENTS) {
-        formatted = formatted.replace(command, symbol)
-    }
+    val trimmed = rawLatex.trim().removeSurrounding("$")
+    val formatted =
+        LATEX_COMMAND_REGEX.replace(trimmed) { match ->
+            val cmd = match.value
+            when {
+                cmd in LATEX_FONT_COMMANDS -> ""
+                else -> LATEX_SYMBOL_REPLACEMENTS[cmd] ?: cmd
+            }
+        }
     return convertLatexScripts(formatted)
 }
 
@@ -822,15 +824,19 @@ private const val DOUBLE_BR_HTML = "<br><br>"
 private const val BR_XHTML = "<br/>"
 private const val DOUBLE_BR_XHTML = "<br/><br/>"
 
-private const val STRIPPED_MEDIA_QUERY = "svg, iframe, script, style"
-private const val STRIPPED_INLINE_MEDIA_QUERY = "img, figure, svg, iframe, script, style"
+private const val STRIPPED_MEDIA_QUERY =
+    "svg, iframe, script, style, noscript, template, object, embed"
+private const val STRIPPED_INLINE_MEDIA_QUERY =
+    "img, figure, svg, iframe, script, style, noscript, template, object, embed"
 private const val INLINE_UNWRAP_CONTAINERS_QUERY =
     "div, section, article, header, footer, main, aside, details, summary, center, span"
 
 private val INLINE_LIST_WRAPPER_TAGS = setOf("b", "strong", "i", "em")
 
+private val LATEX_COMMAND_REGEX = Regex("""\\[A-Za-z]+""")
+
 private val LATEX_FONT_COMMANDS =
-    listOf(
+    setOf(
         """\mathrm""",
         """\mathbf""",
         """\mathit""",
@@ -839,11 +845,15 @@ private val LATEX_FONT_COMMANDS =
         """\mathcal""",
         """\mathbb""",
         """\text""",
+        """\textbf""",
+        """\textit""",
+        """\textrm""",
+        """\texttt""",
         """\operatorname""",
     )
 
 private val LATEX_SYMBOL_REPLACEMENTS =
-    listOf(
+    mapOf(
         """\geq""" to " ≥ ",
         """\ge""" to " ≥ ",
         """\leq""" to " ≤ ",

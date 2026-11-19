@@ -236,8 +236,16 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                     vm.cleanupRemovedEntries(feedEntryIds)
                 }
                 vm.transientState.update { current ->
-                    val nextFeedId =
-                        if (current.selectedFeedId == feedId) null else current.selectedFeedId
+                    val deletingScopedFeed = current.selectedFeedId == feedId
+                    val nextFeedId = if (deletingScopedFeed) null else current.selectedFeedId
+                    val nextScopeOriginTab =
+                        if (deletingScopedFeed) null else current.scopeOriginTab
+                    val nextActiveTab =
+                        if (deletingScopedFeed) {
+                            current.scopeOriginTab ?: AppTab.FEEDS
+                        } else {
+                            current.activeTab
+                        }
                     val nextFeedSheetId =
                         if (current.feedContextSheetId == feedId) {
                             null
@@ -245,7 +253,9 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                             current.feedContextSheetId
                         }
                     current.copy(
+                        activeTab = nextActiveTab,
                         selectedFeedId = nextFeedId,
+                        scopeOriginTab = nextScopeOriginTab,
                         feedContextSheetId = nextFeedSheetId,
                         undoEvent = null,
                         statusBanner = "Unsubscribed from \"${title.take(SNACKBAR_TITLE_LIMIT)}\"",

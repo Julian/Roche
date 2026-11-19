@@ -97,14 +97,20 @@ internal class PodcastPlaybackOrchestrator(
         }
         val nextAudio = resolveNextQueuedAudioEntry(excludeEntryId = completedEntryId)
         if (nextAudio != null) {
-            playAudioEntry(
-                playerController = playerController,
-                entryId = nextAudio.id,
-                openFullscreen = wasFullscreen,
-            )
-            playerController.emitUiMessage(
-                "Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}"
-            )
+            val started =
+                playAudioEntry(
+                    playerController = playerController,
+                    entryId = nextAudio.id,
+                    openFullscreen = wasFullscreen,
+                )
+            if (started) {
+                playerController.emitUiMessage(
+                    "Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}"
+                )
+            } else {
+                playerController.stopAndClear()
+                playerController.emitUiMessage("Could not play next episode")
+            }
         } else {
             playerController.stopAndClear()
             playerController.emitUiMessage("Finished episode · Archived & deleted download")
@@ -133,12 +139,20 @@ internal class PodcastPlaybackOrchestrator(
             }
         }
         val openFullscreen = if (currentId != null) currentState.isFullscreenOpen else true
-        playAudioEntry(
-            playerController = playerController,
-            entryId = nextAudio.id,
-            openFullscreen = openFullscreen,
-        )
-        playerController.emitUiMessage("Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}")
+        val started =
+            playAudioEntry(
+                playerController = playerController,
+                entryId = nextAudio.id,
+                openFullscreen = openFullscreen,
+            )
+        if (started) {
+            playerController.emitUiMessage(
+                "Up next · ${nextAudio.title.take(SNACKBAR_TITLE_LIMIT)}"
+            )
+        } else {
+            playerController.stopAndClear()
+            playerController.emitUiMessage("Could not play next episode")
+        }
     }
 
     private suspend fun resolveNextQueuedAudioEntry(excludeEntryId: String?): InboxEntry? {

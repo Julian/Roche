@@ -9,6 +9,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.extractCleanDomain
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 
@@ -189,20 +190,25 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         targetFavorite: Boolean? = null,
         bannerAlreadyShown: Boolean = false,
     ) {
+        var failed = false
         try {
             val starred =
                 vm.repository.toggleStar(itemId = entryId, targetFavorite = targetFavorite)
             if (!bannerAlreadyShown) {
                 vm.showStatusMessage(if (starred) "Starred" else "Removed star")
             }
+        } catch (err: Throwable) {
+            if (err is CancellationException) throw err
+            failed = true
+            vm.showStatusMessage("Could not update star (${err.message ?: "error"})")
         } finally {
             if (bannerAlreadyShown) {
-                clearSettledOptimisticStar(entryId)
+                clearSettledOptimisticStar(entryId, forceClear = failed)
             }
         }
     }
 
-    private fun clearSettledOptimisticStar(entryId: String) {
+    private fun clearSettledOptimisticStar(entryId: String, forceClear: Boolean = false) {
         val remaining =
             synchronized(inFlightStarCounts) {
                 val next = ((inFlightStarCounts[entryId] ?: 1) - 1).coerceAtLeast(0)
@@ -216,10 +222,10 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
         if (remaining == 0) {
             val persistedFav =
                 vm.repository.latestSnapshot?.entries?.firstOrNull { it.id == entryId }?.isFavorite
-            if (
+            val settled =
                 persistedFav != null &&
                     vm.transientState.value.optimisticFavorites[entryId] == persistedFav
-            ) {
+            if (forceClear || settled) {
                 vm.transientState.update { current ->
                     current.copy(optimisticFavorites = current.optimisticFavorites - entryId)
                 }
@@ -444,7 +450,6 @@ internal class MainInboxReaderDelegate(private val vm: MainViewModel) {
                     .onSuccess { saved ->
                         vm.transientState.update {
                             it.copy(
-                                activeTab = AppTab.FEEDS,
                                 statusBanner =
                                     "Subscribed \"${saved.title.take(SNACKBAR_TITLE_LIMIT)}\"",
                                 messageSequence = it.messageSequence + 1,

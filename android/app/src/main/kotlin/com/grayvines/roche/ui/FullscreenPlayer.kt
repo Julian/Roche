@@ -22,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
@@ -49,7 +50,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.FeedItem
-import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.FastForwardIcon
 import com.grayvines.roche.ui.components.FilterChipPill
@@ -61,8 +61,8 @@ import com.grayvines.roche.ui.components.SkipNextIcon
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.components.drawPodcastArtworkCanvas
 import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import kotlin.math.roundToLong
 
 /**
@@ -136,7 +136,12 @@ fun DockedMiniPlayer(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = "${entry.feedTitle} · ${playerState.speedAdjustedRemainingLabel}",
+                    text =
+                        if (playerState.isBuffering) {
+                            "${entry.feedTitle} · Buffering…"
+                        } else {
+                            "${entry.feedTitle} · ${playerState.speedAdjustedRemainingLabel}"
+                        },
                     color = colors.textMuted,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
@@ -165,7 +170,12 @@ fun DockedMiniPlayer(
                             .clickable { onAction(MainAction.TogglePlayPause) }
                             .semantics {
                                 role = Role.Button
-                                contentDescription = if (playerState.isPlaying) "Pause" else "Play"
+                                contentDescription =
+                                    when {
+                                        playerState.isBuffering -> "Buffering"
+                                        playerState.isPlaying -> "Pause"
+                                        else -> "Play"
+                                    }
                             }
                             .testTag("mini_player_play_pause_btn"),
                 ) {
@@ -174,11 +184,19 @@ fun DockedMiniPlayer(
                         modifier =
                             Modifier.size(34.dp).clip(CircleShape).background(colors.accentBlue),
                     ) {
-                        PlayPauseIcon(
-                            isPlaying = playerState.isPlaying,
-                            tint = Color.White,
-                            size = 15.dp,
-                        )
+                        if (playerState.isBuffering) {
+                            CircularProgressIndicator(
+                                color = Color.White,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        } else {
+                            PlayPauseIcon(
+                                isPlaying = playerState.isPlaying,
+                                tint = Color.White,
+                                size = 15.dp,
+                            )
+                        }
                     }
                 }
                 RocheIconActionButton(
@@ -291,12 +309,6 @@ private fun FullscreenPlayerTopBar(
     var showOverflowMenu by rememberSaveable { mutableStateOf(false) }
     var showSleepMenu by rememberSaveable { mutableStateOf(false) }
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
-    val sleepTint =
-        if (playerState.sleepTimerRemainingMinutes != null) {
-            colors.accentEcru
-        } else {
-            colors.textSecondary
-        }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -305,6 +317,7 @@ private fun FullscreenPlayerTopBar(
     ) {
         HeaderActionButton(
             label = "⌄",
+            contentDescription = "Collapse player",
             onClick = { onAction(MainAction.CloseFullscreenPlayer) },
             modifier = Modifier.testTag("player_collapse_btn"),
         )
@@ -324,6 +337,10 @@ private fun FullscreenPlayerTopBar(
             Box {
                 HeaderActionButton(
                     label = playerState.sleepTimerRemainingMinutes?.let { "Zz ${it}m" } ?: "Zz",
+                    contentDescription =
+                        playerState.sleepTimerRemainingMinutes?.let {
+                            "Sleep timer, $it minutes remaining"
+                        } ?: "Sleep timer",
                     onClick = { showSleepMenu = true },
                     modifier = Modifier.testTag("player_sleep_btn"),
                 )
@@ -331,6 +348,7 @@ private fun FullscreenPlayerTopBar(
                     expanded = showSleepMenu,
                     onDismissRequest = { showSleepMenu = false },
                 ) {
+                    val activeRemaining = playerState.sleepTimerRemainingMinutes
                     listOf(
                             null to "Sleep timer off",
                             15 to "15 minutes",
@@ -339,8 +357,27 @@ private fun FullscreenPlayerTopBar(
                             60 to "60 minutes",
                         )
                         .forEach { (mins, label) ->
+                            val isSelected =
+                                (mins == null && activeRemaining == null) ||
+                                    (mins != null && activeRemaining == mins)
                             DropdownMenuItem(
-                                text = { Text(label, color = sleepTint) },
+                                text = {
+                                    Text(
+                                        text = label,
+                                        color =
+                                            if (isSelected) {
+                                                colors.accentEcru
+                                            } else {
+                                                colors.textPrimary
+                                            },
+                                        fontWeight =
+                                            if (isSelected) {
+                                                FontWeight.SemiBold
+                                            } else {
+                                                FontWeight.Normal
+                                            },
+                                    )
+                                },
                                 onClick = {
                                     showSleepMenu = false
                                     onAction(MainAction.SetSleepTimerMinutes(mins))
@@ -365,6 +402,7 @@ private fun FullscreenPlayerTopBar(
             Box {
                 HeaderActionButton(
                     label = "•••",
+                    contentDescription = "More player options",
                     onClick = { showOverflowMenu = true },
                     modifier = Modifier.testTag("player_overflow_btn"),
                 )
@@ -428,16 +466,42 @@ private fun FullscreenPlayerTopBar(
                             )
                         },
                     )
+                    if (entry.isArchived && entry.isCachedOffline) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    "Delete Download",
+                                    color = colors.accentIndianRed,
+                                )
+                            },
+                            onClick = {
+                                showOverflowMenu = false
+                                onAction(MainAction.ToggleOfflineCache(entry.id))
+                            },
+                        )
+                    }
                     DropdownMenuItem(
                         text = {
                             Text(
-                                "Archive & Delete Download",
-                                color = colors.accentIndianRed,
+                                text =
+                                    if (entry.isArchived) {
+                                        "Unarchive Episode"
+                                    } else {
+                                        "Archive & Delete Download"
+                                    },
+                                color =
+                                    if (entry.isArchived) {
+                                        colors.textPrimary
+                                    } else {
+                                        colors.accentIndianRed
+                                    },
                             )
                         },
                         onClick = {
                             showOverflowMenu = false
-                            onAction(MainAction.CloseFullscreenPlayer)
+                            if (!entry.isArchived) {
+                                onAction(MainAction.CloseFullscreenPlayer)
+                            }
                             onAction(MainAction.ToggleArchive(entry))
                         },
                     )
@@ -454,12 +518,7 @@ private fun FullscreenPlayerArtworkAndMeta(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     val bitmap =
         rememberEntryThumbnailBitmap(
             primaryKey = entry.thumbnailMediaId,
@@ -607,6 +666,9 @@ private fun PlayerScrubberSection(
                 onAction(MainAction.SeekPlayerToFraction(fraction))
             },
             onDragPreviewChange = { previewFraction = it },
+            contentDescription = "Playback position",
+            stateDescription =
+                "${previewState.elapsedFormatted} elapsed, ${previewState.remainingFormatted} remaining",
             modifier = Modifier.fillMaxWidth().testTag("player_scrubber_slider"),
         )
         Row(
@@ -709,15 +771,28 @@ private fun FullscreenPlayerTransportRow(
                     .clickable { onAction(MainAction.TogglePlayPause) }
                     .semantics {
                         role = Role.Button
-                        contentDescription = if (playerState.isPlaying) "Pause" else "Play"
+                        contentDescription =
+                            when {
+                                playerState.isBuffering -> "Buffering"
+                                playerState.isPlaying -> "Pause"
+                                else -> "Play"
+                            }
                     }
                     .testTag("player_play_pause_btn"),
         ) {
-            PlayPauseIcon(
-                isPlaying = playerState.isPlaying,
-                tint = Color.White,
-                size = 28.dp,
-            )
+            if (playerState.isBuffering) {
+                CircularProgressIndicator(
+                    color = Color.White,
+                    strokeWidth = 3.dp,
+                    modifier = Modifier.size(26.dp),
+                )
+            } else {
+                PlayPauseIcon(
+                    isPlaying = playerState.isPlaying,
+                    tint = Color.White,
+                    size = 28.dp,
+                )
+            }
         }
 
         Box(

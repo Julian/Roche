@@ -26,6 +26,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -308,6 +311,28 @@ private fun SettlementSummaryCard(settlement: RankSettlementSummary) {
     }
 }
 
+private fun rankBoardStateSaver(
+    candidates: List<RankClusterCandidate>
+): Saver<RankBoardState, ArrayList<ArrayList<String>>> =
+    Saver(
+        save = { state ->
+            ArrayList(state.buckets.map { bucket -> ArrayList(bucket.map { it.entryId }) })
+        },
+        restore = { savedBuckets ->
+            val byId = candidates.associateBy { it.entryId }
+            val restored =
+                savedBuckets
+                    .map { bucketIds -> bucketIds.mapNotNull { byId[it] } }
+                    .filter { it.isNotEmpty() }
+            val restoredIds = restored.flatten().map { it.entryId }.toSet()
+            if (restoredIds == byId.keys && restored.isNotEmpty()) {
+                RankBoardState(restored)
+            } else {
+                RankBoardState.fromCandidates(candidates)
+            }
+        },
+    )
+
 @Composable
 private fun ActiveClusterRankBody(
     session: ActiveRankSessionUiState,
@@ -316,8 +341,11 @@ private fun ActiveClusterRankBody(
     val colors = LocalRocheColors.current
     val clusterKey =
         remember(session.roundIndex, session.cluster) { session.cluster.map { it.entryId } }
+    val boardSaver = remember(session.cluster) { rankBoardStateSaver(session.cluster) }
     var board by
-        remember(clusterKey) { mutableStateOf(RankBoardState.fromCandidates(session.cluster)) }
+        rememberSaveable(session.roundIndex, clusterKey, stateSaver = boardSaver) {
+            mutableStateOf(RankBoardState.fromCandidates(session.cluster))
+        }
     val rows = remember(board) { board.rows() }
 
     Column(
@@ -573,6 +601,9 @@ private fun SmallReorderPill(
                 .semantics {
                     role = Role.Button
                     contentDescription = description
+                    if (!enabled) {
+                        disabled()
+                    }
                 }
                 .testTag(testTag),
     ) {

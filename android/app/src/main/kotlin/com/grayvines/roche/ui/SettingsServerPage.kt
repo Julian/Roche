@@ -60,16 +60,22 @@ internal fun SettingsServerPage(
 ) {
     val colors = LocalRocheColors.current
     var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
-    var bearerToken by
-        remember(state.settings.bearerToken) {
-            mutableStateOf(state.settings.bearerToken)
-        }
+    var bearerToken by remember { mutableStateOf(state.settings.bearerToken) }
+    var lastSavedBearerToken by remember { mutableStateOf(state.settings.bearerToken) }
     var pairingCode by remember { mutableStateOf("") }
     var revealToken by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.settings.serverUrl) {
         if (normalizeServerUrl(serverUrl) != state.settings.serverUrl) {
             serverUrl = state.settings.serverUrl
+        }
+    }
+    LaunchedEffect(state.settings.bearerToken) {
+        if (state.settings.bearerToken != lastSavedBearerToken) {
+            lastSavedBearerToken = state.settings.bearerToken
+            if (bearerToken.trim() != state.settings.bearerToken) {
+                bearerToken = state.settings.bearerToken
+            }
         }
     }
     ServerConfigAutoSaveEffect(
@@ -86,6 +92,7 @@ internal fun SettingsServerPage(
             navigationAction = {
                 HeaderActionButton(
                     label = "←",
+                    contentDescription = "Back",
                     onClick = onBack,
                     modifier = Modifier.testTag("settings_subpage_back_btn"),
                 )

@@ -18,12 +18,12 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
@@ -222,8 +222,25 @@ class MainViewModel(
             playerController.state
                 .map { it.currentEntryId }
                 .distinctUntilChanged()
-                .filterNotNull()
                 .collect { entryId ->
+                    if (entryId == null) {
+                        transientState.update { current ->
+                            if (current.activePlayerNotesContent != null) {
+                                current.copy(activePlayerNotesContent = null)
+                            } else {
+                                current
+                            }
+                        }
+                        return@collect
+                    }
+                    transientState.update { current ->
+                        val kept = current.activePlayerNotesContent?.takeIf { it.itemId == entryId }
+                        if (kept !== current.activePlayerNotesContent) {
+                            current.copy(activePlayerNotesContent = kept)
+                        } else {
+                            current
+                        }
+                    }
                     val hydrated =
                         repository.hydrateItemContentIfNeeded(entryId) { localContent ->
                             applyReaderContentIfActive(entryId, localContent)
@@ -410,6 +427,7 @@ class MainViewModel(
             return
         }
         deepSearchJob = viewModelScope.launch {
+            delay(DEEP_SEARCH_DEBOUNCE_MS)
             val deepMatches = repository.searchDeepEntries(rawQuery)
             transientState.update { current ->
                 if (current.searchQuery.trim().lowercase() == normalized) {
@@ -477,10 +495,13 @@ class MainViewModel(
         transientState.update { current ->
             val nextReaderId = current.selectedReaderEntryId?.takeUnless { it in removedIds }
             val nextContent = nextReaderId?.let { current.readerContent }
+            val nextPlayerNotes =
+                current.activePlayerNotesContent?.takeUnless { it.itemId in removedIds }
             val nextSheetId = current.contextSheetEntryId?.takeUnless { it in removedIds }
             current.copy(
                 selectedReaderEntryId = nextReaderId,
                 readerContent = nextContent,
+                activePlayerNotesContent = nextPlayerNotes,
                 contextSheetEntryId = nextSheetId,
             )
         }
@@ -518,8 +539,18 @@ class MainViewModel(
     internal fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
         val activePlayerId = playerController.state.value.currentEntryId
         transientState.update { current ->
-            if (current.selectedReaderEntryId == entryId || activePlayerId == entryId) {
-                current.copy(readerContent = content)
+            val nextReaderContent =
+                if (current.selectedReaderEntryId == entryId) content else current.readerContent
+            val nextPlayerNotes =
+                if (activePlayerId == entryId) content else current.activePlayerNotesContent
+            if (
+                nextReaderContent !== current.readerContent ||
+                    nextPlayerNotes !== current.activePlayerNotesContent
+            ) {
+                current.copy(
+                    readerContent = nextReaderContent,
+                    activePlayerNotesContent = nextPlayerNotes,
+                )
             } else {
                 current
             }
@@ -577,6 +608,7 @@ class MainViewModel(
 
     internal companion object {
         private const val STOP_TIMEOUT_MS = 5_000L
+        private const val DEEP_SEARCH_DEBOUNCE_MS = 200L
         internal const val SAVED_NAV_STATE_KEY = "roche_saved_navigation_state"
         internal const val SAVED_NAV_JSON_KEY = "roche_saved_navigation_json"
 

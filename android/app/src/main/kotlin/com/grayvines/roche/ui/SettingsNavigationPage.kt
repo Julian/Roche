@@ -60,6 +60,7 @@ internal fun SettingsNavigationBarPage(
             navigationAction = {
                 HeaderActionButton(
                     label = "←",
+                    contentDescription = "Back",
                     onClick = onBack,
                     modifier = Modifier.testTag("settings_subpage_back_btn"),
                 )

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
@@ -24,9 +25,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.LayoutCoordinates
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontFamily
@@ -35,11 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.model.HeadlineFont
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
-import kotlin.math.roundToInt
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
@@ -466,39 +462,6 @@ internal fun extractPreCodeText(preElement: Element): String {
     return clone.wholeText().trim('\r', '\n')
 }
 
-internal class ScrollCoordinateHolder {
-    var coords: LayoutCoordinates? = null
-}
-
-internal fun computeRelativeYOffsetPx(
-    rootCoords: LayoutCoordinates?,
-    targetCoords: LayoutCoordinates,
-): Int? =
-    if (rootCoords != null && rootCoords.isAttached && targetCoords.isAttached) {
-        (targetCoords.positionInRoot().y - rootCoords.positionInRoot().y)
-            .roundToInt()
-            .coerceAtLeast(0)
-    } else {
-        null
-    }
-
-internal fun Modifier.trackHeadingPosition(
-    headingIndex: Int?,
-    scrollRootCoords: (() -> LayoutCoordinates?)?,
-    fallbackOrigin: ScrollCoordinateHolder,
-    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)?,
-): Modifier =
-    if (headingIndex == null || onHeadingMeasured == null) {
-        this
-    } else {
-        onGloballyPositioned { headingCoords ->
-            val rootCoords = scrollRootCoords?.invoke() ?: fallbackOrigin.coords
-            computeRelativeYOffsetPx(rootCoords, headingCoords)?.let { yOffsetPx ->
-                onHeadingMeasured(headingIndex, yOffsetPx)
-            }
-        }
-    }
-
 @Composable
 internal fun rememberReaderLinkStyles(): TextLinkStyles {
     val accentBlue = LocalRocheColors.current.accentBlue
@@ -518,40 +481,16 @@ internal fun StructuredHtmlArticleContent(
     blocks: List<ArticleBlock>,
     baseUrl: String? = null,
     onOpenUrl: ((String) -> Unit)? = null,
-    scrollRootCoords: (() -> LayoutCoordinates?)? = null,
-    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
 ) {
     val linkStyles = rememberReaderLinkStyles()
-    val localOrigin = remember { ScrollCoordinateHolder() }
-    val headingIndices =
-        remember(blocks, onHeadingMeasured != null) {
-            if (onHeadingMeasured != null) mapBlockHeadingIndices(blocks) else emptyMap()
-        }
-    val columnModifier =
-        if (onHeadingMeasured != null) {
-            Modifier.onGloballyPositioned { coords -> localOrigin.coords = coords }
-        } else {
-            Modifier
-        }
 
-    Column(
-        modifier = columnModifier,
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        blocks.forEachIndexed { blockIndex, block ->
-            val headingModifier =
-                Modifier.trackHeadingPosition(
-                    headingIndex = headingIndices[blockIndex],
-                    scrollRootCoords = scrollRootCoords,
-                    fallbackOrigin = localOrigin,
-                    onHeadingMeasured = onHeadingMeasured,
-                )
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        blocks.forEach { block ->
             RenderArticleBlock(
                 block = block,
                 linkStyles = linkStyles,
                 baseUrl = baseUrl,
                 onOpenUrl = onOpenUrl,
-                modifier = headingModifier,
             )
         }
     }
@@ -629,12 +568,7 @@ internal fun RenderHeadingBlock(
 ) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     val annotated =
         rememberRichHtmlText(
             html = block.html,
@@ -656,7 +590,6 @@ internal fun RenderHeadingBlock(
             2 -> 25f
             else -> 23f
         }
-    Spacer(modifier = Modifier.height(4.dp))
     Text(
         text = annotated,
         color = colors.textPrimary,
@@ -664,7 +597,7 @@ internal fun RenderHeadingBlock(
         fontSize = (baseFontSize * scale).sp,
         lineHeight = (baseLineHeight * scale).sp,
         fontWeight = FontWeight.SemiBold,
-        modifier = modifier,
+        modifier = modifier.padding(top = 4.dp),
     )
 }
 
@@ -782,7 +715,8 @@ internal fun RenderListBlock(
                     fontFamily = FontFamily.Monospace,
                     fontSize = (13.5f * scale).sp,
                     lineHeight = (25f * scale).sp,
-                    modifier = Modifier.width(24.dp),
+                    softWrap = false,
+                    modifier = Modifier.widthIn(min = (24f * scale).dp).padding(end = 6.dp),
                 )
                 Text(
                     text = annotated,
@@ -911,7 +845,7 @@ private fun RenderTableRow(
                 fontWeight = style.fontWeight,
                 fontSize = (13.5f * scale).sp,
                 lineHeight = (20f * scale).sp,
-                modifier = Modifier.width(widthDp.dp),
+                modifier = Modifier.width((widthDp * scale).dp),
             )
         }
     }

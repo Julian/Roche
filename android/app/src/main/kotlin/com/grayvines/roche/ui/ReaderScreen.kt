@@ -29,6 +29,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -40,7 +41,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -57,9 +57,10 @@ import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
@@ -74,6 +75,14 @@ internal data class ParsedArticleBlocksState(
 
 private val parsedArticleBlocksCache = LruCache<String, List<ArticleBlock>>(MAX_CACHED_PARSED_DOCS)
 
+private fun articleBlocksCacheKey(cleanHtml: String, baseUrl: String?): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(baseUrl.orEmpty().toByteArray(Charsets.UTF_8))
+    digest.update(0)
+    digest.update(cleanHtml.toByteArray(Charsets.UTF_8))
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
 @Composable
 internal fun rememberParsedArticleBlocks(
     htmlBody: String?,
@@ -82,14 +91,13 @@ internal fun rememberParsedArticleBlocks(
     val cleanHtml = htmlBody?.takeIf { it.isNotBlank() }
     val cacheKey =
         remember(cleanHtml, baseUrl) {
-            if (cleanHtml == null) "" else "${baseUrl.orEmpty()}\n$cleanHtml"
+            if (cleanHtml == null) "" else articleBlocksCacheKey(cleanHtml, baseUrl)
         }
     val initialState =
         remember(cacheKey) {
             resolveInitialParsedBlocks(
                 cacheKey = cacheKey,
                 cleanHtml = cleanHtml,
-                baseUrl = baseUrl,
             )
         }
     val state by
@@ -112,24 +120,13 @@ internal fun rememberParsedArticleBlocks(
 private fun resolveInitialParsedBlocks(
     cacheKey: String,
     cleanHtml: String?,
-    baseUrl: String?,
 ): ParsedArticleBlocksState {
     if (cleanHtml == null) return ParsedArticleBlocksState(emptyList(), isParsing = false)
     val cached = synchronized(parsedArticleBlocksCache) { parsedArticleBlocksCache[cacheKey] }
-    return when {
-        cached != null -> {
-            ParsedArticleBlocksState(cached, isParsing = false)
-        }
-        cleanHtml.length <= INLINE_PARSE_CHAR_LIMIT -> {
-            val parsed = parseHtmlArticleBlocks(rawHtml = cleanHtml, baseUrl = baseUrl)
-            synchronized(parsedArticleBlocksCache) {
-                parsedArticleBlocksCache.put(cacheKey, parsed)
-            }
-            ParsedArticleBlocksState(parsed, isParsing = false)
-        }
-        else -> {
-            ParsedArticleBlocksState(emptyList(), isParsing = true)
-        }
+    return if (cached != null) {
+        ParsedArticleBlocksState(cached, isParsing = false)
+    } else {
+        ParsedArticleBlocksState(emptyList(), isParsing = true)
     }
 }
 
@@ -143,9 +140,9 @@ fun ReaderView(
     settings: Settings = Settings(),
     isHydrating: Boolean = false,
 ) {
-    var showTypographyDrawer by rememberSaveable { mutableStateOf(false) }
+    var showTypographyDrawer by rememberSaveable(entry.id) { mutableStateOf(false) }
     val colors = LocalRocheColors.current
-    val listState = rememberLazyListState()
+    val listState = key(entry.id) { rememberLazyListState() }
     val parsedState =
         rememberParsedArticleBlocks(htmlBody = resolveReaderHtmlBody(entry), baseUrl = entry.url)
     val pdfSession =
@@ -454,6 +451,7 @@ private fun ReaderTopToolbar(
                 if (showTypographyDrawer) RocheButtonStyle.PRIMARY else RocheButtonStyle.SECONDARY
             HeaderActionButton(
                 label = "Aa",
+                contentDescription = "Typography settings",
                 style = aaStyle,
                 horizontalPadding = 9.dp,
                 onClick = onToggleTypography,
@@ -563,6 +561,7 @@ internal fun ReaderFontScaleControlsRow(
     ) {
         HeaderActionButton(
             label = "A−",
+            contentDescription = "Decrease font size",
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -584,6 +583,7 @@ internal fun ReaderFontScaleControlsRow(
         }
         HeaderActionButton(
             label = "A+",
+            contentDescription = "Increase font size",
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -810,12 +810,8 @@ private fun ReaderPlainParagraphItem(paragraph: String) {
 @Composable
 internal fun ReaderArticleHeader(entry: InboxEntry) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val scale = LocalReaderFontScale.current
+    val headlineFamily = currentHeadlineFontFamily()
     SelectionContainer {
         Column {
             Text(
@@ -831,8 +827,8 @@ internal fun ReaderArticleHeader(entry: InboxEntry) {
                 text = entry.title,
                 color = colors.textPrimary,
                 fontFamily = headlineFamily,
-                fontSize = 23.sp,
-                lineHeight = 29.sp,
+                fontSize = (23f * scale).sp,
+                lineHeight = (29f * scale).sp,
                 fontWeight = FontWeight.Medium,
             )
             Spacer(modifier = Modifier.height(8.dp))
@@ -849,8 +845,6 @@ internal fun ReaderArticleHeader(entry: InboxEntry) {
 internal fun ReaderBodyContent(
     entry: InboxEntry,
     onOpenExternalUrl: (String) -> Unit = {},
-    scrollRootCoords: (() -> LayoutCoordinates?)? = null,
-    onHeadingMeasured: ((headingIndex: Int, yOffsetPx: Int) -> Unit)? = null,
 ) {
     val htmlBody = resolveReaderHtmlBody(entry)
     val parsedState = rememberParsedArticleBlocks(htmlBody = htmlBody, baseUrl = entry.url)
@@ -861,8 +855,6 @@ internal fun ReaderBodyContent(
                     blocks = parsedState.blocks,
                     baseUrl = entry.url,
                     onOpenUrl = onOpenExternalUrl,
-                    scrollRootCoords = scrollRootCoords,
-                    onHeadingMeasured = onHeadingMeasured,
                 )
             } else if (parsedState.isParsing) {
                 Text(
@@ -875,11 +867,13 @@ internal fun ReaderBodyContent(
             }
         }
     }
-    Spacer(modifier = Modifier.height(8.dp))
-    HeaderActionButton(
-        label = "Open Original Link ↗",
-        onClick = { onOpenExternalUrl(entry.url) },
-    )
+    if (!entry.url.startsWith("localpdf://", ignoreCase = true) && entry.url.isNotBlank()) {
+        Spacer(modifier = Modifier.height(8.dp))
+        HeaderActionButton(
+            label = "Open Original Link ↗",
+            onClick = { onOpenExternalUrl(entry.url) },
+        )
+    }
 }
 
 @Composable
@@ -909,23 +903,6 @@ internal fun resolveReaderHtmlBody(entry: InboxEntry): String? =
     entry.contentHtml?.takeIf { it.isNotBlank() }
         ?: entry.summary?.takeIf { "<" in it || "&" in it }
 
-internal fun resolveHeadingScrollPx(
-    headingIndex: Int,
-    totalHeadings: Int,
-    maxScrollPx: Int,
-    measuredOffsetsPx: Map<Int, Int>,
-): Int {
-    val safeMax = maxScrollPx.coerceAtLeast(0)
-    val measured = measuredOffsetsPx[headingIndex]
-    return if (measured != null) {
-        measured.coerceIn(0, safeMax)
-    } else {
-        val safeCount = totalHeadings.coerceAtLeast(1)
-        val fraction = if (totalHeadings <= 1) 0f else headingIndex.toFloat() / safeCount.toFloat()
-        (fraction * safeMax).roundToInt().coerceIn(0, safeMax)
-    }
-}
-
 private fun formatReaderByline(entry: InboxEntry): String = buildString {
     entry.author?.let { append("$it · ") }
     append(entry.formattedPublishedLabel)
@@ -935,7 +912,6 @@ private fun formatReaderByline(entry: InboxEntry): String = buildString {
 }
 
 private const val HEADER_ITEM_COUNT = 1
-private const val INLINE_PARSE_CHAR_LIMIT = 2_048
 private const val MAX_CACHED_PARSED_DOCS = 32
 private const val MAX_IN_FLIGHT_SCROLL_FRACTION = 0.999
 private const val MIN_PROGRESS = 0.08f

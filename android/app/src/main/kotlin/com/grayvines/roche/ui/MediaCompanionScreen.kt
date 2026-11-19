@@ -55,7 +55,6 @@ import com.grayvines.roche.data.RankedCatalogEntry
 import com.grayvines.roche.data.STARRED_COLLECTION_ID
 import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.generatorFor
-import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RefreshIcon
@@ -64,8 +63,8 @@ import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.util.Locale
 
 @Composable
@@ -78,6 +77,8 @@ fun MediaCompanionScreen(
 ) {
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
+    val diaryListState = rememberLazyListState()
+    val wantListState = rememberLazyListState()
 
     Column(modifier = Modifier.fillMaxSize().testTag("lists_companion_screen")) {
         CompanionTopBar(state = state, onAction = onAction)
@@ -109,7 +110,7 @@ fun MediaCompanionScreen(
                     DiaryHistoryPane(
                         state = state,
                         diaryEntries = state.catalog.diaryEntries,
-                        listState = listState,
+                        listState = diaryListState,
                         onAction = onAction,
                         onOpenExternalUrl = onOpenExternalUrl,
                         onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
@@ -117,7 +118,7 @@ fun MediaCompanionScreen(
                 CompanionSubTab.WANT ->
                     WantQueuesPane(
                         state = state,
-                        listState = listState,
+                        listState = wantListState,
                         onAction = onAction,
                         onOpenExternalUrl = onOpenExternalUrl,
                     )
@@ -646,12 +647,7 @@ private fun RankedEntryHeaderRow(
     onFocusRank: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,

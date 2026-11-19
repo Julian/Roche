@@ -1084,7 +1084,8 @@ class MainViewModelTest {
             localVm.uiState.first { it.searchQuery == "Episode" }
             localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
             localVm.uiState.first {
-                it.playerState.currentEntryId == "ep-tier-1" && it.readerContent != null
+                it.playerState.currentEntryId == "ep-tier-1" &&
+                    it.activePlayerNotesContent != null
             }
             localVm.playerController.cancelAutoTickerForTest()
             localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
@@ -1151,7 +1152,7 @@ class MainViewModelTest {
         }
 
     @Test
-    internal fun `reader section outline heading map and scroll target use measured Y offsets`() {
+    internal fun `reader section outline heading map deduplicates headings`() {
         val html =
             "<p>Lead paragraph</p>" +
                 "<h2>Overview</h2>" +
@@ -1166,35 +1167,6 @@ class MainViewModelTest {
 
         assertEquals(listOf("Overview", "Benchmarks"), headings)
         assertEquals(mapOf(1 to 0, 4 to 1), blockHeadingMap)
-
-        val measuredOffsets = mapOf(0 to 780, 1 to 4_650)
-        assertEquals(
-            780,
-            resolveHeadingScrollPx(
-                headingIndex = 0,
-                totalHeadings = headings.size,
-                maxScrollPx = 4_000,
-                measuredOffsetsPx = measuredOffsets,
-            ),
-        )
-        assertEquals(
-            4_000,
-            resolveHeadingScrollPx(
-                headingIndex = 1,
-                totalHeadings = headings.size,
-                maxScrollPx = 4_000,
-                measuredOffsetsPx = measuredOffsets,
-            ),
-        )
-        assertEquals(
-            2_000,
-            resolveHeadingScrollPx(
-                headingIndex = 1,
-                totalHeadings = headings.size,
-                maxScrollPx = 4_000,
-                measuredOffsetsPx = mapOf(0 to 780),
-            ),
-        )
     }
 
     @Test
@@ -1234,7 +1206,7 @@ class MainViewModelTest {
                         it.searchQuery == "Systems" &&
                         it.searchResults.size == 2 &&
                         it.listeningHistoryEntries.size == 1 &&
-                        it.readerContent != null
+                        it.activePlayerNotesContent != null
                 }
             viewModel.playerController.cancelAutoTickerForTest()
             assertEquals(2, beforeState.visibleEntries.size)
@@ -1312,7 +1284,7 @@ class MainViewModelTest {
                     seekVm.uiState.first {
                         it.playerState.currentEntryId == "ep-stage-1" &&
                             !it.playerState.isBuffering &&
-                            it.readerContent != null
+                            it.activePlayerNotesContent != null
                     }
                 seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
                 val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }

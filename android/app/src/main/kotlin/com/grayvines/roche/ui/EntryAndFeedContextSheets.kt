@@ -15,11 +15,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -240,9 +242,14 @@ private fun ContextSheetActionsList(
     if (!isLocalPdfUrl) {
         ContextActionItem(label = "Share…", onClick = onShare)
     }
+    var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
+    val colors = LocalRocheColors.current
     ContextActionItem(
         label = offlineLabel,
-        onClick = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
+        onClick = {
+            onAction(MainAction.CloseContextSheet)
+            onAction(MainAction.ToggleOfflineCache(entry.id))
+        },
     )
     if (entry.feedId != null) {
         ContextActionItem(
@@ -255,9 +262,37 @@ private fun ContextSheetActionsList(
     }
     ContextActionItem(
         label = "Delete Entry",
-        textColor = LocalRocheColors.current.accentIndianRed,
-        onClick = { onAction(MainAction.DeleteEntry(entry.id)) },
+        textColor = colors.accentIndianRed,
+        onClick = { confirmDeleteEntry = true },
     )
+    if (confirmDeleteEntry) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteEntry = false },
+            containerColor = colors.surfaceElevated,
+            title = { Text("Delete entry?", color = colors.textPrimary) },
+            text = {
+                Text(
+                    text = "Permanently delete \"${entry.title}\" from your library?",
+                    color = colors.textSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDeleteEntry = false
+                        onAction(MainAction.DeleteEntry(entry.id))
+                    }
+                ) {
+                    Text("Delete", color = colors.accentIndianRed)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteEntry = false }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
+    }
 }
 
 @Composable
@@ -545,12 +580,43 @@ internal fun FeedContextActionsList(
         onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
         modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
     )
+    var confirmDeleteFeed by rememberSaveable(feed.id) { mutableStateOf(false) }
     ContextActionItem(
         label = "Unsubscribe from Feed",
         textColor = colors.accentIndianRed,
-        onClick = { onAction(MainAction.DeleteFeed(feed.id)) },
+        onClick = { confirmDeleteFeed = true },
         modifier = Modifier.testTag("delete_feed_${feed.id}"),
     )
+    if (confirmDeleteFeed) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteFeed = false },
+            containerColor = colors.surfaceElevated,
+            title = { Text("Unsubscribe from feed?", color = colors.textPrimary) },
+            text = {
+                Text(
+                    text =
+                        "Unsubscribe from \"${feed.title}\" and remove its entries from your Inbox?",
+                    color = colors.textSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDeleteFeed = false
+                        onAction(MainAction.DeleteFeed(feed.id))
+                    },
+                    modifier = Modifier.testTag("confirm_delete_feed_${feed.id}"),
+                ) {
+                    Text("Unsubscribe", color = colors.accentIndianRed)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteFeed = false }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
+    }
 }
 
 @Composable

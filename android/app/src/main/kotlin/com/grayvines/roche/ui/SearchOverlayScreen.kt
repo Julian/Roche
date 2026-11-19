@@ -119,6 +119,7 @@ fun SearchOverlay(
             navigationAction = {
                 HeaderActionButton(
                     label = "←",
+                    contentDescription = "Close search",
                     onClick = { onAction(MainAction.CloseSearch) },
                     modifier = Modifier.testTag("close_search_btn"),
                 )

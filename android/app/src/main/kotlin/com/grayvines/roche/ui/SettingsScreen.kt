@@ -22,6 +22,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -341,14 +342,16 @@ internal fun NavigationSummaryCardSection(
             ) {
                 BottomTabIcon(tab = AppTab.HOME, tint = colors.accentBlue, size = 18.dp)
             }
-            unpinnedTabs.forEach { unpinnedTab ->
-                val totalStarred =
+            val totalStarred =
+                remember(state.starredEntries, state.catalog.entriesByCollectionId) {
                     (state.starredEntries.map { it.id } +
                             state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID]
                                 .orEmpty()
                                 .map { it.entry.id })
                         .distinct()
                         .size
+                }
+            unpinnedTabs.forEach { unpinnedTab ->
                 val unpinnedSubtitle =
                     when (unpinnedTab) {
                         AppTab.HOME -> "Quick access to your unpinned Home widgets"

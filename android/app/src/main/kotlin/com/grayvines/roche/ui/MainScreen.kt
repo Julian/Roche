@@ -563,11 +563,19 @@ private fun MainSearchDestination(
     } else if (retainedFromParent != null) {
         retainedSearchState = retainedFromParent
     }
-    val searchScrollKey = "search:${retainedSearchState.searchQuery.trim().lowercase()}"
+    val normalizedQuery = retainedSearchState.searchQuery.trim().lowercase()
+    val searchListState = scrollStates.lazyListState(SEARCH_SCROLL_STATE_KEY)
+    var lastScrolledQuery by remember { mutableStateOf(normalizedQuery) }
+    LaunchedEffect(normalizedQuery) {
+        if (normalizedQuery != lastScrolledQuery) {
+            lastScrolledQuery = normalizedQuery
+            searchListState.scrollToItem(0)
+        }
+    }
     SearchOverlay(
         state = retainedSearchState,
         onAction = onAction,
-        listState = scrollStates.lazyListState(searchScrollKey),
+        listState = searchListState,
         isSearchActive = state.isSearchOpen,
     )
 }
@@ -899,12 +907,16 @@ internal class MainScrollStateHolder(
     internal fun toSavedSnapshot(): SavedScrollStateSnapshot =
         SavedScrollStateSnapshot(
             lazyPositions =
-                lazyStates.mapValues { (_, state) ->
-                    SavedLazyListPosition(
-                        firstVisibleItemIndex = state.firstVisibleItemIndex,
-                        firstVisibleItemScrollOffset = state.firstVisibleItemScrollOffset,
-                    )
-                },
+                lazyStates
+                    .filterKeys { key ->
+                        key != SEARCH_SCROLL_STATE_KEY && !key.startsWith("$SEARCH_SCROLL_STATE_KEY:")
+                    }
+                    .mapValues { (_, state) ->
+                        SavedLazyListPosition(
+                            firstVisibleItemIndex = state.firstVisibleItemIndex,
+                            firstVisibleItemScrollOffset = state.firstVisibleItemScrollOffset,
+                        )
+                    },
             scrollOffsets = scrollStates.mapValues { (_, state) -> state.value },
         )
 
@@ -937,3 +949,4 @@ internal class MainScrollStateHolder(
 
 private const val SNACKBAR_AUTO_DISMISS_MS = 4_000L
 private const val MAX_RETAINED_SCOPED_STATES = 8
+internal const val SEARCH_SCROLL_STATE_KEY = "search"

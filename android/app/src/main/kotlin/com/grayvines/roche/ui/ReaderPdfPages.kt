@@ -2,6 +2,7 @@ package com.grayvines.roche.ui
 
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
+import android.util.LruCache
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,40 +39,67 @@ import androidx.compose.ui.unit.sp
 import androidx.core.graphics.createBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 val LocalOfflineCacheDir = staticCompositionLocalOf<File?> { null }
 
+private val pdfTeardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+internal sealed interface PdfPageRenderState {
+    data object Loading : PdfPageRenderState
+
+    data class Success(val page: RenderedPdfPage) : PdfPageRenderState
+
+    data object Error : PdfPageRenderState
+}
+
 internal class PdfRendererSession(
     private val descriptor: ParcelFileDescriptor,
     private val renderer: PdfRenderer,
+    val canonicalPath: String = "",
 ) : AutoCloseable {
     private val renderMutex = Mutex()
-    private var closed = false
+    private val closeRequested = AtomicBoolean(false)
+    @Volatile private var closed = false
+    private val pageCache = LruCache<Int, CachedRenderedPdfPage>(MAX_CACHED_PDF_PAGES)
 
     val pageCount: Int = renderer.pageCount
 
     suspend fun renderPageBitmap(pageIndex: Int, targetWidthPx: Int): RenderedPdfPage? =
         withContext(Dispatchers.IO) {
+            if (closed || closeRequested.get()) return@withContext null
+            val clampedWidthPx = targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, MAX_RENDER_WIDTH_PX)
             renderMutex.withLock {
-                if (closed || pageIndex !in 0 until pageCount) {
+                if (closed || closeRequested.get() || pageIndex !in 0 until pageCount) {
                     null
                 } else {
-                    renderSinglePageLocked(pageIndex, targetWidthPx)
+                    val cached = pageCache.get(pageIndex)
+                    if (cached != null && cached.widthPx == clampedWidthPx) {
+                        cached.page
+                    } else {
+                        renderSinglePageLocked(pageIndex, clampedWidthPx)?.also { rendered ->
+                            pageCache.put(pageIndex, CachedRenderedPdfPage(clampedWidthPx, rendered))
+                        }
+                    }
                 }
             }
         }
 
-    private fun renderSinglePageLocked(pageIndex: Int, targetWidthPx: Int): RenderedPdfPage? =
+    private fun renderSinglePageLocked(pageIndex: Int, widthPx: Int): RenderedPdfPage? =
         runCatching {
             renderer.openPage(pageIndex).use { page ->
                 val rawW = page.width.coerceAtLeast(1)
                 val rawH = page.height.coerceAtLeast(1)
-                val widthPx = targetWidthPx.coerceIn(MIN_RENDER_WIDTH_PX, MAX_RENDER_WIDTH_PX)
                 val heightPx =
                     (widthPx.toDouble() * rawH.toDouble() / rawW.toDouble())
                         .roundToInt()
@@ -88,12 +116,30 @@ internal class PdfRendererSession(
         }
         .getOrNull()
 
+    suspend fun closeAsync() {
+        closeRequested.set(true)
+        withContext(Dispatchers.IO) {
+            renderMutex.withLock {
+                if (!closed) {
+                    closed = true
+                    pageCache.evictAll()
+                    runCatching { renderer.close() }
+                    runCatching { descriptor.close() }
+                }
+            }
+        }
+    }
+
     override fun close() {
-        closed = true
-        runCatching { renderer.close() }
-        runCatching { descriptor.close() }
+        if (!closeRequested.compareAndSet(false, true)) return
+        pdfTeardownScope.launch { closeAsync() }
     }
 }
+
+private data class CachedRenderedPdfPage(
+    val widthPx: Int,
+    val page: RenderedPdfPage,
+)
 
 internal data class RenderedPdfPage(
     val bitmap: ImageBitmap,
@@ -110,14 +156,43 @@ internal fun rememberCachedPdfSession(
     var session by remember(cacheRoot, entryId) { mutableStateOf<PdfRendererSession?>(null) }
 
     LaunchedEffect(cacheRoot, entryId, isCachedOffline, url) {
-        val opened =
+        val candidate =
             withContext(Dispatchers.IO) {
-                findCachedPdfFileForEntry(cacheRoot, entryId)?.let(::openPdfRendererSession)
+                findCachedPdfFileForEntry(cacheRoot, entryId)?.let { file ->
+                    val canonical = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+                    file to canonical
+                }
             }
-        val previous = session
-        session = opened
-        if (previous !== opened) {
-            previous?.close()
+        val currentSession = session
+        if (candidate != null && currentSession != null && currentSession.canonicalPath == candidate.second) {
+            return@LaunchedEffect
+        }
+        var opened: PdfRendererSession? = null
+        try {
+            opened =
+                if (candidate != null) {
+                    withContext(Dispatchers.IO) {
+                        val created = openPdfRendererSession(candidate.first, candidate.second)
+                        if (!coroutineContext.isActive) {
+                            created?.close()
+                            null
+                        } else {
+                            created
+                        }
+                    }
+                } else {
+                    null
+                }
+            val previous = session
+            session = opened
+            if (previous !== opened) {
+                previous?.close()
+            }
+        } catch (ce: CancellationException) {
+            if (opened !== session) {
+                opened?.close()
+            }
+            throw ce
         }
     }
     DisposableEffect(cacheRoot, entryId) {
@@ -140,12 +215,25 @@ internal fun PdfPageCardItem(
         remember(containerWidthPx) {
             (containerWidthPx * PDF_SUPERSAMPLE_FACTOR).roundToInt()
         }
-    val rendered by
-        produceState<RenderedPdfPage?>(initialValue = null, session, pageIndex, targetWidthPx) {
-            value = session.renderPageBitmap(pageIndex, targetWidthPx)
+    val renderState by
+        produceState<PdfPageRenderState>(
+            initialValue = PdfPageRenderState.Loading,
+            session,
+            pageIndex,
+            targetWidthPx,
+        ) {
+            value = PdfPageRenderState.Loading
+            val rendered = session.renderPageBitmap(pageIndex, targetWidthPx)
+            value =
+                if (rendered != null) {
+                    PdfPageRenderState.Success(rendered)
+                } else {
+                    PdfPageRenderState.Error
+                }
         }
     val shape = RoundedCornerShape(6.dp)
-    val aspect = rendered?.aspectRatio ?: DEFAULT_LETTER_ASPECT
+    val aspect =
+        (renderState as? PdfPageRenderState.Success)?.page?.aspectRatio ?: DEFAULT_LETTER_ASPECT
 
     Column(
         modifier = Modifier.fillMaxWidth().testTag("reader_pdf_page_${pageIndex + 1}"),
@@ -160,21 +248,31 @@ internal fun PdfPageCardItem(
                     .border(1.dp, colors.border, shape),
             contentAlignment = Alignment.Center,
         ) {
-            val pageImg = rendered
-            if (pageImg != null) {
-                Image(
-                    bitmap = pageImg.bitmap,
-                    contentDescription = "PDF page ${pageIndex + 1} of ${session.pageCount}",
-                    contentScale = ContentScale.FillWidth,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                Text(
-                    text = "Rendering page ${pageIndex + 1}…",
-                    color = colors.textMuted,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                )
+            when (val state = renderState) {
+                is PdfPageRenderState.Success -> {
+                    Image(
+                        bitmap = state.page.bitmap,
+                        contentDescription = "PDF page ${pageIndex + 1} of ${session.pageCount}",
+                        contentScale = ContentScale.FillWidth,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                PdfPageRenderState.Loading -> {
+                    Text(
+                        text = "Rendering page ${pageIndex + 1}…",
+                        color = colors.textMuted,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
+                PdfPageRenderState.Error -> {
+                    Text(
+                        text = "Unable to render page ${pageIndex + 1}",
+                        color = colors.textMuted,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                }
             }
         }
         Text(
@@ -215,28 +313,29 @@ private fun isValidPdfFile(file: File): Boolean {
         .getOrDefault(false)
 }
 
-private fun openPdfRendererSession(file: File): PdfRendererSession? = runCatching {
-    val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-    val renderer = runCatching {
-        PdfRenderer(pfd)
+private fun openPdfRendererSession(file: File, canonicalPath: String): PdfRendererSession? =
+    runCatching {
+        val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        val renderer =
+            runCatching { PdfRenderer(pfd) }
+                .onFailure { runCatching { pfd.close() } }
+                .getOrThrow()
+        if (renderer.pageCount <= 0) {
+            renderer.close()
+            pfd.close()
+            null
+        } else {
+            PdfRendererSession(pfd, renderer, canonicalPath)
+        }
     }
-        .onFailure { runCatching { pfd.close() } }
-        .getOrThrow()
-    if (renderer.pageCount <= 0) {
-        renderer.close()
-        pfd.close()
-        null
-    } else {
-        PdfRendererSession(pfd, renderer)
-    }
-}
     .getOrNull()
 
 private val PDF_MAGIC_BYTES = byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D) // "%PDF-"
 private const val DEFAULT_LETTER_ASPECT = 0.7727f
 private const val MIN_ASPECT = 0.35f
 private const val MAX_ASPECT = 2.5f
-private const val PDF_SUPERSAMPLE_FACTOR = 1.6f
+private const val PDF_SUPERSAMPLE_FACTOR = 1.25f
 private const val MIN_RENDER_WIDTH_PX = 720
-private const val MAX_RENDER_WIDTH_PX = 2_400
-private const val MAX_RENDER_HEIGHT_PX = 4_096
+private const val MAX_RENDER_WIDTH_PX = 1_600
+private const val MAX_RENDER_HEIGHT_PX = 2_800
+private const val MAX_CACHED_PDF_PAGES = 6

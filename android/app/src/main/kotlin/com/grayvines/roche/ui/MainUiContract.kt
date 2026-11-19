@@ -83,6 +83,7 @@ data class MainUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val readerContent: ReaderItemContent? = null,
+    val activePlayerNotesContent: ReaderItemContent? = null,
     val hydratingEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
@@ -130,17 +131,10 @@ data class MainUiState(
         get() {
             val activeId = playerState.currentEntryId ?: return null
             val base = allEntries.firstOrNull { it.id == activeId } ?: return null
-            val full = readerContent?.takeIf { it.itemId == base.id } ?: return base
-            val mergedHtml = pickLongerReaderText(full.contentHtml, base.contentHtml)
-            val mergedText = pickLongerReaderText(full.contentText, base.contentText)
-            return if (mergedHtml != base.contentHtml || mergedText != base.contentText) {
-                base.copy(
-                    contentHtml = mergedHtml,
-                    contentText = mergedText,
-                )
-            } else {
-                base
-            }
+            val full =
+                activePlayerNotesContent?.takeIf { it.itemId == base.id }
+                    ?: readerContent?.takeIf { it.itemId == base.id }
+            return base.mergeReaderContent(full)
         }
 
     val activePlayerFeed: FeedItem?
@@ -163,17 +157,10 @@ data class MainUiState(
     val activeReaderEntry: InboxEntry?
         get() {
             val base = allEntries.firstOrNull { it.id == selectedReaderEntryId } ?: return null
-            val full = readerContent?.takeIf { it.itemId == base.id } ?: return base
-            val mergedHtml = pickLongerReaderText(full.contentHtml, base.contentHtml)
-            val mergedText = pickLongerReaderText(full.contentText, base.contentText)
-            return if (mergedHtml != base.contentHtml || mergedText != base.contentText) {
-                base.copy(
-                    contentHtml = mergedHtml,
-                    contentText = mergedText,
-                )
-            } else {
-                base
-            }
+            val full =
+                readerContent?.takeIf { it.itemId == base.id }
+                    ?: activePlayerNotesContent?.takeIf { it.itemId == base.id }
+            return base.mergeReaderContent(full)
         }
 
     val contextSheetEntry: InboxEntry?
@@ -489,6 +476,7 @@ internal data class TransientUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val readerContent: ReaderItemContent? = null,
+    val activePlayerNotesContent: ReaderItemContent? = null,
     val hydratingEntryIds: Set<String> = emptySet(),
     val contextSheetEntryId: String? = null,
     val feedContextSheetId: String? = null,
@@ -584,13 +572,7 @@ internal fun reduceUiAction(
                     selectedTag = null,
                     scopeOriginTab = null,
                 )
-        is MainAction.SelectFilter ->
-            state.copy(
-                activeFilter = action.filter,
-                selectedTag = null,
-                selectedFeedId = null,
-                scopeOriginTab = null,
-            )
+        is MainAction.SelectFilter -> state.copy(activeFilter = action.filter)
         is MainAction.FilterByTag ->
             state
                 .clearSearch()
@@ -629,6 +611,20 @@ internal fun reduceUiAction(
             )
         else -> reduceOverlayUiAction(state, action)
     }
+
+private fun InboxEntry.mergeReaderContent(full: ReaderItemContent?): InboxEntry {
+    if (full == null) return this
+    val mergedHtml = pickLongerReaderText(full.contentHtml, contentHtml)
+    val mergedText = pickLongerReaderText(full.contentText, contentText)
+    return if (mergedHtml != contentHtml || mergedText != contentText) {
+        copy(
+            contentHtml = mergedHtml,
+            contentText = mergedText,
+        )
+    } else {
+        this
+    }
+}
 
 internal fun pickLongerReaderText(first: String?, second: String?): String? {
     val a = first?.takeIf { it.isNotBlank() }
@@ -884,6 +880,7 @@ internal class MainUiStateMemoizer {
             scopeOriginTab = local.scopeOriginTab,
             selectedReaderEntryId = local.selectedReaderEntryId,
             readerContent = local.readerContent,
+            activePlayerNotesContent = local.activePlayerNotesContent,
             hydratingEntryIds = local.hydratingEntryIds,
             contextSheetEntryId = local.contextSheetEntryId,
             feedContextSheetId = local.feedContextSheetId,

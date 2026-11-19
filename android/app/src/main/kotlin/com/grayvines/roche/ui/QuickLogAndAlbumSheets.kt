@@ -82,6 +82,7 @@ internal fun CollectionDrawNoteModalSheet(
                 collectionId = dialog.collectionId,
                 isAbandon = isAbandon,
                 notes = notes,
+                canConfirm = draw != null,
                 onAction = onAction,
             )
             Spacer(modifier = Modifier.height(14.dp))
@@ -132,6 +133,7 @@ private fun DrawNoteSheetFooter(
     collectionId: String,
     isAbandon: Boolean,
     notes: String,
+    canConfirm: Boolean,
     onAction: (MainAction) -> Unit,
 ) {
     Row(
@@ -147,7 +149,9 @@ private fun DrawNoteSheetFooter(
         HeaderActionButton(
             label = if (isAbandon) "Abandon & Draw Next" else "Finish & Rank",
             style = RocheButtonStyle.PRIMARY,
+            enabled = canConfirm,
             onClick = {
+                if (!canConfirm) return@HeaderActionButton
                 val action =
                     if (isAbandon) {
                         MainAction.ConfirmAbandonDraw(collectionId, notes)
@@ -271,9 +275,17 @@ private fun QuickLogSheetBody(
                 addToWant -> "Add to Want"
                 else -> "Save Log"
             }
-        QuickLogFooterRow(submitLabel, { onAction(MainAction.CloseQuickLogSheet) }) {
-            onAction(submitAction)
-        }
+        val canSubmit = title.isNotBlank()
+        QuickLogFooterRow(
+            submitLabel = submitLabel,
+            canSubmit = canSubmit,
+            onCancel = { onAction(MainAction.CloseQuickLogSheet) },
+            onSubmit = {
+                if (canSubmit) {
+                    onAction(submitAction)
+                }
+            },
+        )
         Spacer(modifier = Modifier.height(14.dp))
     }
 }
@@ -480,6 +492,7 @@ private fun QuickLogDiaryOptions(
 @Composable
 private fun QuickLogFooterRow(
     submitLabel: String,
+    canSubmit: Boolean,
     onCancel: () -> Unit,
     onSubmit: () -> Unit,
 ) {
@@ -492,6 +505,7 @@ private fun QuickLogFooterRow(
         HeaderActionButton(
             label = submitLabel,
             style = RocheButtonStyle.PRIMARY,
+            enabled = canSubmit,
             onClick = onSubmit,
             modifier = Modifier.testTag("quick_log_submit_btn"),
         )

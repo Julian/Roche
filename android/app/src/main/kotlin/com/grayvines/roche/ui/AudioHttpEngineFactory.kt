@@ -10,21 +10,29 @@ import android.os.Build
 import android.os.ext.SdkExtensions
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
+import androidx.media3.common.C
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSourceException
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.HttpEngineDataSource
-import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.datasource.HttpUtil
 import androidx.media3.datasource.TransferListener
 import com.grayvines.roche.data.remote.MAX_REDIRECTS
 import com.grayvines.roche.data.remote.PublicUrlValidator
 import com.grayvines.roche.data.remote.resolveRedirectUrl
+import java.io.EOFException
 import java.io.IOException
+import java.io.InputStream
 import java.io.InterruptedIOException
+import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.URL
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutionException
@@ -74,46 +82,271 @@ internal class AudioRedirectCache(
 internal fun createAudioDataSourceFactory(
     context: Context,
     httpEngine: HttpEngine,
-    callbackExecutor: Executor,
+    @Suppress("UNUSED_PARAMETER") callbackExecutor: Executor,
 ): DataSource.Factory {
-    val redirectCache = AudioRedirectCache()
     val useHttpEngine =
         SdkExtensions.getExtensionVersion(Build.VERSION_CODES.S) >= MIN_S_EXT_HTTP_ENGINE
-    val baseHttpFactory: DataSource.Factory =
+    val connectionOpener: (URL) -> HttpURLConnection =
         if (useHttpEngine) {
-            HttpEngineDataSource.Factory(httpEngine, callbackExecutor)
-                .setUserAgent(ROCHE_AUDIO_USER_AGENT)
-                .setConnectionTimeoutMs(AUDIO_HTTP_CONNECT_TIMEOUT_MS)
-                .setReadTimeoutMs(AUDIO_HTTP_READ_TIMEOUT_MS)
-                .setResetTimeoutOnRedirects(true)
+            { url -> httpEngine.openConnection(url) as HttpURLConnection }
         } else {
-            DefaultHttpDataSource.Factory()
-                .setUserAgent(ROCHE_AUDIO_USER_AGENT)
-                .setConnectTimeoutMs(AUDIO_HTTP_CONNECT_TIMEOUT_MS)
-                .setReadTimeoutMs(AUDIO_HTTP_READ_TIMEOUT_MS)
-                .setAllowCrossProtocolRedirects(false)
+            { url -> url.openConnection() as HttpURLConnection }
         }
-    val guardedHttpFactory = wrapWithPostRedirectCheck(baseHttpFactory)
-    val resolvingHttpFactory =
-        ResolvingDataSource.Factory(guardedHttpFactory) { dataSpec ->
-            if (useHttpEngine) {
-                resolveSafeHttpDataSpec(
-                    dataSpec = dataSpec,
-                    redirectResolver = { rawUrl ->
-                        resolveCachedAudioUrl(
-                            rawUrl = rawUrl,
-                            cache = redirectCache,
-                            probeHop = { hopUrl ->
-                                probeAudioRedirectHop(hopUrl, httpEngine, callbackExecutor)
-                            },
-                        )
-                    },
+    val safeHttpFactory =
+        DataSource.Factory {
+            SafeRedirectHttpDataSource(
+                openConnection = connectionOpener,
+                userAgent = ROCHE_AUDIO_USER_AGENT,
+                connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
+                readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
+            )
+        }
+    return DefaultDataSource.Factory(context, safeHttpFactory)
+}
+
+@OptIn(UnstableApi::class)
+internal class SafeRedirectHttpDataSource(
+    private val openConnection: (URL) -> HttpURLConnection = { url ->
+        url.openConnection() as HttpURLConnection
+    },
+    private val validateUrl: (String) -> String = { resolveSafeHttpPlaybackUrl(it) },
+    private val userAgent: String = ROCHE_AUDIO_USER_AGENT,
+    private val connectTimeoutMs: Int = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
+    private val readTimeoutMs: Int = AUDIO_HTTP_READ_TIMEOUT_MS,
+    private val maxRedirects: Int = MAX_REDIRECTS,
+) : BaseDataSource(/* isNetwork = */ true) {
+    private var connection: HttpURLConnection? = null
+    private var inputStream: InputStream? = null
+    private var opened = false
+    private var currentUri: Uri? = null
+    private var bytesToRead: Long = C.LENGTH_UNSET.toLong()
+    private var bytesRead: Long = 0L
+
+    override fun open(dataSpec: DataSpec): Long {
+        bytesRead = 0L
+        bytesToRead = C.LENGTH_UNSET.toLong()
+        transferInitializing(dataSpec)
+
+        val conn =
+            try {
+                openValidatedConnection(dataSpec)
+            } catch (err: IOException) {
+                closeConnectionQuietly()
+                throw err
+            } catch (err: IllegalArgumentException) {
+                closeConnectionQuietly()
+                throw IOException("Blocked unsafe audio target", err)
+            }
+
+        connection = conn
+        val responseCode = conn.responseCode
+        val responseMessage = conn.responseMessage
+        val headers = conn.headerFields ?: emptyMap()
+
+        if (responseCode < 200 || responseCode > 299) {
+            closeConnectionQuietly()
+            if (responseCode == 416) {
+                val documentSize =
+                    HttpUtil.getDocumentSize(conn.getHeaderField("Content-Range"))
+                if (dataSpec.position == documentSize) {
+                    opened = true
+                    transferStarted(dataSpec)
+                    return if (dataSpec.length != C.LENGTH_UNSET.toLong()) dataSpec.length else 0L
+                }
+                throw DataSourceException(PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE)
+            }
+            throw HttpDataSource.InvalidResponseCodeException(
+                responseCode,
+                responseMessage,
+                null,
+                headers,
+                dataSpec,
+                ByteArray(0),
+            )
+        }
+
+        val bytesToSkip = if (responseCode == 200 && dataSpec.position != 0L) dataSpec.position else 0L
+        if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+            bytesToRead = dataSpec.length
+        } else {
+            val contentLength =
+                HttpUtil.getContentLength(
+                    conn.getHeaderField("Content-Length"),
+                    conn.getHeaderField("Content-Range"),
                 )
-            } else {
-                resolveSafeHttpDataSpec(dataSpec)
+            bytesToRead =
+                if (contentLength != C.LENGTH_UNSET.toLong()) {
+                    (contentLength - bytesToSkip).coerceAtLeast(0L)
+                } else {
+                    C.LENGTH_UNSET.toLong()
+                }
+        }
+
+        try {
+            val stream = conn.inputStream
+            skipFully(stream, bytesToSkip)
+            inputStream = stream
+        } catch (err: IOException) {
+            closeConnectionQuietly()
+            throw err
+        }
+
+        opened = true
+        transferStarted(dataSpec)
+        return bytesToRead
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        if (bytesToRead != C.LENGTH_UNSET.toLong()) {
+            val remaining = bytesToRead - bytesRead
+            if (remaining <= 0L) return C.RESULT_END_OF_INPUT
+            val toRead = minOf(length.toLong(), remaining).toInt()
+            val readCount = inputStream?.read(buffer, offset, toRead) ?: C.RESULT_END_OF_INPUT
+            if (readCount == -1) return C.RESULT_END_OF_INPUT
+            bytesRead += readCount
+            bytesTransferred(readCount)
+            return readCount
+        }
+        val readCount = inputStream?.read(buffer, offset, length) ?: C.RESULT_END_OF_INPUT
+        if (readCount == -1) return C.RESULT_END_OF_INPUT
+        bytesRead += readCount
+        bytesTransferred(readCount)
+        return readCount
+    }
+
+    override fun getUri(): Uri? = currentUri
+
+    override fun getResponseHeaders(): Map<String, List<String>> =
+        connection?.headerFields ?: emptyMap()
+
+    override fun close() {
+        try {
+            inputStream?.close()
+        } finally {
+            inputStream = null
+            closeConnectionQuietly()
+            if (opened) {
+                opened = false
+                transferEnded()
             }
         }
-    return DefaultDataSource.Factory(context, resolvingHttpFactory)
+    }
+
+    private fun openValidatedConnection(dataSpec: DataSpec): HttpURLConnection {
+        val (conn, finalUrl) =
+            openValidatedUrl(
+                rawUrl = dataSpec.uri.toString().trim(),
+                httpMethod = dataSpec.httpMethodString,
+                httpBody = dataSpec.httpBody,
+                requestHeaders = dataSpec.httpRequestHeaders,
+                position = dataSpec.position,
+                length = dataSpec.length,
+            )
+        currentUri = finalUrl.toUri()
+        return conn
+    }
+
+    internal fun openValidatedUrl(
+        rawUrl: String,
+        httpMethod: String = "GET",
+        httpBody: ByteArray? = null,
+        requestHeaders: Map<String, String> = emptyMap(),
+        position: Long = 0L,
+        length: Long = C.LENGTH_UNSET.toLong(),
+    ): Pair<HttpURLConnection, String> {
+        var currentUrl = validateUrl(rawUrl.trim())
+        var method = httpMethod
+        var body = httpBody
+
+        for (hop in 0..maxRedirects) {
+            val conn =
+                openSingleConnection(
+                    url = currentUrl,
+                    httpMethod = method,
+                    httpBody = body,
+                    requestHeaders = requestHeaders,
+                    position = position,
+                    length = length,
+                )
+            val responseCode = conn.responseCode
+            if (responseCode in REDIRECT_STATUS_CODES) {
+                val location = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (hop >= maxRedirects) {
+                    throw IOException("Too many audio redirects")
+                }
+                val nextRaw =
+                    resolveRedirectUrl(currentUrl, location)
+                        ?: throw IOException("Blocked or invalid audio redirect URL")
+                currentUrl = validateUrl(nextRaw)
+                if (responseCode in 301..303 && method == "POST") {
+                    method = "GET"
+                    body = null
+                }
+                continue
+            }
+            return conn to currentUrl
+        }
+        throw IOException("Too many audio redirects")
+    }
+
+    private fun openSingleConnection(
+        url: String,
+        httpMethod: String,
+        httpBody: ByteArray?,
+        requestHeaders: Map<String, String>,
+        position: Long,
+        length: Long,
+    ): HttpURLConnection {
+        val conn = openConnection(URI.create(url).toURL())
+        conn.instanceFollowRedirects = false
+        conn.connectTimeout = connectTimeoutMs
+        conn.readTimeout = readTimeoutMs
+        conn.requestMethod = httpMethod
+        conn.setRequestProperty("User-Agent", userAgent)
+        conn.setRequestProperty("Accept-Encoding", "identity")
+        for ((key, value) in requestHeaders) {
+            conn.setRequestProperty(key, value)
+        }
+        val rangeHeader = HttpUtil.buildRangeRequestHeader(position, length)
+        if (rangeHeader != null) {
+            conn.setRequestProperty("Range", rangeHeader)
+        }
+        if (httpBody != null) {
+            conn.doOutput = true
+            conn.setFixedLengthStreamingMode(httpBody.size)
+            conn.connect()
+            conn.outputStream.use { out -> out.write(httpBody) }
+        } else {
+            conn.connect()
+        }
+        return conn
+    }
+
+    private fun skipFully(stream: InputStream, bytesToSkip: Long) {
+        var remaining = bytesToSkip
+        val skipBuffer = ByteArray(4096)
+        while (remaining > 0L) {
+            val read = stream.read(skipBuffer, 0, minOf(remaining, skipBuffer.size.toLong()).toInt())
+            if (read == -1) {
+                throw EOFException("Unexpected end of stream while skipping audio bytes")
+            }
+            remaining -= read
+            bytesTransferred(read)
+        }
+    }
+
+    private fun closeConnectionQuietly() {
+        connection?.let {
+            runCatching { it.disconnect() }
+            connection = null
+        }
+    }
+
+    private companion object {
+        val REDIRECT_STATUS_CODES = setOf(300, 301, 302, 303, 307, 308)
+    }
 }
 
 @OptIn(UnstableApi::class)
@@ -216,6 +449,7 @@ internal fun resolveCachedAudioUrl(
             maxRedirects = MAX_REDIRECTS,
             validateUrl = validateUrl,
             probeHop = probeHop,
+            initialAlreadyValidated = true,
         )
     cache.put(startUrl, resolved)
     return resolved
@@ -226,8 +460,9 @@ internal fun resolveAudioRedirectChain(
     maxRedirects: Int = MAX_REDIRECTS,
     validateUrl: (String) -> String = { resolveSafeHttpPlaybackUrl(it) },
     probeHop: (String) -> AudioHopOutcome,
+    initialAlreadyValidated: Boolean = false,
 ): String {
-    var currentUrl = validateUrl(initialUrl)
+    var currentUrl = if (initialAlreadyValidated) initialUrl else validateUrl(initialUrl)
     for (hop in 0..maxRedirects) {
         when (val outcome = probeHop(currentUrl)) {
             AudioHopOutcome.Final -> {

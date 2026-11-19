@@ -60,7 +60,7 @@ private val DarkRocheColors =
         border = Color(0xFF272624),
         textPrimary = RochePalette.Timberwolf,
         textSecondary = Color(0xFFA8A39D),
-        textMuted = Color(0xFF6E6A65),
+        textMuted = Color(0xFF94908A),
         accentBlue = RochePalette.SteelBlue,
         accentVerdigris = RochePalette.Verdigris,
         accentEcru = RochePalette.Ecru,
@@ -75,11 +75,11 @@ private val LightRocheColors =
         surfaceElevated = Color(0xFFD8D2CC),
         border = Color(0xFFD2CBC3),
         textPrimary = Color(0xFF182024),
-        textSecondary = Color(0xFF525A5E),
-        textMuted = Color(0xFF7E8487),
+        textSecondary = Color(0xFF424A4E),
+        textMuted = Color(0xFF53595C),
         accentBlue = Color(0xFF336B8A),
         accentVerdigris = Color(0xFF358784),
-        accentEcru = Color(0xFF9E7B46),
+        accentEcru = Color(0xFF6E5122),
         accentIndianRed = Color(0xFFA84C51),
         isDark = false,
     )
@@ -87,6 +87,12 @@ private val LightRocheColors =
 val LocalRocheColors = staticCompositionLocalOf { DarkRocheColors }
 val LocalHeadlineFont = staticCompositionLocalOf { HeadlineFont.SERIF }
 val LocalReaderFontScale = staticCompositionLocalOf { 1.0f }
+
+fun HeadlineFont.toFontFamily(): FontFamily =
+    if (this == HeadlineFont.SERIF) FontFamily.Serif else FontFamily.SansSerif
+
+@Composable
+fun currentHeadlineFontFamily(): FontFamily = LocalHeadlineFont.current.toFontFamily()
 
 @Composable
 fun RocheTheme(
@@ -97,8 +103,7 @@ fun RocheTheme(
 ) {
     val rocheColors = if (themeMode == ThemeMode.DARK) DarkRocheColors else LightRocheColors
     val darkTheme = rocheColors.isDark
-    val headlineFamily =
-        if (headlineFont == HeadlineFont.SERIF) FontFamily.Serif else FontFamily.SansSerif
+    val headlineFamily = headlineFont.toFontFamily()
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {

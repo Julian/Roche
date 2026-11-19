@@ -53,12 +53,14 @@ internal fun formatPlaybackSpeedLabel(speed: Float): String {
 internal fun parseChaptersFromEpisodeNotes(rawHtmlOrText: String): List<PodcastChapter> {
     if (rawHtmlOrText.isBlank()) return emptyList()
     val plainLines =
-        rawHtmlOrText
-            .replace(BR_TAG_REGEX, "\n")
-            .replace(BLOCK_END_TAG_REGEX, "\n")
-            .replace(ANY_TAG_REGEX, " ")
-            .replace("&amp;", "&")
-            .replace("&nbsp;", " ")
+        org.jsoup.parser.Parser.unescapeEntities(
+                rawHtmlOrText
+                    .replace(BR_TAG_REGEX, "\n")
+                    .replace(BLOCK_END_TAG_REGEX, "\n")
+                    .replace(ANY_TAG_REGEX, " "),
+                false,
+            )
+            .replace('\u00A0', ' ')
             .lines()
 
     return plainLines

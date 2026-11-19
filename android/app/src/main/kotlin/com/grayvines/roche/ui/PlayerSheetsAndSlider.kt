@@ -41,10 +41,12 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,6 +91,7 @@ fun PlaybackSpeedAndPodcastSheet(
         Column(
             modifier =
                 Modifier.fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 10.dp)
                     .testTag("playback_speed_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -163,6 +166,8 @@ fun PlaybackSpeedAndPodcastSheet(
                     onAction(MainAction.SetPlaybackSpeed(clampPlaybackSpeed(raw)))
                 },
                 onDragPreviewChange = { previewSpeedFraction = it },
+                contentDescription = "Playback speed",
+                stateDescription = speedFormatted,
                 modifier = Modifier.fillMaxWidth().testTag("speed_slider"),
             )
 
@@ -254,43 +259,53 @@ internal fun PlayerContentDrawerSheet(
                     ReaderBodyContent(entry = entry, onOpenExternalUrl = onOpenExternalUrl)
                 }
                 PlayerDrawerTab.CHAPTERS -> {
-                    playerState.chapters.forEach { chapter ->
-                        val isCurrent = playerState.currentChapter?.index == chapter.index
-                        Row(
-                            modifier =
-                                Modifier.fillMaxWidth()
-                                    .heightIn(min = 48.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (isCurrent) {
-                                            colors.accentBlue.copy(alpha = 0.14f)
-                                        } else {
-                                            Color.Transparent
+                    if (playerState.chapters.isEmpty()) {
+                        Text(
+                            text = "No chapters available for this episode.",
+                            color = colors.textMuted,
+                            fontSize = 13.5.sp,
+                            modifier = Modifier.padding(vertical = 12.dp),
+                        )
+                    } else {
+                        playerState.chapters.forEach { chapter ->
+                            val isCurrent = playerState.currentChapter?.index == chapter.index
+                            Row(
+                                modifier =
+                                    Modifier.fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(
+                                            if (isCurrent) {
+                                                colors.accentBlue.copy(alpha = 0.14f)
+                                            } else {
+                                                Color.Transparent
+                                            }
+                                        )
+                                        .clickable {
+                                            onAction(MainAction.SeekPlayerToMs(chapter.startMs))
+                                            onAction(MainAction.SelectPlayerDrawerTab(null))
                                         }
-                                    )
-                                    .clickable {
-                                        onAction(MainAction.SeekPlayerToMs(chapter.startMs))
-                                        onAction(MainAction.SelectPlayerDrawerTab(null))
-                                    }
-                                    .semantics { role = Role.Button }
-                                    .padding(horizontal = 10.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                text = "${chapter.index}. ${chapter.title}",
-                                color = if (isCurrent) colors.accentBlue else colors.textPrimary,
-                                fontSize = 14.sp,
-                                fontWeight =
-                                    if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Text(
-                                text = formatPlaybackClock(chapter.startMs),
-                                color = colors.textMuted,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.5.sp,
-                            )
+                                        .semantics { role = Role.Button }
+                                        .padding(horizontal = 10.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "${chapter.index}. ${chapter.title}",
+                                    color =
+                                        if (isCurrent) colors.accentBlue else colors.textPrimary,
+                                    fontSize = 14.sp,
+                                    fontWeight =
+                                        if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Text(
+                                    text = formatPlaybackClock(chapter.startMs),
+                                    color = colors.textMuted,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.5.sp,
+                                )
+                            }
                         }
                     }
                 }
@@ -317,12 +332,30 @@ internal fun PlayerContentDrawerSheet(
     }
 }
 
+internal fun computeSliderThumbCenterX(
+    width: Float,
+    fraction: Float,
+    thumbRadius: Float,
+): Float {
+    if (width <= 0f) return 0f
+    val clampedFraction = fraction.coerceIn(0f, 1f)
+    val activeWidth = (width * clampedFraction).coerceIn(0f, width)
+    val maxCenter = (width - thumbRadius).coerceAtLeast(thumbRadius)
+    return if (width <= thumbRadius * 2f) {
+        width * 0.5f
+    } else {
+        activeWidth.coerceIn(thumbRadius, maxCenter)
+    }
+}
+
 @Composable
 internal fun RocheInteractiveSlider(
     fraction: Float,
     onFractionChangeFinished: (Float) -> Unit,
     modifier: Modifier = Modifier,
     onDragPreviewChange: ((Float?) -> Unit)? = null,
+    contentDescription: String? = null,
+    stateDescription: String? = null,
 ) {
     val colors = LocalRocheColors.current
     var dragFraction by remember { mutableStateOf<Float?>(null) }
@@ -334,6 +367,12 @@ internal fun RocheInteractiveSlider(
             modifier
                 .height(48.dp)
                 .semantics {
+                    if (contentDescription != null) {
+                        this.contentDescription = contentDescription
+                    }
+                    if (stateDescription != null) {
+                        this.stateDescription = stateDescription
+                    }
                     progressBarRangeInfo = ProgressBarRangeInfo(displayFraction, 0f..1f)
                     setProgress { targetValue ->
                         val target = targetValue.coerceIn(0f, 1f)
@@ -384,10 +423,12 @@ internal fun RocheInteractiveSlider(
                     }
                 }
     ) {
+        if (size.width <= 0f) return@Canvas
         val trackHeight = 4.dp.toPx()
         val thumbRadius = 7.dp.toPx()
         val centerY = size.height * 0.5f
         val activeWidth = (size.width * displayFraction).coerceIn(0f, size.width)
+        val thumbCenterX = computeSliderThumbCenterX(size.width, displayFraction, thumbRadius)
         val corner = CornerRadius(trackHeight * 0.5f, trackHeight * 0.5f)
         drawRoundRect(
             color = colors.border,
@@ -404,7 +445,7 @@ internal fun RocheInteractiveSlider(
         drawCircle(
             color = colors.accentBlue,
             radius = thumbRadius,
-            center = Offset(activeWidth.coerceIn(thumbRadius, size.width - thumbRadius), centerY),
+            center = Offset(thumbCenterX, centerY),
         )
     }
 }

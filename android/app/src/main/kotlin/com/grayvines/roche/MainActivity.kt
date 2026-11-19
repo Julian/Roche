@@ -28,11 +28,13 @@ import com.grayvines.roche.ui.PodcastPlaybackService
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : ComponentActivity() {
+    private var musicDrawResolveJob: Job? = null
 
     private val viewModel: MainViewModel by viewModels {
         val graph = (application as RocheApp).graph
@@ -166,15 +168,17 @@ class MainActivity : ComponentActivity() {
             return
         }
         val repo = (application as RocheApp).graph.repository
-        lifecycleScope.launch {
-            val enriched =
-                withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
-                    repo.resolveCollectionDrawStreaming(draw)
-                } ?: draw
-            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
+        musicDrawResolveJob?.cancel()
+        musicDrawResolveJob =
+            lifecycleScope.launch {
+                val enriched =
+                    withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
+                        repo.resolveCollectionDrawStreaming(draw)
+                    } ?: draw
+                if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                    openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
+                }
             }
-        }
     }
 
     private fun openUrlInBrowser(url: String) {

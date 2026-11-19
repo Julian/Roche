@@ -400,28 +400,26 @@ private fun RenderErrorInlineImage(
     baseUrl: String?,
     onOpenUrl: ((String) -> Unit)?,
 ) {
-    if (block.captionHtml.isNullOrBlank() && block.alt.isNullOrBlank()) return
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val shape = RoundedCornerShape(8.dp)
+    val fallbackLabel = block.alt?.takeIf { it.isNotBlank() } ?: "Image unavailable"
     Column(modifier = Modifier.fillMaxWidth().testTag(READER_INLINE_IMAGE_TAG)) {
-        if (!block.alt.isNullOrBlank()) {
-            Box(
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .clip(shape)
-                        .background(colors.surfaceElevated)
-                        .border(width = 1.dp, color = colors.border, shape = shape)
-                        .padding(horizontal = 12.dp, vertical = 10.dp)
-            ) {
-                Text(
-                    text = block.alt,
-                    color = colors.textMuted,
-                    fontFamily = FontFamily.SansSerif,
-                    fontSize = (12.5f * scale).sp,
-                    lineHeight = (18f * scale).sp,
-                )
-            }
+        Box(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .clip(shape)
+                    .background(colors.surfaceElevated)
+                    .border(width = 1.dp, color = colors.border, shape = shape)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            Text(
+                text = fallbackLabel,
+                color = colors.textMuted,
+                fontFamily = FontFamily.SansSerif,
+                fontSize = (12.5f * scale).sp,
+                lineHeight = (18f * scale).sp,
+            )
         }
         if (!block.captionHtml.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
@@ -476,7 +474,7 @@ private fun RenderImageCaption(
 @Composable
 private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
     val cleanUrl = imageUrl.trim()
-    val loader = LocalThumbnailLoader.current ?: return InlineImageLoadState.Loading
+    val loader = LocalThumbnailLoader.current ?: return InlineImageLoadState.Error
     val initialState =
         loader.getCachedInlineImage(cleanUrl)?.let { InlineImageLoadState.Success(it) }
             ?: InlineImageLoadState.Loading

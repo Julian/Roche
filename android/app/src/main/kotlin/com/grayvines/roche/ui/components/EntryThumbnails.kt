@@ -39,7 +39,6 @@ import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
-import kotlin.math.abs
 
 /**
  * Renders a rounded site favicon badge (`28.dp` on Feeds rows, `14.dp` inline in Inbox meta).
@@ -162,7 +161,8 @@ private fun resolveFaviconBrandStyle(
 ): FaviconBrandStyle {
     val cleanDomain = domain.lowercase()
     val monogram = extractDomainMonogram(cleanDomain.ifBlank { title })
-    val defaultPaletteIndex = abs(cleanDomain.ifBlank { title }.hashCode()) % FAVICON_SWATCHES.size
+    val defaultPaletteIndex =
+        Math.floorMod(cleanDomain.ifBlank { title }.hashCode(), FAVICON_SWATCHES.size)
     val (defaultBg, defaultFg) = FAVICON_SWATCHES[defaultPaletteIndex]
     return when {
         feedType == FeedType.ARXIV || "arxiv" in cleanDomain ->

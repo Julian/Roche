@@ -58,7 +58,6 @@ import com.grayvines.roche.data.CollectionGeneratorState
 import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
-import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.ui.components.BottomTabIcon
@@ -73,7 +72,7 @@ import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
-import com.grayvines.roche.ui.theme.LocalHeadlineFont
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
 
@@ -359,12 +358,7 @@ internal fun CollectionDrawSleeveCardBody(
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
 
     CollectionDrawSquareCover(
         draw = draw,
@@ -936,12 +930,7 @@ private fun HomeInboxPreviewRow(
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     Row(
         modifier =
             Modifier.fillMaxWidth()
@@ -1079,12 +1068,7 @@ internal fun HomeSpotlightRow(
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (LocalHeadlineFont.current == HeadlineFont.SERIF) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
     val badge =
         when {
             isPlayingAudio -> "NOW PLAYING"

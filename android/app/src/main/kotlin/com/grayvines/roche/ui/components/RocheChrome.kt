@@ -10,6 +10,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +29,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -45,6 +47,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -56,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 /** Crisp circular refresh arrow icon for feed rows and sync actions. */
 @Composable
@@ -207,15 +211,7 @@ fun RocheTopHeader(
     content: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily =
-        if (
-            com.grayvines.roche.ui.theme.LocalHeadlineFont.current ==
-                com.grayvines.roche.model.HeadlineFont.SERIF
-        ) {
-            FontFamily.Serif
-        } else {
-            FontFamily.SansSerif
-        }
+    val headlineFamily = currentHeadlineFontFamily()
 
     Row(
         modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -270,6 +266,7 @@ fun FilterChipPill(
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    role: Role = Role.Tab,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
@@ -287,18 +284,31 @@ fun FilterChipPill(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .height(32.dp)
+                .minimumInteractiveComponentSize()
                 .clip(shape)
-                .background(bg)
-                .border(width = 1.dp, color = border, shape = shape)
                 .clickable(onClick = onClick)
                 .semantics {
-                    role = Role.Tab
+                    this.role = role
                     this.selected = selected
-                }
-                .padding(horizontal = 12.dp),
+                },
     ) {
-        Text(text = label, color = textColor, fontSize = 12.sp, fontWeight = weight, maxLines = 1)
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.height(32.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .border(width = 1.dp, color = border, shape = shape)
+                    .padding(horizontal = 12.dp),
+        ) {
+            Text(
+                text = label,
+                color = textColor,
+                fontSize = 12.sp,
+                fontWeight = weight,
+                maxLines = 1,
+            )
+        }
     }
 }
 
@@ -314,45 +324,66 @@ fun HeaderActionButton(
     modifier: Modifier = Modifier,
     style: RocheButtonStyle = RocheButtonStyle.SECONDARY,
     horizontalPadding: Dp = 14.dp,
+    contentDescription: String? = null,
+    enabled: Boolean = true,
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(8.dp)
     val bg =
         when (style) {
-            RocheButtonStyle.PRIMARY -> colors.accentBlue
-            RocheButtonStyle.SECONDARY -> colors.surfaceElevated
+            RocheButtonStyle.PRIMARY ->
+                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
+            RocheButtonStyle.SECONDARY ->
+                if (enabled) colors.surfaceElevated else colors.surfaceElevated.copy(alpha = 0.5f)
         }
     val border =
         when (style) {
-            RocheButtonStyle.PRIMARY -> colors.accentBlue
+            RocheButtonStyle.PRIMARY ->
+                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
             RocheButtonStyle.SECONDARY -> colors.border
         }
     val textColor =
         when (style) {
-            RocheButtonStyle.PRIMARY -> Color.White
-            RocheButtonStyle.SECONDARY -> colors.textPrimary
+            RocheButtonStyle.PRIMARY -> if (enabled) Color.White else Color.White.copy(alpha = 0.6f)
+            RocheButtonStyle.SECONDARY ->
+                if (enabled) colors.textPrimary else colors.textMuted
         }
 
     Box(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .height(36.dp)
+                .minimumInteractiveComponentSize()
                 .clip(shape)
-                .background(bg)
-                .border(1.dp, border, shape)
-                .clickable(onClick = onClick)
-                .semantics { role = Role.Button }
-                .padding(horizontal = horizontalPadding),
+                .clickable(enabled = enabled, onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    if (!enabled) {
+                        disabled()
+                    }
+                    if (contentDescription != null) {
+                        this.contentDescription = contentDescription
+                    }
+                },
     ) {
-        Text(
-            text = label,
-            color = textColor,
-            fontSize = 12.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.height(36.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .border(1.dp, border, shape)
+                    .padding(horizontal = horizontalPadding),
+        ) {
+            Text(
+                text = label,
+                color = textColor,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -380,7 +411,7 @@ fun RocheIconActionButton(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .defaultMinSize(minWidth = 40.dp, minHeight = 48.dp)
+                .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
                 .clip(shape)
                 .clickable(onClick = onClick)
                 .semantics {
@@ -402,7 +433,16 @@ fun SettingToggleRow(
 ) {
     val colors = LocalRocheColors.current
     Row(
-        modifier = modifier.fillMaxWidth().padding(vertical = 4.dp),
+        modifier =
+            modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .toggleable(
+                    value = checked,
+                    role = Role.Switch,
+                    onValueChange = onCheckedChange,
+                )
+                .padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -410,7 +450,7 @@ fun SettingToggleRow(
             Text(text = title, color = colors.textPrimary, fontSize = 14.sp)
             Text(text = subtitle, color = colors.textMuted, fontSize = 11.5.sp)
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 
@@ -456,7 +496,10 @@ fun UndoOrStatusSnackbar(
                     )
                 }
             }
-            TextButton(onClick = onDismiss) {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.semantics { contentDescription = "Dismiss message" },
+            ) {
                 Text(text = "✕", color = colors.textMuted, fontSize = 12.sp)
             }
         }
@@ -485,7 +528,8 @@ internal fun RocheSectionHeader(
         return
     }
     val actionMod =
-        Modifier.clip(RoundedCornerShape(4.dp))
+        Modifier.minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(4.dp))
             .clickable(onClick = onActionClick)
             .semantics { role = Role.Button }
             .padding(horizontal = 4.dp, vertical = 2.dp)

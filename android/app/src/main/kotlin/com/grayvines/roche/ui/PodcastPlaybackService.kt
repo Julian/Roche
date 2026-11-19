@@ -7,7 +7,6 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.annotation.OptIn
-import androidx.core.net.toUri
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
@@ -22,6 +21,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.grayvines.roche.MainActivity
 import com.grayvines.roche.RocheApp
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -29,6 +29,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -72,10 +73,13 @@ class AndroidPodcastMediaSessionBridge
 internal constructor(
     internal val appContext: Context?,
     internal val backend: ExoPlayerAudioBackend? = null,
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    scope: CoroutineScope? = null,
     internal val artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
     private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
 ) : PodcastMediaSessionBridge {
+    private val ownsScope: Boolean = scope == null
+    private val scope: CoroutineScope =
+        scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sessionGeneration = AtomicLong(0L)
 
     @Volatile private var callbacks: PodcastMediaSessionCallbacks? = null
@@ -83,17 +87,18 @@ internal constructor(
     @Volatile internal var cachedArtworkUrl: String? = null
     @Volatile internal var cachedArtworkBytes: ByteArray? = null
     @Volatile private var activeMediaSession: MediaSession? = null
+    @Volatile private var activeForwardingPlayer: RocheSessionForwardingPlayer? = null
 
     internal var lastMetadataKey: SessionMetadataKey? = null
     internal var lastHasNextQueuedAudio: Boolean? = null
     internal var loadingArtworkUrl: String? = null
     internal var artworkLoadJob: Job? = null
-    private var controllerFuture: ListenableFuture<MediaController>? = null
+    internal var controllerFuture: ListenableFuture<MediaController>? = null
 
     constructor(
         context: Context,
         backend: ExoPlayerAudioBackend? = null,
-        scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+        scope: CoroutineScope? = null,
         artworkBitmapLoader: (suspend (String) -> Bitmap?)? = null,
     ) : this(
         appContext = context.applicationContext,
@@ -144,11 +149,18 @@ internal constructor(
                 lastHasNextQueuedAudio = null
                 disconnectControllerOnMain()
             }
+            if (ownsScope) {
+                scope.cancel()
+            }
         }
     }
 
-    internal fun attachServiceSessionOnMain(session: MediaSession) {
+    internal fun attachServiceSessionOnMain(
+        session: MediaSession,
+        forwardingPlayer: RocheSessionForwardingPlayer? = null,
+    ) {
         activeMediaSession = session
+        activeForwardingPlayer = forwardingPlayer
         latestSnapshot?.let { snapshot ->
             lastHasNextQueuedAudio = null
             applyButtonPrefsOnMain(session, snapshot.hasNextQueuedAudio)
@@ -158,7 +170,9 @@ internal constructor(
     internal fun detachServiceSessionOnMain(session: MediaSession) {
         if (activeMediaSession === session) {
             activeMediaSession = null
+            activeForwardingPlayer = null
             lastHasNextQueuedAudio = null
+            disconnectControllerOnMain()
         }
     }
 
@@ -196,6 +210,7 @@ internal constructor(
         if (lastHasNextQueuedAudio == hasNextQueuedAudio) return
         lastHasNextQueuedAudio = hasNextQueuedAudio
         session.setMediaButtonPreferences(buildTransportButtons(hasNextQueuedAudio))
+        activeForwardingPlayer?.notifyAvailableCommandsChanged()
     }
 
     private fun connectControllerOnMain() {
@@ -207,7 +222,19 @@ internal constructor(
                     context,
                     ComponentName(context, PodcastPlaybackService::class.java),
                 )
-            controllerFuture = MediaController.Builder(context, token).buildAsync()
+            val future = MediaController.Builder(context, token).buildAsync()
+            controllerFuture = future
+            future.addListener(
+                {
+                    val failedOrCancelled =
+                        future.isCancelled || runCatching { future.get() }.isFailure
+                    if (failedOrCancelled && controllerFuture === future) {
+                        controllerFuture = null
+                        runCatching { MediaController.releaseFuture(future) }
+                    }
+                },
+                context.mainExecutor,
+            )
         }
     }
 
@@ -318,10 +345,8 @@ internal constructor(
                     .setSubtitle(podcast)
                     .setIsBrowsable(false)
                     .setIsPlayable(true)
-            snapshot.artworkUrl
-                ?.trim()
-                ?.takeIf { it.startsWith("https://", true) || it.startsWith("http://", true) }
-                ?.let { builder.setArtworkUri(it.toUri()) }
+            // Intentionally omit setArtworkUri so Media3/SystemUI never performs unvalidated or
+            // cleartext artwork fetches; artwork is delivered via artworkData after safe loading.
             if (artworkBytes != null && artworkBytes.isNotEmpty()) {
                 builder.setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
             }
@@ -352,10 +377,28 @@ internal constructor(
 
 @OptIn(UnstableApi::class)
 @Suppress("TooManyFunctions")
-private class RocheSessionForwardingPlayer(
+internal class RocheSessionForwardingPlayer(
     player: Player,
     private val bridge: AndroidPodcastMediaSessionBridge,
 ) : ForwardingPlayer(player) {
+    private val registeredListeners = CopyOnWriteArraySet<Player.Listener>()
+
+    override fun addListener(listener: Player.Listener) {
+        registeredListeners.add(listener)
+        super.addListener(listener)
+    }
+
+    override fun removeListener(listener: Player.Listener) {
+        registeredListeners.remove(listener)
+        super.removeListener(listener)
+    }
+
+    internal fun notifyAvailableCommandsChanged() {
+        val commands = availableCommands
+        for (listener in registeredListeners) {
+            listener.onAvailableCommandsChanged(commands)
+        }
+    }
 
     override fun getAvailableCommands(): Player.Commands {
         val hasNext = bridge.currentSnapshot()?.hasNextQueuedAudio == true
@@ -470,7 +513,7 @@ class PodcastPlaybackService : MediaSessionService() {
                 )
                 .build()
         mediaSession = session
-        bridge.attachServiceSessionOnMain(session)
+        bridge.attachServiceSessionOnMain(session, forwardingPlayer)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =

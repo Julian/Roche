@@ -51,6 +51,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -211,6 +212,7 @@ private fun InboxHeaderSection(
                 {
                     HeaderActionButton(
                         label = "←",
+                        contentDescription = "Back",
                         onClick = { onAction(MainAction.NavigateBackFromScope) },
                         modifier = Modifier.testTag("clear_scope_btn"),
                     )
@@ -441,13 +443,13 @@ private fun InboxFilterStrip(state: MainUiState, onAction: (MainAction) -> Unit)
                 label = scopeLabel,
                 selected = true,
                 onClick = { onAction(MainAction.NavigateBackFromScope) },
+                role = Role.Button,
             )
         }
-        val hasScopeFilter = state.selectedTag != null || state.selectedFeedId != null
         InboxFilter.entries.forEach { filter ->
             FilterChipPill(
                 label = filter.label,
-                selected = !hasScopeFilter && state.activeFilter == filter,
+                selected = state.activeFilter == filter,
                 onClick = { onAction(MainAction.SelectFilter(filter)) },
             )
         }
