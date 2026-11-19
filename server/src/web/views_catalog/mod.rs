@@ -178,17 +178,13 @@ pub(super) async fn load_existing_reader_item_ids<'a, F: FeedFetcher>(
     service: &RocheService<F>,
     entries: impl IntoIterator<Item = &'a CatalogEntry>,
 ) -> HashSet<String> {
-    let mut candidate_ids = HashSet::new();
-    for entry in entries {
-        if entry.kind.is_reader_openable() && entry.url.is_some() {
-            candidate_ids.insert(entry.id.clone());
-        }
+    let candidate_ids: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| entry.kind.is_reader_openable() && entry.url.is_some())
+        .map(|entry| entry.id.clone())
+        .collect();
+    if candidate_ids.is_empty() {
+        return HashSet::new();
     }
-    let mut existing = HashSet::new();
-    for id in candidate_ids {
-        if service.items().get(&id).await.is_ok() {
-            existing.insert(id);
-        }
-    }
-    existing
+    service.items().existing_ids(&candidate_ids).await.unwrap_or_default()
 }

@@ -2162,3 +2162,104 @@ async fn test_round2_web_security_reader_origin_and_rank_redirect() {
     assert!(bad_rank_loc.contains("round=2"), "got {bad_rank_loc}");
     assert!(bad_rank_loc.contains("err=Invalid+comparison+ordering"), "got {bad_rank_loc}");
 }
+
+#[tokio::test]
+async fn test_load_existing_reader_item_ids_batched_lookup_and_catalog_links() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let svc = RocheService::new(db.clone(), DummyWebFetcher, Config::default());
+    let app = ApiRoutes::router_with_service(svc.clone());
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let reader_url = Url::parse("https://example.org/batched-reader-article").unwrap();
+    let (live_reader_item, _) = db
+        .items()
+        .save_manual_input_with_tags(&crate::db::ManualItemInput {
+            url: &reader_url,
+            title: "Batched Reader Essay",
+            summary: Some("Full reader summary"),
+            content_html: Some("<p>Readable essay</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &[],
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&live_reader_item.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+
+    let catalog_only_art = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Catalog Only Essay".to_owned(),
+            url: Some("https://example.org/catalog-only-essay".to_owned()),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&catalog_only_art.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+
+    let (_, want_no_url) = db
+        .catalog()
+        .want_entry(
+            &crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Article),
+                title: "Queued Article Without URL".to_owned(),
+                ..crate::db::UpsertEntryInput::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let (_, want_with_url) = db
+        .catalog()
+        .want_entry(
+            &crate::db::UpsertEntryInput {
+                kind: Some(EntryKind::Article),
+                title: "Queued Article With URL".to_owned(),
+                url: Some("https://example.org/queued-article".to_owned()),
+                ..crate::db::UpsertEntryInput::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let movie_entry = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Some Film".to_owned(),
+            url: Some("https://example.org/film".to_owned()),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+
+    let live_entry =
+        db.catalog().get_entry_detail(&live_reader_item.id).await.unwrap().unwrap().entry;
+    assert!(super::views_catalog::load_existing_reader_item_ids(&svc, []).await.is_empty());
+
+    let found = super::views_catalog::load_existing_reader_item_ids(
+        &svc,
+        [&live_entry, &live_entry, &catalog_only_art, &want_no_url, &want_with_url, &movie_entry],
+    )
+    .await;
+    assert_eq!(found.len(), 2);
+    assert!(found.contains(&live_reader_item.id));
+    assert!(found.contains(&want_with_url.id));
+
+    let articles_html = read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
+    assert!(articles_html.contains(&format!("/reader/{}", live_reader_item.id)));
+    assert!(!articles_html.contains(&format!("/reader/{}", catalog_only_art.id)));
+
+    let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
+    assert!(queue_html.contains(&format!("/reader/{}", want_with_url.id)));
+    assert!(!queue_html.contains(&format!("/reader/{}", want_no_url.id)));
+}
