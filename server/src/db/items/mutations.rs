@@ -766,8 +766,7 @@ impl ItemRepo<'_> {
         .await?;
         Ok(candidate_orderings.iter().any(|raw| {
             serde_json::from_str::<Vec<Vec<String>>>(raw)
-                .ok()
-                .is_some_and(|groups| groups.iter().flatten().any(|id| id == entry_id))
+                .is_ok_and(|groups| groups.iter().flatten().any(|id| id == entry_id))
         }))
     }
 

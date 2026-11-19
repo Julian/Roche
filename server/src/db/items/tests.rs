@@ -577,9 +577,9 @@ async fn test_entry_has_catalog_history_escapes_like_wildcards() {
         .unwrap();
 
     let mut conn = db.pool().acquire().await.unwrap();
-    assert!(ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, "item_1_a").await.unwrap());
+    assert!(ItemRepo::entry_has_catalog_history_in_tx(&mut conn, "item_1_a").await.unwrap());
     assert!(
-        !ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, "item_1__").await.unwrap(),
+        !ItemRepo::entry_has_catalog_history_in_tx(&mut conn, "item_1__").await.unwrap(),
         "SQLite LIKE wildcards in custom entry IDs must not falsely match other comparison entries"
     );
 }

@@ -2942,16 +2942,16 @@ async fn test_collection_entry_tombstone_clears_or_redraws_dangling_generator() 
         .unwrap();
 
     // Incoming CollectionEntry tombstone removes Book A -> generator must redraw Book B
-    let del_a_ts = Utc::now() + chrono::Duration::seconds(20);
-    let del_a_hlc = HlcTimestamp::from_datetime(del_a_ts, "peer-a").encode();
+    let first_delete_ts = Utc::now() + chrono::Duration::seconds(20);
+    let first_delete_hlc = HlcTimestamp::from_datetime(first_delete_ts, "peer-a").encode();
     db.sync()
         .merge_peer_state(&PeerSyncRequest {
             peer_id: "peer-a".to_owned(),
             tombstones: vec![SyncTombstone {
                 entity_type: ActivityEntityType::CollectionEntry,
                 natural_key: collection_entry_natural_key(&col.id, &book_a.id),
-                deleted_at: del_a_ts,
-                hlc: del_a_hlc,
+                deleted_at: first_delete_ts,
+                hlc: first_delete_hlc,
             }],
             ..PeerSyncRequest::default()
         })
@@ -2961,16 +2961,16 @@ async fn test_collection_entry_tombstone_clears_or_redraws_dangling_generator() 
     assert_eq!(after_a.current_entry.as_ref().map(|e| e.id.as_str()), Some(book_b.id.as_str()));
 
     // Incoming CollectionEntry tombstone removes Book B (last entry) -> generator must clear to None
-    let del_b_ts = Utc::now() + chrono::Duration::seconds(40);
-    let del_b_hlc = HlcTimestamp::from_datetime(del_b_ts, "peer-a").encode();
+    let second_delete_ts = Utc::now() + chrono::Duration::seconds(40);
+    let second_delete_hlc = HlcTimestamp::from_datetime(second_delete_ts, "peer-a").encode();
     db.sync()
         .merge_peer_state(&PeerSyncRequest {
             peer_id: "peer-a".to_owned(),
             tombstones: vec![SyncTombstone {
                 entity_type: ActivityEntityType::CollectionEntry,
                 natural_key: collection_entry_natural_key(&col.id, &book_b.id),
-                deleted_at: del_b_ts,
-                hlc: del_b_hlc,
+                deleted_at: second_delete_ts,
+                hlc: second_delete_hlc,
             }],
             ..PeerSyncRequest::default()
         })
