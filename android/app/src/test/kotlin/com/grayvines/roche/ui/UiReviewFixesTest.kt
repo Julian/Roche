@@ -214,48 +214,25 @@ class UiReviewFixesTest {
     @Test
     fun `readerContent and activePlayerNotesContent stay isolated`() {
         val article =
-            InboxEntry(
+            sampleInboxEntry(
                 id = "article-1",
                 feedId = "feed-1",
                 title = "Deep Dive Article",
                 url = "https://example.com/article",
-                author = null,
-                summary = null,
                 contentHtml = "<p>Short preview</p>",
-                contentText = null,
                 contentType = ContentType.ARTICLE,
-                status = ItemStatus.UNREAD,
-                isFavorite = false,
-                isCachedOffline = false,
-                publishedAt = null,
-                createdAt = "2026-01-01T00:00:00Z",
-                readProgress = 0.0,
-                thumbnailMediaId = null,
-                duration = null,
                 feedTitle = "Tech Blog",
-                tags = emptyList(),
             )
         val podcast =
-            InboxEntry(
+            sampleInboxEntry(
                 id = "pod-1",
                 feedId = "feed-2",
                 title = "Episode 42",
                 url = "https://example.com/ep42",
-                author = null,
-                summary = null,
                 contentHtml = "<p>Short notes</p>",
-                contentText = null,
                 contentType = ContentType.AUDIO,
-                status = ItemStatus.UNREAD,
-                isFavorite = false,
-                isCachedOffline = false,
-                publishedAt = null,
-                createdAt = "2026-01-01T00:00:00Z",
-                readProgress = 0.0,
-                thumbnailMediaId = null,
                 duration = "45:00",
                 feedTitle = "Systems Pod",
-                tags = emptyList(),
             )
         val articleFull =
             ReaderItemContent(
@@ -294,6 +271,39 @@ class UiReviewFixesTest {
         assertNull(closedReaderTransient.readerContent)
         assertEquals(podcastFull, closedReaderTransient.activePlayerNotesContent)
     }
+
+    @Suppress("LongParameterList")
+    private fun sampleInboxEntry(
+        id: String,
+        feedId: String,
+        title: String,
+        url: String,
+        contentHtml: String,
+        contentType: ContentType,
+        feedTitle: String,
+        duration: String? = null,
+    ): InboxEntry =
+        InboxEntry(
+            id = id,
+            feedId = feedId,
+            title = title,
+            url = url,
+            author = null,
+            summary = null,
+            contentHtml = contentHtml,
+            contentText = null,
+            contentType = contentType,
+            status = ItemStatus.UNREAD,
+            isFavorite = false,
+            isCachedOffline = false,
+            publishedAt = null,
+            createdAt = "2026-01-01T00:00:00Z",
+            readProgress = 0.0,
+            thumbnailMediaId = null,
+            duration = duration,
+            feedTitle = feedTitle,
+            tags = emptyList(),
+        )
 
     @Test
     fun `SelectFilter preserves feed and tag scope`() {

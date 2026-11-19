@@ -155,7 +155,7 @@ private suspend fun applyIncomingTombstonesInTx(
             COLLECTION_ENTRY_ENTITY ->
                 applyCollectionEntryTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_COLLECTION_GENERATOR ->
-                applyCollectionGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
+                applyGeneratorTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_CONSUMPTION_LOG ->
                 applyConsumptionLogTombstone(dao, rawKey, deletedAt, tombHlc)
             TOMBSTONE_ENTITY_ENTRY -> applyEntryTombstone(dao, rawKey, deletedAt, tombHlc)
@@ -248,7 +248,7 @@ private fun doesInboxEntryMatchTombstone(
         state != null &&
             (state.inboxState == INBOX_STATE_UNREAD ||
                 state.inboxState == INBOX_STATE_DISMISSED ||
-                (canonFeed == null && state.inboxState == INBOX_STATE_NONE))
+                canonFeed == null && state.inboxState == INBOX_STATE_NONE)
     if (!validInboxState) return false
     val entryFeeds = entryColIds.mapNotNull { feedUrlsByColId[it] }
     if (entry.id == detId) {
@@ -315,7 +315,7 @@ private suspend fun applyCollectionEntryTombstone(
     upsertCleanTombstone(dao, COLLECTION_ENTRY_ENTITY, canonKey, deletedAt, tombHlc)
 }
 
-private suspend fun applyCollectionGeneratorTombstone(
+private suspend fun applyGeneratorTombstone(
     dao: RocheDao,
     rawKey: String,
     deletedAt: String,
@@ -581,7 +581,32 @@ private suspend fun mergeSingleIncomingEntry(
             ctx.nowIso,
         )
     dao.upsertEntry(updatedEntry)
+    mergeIncomingEntrySubtables(
+        dao = dao,
+        targetId = targetId,
+        mergedInto = mergedInto,
+        resolvedKind = resolvedKind,
+        rec = rec,
+        updatedEntry = updatedEntry,
+        entryHlc = entryHlc,
+        itemAction = itemAction,
+        ctx = ctx,
+    )
+    return mergedInto?.let { targetId to it }
+}
 
+@Suppress("LongParameterList")
+private suspend fun mergeIncomingEntrySubtables(
+    dao: RocheDao,
+    targetId: String,
+    mergedInto: String?,
+    resolvedKind: EntryKind,
+    rec: SyncEntryRecordDto,
+    updatedEntry: EntryEntity,
+    entryHlc: String,
+    itemAction: ItemTombstoneAction,
+    ctx: IncomingEntriesMergeCtx,
+) {
     rec.collectionSpec?.let { specDto ->
         mergeIncomingSpecInDao(dao, targetId, specDto, resolvedKind)
     }
@@ -609,8 +634,6 @@ private suspend fun mergeSingleIncomingEntry(
         )
     }
     mergeIncomingIdentifiersInDao(dao, targetId, mergedInto, resolvedKind, rec)
-
-    return mergedInto?.let { targetId to it }
 }
 
 private suspend fun resolveEntrySuppression(

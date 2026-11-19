@@ -106,13 +106,7 @@ private suspend fun reconcileLinkedInboxTombstone(
     val itemUrl = entry.url?.takeIf { it.isNotBlank() } ?: return
     val feedUrls = entryColIds.mapNotNull { feedUrlsByColId[it] }
     val isManualActive =
-        feedUrls.isEmpty() &&
-            (state.inboxState == "unread" ||
-                state.inboxState == "dismissed" ||
-                (state.inboxState == "none" &&
-                    (WANT_TO_READ_COLLECTION_ID in entryColIds ||
-                        dao.getEntryContentById(entry.id) != null ||
-                        !dao.entryHasCatalogHistory(entry.id))))
+        feedUrls.isEmpty() && isManualInboxItemActive(dao, entry.id, state, entryColIds)
     val isFeedActive =
         feedUrls.isNotEmpty() && (state.inboxState == "unread" || state.inboxState == "dismissed")
     if (!isManualActive && !isFeedActive) return
@@ -133,6 +127,22 @@ private suspend fun reconcileLinkedInboxTombstone(
         )
     }
 }
+
+private suspend fun isManualInboxItemActive(
+    dao: RocheDao,
+    entryId: String,
+    state: EntryStateEntity,
+    entryColIds: List<String>,
+): Boolean =
+    when (state.inboxState) {
+        "unread",
+        "dismissed" -> true
+        "none" ->
+            WANT_TO_READ_COLLECTION_ID in entryColIds ||
+                dao.getEntryContentById(entryId) != null ||
+                !dao.entryHasCatalogHistory(entryId)
+        else -> false
+    }
 
 @Suppress("LongParameterList")
 private suspend fun mergeCollectionEntriesInDao(
@@ -206,15 +216,7 @@ private fun resolveIncomingMembershipDto(
     val rawEntryId = ce.entryId.trim()
     val colId = followMergedInMap(rawColId, ctx.redirects)
     val entryId = followMergedInMap(rawEntryId, ctx.redirects)
-    if (
-        colId.isEmpty() ||
-            entryId.isEmpty() ||
-            colId == entryId ||
-            rawColId in ctx.suppressedEntryIds ||
-            rawEntryId in ctx.suppressedEntryIds ||
-            colId in ctx.suppressedEntryIds ||
-            entryId in ctx.suppressedEntryIds
-    ) {
+    if (isInvalidOrSuppressedEdge(rawColId, rawEntryId, colId, entryId, ctx.suppressedEntryIds)) {
         return null
     }
     val memHlc = resolveOrSynthesizeHlc(ce.hlc, ce.addedAt, nowIso, serverNode, ctx.nowMs)
@@ -237,6 +239,17 @@ private fun resolveIncomingMembershipDto(
             isLocalDirty = false,
         )
     return entity to tomb?.let { natKey }
+}
+
+private fun isInvalidOrSuppressedEdge(
+    rawColId: String,
+    rawEntryId: String,
+    colId: String,
+    entryId: String,
+    suppressedEntryIds: Set<String>,
+): Boolean {
+    if (colId.isEmpty() || entryId.isEmpty() || colId == entryId) return true
+    return listOf(rawColId, rawEntryId, colId, entryId).any { it in suppressedEntryIds }
 }
 
 private data class IncomingLogsMergePlan(
@@ -299,27 +312,18 @@ private class IncomingLogsAcc(
 
     fun accept(log: SyncConsumptionLogDto, entryId: String) {
         val status = ConsumptionStatus.fromWireValue(log.status)
-        val tsMillis = runCatching { Instant.parse(log.ts.trim()).toEpochMilli() }.getOrDefault(0L)
-        val id =
-            log.id.trim().takeIf { it.isNotEmpty() }
-                ?: deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+        val id = resolveIncomingLogId(log, entryId, status)
         val autoLogId = deterministicAutoLogId(entryId)
         val isConsumed = status == ConsumptionStatus.CONSUMED
         val logHlc = resolveOrSynthesizeHlc(log.hlc, log.ts, nowIso, serverNode, nowMs)
-        val tomb = tombstonesById[id]
-        if (tomb != null && tomb.hlc >= logHlc) return
-        if (tomb != null) {
-            clearedTombstoneIds.add(id)
-        }
+        if (!checkAndClearLogTombstone(id, logHlc)) return
 
         if (isConsumed && id == autoLogId && entryId in consumedInBatch) {
             recordConsumedHlc(entryId, logHlc)
             return
         }
         if (isConsumed && id != autoLogId) {
-            existingConsumedByEntry[entryId]
-                ?.firstOrNull { it.id == autoLogId && it.notes == null && !it.isLocalDirty }
-                ?.let { replacedAutoIds.add(it.id) }
+            markReplacedAutoLogIfNeeded(entryId, autoLogId)
         }
         toInsert.add(
             ConsumptionLogEntity(
@@ -337,6 +341,30 @@ private class IncomingLogsAcc(
             consumedInBatch.add(entryId)
             recordConsumedHlc(entryId, logHlc)
         }
+    }
+
+    private fun resolveIncomingLogId(
+        log: SyncConsumptionLogDto,
+        entryId: String,
+        status: ConsumptionStatus,
+    ): String {
+        val explicit = log.id.trim()
+        if (explicit.isNotEmpty()) return explicit
+        val tsMillis = runCatching { Instant.parse(log.ts.trim()).toEpochMilli() }.getOrDefault(0L)
+        return deterministicConsumptionLogId(entryId, tsMillis, status.wireValue)
+    }
+
+    private fun checkAndClearLogTombstone(id: String, logHlc: String): Boolean {
+        val tomb = tombstonesById[id] ?: return true
+        if (tomb.hlc >= logHlc) return false
+        clearedTombstoneIds.add(id)
+        return true
+    }
+
+    private fun markReplacedAutoLogIfNeeded(entryId: String, autoLogId: String) {
+        existingConsumedByEntry[entryId]
+            ?.firstOrNull { it.id == autoLogId && it.notes == null && !it.isLocalDirty }
+            ?.let { replacedAutoIds.add(it.id) }
     }
 
     private fun recordConsumedHlc(entryId: String, logHlc: String) {
@@ -445,7 +473,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
     val specsById = dao.getAllCollectionSpecs().associateBy { it.collectionId }
     val localByColId = dao.getAllCollectionGenerators().associateBy { it.collectionId }
     val remoteByColId =
-        filterTombstonedRemoteGenerators(
+        filterTombstonedGenerators(
             dao = dao,
             remoteByColId = indexEligibleRemoteGenerators(incoming, specsById, redirects),
             serverNode = serverNode,
@@ -473,7 +501,7 @@ private suspend fun mergeIncomingGeneratorsInDao(
     }
 }
 
-private suspend fun filterTombstonedRemoteGenerators(
+private suspend fun filterTombstonedGenerators(
     dao: RocheDao,
     remoteByColId: Map<String, SyncCollectionGeneratorDto>,
     serverNode: String,

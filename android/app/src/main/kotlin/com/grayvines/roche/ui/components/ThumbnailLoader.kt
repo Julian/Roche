@@ -313,7 +313,9 @@ class ThumbnailLoader(
                         apiClient.fetchExternalImageBytes(mediaId)
                     }
                     policy == ImageSourcePolicy.EXTERNAL_HTTPS_ONLY ||
-                        isHttpThumbnailUrl(mediaId) -> null
+                        isHttpThumbnailUrl(mediaId) -> {
+                        null
+                    }
                     else -> {
                         val currentSettings = settings.settings.first()
                         val serverUrl = currentSettings.serverUrl
@@ -347,36 +349,9 @@ class ThumbnailLoader(
                 val stagingFile =
                     resolveSafeChildFile(thumbsDir, "$fileKey.${System.nanoTime()}.tmp")
                 tmpFile = stagingFile
-                val streamed =
-                    when {
-                        isHttpsImageUrl(mediaId) -> {
-                            attempted = true
-                            apiClient.streamExternalBinaryToFile(
-                                mediaId,
-                                stagingFile,
-                                MAX_THUMBNAIL_BYTES,
-                            )
-                        }
-                        policy == ImageSourcePolicy.EXTERNAL_HTTPS_ONLY ||
-                            isHttpThumbnailUrl(mediaId) -> false
-                        else -> {
-                            val currentSettings = settings.settings.first()
-                            val serverUrl = currentSettings.serverUrl
-                            val token = currentSettings.bearerToken
-                            if (serverUrl.isNotBlank() && token.isNotBlank()) {
-                                attempted = true
-                                apiClient.streamMediaToFile(
-                                    serverUrl = serverUrl,
-                                    token = token,
-                                    mediaId = mediaId,
-                                    targetFile = stagingFile,
-                                    maxBytes = MAX_THUMBNAIL_BYTES,
-                                )
-                            } else {
-                                false
-                            }
-                        }
-                    }
+                val (streamed, didAttempt) =
+                    streamRemoteSourceToFile(apiClient, settings, mediaId, policy, stagingFile)
+                attempted = didAttempt
                 if (
                     streamed && stagingFile.isFile && stagingFile.length() in 1..MAX_THUMBNAIL_BYTES
                 ) {
@@ -464,6 +439,42 @@ class ThumbnailLoader(
         internal const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
     }
 }
+
+private suspend fun streamRemoteSourceToFile(
+    apiClient: RocheApiClient,
+    settings: SettingsRepository,
+    mediaId: String,
+    policy: ImageSourcePolicy,
+    stagingFile: File,
+): Pair<Boolean, Boolean> =
+    when {
+        isHttpsImageUrl(mediaId) -> {
+            apiClient.streamExternalBinaryToFile(
+                mediaId,
+                stagingFile,
+                ThumbnailLoader.MAX_THUMBNAIL_BYTES,
+            ) to true
+        }
+        policy == ImageSourcePolicy.EXTERNAL_HTTPS_ONLY || isHttpThumbnailUrl(mediaId) -> {
+            false to false
+        }
+        else -> {
+            val currentSettings = settings.settings.first()
+            val serverUrl = currentSettings.serverUrl
+            val token = currentSettings.bearerToken
+            if (serverUrl.isNotBlank() && token.isNotBlank()) {
+                apiClient.streamMediaToFile(
+                    serverUrl = serverUrl,
+                    token = token,
+                    mediaId = mediaId,
+                    targetFile = stagingFile,
+                    maxBytes = ThumbnailLoader.MAX_THUMBNAIL_BYTES,
+                ) to true
+            } else {
+                false to false
+            }
+        }
+    }
 
 private fun findDiskCachedFile(cacheDir: File?, mediaId: String): File? = runCatching {
     val rootDir = cacheDir ?: return null

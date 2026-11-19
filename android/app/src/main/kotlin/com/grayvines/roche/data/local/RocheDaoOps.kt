@@ -1033,6 +1033,7 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
 internal suspend fun RocheDao.entryHasCatalogHistory(entryId: String): Boolean =
     hasCatalogHistoryRaw(entryId, "%\"$entryId\"%") != 0
 
+@Suppress("FunctionNameMaxLength")
 internal suspend fun RocheDao.deleteCollectionGeneratorWithTombstone(
     collectionId: String,
     recordTombstone: Boolean = true,
@@ -1099,7 +1100,7 @@ internal suspend fun RocheDao.deleteItemPreservingHistory(
                 isCachedOffline = keepReadable && prevState?.isCachedOffline == true,
                 hlc = hlc,
                 isLocalDirty =
-                    emitTombstones || (recordTombstones && prevState?.isLocalDirty == true),
+                    emitTombstones || recordTombstones && prevState?.isLocalDirty == true,
             )
         )
         if (!keepReadable) {

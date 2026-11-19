@@ -388,8 +388,7 @@ class DataSyncRound2FixesTest {
                                     url = pureUrl,
                                     hlc = hlcStale,
                                     content = SyncEntryContentDto(contentType = "article"),
-                                    state =
-                                        SyncEntryStateDto(inboxState = "none", hlc = hlcStale),
+                                    state = SyncEntryStateDto(inboxState = "none", hlc = hlcStale),
                                 ),
                                 SyncEntryRecordDto(
                                     id = histId,
@@ -398,8 +397,7 @@ class DataSyncRound2FixesTest {
                                     url = histUrl,
                                     hlc = hlcStale,
                                     content = SyncEntryContentDto(contentType = "article"),
-                                    state =
-                                        SyncEntryStateDto(inboxState = "none", hlc = hlcStale),
+                                    state = SyncEntryStateDto(inboxState = "none", hlc = hlcStale),
                                 ),
                             ),
                         collectionEntries =
@@ -445,8 +443,7 @@ class DataSyncRound2FixesTest {
                                     url = pureUrl,
                                     hlc = hlcResave,
                                     content = SyncEntryContentDto(contentType = "article"),
-                                    state =
-                                        SyncEntryStateDto(inboxState = "none", hlc = hlcResave),
+                                    state = SyncEntryStateDto(inboxState = "none", hlc = hlcResave),
                                 )
                             ),
                         collectionEntries =
@@ -523,8 +520,9 @@ class DataSyncRound2FixesTest {
                 val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
                 receivedRequests.add(parsed)
                 val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
-                val containsPoison =
-                    entriesArr.any { it.jsonObject["id"]?.jsonPrimitive?.content == poisonId }
+                val containsPoison = entriesArr.any {
+                    it.jsonObject["id"]?.jsonPrimitive?.content == poisonId
+                }
                 if (containsPoison) {
                     HttpResponse(
                         statusCode = 413,
@@ -595,65 +593,23 @@ class DataSyncRound2FixesTest {
         )
 
         val rssXml =
-            """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <rss version="2.0"><channel><title>Blog</title>
-            <item><title>Post 1</title><link>https://blog.example.com/1</link><description>A</description></item>
-            <item><title>Post 2</title><link>https://blog.example.com/2</link><description>B</description></item>
-            </channel></rss>
-            """
-                .trimIndent()
+            """<?xml version="1.0" encoding="UTF-8"?>""" +
+                """<rss version="2.0"><channel><title>Blog</title>""" +
+                """<item><title>Post 1</title><link>https://blog.example.com/1</link><description>A</description></item>""" +
+                """<item><title>Post 2</title><link>https://blog.example.com/2</link><description>B</description></item>""" +
+                """</channel></rss>"""
 
         val cursorUpdates = CopyOnWriteArrayList<String>()
         val postPollSyncBodies = CopyOnWriteArrayList<JsonObject>()
-        var syncCallCount = 0
-        var seq = 10L
-        var postPollResetSent = false
         val uploadedPostUrls = LinkedHashSet<String>()
-
-        val apiClient = RocheApiClient { req ->
-            if (req.url == feedUrl) {
-                HttpResponse(statusCode = 200, body = rssXml)
-            } else {
-                syncCallCount++
-                val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
-                if (syncCallCount == 1) {
-                    HttpResponse(
-                        statusCode = 200,
-                        body =
-                            """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":11,"has_more":false,"reset_required":false,"active_peers":[{"peer_id":"android-peer-1","weight":1.0,"network_tier":"wifi"}]}""",
-                    )
-                } else {
-                    postPollSyncBodies.add(parsed)
-                    val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
-                    if (!postPollResetSent) {
-                        postPollResetSent = true
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":0,"has_more":false,"reset_required":true}""",
-                        )
-                    } else if (entriesArr.size > 1) {
-                        HttpResponse(
-                            statusCode = 413,
-                            body = """{"title":"Payload Too Large","status":413}""",
-                        )
-                    } else {
-                        entriesArr.forEach { el ->
-                            el.jsonObject["url"]?.jsonPrimitive?.content?.let {
-                                uploadedPostUrls.add(it)
-                            }
-                        }
-                        seq += 1L
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
-                        )
-                    }
-                }
-            }
-        }
+        val apiClient =
+            buildPostPollResetTestClient(
+                feedUrl = feedUrl,
+                rssXml = rssXml,
+                nowIso = nowIso,
+                postPollSyncBodies = postPollSyncBodies,
+                uploadedPostUrls = uploadedPostUrls,
+            )
 
         val coordinator =
             PeerSyncCoordinator(
@@ -681,6 +637,67 @@ class DataSyncRound2FixesTest {
         )
         assertTrue("https://blog.example.com/1" in uploadedPostUrls)
         assertTrue("https://blog.example.com/2" in uploadedPostUrls)
+    }
+
+    private fun buildPostPollResetTestClient(
+        feedUrl: String,
+        rssXml: String,
+        nowIso: String,
+        postPollSyncBodies: CopyOnWriteArrayList<JsonObject>,
+        uploadedPostUrls: MutableSet<String>,
+    ): RocheApiClient {
+        var syncCallCount = 0
+        var seq = 10L
+        var postPollResetSent = false
+        return RocheApiClient { req ->
+            if (req.url == feedUrl) {
+                HttpResponse(statusCode = 200, body = rssXml)
+            } else {
+                syncCallCount++
+                val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
+                when {
+                    syncCallCount == 1 -> {
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":11,"has_more":false,"reset_required":false,"active_peers":[{"peer_id":"android-peer-1","weight":1.0,"network_tier":"wifi"}]}""",
+                        )
+                    }
+                    !postPollResetSent -> {
+                        postPollSyncBodies.add(parsed)
+                        postPollResetSent = true
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":0,"has_more":false,"reset_required":true}""",
+                        )
+                    }
+                    else -> {
+                        postPollSyncBodies.add(parsed)
+                        val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
+                        if (entriesArr.size > 1) {
+                            HttpResponse(
+                                statusCode = 413,
+                                body = """{"title":"Payload Too Large","status":413}""",
+                            )
+                        } else {
+                            entriesArr.forEach { el ->
+                                el.jsonObject["url"]
+                                    ?.jsonPrimitive
+                                    ?.content
+                                    ?.let(uploadedPostUrls::add)
+                            }
+                            seq += 1L
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     @Test

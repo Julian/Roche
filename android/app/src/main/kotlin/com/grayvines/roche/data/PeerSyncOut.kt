@@ -507,8 +507,7 @@ private fun splitEntriesByByteBudget(
     val safeMaxEntries = maxEntries.coerceAtLeast(1)
     for (entry in cappedEntries) {
         val estBytes = estimateSyncEntryBytes(entry, contentsById, unsyncedFeedIds)
-        val fits =
-            sent.isEmpty() || (sent.size < safeMaxEntries && usedBytes + estBytes <= maxBytes)
+        val fits = sent.isEmpty() || sent.size < safeMaxEntries && usedBytes + estBytes <= maxBytes
         if (fits) {
             sent.add(entry)
             usedBytes += estBytes
