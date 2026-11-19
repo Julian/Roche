@@ -18,6 +18,34 @@ pub struct ItemDeleteOutcome {
     pub deleted: bool,
     pub readable_content_removed: bool,
 }
+
+#[derive(sqlx::FromRow)]
+struct ExistingItemStateRow {
+    kind: EntryKind,
+    inbox_state: InboxState,
+    is_favorite: bool,
+    in_want_to_read: bool,
+    progress: f64,
+    read_at: Option<DateTime<Utc>>,
+}
+
+struct EntryMetadataBackfill<'a> {
+    title: Option<&'a str>,
+    creators_json: Option<String>,
+    published_at: Option<DateTime<Utc>>,
+    summary: Option<&'a str>,
+    thumbnail_url: Option<&'a str>,
+}
+
+impl EntryMetadataBackfill<'_> {
+    const fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.creators_json.is_none()
+            && self.published_at.is_none()
+            && self.summary.is_none()
+            && self.thumbnail_url.is_none()
+    }
+}
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
@@ -271,7 +299,6 @@ impl ItemRepo<'_> {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn save_manual_input_with_tags(
         &self,
         input: &ManualItemInput<'_>,
@@ -299,216 +326,69 @@ impl ItemRepo<'_> {
         let existing_dedup =
             resolve_dedup_entry_id(&mut tx, &det_item_id, &canon_url, arxiv_id.as_deref()).await?;
 
-        let final_item_id = if let Some(existing_id) = existing_dedup {
-            let has_feed_source: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM collection_entries ce
-                 JOIN feed_sources fs ON fs.collection_id = ce.collection_id
-                 WHERE ce.entry_id = ? LIMIT 1",
-            )
-            .bind(&existing_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
-            sqlx::query(
-                "UPDATE entries
-                 SET title = CASE
-                         WHEN ? = ? AND ? THEN ?
-                         WHEN title = url AND ? != '' THEN ?
-                         ELSE title
-                     END,
-                     summary = COALESCE(summary, ?),
-                     thumbnail_url = COALESCE(thumbnail_url, ?),
-                     updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(&existing_id)
-            .bind(&det_item_id)
-            .bind(has_explicit_non_url_title)
-            .bind(input.title)
-            .bind(trimmed_title)
-            .bind(input.title)
-            .bind(input.summary)
-            .bind(input.thumbnail_url)
-            .bind(now)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO entry_content (entry_id, content_html, content_type)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(entry_id) DO UPDATE SET
-                     content_html = COALESCE(NULLIF(excluded.content_html, ''), entry_content.content_html)",
-            )
-            .bind(&existing_id)
-            .bind(input.content_html)
-            .bind(input.content_type)
-            .execute(&mut *tx)
-            .await?;
-
-            if has_feed_source.is_some() {
-                sqlx::query(
-                    "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-                     VALUES (?, 'unread', 0.0, ?, ?)
-                     ON CONFLICT(entry_id) DO UPDATE SET
-                         read_at = NULL,
-                         interaction_updated_at = excluded.interaction_updated_at,
-                         updated_at = excluded.updated_at",
-                )
-                .bind(&existing_id)
-                .bind(now)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query(
-                    "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-                     VALUES (?, 'none', 0.0, ?, ?)
-                     ON CONFLICT(entry_id) DO UPDATE SET
-                         inbox_state = 'none',
-                         read_at = NULL,
-                         interaction_updated_at = excluded.interaction_updated_at,
-                         updated_at = excluded.updated_at",
-                )
-                .bind(&existing_id)
-                .bind(now)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            set_collection_flag_membership_in_tx(
+        let (final_item_id, activity_action) = if let Some(existing_id) = existing_dedup {
+            Self::update_existing_manual_item_in_tx(
                 &mut tx,
-                WANT_TO_READ_COLLECTION_ID,
                 &existing_id,
-                true,
+                &det_item_id,
+                trimmed_title,
+                input,
                 now,
             )
             .await?;
-
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('url', ?, ?)",
-            )
-            .bind(&canon_url)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            if let Some(ref aid) = arxiv_id {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('arxiv', ?, ?)",
-                )
-                .bind(aid)
-                .bind(&existing_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            MediaRepo::upsert_audio_enclosure_in_tx(
-                &mut tx,
-                &existing_id,
-                input.audio_url,
-                clean_duration,
-                now,
-            )
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Item,
-                &existing_id,
-                ActivityAction::Update,
-                now,
-            )
-            .await?;
-            existing_id
+            (existing_id, ActivityAction::Update)
         } else {
-            sqlx::query(
-                "INSERT INTO entries
-                 (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
-                 VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(entry_kind)
-            .bind(input.title)
-            .bind(url_str)
-            .bind(input.summary)
-            .bind(input.thumbnail_url)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            Self::insert_new_manual_item_in_tx(&mut tx, &det_item_id, entry_kind, input, now)
+                .await?;
+            (det_item_id, ActivityAction::Create)
+        };
 
-            sqlx::query(
-                "INSERT INTO entry_content (entry_id, content_html, content_type)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(input.content_html)
-            .bind(input.content_type)
-            .execute(&mut *tx)
-            .await?;
+        set_collection_flag_membership_in_tx(
+            &mut tx,
+            WANT_TO_READ_COLLECTION_ID,
+            &final_item_id,
+            true,
+            now,
+        )
+        .await?;
 
-            sqlx::query(
-                "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                 VALUES (?, 'none', 0.0, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
+             VALUES ('url', ?, ?)",
+        )
+        .bind(&canon_url)
+        .bind(&final_item_id)
+        .execute(&mut *tx)
+        .await?;
 
-            set_collection_flag_membership_in_tx(
-                &mut tx,
-                WANT_TO_READ_COLLECTION_ID,
-                &det_item_id,
-                true,
-                now,
-            )
-            .await?;
-
+        if let Some(ref aid) = arxiv_id {
             sqlx::query(
                 "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('url', ?, ?)",
+                 VALUES ('arxiv', ?, ?)",
             )
-            .bind(&canon_url)
-            .bind(&det_item_id)
+            .bind(aid)
+            .bind(&final_item_id)
             .execute(&mut *tx)
             .await?;
+        }
 
-            if let Some(ref aid) = arxiv_id {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('arxiv', ?, ?)",
-                )
-                .bind(aid)
-                .bind(&det_item_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+        MediaRepo::upsert_audio_enclosure_in_tx(
+            &mut tx,
+            &final_item_id,
+            input.audio_url,
+            clean_duration,
+            now,
+        )
+        .await?;
 
-            MediaRepo::upsert_audio_enclosure_in_tx(
-                &mut tx,
-                &det_item_id,
-                input.audio_url,
-                clean_duration,
-                now,
-            )
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Item,
-                &det_item_id,
-                ActivityAction::Create,
-                now,
-            )
-            .await?;
-            det_item_id
-        };
+        SyncRepo::record_activity(
+            &mut tx,
+            ActivityEntityType::Item,
+            &final_item_id,
+            activity_action,
+            now,
+        )
+        .await?;
 
         let mut seen_names = HashSet::new();
         let mut attached_tags = Vec::new();
@@ -529,6 +409,126 @@ impl ItemRepo<'_> {
 
         tx.commit().await?;
         Ok((item, attached_tags))
+    }
+
+    async fn insert_new_manual_item_in_tx(
+        tx: &mut SqliteConnection,
+        det_item_id: &str,
+        entry_kind: EntryKind,
+        input: &ManualItemInput<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO entries
+             (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
+             VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
+        )
+        .bind(det_item_id)
+        .bind(entry_kind)
+        .bind(input.title)
+        .bind(input.url.as_str())
+        .bind(input.summary)
+        .bind(input.thumbnail_url)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, ?, ?)",
+        )
+        .bind(det_item_id)
+        .bind(input.content_html)
+        .bind(input.content_type)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
+             VALUES (?, 'none', 0.0, ?)",
+        )
+        .bind(det_item_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_existing_manual_item_in_tx(
+        tx: &mut SqliteConnection,
+        existing_id: &str,
+        det_item_id: &str,
+        trimmed_title: &str,
+        input: &ManualItemInput<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let has_feed_source: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM collection_entries ce
+             JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+             WHERE ce.entry_id = ? LIMIT 1",
+        )
+        .bind(existing_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let url_str = input.url.as_str();
+        let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
+        sqlx::query(
+            "UPDATE entries
+             SET title = CASE
+                     WHEN ? = ? AND ? THEN ?
+                     WHEN title = url AND ? != '' THEN ?
+                     ELSE title
+                 END,
+                 summary = COALESCE(summary, ?),
+                 thumbnail_url = COALESCE(thumbnail_url, ?),
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(existing_id)
+        .bind(det_item_id)
+        .bind(has_explicit_non_url_title)
+        .bind(input.title)
+        .bind(trimmed_title)
+        .bind(input.title)
+        .bind(input.summary)
+        .bind(input.thumbnail_url)
+        .bind(now)
+        .bind(existing_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 content_html = COALESCE(NULLIF(excluded.content_html, ''), entry_content.content_html)",
+        )
+        .bind(existing_id)
+        .bind(input.content_html)
+        .bind(input.content_type)
+        .execute(&mut *tx)
+        .await?;
+
+        let state_sql = if has_feed_source.is_some() {
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
+             VALUES (?, 'unread', 0.0, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 read_at = NULL,
+                 interaction_updated_at = excluded.interaction_updated_at,
+                 updated_at = excluded.updated_at"
+        } else {
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
+             VALUES (?, 'none', 0.0, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 inbox_state = 'none',
+                 read_at = NULL,
+                 interaction_updated_at = excluded.interaction_updated_at,
+                 updated_at = excluded.updated_at"
+        };
+        sqlx::query(state_sql).bind(existing_id).bind(now).bind(now).execute(&mut *tx).await?;
+        Ok(())
     }
 
     pub async fn update(
@@ -614,9 +614,6 @@ impl ItemRepo<'_> {
         now: DateTime<Utc>,
         allow_auto_log: bool,
     ) -> std::result::Result<bool, sqlx::Error> {
-        type ExistingItemStateTuple =
-            (EntryKind, InboxState, bool, bool, f64, Option<DateTime<Utc>>);
-
         let mut check_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.kind,
                     COALESCE(es.inbox_state, 'none') AS inbox_state,
@@ -648,17 +645,17 @@ impl ItemRepo<'_> {
             .push(" AND i.merged_into_id IS NULL AND ")
             .push(IS_LIVE_ITEM_SQL);
 
-        let existing: Option<ExistingItemStateTuple> =
+        let existing: Option<ExistingItemStateRow> =
             check_qb.build_query_as().fetch_optional(&mut *tx).await?;
 
-        let Some((
-            entry_kind,
-            cur_inbox,
-            current_favorite,
-            current_in_wtr,
-            current_progress,
-            current_read_at,
-        )) = existing
+        let Some(ExistingItemStateRow {
+            kind: entry_kind,
+            inbox_state: cur_inbox,
+            is_favorite: current_favorite,
+            in_want_to_read: current_in_wtr,
+            progress: current_progress,
+            read_at: current_read_at,
+        }) = existing
         else {
             return Ok(false);
         };
@@ -1059,48 +1056,16 @@ impl ItemRepo<'_> {
         Ok(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn apply_background_enrichment(
-        &self,
+    async fn backfill_entry_fields_in_tx(
+        tx: &mut SqliteConnection,
         id: &str,
-        title: Option<&str>,
-        authors: &[String],
-        published_at: Option<DateTime<Utc>>,
-        summary: Option<&str>,
-        thumbnail_url: Option<&str>,
-        content_html: Option<&str>,
-    ) -> Result<()> {
-        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
-        let new_creators_json = crate::db::serialize_creators_json(authors);
-        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        let clean_thumb = thumbnail_url.map(str::trim).filter(|s| !s.is_empty());
-        let clean_html = content_html.filter(|s| !s.trim().is_empty());
-        if clean_title.is_none()
-            && new_creators_json.is_none()
-            && published_at.is_none()
-            && clean_summary.is_none()
-            && clean_thumb.is_none()
-            && clean_html.is_none()
-        {
-            return Ok(());
+        backfill: &EntryMetadataBackfill<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        if backfill.is_empty() {
+            return Ok(false);
         }
-
-        let creators_ref = new_creators_json.as_deref();
-        let now = now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
-
-        let live: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM entries e
-             JOIN entry_content ec ON ec.entry_id = e.id
-             WHERE e.id = ? AND e.merged_into_id IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if live.is_none() {
-            return Ok(());
-        }
-
+        let creators_ref = backfill.creators_json.as_deref();
         let entry_res = sqlx::query(
             "UPDATE entries
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
@@ -1116,22 +1081,64 @@ impl ItemRepo<'_> {
                     OR (summary IS NULL AND ? IS NOT NULL)
                     OR (thumbnail_url IS NULL AND ? IS NOT NULL))",
         )
-        .bind(clean_title)
-        .bind(clean_title)
+        .bind(backfill.title)
+        .bind(backfill.title)
         .bind(creators_ref)
         .bind(creators_ref)
-        .bind(published_at)
-        .bind(clean_summary)
-        .bind(clean_thumb)
+        .bind(backfill.published_at)
+        .bind(backfill.summary)
+        .bind(backfill.thumbnail_url)
         .bind(now)
         .bind(id)
-        .bind(clean_title)
+        .bind(backfill.title)
         .bind(creators_ref)
-        .bind(published_at)
-        .bind(clean_summary)
-        .bind(clean_thumb)
+        .bind(backfill.published_at)
+        .bind(backfill.summary)
+        .bind(backfill.thumbnail_url)
         .execute(&mut *tx)
         .await?;
+        Ok(entry_res.rows_affected() > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_background_enrichment(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        authors: &[String],
+        published_at: Option<DateTime<Utc>>,
+        summary: Option<&str>,
+        thumbnail_url: Option<&str>,
+        content_html: Option<&str>,
+    ) -> Result<()> {
+        let backfill = EntryMetadataBackfill {
+            title: title.map(str::trim).filter(|s| !s.is_empty()),
+            creators_json: crate::db::serialize_creators_json(authors),
+            published_at,
+            summary: summary.map(str::trim).filter(|s| !s.is_empty()),
+            thumbnail_url: thumbnail_url.map(str::trim).filter(|s| !s.is_empty()),
+        };
+        let clean_html = content_html.filter(|s| !s.trim().is_empty());
+        if backfill.is_empty() && clean_html.is_none() {
+            return Ok(());
+        }
+
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM entries e
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.id = ? AND e.merged_into_id IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Ok(());
+        }
+
+        let entry_updated = Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await?;
 
         let mut content_updated = false;
         if let Some(html) = clean_html {
@@ -1154,7 +1161,7 @@ impl ItemRepo<'_> {
             }
         }
 
-        if entry_res.rows_affected() > 0 || content_updated {
+        if entry_updated || content_updated {
             SyncRepo::record_activity(
                 &mut tx,
                 ActivityEntityType::Item,
@@ -1175,42 +1182,23 @@ impl ItemRepo<'_> {
         author: Option<&str>,
         summary: Option<&str>,
     ) -> Result<()> {
-        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
-        let clean_author = author.map(str::trim).filter(|s| !s.is_empty());
-        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        if clean_title.is_none() && clean_author.is_none() && clean_summary.is_none() {
+        let backfill = EntryMetadataBackfill {
+            title: title.map(str::trim).filter(|s| !s.is_empty()),
+            creators_json: author
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|a| serde_json::to_string(&[a]).ok()),
+            published_at: None,
+            summary: summary.map(str::trim).filter(|s| !s.is_empty()),
+            thumbnail_url: None,
+        };
+        if backfill.is_empty() {
             return Ok(());
         }
 
-        let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
-        let creators_ref = new_creators_json.as_deref();
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        let result = sqlx::query!(
-            "UPDATE entries
-             SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
-                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
-                 summary = COALESCE(summary, ?),
-                 updated_at = ?
-             WHERE id = ?
-               AND ((title = url AND ? IS NOT NULL)
-                    OR (creators_json = '[]' AND ? IS NOT NULL)
-                    OR (summary IS NULL AND ? IS NOT NULL))",
-            clean_title as _,
-            clean_title as _,
-            creators_ref as _,
-            creators_ref as _,
-            clean_summary as _,
-            now as _,
-            id,
-            clean_title as _,
-            creators_ref as _,
-            clean_summary as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() > 0 {
+        if Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await? {
             SyncRepo::record_activity(
                 &mut tx,
                 ActivityEntityType::Item,

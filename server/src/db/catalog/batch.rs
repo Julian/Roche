@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     db::{
-        sync::{SyncRepo, collection_entry_natural_key},
+        sync::SyncRepo,
         types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
     },
     ranking::validate_ordering,
@@ -111,12 +111,13 @@ impl CatalogRepo<'_> {
             for member in &col.members {
                 let member_id =
                     Self::resolve_batch_ref_in_tx(tx, ref_map, &member.entry_ref).await?;
-                Self::attach_batch_collection_member_in_tx(
+                Self::attach_collection_member_in_tx(
                     tx,
                     &col_id,
                     &member_id,
                     member.position,
                     now,
+                    false,
                 )
                 .await?;
             }
@@ -219,48 +220,6 @@ impl CatalogRepo<'_> {
         Ok(target_id)
     }
 
-    async fn attach_batch_collection_member_in_tx(
-        tx: &mut SqliteConnection,
-        col_id: &str,
-        member_id: &str,
-        position: Option<f64>,
-        now: DateTime<Utc>,
-    ) -> CatalogResult<()> {
-        if col_id == member_id {
-            return Err(CatalogError::InvalidInput(
-                "A collection cannot contain itself".to_owned(),
-            ));
-        }
-        if Self::would_introduce_collection_cycle_in_tx(tx, col_id, member_id).await? {
-            return Err(CatalogError::InvalidInput(
-                "Adding entry to collection would create a cycle".to_owned(),
-            ));
-        }
-        let nat_key = collection_entry_natural_key(col_id, member_id);
-        SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
-        sqlx::query(
-            "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(collection_id, entry_id) DO UPDATE SET
-                position = COALESCE(excluded.position, collection_entries.position)",
-        )
-        .bind(col_id)
-        .bind(member_id)
-        .bind(position)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        SyncRepo::record_activity(
-            tx,
-            ActivityEntityType::CollectionEntry,
-            &nat_key,
-            ActivityAction::Create,
-            now,
-        )
-        .await?;
-        Ok(())
-    }
-
     async fn apply_batch_comparisons_in_tx(
         tx: &mut SqliteConnection,
         ref_map: &HashMap<String, String>,
@@ -312,14 +271,7 @@ impl CatalogRepo<'_> {
             let (col_id, col_title, mode, role) =
                 Self::resolve_batch_collection_ref_in_tx(tx, ref_map, &gen_input.collection_ref)
                     .await?;
-            if col_id == crate::db::STARRED_COLLECTION_ID
-                || mode != CollectionMode::Manual
-                || role != CollectionRole::List
-            {
-                return Err(CatalogError::InvalidInput(format!(
-                    "Collection '{col_title}' cannot use a generator (must be a custom manual list)"
-                )));
-            }
+            Self::ensure_generator_eligible(&col_id, &col_title, mode, role)?;
             let explicit_entry_id = match gen_input
                 .current_entry_ref
                 .as_deref()
@@ -390,8 +342,20 @@ impl CatalogRepo<'_> {
         if let Some((raw_scheme, raw_val)) = trimmed.split_once(':') {
             let scheme = normalize_identifier_scheme(raw_scheme);
             if !scheme.is_empty() && !raw_val.trim().is_empty() {
-                for candidate_kind in [EntryKind::Album, EntryKind::Book, EntryKind::Movie] {
+                let mut tried_vals = HashSet::new();
+                for candidate_kind in [
+                    EntryKind::Album,
+                    EntryKind::Song,
+                    EntryKind::Artist,
+                    EntryKind::Podcast,
+                    EntryKind::PodcastEpisode,
+                    EntryKind::Book,
+                    EntryKind::Movie,
+                ] {
                     let norm_val = normalize_identifier_value(candidate_kind, &scheme, raw_val);
+                    if !tried_vals.insert(norm_val.clone()) {
+                        continue;
+                    }
                     if let Some(found) = sqlx::query_scalar::<_, String>(
                         "SELECT entry_id FROM entry_identifiers
                          WHERE scheme = ? AND value = ?

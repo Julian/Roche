@@ -503,4 +503,68 @@ mod tests {
         assert_eq!(item.title, "Multi Author Paper");
         assert_eq!(item.author.as_deref(), Some("Alice Smith, Bob Jones"));
     }
+
+    #[tokio::test]
+    async fn test_content_startup_maintenance_normalizes_html_summaries_and_skips_rerun() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let url1 = Url::parse("https://example.com/legacy-post").unwrap();
+        let item1 = db
+            .items()
+            .create(&crate::db::NewItem {
+                feed_id: None,
+                title: "Legacy Post",
+                url: &url1,
+                author: None,
+                published_at: None,
+                summary: Some(
+                    "<figure><img src=\"https://example.com/a.png\"></figure><p>Clean &amp; fast summary</p>",
+                ),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        let url2 = Url::parse("https://example.com/angle-post").unwrap();
+        let item2 = db
+            .items()
+            .create(&crate::db::NewItem {
+                feed_id: None,
+                title: "Angle Post",
+                url: &url2,
+                author: None,
+                published_at: None,
+                summary: Some("<p>Use &lt;div&gt; or x &lt; y &gt; z</p>"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+
+        crate::service::run_content_startup_maintenance(&db).await;
+
+        let refreshed1 = db.items().get(&item1.id).await.unwrap().unwrap();
+        assert_eq!(refreshed1.summary.as_deref(), Some("Clean & fast summary"));
+        assert!(refreshed1.content_html.as_deref().unwrap().contains("<figure>"));
+        assert_eq!(refreshed1.thumbnail_url.as_deref(), Some("https://example.com/a.png"));
+
+        let refreshed2 = db.items().get(&item2.id).await.unwrap().unwrap();
+        assert_eq!(refreshed2.summary.as_deref(), Some("Use <div> or x < y > z"));
+
+        // Inject raw HTML after maintenance completion; re-running skips completed tasks
+        let url3 = Url::parse("https://example.com/after-maint").unwrap();
+        let item3 = db
+            .items()
+            .create(&crate::db::NewItem {
+                feed_id: None,
+                title: "After Maint",
+                url: &url3,
+                author: None,
+                published_at: None,
+                summary: Some("<p>Should NOT be rescanned</p>"),
+                content_type: ContentType::Article,
+            })
+            .await
+            .unwrap();
+        crate::service::run_content_startup_maintenance(&db).await;
+        let untouched = db.items().get(&item3.id).await.unwrap().unwrap();
+        assert_eq!(untouched.summary.as_deref(), Some("<p>Should NOT be rescanned</p>"));
+    }
 }

@@ -253,7 +253,88 @@ impl<'a> FeedRepo<'a> {
         self.create_with_interval(feed_type, url, title, description, 30).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    async fn reactivate_archived_feed_in_tx(
+        tx: &mut SqliteConnection,
+        url_str: &str,
+        det_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        prefer_incoming_title: bool,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let existing_archived_id: Option<String> = sqlx::query_scalar(
+            "SELECT collection_id FROM feed_sources
+             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
+             LIMIT 1",
+        )
+        .bind(url_str)
+        .bind(det_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(existing_id) = existing_archived_id else {
+            return Ok(None);
+        };
+
+        let feed_sql = if prefer_incoming_title {
+            "UPDATE feed_sources
+             SET is_active = 1,
+                 feed_title = COALESCE(?, feed_title),
+                 consecutive_failures = 0,
+                 last_error = NULL,
+                 last_error_by = NULL
+             WHERE collection_id = ?"
+        } else {
+            "UPDATE feed_sources
+             SET is_active = 1,
+                 feed_title = COALESCE(feed_title, ?),
+                 consecutive_failures = 0,
+                 last_error = NULL,
+                 last_error_by = NULL
+             WHERE collection_id = ?"
+        };
+        sqlx::query(feed_sql).bind(title).bind(&existing_id).execute(&mut *tx).await?;
+
+        if prefer_incoming_title {
+            sqlx::query(
+                "UPDATE entries
+                 SET title = COALESCE(?, title),
+                     summary = COALESCE(?, summary),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(title)
+            .bind(description)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE entries
+                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&existing_id)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        SyncRepo::record_activity(
+            &mut *tx,
+            ActivityEntityType::Feed,
+            &existing_id,
+            ActivityAction::Unarchive,
+            now,
+        )
+        .await?;
+
+        Ok(Some(existing_id))
+    }
+
     pub async fn create_with_interval(
         &self,
         feed_type: FeedType,
@@ -270,54 +351,17 @@ impl<'a> FeedRepo<'a> {
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Feed, &nat_key).await?;
 
-        let existing_archived_id: Option<String> = sqlx::query_scalar!(
-            "SELECT collection_id FROM feed_sources
-             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
-             LIMIT 1",
+        if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
+            &mut tx,
             url_str,
-            id,
+            &id,
+            title,
+            description,
+            true,
+            now,
         )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(existing_id) = existing_archived_id {
-            sqlx::query(
-                "UPDATE feed_sources
-                 SET is_active = 1,
-                     feed_title = COALESCE(?, feed_title),
-                     consecutive_failures = 0,
-                     last_error = NULL,
-                     last_error_by = NULL
-                 WHERE collection_id = ?",
-            )
-            .bind(title)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query!(
-                "UPDATE entries
-                 SET title = COALESCE(?, title),
-                     summary = COALESCE(?, summary),
-                     updated_at = ?
-                 WHERE id = ?",
-                title,
-                description,
-                now as _,
-                existing_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Feed,
-                &existing_id,
-                ActivityAction::Unarchive,
-                now,
-            )
-            .await?;
-
+        .await?
+        {
             tx.commit().await?;
             return self
                 .get(&existing_id)
@@ -483,7 +527,6 @@ impl<'a> FeedRepo<'a> {
         Ok(imported)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn import_single_outline_in_tx(
         tx: &mut SqliteConnection,
         outline: OpmlOutline,
@@ -496,52 +539,17 @@ impl<'a> FeedRepo<'a> {
         let clean_title = outline.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
         SyncRepo::clear_tombstone(&mut *tx, ActivityEntityType::Feed, &nat_key).await?;
 
-        let existing_archived_id: Option<String> = sqlx::query_scalar!(
-            "SELECT collection_id FROM feed_sources
-             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
-             LIMIT 1",
+        if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
+            &mut *tx,
             xml_url_str,
-            id,
+            &id,
+            clean_title,
+            None,
+            false,
+            now,
         )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(existing_id) = existing_archived_id {
-            sqlx::query(
-                "UPDATE feed_sources
-                 SET is_active = 1,
-                     feed_title = COALESCE(feed_title, ?),
-                     consecutive_failures = 0,
-                     last_error = NULL,
-                     last_error_by = NULL
-                 WHERE collection_id = ?",
-            )
-            .bind(clean_title)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query!(
-                "UPDATE entries
-                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
-                     updated_at = ?
-                 WHERE id = ?",
-                existing_id,
-                now as _,
-                existing_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut *tx,
-                ActivityEntityType::Feed,
-                &existing_id,
-                ActivityAction::Unarchive,
-                now,
-            )
-            .await?;
-
+        .await?
+        {
             let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
                 .bind(&existing_id)
                 .fetch_optional(&mut *tx)

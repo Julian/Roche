@@ -5,7 +5,7 @@ use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow},
+    models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow, raw_entry_columns},
 };
 use crate::db::{
     MediaRepo,
@@ -13,7 +13,7 @@ use crate::db::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
         deterministic_comparison_id,
     },
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
 };
 
 impl CatalogRepo<'_> {
@@ -160,21 +160,11 @@ impl CatalogRepo<'_> {
         .await?;
 
         // Backfill missing metadata onto canonical from duplicate
-        let dup_row = sqlx::query_as!(
-            RawEntryRow,
-            r#"SELECT id as "id!", kind as "kind!: EntryKind", title as "title!",
-                      creators_json as "creators_json!", url as "url?",
-                      published_at as "published_at?: DateTime<Utc>",
-                      release_year as "release_year?: i32", summary as "summary?",
-                      thumbnail_url as "thumbnail_url?", metadata_json as "metadata_json!",
-                      merged_into_id as "merged_into_id?",
-                      created_at as "created_at!: DateTime<Utc>",
-                      updated_at as "updated_at!: DateTime<Utc>"
-               FROM entries WHERE id = ?"#,
-            dup_resolved,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let dup_row: RawEntryRow =
+            sqlx::query_as(concat!("SELECT ", raw_entry_columns!(), " FROM entries WHERE id = ?"))
+                .bind(dup_resolved)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let dup_url = dup_row.url.as_deref();
         let dup_summary = dup_row.summary.as_deref();
@@ -505,15 +495,15 @@ impl CatalogRepo<'_> {
         .await?;
 
         if let Some((dup_enabled, mut dup_cur_entry, mut dup_drawn_at)) = dup_gen {
-            let canon_eligible = canon_resolved != crate::db::STARRED_COLLECTION_ID
-                && sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM collection_specs
-                     WHERE collection_id = ? AND mode = 'manual' AND collection_role = 'list'",
-                )
-                .bind(canon_resolved)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
+            let canon_spec: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
+                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            )
+            .bind(canon_resolved)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let canon_eligible = canon_spec.is_some_and(|(mode, role)| {
+                Self::is_generator_eligible(canon_resolved, mode, role)
+            });
             let canon_gen_updated: Option<DateTime<Utc>> = sqlx::query_scalar(
                 "SELECT updated_at FROM collection_generators WHERE collection_id = ?",
             )

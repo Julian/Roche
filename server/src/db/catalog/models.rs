@@ -119,6 +119,31 @@ impl CatalogEntry {
     }
 }
 
+macro_rules! raw_entry_columns {
+    () => {
+        "id, kind, title, creators_json, url, published_at, release_year, summary, \
+         thumbnail_url, metadata_json, merged_into_id, created_at, updated_at"
+    };
+    (e) => {
+        "e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year, \
+         e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, \
+         e.updated_at"
+    };
+}
+
+pub(super) use raw_entry_columns;
+
+macro_rules! raw_collection_columns {
+    () => {
+        "e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role, \
+         cs.rule_json, cs.show_in_lists, cs.color, \
+         EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator, \
+         e.created_at, e.updated_at"
+    };
+}
+
+pub(super) use raw_collection_columns;
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(super) struct RawEntryRow {
     pub id: String,
@@ -317,6 +342,29 @@ pub(super) struct RawCollectionRow {
     pub has_generator: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl RawCollectionRow {
+    #[must_use]
+    pub fn into_summary(self, member_count: usize, comparison_count: usize) -> CollectionSummary {
+        CollectionSummary {
+            id: self.id,
+            slug: self.slug,
+            title: self.title,
+            summary: self.summary,
+            kind: self.kind,
+            mode: self.mode,
+            role: self.collection_role,
+            rule_json: self.rule_json,
+            show_in_lists: self.show_in_lists,
+            color: self.color,
+            member_count,
+            comparison_count,
+            has_generator: self.has_generator,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -190,13 +190,13 @@ impl SyncRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
-        let _ = sqlx::query!(
+        sqlx::query!(
             "DELETE FROM sync_tombstones
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
             cutoff as _,
         )
         .execute(&mut *tx)
-        .await;
+        .await?;
         tx.commit().await?;
         Ok(result.rows_affected())
     }

@@ -37,11 +37,52 @@ pub use self::{
 };
 use crate::{
     config::Config,
+    content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{ActivityEntry, Db, Feed, Item, ItemTag, SyncRepo, Tag},
     media::{MediaStore, ytdlp::YtDlpWorker},
     scheduler::{DynFeedFetcher, FeedFetcher, FeedPollLocks, MediaIngestContext},
-    util::clock::now_utc,
+    util::{clock::now_utc, media_urls::youtube_thumbnail_url},
 };
+
+/// Runs one-time content-layer database maintenance tasks (`normalize_legacy_html_summaries` and
+/// `backfill_missing_thumbnails`) using `HtmlSanitizer` outside the `db` module.
+pub async fn run_content_startup_maintenance(db: &Db) {
+    const NORMALIZE_SUMMARIES_TASK: &str = "normalize_legacy_html_summaries";
+    const BACKFILL_THUMBNAILS_TASK: &str = "backfill_missing_thumbnails";
+
+    db.run_maintenance_task_once(NORMALIZE_SUMMARIES_TASK, async {
+        db.items().normalize_legacy_html_summaries(normalize_legacy_summary).await.map(|_| ())
+    })
+    .await;
+    db.run_maintenance_task_once(BACKFILL_THUMBNAILS_TASK, async {
+        db.items().backfill_missing_thumbnails(extract_backfill_thumbnail).await.map(|_| ())
+    })
+    .await;
+}
+
+#[must_use]
+pub fn normalize_legacy_summary(
+    raw_summary: &str,
+    base_url: Option<&url::Url>,
+) -> (String, Option<String>) {
+    let excerpt = HtmlSanitizer::plain_text_excerpt(raw_summary, MAX_SUMMARY_CHARS);
+    let thumb = if excerpt == raw_summary {
+        None
+    } else {
+        HtmlSanitizer::extract_first_image_url_with_base(raw_summary, base_url)
+    };
+    (excerpt, thumb)
+}
+
+#[must_use]
+pub fn extract_backfill_thumbnail(
+    content_html: Option<&str>,
+    base_url: Option<&url::Url>,
+) -> Option<String> {
+    content_html
+        .and_then(|html| HtmlSanitizer::extract_first_image_url_with_base(html, base_url))
+        .or_else(|| base_url.and_then(youtube_thumbnail_url))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExportBundle {

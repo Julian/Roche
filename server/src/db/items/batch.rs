@@ -185,9 +185,10 @@ impl ItemRepo<'_> {
         Ok(u64::try_from(archived_ids.len()).unwrap_or(u64::MAX))
     }
 
-    pub async fn normalize_legacy_html_summaries(&self) -> Result<u64> {
-        use crate::content::{HtmlSanitizer, MAX_SUMMARY_CHARS};
-
+    pub async fn normalize_legacy_html_summaries(
+        &self,
+        normalize: fn(&str, Option<&Url>) -> (String, Option<String>),
+    ) -> Result<u64> {
         let candidates = sqlx::query!(
             "SELECT e.id,
                     COALESCE(e.url, '') AS \"url!: String\",
@@ -218,18 +219,9 @@ impl ItemRepo<'_> {
                         let id = row.id;
                         let url_str = row.url;
                         let raw_summary = row.summary;
-                        let excerpt =
-                            HtmlSanitizer::plain_text_excerpt(&raw_summary, MAX_SUMMARY_CHARS);
-                        if excerpt == raw_summary {
-                            None
-                        } else {
-                            let base_url = Url::parse(&url_str).ok();
-                            let thumb = HtmlSanitizer::extract_first_image_url_with_base(
-                                &raw_summary,
-                                base_url.as_ref(),
-                            );
-                            Some((id, excerpt, thumb))
-                        }
+                        let base_url = Url::parse(&url_str).ok();
+                        let (excerpt, thumb) = normalize(&raw_summary, base_url.as_ref());
+                        if excerpt == raw_summary { None } else { Some((id, excerpt, thumb)) }
                     })
                     .collect()
             })
@@ -269,9 +261,10 @@ impl ItemRepo<'_> {
         Ok(count)
     }
 
-    pub async fn backfill_missing_thumbnails(&self) -> Result<u64> {
-        use crate::{content::HtmlSanitizer, util::media_urls::youtube_thumbnail_url};
-
+    pub async fn backfill_missing_thumbnails(
+        &self,
+        extract_thumb: fn(Option<&str>, Option<&Url>) -> Option<String>,
+    ) -> Result<u64> {
         let candidates = sqlx::query!(
             "SELECT e.id,
                     COALESCE(e.url, '') AS \"url!: String\",
@@ -309,15 +302,7 @@ impl ItemRepo<'_> {
                     let html_opt = row.content_html;
                     let old_thumb = row.thumbnail_url;
                     let base_url = Url::parse(&url_str).ok();
-                    let new_thumb = html_opt
-                        .as_deref()
-                        .and_then(|html| {
-                            HtmlSanitizer::extract_first_image_url_with_base(
-                                html,
-                                base_url.as_ref(),
-                            )
-                        })
-                        .or_else(|| base_url.as_ref().and_then(youtube_thumbnail_url));
+                    let new_thumb = extract_thumb(html_opt.as_deref(), base_url.as_ref());
                     (new_thumb != old_thumb).then_some((id, new_thumb))
                 })
                 .collect()

@@ -37,6 +37,40 @@ impl<'a> MediaRepo<'a> {
         Self { pool }
     }
 
+    async fn insert_media_row_in_tx(
+        tx: &mut SqliteConnection,
+        item_id: &str,
+        spec: &NewMediaSpec<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Media> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query!(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            id,
+            item_id,
+            spec.media_type as _,
+            spec.path,
+            spec.file_size,
+            spec.duration,
+            now as _,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        SyncRepo::record_activity(tx, ActivityEntityType::Media, &id, ActivityAction::Create, now)
+            .await?;
+
+        Ok(Media {
+            id,
+            item_id: item_id.to_owned(),
+            media_type: spec.media_type,
+            path: spec.path.to_owned(),
+            file_size: spec.file_size,
+            duration: spec.duration,
+        })
+    }
+
     pub async fn create_batch(
         &self,
         item_id: &str,
@@ -50,38 +84,7 @@ impl<'a> MediaRepo<'a> {
         let mut out = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            let id = Uuid::new_v4().to_string();
-            sqlx::query!(
-                "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
-                 VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-                id,
-                item_id,
-                spec.media_type as _,
-                spec.path,
-                spec.file_size,
-                spec.duration,
-                now as _,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Media,
-                &id,
-                ActivityAction::Create,
-                now,
-            )
-            .await?;
-
-            out.push(Media {
-                id,
-                item_id: item_id.to_owned(),
-                media_type: spec.media_type,
-                path: spec.path.to_owned(),
-                file_size: spec.file_size,
-                duration: spec.duration,
-            });
+            out.push(Self::insert_media_row_in_tx(&mut tx, item_id, spec, now).await?);
         }
 
         tx.commit().await?;
@@ -126,43 +129,17 @@ impl<'a> MediaRepo<'a> {
         file_size: Option<i64>,
         duration: Option<i64>,
     ) -> Result<Media> {
-        let id = Uuid::new_v4().to_string();
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-
-        sqlx::query!(
-            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
-             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-            id,
-            item_id,
-            media_type as _,
-            path,
-            file_size,
-            duration,
-            now as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        SyncRepo::record_activity(
+        let media = Self::insert_media_row_in_tx(
             &mut tx,
-            ActivityEntityType::Media,
-            &id,
-            ActivityAction::Create,
+            item_id,
+            &NewMediaSpec { media_type, path, file_size, duration },
             now,
         )
         .await?;
-
         tx.commit().await?;
-
-        Ok(Media {
-            id,
-            item_id: item_id.to_string(),
-            media_type,
-            path: path.to_string(),
-            file_size,
-            duration,
-        })
+        Ok(media)
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Media>> {

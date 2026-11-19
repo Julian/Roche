@@ -40,9 +40,10 @@ pub use identity::{
 #[allow(unused_imports)]
 pub use models::{
     InsertedItemCandidate, MAX_PEER_SYNC_PAGE_BYTES, MAX_PEER_SYNC_PAGE_CHANGES,
-    MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, SyncCollectionEntryRecord,
-    SyncCollectionGeneratorRecord, SyncCollectionSpec, SyncComparisonRecord,
-    SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord, SyncEntryState, SyncFeedSource,
+    MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry,
+    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
+    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
+    SyncEntryState, SyncFeedSource,
 };
 use sqlx::SqlitePool;
 

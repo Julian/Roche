@@ -5,9 +5,7 @@ use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    models::{
-        CatalogError, CatalogResult, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
-    },
+    models::{CatalogError, CatalogResult, CollectionRankingInputs, ComparisonRecord},
 };
 use crate::{
     db::{
@@ -25,12 +23,15 @@ impl CatalogRepo<'_> {
         ordering: &[Vec<String>],
         ts: Option<DateTime<Utc>>,
     ) -> CatalogResult<ComparisonRecord> {
+        let now = now_utc();
+        let event_ts = ts.unwrap_or(now);
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
         let mut resolved_ordering: Vec<Vec<String>> = Vec::with_capacity(ordering.len());
         for group in ordering {
             let mut resolved_group = Vec::with_capacity(group.len());
             for raw_id in group {
-                let canon_id = self
-                    .follow_merged_id(raw_id)
+                let canon_id = Self::follow_merged_id_in_tx(&mut tx, raw_id)
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(format!("Entry '{raw_id}'")))?;
                 resolved_group.push(canon_id);
@@ -41,15 +42,12 @@ impl CatalogRepo<'_> {
 
         let clean_scope = match scope_collection_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(sc) => {
-                let col = self.lookup_collection_row(sc, false).await?;
+                let col = Self::lookup_collection_row_in_tx(&mut tx, sc, false).await?;
                 Some(col.id)
             }
             None => None,
         };
 
-        let now = now_utc();
-        let event_ts = ts.unwrap_or(now);
-        let mut tx = crate::db::begin_write(self.pool).await?;
         let (record, _) =
             Self::append_comparison_in_tx(&mut tx, clean_scope, resolved_ordering, event_ts, now)
                 .await?;
@@ -116,30 +114,13 @@ impl CatalogRepo<'_> {
         want: bool,
     ) -> CatalogResult<CollectionRankingInputs> {
         let raw_col = if want {
-            let summary = self.get_or_create_want_collection(slug_or_id).await?;
-            self.lookup_collection_row(&summary.id, false).await?
+            self.ensure_want_collection_row(slug_or_id).await?
         } else {
             self.lookup_collection_row(slug_or_id, true).await?
         };
         let is_priority_scope = raw_col.collection_role == CollectionRole::Want;
         let members = self.resolve_rankable_members(&raw_col).await?;
-        let summary = CollectionSummary {
-            id: raw_col.id,
-            slug: raw_col.slug,
-            title: raw_col.title,
-            summary: raw_col.summary,
-            kind: raw_col.kind,
-            mode: raw_col.mode,
-            role: raw_col.collection_role,
-            rule_json: raw_col.rule_json,
-            show_in_lists: raw_col.show_in_lists,
-            color: raw_col.color,
-            member_count: members.len(),
-            comparison_count: 0,
-            has_generator: raw_col.has_generator,
-            created_at: raw_col.created_at,
-            updated_at: raw_col.updated_at,
-        };
+        let summary = raw_col.into_summary(members.len(), 0);
         Ok(CollectionRankingInputs { collection: summary, is_priority_scope, members })
     }
 
@@ -151,8 +132,7 @@ impl CatalogRepo<'_> {
         want: bool,
     ) -> CatalogResult<usize> {
         let raw_col = if want {
-            let summary = self.get_or_create_want_collection(slug_or_id).await?;
-            self.lookup_collection_row(&summary.id, false).await?
+            self.ensure_want_collection_row(slug_or_id).await?
         } else {
             self.lookup_collection_row(slug_or_id, true).await?
         };

@@ -11,85 +11,74 @@ use super::{
     },
     models::{
         CatalogEntry, CatalogError, CatalogResult, ConsumptionLogRow, EntryDetailView,
-        EntryIdentifier, RawEntryRow, UpsertEntryInput,
+        EntryIdentifier, RawEntryRow, UpsertEntryInput, raw_entry_columns,
     },
 };
 use crate::db::{
-    sync::{SyncRepo, collection_entry_natural_key, deterministic_title_entry_id},
+    sync::{SyncRepo, deterministic_title_entry_id},
     types::{ActivityAction, ActivityEntityType, CollectionMode, ConsumptionStatus, EntryKind},
 };
 
 impl CatalogRepo<'_> {
     pub async fn get_entry(&self, id: &str) -> CatalogResult<Option<CatalogEntry>> {
-        let canonical_id = self.follow_merged_id(id).await?;
-        let Some(target_id) = canonical_id else {
-            return Ok(None);
+        let raw_opt = {
+            let mut conn = self.pool.acquire().await?;
+            Self::get_entry_raw_in_tx(&mut conn, id).await?
         };
-        let row = sqlx::query_as!(
-            RawEntryRow,
-            r#"SELECT id as "id!", kind as "kind!: EntryKind", title as "title!",
-                      creators_json as "creators_json!", url as "url?",
-                      published_at as "published_at?: DateTime<Utc>",
-                      release_year as "release_year?: i32", summary as "summary?",
-                      thumbnail_url as "thumbnail_url?", metadata_json as "metadata_json!",
-                      merged_into_id as "merged_into_id?",
-                      created_at as "created_at!: DateTime<Utc>",
-                      updated_at as "updated_at!: DateTime<Utc>"
-               FROM entries WHERE id = ? AND merged_into_id IS NULL"#,
-            &target_id,
-        )
-        .fetch_optional(self.pool)
-        .await?;
-        let Some(raw) = row else {
+        let Some(raw) = raw_opt else {
             return Ok(None);
         };
         let idents = self.load_identifiers_for_one(&raw.id).await?;
         Ok(Some(raw.into_entry(idents)))
     }
 
+    pub(super) async fn get_entry_raw_in_tx(
+        conn: &mut SqliteConnection,
+        id: &str,
+    ) -> CatalogResult<Option<RawEntryRow>> {
+        let Some(target_id) = Self::follow_merged_id_in_tx(&mut *conn, id).await? else {
+            return Ok(None);
+        };
+        let row: Option<RawEntryRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            raw_entry_columns!(),
+            " FROM entries WHERE id = ? AND merged_into_id IS NULL"
+        ))
+        .bind(&target_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
     pub async fn get_entry_detail(&self, id: &str) -> CatalogResult<Option<EntryDetailView>> {
         let Some(entry) = self.get_entry(id).await? else {
             return Ok(None);
         };
-        let child_rows = sqlx::query_as!(
-            RawEntryRow,
-            r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
-                      e.creators_json as "creators_json!", e.url as "url?",
-                      e.published_at as "published_at?: DateTime<Utc>",
-                      e.release_year as "release_year?: i32", e.summary as "summary?",
-                      e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
-                      e.merged_into_id as "merged_into_id?",
-                      e.created_at as "created_at!: DateTime<Utc>",
-                      e.updated_at as "updated_at!: DateTime<Utc>"
-               FROM collection_entries ce
-               JOIN entries e ON e.id = ce.entry_id
-               WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-               ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC"#,
-            &entry.id,
-        )
+        let child_rows: Vec<RawEntryRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            raw_entry_columns!(e),
+            " FROM collection_entries ce
+             JOIN entries e ON e.id = ce.entry_id
+             WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+             ORDER BY ce.position ASC NULLS LAST, COALESCE(e.release_year, 0) DESC, LOWER(e.title) ASC"
+        ))
+        .bind(&entry.id)
         .fetch_all(self.pool)
         .await?;
         let children = self.hydrate_entries(child_rows).await?;
 
-        let parent_rows = sqlx::query_as!(
-            RawEntryRow,
-            r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
-                      e.creators_json as "creators_json!", e.url as "url?",
-                      e.published_at as "published_at?: DateTime<Utc>",
-                      e.release_year as "release_year?: i32", e.summary as "summary?",
-                      e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
-                      e.merged_into_id as "merged_into_id?",
-                      e.created_at as "created_at!: DateTime<Utc>",
-                      e.updated_at as "updated_at!: DateTime<Utc>"
-               FROM collection_entries ce
-               JOIN entries e ON e.id = ce.collection_id
-               LEFT JOIN collection_specs cs ON cs.collection_id = e.id
-               WHERE ce.entry_id = ?
-                 AND e.merged_into_id IS NULL
-                 AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'tag'))
-               ORDER BY LOWER(e.title) ASC"#,
-            &entry.id,
-        )
+        let parent_rows: Vec<RawEntryRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            raw_entry_columns!(e),
+            " FROM collection_entries ce
+             JOIN entries e ON e.id = ce.collection_id
+             LEFT JOIN collection_specs cs ON cs.collection_id = e.id
+             WHERE ce.entry_id = ?
+               AND e.merged_into_id IS NULL
+               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'tag'))
+             ORDER BY LOWER(e.title) ASC"
+        ))
+        .bind(&entry.id)
         .fetch_all(self.pool)
         .await?;
         let parents = self.hydrate_entries(parent_rows).await?;
@@ -118,19 +107,19 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<Vec<CatalogEntry>> {
         let cap = i64::try_from(limit.clamp(1, 500)).unwrap_or(100);
         let trimmed = query.map(str::trim).filter(|s| !s.is_empty());
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year,
-                    e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, e.updated_at
-             FROM entries e
+        let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+            "SELECT ",
+            raw_entry_columns!(e),
+            " FROM entries e
              LEFT JOIN collection_specs cs ON cs.collection_id = e.id
              WHERE e.merged_into_id IS NULL
-               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'want', 'tag'))",
-        );
+               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'want', 'tag'))"
+        ));
         if let Some(k) = kind {
             qb.push(" AND e.kind = ").push_bind(k);
         }
         if let Some(q) = trimmed {
-            let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped = crate::db::escape_like_literal(q);
             let pattern = format!("%{escaped}%");
             qb.push(" AND (e.title LIKE ")
                 .push_bind(pattern.clone())
@@ -189,12 +178,26 @@ impl CatalogRepo<'_> {
         kind: Option<EntryKind>,
         only_collection_id: Option<&str>,
     ) -> CatalogResult<CatalogEntry> {
+        let raw = {
+            let mut conn = self.pool.acquire().await?;
+            Self::resolve_entry_raw_in_tx(&mut conn, query, kind, only_collection_id).await?
+        };
+        let idents = self.load_identifiers_for_one(&raw.id).await?;
+        Ok(raw.into_entry(idents))
+    }
+
+    pub(super) async fn resolve_entry_raw_in_tx(
+        conn: &mut SqliteConnection,
+        query: &str,
+        kind: Option<EntryKind>,
+        only_collection_id: Option<&str>,
+    ) -> CatalogResult<RawEntryRow> {
         let q = query.trim();
         if q.is_empty() {
             return Err(CatalogError::InvalidInput("Lookup query cannot be empty".to_owned()));
         }
 
-        if let Some(by_id) = self.get_entry(q).await?
+        if let Some(by_id) = Self::get_entry_raw_in_tx(&mut *conn, q).await?
             && kind.is_none_or(|k| by_id.kind == k)
         {
             if let Some(col_id) = only_collection_id {
@@ -203,7 +206,7 @@ impl CatalogRepo<'_> {
                     col_id,
                     &by_id.id,
                 )
-                .fetch_optional(self.pool)
+                .fetch_optional(&mut *conn)
                 .await?;
                 if in_col.is_some() {
                     return Ok(by_id);
@@ -213,15 +216,14 @@ impl CatalogRepo<'_> {
             }
         }
 
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT DISTINCT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at,
-                    e.release_year, e.summary, e.thumbnail_url, e.metadata_json,
-                    e.merged_into_id, e.created_at, e.updated_at
-             FROM entries e
+        let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+            "SELECT DISTINCT ",
+            raw_entry_columns!(e),
+            " FROM entries e
              LEFT JOIN collection_specs cs ON cs.collection_id = e.id
              WHERE e.merged_into_id IS NULL
-               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'want', 'tag'))",
-        );
+               AND (cs.collection_role IS NULL OR cs.collection_role NOT IN ('system', 'want', 'tag'))"
+        ));
         if let Some(k) = kind {
             qb.push(" AND e.kind = ").push_bind(k);
         }
@@ -247,28 +249,13 @@ impl CatalogRepo<'_> {
         }
         qb.push("))) ORDER BY e.created_at ASC, e.id ASC");
 
-        let mut candidates: Vec<RawEntryRow> = qb.build_query_as().fetch_all(self.pool).await?;
+        let mut candidates: Vec<RawEntryRow> = qb.build_query_as().fetch_all(&mut *conn).await?;
 
         // Fallback for album edition-stripped title lookup
         if candidates.is_empty() && kind == Some(EntryKind::Album) {
-            let stripped_q = strip_album_edition_suffix(q).to_lowercase();
-            let mut aqb = QueryBuilder::<Sqlite>::new(
-                "SELECT id, kind, title, creators_json, url, published_at, release_year, summary,
-                        thumbnail_url, metadata_json, merged_into_id, created_at, updated_at
-                 FROM entries WHERE kind = 'album' AND merged_into_id IS NULL",
-            );
-            if let Some(col_id) = only_collection_id {
-                aqb.push(
-                    " AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.collection_id = ",
-                )
-                .push_bind(col_id)
-                .push(" AND ce.entry_id = entries.id)");
-            }
-            let albums: Vec<RawEntryRow> = aqb.build_query_as().fetch_all(self.pool).await?;
-            candidates = albums
-                .into_iter()
-                .filter(|a| strip_album_edition_suffix(&a.title).to_lowercase() == stripped_q)
-                .collect();
+            candidates =
+                Self::resolve_album_edition_fallback_in_tx(&mut *conn, q, only_collection_id)
+                    .await?;
         }
 
         if candidates.is_empty() {
@@ -284,8 +271,30 @@ impl CatalogRepo<'_> {
                 candidates: matched_candidates,
             });
         }
-        let hydrated = self.hydrate_entries(candidates).await?;
-        hydrated.into_iter().next().ok_or_else(|| CatalogError::NotFound(format!("Entry '{q}'")))
+        candidates.into_iter().next().ok_or_else(|| CatalogError::NotFound(format!("Entry '{q}'")))
+    }
+
+    async fn resolve_album_edition_fallback_in_tx(
+        conn: &mut SqliteConnection,
+        query: &str,
+        only_collection_id: Option<&str>,
+    ) -> CatalogResult<Vec<RawEntryRow>> {
+        let stripped_q = strip_album_edition_suffix(query).to_lowercase();
+        let mut aqb = QueryBuilder::<Sqlite>::new(concat!(
+            "SELECT ",
+            raw_entry_columns!(),
+            " FROM entries WHERE kind = 'album' AND merged_into_id IS NULL"
+        ));
+        if let Some(col_id) = only_collection_id {
+            aqb.push(" AND EXISTS (SELECT 1 FROM collection_entries ce WHERE ce.collection_id = ")
+                .push_bind(col_id)
+                .push(" AND ce.entry_id = entries.id)");
+        }
+        let albums: Vec<RawEntryRow> = aqb.build_query_as().fetch_all(&mut *conn).await?;
+        Ok(albums
+            .into_iter()
+            .filter(|a| strip_album_edition_suffix(&a.title).to_lowercase() == stripped_q)
+            .collect())
     }
 
     /// Upserts a catalog entry with upfront `entry_identifiers` deduplication, album edition-variant
@@ -406,8 +415,7 @@ impl CatalogRepo<'_> {
         {
             let target_artist = primary_artist.to_lowercase();
             let target_stripped = strip_album_edition_suffix(title).to_lowercase();
-            let escaped_prefix =
-                target_stripped.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            let escaped_prefix = crate::db::escape_like_literal(&target_stripped);
             let title_like = format!("{escaped_prefix}%");
             let existing_albums: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT id, title, creators_json
@@ -616,36 +624,13 @@ impl CatalogRepo<'_> {
         }
 
         if let Some(canon_parent) = resolved_parent_id {
-            if canon_parent == final_id {
-                return Err(CatalogError::InvalidInput(
-                    "A collection cannot contain itself".to_owned(),
-                ));
-            }
-            if Self::would_introduce_collection_cycle_in_tx(tx, &canon_parent, &final_id).await? {
-                return Err(CatalogError::InvalidInput(
-                    "Adding entry to parent collection would create a cycle".to_owned(),
-                ));
-            }
-            let nat_key = collection_entry_natural_key(&canon_parent, &final_id);
-            SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
-            sqlx::query!(
-                "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
-                 VALUES (?, ?, ?, ?)
-                 ON CONFLICT(collection_id, entry_id) DO UPDATE SET
-                    position = COALESCE(excluded.position, collection_entries.position)",
+            Self::attach_collection_member_in_tx(
+                tx,
                 &canon_parent,
                 &final_id,
                 input.parent_position,
-                now as _,
-            )
-            .execute(&mut *tx)
-            .await?;
-            SyncRepo::record_activity(
-                tx,
-                ActivityEntityType::CollectionEntry,
-                &nat_key,
-                ActivityAction::Create,
                 now,
+                false,
             )
             .await?;
         }
@@ -830,11 +815,11 @@ impl CatalogRepo<'_> {
         }
         let mut raw_rows = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(400) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "SELECT id, kind, title, creators_json, url, published_at, release_year, summary,
-                        thumbnail_url, metadata_json, merged_into_id, created_at, updated_at
-                 FROM entries WHERE id IN (",
-            );
+            let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+                "SELECT ",
+                raw_entry_columns!(),
+                " FROM entries WHERE id IN ("
+            ));
             let mut sep = qb.separated(", ");
             for id in chunk {
                 sep.push_bind(id);

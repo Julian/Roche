@@ -36,7 +36,13 @@ struct RawExistingGenRow {
     drawn_at: Option<DateTime<Utc>>,
 }
 
-type GeneratorStateTuple = (bool, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>);
+#[derive(sqlx::FromRow)]
+struct RawGeneratorStateRow {
+    enabled: bool,
+    current_entry_id: Option<String>,
+    drawn_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
 
 macro_rules! list_generators_sql {
     ($extra_where:literal, $order_by:literal) => {
@@ -99,12 +105,37 @@ impl CatalogRepo<'_> {
         Ok(out)
     }
 
+    #[must_use]
+    pub(crate) fn is_generator_eligible(
+        collection_id: &str,
+        mode: CollectionMode,
+        role: CollectionRole,
+    ) -> bool {
+        collection_id != crate::db::STARRED_COLLECTION_ID
+            && mode == CollectionMode::Manual
+            && role == CollectionRole::List
+    }
+
+    pub(super) fn ensure_generator_eligible(
+        collection_id: &str,
+        collection_title: &str,
+        mode: CollectionMode,
+        role: CollectionRole,
+    ) -> CatalogResult<()> {
+        if !Self::is_generator_eligible(collection_id, mode, role) {
+            return Err(CatalogError::InvalidInput(format!(
+                "Collection '{collection_title}' cannot use a generator (must be a custom manual list)"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn get_collection_generator(
         &self,
         slug_or_id: &str,
     ) -> CatalogResult<CollectionGeneratorState> {
         let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
-        let gen_row: Option<GeneratorStateTuple> = sqlx::query_as(
+        let gen_row: Option<RawGeneratorStateRow> = sqlx::query_as(
             "SELECT enabled, current_entry_id, drawn_at, updated_at
              FROM collection_generators
              WHERE collection_id = ?",
@@ -113,8 +144,10 @@ impl CatalogRepo<'_> {
         .fetch_optional(self.pool)
         .await?;
 
-        let (enabled, current_entry_id, drawn_at, updated_at) =
-            gen_row.unwrap_or((false, None, None, col.updated_at));
+        let (enabled, current_entry_id, drawn_at, updated_at) = gen_row.map_or_else(
+            || (false, None, None, col.updated_at),
+            |row| (row.enabled, row.current_entry_id, row.drawn_at, row.updated_at),
+        );
 
         let (total_pool, consumed_count, abandoned_count): (i64, i64, i64) = sqlx::query_as(
             "SELECT
@@ -168,9 +201,9 @@ impl CatalogRepo<'_> {
         explicit_entry_id: Option<&str>,
         explicit_drawn_at: Option<DateTime<Utc>>,
     ) -> CatalogResult<CollectionGeneratorState> {
-        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
+        let col = Self::lookup_generator_eligible_collection_in_tx(&mut tx, slug_or_id).await?;
         Self::update_collection_generator_in_tx(
             &mut tx,
             &col.id,
@@ -186,9 +219,9 @@ impl CatalogRepo<'_> {
     }
 
     pub async fn remove_collection_generator(&self, slug_or_id: &str) -> CatalogResult<bool> {
-        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
+        let col = Self::lookup_generator_eligible_collection_in_tx(&mut tx, slug_or_id).await?;
         let res = sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
             .bind(&col.id)
             .execute(&mut *tx)
@@ -237,9 +270,9 @@ impl CatalogRepo<'_> {
         status: ConsumptionStatus,
         notes: Option<&str>,
     ) -> CatalogResult<(CatalogEntry, CollectionGeneratorState)> {
-        let col = self.lookup_generator_eligible_collection(slug_or_id).await?;
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
+        let col = Self::lookup_generator_eligible_collection_in_tx(&mut tx, slug_or_id).await?;
 
         let active_opt: Option<(Option<String>,)> = sqlx::query_as(
             "SELECT current_entry_id FROM collection_generators WHERE collection_id = ?",
@@ -273,16 +306,16 @@ impl CatalogRepo<'_> {
         &self,
         slug_or_id: &str,
     ) -> CatalogResult<RawCollectionRow> {
-        let col = self.lookup_collection_row(slug_or_id, false).await?;
-        if col.id == crate::db::STARRED_COLLECTION_ID
-            || col.mode != CollectionMode::Manual
-            || col.collection_role != CollectionRole::List
-        {
-            return Err(CatalogError::InvalidInput(format!(
-                "Collection '{}' cannot use a generator (must be a custom manual list)",
-                col.title
-            )));
-        }
+        let mut conn = self.pool.acquire().await?;
+        Self::lookup_generator_eligible_collection_in_tx(&mut conn, slug_or_id).await
+    }
+
+    async fn lookup_generator_eligible_collection_in_tx(
+        conn: &mut SqliteConnection,
+        slug_or_id: &str,
+    ) -> CatalogResult<RawCollectionRow> {
+        let col = Self::lookup_collection_row_in_tx(conn, slug_or_id, false).await?;
+        Self::ensure_generator_eligible(&col.id, &col.title, col.mode, col.collection_role)?;
         Ok(col)
     }
 

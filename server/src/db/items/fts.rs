@@ -12,18 +12,6 @@ pub struct SearchTerm {
 
 impl ItemFilter {
     #[must_use]
-    pub fn escape_like(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        for ch in input.chars() {
-            if matches!(ch, '\\' | '%' | '_') {
-                out.push('\\');
-            }
-            out.push(ch);
-        }
-        out
-    }
-
-    #[must_use]
     pub fn tokenize_search_terms(input: &str) -> Vec<SearchTerm> {
         let mut terms = Vec::new();
         let mut chars = input.chars().peekable();
@@ -45,13 +33,13 @@ impl ItemFilter {
                     let joined = words.join(" ");
                     terms.push(SearchTerm {
                         fts_clause: format!("\"{joined}\""),
-                        like_pattern: format!("%{}%", Self::escape_like(&joined)),
+                        like_pattern: format!("%{}%", crate::db::escape_like_literal(&joined)),
                     });
                 } else {
                     for word in words {
                         terms.push(SearchTerm {
                             fts_clause: format!("(\"{word}\" OR \"{word}\"*)"),
-                            like_pattern: format!("%{}%", Self::escape_like(word)),
+                            like_pattern: format!("%{}%", crate::db::escape_like_literal(word)),
                         });
                     }
                 }
@@ -67,7 +55,7 @@ impl ItemFilter {
                 for word in Self::extract_word_tokens(&unquoted_buf) {
                     terms.push(SearchTerm {
                         fts_clause: format!("(\"{word}\" OR \"{word}\"*)"),
-                        like_pattern: format!("%{}%", Self::escape_like(word)),
+                        like_pattern: format!("%{}%", crate::db::escape_like_literal(word)),
                     });
                 }
             }
@@ -103,7 +91,7 @@ impl ItemRepo<'_> {
         search_terms: &[SearchTerm],
     ) {
         if search_terms.is_empty() {
-            let pattern = format!("%{}%", ItemFilter::escape_like(raw_search));
+            let pattern = format!("%{}%", crate::db::escape_like_literal(raw_search));
             qb.push(" AND (i.title LIKE ")
                 .push_bind(pattern.clone())
                 .push(" ESCAPE '\\' OR COALESCE(i.summary, '') LIKE ")

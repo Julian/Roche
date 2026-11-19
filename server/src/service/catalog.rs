@@ -199,49 +199,8 @@ impl<'a> CatalogService<'a> {
         notes: Option<&str>,
         queue: Option<&str>,
     ) -> Result<(CollectionSummary, CatalogEntry), AppError> {
-        let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
-        if !Self::has_explicit_metadata(input)
-            && let Ok(existing) = self.repo.resolve_entry(&input.title, input.kind, None).await
-        {
-            let mut merged_meta = input.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
-            if let Some(note_text) = clean_notes
-                && let Some(obj) = merged_meta.as_object_mut()
-            {
-                obj.insert(
-                    "want_notes".to_owned(),
-                    serde_json::Value::String(note_text.to_owned()),
-                );
-            }
-            let resolved_input = UpsertEntryInput {
-                id: Some(existing.id),
-                kind: Some(existing.kind),
-                title: existing.title,
-                creators: existing.creators,
-                url: existing.url,
-                published_at: existing.published_at,
-                release_year: existing.release_year,
-                summary: existing.summary,
-                thumbnail_url: existing.thumbnail_url,
-                metadata: clean_notes.map(|_| merged_meta),
-                identifiers: Vec::new(),
-                parent_collection_id: None,
-                parent_position: None,
-            };
-            return Ok(self.repo.want_entry(&resolved_input, queue).await?);
-        }
-
-        let mut enriched = input.clone();
-        if let Some(note_text) = clean_notes {
-            let mut meta = enriched.metadata.take().unwrap_or_else(|| serde_json::json!({}));
-            if let Some(obj) = meta.as_object_mut() {
-                obj.insert(
-                    "want_notes".to_owned(),
-                    serde_json::Value::String(note_text.to_owned()),
-                );
-            }
-            enriched.metadata = Some(meta);
-        }
-        Ok(self.repo.want_entry(&enriched, queue).await?)
+        let try_resolve = !Self::has_explicit_metadata(input);
+        Ok(self.repo.want_resolved_or_upsert(input, notes, queue, try_resolve).await?)
     }
 
     pub async fn unwant_entry(

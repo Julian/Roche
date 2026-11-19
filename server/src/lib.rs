@@ -22,6 +22,7 @@ pub struct RocheServer;
 impl RocheServer {
     pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
+        service::run_content_startup_maintenance(&db).await;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         let (listen_cfg, ts_identity) = Self::prepare_tailscale(&cfg).await?;
         let bootstrap_canonical_url =
@@ -238,11 +239,13 @@ impl RocheServer {
     }
 
     pub(crate) async fn connect_db(cfg: &config::Config) -> anyhow::Result<db::Db> {
-        db::Db::connect(&cfg.storage.database_path).await
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        service::run_content_startup_maintenance(&db).await;
+        Ok(db)
     }
 
     async fn connect_service(cfg: &config::Config) -> anyhow::Result<service::RocheService> {
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        let db = Self::connect_db(cfg).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         Ok(service::RocheService::new(db, fetcher, cfg.clone()))
     }

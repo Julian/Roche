@@ -1,13 +1,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use super::{
     activity::SyncTombstone,
     hrw::{NetworkTier, PeerNode},
+    identity::canonicalize_sync_url,
 };
-use crate::db::{
-    CollectionMode, CollectionRole, ConsumptionStatus, ContentType, EntryIdentifier, EntryKind,
-    FeedType, InboxState, PollItemCandidate,
+use crate::{
+    db::{
+        CollectionMode, CollectionRole, ConsumptionStatus, ContentType, EntryIdentifier, EntryKind,
+        FeedType, InboxState, PollItemCandidate,
+    },
+    util::media_urls::{extract_arxiv_id, is_direct_audio_url},
 };
 
 pub const MAX_PEER_SYNC_PAGE_CHANGES: usize = 2_000;
@@ -240,4 +245,108 @@ pub struct PeerSyncResponse {
     pub comparisons: Vec<SyncComparisonRecord>,
     #[serde(default)]
     pub tombstones: Vec<SyncTombstone>,
+}
+
+/// Incoming peer sync entry whose HTML, summary excerpt, and thumbnail URL have already been
+/// sanitized outside the database layer before entering the SQLite write transaction.
+#[derive(Debug)]
+pub struct PreparedSyncEntry {
+    pub record: SyncEntryRecord,
+    pub parsed_url: Option<Url>,
+    pub canon_url: Option<String>,
+    pub arxiv_id: Option<String>,
+    pub clean_summary: Option<String>,
+    pub clean_html: Option<String>,
+    pub clean_thumb: Option<String>,
+    pub clean_audio_url: Option<String>,
+    pub clean_duration: Option<i64>,
+    pub resolved_content_type: ContentType,
+}
+
+impl PreparedSyncEntry {
+    #[must_use]
+    pub fn from_sanitized_fields(
+        rec: SyncEntryRecord,
+        parsed_url: Option<Url>,
+        clean_html: Option<String>,
+        clean_summary: Option<String>,
+        clean_thumb: Option<String>,
+    ) -> Self {
+        let canon_url = rec
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(canonicalize_sync_url)
+            .filter(|s| !s.is_empty());
+        let arxiv_id = rec.url.as_deref().and_then(extract_arxiv_id);
+
+        let base_content_type = rec.content.as_ref().map_or_else(
+            || match rec.kind {
+                EntryKind::Video => ContentType::Video,
+                EntryKind::Paper => ContentType::Paper,
+                EntryKind::PodcastEpisode => ContentType::Audio,
+                _ => ContentType::Article,
+            },
+            |c| c.content_type,
+        );
+
+        let clean_audio_url = rec
+            .content
+            .as_ref()
+            .and_then(|c| c.audio_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|u| Url::parse(u).ok())
+            .map(String::from)
+            .or_else(|| {
+                parsed_url
+                    .as_ref()
+                    .filter(|u| base_content_type == ContentType::Audio && is_direct_audio_url(u))
+                    .map(|u| u.as_str().to_owned())
+            });
+
+        let clean_duration = rec.content.as_ref().and_then(|c| c.duration).filter(|&d| d > 0);
+        let resolved_content_type =
+            if clean_audio_url.is_some() { ContentType::Audio } else { base_content_type };
+
+        Self {
+            record: rec,
+            parsed_url,
+            canon_url,
+            arxiv_id,
+            clean_summary,
+            clean_html,
+            clean_thumb,
+            clean_audio_url,
+            clean_duration,
+            resolved_content_type,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn from_pre_cleaned_record(rec: SyncEntryRecord) -> Self {
+        let parsed_url = rec
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|u| Url::parse(u).ok());
+        let clean_html = rec
+            .content
+            .as_ref()
+            .and_then(|c| c.content_html.as_deref())
+            .filter(|h| !h.trim().is_empty())
+            .map(str::to_owned);
+        let clean_summary =
+            rec.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let clean_thumb = rec
+            .thumbnail_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|u| crate::util::url_guard::parse_public_url(u).ok().map(String::from));
+        Self::from_sanitized_fields(rec, parsed_url, clean_html, clean_summary, clean_thumb)
+    }
 }
