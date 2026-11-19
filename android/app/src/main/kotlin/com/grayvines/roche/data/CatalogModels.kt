@@ -1,5 +1,7 @@
 package com.grayvines.roche.data
 
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -321,8 +323,11 @@ data class SyncEntryContentDto(
 )
 
 @Serializable
+@OptIn(ExperimentalSerializationApi::class)
 data class SyncEntryStateDto(
-    @SerialName("inbox_state") val inboxState: String = "none",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("inbox_state")
+    val inboxState: String = "none",
     @SerialName("read_at") val readAt: String? = null,
     val progress: Double = 0.0,
     @SerialName("interaction_updated_at") val interactionUpdatedAt: String? = null,

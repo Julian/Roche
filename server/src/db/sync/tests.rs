@@ -2056,3 +2056,12 @@ async fn test_unicode_tags_membership_tombstones_and_mid_pagination_writes() {
     assert!(!p2.has_more);
     assert!(p2.entries.iter().any(|e| e.id == mid_entry.id));
 }
+
+#[test]
+fn test_sync_entry_state_defaults_missing_inbox_state_to_none() {
+    let parsed: SyncEntryState =
+        serde_json::from_str(r#"{"hlc":"001780000001000-0000-peer-android"}"#).unwrap();
+    assert_eq!(parsed.inbox_state, InboxState::None);
+    assert!((parsed.progress - 0.0).abs() < f64::EPSILON);
+    assert_eq!(parsed.hlc, "001780000001000-0000-peer-android");
+}

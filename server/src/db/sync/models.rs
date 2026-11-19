@@ -42,6 +42,7 @@ pub struct SyncEntryContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncEntryState {
+    #[serde(default)]
     pub inbox_state: InboxState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,

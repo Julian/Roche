@@ -1483,6 +1483,7 @@ internal fun buildOfflineCacheMockClient(
 internal fun assertTwoWaySyncPushedRequests(pushedBodies: List<String>) {
     val body = pushedBodies.single()
     assertTrue(body.contains("https://example.com/offline-note"))
+    assertTrue(body.contains(""""inbox_state":"none""""))
     assertTrue(body.contains(""""slug":"want:read""""))
     assertTrue(body.contains(""""collection_id":"$WANT_TO_READ_COLLECTION_ID""""))
     assertTrue(body.contains(""""inbox_state":"dismissed""""))
