@@ -5,20 +5,26 @@ use axum::{
     extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Datelike as _, NaiveDate, Utc};
 use url::Url;
 
 use super::{ArchiveBatchForm, InboxQuery, ItemReturnForm, SaveUrlForm, render_audio_play_button};
 use crate::{
-    db::{ContentType, Item, ItemFilter, ItemStatus, ItemStatusFilter, ReadAtPatch},
+    db::{
+        ContentType, Feed, Item, ItemFilter, ItemStatus, ItemStatusFilter, ReadAtPatch,
+        WANT_TO_READ_COLLECTION_ID,
+    },
     scheduler::FeedFetcher,
     service::RocheService,
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, content_type_label, esc, parse_csv_list,
-            redirect_see_other, redirect_with_flash, render_inline_csrf_form, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, content_type_badge_class,
+            content_type_label, esc, parse_csv_list, redirect_see_other, redirect_with_flash,
+            render_feed_favicon, render_inline_csrf_form, render_page, safe_local_redirect,
+            urlencode, web_api_error_response,
         },
+        links::sanitize_non_local_href,
     },
 };
 
@@ -61,12 +67,21 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         ..ItemFilter::default()
     };
 
-    let page = match service.items().query().with_filter(filter).list_page().await {
+    let (page_res, feeds, sync_res, labels) = tokio::join!(
+        service.items().query().with_filter(filter).list_page(),
+        load_sorted_active_feeds(&service),
+        service.sync_status(),
+        load_inbox_filter_labels(&service, clean_feed, clean_tag),
+    );
+    let page = match page_res {
         Ok(p) => p,
         Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
     };
-
-    let (feed_label, tag_label) = load_inbox_filter_labels(&service, clean_feed, clean_tag).await;
+    let total_unread = sync_res.map_or_else(
+        |_| feeds.iter().map(|f| f.unread_count).sum::<i64>(),
+        |s| s.unread_items_count,
+    );
+    let (feed_label, tag_label) = labels;
 
     let nav_ctx = InboxNavParams {
         status: status_slug,
@@ -78,28 +93,39 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
     };
     let return_url = build_inbox_href(&nav_ctx);
 
-    let mut body = String::with_capacity(8_192);
-    body.push_str("<div class=\"page-head\"><h2>Feed Inbox</h2>");
-    render_inline_csrf_form(
+    let mut body = String::with_capacity(16_384);
+    body.push_str("<div class=\"inbox-layout\">\n");
+    render_inbox_sidebar(&mut body, &nav_ctx, &feeds, total_unread);
+    body.push_str("<section class=\"inbox-stream\" aria-label=\"Feed stream\">\n");
+    render_inbox_mobile_pills(&mut body, &nav_ctx);
+    render_inbox_toolbar(
         &mut body,
-        "/web/feeds/refresh-all",
         &session.csrf_token,
-        &[("return_to", &return_url)],
-        None,
-        "<button type=\"submit\" class=\"btn btn-small\">&#8635; Refresh Feeds</button>",
+        &nav_ctx,
+        feed_label.as_deref(),
+        total_unread,
+        &page.items,
+        &return_url,
     );
-    body.push_str(
-        "</div>\n\
-         <p class=\"lede\">Read-only chronological stream from your subscribed feeds. Save standalone links or PDFs to <a href=\"/\">Want to Read</a>.</p>\n",
-    );
-    render_inbox_filter_bar(&mut body, &nav_ctx, feed_label.as_deref(), tag_label.as_deref());
-    render_inbox_batch_controls(&mut body, &session.csrf_token, &nav_ctx, &page.items, &return_url);
+    let has_active_filters = nav_ctx.feed.is_some()
+        || nav_ctx.tag.is_some()
+        || nav_ctx.kind.is_some()
+        || nav_ctx.q.is_some();
+    if has_active_filters {
+        render_inbox_active_filters(
+            &mut body,
+            &nav_ctx,
+            feed_label.as_deref(),
+            tag_label.as_deref(),
+        );
+    }
     render_item_rows(&mut body, &page.items, &session.csrf_token, &return_url);
     render_inbox_pager(&mut body, &nav_ctx, page_num, page.has_more);
+    body.push_str("</section>\n</div>\n");
 
     let flash = FlashQuery { notice: q.notice, err: q.err };
     render_page(&PageShell {
-        title: "Inbox",
+        title: feed_label.as_deref().unwrap_or("Inbox"),
         active: NavSection::Inbox,
         csrf_token: &session.csrf_token,
         flash: &flash,
@@ -107,6 +133,19 @@ pub(in crate::web) async fn inbox_get<F: FeedFetcher>(
         body_html: &body,
     })
     .into_response()
+}
+
+async fn load_sorted_active_feeds<F: FeedFetcher>(service: &RocheService<F>) -> Vec<Feed> {
+    let mut feeds = service.feeds().list().await.unwrap_or_default();
+    feeds.retain(|f| f.is_active);
+    feeds.sort_by(|a, b| {
+        b.unread_count.cmp(&a.unread_count).then_with(|| {
+            let ta = a.title.as_deref().unwrap_or(a.url.as_str()).to_ascii_lowercase();
+            let tb = b.title.as_deref().unwrap_or(b.url.as_str()).to_ascii_lowercase();
+            ta.cmp(&tb)
+        })
+    });
+    feeds
 }
 
 async fn load_inbox_filter_labels<F: FeedFetcher>(
@@ -185,13 +224,94 @@ fn build_inbox_href(p: &InboxNavParams<'_>) -> String {
     format!("/inbox?{}", parts.join("&"))
 }
 
-fn render_inbox_filter_bar(
+fn render_inbox_sidebar(
     out: &mut String,
     p: &InboxNavParams<'_>,
-    feed_label: Option<&str>,
-    tag_label: Option<&str>,
+    feeds: &[Feed],
+    total_unread: i64,
 ) {
-    out.push_str("<div class=\"pill-bar\">\n");
+    out.push_str(
+        "<div class=\"inbox-sidebar\">\n\
+         <div class=\"sidebar-group\">\n\
+           <div class=\"sidebar-heading\">Views</div>\n\
+           <ul class=\"sidebar-list\">\n",
+    );
+    for (slug, label, count_opt) in [
+        ("unread", "Unread", Some(total_unread)),
+        ("all", "All Items", None),
+        ("archived", "Archived", None),
+    ] {
+        let is_active = p.status == slug && p.feed.is_none();
+        let attrs = if is_active { " class=\"is-active\" aria-current=\"true\"" } else { "" };
+        let href = build_inbox_href(&InboxNavParams { status: slug, feed: None, page: 1, ..*p });
+        let count_html = count_opt.map_or_else(String::new, |c| format!("{c}"));
+        let _ = writeln!(
+            out,
+            "<li><a href=\"{}\"{attrs}><span class=\"sidebar-label\">{label}</span>\
+             <span class=\"sidebar-count\">{count_html}</span></a></li>",
+            esc(&href),
+        );
+    }
+    out.push_str(
+        "</ul>\n</div>\n\
+         <div class=\"sidebar-group\">\n\
+           <div class=\"sidebar-heading\">Format</div>\n\
+           <ul class=\"sidebar-list\">\n",
+    );
+    // TODO(backend): include per-format unread counts in inbox sidebar
+    for (k_slug, label) in
+        [("article", "Articles"), ("audio", "Podcasts"), ("paper", "Papers"), ("video", "Videos")]
+    {
+        let is_cur = p.kind == Some(k_slug);
+        let attrs = if is_cur { " class=\"is-active\" aria-current=\"true\"" } else { "" };
+        let next_kind = if is_cur { None } else { Some(k_slug) };
+        let href = build_inbox_href(&InboxNavParams { kind: next_kind, page: 1, ..*p });
+        let _ = writeln!(
+            out,
+            "<li><a href=\"{}\"{attrs}><span class=\"sidebar-label\">{label}</span></a></li>",
+            esc(&href),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "</ul>\n</div>\n\
+         <div class=\"sidebar-group\">\n\
+           <div class=\"sidebar-heading\">Feeds ({})</div>\n\
+           <input type=\"search\" class=\"sidebar-feed-filter\" placeholder=\"Filter feeds…\" aria-label=\"Filter feeds\">\n\
+           <ul class=\"sidebar-list\" id=\"roche-sidebar-feeds\">",
+        feeds.len(),
+    );
+    for feed in feeds {
+        let label = feed.title.as_deref().filter(|s| !s.is_empty()).unwrap_or(feed.url.as_str());
+        let is_cur = p.feed == Some(feed.id.as_str());
+        let attrs = if is_cur { " class=\"is-active\" aria-current=\"true\"" } else { "" };
+        let next_feed = if is_cur { None } else { Some(feed.id.as_str()) };
+        let next_status = if is_cur { p.status } else { "all" };
+        let href = build_inbox_href(&InboxNavParams {
+            status: next_status,
+            feed: next_feed,
+            page: 1,
+            ..*p
+        });
+        let _ = write!(
+            out,
+            "<li data-feed-name=\"{}\"><a href=\"{}\"{attrs}><span class=\"sidebar-item-main\">",
+            esc(&label.to_ascii_lowercase()),
+            esc(&href),
+        );
+        render_feed_favicon(out, Some(feed.url.as_str()), label, false);
+        let cnt = if feed.unread_count > 0 { feed.unread_count.to_string() } else { String::new() };
+        let _ = writeln!(
+            out,
+            "<span class=\"sidebar-label\">{}</span></span><span class=\"sidebar-count\">{cnt}</span></a></li>",
+            esc(label),
+        );
+    }
+    out.push_str("</ul>\n</div>\n</div>\n");
+}
+
+fn render_inbox_mobile_pills(out: &mut String, p: &InboxNavParams<'_>) {
+    out.push_str("<div class=\"inbox-mobile-filters pill-bar\">\n");
     for (slug, label) in [("unread", "Unread"), ("all", "All"), ("archived", "Archived")] {
         let attrs = if p.status == slug {
             "class=\"pill is-active\" aria-current=\"true\""
@@ -215,16 +335,42 @@ fn render_inbox_filter_bar(
         let _ = writeln!(out, "<a {attrs} href=\"{}\">{label}</a>", esc(&href));
     }
     out.push_str("</div>\n");
+}
 
-    let has_active_filters =
-        p.feed.is_some() || p.tag.is_some() || p.kind.is_some() || p.q.is_some();
-    if has_active_filters {
-        render_inbox_active_filters(out, p, feed_label, tag_label);
+fn render_inbox_toolbar(
+    out: &mut String,
+    csrf: &str,
+    p: &InboxNavParams<'_>,
+    feed_label: Option<&str>,
+    total_unread: i64,
+    items: &[Item],
+    return_to: &str,
+) {
+    let heading = feed_label.unwrap_or(match p.status {
+        "all" => "All Items",
+        "archived" => "Archived",
+        _ => "Unread",
+    });
+    let _ = write!(
+        out,
+        "<div class=\"inbox-toolbar\">\n\
+           <div class=\"inbox-toolbar-title\">\n\
+             <h2>{}</h2>",
+        esc(heading),
+    );
+    if feed_label.is_none() && p.status == "unread" && p.kind.is_none() && p.q.is_none() {
+        let _ = write!(out, "<span class=\"inbox-toolbar-count\">{total_unread} items</span>");
     }
+    out.push_str("</div>\n<div class=\"inbox-toolbar-actions\">\n");
+    render_inbox_inline_search(out, p);
+    render_inbox_batch_controls(out, csrf, p, items, return_to);
+    out.push_str("</div>\n</div>\n");
+}
 
+fn render_inbox_inline_search(out: &mut String, p: &InboxNavParams<'_>) {
     let _ = writeln!(
         out,
-        "<form method=\"get\" action=\"/inbox\" class=\"search-form\">\n\
+        "<form method=\"get\" action=\"/inbox\" class=\"inbox-toolbar-search\">\n\
            <input type=\"hidden\" name=\"status\" value=\"{}\">",
         esc(p.status),
     );
@@ -239,8 +385,7 @@ fn render_inbox_filter_bar(
     }
     let _ = write!(
         out,
-        "<input type=\"search\" name=\"q\" aria-label=\"Search inbox\" value=\"{}\" placeholder=\"Search titles, full text, feeds, tags...\" class=\"flex-1\">\n\
-         <button type=\"submit\" class=\"btn\">Search</button>\n\
+        "<input type=\"search\" name=\"q\" aria-label=\"Search inbox\" value=\"{}\" placeholder=\"Filter stream…\">\n\
          </form>\n",
         esc(p.q.unwrap_or("")),
     );
@@ -318,7 +463,6 @@ fn render_inbox_batch_controls(
     if p.status == "archived" || unread_ids.is_empty() {
         return;
     }
-    out.push_str("<div class=\"batch-controls\">\n");
     if has_narrowing {
         let joined = unread_ids.join(",");
         let btn = format!(
@@ -352,7 +496,58 @@ fn render_inbox_batch_controls(
             "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Archive All Unread</button>",
         );
     }
-    out.push_str("\n</div>\n");
+}
+
+fn day_bucket_label(dt: DateTime<Utc>, today: NaiveDate) -> String {
+    let date = dt.date_naive();
+    if date == today {
+        format!("Today · {}", dt.format("%b %d"))
+    } else if today.pred_opt() == Some(date) {
+        format!("Yesterday · {}", dt.format("%b %d"))
+    } else if date.year() == today.year() {
+        dt.format("%A · %b %d").to_string()
+    } else {
+        dt.format("%b %d, %Y").to_string()
+    }
+}
+
+fn clean_plain_excerpt(raw: &str) -> String {
+    let mut plain = String::with_capacity(raw.len().min(260));
+    let mut in_tag = false;
+    let mut prev_space = true;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !prev_space {
+                    plain.push(' ');
+                    prev_space = true;
+                }
+            }
+            c if !in_tag => {
+                if c.is_whitespace() {
+                    if !prev_space {
+                        plain.push(' ');
+                        prev_space = true;
+                    }
+                } else {
+                    plain.push(c);
+                    prev_space = false;
+                }
+            }
+            _ => {}
+        }
+        if plain.chars().count() >= 220 {
+            break;
+        }
+    }
+    let trimmed = plain.trim_end();
+    if raw.chars().count() > 220 && !trimmed.is_empty() {
+        format!("{trimmed}…")
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, return_to: &str) {
@@ -361,82 +556,163 @@ pub(super) fn render_item_rows(out: &mut String, items: &[Item], csrf: &str, ret
         return;
     }
 
-    out.push_str("<ul class=\"inbox-list\">\n");
+    let today = Utc::now().date_naive();
+    let mut active_day: Option<String> = None;
+    let mut first_group = true;
     for item in items {
-        let row_cls =
-            if item.status == ItemStatus::Archived { "inbox-row is-archived" } else { "inbox-row" };
+        let day_label = day_bucket_label(item.published_at.unwrap_or(item.created_at), today);
+        if active_day.as_deref() != Some(day_label.as_str()) {
+            if active_day.is_some() {
+                out.push_str("</ul>\n");
+            }
+            let cls = if first_group { "day-divider is-today" } else { "day-divider" };
+            let _ = writeln!(
+                out,
+                "<div class=\"{cls}\">{}</div>\n<ul class=\"inbox-list\">",
+                esc(&day_label)
+            );
+            active_day = Some(day_label);
+            first_group = false;
+        }
+        render_single_inbox_row(out, item, csrf, return_to);
+    }
+    if active_day.is_some() {
+        out.push_str("</ul>\n");
+    }
+}
+
+fn render_single_inbox_row(out: &mut String, item: &Item, csrf: &str, return_to: &str) {
+    let row_cls =
+        if item.status == ItemStatus::Archived { "inbox-row is-archived" } else { "inbox-row" };
+    let id_enc = urlencode(&item.id);
+    let (star_glyph, star_pressed, star_cls) = if item.is_favorite {
+        ("&#9733;", "true", "btn btn-small btn-ghost inbox-star-btn is-starred")
+    } else {
+        ("&#9734;", "false", "btn btn-small btn-ghost inbox-star-btn")
+    };
+    let star_btn = format!(
+        "<button type=\"submit\" class=\"{star_cls}\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+        esc(&item.title),
+    );
+
+    let _ = write!(out, "<li class=\"{row_cls}\">\n<div class=\"inbox-star-col\">");
+    render_inline_csrf_form(
+        out,
+        &format!("/web/items/{id_enc}/star"),
+        csrf,
+        &[("return_to", return_to)],
+        None,
+        &star_btn,
+    );
+    out.push_str("</div>\n");
+
+    if let Some(thumb) = item.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+        let _ = writeln!(
+            out,
+            "<a class=\"inbox-thumb-link\" href=\"/reader/{id_enc}\" tabindex=\"-1\" aria-hidden=\"true\">\
+               <img class=\"inbox-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+             </a>",
+            esc(thumb),
+        );
+    }
+
+    let _ = write!(
+        out,
+        "<div class=\"inbox-main\">\n\
+           <div class=\"inbox-title\"><a href=\"/reader/{id_enc}\">{}</a></div>\
+           <div class=\"item-byline\">",
+        esc(&item.title),
+    );
+    if item.content_type != ContentType::Article {
         let _ = write!(
             out,
-            "<li class=\"{row_cls}\">\n\
-               <div class=\"inbox-main\">\n\
-                 <div class=\"inbox-title\"><a href=\"/reader/{}\">{}</a></div>\
-                 <div class=\"item-byline\"><span class=\"badge\">{}</span>",
-            esc(&urlencode(&item.id)),
-            esc(&item.title),
+            "<span class=\"badge badge-kind{}\">{}</span>",
+            content_type_badge_class(item.content_type),
             esc(content_type_label(item.content_type)),
         );
-        if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
-            if let Some(fid) = item.feed_id.as_deref() {
-                let _ = write!(
-                    out,
-                    "<a href=\"/inbox?status=all&amp;feed={}\">{}</a>",
-                    esc(&urlencode(fid)),
-                    esc(ft)
-                );
-            } else {
-                let _ = write!(out, "<span>{}</span>", esc(ft));
-            }
+    }
+    if let Some(ft) = item.feed_title.as_deref().filter(|s| !s.is_empty()) {
+        let icon_url = item.feed_url.as_deref().or(Some(item.url.as_str()));
+        if let Some(fid) = item.feed_id.as_deref() {
+            let _ = write!(
+                out,
+                "<a class=\"byline-item byline-feed\" href=\"/inbox?status=all&amp;feed={}\">",
+                esc(&urlencode(fid)),
+            );
+            render_feed_favicon(out, icon_url, ft, true);
+            let _ = write!(out, "<span>{}</span></a>", esc(ft));
+        } else {
+            out.push_str("<span class=\"byline-item byline-feed\">");
+            render_feed_favicon(out, icon_url, ft, true);
+            let _ = write!(out, "<span>{}</span></span>", esc(ft));
         }
-        if let Some(dt) = item.published_at {
-            let _ = write!(out, "<span>{}</span>", dt.format("%Y-%m-%d"));
+    }
+    if let Some(dt) = item.published_at {
+        let _ = write!(out, "<span class=\"byline-item\">{}</span>", dt.format("%b %d"));
+    }
+    for tag_name in &item.tag_names.0 {
+        let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
+    }
+    out.push_str("</div>\n");
+    if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let excerpt = clean_plain_excerpt(sum);
+        if !excerpt.is_empty() {
+            let _ = writeln!(out, "<p class=\"item-excerpt-clamped\">{}</p>", esc(&excerpt));
         }
-        for tag_name in &item.tag_names.0 {
-            let _ = write!(out, "<span class=\"badge\">#{}</span>", esc(tag_name));
-        }
-        out.push_str("</div>\n");
-        if let Some(sum) = item.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let snippet: String = sum.chars().take(180).collect();
-            let suffix = if sum.chars().count() > 180 { "…" } else { "" };
-            let _ = writeln!(out, "<p class=\"item-excerpt\">{}{suffix}</p>", esc(&snippet));
-        }
-        out.push_str("</div>\n<div class=\"inbox-controls\">\n");
-        render_audio_play_button(out, item);
+    }
+    out.push_str("</div>\n");
+    render_inbox_row_controls(out, item, &id_enc, csrf, return_to);
+    out.push_str("</li>\n");
+}
 
-        let id_enc = urlencode(&item.id);
-        let (star_glyph, star_pressed) =
-            if item.is_favorite { ("&#9733;", "true") } else { ("&#9734;", "false") };
-        let star_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\" title=\"Toggle Star\" aria-label=\"Star {}\" aria-pressed=\"{star_pressed}\"><span aria-hidden=\"true\">{star_glyph}</span></button>",
+fn render_inbox_row_controls(
+    out: &mut String,
+    item: &Item,
+    id_enc: &str,
+    csrf: &str,
+    return_to: &str,
+) {
+    out.push_str("<div class=\"inbox-controls inbox-controls-subtle\">\n");
+    render_audio_play_button(out, item);
+
+    let queue_btn = format!(
+        "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\" title=\"Add to Queue\" aria-label=\"Add {} to Queue\">+ Queue</button>",
+        esc(&item.title),
+    );
+    render_inline_csrf_form(
+        out,
+        &format!("/web/entries/{id_enc}/list-add"),
+        csrf,
+        &[("list_slug_or_id", WANT_TO_READ_COLLECTION_ID), ("return_to", return_to)],
+        None,
+        &queue_btn,
+    );
+    out.push_str("<span class=\"controls-sep\" aria-hidden=\"true\"></span>");
+
+    if item.status == ItemStatus::Unread {
+        let arch_btn = format!(
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-icon\" title=\"Archive (mark read)\" aria-label=\"Archive {}\">{ARCHIVE_BOX_SVG}</button>",
             esc(&item.title),
         );
         render_inline_csrf_form(
             out,
-            &format!("/web/items/{id_enc}/star"),
-            csrf,
-            &[("return_to", return_to)],
-            None,
-            &star_btn,
-        );
-
-        let (arch_action, arch_label) = if item.status == ItemStatus::Unread {
-            ("archive", "Archive")
-        } else {
-            ("unarchive", "Restore")
-        };
-        let arch_btn = format!(
-            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">{arch_label}</button>"
-        );
-        render_inline_csrf_form(
-            out,
-            &format!("/web/items/{id_enc}/{arch_action}"),
+            &format!("/web/items/{id_enc}/archive"),
             csrf,
             &[("return_to", return_to)],
             None,
             &arch_btn,
         );
-        out.push_str("\n</div>\n</li>\n");
+    } else {
+        render_inline_csrf_form(
+            out,
+            &format!("/web/items/{id_enc}/unarchive"),
+            csrf,
+            &[("return_to", return_to)],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Restore</button>",
+        );
     }
-    out.push_str("</ul>\n");
+    out.push_str("\n</div>\n");
 }
 
 pub(in crate::web) async fn starred_get<F: FeedFetcher>(

@@ -1224,6 +1224,16 @@
     });
   };
 
+  const initFaviconFallbacks = () => {
+    for (const img of document.querySelectorAll(".feed-favicon img")) {
+      if (img.dataset.bound === "1") continue;
+      img.dataset.bound = "1";
+      const markFallback = () => img.closest(".feed-favicon")?.classList.add("is-fallback");
+      img.addEventListener("error", markFallback, { once: true });
+      if (img.complete && img.naturalWidth === 0) markFallback();
+    }
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
     initRankBoard();
@@ -1231,6 +1241,7 @@
     initRefreshBanner();
     initSleeveDrawers();
     initSidebarFeedFilter();
+    initFaviconFallbacks();
   };
 
   if (document.readyState === "loading") {

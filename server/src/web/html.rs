@@ -110,6 +110,8 @@ pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
     }
 }
 
+pub(super) const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
+
 #[must_use]
 pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
     match ct {
@@ -119,6 +121,49 @@ pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
         ContentType::Audio => "Audio",
         ContentType::Pdf => "PDF",
     }
+}
+
+#[must_use]
+pub(super) const fn content_type_badge_class(ct: ContentType) -> &'static str {
+    match ct {
+        ContentType::Article => "",
+        ContentType::Audio => " badge-podcast",
+        ContentType::Paper => " badge-paper",
+        ContentType::Pdf => " badge-pdf",
+        ContentType::Video => " badge-video",
+    }
+}
+
+pub(super) fn render_feed_favicon(
+    out: &mut String,
+    raw_url: Option<&str>,
+    label: &str,
+    small: bool,
+) {
+    let host = raw_url
+        .and_then(|u| url::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .filter(|h| !h.is_empty());
+    let seed = host.as_deref().unwrap_or(label);
+    let letter = label
+        .chars()
+        .chain(seed.chars())
+        .find(|c| c.is_alphanumeric())
+        .map_or('?', |c| c.to_ascii_uppercase());
+    let tone = seed.bytes().fold(0usize, |acc, b| acc.wrapping_add(usize::from(b))) % 5;
+    let sz_cls = if small { " feed-favicon-sm" } else { "" };
+    let _ = write!(
+        out,
+        "<span class=\"feed-favicon{sz_cls} fav-tone-{tone}\" aria-hidden=\"true\">{letter}"
+    );
+    if let Some(h) = host {
+        let _ = write!(
+            out,
+            "<img src=\"https://icons.duckduckgo.com/ip3/{}.ico\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+            esc(&h),
+        );
+    }
+    out.push_str("</span>");
 }
 
 #[must_use]
