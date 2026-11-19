@@ -362,7 +362,9 @@ class ThumbnailLoader(
                             }
                         }
                     }
-                if (streamed && stagingFile.isFile && stagingFile.length() in 1..MAX_THUMBNAIL_BYTES) {
+                if (
+                    streamed && stagingFile.isFile && stagingFile.length() in 1..MAX_THUMBNAIL_BYTES
+                ) {
                     commitStreamedCacheFile(thumbsDir, fileKey, stagingFile)
                 } else {
                     null
@@ -418,9 +420,7 @@ class ThumbnailLoader(
             targetFile.setLastModified(clockMs())
             if (estimatedDiskFileCount < 0) {
                 estimatedDiskFileCount =
-                    thumbsDir
-                        .listFiles()
-                        ?.count { it.isFile && !it.name.endsWith(".tmp") } ?: 1
+                    thumbsDir.listFiles()?.count { it.isFile && !it.name.endsWith(".tmp") } ?: 1
             } else if (!existedBefore) {
                 estimatedDiskFileCount++
             }

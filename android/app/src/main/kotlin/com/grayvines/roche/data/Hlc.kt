@@ -122,8 +122,7 @@ internal class HlcClock(
                 prev == null || phys > prev.wallMs -> HlcTimestamp.create(phys, 0, nodeId)
                 prev.counter < MAX_HLC_COUNTER ->
                     HlcTimestamp.create(prev.wallMs, prev.counter + 1, nodeId)
-                prev.wallMs < MAX_HLC_WALL_MS ->
-                    HlcTimestamp.create(prev.wallMs + 1L, 0, nodeId)
+                prev.wallMs < MAX_HLC_WALL_MS -> HlcTimestamp.create(prev.wallMs + 1L, 0, nodeId)
                 else -> HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, nodeId)
             }
         last = next
@@ -227,13 +226,12 @@ internal suspend fun nextLocalHlc(
     nowMs: Long = System.currentTimeMillis(),
 ): String {
     val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val next =
-        hlcClockMutex.withLock {
-            val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
-            val ticked = HlcClock(nodeId, seed).tick(nowMs).encode()
-            lastHlcByDao[dao] = ticked
-            ticked
-        }
+    val next = hlcClockMutex.withLock {
+        val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
+        val ticked = HlcClock(nodeId, seed).tick(nowMs).encode()
+        lastHlcByDao[dao] = ticked
+        ticked
+    }
     dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }
@@ -245,22 +243,20 @@ internal suspend fun witnessRemoteHlcInDao(
     nowMs: Long = System.currentTimeMillis(),
 ): String {
     val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
-    val next =
-        hlcClockMutex.withLock {
-            val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
-            val clock = HlcClock(nodeId, seed)
-            var witnessedAny = false
-            for (raw in remoteHlcValues) {
-                val parsed = HlcTimestamp.parse(raw) ?: continue
-                clock.witness(parsed, nowMs)
-                witnessedAny = true
-            }
-            val advanced =
-                (if (witnessedAny) clock.current() else null)?.encode()
-                    ?: clock.tick(nowMs).encode()
-            lastHlcByDao[dao] = advanced
-            advanced
+    val next = hlcClockMutex.withLock {
+        val seed = maxHlcRaw(dbPrev, lastHlcByDao[dao])
+        val clock = HlcClock(nodeId, seed)
+        var witnessedAny = false
+        for (raw in remoteHlcValues) {
+            val parsed = HlcTimestamp.parse(raw) ?: continue
+            clock.witness(parsed, nowMs)
+            witnessedAny = true
         }
+        val advanced =
+            (if (witnessedAny) clock.current() else null)?.encode() ?: clock.tick(nowMs).encode()
+        lastHlcByDao[dao] = advanced
+        advanced
+    }
     dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
     return next
 }

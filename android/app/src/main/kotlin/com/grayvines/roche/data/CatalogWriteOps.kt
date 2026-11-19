@@ -238,7 +238,8 @@ private suspend fun synthesizeArtistsInDao(
         val clean = rawArtist.trim()
         if (clean.isEmpty()) continue
         val existing = allArtists.firstOrNull { it.title.equals(clean, ignoreCase = true) }
-        val artistId = existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
+        val artistId =
+            existing?.id ?: ensureSynthesizedArtist(dao, clean, nowIso, markDirty, nodeId)
         val hlc =
             if (markDirty) {
                 nextLocalHlc(dao, nodeId)

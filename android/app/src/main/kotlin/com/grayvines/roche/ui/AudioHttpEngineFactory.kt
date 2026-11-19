@@ -92,15 +92,14 @@ internal fun createAudioDataSourceFactory(
         } else {
             { url -> url.openConnection() as HttpURLConnection }
         }
-    val safeHttpFactory =
-        DataSource.Factory {
-            SafeRedirectHttpDataSource(
-                openConnection = connectionOpener,
-                userAgent = ROCHE_AUDIO_USER_AGENT,
-                connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
-                readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
-            )
-        }
+    val safeHttpFactory = DataSource.Factory {
+        SafeRedirectHttpDataSource(
+            openConnection = connectionOpener,
+            userAgent = ROCHE_AUDIO_USER_AGENT,
+            connectTimeoutMs = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = AUDIO_HTTP_READ_TIMEOUT_MS,
+        )
+    }
     return DefaultDataSource.Factory(context, safeHttpFactory)
 }
 
@@ -114,7 +113,7 @@ internal class SafeRedirectHttpDataSource(
     private val connectTimeoutMs: Int = AUDIO_HTTP_CONNECT_TIMEOUT_MS,
     private val readTimeoutMs: Int = AUDIO_HTTP_READ_TIMEOUT_MS,
     private val maxRedirects: Int = MAX_REDIRECTS,
-) : BaseDataSource(/* isNetwork = */ true) {
+) : BaseDataSource(/* isNetwork= */ true) {
     private var connection: HttpURLConnection? = null
     private var inputStream: InputStream? = null
     private var opened = false
@@ -146,14 +145,15 @@ internal class SafeRedirectHttpDataSource(
         if (responseCode < 200 || responseCode > 299) {
             closeConnectionQuietly()
             if (responseCode == 416) {
-                val documentSize =
-                    HttpUtil.getDocumentSize(conn.getHeaderField("Content-Range"))
+                val documentSize = HttpUtil.getDocumentSize(conn.getHeaderField("Content-Range"))
                 if (dataSpec.position == documentSize) {
                     opened = true
                     transferStarted(dataSpec)
                     return if (dataSpec.length != C.LENGTH_UNSET.toLong()) dataSpec.length else 0L
                 }
-                throw DataSourceException(PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE)
+                throw DataSourceException(
+                    PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE
+                )
             }
             throw HttpDataSource.InvalidResponseCodeException(
                 responseCode,
@@ -165,7 +165,8 @@ internal class SafeRedirectHttpDataSource(
             )
         }
 
-        val bytesToSkip = if (responseCode == 200 && dataSpec.position != 0L) dataSpec.position else 0L
+        val bytesToSkip =
+            if (responseCode == 200 && dataSpec.position != 0L) dataSpec.position else 0L
         if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
             bytesToRead = dataSpec.length
         } else {
@@ -328,7 +329,8 @@ internal class SafeRedirectHttpDataSource(
         var remaining = bytesToSkip
         val skipBuffer = ByteArray(4096)
         while (remaining > 0L) {
-            val read = stream.read(skipBuffer, 0, minOf(remaining, skipBuffer.size.toLong()).toInt())
+            val read =
+                stream.read(skipBuffer, 0, minOf(remaining, skipBuffer.size.toLong()).toInt())
             if (read == -1) {
                 throw EOFException("Unexpected end of stream while skipping audio bytes")
             }

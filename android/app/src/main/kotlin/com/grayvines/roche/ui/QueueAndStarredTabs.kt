@@ -62,8 +62,8 @@ import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 private sealed interface StarredDisplayRow {
     val stableKey: String

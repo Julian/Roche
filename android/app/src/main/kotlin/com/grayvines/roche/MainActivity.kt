@@ -169,16 +169,15 @@ class MainActivity : ComponentActivity() {
         }
         val repo = (application as RocheApp).graph.repository
         musicDrawResolveJob?.cancel()
-        musicDrawResolveJob =
-            lifecycleScope.launch {
-                val enriched =
-                    withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
-                        repo.resolveCollectionDrawStreaming(draw)
-                    } ?: draw
-                if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                    openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
-                }
+        musicDrawResolveJob = lifecycleScope.launch {
+            val enriched =
+                withTimeoutOrNull(ALBUM_RESOLVE_TIMEOUT_MS) {
+                    repo.resolveCollectionDrawStreaming(draw)
+                } ?: draw
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                openAlbumInMusicApp(this@MainActivity, enriched, ::openUrlInBrowser)
             }
+        }
     }
 
     private fun openUrlInBrowser(url: String) {

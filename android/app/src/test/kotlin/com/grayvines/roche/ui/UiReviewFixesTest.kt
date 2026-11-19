@@ -50,10 +50,8 @@ class UiReviewFixesTest {
 
     @Test
     fun `SafeRedirectHttpDataSource disables auto-redirects and blocks private redirect hops pre-connect`() {
-        val publicAddr =
-            InetAddress.getByAddress("pod.example.com", byteArrayOf(93, -72, -40, 34))
-        val privateAddr =
-            InetAddress.getByAddress("internal.local", byteArrayOf(127, 0, 0, 1))
+        val publicAddr = InetAddress.getByAddress("pod.example.com", byteArrayOf(93, -72, -40, 34))
+        val privateAddr = InetAddress.getByAddress("internal.local", byteArrayOf(127, 0, 0, 1))
         val connectedUrls = mutableListOf<String>()
         val followRedirectsSettings = mutableListOf<Boolean>()
 
@@ -74,18 +72,18 @@ class UiReviewFixesTest {
                     resolveSafeHttpPlaybackUrl(
                         rawUrl = url,
                         resolveAddresses = { host ->
-                            if (host == "internal.local") arrayOf(privateAddr) else arrayOf(publicAddr)
+                            if (host == "internal.local") arrayOf(privateAddr)
+                            else arrayOf(publicAddr)
                         },
                         isCleartextPermitted = { false },
                     )
                 },
             )
 
-        val err =
-            runCatching {
-                dataSource.openValidatedUrl("https://pod.example.com/start.mp3")
-            }
-                .exceptionOrNull()
+        val err = runCatching {
+            dataSource.openValidatedUrl("https://pod.example.com/start.mp3")
+        }
+            .exceptionOrNull()
         assertTrue(err is IOException)
         assertEquals(listOf("https://pod.example.com/start.mp3"), connectedUrls)
         assertEquals(listOf(false), followRedirectsSettings)
@@ -98,7 +96,10 @@ class UiReviewFixesTest {
         assertEquals(5f, computeSliderThumbCenterX(width = 10f, fraction = 0.2f, thumbRadius = 7f))
         assertEquals(7f, computeSliderThumbCenterX(width = 100f, fraction = 0f, thumbRadius = 7f))
         assertEquals(93f, computeSliderThumbCenterX(width = 100f, fraction = 1f, thumbRadius = 7f))
-        assertEquals(50f, computeSliderThumbCenterX(width = 100f, fraction = 0.5f, thumbRadius = 7f))
+        assertEquals(
+            50f,
+            computeSliderThumbCenterX(width = 100f, fraction = 0.5f, thumbRadius = 7f),
+        )
     }
 
     @Test
@@ -217,7 +218,10 @@ class UiReviewFixesTest {
 
     @Test
     fun `formatLatexAltToHtml preserves prefix-sharing commands and strips noscript template object embed`() {
-        val latex = formatLatexAltToHtml("""\left( \int_0^1 x^\top \alpha \le \textbf{M} \in \mathbb{R} \right)""")
+        val latex =
+            formatLatexAltToHtml(
+                """\left( \int_0^1 x^\top \alpha \le \textbf{M} \in \mathbb{R} \right)"""
+            )
         assertTrue(latex.contains("""\left"""))
         assertTrue(latex.contains("""\int"""))
         assertTrue(latex.contains("""\top"""))
@@ -330,7 +334,10 @@ class UiReviewFixesTest {
         override fun getResponseMessage(): String = "OK"
 
         override fun getHeaderField(name: String?): String? =
-            headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
+            headers.entries
+                .firstOrNull { it.key.equals(name, ignoreCase = true) }
+                ?.value
+                ?.firstOrNull()
 
         override fun getHeaderFields(): MutableMap<String, MutableList<String>> =
             headers.mapValues { it.value.toMutableList() }.toMutableMap()

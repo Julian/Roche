@@ -8,7 +8,6 @@ import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.TombstoneEntity
 import com.grayvines.roche.data.local.buildSqlContainsPattern
-import com.grayvines.roche.data.local.deleteEntryCascade
 import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureWantToReadSpecExists
 import com.grayvines.roche.data.local.extractFtsTokenQueries
@@ -23,7 +22,6 @@ import com.grayvines.roche.data.local.updateFeedTitleGraph
 import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.PublicUrlValidator
-import com.grayvines.roche.data.remote.RemoteItemDto
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.settings.clampPlaybackSpeed

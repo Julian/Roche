@@ -1084,8 +1084,7 @@ class MainViewModelTest {
             localVm.uiState.first { it.searchQuery == "Episode" }
             localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
             localVm.uiState.first {
-                it.playerState.currentEntryId == "ep-tier-1" &&
-                    it.activePlayerNotesContent != null
+                it.playerState.currentEntryId == "ep-tier-1" && it.activePlayerNotesContent != null
             }
             localVm.playerController.cancelAutoTickerForTest()
             localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))

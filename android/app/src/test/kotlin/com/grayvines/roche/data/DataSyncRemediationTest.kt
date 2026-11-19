@@ -3,7 +3,6 @@ package com.grayvines.roche.data
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.grayvines.roche.data.local.CollectionEntryEntity
-import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryEntity
@@ -50,9 +49,7 @@ class DataSyncRemediationTest {
     fun setUp() {
         tempDir = Files.createTempDirectory("roche-remediation-test").toFile()
         database =
-            Room.inMemoryDatabaseBuilder<RocheDatabase>()
-                .setDriver(BundledSQLiteDriver())
-                .build()
+            Room.inMemoryDatabaseBuilder<RocheDatabase>().setDriver(BundledSQLiteDriver()).build()
     }
 
     @AfterEach
@@ -68,11 +65,13 @@ class DataSyncRemediationTest {
         assertFalse(isAllowedSharedContentUri("file", "com.external.app", ownPkg))
         assertFalse(isAllowedSharedContentUri("content", ownPkg, ownPkg))
         assertFalse(isAllowedSharedContentUri("content", "$ownPkg.fileprovider", ownPkg))
-        assertFalse(
-            isAllowedSharedContentUri("content", "org.other.alias", ownPkg) { ownPkg }
-        )
+        assertFalse(isAllowedSharedContentUri("content", "org.other.alias", ownPkg) { ownPkg })
         assertTrue(
-            isAllowedSharedContentUri("content", "com.android.providers.downloads.documents", ownPkg) {
+            isAllowedSharedContentUri(
+                "content",
+                "com.android.providers.downloads.documents",
+                ownPkg,
+            ) {
                 "com.android.providers.downloads"
             }
         )
@@ -83,7 +82,10 @@ class DataSyncRemediationTest {
         val pdfPayload = "%PDF-1.7\n1 0 obj\n<<>>\nendobj\n".toByteArray(Charsets.UTF_8)
         val valid = openValidatedPdfStream(ByteArrayInputStream(pdfPayload))
         assertNotNull(valid)
-        assertEquals(String(pdfPayload, Charsets.UTF_8), String(valid!!.readBytes(), Charsets.UTF_8))
+        assertEquals(
+            String(pdfPayload, Charsets.UTF_8),
+            String(valid!!.readBytes(), Charsets.UTF_8),
+        )
 
         val sqliteHeader = "SQLite format 3\u0000more bytes".toByteArray(Charsets.UTF_8)
         assertNull(openValidatedPdfStream(ByteArrayInputStream(sqliteHeader)))
@@ -94,7 +96,9 @@ class DataSyncRemediationTest {
     fun `writeSharedPdfToItemDir confines path cleans temp file and handles zero-byte reads`() =
         runTest {
             val pdfBytes = "%PDF-1.4\nhello world\n".toByteArray(Charsets.UTF_8)
-            assertFalse(writeSharedPdfToItemDir(tempDir, "../escape", ByteArrayInputStream(pdfBytes)))
+            assertFalse(
+                writeSharedPdfToItemDir(tempDir, "../escape", ByteArrayInputStream(pdfBytes))
+            )
 
             val invalidResult =
                 writeSharedPdfToItemDir(
@@ -208,28 +212,27 @@ class DataSyncRemediationTest {
             val receivedRequests = CopyOnWriteArrayList<JsonObject>()
             val uploadedEntryIds = LinkedHashSet<String>()
             var seq = 10L
-            val apiClient =
-                RocheApiClient { req ->
-                    val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
-                    receivedRequests.add(parsed)
-                    val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
-                    if (entriesArr.size > 1) {
-                        HttpResponse(
-                            statusCode = 413,
-                            body = """{"title":"Payload Too Large","status":413}""",
-                        )
-                    } else {
-                        entriesArr.forEach { el ->
-                            uploadedEntryIds.add(el.jsonObject["id"]!!.jsonPrimitive.content)
-                        }
-                        seq += 1L
-                        HttpResponse(
-                            statusCode = 200,
-                            body =
-                                """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
-                        )
+            val apiClient = RocheApiClient { req ->
+                val parsed = rocheJson.parseToJsonElement(req.body.orEmpty()).jsonObject
+                receivedRequests.add(parsed)
+                val entriesArr = parsed["entries"]?.jsonArray.orEmpty()
+                if (entriesArr.size > 1) {
+                    HttpResponse(
+                        statusCode = 413,
+                        body = """{"title":"Payload Too Large","status":413}""",
+                    )
+                } else {
+                    entriesArr.forEach { el ->
+                        uploadedEntryIds.add(el.jsonObject["id"]!!.jsonPrimitive.content)
                     }
+                    seq += 1L
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
+                    )
                 }
+            }
 
             val coordinator =
                 PeerSyncCoordinator(
@@ -271,7 +274,10 @@ class DataSyncRemediationTest {
             // Verify halving eventually drained all 4 entries instead of stalling
             assertTrue(uploadedEntryIds.containsAll(entryIds))
             for (id in entryIds) {
-                assertFalse(dao.getEntryById(id)!!.isLocalDirty, "Entry $id should be clean after drain")
+                assertFalse(
+                    dao.getEntryById(id)!!.isLocalDirty,
+                    "Entry $id should be clean after drain",
+                )
             }
         }
 
@@ -302,14 +308,16 @@ class DataSyncRemediationTest {
     fun `HLC clamps future drift saturates at max wall and serializes concurrent ticks`() =
         runTest {
             val nowMs = 1_700_000_000_000L
-            val farFuture = HlcTimestamp.create(nowMs + MAX_CLOCK_DRIFT_MS + 99_999_999L, 42, "rogue")
+            val farFuture =
+                HlcTimestamp.create(nowMs + MAX_CLOCK_DRIFT_MS + 99_999_999L, 42, "rogue")
             val clock = HlcClock("android-dev-1")
             val witnessed = clock.witness(farFuture, nowMs = nowMs)
             assertEquals(nowMs + MAX_CLOCK_DRIFT_MS, witnessed.wallMs)
             assertEquals(1, witnessed.counter)
 
             // Saturation at MAX_HLC_WALL_MS: counter stays 0xFFFF instead of wrapping to 0
-            val maxInitial = HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, "node-a").encode()
+            val maxInitial =
+                HlcTimestamp.create(MAX_HLC_WALL_MS, MAX_HLC_COUNTER, "node-a").encode()
             val satClock = HlcClock("node-a", initial = maxInitial)
             val ticked = satClock.tick(nowMs = MAX_HLC_WALL_MS)
             assertEquals(MAX_HLC_WALL_MS, ticked.wallMs)
@@ -317,16 +325,15 @@ class DataSyncRemediationTest {
 
             // Concurrent nextLocalHlc calls emit strictly unique values with device peerId
             val dao = database.dao()
-            val emitted =
-                coroutineScope {
-                    (1..20)
-                        .map {
-                            async(Dispatchers.Default) {
-                                nextLocalHlc(dao, nodeId = "android-device-99", nowMs = nowMs)
-                            }
+            val emitted = coroutineScope {
+                (1..20)
+                    .map {
+                        async(Dispatchers.Default) {
+                            nextLocalHlc(dao, nodeId = "android-device-99", nowMs = nowMs)
                         }
-                        .awaitAll()
-                }
+                    }
+                    .awaitAll()
+            }
             assertEquals(20, emitted.toSet().size)
             assertTrue(emitted.all { it.endsWith("-android-device-99") })
 
@@ -395,11 +402,17 @@ class DataSyncRemediationTest {
             val outgoing =
                 buildPeerSyncRequest(
                     dao = dao,
-                    config = PeerSyncRequestConfig(peerId = "android-peer-1", deviceName = "P", sinceSeq = 1L),
+                    config =
+                        PeerSyncRequestConfig(
+                            peerId = "android-peer-1",
+                            deviceName = "P",
+                            sinceSeq = 1L,
+                        ),
                 )
             assertTrue(
                 outgoing.tombstones.any {
-                    it.entityType == TOMBSTONE_ENTITY_COLLECTION_GENERATOR && it.naturalKey == listId
+                    it.entityType == TOMBSTONE_ENTITY_COLLECTION_GENERATOR &&
+                        it.naturalKey == listId
                 }
             )
 
@@ -480,7 +493,8 @@ class DataSyncRemediationTest {
             <a href=javascript:alert(2)>bad2</a>
             <script>alert(3)</script >
             <img src="/images/pic.png">
-            """.trimIndent()
+            """
+                .trimIndent()
         val cleaned = sanitizeFeedHtml(malicious, "https://blog.example.com/posts/1")
         assertTrue(cleaned.contains("<p>Hello</p>"))
         assertTrue(cleaned.contains("https://blog.example.com/images/pic.png"))

@@ -142,26 +142,26 @@ class ShareReceiveActivity : Activity() {
         val uri = runCatching { rawUri.toUri() }.getOrNull() ?: return null
         if (!isAllowedSharedUri(uri)) return null
         return runCatching {
-                val rawStream = contentResolver.openInputStream(uri) ?: return null
-                openValidatedPdfStream(rawStream)
-            }
+            val rawStream = contentResolver.openInputStream(uri) ?: return null
+            openValidatedPdfStream(rawStream)
+        }
             .getOrNull()
     }
 
     private fun queryStreamDisplayName(uri: Uri): String? {
         if (!isAllowedSharedUri(uri)) return null
         return runCatching {
-                contentResolver
-                    .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { cursor ->
-                        val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (colIdx >= 0 && cursor.moveToFirst()) {
-                            cursor.getString(colIdx)
-                        } else {
-                            null
-                        }
+            contentResolver
+                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (colIdx >= 0 && cursor.moveToFirst()) {
+                        cursor.getString(colIdx)
+                    } else {
+                        null
                     }
-            }
+                }
+        }
             .getOrNull()
     }
 
