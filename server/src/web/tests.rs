@@ -973,8 +973,13 @@ async fn test_web_music_links_only_show_wikipedia_and_spotify_with_lucide_icons(
         assert!(html.contains("https://en.wikipedia.org/wiki/21_(Adele_album)"));
         assert!(html.contains("https://open.spotify.com/album/5duyQokC4FMcWPYTV9Gpf9"));
         assert!(html.contains("<svg class=\"icon\""));
-        assert!(html.contains("<span>Wikipedia</span>"));
-        assert!(html.contains("<span>Spotify</span>"));
+        if path.starts_with("/entries/") {
+            assert!(html.contains("<span>Wikipedia</span>"));
+            assert!(html.contains("<span>Spotify</span>"));
+        } else {
+            assert!(html.contains("title=\"Wikipedia\""));
+            assert!(html.contains("title=\"Listen on Spotify\""));
+        }
         assert!(!html.contains(">Pause draw<"), "draw card must not show Pause draw on {path}");
         if path == "/" {
             assert!(!html.contains("/generator/toggle"));
@@ -1397,7 +1402,7 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
     }
 
     let home_html = resp_html(get_authed(&app, "/", &cookie).await).await;
-    assert!(home_html.contains("Want to Read (1)"));
+    assert!(home_html.contains("Queue (1)"));
     assert!(home_html.contains("LSM Compaction"));
     assert!(home_html.contains("Feed Inbox (0)"));
 
@@ -1885,19 +1890,21 @@ fn strip_css_comments(css: &str) -> String {
     out
 }
 
-fn parse_css_root_vars(css: &str) -> std::collections::HashMap<String, String> {
+fn parse_css_theme_blocks(css: &str) -> Vec<(String, std::collections::HashMap<String, String>)> {
     let cleaned = strip_css_comments(css);
-    let mut vars = std::collections::HashMap::new();
+    let mut blocks = Vec::new();
     let mut search = cleaned.as_str();
     while let Some(root_start) = search.find(":root") {
-        let rest = &search[root_start + ":root".len()..];
-        let Some(open) = rest.find('{') else {
+        let after_root = &search[root_start..];
+        let Some(open) = after_root.find('{') else {
             break;
         };
-        let Some(close) = rest[open + 1..].find('}') else {
+        let selector = after_root[..open].trim().to_owned();
+        let Some(close) = after_root[open + 1..].find('}') else {
             break;
         };
-        for decl in rest[open + 1..open + 1 + close].split(';') {
+        let mut vars = std::collections::HashMap::new();
+        for decl in after_root[open + 1..open + 1 + close].split(';') {
             let trimmed = decl.trim();
             if let Some(prop) = trimmed.strip_prefix("--")
                 && let Some((name, value)) = prop.split_once(':')
@@ -1905,9 +1912,12 @@ fn parse_css_root_vars(css: &str) -> std::collections::HashMap<String, String> {
                 vars.insert(format!("--{}", name.trim()), value.trim().to_string());
             }
         }
-        search = &rest[open + 1 + close + 1..];
+        if !vars.is_empty() {
+            blocks.push((selector, vars));
+        }
+        search = &after_root[open + 1 + close + 1..];
     }
-    vars
+    blocks
 }
 
 fn parse_hex_rgb(hex: &str) -> (f64, f64, f64) {
@@ -1972,17 +1982,9 @@ fn assert_valid_heading_hierarchy(route: &str, html: &str) {
 
 #[test]
 fn web_css_palette_meets_wcag_aa_contrast() {
-    let vars = parse_css_root_vars(super::ROCHE_CSS);
-    let get = |name: &str| -> &str {
-        vars.get(name).unwrap_or_else(|| panic!("missing CSS token {name} in roche.css"))
-    };
+    let blocks = parse_css_theme_blocks(super::ROCHE_CSS);
+    assert!(blocks.len() >= 2, "roche.css must define light and dark :root theme blocks");
 
-    // All three editorial surfaces: main paper, recessed paper, and input/card paper (#fffdf7).
-    let surfaces = [
-        ("--paper", get("--paper")),
-        ("--paper-deep", get("--paper-deep")),
-        ("input/card #fffdf7", "#fffdf7"),
-    ];
     let normal_text_tokens = [
         "--ink",
         "--ink-soft",
@@ -1997,36 +1999,52 @@ fn web_css_palette_meets_wcag_aa_contrast() {
         "--tier-D",
     ];
 
-    for (surface_label, surface_hex) in surfaces {
-        for text_token in normal_text_tokens {
-            let text_hex = get(text_token);
-            let ratio = wcag_contrast_ratio(text_hex, surface_hex);
+    for (selector, vars) in &blocks {
+        let get = |name: &str| -> &str {
+            vars.get(name)
+                .map_or_else(|| panic!("missing CSS token {name} in {selector}"), String::as_str)
+        };
+
+        // All three editorial surfaces for this theme: main paper, recessed paper, and input paper.
+        let surfaces = [
+            ("--paper", get("--paper")),
+            ("--paper-deep", get("--paper-deep")),
+            ("--paper-input", get("--paper-input")),
+        ];
+
+        for (surface_label, surface_hex) in surfaces {
+            for text_token in normal_text_tokens {
+                let text_hex = get(text_token);
+                let ratio = wcag_contrast_ratio(text_hex, surface_hex);
+                assert!(
+                    ratio >= 4.5,
+                    "roche.css ({selector}) {text_token} ({text_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+                );
+            }
+
+            // WCAG 2.1 AA SC 1.4.11 non-text contrast (>= 3.0:1) for interactive borders and focus ring.
+            for ui_token in ["--control-border", "--accent"] {
+                let ui_hex = get(ui_token);
+                let ratio = wcag_contrast_ratio(ui_hex, surface_hex);
+                assert!(
+                    ratio >= 3.0,
+                    "roche.css ({selector}) {ui_token} ({ui_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG 1.4.11 requires >= 3.0:1)"
+                );
+            }
+        }
+
+        // Inverted button / skip-link surfaces (--paper on --ink, --accent-on-fill on --accent-fill / hover).
+        for (foreground_token, background_token) in [
+            ("--paper", "--ink"),
+            ("--accent-on-fill", "--accent-fill"),
+            ("--accent-on-fill", "--accent-fill-hover"),
+        ] {
+            let ratio = wcag_contrast_ratio(get(foreground_token), get(background_token));
             assert!(
                 ratio >= 4.5,
-                "roche.css {text_token} ({text_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
+                "roche.css ({selector}) {foreground_token} on {background_token} has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
             );
         }
-
-        // WCAG 2.1 AA SC 1.4.11 non-text contrast (>= 3.0:1) for interactive borders and focus ring.
-        for ui_token in ["--control-border", "--accent"] {
-            let ui_hex = get(ui_token);
-            let ratio = wcag_contrast_ratio(ui_hex, surface_hex);
-            assert!(
-                ratio >= 3.0,
-                "roche.css {ui_token} ({ui_hex}) on {surface_label} ({surface_hex}) has contrast {ratio:.2}:1 (WCAG 1.4.11 requires >= 3.0:1)"
-            );
-        }
-    }
-
-    // Inverted button / skip-link surfaces (--paper on --ink, --accent, and --link-hover).
-    for (foreground_token, background_token) in
-        [("--paper", "--ink"), ("--paper", "--accent"), ("--paper", "--link-hover")]
-    {
-        let ratio = wcag_contrast_ratio(get(foreground_token), get(background_token));
-        assert!(
-            ratio >= 4.5,
-            "roche.css {foreground_token} on {background_token} has contrast {ratio:.2}:1 (WCAG AA requires >= 4.5:1)"
-        );
     }
 
     // Guard against missing placeholder, disabled, and sticky-player scroll-padding styles.

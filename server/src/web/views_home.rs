@@ -129,9 +129,7 @@ async fn render_home_inner<F: FeedFetcher>(
         sync_status.unread_items_count,
         &session.csrf_token,
     );
-    body.push_str(
-        "</section>\n<aside class=\"home-rail\" aria-label=\"Queue, Active Draw and Diary\">\n",
-    );
+    body.push_str("</section>\n<div class=\"home-rail\">\n");
 
     let wtr_total = collections
         .iter()
@@ -155,7 +153,7 @@ async fn render_home_inner<F: FeedFetcher>(
     }
 
     render_recent_diary_section(&mut body, &recent_diary, &artist_links);
-    body.push_str("</aside>\n</div>\n");
+    body.push_str("</div>\n</div>\n");
 
     Ok(render_page(&PageShell {
         title: "Roche",
@@ -206,7 +204,11 @@ pub(in crate::web) fn render_collection_draw_section(
         ext_links.iter().find(|l| l.icon == WebLinkIcon::Wikipedia).map(|l| l.href.as_str());
     let entry_href = format!("/entries/{}", urlencode(&entry.id));
 
-    out.push_str("<section class=\"rail-block album-sleeve\" aria-label=\"Active Collection Draw\">\n<div class=\"sleeve-body\">\n");
+    let _ = writeln!(
+        out,
+        "<section class=\"rail-block album-sleeve\" aria-label=\"Active draw: {}\">\n<div class=\"sleeve-body\">",
+        esc(&state.collection_title),
+    );
     render_sleeve_cover(out, entry, &entry_href, spotify_href);
     out.push_str("<div class=\"sleeve-info\">\n<div class=\"sleeve-head-row\">\n<div class=\"album-title-row\">\n");
     let _ = writeln!(

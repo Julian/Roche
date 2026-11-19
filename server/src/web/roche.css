@@ -46,7 +46,7 @@
     --ink-faint: #9c9281;
     --rule: #3a3329;
     --rule-soft: #2b251e;
-    --control-border: #6a6051;
+    --control-border: #7c7261;
     --link: #e09a68;
     --link-hover: #f3bd93;
     --accent: #e06c64;
@@ -74,7 +74,7 @@
   --ink-faint: #9c9281;
   --rule: #3a3329;
   --rule-soft: #2b251e;
-  --control-border: #6a6051;
+  --control-border: #7c7261;
   --link: #e09a68;
   --link-hover: #f3bd93;
   --accent: #e06c64;
@@ -895,9 +895,9 @@ details.editorial-panel[open] > summary {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.2rem;
-  height: 1.2rem;
-  color: var(--ink-faint);
+  min-width: 24px;
+  min-height: 24px;
+  color: var(--ink-soft);
   text-decoration: none;
   border-radius: 2px;
   vertical-align: -0.08em;
@@ -957,13 +957,15 @@ details.editorial-panel[open] > summary {
 .sleeve-skip-details > summary {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   list-style: none;
   font-size: 0.69rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  padding: 0.1rem 0.38rem;
-  min-height: 22px;
-  color: var(--ink-faint);
+  padding: 0.14rem 0.42rem;
+  min-width: 24px;
+  min-height: 24px;
+  color: var(--ink-soft);
   border: 1px solid transparent;
   background: transparent;
   border-radius: 2px;
