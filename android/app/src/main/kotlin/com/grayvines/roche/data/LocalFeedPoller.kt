@@ -66,11 +66,19 @@ internal object LocalFeedPoller {
         apiClient: RocheApiClient,
         feed: FeedRow,
         localPeerId: String,
-        nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
+        nowInstant: Instant? = null,
         prefetchedBatch: ParsedFeedBatch? = null,
+        clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
     ): Result<Int> =
         withContext(Dispatchers.Default) {
-            pollFeedInternal(dao, apiClient, feed, localPeerId, nowInstant, prefetchedBatch)
+            pollFeedInternal(
+                dao = dao,
+                apiClient = apiClient,
+                feed = feed,
+                localPeerId = localPeerId,
+                resolveNow = { nowInstant ?: clock() },
+                prefetchedBatch = prefetchedBatch,
+            )
         }
 
     @Suppress("LongParameterList")
@@ -79,10 +87,9 @@ internal object LocalFeedPoller {
         apiClient: RocheApiClient,
         feed: FeedRow,
         localPeerId: String,
-        nowInstant: Instant,
+        resolveNow: () -> Instant,
         prefetchedBatch: ParsedFeedBatch?,
     ): Result<Int> {
-        val nowIso = nowInstant.toString()
         val fetchUrl = canonicalizeFeedUrl(feed.url)
         val syncableFeed = isSyncablePublicUrl(feed.url)
         val batch =
@@ -91,13 +98,13 @@ internal object LocalFeedPoller {
             } else {
                 val xml =
                     apiClient.fetchExternalFeedXml(fetchUrl).getOrElse { error ->
-                        dao.upsertFeed(
-                            feed.copy(
-                                lastPolled = nowIso,
-                                lastError = sanitizeFeedFetchError(error),
-                                lastErrorBy = localPeerId,
-                                isLocalDirty = syncableFeed || feed.isLocalDirty,
-                            )
+                        recordPollFailure(
+                            dao = dao,
+                            feed = feed,
+                            localPeerId = localPeerId,
+                            completedIso = resolveNow().toString(),
+                            errorMessage = sanitizeFeedFetchError(error),
+                            syncableFeed = syncableFeed,
                         )
                         return Result.failure(error)
                     }
@@ -105,18 +112,19 @@ internal object LocalFeedPoller {
                     parseFeedXml(xml = xml, feedUrl = fetchUrl, feedType = feed.feedType)
                 }
                     .getOrElse { error ->
-                        dao.upsertFeed(
-                            feed.copy(
-                                lastPolled = nowIso,
-                                lastError = "Feed XML parse failed",
-                                lastErrorBy = localPeerId,
-                                isLocalDirty = syncableFeed || feed.isLocalDirty,
-                            )
+                        recordPollFailure(
+                            dao = dao,
+                            feed = feed,
+                            localPeerId = localPeerId,
+                            completedIso = resolveNow().toString(),
+                            errorMessage = "Feed XML parse failed",
+                            syncableFeed = syncableFeed,
                         )
                         return Result.failure(error)
                     }
             }
 
+        val nowIso = resolveNow().toString()
         val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
         val configChanged = updatedFeed.title != feed.title || updatedFeed.feedType != feed.feedType
         dao.upsertFeed(updatedFeed, markDirty = configChanged && syncableFeed)
@@ -130,6 +138,29 @@ internal object LocalFeedPoller {
                 markDirty = syncableFeed,
             )
         return Result.success(maxOf(insertedOrUpdatedCount, batch.items.size))
+    }
+
+    @Suppress("LongParameterList")
+    private suspend fun recordPollFailure(
+        dao: RocheDao,
+        feed: FeedRow,
+        localPeerId: String,
+        completedIso: String,
+        errorMessage: String,
+        syncableFeed: Boolean,
+    ) {
+        val previousFailures =
+            normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures)
+        val nextFailures = (previousFailures + 1).coerceAtMost(MAX_CONSECUTIVE_FAILURES)
+        dao.upsertFeed(
+            feed.copy(
+                lastPolled = completedIso,
+                lastError = errorMessage,
+                lastErrorBy = localPeerId,
+                consecutiveFailures = nextFailures,
+                isLocalDirty = syncableFeed || feed.isLocalDirty,
+            )
+        )
     }
 
     private fun sanitizeFeedFetchError(error: Throwable): String {
@@ -175,6 +206,7 @@ internal object LocalFeedPoller {
             lastPolledBy = localPeerId,
             lastError = null,
             lastErrorBy = null,
+            consecutiveFailures = 0,
             isLocalDirty = syncableFeed || feed.isLocalDirty,
         )
     }

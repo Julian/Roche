@@ -10,8 +10,8 @@ import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
-import java.time.Duration
 import java.time.Instant
+import java.time.OffsetDateTime
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.ln
@@ -81,7 +81,7 @@ data class SyncTombstoneDto(
  */
 internal fun deterministicEntityUuid(kind: String, naturalKey: String): String {
     val digest =
-        MessageDigest.getInstance("SHA-256").run {
+        MessageDigest.getInstance(DIGEST_ALGORITHM_SHA256).run {
             update("roche:entity:v1:".toByteArray(StandardCharsets.UTF_8))
             update(kind.toByteArray(StandardCharsets.UTF_8))
             update(":".toByteArray(StandardCharsets.UTF_8))
@@ -414,7 +414,7 @@ internal fun collectionEntryNaturalKey(collectionId: String, entryId: String): S
  */
 internal fun rendezvousUniformUnit(peerId: String, feedUrl: String, epoch: Long): Double {
     val digest =
-        MessageDigest.getInstance("SHA-256").run {
+        MessageDigest.getInstance(DIGEST_ALGORITHM_SHA256).run {
             update("roche:hrw:v1:".toByteArray(StandardCharsets.UTF_8))
             update(peerId.toByteArray(StandardCharsets.UTF_8))
             update(byteArrayOf(0))
@@ -428,6 +428,86 @@ internal fun rendezvousUniformUnit(peerId: String, feedUrl: String, epoch: Long)
     return (top53.toDouble() + HRW_HALF_OFFSET) / (1L shl IEEE754_MANTISSA_BITS).toDouble()
 }
 
+internal fun normalizeConsecutiveFailures(lastError: String?, rawCount: Int): Int =
+    when {
+        lastError.isNullOrBlank() -> 0
+        rawCount <= 0 -> 1
+        else -> rawCount.coerceAtMost(MAX_CONSECUTIVE_FAILURES)
+    }
+
+/**
+ * Deterministic per-feed phase offset in `[0, intervalSecs)` derived from SHA-256 of the
+ * canonicalized feed URL. Bit-for-bit identical across Rust and Kotlin/JVM.
+ */
+internal fun feedPhaseOffsetSecs(feedUrl: String, pollIntervalMinutes: Int): Long {
+    val intervalSecs =
+        pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+    val canonicalUrl = canonicalizeSyncUrl(feedUrl)
+    val digest =
+        MessageDigest.getInstance(DIGEST_ALGORITHM_SHA256).run {
+            update("roche:phase:v1:".toByteArray(StandardCharsets.UTF_8))
+            update(canonicalUrl.toByteArray(StandardCharsets.UTF_8))
+            digest()
+        }
+    val raw = ByteBuffer.wrap(digest, 0, Long.SIZE_BYTES).long
+    return java.lang.Long.remainderUnsigned(raw, intervalSecs)
+}
+
+internal fun nextPhaseSlotAtOrAfter(
+    earliestEpochSeconds: Long,
+    phaseOffsetSecs: Long,
+    intervalSecs: Long,
+): Long {
+    val safeInterval = intervalSecs.coerceAtLeast(1L)
+    val safePhase = Math.floorMod(phaseOffsetSecs, safeInterval)
+    val slot = Math.floorDiv(earliestEpochSeconds - safePhase + safeInterval - 1L, safeInterval)
+    return slot * safeInterval + safePhase
+}
+
+internal fun targetPollIntervalSecs(pollIntervalMinutes: Int, consecutiveFailures: Int): Long {
+    val intervalSecs =
+        pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+    if (consecutiveFailures <= 0) return intervalSecs
+    val fourX =
+        if (intervalSecs > Long.MAX_VALUE / LARGE_INTERVAL_BACKOFF_MULTIPLIER) {
+            Long.MAX_VALUE
+        } else {
+            intervalSecs * LARGE_INTERVAL_BACKOFF_MULTIPLIER
+        }
+    val capSecs = minOf(maxOf(DEFAULT_MAX_BACKOFF_SECS, fourX), ABSOLUTE_MAX_BACKOFF_SECS)
+    val shift = consecutiveFailures.coerceIn(1, MAX_BACKOFF_SHIFT)
+    val multiplier = 1L shl shift
+    val scaled =
+        if (intervalSecs > Long.MAX_VALUE / multiplier) {
+            Long.MAX_VALUE
+        } else {
+            intervalSecs * multiplier
+        }
+    return maxOf(intervalSecs, minOf(scaled, capSecs))
+}
+
+internal fun nextScheduledPollEpochSecs(
+    feedUrl: String,
+    pollIntervalMinutes: Int,
+    lastPolledEpochSeconds: Long,
+    consecutiveFailures: Int,
+): Long {
+    val intervalSecs =
+        pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+    val phaseSecs = feedPhaseOffsetSecs(feedUrl, pollIntervalMinutes)
+    val earliest =
+        if (consecutiveFailures <= 0) {
+            val minHealthyGap =
+                minOf(intervalSecs / MIN_HEALTHY_GAP_DIVISOR, MAX_MIN_HEALTHY_GAP_SECS)
+            lastPolledEpochSeconds + minHealthyGap
+        } else {
+            val targetDelay = targetPollIntervalSecs(pollIntervalMinutes, consecutiveFailures)
+            val snapMargin = intervalSecs / BACKOFF_SNAP_MARGIN_DIVISOR
+            lastPolledEpochSeconds + targetDelay - snapMargin
+        }
+    return nextPhaseSlotAtOrAfter(earliest, phaseSecs, intervalSecs)
+}
+
 internal fun computeThroughputWeight(
     feedsCompleted: Int,
     itemsProcessed: Int,
@@ -438,6 +518,25 @@ internal fun computeThroughputWeight(
     val workUnits = feedsCompleted.toDouble() + itemsProcessed.toDouble() / ITEMS_PER_WORK_UNIT
     val unitsPerSec = workUnits / safeSecs
     return unitsPerSec.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+}
+
+internal fun updateThroughputEwma(currentWeight: Double, sampleWeight: Double): Double {
+    val base =
+        if (currentWeight.isFinite() && currentWeight > 0.0) {
+            currentWeight.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+        } else {
+            DEFAULT_ONLINE_PEER_WEIGHT
+        }
+    val sample =
+        if (sampleWeight.isFinite()) {
+            sampleWeight.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+        } else {
+            base
+        }
+    return (THROUGHPUT_EWMA_ALPHA * sample + (1.0 - THROUGHPUT_EWMA_ALPHA) * base).coerceIn(
+        MIN_PEER_WEIGHT,
+        MAX_PEER_WEIGHT,
+    )
 }
 
 private fun peerLivenessFactor(lastSeenAtIso: String, nowEpochSeconds: Long): Double {
@@ -490,8 +589,10 @@ internal fun selectFeedPoller(
     localBoostFactor: Double = 1.0,
 ): String? {
     if (activePeers.isEmpty()) return null
-    val intervalSecs = pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES) * 60L
-    val epoch = Math.floorDiv(nowEpochSeconds, intervalSecs)
+    val intervalSecs =
+        pollIntervalMinutes.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+    val phaseSecs = feedPhaseOffsetSecs(feedUrl, pollIntervalMinutes)
+    val epoch = Math.floorDiv(nowEpochSeconds - phaseSecs, intervalSecs)
 
     var bestPeer: String? = null
     var bestScore = Double.NEGATIVE_INFINITY
@@ -515,21 +616,60 @@ internal fun selectFeedPoller(
     return bestPeer
 }
 
+private data class FeedPollScheduleState(
+    val isCrossPeerRescue: Boolean,
+    val lastPolledEpochSecs: Long?,
+    val dueAtSecs: Long,
+    val intervalSecs: Long,
+)
+
+private fun parseLastPolledEpochSecs(raw: String?): Long? {
+    val clean = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return runCatching { Instant.parse(clean).epochSecond }.getOrNull()
+        ?: runCatching { OffsetDateTime.parse(clean).toEpochSecond() }.getOrNull()
+}
+
+private fun evaluateFeedPollSchedule(
+    localPeerId: String,
+    feed: FeedRow,
+    nowEpochSeconds: Long,
+): FeedPollScheduleState {
+    val hasError = !feed.lastError.isNullOrBlank()
+    val effectiveFailures = normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures)
+    val cleanErrorBy = feed.lastErrorBy?.trim()?.takeIf { it.isNotEmpty() }
+    val isCrossPeerRescue =
+        hasError && effectiveFailures == 1 && cleanErrorBy != null && cleanErrorBy != localPeerId
+    val lastPolledEpochSecs = parseLastPolledEpochSecs(feed.lastPolled)
+    val intervalSecs =
+        feed.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong() * SECONDS_PER_MINUTE
+    val dueAtSecs =
+        if (lastPolledEpochSecs == null) {
+            nowEpochSeconds
+        } else {
+            nextScheduledPollEpochSecs(
+                feedUrl = feed.url,
+                pollIntervalMinutes = feed.pollInterval,
+                lastPolledEpochSeconds = lastPolledEpochSecs,
+                consecutiveFailures = effectiveFailures,
+            )
+        }
+    return FeedPollScheduleState(
+        isCrossPeerRescue = isCrossPeerRescue,
+        lastPolledEpochSecs = lastPolledEpochSecs,
+        dueAtSecs = dueAtSecs,
+        intervalSecs = intervalSecs,
+    )
+}
+
 internal fun isFeedDueOrRescueForPeer(
     localPeerId: String,
     feed: FeedRow,
     nowInstant: Instant,
 ): Boolean {
     if (!feed.isActive) return false
-    val hasCrossPeerError =
-        !feed.lastError.isNullOrBlank() &&
-            !feed.lastErrorBy.isNullOrBlank() &&
-            feed.lastErrorBy != localPeerId
-    if (hasCrossPeerError) return true
-    val lastPolledIso = feed.lastPolled?.trim()?.takeIf { it.isNotEmpty() } ?: return true
-    val lastPolledInstant = runCatching { Instant.parse(lastPolledIso) }.getOrNull() ?: return true
-    val intervalMinutes = feed.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong()
-    return Duration.between(lastPolledInstant, nowInstant) >= Duration.ofMinutes(intervalMinutes)
+    val nowSecs = nowInstant.epochSecond
+    val schedule = evaluateFeedPollSchedule(localPeerId, feed, nowSecs)
+    return schedule.isCrossPeerRescue || nowSecs >= schedule.dueAtSecs
 }
 
 internal fun shouldPeerPollFeed(
@@ -538,25 +678,21 @@ internal fun shouldPeerPollFeed(
     feed: FeedRow,
     nowInstant: Instant = Instant.now(),
 ): Boolean {
-    if (!isFeedDueOrRescueForPeer(localPeerId, feed, nowInstant)) return false
-    val intervalMinutes = feed.pollInterval.coerceAtLeast(MIN_POLL_INTERVAL_MINUTES).toLong()
-    val intervalSecs = intervalMinutes * 60L
-    val lastPolledInstant =
-        feed.lastPolled
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let {
-                runCatching { Instant.parse(it) }.getOrNull()
-            }
-    val elapsedSecs = lastPolledInstant?.let { Duration.between(it, nowInstant).seconds }
-    if (elapsedSecs != null && elapsedSecs >= intervalSecs * OVERDUE_RESCUE_MULTIPLIER) {
+    if (!feed.isActive) return false
+    val nowSecs = nowInstant.epochSecond
+    val schedule = evaluateFeedPollSchedule(localPeerId, feed, nowSecs)
+    if (!schedule.isCrossPeerRescue && nowSecs < schedule.dueAtSecs) return false
+
+    val overdueSecs = (nowSecs - schedule.dueAtSecs).coerceAtLeast(0L)
+    val isOverdueRescue =
+        schedule.lastPolledEpochSecs != null && overdueSecs >= schedule.intervalSecs
+    if (isOverdueRescue || !isSyncablePublicUrl(feed.url) || activePeers.size <= 1) {
         return true
     }
-    if (!isSyncablePublicUrl(feed.url) || activePeers.size <= 1) return true
-    val overdueSecs = elapsedSecs?.let { (it - intervalSecs).coerceAtLeast(0L) } ?: 0L
+
     val localStealBoost =
         if (overdueSecs > 0L) {
-            val overdueRatio = overdueSecs.toDouble() / intervalSecs.toDouble()
+            val overdueRatio = overdueSecs.toDouble() / schedule.intervalSecs.toDouble()
             1.0 + OVERDUE_STEAL_SCALE * overdueRatio * overdueRatio
         } else {
             1.0
@@ -565,7 +701,7 @@ internal fun shouldPeerPollFeed(
         activePeers = activePeers,
         feedUrl = feed.url,
         pollIntervalMinutes = feed.pollInterval,
-        nowEpochSeconds = nowInstant.epochSecond,
+        nowEpochSeconds = nowSecs,
         lastPolledBy = feed.lastPolledBy,
         lastError = feed.lastError,
         lastErrorBy = feed.lastErrorBy,
@@ -710,6 +846,7 @@ private fun isPublicIpv6Address(addr: InetAddress): Boolean {
         !addr.isMulticastAddress
 }
 
+private const val DIGEST_ALGORITHM_SHA256 = "SHA-256"
 private const val SCHEME_HTTP = "http"
 private const val SCHEME_HTTPS = "https"
 private const val DEFAULT_HTTP_PORT = 80
@@ -777,8 +914,10 @@ private const val UUID_VARIANT_RFC4122_BITS = 0x80
 private const val HRW_SHIFT_BITS = 11
 private const val HRW_HALF_OFFSET = 0.5
 private const val IEEE754_MANTISSA_BITS = 53
-private const val MIN_PEER_WEIGHT = 0.2
-private const val MAX_PEER_WEIGHT = 10.0
+internal const val MIN_PEER_WEIGHT = 0.2
+internal const val MAX_PEER_WEIGHT = 10.0
+internal const val THROUGHPUT_EWMA_ALPHA = 0.2
+internal const val MAX_CONSECUTIVE_FAILURES = 20
 private const val MIN_MEASURED_ELAPSED_SECS = 0.05
 private const val ITEMS_PER_WORK_UNIT = 25.0
 private const val LIVENESS_GRACE_SECONDS = 120L
@@ -788,4 +927,11 @@ private const val FAILING_PEER_PENALTY_FACTOR = 0.05
 private const val RESCUE_PEER_BOOST_FACTOR = 2.0
 private const val HEALTHY_AFFINITY_FACTOR = 1.1
 private const val MIN_POLL_INTERVAL_MINUTES = 1
-private const val OVERDUE_RESCUE_MULTIPLIER = 2L
+private const val SECONDS_PER_MINUTE = 60L
+private const val DEFAULT_MAX_BACKOFF_SECS = 24L * 3_600L
+private const val ABSOLUTE_MAX_BACKOFF_SECS = 7L * 24L * 3_600L
+private const val LARGE_INTERVAL_BACKOFF_MULTIPLIER = 4L
+private const val MAX_BACKOFF_SHIFT = 16
+private const val MIN_HEALTHY_GAP_DIVISOR = 10L
+private const val MAX_MIN_HEALTHY_GAP_SECS = 120L
+private const val BACKOFF_SNAP_MARGIN_DIVISOR = 2L

@@ -92,6 +92,8 @@ pub struct SyncFeedSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_by: Option<String>,
     #[serde(default)]
+    pub consecutive_failures: i64,
+    #[serde(default)]
     pub hlc: String,
 }
 

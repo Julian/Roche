@@ -24,6 +24,8 @@ import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.formatDurationSecondsLabel
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.formatArticleMinutes
+import java.time.Instant
+import java.time.OffsetDateTime
 
 internal suspend fun reconcilePeerSyncResponse(
     dao: RocheDao,
@@ -791,6 +793,43 @@ private suspend fun mergeIncomingFeedSourceInDao(
     dao.clearFallbackFeedTitleForFeed(targetId)
 }
 
+private data class MergedFeedPollTelemetry(
+    val lastPolledAt: String?,
+    val lastPolledBy: String?,
+    val lastError: String?,
+    val lastErrorBy: String?,
+    val consecutiveFailures: Int,
+)
+
+private fun String?.trimmedOrNull(): String? = this?.trim()?.takeIf { it.isNotEmpty() }
+
+private fun resolveMergedFeedPollTelemetry(
+    existing: FeedSourceEntity,
+    fsDto: SyncFeedSourceDto,
+    configWins: Boolean,
+): MergedFeedPollTelemetry {
+    val incomingError = fsDto.lastError.trimmedOrNull()
+    val localPollNewer = isLocalPollNewer(existing.lastPolledAt, fsDto.lastPolledAt)
+    val incomingPollNewer = isLocalPollNewer(fsDto.lastPolledAt, existing.lastPolledAt)
+    val localPollWins = localPollNewer || !incomingPollNewer && !configWins
+    val lastPolledAt = if (localPollWins) existing.lastPolledAt else fsDto.lastPolledAt
+    val lastPolledBy = if (localPollWins) existing.lastPolledBy else fsDto.lastPolledBy
+    val isRemoteUnarchive = configWins && !existing.isActive && fsDto.isActive
+    if (isRemoteUnarchive && incomingError == null) {
+        return MergedFeedPollTelemetry(lastPolledAt, lastPolledBy, null, null, 0)
+    }
+    val cleanError = if (localPollWins) existing.lastError.trimmedOrNull() else incomingError
+    val rawErrorBy = if (localPollWins) existing.lastErrorBy else fsDto.lastErrorBy
+    val rawFailures = if (localPollWins) existing.consecutiveFailures else fsDto.consecutiveFailures
+    return MergedFeedPollTelemetry(
+        lastPolledAt = lastPolledAt,
+        lastPolledBy = lastPolledBy,
+        lastError = cleanError,
+        lastErrorBy = cleanError?.let { rawErrorBy.trimmedOrNull() },
+        consecutiveFailures = normalizeConsecutiveFailures(cleanError, rawFailures),
+    )
+}
+
 private fun buildMergedFeedSourceEntity(
     targetId: String,
     fsDto: SyncFeedSourceDto,
@@ -798,6 +837,8 @@ private fun buildMergedFeedSourceEntity(
     fsHlc: String,
 ): FeedSourceEntity {
     if (existing == null) {
+        val incomingError = fsDto.lastError.trimmedOrNull()
+        val incomingErrorBy = incomingError?.let { fsDto.lastErrorBy.trimmedOrNull() }
         return FeedSourceEntity(
             collectionId = targetId,
             feedUrl = fsDto.feedUrl,
@@ -809,8 +850,10 @@ private fun buildMergedFeedSourceEntity(
             isActive = fsDto.isActive,
             lastPolledAt = fsDto.lastPolledAt,
             lastPolledBy = fsDto.lastPolledBy,
-            lastError = fsDto.lastError,
-            lastErrorBy = fsDto.lastErrorBy,
+            lastError = incomingError,
+            lastErrorBy = incomingErrorBy,
+            consecutiveFailures =
+                normalizeConsecutiveFailures(incomingError, fsDto.consecutiveFailures),
             autoDownloadEpisodes = false,
             customPlaybackSpeed = null,
             hlc = fsHlc,
@@ -818,7 +861,7 @@ private fun buildMergedFeedSourceEntity(
         )
     }
     val configWins = shouldIncomingWinHlc(fsHlc, existing.hlc, existing.isLocalDirty)
-    val pollSrc = existing.takeIf { isLocalPollNewer(it.lastPolledAt, fsDto.lastPolledAt) }
+    val telemetry = resolveMergedFeedPollTelemetry(existing, fsDto, configWins)
     val resolvedType = resolveMergedFeedSourceType(existing, fsDto, configWins)
     val resolvedTitle =
         if (configWins) {
@@ -835,10 +878,11 @@ private fun buildMergedFeedSourceEntity(
         language = fsDto.language?.takeIf { it.isNotBlank() } ?: existing.language,
         pollInterval = if (configWins) fsDto.pollInterval else existing.pollInterval,
         isActive = if (configWins) fsDto.isActive else existing.isActive,
-        lastPolledAt = pollSrc?.lastPolledAt ?: fsDto.lastPolledAt,
-        lastPolledBy = pollSrc?.lastPolledBy ?: fsDto.lastPolledBy,
-        lastError = pollSrc?.lastError ?: fsDto.lastError,
-        lastErrorBy = pollSrc?.lastErrorBy ?: fsDto.lastErrorBy,
+        lastPolledAt = telemetry.lastPolledAt,
+        lastPolledBy = telemetry.lastPolledBy,
+        lastError = telemetry.lastError,
+        lastErrorBy = telemetry.lastErrorBy,
+        consecutiveFailures = telemetry.consecutiveFailures,
         autoDownloadEpisodes = existing.autoDownloadEpisodes,
         customPlaybackSpeed = existing.customPlaybackSpeed,
         hlc = maxOf(fsHlc, existing.hlc),
@@ -846,8 +890,21 @@ private fun buildMergedFeedSourceEntity(
     )
 }
 
-private fun isLocalPollNewer(localPolledAt: String?, incomingPolledAt: String?): Boolean =
-    localPolledAt != null && (incomingPolledAt == null || localPolledAt > incomingPolledAt)
+internal fun isLocalPollNewer(localPolledAt: String?, incomingPolledAt: String?): Boolean {
+    val local = localPolledAt?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+    val incoming = incomingPolledAt?.trim()?.takeIf { it.isNotEmpty() } ?: return true
+    val localInstant = parsePollInstantOrNull(local)
+    val incomingInstant = parsePollInstantOrNull(incoming)
+    return if (localInstant != null && incomingInstant != null) {
+        localInstant.isAfter(incomingInstant)
+    } else {
+        local > incoming
+    }
+}
+
+private fun parsePollInstantOrNull(raw: String): Instant? =
+    runCatching { Instant.parse(raw) }.getOrNull()
+        ?: runCatching { OffsetDateTime.parse(raw).toInstant() }.getOrNull()
 
 private fun resolveMergedFeedSourceType(
     existing: FeedSourceEntity?,

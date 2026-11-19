@@ -121,6 +121,36 @@ internal data class HlcVectorsFixture(
 )
 
 @Serializable
+internal data class FeedPhaseOffsetVector(
+    @SerialName("feed_url") val feedUrl: String,
+    @SerialName("poll_interval_mins") val pollIntervalMins: Int,
+    @SerialName("expected_phase_secs") val expectedPhaseSecs: Long,
+)
+
+@Serializable
+internal data class BackoffScheduleVector(
+    @SerialName("poll_interval_mins") val pollIntervalMins: Int,
+    @SerialName("consecutive_failures") val consecutiveFailures: Int,
+    @SerialName("expected_target_delay_secs") val expectedTargetDelaySecs: Long,
+)
+
+@Serializable
+internal data class StaggeredPollScheduleVector(
+    @SerialName("feed_url") val feedUrl: String,
+    @SerialName("poll_interval_mins") val pollIntervalMins: Int,
+    @SerialName("last_polled_epoch_secs") val lastPolledEpochSecs: Long,
+    @SerialName("consecutive_failures") val consecutiveFailures: Int,
+    @SerialName("expected_next_due_epoch_secs") val expectedNextDueEpochSecs: Long,
+)
+
+@Serializable
+internal data class ThroughputEwmaStepVector(
+    @SerialName("current_weight") val currentWeight: Double,
+    @SerialName("sample_weight") val sampleWeight: Double,
+    @SerialName("expected_weight") val expectedWeight: Double,
+)
+
+@Serializable
 internal data class CrossStackGoldenVectors(
     @SerialName("canonical_urls") val canonicalUrls: List<CanonicalUrlVector>,
     @SerialName("entity_ids") val entityIds: List<EntityIdVector>,
@@ -136,6 +166,11 @@ internal data class CrossStackGoldenVectors(
     @SerialName("ranked_collection_parity")
     val rankedCollectionParity: List<RankedCollectionParityVector>,
     @SerialName("hlc_vectors") val hlcVectors: HlcVectorsFixture,
+    @SerialName("feed_phase_offsets") val feedPhaseOffsets: List<FeedPhaseOffsetVector>,
+    @SerialName("backoff_schedules") val backoffSchedules: List<BackoffScheduleVector>,
+    @SerialName("staggered_poll_schedules")
+    val staggeredPollSchedules: List<StaggeredPollScheduleVector>,
+    @SerialName("throughput_ewma_steps") val throughputEwmaSteps: List<ThroughputEwmaStepVector>,
 )
 
 class CrossStackVectorsTest {
@@ -342,12 +377,65 @@ class CrossStackVectorsTest {
                 .map { it.encode() }
         assertEquals(vectors.totalOrder.expectedSorted, parsedSorted)
     }
+
+    @Test
+    fun `feed phase offsets and staggered poll schedules match Rust golden vectors`() {
+        val vectors = loadGoldenVectors()
+        assertTrue(vectors.feedPhaseOffsets.size >= MIN_FEED_PHASE_OFFSET_VECTORS)
+        vectors.feedPhaseOffsets.forEach { vector ->
+            assertEquals(
+                vector.expectedPhaseSecs,
+                feedPhaseOffsetSecs(vector.feedUrl, vector.pollIntervalMins),
+                "feed_phase_offsets mismatch for (${vector.feedUrl}, ${vector.pollIntervalMins}m)",
+            )
+        }
+        assertTrue(vectors.staggeredPollSchedules.size >= MIN_STAGGERED_SCHEDULE_VECTORS)
+        vectors.staggeredPollSchedules.forEach { vector ->
+            assertEquals(
+                vector.expectedNextDueEpochSecs,
+                nextScheduledPollEpochSecs(
+                    feedUrl = vector.feedUrl,
+                    pollIntervalMinutes = vector.pollIntervalMins,
+                    lastPolledEpochSeconds = vector.lastPolledEpochSecs,
+                    consecutiveFailures = vector.consecutiveFailures,
+                ),
+                "staggered_poll_schedules mismatch for $vector",
+            )
+        }
+    }
+
+    @Test
+    fun `backoff schedules and throughput ewma steps match Rust golden vectors`() {
+        val vectors = loadGoldenVectors()
+        assertTrue(vectors.backoffSchedules.size >= MIN_BACKOFF_SCHEDULE_VECTORS)
+        vectors.backoffSchedules.forEach { vector ->
+            assertEquals(
+                vector.expectedTargetDelaySecs,
+                targetPollIntervalSecs(vector.pollIntervalMins, vector.consecutiveFailures),
+                "backoff_schedules mismatch for (${vector.pollIntervalMins}m, k=${vector.consecutiveFailures})",
+            )
+        }
+        assertTrue(vectors.throughputEwmaSteps.size >= MIN_THROUGHPUT_EWMA_VECTORS)
+        vectors.throughputEwmaSteps.forEach { vector ->
+            assertEquals(
+                vector.expectedWeight,
+                updateThroughputEwma(vector.currentWeight, vector.sampleWeight),
+                EWMA_FLOAT_EPSILON,
+                "throughput_ewma_steps mismatch for (${vector.currentWeight} -> ${vector.sampleWeight})",
+            )
+        }
+    }
 }
 
 internal const val MIN_CANONICAL_URL_VECTORS = 6
 internal const val MIN_ENTITY_ID_VECTORS = 3
 internal const val MIN_HRW_ELECTION_VECTORS = 3
+internal const val MIN_FEED_PHASE_OFFSET_VECTORS = 5
+internal const val MIN_BACKOFF_SCHEDULE_VECTORS = 10
+internal const val MIN_STAGGERED_SCHEDULE_VECTORS = 7
+internal const val MIN_THROUGHPUT_EWMA_VECTORS = 5
 internal const val DEFAULT_VECTOR_POLL_MINUTES = 30
+internal const val EWMA_FLOAT_EPSILON = 1e-9
 
 internal fun loadGoldenVectors(): CrossStackGoldenVectors {
     val vectorFile =

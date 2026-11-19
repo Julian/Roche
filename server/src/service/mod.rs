@@ -33,7 +33,9 @@ use crate::{
     error::ApiError,
     feeds::{FeedSource, OpmlDocument},
     media::{MediaStore, ytdlp::YtDlpWorker},
-    scheduler::{FeedFetcher, FeedIngester, HttpFeedFetcher, MediaIngestContext, PollError},
+    scheduler::{
+        FeedFetcher, FeedIngester, FeedPollLocks, HttpFeedFetcher, MediaIngestContext, PollError,
+    },
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
@@ -180,6 +182,7 @@ pub struct RocheService<F = HttpFeedFetcher> {
     ytdlp_worker: YtDlpWorker,
     download_semaphore: Arc<Semaphore>,
     active_refreshes: Arc<AtomicUsize>,
+    feed_poll_locks: FeedPollLocks,
     pairing_limiter: Arc<PairingRateLimiter>,
     tailscale_web_sessions: Arc<Mutex<HashMap<String, String>>>,
     node_identity: Option<crate::tailscale::NodeIdentity>,
@@ -195,6 +198,7 @@ impl<F> Clone for RocheService<F> {
             ytdlp_worker: self.ytdlp_worker.clone(),
             download_semaphore: Arc::clone(&self.download_semaphore),
             active_refreshes: Arc::clone(&self.active_refreshes),
+            feed_poll_locks: self.feed_poll_locks.clone(),
             pairing_limiter: Arc::clone(&self.pairing_limiter),
             tailscale_web_sessions: Arc::clone(&self.tailscale_web_sessions),
             node_identity: self.node_identity.clone(),
@@ -217,6 +221,7 @@ impl<F: FeedFetcher> RocheService<F> {
             ytdlp_worker,
             download_semaphore,
             active_refreshes: Arc::new(AtomicUsize::new(0)),
+            feed_poll_locks: FeedPollLocks::new(),
             pairing_limiter: Arc::new(PairingRateLimiter::default()),
             tailscale_web_sessions: Arc::new(Mutex::new(HashMap::new())),
             node_identity: None,
@@ -341,7 +346,7 @@ impl<F: FeedFetcher> RocheService<F> {
             self.db.clone(),
             Arc::clone(&self.fetcher),
         )
-        .with_active_counter(Arc::clone(&self.active_refreshes))
+        .with_feed_poll_locks(self.feed_poll_locks.clone())
         .with_media(
             self.media_store.clone(),
             self.ytdlp_worker.clone(),
@@ -907,16 +912,32 @@ impl<F: FeedFetcher> FeedService<'_, F> {
 
     pub async fn refresh(&self, id: &str) -> Result<Feed, ApiError> {
         let _guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
+        let poll_guard = self.service.feed_poll_locks.acquire(id).await;
         let feed = self.get(id).await?;
         let ctx = self.service.media_ingest_context();
 
-        if let Err(err) = FeedIngester::poll_and_record(&ctx, &feed, "manual_refresh").await {
-            return match err {
-                PollError::Upstream(upstream) => {
-                    Err(ApiError::bad_gateway(format!("Failed to refresh feed: {upstream}")))
-                }
-                PollError::Database(db_err) => Err(ApiError::Database(db_err)),
-            };
+        let poll_res = FeedIngester::poll_xml_and_record_outcome(
+            ctx.db,
+            ctx.fetcher,
+            &feed,
+            "manual_refresh",
+            true,
+        )
+        .await;
+        drop(poll_guard);
+
+        match poll_res {
+            Ok(outcome) => {
+                FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
+            }
+            Err(err) => {
+                return match err {
+                    PollError::Upstream(upstream) => {
+                        Err(ApiError::bad_gateway(format!("Failed to refresh feed: {upstream}")))
+                    }
+                    PollError::Database(db_err) => Err(ApiError::Database(db_err)),
+                };
+            }
         }
 
         self.get(id).await
@@ -951,16 +972,33 @@ impl<F: FeedFetcher> FeedService<'_, F> {
         let mut join_set = tokio::task::JoinSet::new();
 
         for feed in feeds {
+            let Some(poll_guard) = self.service.feed_poll_locks.try_acquire(&feed.id) else {
+                continue;
+            };
             let service_clone = self.service.clone();
             let p_sem = Arc::clone(&poll_sem);
             let refresh_guard = ActiveRefreshGuard::acquire(&self.service.active_refreshes);
             join_set.spawn(async move {
                 let _task_guard = refresh_guard;
-                let Ok(_permit) = p_sem.acquire_owned().await else {
-                    return;
-                };
                 let ctx = service_clone.media_ingest_context();
-                let _ = FeedIngester::poll_and_record(&ctx, &feed, "background_refresh").await;
+                let poll_res = {
+                    let Ok(_permit) = p_sem.acquire_owned().await else {
+                        drop(poll_guard);
+                        return;
+                    };
+                    FeedIngester::poll_xml_and_record_outcome(
+                        ctx.db,
+                        ctx.fetcher,
+                        &feed,
+                        "background_refresh",
+                        true,
+                    )
+                    .await
+                };
+                drop(poll_guard);
+                if let Ok(outcome) = poll_res {
+                    FeedIngester::ingest_items_concurrently(&ctx, &outcome.inserted).await;
+                }
             });
         }
         while join_set.join_next().await.is_some() {}

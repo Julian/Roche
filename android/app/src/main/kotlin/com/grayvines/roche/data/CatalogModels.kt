@@ -357,6 +357,7 @@ data class SyncFeedSourceDto(
     @SerialName("last_polled_by") val lastPolledBy: String? = null,
     @SerialName("last_error") val lastError: String? = null,
     @SerialName("last_error_by") val lastErrorBy: String? = null,
+    @SerialName("consecutive_failures") val consecutiveFailures: Int = 0,
     val hlc: String = "",
 )
 

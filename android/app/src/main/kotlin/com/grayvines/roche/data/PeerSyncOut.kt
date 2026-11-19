@@ -638,6 +638,8 @@ private fun toSyncFeedSourceDto(source: FeedSourceEntity): SyncFeedSourceDto =
         lastPolledBy = source.lastPolledBy,
         lastError = source.lastError,
         lastErrorBy = source.lastErrorBy,
+        consecutiveFailures =
+            normalizeConsecutiveFailures(source.lastError, source.consecutiveFailures),
         hlc = source.hlc,
     )
 

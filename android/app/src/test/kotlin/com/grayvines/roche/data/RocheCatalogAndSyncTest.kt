@@ -7,7 +7,9 @@ import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
+import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertFeeds
 import com.grayvines.roche.data.local.upsertItem
@@ -18,7 +20,12 @@ import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.buildPeerSyncRequestPayload
 import com.grayvines.roche.data.remote.parsePeerSyncResponseJson
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.model.FeedItem
+import com.grayvines.roche.model.FeedType
+import com.grayvines.roche.model.isCrossPeerRescueError
 import java.io.File
+import java.time.Instant
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
@@ -132,6 +139,7 @@ class RocheCatalogAndSyncTest {
                         RocheDatabase.MIGRATION_7_8,
                         RocheDatabase.MIGRATION_8_9,
                         RocheDatabase.MIGRATION_9_10,
+                        RocheDatabase.MIGRATION_10_11,
                     )
                     .build()
             try {
@@ -787,6 +795,7 @@ class RocheCatalogAndSyncTest {
                         RocheDatabase.MIGRATION_7_8,
                         RocheDatabase.MIGRATION_8_9,
                         RocheDatabase.MIGRATION_9_10,
+                        RocheDatabase.MIGRATION_10_11,
                     )
                     .build()
             try {
@@ -1089,6 +1098,7 @@ class RocheCatalogAndSyncTest {
                     .addMigrations(
                         RocheDatabase.MIGRATION_8_9,
                         RocheDatabase.MIGRATION_9_10,
+                        RocheDatabase.MIGRATION_10_11,
                     )
                     .build()
             try {
@@ -1200,7 +1210,10 @@ class RocheCatalogAndSyncTest {
             val migratedDb =
                 Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
                     .setDriver(BundledSQLiteDriver())
-                    .addMigrations(RocheDatabase.MIGRATION_9_10)
+                    .addMigrations(
+                        RocheDatabase.MIGRATION_9_10,
+                        RocheDatabase.MIGRATION_10_11,
+                    )
                     .build()
             try {
                 val dao = migratedDb.dao()
@@ -1563,6 +1576,571 @@ class RocheCatalogAndSyncTest {
                     it.id == "older-item-1"
                 }
             )
+        }
+
+    @Test
+    fun `Room MIGRATION_10_11 adds consecutiveFailures and backfills failing rows only`() =
+        runTest {
+            val dbFile = File(tempDir, "roche_v10_to_v11.db")
+            val driver = BundledSQLiteDriver()
+            driver.open(dbFile.absolutePath).use { conn ->
+                createBaseV6TablesForMigrationTest(conn)
+                com.grayvines.roche.data.local.migrateCatalogSchemaV7(conn)
+                com.grayvines.roche.data.local.migrateCatalogAndSyncSchemaV8(conn)
+                RocheDatabase.MIGRATION_8_9.migrate(conn)
+                RocheDatabase.MIGRATION_9_10.migrate(conn)
+                conn.execSQL(
+                    "INSERT INTO `entries` (`id`, `kind`, `title`, `creatorsJson`, `url`, " +
+                        "`metadataJson`, `createdAt`, `updatedAt`, `hlc`, `isLocalDirty`) VALUES " +
+                        "('f-ok', 'publication', 'Healthy Feed', '[]', 'https://ok.example.com', '{}', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '001', 0), " +
+                        "('f-fail', 'publication', 'Failing Feed', '[]', 'https://fail.example.com', '{}', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '001', 0), " +
+                        "('f-blank', 'publication', 'Blank Err Feed', '[]', 'https://blank.example.com', '{}', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '001', 0)"
+                )
+                conn.execSQL(
+                    "INSERT INTO `feed_sources` (`collectionId`, `feedUrl`, `sourceType`, `feedTitle`, " +
+                        "`pollInterval`, `isActive`, `lastError`, `lastErrorBy`, `autoDownloadEpisodes`, `hlc`, `isLocalDirty`) VALUES " +
+                        "('f-ok', 'https://ok.example.com/rss.xml', 'rss', 'Healthy Feed', 30, 1, NULL, NULL, 0, '001', 0), " +
+                        "('f-fail', 'https://fail.example.com/rss.xml', 'rss', 'Failing Feed', 30, 1, 'HTTP 503', 'server', 0, '001', 0), " +
+                        "('f-blank', 'https://blank.example.com/rss.xml', 'rss', 'Blank Err Feed', 30, 1, '   ', 'server', 0, '001', 0)"
+                )
+                conn.execSQL("PRAGMA user_version = 10")
+            }
+
+            val migratedDb =
+                Room.databaseBuilder<RocheDatabase>(name = dbFile.absolutePath)
+                    .setDriver(BundledSQLiteDriver())
+                    .addMigrations(RocheDatabase.MIGRATION_10_11)
+                    .build()
+            try {
+                val dao = migratedDb.dao()
+                assertEquals(0, dao.getFeedById("f-ok")?.consecutiveFailures)
+                assertEquals(1, dao.getFeedById("f-fail")?.consecutiveFailures)
+                assertEquals(0, dao.getFeedById("f-blank")?.consecutiveFailures)
+                assertEquals(1, dao.getFeedSourceById("f-fail")?.consecutiveFailures)
+                assertEquals(0, dao.getFeedSourceById("f-ok")?.consecutiveFailures)
+            } finally {
+                migratedDb.close()
+            }
+        }
+
+    @Test
+    fun `staggered scheduling phase-aligned HRW backoff caps and cross-peer rescue prevent ping-pong`() {
+        val url = "https://blog.rust-lang.org/feed.xml"
+        val intervalSecs = 1_800L
+        val phase = feedPhaseOffsetSecs(url, 30)
+        assertTrue(phase in 0L until intervalSecs)
+
+        // 1. Staggering spreads 100 feeds across the 30-minute window (not bunched at :00/:30)
+        val phases =
+            (0 until 100).map { i ->
+                feedPhaseOffsetSecs("https://feed-$i.example.com/rss.xml", 30)
+            }
+        assertTrue(phases.distinct().size >= 85)
+        assertTrue(
+            phases.any { it < 450L } &&
+                phases.any { it in 450L..1_350L } &&
+                phases.any { it > 1_350L }
+        )
+
+        // 2. Phase-aligned HRW stays constant across the feed's entire [slot, slot + interval)
+        // window, even across wall-clock :00/:30 boundaries
+        val peers =
+            listOf(
+                PeerNodeDto("server", "Headless", "wired", 1.0, "2026-06-01T12:00:00Z"),
+                PeerNodeDto("android-1", "Pixel", "wifi", 1.0, "2026-06-01T12:00:00Z"),
+            )
+        val slotStart = 1_780_315_200L + phase // 2026-06-01T12:00:00Z + phase
+        val winnerAtStart = selectFeedPoller(peers, url, 30, slotStart, null, null, null)
+        val winnerAcrossWallBoundary =
+            selectFeedPoller(peers, url, 30, slotStart + intervalSecs - 1L, null, null, null)
+        assertEquals(winnerAtStart, winnerAcrossWallBoundary)
+
+        // 3. Steady-state healthy poll at slot + 5s schedules next poll at exact slot + interval
+        assertEquals(
+            slotStart + intervalSecs,
+            nextScheduledPollEpochSecs(url, 30, slotStart + 5L, 0),
+        )
+        // Post-Refresh-All at T spreads feeds across [T + 120s, T + 120s + 1800s) on phase slots
+        val refreshAllEpoch = 1_780_315_200L
+        val nextSlots =
+            (0 until 40).map { i ->
+                nextScheduledPollEpochSecs(
+                    "https://feed-$i.example.com/rss.xml",
+                    30,
+                    refreshAllEpoch,
+                    0,
+                )
+            }
+        val windowStart = refreshAllEpoch + 120L
+        val windowEnd = windowStart + intervalSecs
+        assertTrue(nextSlots.all { it in windowStart..windowEnd })
+        assertTrue(nextSlots.distinct().size >= 30)
+
+        // 4. Exponential backoff progression & caps (30m -> 24h cap, 24h -> 4x cap, 48h -> 7d
+        // ceiling)
+        assertEquals(
+            listOf(1_800L, 3_600L, 7_200L, 14_400L, 28_800L, 57_600L, 86_400L, 86_400L),
+            listOf(0, 1, 2, 3, 4, 5, 6, 20).map { targetPollIntervalSecs(30, it) },
+        )
+        assertEquals(172_800L, targetPollIntervalSecs(1_440, 1))
+        assertEquals(345_600L, targetPollIntervalSecs(1_440, 2))
+        assertEquals(345_600L, targetPollIntervalSecs(1_440, 5))
+        assertEquals(604_800L, targetPollIntervalSecs(2_880, 2))
+
+        // 5. Cross-peer rescue: failure #1 allows immediate rescue by another peer;
+        // failure #2 stops immediate rescue for ALL peers (no ping-pong!) until backoff due_at
+        val failedOnce =
+            FeedRow(
+                id = "f-rescue",
+                title = "Protected",
+                url = url,
+                siteUrl = null,
+                feedType = "rss",
+                pollInterval = 30,
+                lastPolled = Instant.ofEpochSecond(slotStart).toString(),
+                lastPolledBy = "server",
+                lastError = "HTTP 403",
+                lastErrorBy = "server",
+                consecutiveFailures = 1,
+                isActive = true,
+            )
+        val oneMinLater = Instant.ofEpochSecond(slotStart + 60L)
+        assertFalse(shouldPeerPollFeed("server", peers, failedOnce, oneMinLater))
+        assertTrue(shouldPeerPollFeed("android-1", peers, failedOnce, oneMinLater))
+
+        val failedOnceItem =
+            FeedItem(
+                id = "f-rescue",
+                title = "Protected",
+                url = url,
+                siteUrl = null,
+                feedType = FeedType.RSS,
+                unreadCount = 0,
+                lastError = "HTTP 403",
+                lastErrorBy = "server",
+                consecutiveFailures = 1,
+            )
+        assertTrue(failedOnceItem.isCrossPeerRescueError("android-1"))
+        assertFalse(failedOnceItem.isCrossPeerRescueError("server"))
+
+        // Second failure by android-1 -> consecutiveFailures == 2 -> neither peer immediately polls
+        val failedTwice =
+            failedOnce.copy(
+                lastPolled = oneMinLater.toString(),
+                lastError = "HTTP 500",
+                lastErrorBy = "android-1",
+                consecutiveFailures = 2,
+            )
+        val twoMinsLater = Instant.ofEpochSecond(slotStart + 120L)
+        assertFalse(shouldPeerPollFeed("server", peers, failedTwice, twoMinsLater))
+        assertFalse(shouldPeerPollFeed("android-1", peers, failedTwice, twoMinsLater))
+        assertFalse(
+            failedOnceItem
+                .copy(lastErrorBy = "android-1", consecutiveFailures = 2)
+                .isCrossPeerRescueError("server")
+        )
+
+        // Once backoff dueAt + 1 full interval has passed, any peer can rescue overdue feed
+        val dueAfterTwoFailures = nextScheduledPollEpochSecs(url, 30, slotStart + 60L, 2)
+        assertFalse(
+            shouldPeerPollFeed(
+                "server",
+                peers,
+                failedTwice,
+                Instant.ofEpochSecond(dueAfterTwoFailures - 1L),
+            )
+        )
+        assertTrue(
+            shouldPeerPollFeed(
+                "server",
+                peers,
+                failedTwice,
+                Instant.ofEpochSecond(dueAfterTwoFailures + intervalSecs),
+            )
+        )
+    }
+
+    @Test
+    fun `LocalFeedPoller increments caps resets consecutiveFailures and unarchive resets backoff`() =
+        runTest {
+            val dao = database.dao()
+            val feed =
+                FeedRow(
+                    id = "f-backoff",
+                    title = "Flaky Feed",
+                    url = "https://flaky.example.com/rss.xml",
+                    siteUrl = null,
+                    feedType = "rss",
+                )
+            dao.upsertFeed(feed)
+
+            val httpFailClient = RocheApiClient { HttpResponse(statusCode = 503, body = "err") }
+            val badXmlClient = RocheApiClient { HttpResponse(statusCode = 200, body = "not xml") }
+            val okClient = RocheApiClient {
+                HttpResponse(
+                    statusCode = 200,
+                    body =
+                        """<rss version="2.0"><channel><title>Flaky Feed</title>""" +
+                            """<item><title>Recovered</title><link>https://flaky.example.com/1</link></item>""" +
+                            """</channel></rss>""",
+                )
+            }
+
+            // Failure #1 (HTTP) -> 1, Failure #2 (XML parse) -> 2
+            LocalFeedPoller.pollFeed(dao, httpFailClient, dao.getFeedById("f-backoff")!!, "peer-a")
+            assertEquals(1, dao.getFeedById("f-backoff")?.consecutiveFailures)
+            LocalFeedPoller.pollFeed(dao, badXmlClient, dao.getFeedById("f-backoff")!!, "peer-b")
+            val afterTwo = dao.getFeedById("f-backoff")!!
+            assertEquals(2, afterTwo.consecutiveFailures)
+            assertEquals("Feed XML parse failed", afterTwo.lastError)
+            assertEquals("peer-b", afterTwo.lastErrorBy)
+
+            // Cap at MAX_CONSECUTIVE_FAILURES (20)
+            dao.upsertFeed(afterTwo.copy(consecutiveFailures = MAX_CONSECUTIVE_FAILURES))
+            LocalFeedPoller.pollFeed(dao, httpFailClient, dao.getFeedById("f-backoff")!!, "peer-a")
+            assertEquals(
+                MAX_CONSECUTIVE_FAILURES,
+                dao.getFeedById("f-backoff")?.consecutiveFailures,
+            )
+
+            // Unarchive resets consecutiveFailures, lastError, lastErrorBy
+            dao.updateFeedActiveGraph("f-backoff", isActive = false, markDirty = false)
+            assertEquals(
+                MAX_CONSECUTIVE_FAILURES,
+                dao.getFeedById("f-backoff")?.consecutiveFailures,
+            )
+            dao.updateFeedActiveGraph("f-backoff", isActive = true, markDirty = true)
+            val afterUnarchive = dao.getFeedById("f-backoff")!!
+            assertTrue(afterUnarchive.isActive)
+            assertEquals(0, afterUnarchive.consecutiveFailures)
+            assertEquals(null, afterUnarchive.lastError)
+            assertEquals(null, afterUnarchive.lastErrorBy)
+
+            // Poll failure followed by poll success resets consecutiveFailures to 0
+            LocalFeedPoller.pollFeed(dao, httpFailClient, afterUnarchive, "peer-a")
+            assertEquals(1, dao.getFeedById("f-backoff")?.consecutiveFailures)
+            LocalFeedPoller.pollFeed(dao, okClient, dao.getFeedById("f-backoff")!!, "peer-a")
+                .getOrThrow()
+            val afterSuccess = dao.getFeedById("f-backoff")!!
+            assertEquals(0, afterSuccess.consecutiveFailures)
+            assertEquals(null, afterSuccess.lastError)
+            assertEquals(null, afterSuccess.lastErrorBy)
+        }
+
+    @Test
+    fun `pollCooperativeFeedsOnDevice persists per-feed EWMA ignores failures and uses live per-feed completion clock`() =
+        runTest {
+            val dao = database.dao()
+            val rssBody =
+                """<rss version="2.0"><channel><title>Fast</title>""" +
+                    """<item><title>Post</title><link>https://fast.example.com/1</link></item>""" +
+                    """</channel></rss>"""
+            dao.upsertFeeds(
+                listOf(
+                    FeedRow(
+                        id = "f-ewma-1",
+                        title = "Fast 1",
+                        url = "https://fast1.example.com/rss.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                        lastPolled = "2026-06-01T10:00:00Z",
+                    ),
+                    FeedRow(
+                        id = "f-ewma-2",
+                        title = "Fast 2",
+                        url = "https://fast2.example.com/rss.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                        lastPolled = "2026-06-01T10:00:00Z",
+                    ),
+                    FeedRow(
+                        id = "f-ewma-fail",
+                        title = "Broken",
+                        url = "https://broken.example.com/rss.xml",
+                        siteUrl = null,
+                        feedType = "rss",
+                        lastPolled = "2026-06-01T10:00:00Z",
+                    ),
+                )
+            )
+            val tickCounter = AtomicLong(0L)
+            val baseEpoch = Instant.parse("2026-06-01T12:00:00Z").epochSecond
+            val advancingClock: () -> Instant = {
+                Instant.ofEpochSecond(baseEpoch + tickCounter.getAndIncrement() * 5L)
+            }
+            val mixedClient = RocheApiClient { req ->
+                if (req.url.contains("broken.example.com")) {
+                    HttpResponse(statusCode = 500, body = "fail")
+                } else {
+                    HttpResponse(statusCode = 200, body = rssBody)
+                }
+            }
+
+            // Seed from activePeers (weight = 0.8) on first run
+            val outcome1 =
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = mixedClient,
+                    localPeerId = "android-1",
+                    activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.8)),
+                    clock = advancingClock,
+                )
+            assertEquals(2, outcome1.polledFeedsCount)
+            assertEquals(3, outcome1.attemptedFeedsCount)
+            val w1 = outcome1.measuredWeight!!
+            assertTrue(w1 > 0.8 && w1 < 10.0, "Expected smoothed EWMA in (0.8, 10.0), got $w1")
+            assertEquals(w1, dao.getLocalSyncFlag(FLAG_LOCAL_THROUGHPUT_WEIGHT)?.toDouble())
+            assertEquals(1, dao.getFeedById("f-ewma-fail")?.consecutiveFailures)
+
+            // Distinct completion timestamps stamped per feed from advancingClock
+            val polledTimestamps =
+                listOf("f-ewma-1", "f-ewma-2", "f-ewma-fail")
+                    .mapNotNull { dao.getFeedById(it)?.lastPolled }
+                    .distinct()
+            assertEquals(3, polledTimestamps.size)
+
+            // Failed-only poll preserves EWMA flag and returns null measuredWeight
+            dao.upsertLocalSyncFlag(LocalSyncFlagEntity(FLAG_LOCAL_THROUGHPUT_WEIGHT, "2.5"))
+            val failOnlyClient = RocheApiClient { HttpResponse(statusCode = 503, body = "down") }
+            val outcomeFail =
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = failOnlyClient,
+                    localPeerId = "android-1",
+                    activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.5)),
+                    nowInstant = Instant.parse("2026-06-02T12:00:00Z"),
+                )
+            assertEquals(0, outcomeFail.polledFeedsCount)
+            assertEquals(3, outcomeFail.attemptedFeedsCount)
+            assertEquals(null, outcomeFail.measuredWeight)
+            assertEquals("2.5", dao.getLocalSyncFlag(FLAG_LOCAL_THROUGHPUT_WEIGHT))
+
+            // Next successful run seeds from local_sync_flags ("2.5"), not activePeers (0.5)
+            val outcome2 =
+                pollCooperativeFeedsOnDevice(
+                    dao = dao,
+                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = rssBody) },
+                    localPeerId = "android-1",
+                    activePeers = listOf(PeerNodeDto("android-1", "Pixel", "wifi", 0.5)),
+                    nowInstant = Instant.parse("2026-06-04T12:00:00Z"),
+                )
+            val w2 = outcome2.measuredWeight!!
+            assertTrue(w2 > 2.5, "Expected EWMA seeded from persisted 2.5 to rise, got $w2")
+        }
+
+    @Test
+    fun `isLocalPollNewer handles fractional seconds and PeerSyncIn syncs and normalizes consecutiveFailures`() =
+        runTest {
+            assertFalse(isLocalPollNewer("2026-06-01T12:00:00Z", "2026-06-01T12:00:00.500Z"))
+            assertTrue(isLocalPollNewer("2026-06-01T12:00:00.500Z", "2026-06-01T12:00:00Z"))
+            assertFalse(isLocalPollNewer("2026-06-01T12:00:00Z", "2026-06-01T12:00:00+00:00"))
+            assertTrue(isLocalPollNewer("2026-06-01T12:00:00Z", null))
+            assertFalse(isLocalPollNewer(null, "2026-06-01T12:00:00Z"))
+
+            val dao = database.dao()
+            val feedId = deterministicFeedId("https://frac.example.com/rss.xml")
+            dao.upsertFeed(
+                FeedRow(
+                    id = feedId,
+                    title = "Fractional Feed",
+                    url = "https://frac.example.com/rss.xml",
+                    siteUrl = null,
+                    feedType = "rss",
+                    lastPolled = "2026-06-01T12:00:00Z",
+                    lastPolledBy = "android-1",
+                    lastError = null,
+                    lastErrorBy = null,
+                    consecutiveFailures = 0,
+                    hlc = "001780000001000-0000-android-1",
+                )
+            )
+
+            // Incoming poll at 12:00:00.500Z is 500ms newer than local 12:00:00Z, with legacy
+            // consecutive_failures=0 and non-blank last_error -> normalized to 1!
+            val serverHlc = "001780000002000-0000-server"
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncSeq = 1L,
+                        serverHlc = serverHlc,
+                        syncTimestamp = "2026-06-01T12:00:01Z",
+                        entries =
+                            listOf(
+                                SyncEntryRecordDto(
+                                    id = feedId,
+                                    kind = "publication",
+                                    title = "Fractional Feed",
+                                    hlc = serverHlc,
+                                    feedSource =
+                                        SyncFeedSourceDto(
+                                            feedUrl = "https://frac.example.com/rss.xml",
+                                            lastPolledAt = "2026-06-01T12:00:00.500Z",
+                                            lastPolledBy = "server",
+                                            lastError = "HTTP 502",
+                                            lastErrorBy = "server",
+                                            consecutiveFailures = 0,
+                                            hlc = serverHlc,
+                                        ),
+                                )
+                            ),
+                    ),
+                localPeerId = "android-1",
+            )
+            val afterLegacyError = dao.getFeedById(feedId)!!
+            assertEquals("2026-06-01T12:00:00.500Z", afterLegacyError.lastPolled)
+            assertEquals("HTTP 502", afterLegacyError.lastError)
+            assertEquals(1, afterLegacyError.consecutiveFailures)
+
+            // Local newer poll succeeds (lastError = null); stale incoming error must NOT resurrect
+            dao.upsertFeed(
+                afterLegacyError.copy(
+                    lastPolled = "2026-06-01T12:05:00Z",
+                    lastPolledBy = "android-1",
+                    lastError = null,
+                    lastErrorBy = null,
+                    consecutiveFailures = 0,
+                )
+            )
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncSeq = 2L,
+                        serverHlc = serverHlc,
+                        syncTimestamp = "2026-06-01T12:05:01Z",
+                        entries =
+                            listOf(
+                                SyncEntryRecordDto(
+                                    id = feedId,
+                                    kind = "publication",
+                                    title = "Fractional Feed",
+                                    hlc = serverHlc,
+                                    feedSource =
+                                        SyncFeedSourceDto(
+                                            feedUrl = "https://frac.example.com/rss.xml",
+                                            lastPolledAt = "2026-06-01T12:00:00.500Z",
+                                            lastPolledBy = "server",
+                                            lastError = "HTTP 502",
+                                            lastErrorBy = "server",
+                                            consecutiveFailures = 4,
+                                            hlc = serverHlc,
+                                        ),
+                                )
+                            ),
+                    ),
+                localPeerId = "android-1",
+            )
+            val afterStaleRemote = dao.getFeedById(feedId)!!
+            assertEquals("2026-06-01T12:05:00Z", afterStaleRemote.lastPolled)
+            assertEquals(null, afterStaleRemote.lastError)
+            assertEquals(0, afterStaleRemote.consecutiveFailures)
+
+            // Remote unarchive (newer HLC, isActive false -> true, incomingError == null)
+            // clears stale local failure state even if local had an error
+            dao.upsertFeed(
+                afterStaleRemote.copy(
+                    isActive = false,
+                    lastPolled = "2026-06-01T12:06:00Z",
+                    lastError = "HTTP 503",
+                    lastErrorBy = "android-1",
+                    consecutiveFailures = 5,
+                    hlc = "001780000003000-0000-android-1",
+                    isLocalDirty = false,
+                )
+            )
+            val remoteUnarchiveHlc = "001780000004000-0000-server"
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncSeq = 3L,
+                        serverHlc = remoteUnarchiveHlc,
+                        syncTimestamp = "2026-06-01T12:07:00Z",
+                        entries =
+                            listOf(
+                                SyncEntryRecordDto(
+                                    id = feedId,
+                                    kind = "publication",
+                                    title = "Fractional Feed",
+                                    hlc = remoteUnarchiveHlc,
+                                    feedSource =
+                                        SyncFeedSourceDto(
+                                            feedUrl = "https://frac.example.com/rss.xml",
+                                            isActive = true,
+                                            lastPolledAt = "2026-06-01T12:05:00Z",
+                                            lastPolledBy = "server",
+                                            lastError = null,
+                                            lastErrorBy = null,
+                                            consecutiveFailures = 0,
+                                            hlc = remoteUnarchiveHlc,
+                                        ),
+                                )
+                            ),
+                    ),
+                localPeerId = "android-1",
+            )
+            val afterRemoteUnarchive = dao.getFeedById(feedId)!!
+            assertTrue(afterRemoteUnarchive.isActive)
+            assertEquals(null, afterRemoteUnarchive.lastError)
+            assertEquals(null, afterRemoteUnarchive.lastErrorBy)
+            assertEquals(0, afterRemoteUnarchive.consecutiveFailures)
+
+            // Local unarchive clears error and bumps HLC while keeping lastPolledAt unchanged;
+            // a stale pre-unarchive remote DTO with EQUAL lastPolledAt must NOT resurrect error
+            val stalePreUnarchiveHlc = remoteUnarchiveHlc
+            dao.upsertFeed(
+                afterRemoteUnarchive.copy(
+                    isActive = false,
+                    lastPolled = "2026-06-01T12:08:00Z",
+                    lastError = "HTTP 500",
+                    lastErrorBy = "server",
+                    consecutiveFailures = 4,
+                    hlc = stalePreUnarchiveHlc,
+                    isLocalDirty = false,
+                )
+            )
+            dao.updateFeedActiveGraph(feedId, isActive = true, markDirty = true)
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncSeq = 4L,
+                        serverHlc = stalePreUnarchiveHlc,
+                        syncTimestamp = "2026-06-01T12:09:00Z",
+                        entries =
+                            listOf(
+                                SyncEntryRecordDto(
+                                    id = feedId,
+                                    kind = "publication",
+                                    title = "Fractional Feed",
+                                    hlc = stalePreUnarchiveHlc,
+                                    feedSource =
+                                        SyncFeedSourceDto(
+                                            feedUrl = "https://frac.example.com/rss.xml",
+                                            isActive = false,
+                                            lastPolledAt = "2026-06-01T12:08:00Z",
+                                            lastPolledBy = "server",
+                                            lastError = "HTTP 500",
+                                            lastErrorBy = "server",
+                                            consecutiveFailures = 4,
+                                            hlc = stalePreUnarchiveHlc,
+                                        ),
+                                )
+                            ),
+                    ),
+                localPeerId = "android-1",
+            )
+            val afterLocalUnarchiveSync = dao.getFeedById(feedId)!!
+            assertTrue(afterLocalUnarchiveSync.isActive)
+            assertEquals("2026-06-01T12:08:00Z", afterLocalUnarchiveSync.lastPolled)
+            assertEquals(null, afterLocalUnarchiveSync.lastError)
+            assertEquals(null, afterLocalUnarchiveSync.lastErrorBy)
+            assertEquals(0, afterLocalUnarchiveSync.consecutiveFailures)
         }
 }
 

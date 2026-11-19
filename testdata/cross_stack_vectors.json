@@ -76,7 +76,7 @@
           "weight": 1.0
         }
       ],
-      "expected_winner": "server"
+      "expected_winner": "android-tablet"
     },
     {
       "feed_url": "https://rss.arxiv.org/rss/cs.LG",
@@ -94,7 +94,7 @@
           "weight": 1.2
         }
       ],
-      "expected_winner": "android-tablet"
+      "expected_winner": "server"
     },
     {
       "feed_url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
@@ -130,7 +130,7 @@
           "weight": 2.5
         }
       ],
-      "expected_winner": "android-pixel"
+      "expected_winner": "android-tablet"
     }
   ],
   "preferred_identifier_schemes": [
@@ -489,5 +489,292 @@
         "001794920005000-000a-server"
       ]
     }
-  }
+  },
+  "feed_phase_offsets": [
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 281
+    },
+    {
+      "feed_url": "HTTPS://Blog.Rust-Lang.ORG:443/feed.xml",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 281
+    },
+    {
+      "feed_url": "http://example.com:80/feed.xml",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 1688
+    },
+    {
+      "feed_url": "http://example.com/feed.xml",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 1688
+    },
+    {
+      "feed_url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 387
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "poll_interval_mins": 5,
+      "expected_phase_secs": 94
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 1294
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "poll_interval_mins": 1440,
+      "expected_phase_secs": 84094
+    },
+    {
+      "feed_url": "https://bücher.example/feeds/../rss/my feed.xml",
+      "poll_interval_mins": 30,
+      "expected_phase_secs": 49
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 0,
+      "expected_phase_secs": 41
+    }
+  ],
+  "backoff_schedules": [
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 0,
+      "expected_target_delay_secs": 1800
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 1,
+      "expected_target_delay_secs": 3600
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 2,
+      "expected_target_delay_secs": 7200
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 3,
+      "expected_target_delay_secs": 14400
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 4,
+      "expected_target_delay_secs": 28800
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 5,
+      "expected_target_delay_secs": 57600
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 6,
+      "expected_target_delay_secs": 86400
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 10,
+      "expected_target_delay_secs": 86400
+    },
+    {
+      "poll_interval_mins": 30,
+      "consecutive_failures": 20,
+      "expected_target_delay_secs": 86400
+    },
+    {
+      "poll_interval_mins": 5,
+      "consecutive_failures": 1,
+      "expected_target_delay_secs": 600
+    },
+    {
+      "poll_interval_mins": 5,
+      "consecutive_failures": 2,
+      "expected_target_delay_secs": 1200
+    },
+    {
+      "poll_interval_mins": 720,
+      "consecutive_failures": 1,
+      "expected_target_delay_secs": 86400
+    },
+    {
+      "poll_interval_mins": 720,
+      "consecutive_failures": 2,
+      "expected_target_delay_secs": 172800
+    },
+    {
+      "poll_interval_mins": 720,
+      "consecutive_failures": 3,
+      "expected_target_delay_secs": 172800
+    },
+    {
+      "poll_interval_mins": 1440,
+      "consecutive_failures": 1,
+      "expected_target_delay_secs": 172800
+    },
+    {
+      "poll_interval_mins": 1440,
+      "consecutive_failures": 2,
+      "expected_target_delay_secs": 345600
+    },
+    {
+      "poll_interval_mins": 1440,
+      "consecutive_failures": 3,
+      "expected_target_delay_secs": 345600
+    },
+    {
+      "poll_interval_mins": 2880,
+      "consecutive_failures": 1,
+      "expected_target_delay_secs": 345600
+    },
+    {
+      "poll_interval_mins": 2880,
+      "consecutive_failures": 2,
+      "expected_target_delay_secs": 604800
+    },
+    {
+      "poll_interval_mins": 2880,
+      "consecutive_failures": 20,
+      "expected_target_delay_secs": 604800
+    }
+  ],
+  "staggered_poll_schedules": [
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1699999486,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700001281
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1700000981,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700001281
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1700001161,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700001281
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1700001221,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700003081
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "poll_interval_mins": 5,
+      "last_polled_epoch_secs": 1700000164,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700000194
+    },
+    {
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "poll_interval_mins": 5,
+      "last_polled_epoch_secs": 1700000165,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700000494
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1699999491,
+      "consecutive_failures": 1,
+      "expected_next_due_epoch_secs": 1700003081
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1700000381,
+      "consecutive_failures": 1,
+      "expected_next_due_epoch_secs": 1700003081
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1700000382,
+      "consecutive_failures": 1,
+      "expected_next_due_epoch_secs": 1700004881
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1699999486,
+      "consecutive_failures": 3,
+      "expected_next_due_epoch_secs": 1700013881
+    },
+    {
+      "feed_url": "https://blog.rust-lang.org/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1699999486,
+      "consecutive_failures": 6,
+      "expected_next_due_epoch_secs": 1700085881
+    },
+    {
+      "feed_url": "HTTPS://Blog.Rust-Lang.ORG:443/feed.xml",
+      "poll_interval_mins": 30,
+      "last_polled_epoch_secs": 1699999486,
+      "consecutive_failures": 0,
+      "expected_next_due_epoch_secs": 1700001281
+    }
+  ],
+  "throughput_ewma_steps": [
+    {
+      "current_weight": 1.0,
+      "sample_weight": 10.0,
+      "expected_weight": 2.8
+    },
+    {
+      "current_weight": 2.8,
+      "sample_weight": 10.0,
+      "expected_weight": 4.24
+    },
+    {
+      "current_weight": 1.0,
+      "sample_weight": 0.2,
+      "expected_weight": 0.84
+    },
+    {
+      "current_weight": 0.0,
+      "sample_weight": 5.0,
+      "expected_weight": 1.8
+    },
+    {
+      "current_weight": -2.5,
+      "sample_weight": 5.0,
+      "expected_weight": 1.8
+    },
+    {
+      "current_weight": 1.0,
+      "sample_weight": 25.0,
+      "expected_weight": 2.8
+    },
+    {
+      "current_weight": 15.0,
+      "sample_weight": 25.0,
+      "expected_weight": 10.0
+    },
+    {
+      "current_weight": 2.0,
+      "sample_weight": 0.05,
+      "expected_weight": 1.64
+    },
+    {
+      "current_weight": 0.05,
+      "sample_weight": 0.01,
+      "expected_weight": 0.2
+    }
+  ]
 }

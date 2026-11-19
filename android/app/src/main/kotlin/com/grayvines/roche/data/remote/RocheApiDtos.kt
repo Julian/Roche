@@ -27,6 +27,7 @@ data class RemoteFeedDto(
     val lastPolledBy: String? = null,
     val lastError: String? = null,
     val lastErrorBy: String? = null,
+    val consecutiveFailures: Int = 0,
     val isActive: Boolean = true,
 )
 

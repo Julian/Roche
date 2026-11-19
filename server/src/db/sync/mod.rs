@@ -18,9 +18,13 @@ pub use hlc::{
 };
 #[allow(unused_imports)]
 pub use hrw::{
-    DEFAULT_ONLINE_PEER_WEIGHT, NetworkTier, PEER_LEASE_TTL_MINUTES, PeerNode, SERVER_PEER_ID,
-    compute_throughput_weight, effective_peer_weight, rendezvous_uniform_unit, select_feed_poller,
-    should_peer_poll_feed,
+    ABSOLUTE_MAX_BACKOFF_SECS, DEFAULT_MAX_BACKOFF_SECS, DEFAULT_ONLINE_PEER_WEIGHT,
+    MAX_CONSECUTIVE_FAILURES, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT, NetworkTier,
+    PEER_LEASE_TTL_MINUTES, PeerNode, SERVER_PEER_ID, THROUGHPUT_EWMA_ALPHA,
+    compute_throughput_weight, effective_peer_weight, feed_phase_offset_secs,
+    next_phase_slot_at_or_after, next_scheduled_poll_epoch_secs, normalize_consecutive_failures,
+    rendezvous_uniform_unit, select_feed_poller, should_peer_poll_feed, target_poll_interval_secs,
+    update_throughput_ewma,
 };
 #[allow(unused_imports)]
 pub use identity::{

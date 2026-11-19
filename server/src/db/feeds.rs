@@ -8,8 +8,8 @@ use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
     ItemRepo, MediaRepo, SyncRepo,
     sync::{
-        SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id, deterministic_item_id,
-        feed_natural_key, item_natural_key,
+        MAX_CONSECUTIVE_FAILURES, SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id,
+        deterministic_item_id, feed_natural_key, item_natural_key, normalize_consecutive_failures,
     },
 };
 use crate::feeds::{OpmlOutline, arxiv::ArxivParser};
@@ -30,6 +30,8 @@ pub struct Feed {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_by: Option<String>,
+    #[serde(default)]
+    pub consecutive_failures: i64,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub unread_count: i64,
@@ -49,6 +51,7 @@ macro_rules! feed_select_sql {
        fs.last_polled_by,
        fs.last_error,
        fs.last_error_by,
+       fs.consecutive_failures,
        fs.is_active,
        e.created_at,
        (SELECT COUNT(*)
@@ -67,14 +70,24 @@ JOIN entries e ON e.id = fs.collection_id ",
 
 const FEED_SELECT_BY_ID_SQL: &str = feed_select_sql!("WHERE fs.collection_id = ?");
 const FEED_SELECT_ALL_SQL: &str = feed_select_sql!("ORDER BY e.created_at DESC");
-const FEED_SELECT_ACTIVE_POLL_SQL: &str = feed_select_sql!(
-    "WHERE fs.is_active = 1
-       AND (
-           fs.last_polled_at IS NULL
-           OR datetime(fs.last_polled_at) < datetime('now', '-' || fs.poll_interval || ' minutes')
-           OR (fs.last_error IS NOT NULL AND fs.last_error_by IS NOT NULL AND fs.last_error_by != ?)
-       )"
-);
+const FEED_SELECT_ACTIVE_POLL_SQL: &str = "SELECT fs.collection_id AS id,
+       fs.source_type AS feed_type,
+       fs.feed_url AS url,
+       fs.feed_title AS title,
+       e.summary AS description,
+       fs.language,
+       fs.poll_interval,
+       fs.last_polled_at AS last_polled,
+       fs.last_polled_by,
+       fs.last_error,
+       fs.last_error_by,
+       fs.consecutive_failures,
+       fs.is_active,
+       e.created_at,
+       0 AS unread_count
+FROM feed_sources fs
+JOIN entries e ON e.id = fs.collection_id
+WHERE fs.is_active = 1";
 
 #[derive(sqlx::FromRow)]
 struct RawFeedRow {
@@ -89,6 +102,7 @@ struct RawFeedRow {
     last_polled_by: Option<String>,
     last_error: Option<String>,
     last_error_by: Option<String>,
+    consecutive_failures: i64,
     is_active: bool,
     created_at: DateTime<Utc>,
     unread_count: i64,
@@ -102,6 +116,8 @@ impl TryFrom<RawFeedRow> for Feed {
             index: "url".to_owned(),
             source: Box::new(e),
         })?;
+        let consecutive_failures =
+            normalize_consecutive_failures(raw.last_error.as_deref(), raw.consecutive_failures);
         Ok(Self {
             id: raw.id,
             feed_type: raw.feed_type,
@@ -114,6 +130,7 @@ impl TryFrom<RawFeedRow> for Feed {
             last_polled_by: raw.last_polled_by,
             last_error: raw.last_error,
             last_error_by: raw.last_error_by,
+            consecutive_failures,
             is_active: raw.is_active,
             created_at: raw.created_at,
             unread_count: raw.unread_count,
@@ -165,6 +182,7 @@ pub(super) struct NewFeedRow<'a> {
     pub last_polled_by: Option<&'a str>,
     pub last_error: Option<&'a str>,
     pub last_error_by: Option<&'a str>,
+    pub consecutive_failures: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -260,14 +278,17 @@ impl<'a> FeedRepo<'a> {
         .await?;
 
         if let Some(existing_id) = existing_archived_id {
-            sqlx::query!(
+            sqlx::query(
                 "UPDATE feed_sources
                  SET is_active = 1,
-                     feed_title = COALESCE(?, feed_title)
+                     feed_title = COALESCE(?, feed_title),
+                     consecutive_failures = 0,
+                     last_error = NULL,
+                     last_error_by = NULL
                  WHERE collection_id = ?",
-                title,
-                existing_id,
             )
+            .bind(title)
+            .bind(&existing_id)
             .execute(&mut *tx)
             .await?;
 
@@ -328,6 +349,7 @@ impl<'a> FeedRepo<'a> {
                 last_polled_by: None,
                 last_error: None,
                 last_error_by: None,
+                consecutive_failures: 0,
                 created_at: now,
                 updated_at: now,
             },
@@ -348,6 +370,7 @@ impl<'a> FeedRepo<'a> {
             last_polled_by: None,
             last_error: None,
             last_error_by: None,
+            consecutive_failures: 0,
             is_active: true,
             created_at: now,
             unread_count: 0,
@@ -362,6 +385,8 @@ impl<'a> FeedRepo<'a> {
         let entry_title =
             row.title.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(row.feed_url);
         let nat_key = feed_natural_key(row.feed_url);
+        let norm_failures =
+            normalize_consecutive_failures(row.last_error, row.consecutive_failures);
 
         sqlx::query!(
             "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
@@ -393,23 +418,25 @@ impl<'a> FeedRepo<'a> {
         .execute(&mut *conn)
         .await?;
 
-        sqlx::query!(
+        sqlx::query(
             "INSERT OR IGNORE INTO feed_sources
              (collection_id, feed_url, source_type, feed_title, language, poll_interval,
-              is_active, last_polled_at, last_polled_by, last_error, last_error_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            row.id,
-            row.feed_url,
-            row.feed_type as _,
-            row.title,
-            row.language,
-            row.poll_interval,
-            row.is_active as _,
-            row.last_polled as _,
-            row.last_polled_by,
-            row.last_error,
-            row.last_error_by,
+              is_active, last_polled_at, last_polled_by, last_error, last_error_by,
+              consecutive_failures)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(row.id)
+        .bind(row.feed_url)
+        .bind(row.feed_type)
+        .bind(row.title)
+        .bind(row.language)
+        .bind(row.poll_interval)
+        .bind(row.is_active)
+        .bind(row.last_polled)
+        .bind(row.last_polled_by)
+        .bind(row.last_error)
+        .bind(row.last_error_by)
+        .bind(norm_failures)
         .execute(&mut *conn)
         .await?;
 
@@ -477,14 +504,17 @@ impl<'a> FeedRepo<'a> {
         .await?;
 
         if let Some(existing_id) = existing_archived_id {
-            sqlx::query!(
+            sqlx::query(
                 "UPDATE feed_sources
                  SET is_active = 1,
-                     feed_title = COALESCE(feed_title, ?)
+                     feed_title = COALESCE(feed_title, ?),
+                     consecutive_failures = 0,
+                     last_error = NULL,
+                     last_error_by = NULL
                  WHERE collection_id = ?",
-                clean_title,
-                existing_id,
             )
+            .bind(clean_title)
+            .bind(&existing_id)
             .execute(&mut *tx)
             .await?;
 
@@ -542,6 +572,7 @@ impl<'a> FeedRepo<'a> {
                 last_polled_by: None,
                 last_error: None,
                 last_error_by: None,
+                consecutive_failures: 0,
                 created_at: now,
                 updated_at: now,
             },
@@ -560,6 +591,7 @@ impl<'a> FeedRepo<'a> {
             last_polled_by: None,
             last_error: None,
             last_error_by: None,
+            consecutive_failures: 0,
             is_active: true,
             created_at: now,
             unread_count: 0,
@@ -630,13 +662,24 @@ impl<'a> FeedRepo<'a> {
             .await?;
         }
         if let Some(active) = is_active {
-            sqlx::query!(
-                "UPDATE feed_sources SET is_active = ? WHERE collection_id = ?",
-                active as _,
-                id,
-            )
-            .execute(&mut *tx)
-            .await?;
+            if active {
+                sqlx::query(
+                    "UPDATE feed_sources
+                     SET is_active = 1,
+                         consecutive_failures = 0,
+                         last_error = NULL,
+                         last_error_by = NULL
+                     WHERE collection_id = ?",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query("UPDATE feed_sources SET is_active = 0 WHERE collection_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
             .execute(&mut *tx)
@@ -758,12 +801,8 @@ impl<'a> FeedRepo<'a> {
         Ok(true)
     }
 
-    pub async fn get_active_for_cooperative_polling(
-        &self,
-        local_peer_id: &str,
-    ) -> Result<Vec<Feed>> {
+    pub async fn get_active_for_cooperative_polling(&self) -> Result<Vec<Feed>> {
         let rows = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_ACTIVE_POLL_SQL)
-            .bind(local_peer_id)
             .fetch_all(self.pool)
             .await?;
         Ok(rows.into_iter().map(Feed::try_from).collect::<std::result::Result<Vec<_>, _>>()?)
@@ -814,7 +853,7 @@ impl<'a> FeedRepo<'a> {
                 || (r.language.is_none() && new_lang.is_some())
         });
 
-        sqlx::query!(
+        sqlx::query(
             "UPDATE feed_sources
              SET feed_title = COALESCE(feed_title, ?),
                  language = COALESCE(language, ?),
@@ -822,15 +861,16 @@ impl<'a> FeedRepo<'a> {
                  last_polled_at = ?,
                  last_polled_by = ?,
                  last_error = NULL,
-                 last_error_by = NULL
+                 last_error_by = NULL,
+                 consecutive_failures = 0
              WHERE collection_id = ?",
-            new_title,
-            new_lang,
-            has_audio_items as _,
-            now as _,
-            peer_id,
-            feed_id,
         )
+        .bind(new_title)
+        .bind(new_lang)
+        .bind(has_audio_items)
+        .bind(now)
+        .bind(peer_id)
+        .bind(feed_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1245,15 +1285,19 @@ impl<'a> FeedRepo<'a> {
     pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
         let now = SyncRepo::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        sqlx::query!(
+        sqlx::query(
             "UPDATE feed_sources
-             SET last_error = ?, last_error_by = ?, last_polled_at = ?
+             SET last_error = ?,
+                 last_error_by = ?,
+                 last_polled_at = ?,
+                 consecutive_failures = MIN(consecutive_failures + 1, ?)
              WHERE collection_id = ?",
-            error,
-            peer_id,
-            now as _,
-            id,
         )
+        .bind(error)
+        .bind(peer_id)
+        .bind(now)
+        .bind(MAX_CONSECUTIVE_FAILURES)
+        .bind(id)
         .execute(&mut *tx)
         .await?;
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
@@ -1281,18 +1325,48 @@ mod tests {
 
         let feed_url = Url::parse("https://example.com/rss.xml").unwrap();
         let feed = feed_repo.create(FeedType::Rss, &feed_url, Some("Example"), None).await.unwrap();
+        assert_eq!(feed.consecutive_failures, 0);
 
-        let active = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
+        let active = feed_repo.get_active_for_cooperative_polling().await.unwrap();
         assert_eq!(active.len(), 1);
+        assert_eq!(active[0].unread_count, 0);
 
+        // `get_active_for_cooperative_polling` returns all active feeds so `should_peer_poll_feed`
+        // is the single source of truth; `mark_error` increments `consecutive_failures` up to cap.
         feed_repo.mark_error(&feed.id, "timeout").await.unwrap();
-        let active_after_err =
-            feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
-        assert!(active_after_err.is_empty());
+        let after_err1 = feed_repo.get(&feed.id).await.unwrap().unwrap();
+        assert_eq!(after_err1.consecutive_failures, 1);
+        assert_eq!(after_err1.last_error.as_deref(), Some("timeout"));
+        assert_eq!(after_err1.last_error_by.as_deref(), Some("server"));
 
-        let active_for_rescue_peer =
-            feed_repo.get_active_for_cooperative_polling("android-peer-1").await.unwrap();
-        assert_eq!(active_for_rescue_peer.len(), 1);
+        let active_after_err = feed_repo.get_active_for_cooperative_polling().await.unwrap();
+        assert_eq!(active_after_err.len(), 1);
+        assert_eq!(active_after_err[0].consecutive_failures, 1);
+
+        // Increment past cap -> capped at MAX_CONSECUTIVE_FAILURES (20).
+        for _ in 0..25 {
+            feed_repo.mark_error(&feed.id, "still failing").await.unwrap();
+        }
+        let capped = feed_repo.get(&feed.id).await.unwrap().unwrap();
+        assert_eq!(capped.consecutive_failures, crate::db::MAX_CONSECUTIVE_FAILURES);
+
+        // Poll success resets consecutive_failures, last_error, last_error_by.
+        feed_repo
+            .record_poll_batch(
+                &feed.id,
+                &crate::db::PollBatch {
+                    title: Some("Example".to_owned()),
+                    description: None,
+                    language: None,
+                    items: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let recovered = feed_repo.get(&feed.id).await.unwrap().unwrap();
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert!(recovered.last_error.is_none());
+        assert!(recovered.last_error_by.is_none());
 
         let item_url = Url::parse("https://example.com/1").unwrap();
         let item = db
@@ -1339,12 +1413,17 @@ mod tests {
             .await
             .unwrap();
 
+        // Accumulate failures before archiving so we can verify unarchive & re-subscribe reset them.
+        feed_repo.mark_error(&feed.id, "500").await.unwrap();
+        feed_repo.mark_error(&feed.id, "500").await.unwrap();
+        assert_eq!(feed_repo.get(&feed.id).await.unwrap().unwrap().consecutive_failures, 2);
+
         assert!(feed_repo.archive(&feed.id).await.unwrap());
         let archived_feed = feed_repo.get(&feed.id).await.unwrap().unwrap();
         assert!(!archived_feed.is_active);
         assert_eq!(archived_feed.unread_count, 1);
 
-        let active = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
+        let active = feed_repo.get_active_for_cooperative_polling().await.unwrap();
         assert!(active.is_empty());
 
         let preserved = db.items().get(&item.id).await.unwrap().unwrap();
@@ -1353,9 +1432,15 @@ mod tests {
         assert!(feed_repo.unarchive(&feed.id).await.unwrap());
         let unarchived_feed = feed_repo.get(&feed.id).await.unwrap().unwrap();
         assert!(unarchived_feed.is_active);
-        let active_after = feed_repo.get_active_for_cooperative_polling("server").await.unwrap();
+        assert_eq!(unarchived_feed.consecutive_failures, 0);
+        assert!(unarchived_feed.last_error.is_none());
+        assert!(unarchived_feed.last_error_by.is_none());
+        let active_after = feed_repo.get_active_for_cooperative_polling().await.unwrap();
         assert_eq!(active_after.len(), 1);
 
+        feed_repo.mark_error(&feed.id, "503").await.unwrap();
+        feed_repo.mark_error(&feed.id, "503").await.unwrap();
+        feed_repo.mark_error(&feed.id, "503").await.unwrap();
         assert!(feed_repo.archive(&feed.id).await.unwrap());
         let resubscribed = feed_repo
             .create(FeedType::Rss, &feed_url, Some("Resubscribed Title"), None)
@@ -1365,6 +1450,9 @@ mod tests {
         assert!(resubscribed.is_active);
         assert_eq!(resubscribed.title.as_deref(), Some("Resubscribed Title"));
         assert_eq!(resubscribed.unread_count, 1);
+        assert_eq!(resubscribed.consecutive_failures, 0);
+        assert!(resubscribed.last_error.is_none());
+        assert!(resubscribed.last_error_by.is_none());
     }
 
     #[tokio::test]
@@ -1396,6 +1484,8 @@ mod tests {
         let untitled_feed =
             feed_repo.create(FeedType::Rss, &untitled_url, None, None).await.unwrap();
 
+        feed_repo.mark_error(&renamed_feed.id, "upstream 502").await.unwrap();
+        feed_repo.mark_error(&renamed_feed.id, "upstream 502").await.unwrap();
         assert!(feed_repo.archive(&renamed_feed.id).await.unwrap());
         assert!(feed_repo.archive(&untitled_feed.id).await.unwrap());
 
@@ -1426,6 +1516,9 @@ mod tests {
         assert!(imported[0].is_active);
         assert_eq!(imported[0].title.as_deref(), Some("My Custom Title"));
         assert_eq!(imported[0].unread_count, 1);
+        assert_eq!(imported[0].consecutive_failures, 0);
+        assert!(imported[0].last_error.is_none());
+        assert!(imported[0].last_error_by.is_none());
 
         assert_eq!(imported[1].id, untitled_feed.id);
         assert!(imported[1].is_active);

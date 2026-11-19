@@ -138,6 +138,7 @@ data class FeedItem(
     val lastPolledBy: String? = null,
     val lastError: String? = null,
     val lastErrorBy: String? = null,
+    val consecutiveFailures: Int = 0,
     val isActive: Boolean = true,
     val autoDownloadEpisodes: Boolean = false,
     val customPlaybackSpeed: Float? = null,
@@ -163,7 +164,10 @@ data class FeedItem(
 }
 
 fun FeedItem.isCrossPeerRescueError(localPeerId: String): Boolean =
-    hasPollError && !lastErrorBy.isNullOrBlank() && lastErrorBy != localPeerId
+    hasPollError &&
+        consecutiveFailures <= 1 &&
+        !lastErrorBy.isNullOrBlank() &&
+        lastErrorBy != localPeerId
 
 data class TagItem(val id: String, val name: String, val unreadCount: Int)
 

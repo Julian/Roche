@@ -69,6 +69,7 @@ fn make_feed_sync_entry(
             last_polled_by: last_polled_by.map(str::to_owned),
             last_error: None,
             last_error_by: None,
+            consecutive_failures: 0,
             hlc: hlc.to_owned(),
         }),
     }
@@ -156,6 +157,7 @@ fn test_deterministic_uuid_and_hrw_work_splitting() {
             last_polled_by: None,
             last_error: None,
             last_error_by: None,
+            consecutive_failures: 0,
             is_active: true,
             created_at: now,
             unread_count: 0,
@@ -190,6 +192,7 @@ fn test_deterministic_uuid_and_hrw_work_splitting() {
             last_polled_by: None,
             last_error: None,
             last_error_by: None,
+            consecutive_failures: 0,
             is_active: true,
             created_at: now,
             unread_count: 0,
@@ -216,6 +219,7 @@ fn test_deterministic_uuid_and_hrw_work_splitting() {
         last_polled_by: Some("server".to_string()),
         last_error: Some("Upstream server returned HTTP 403 Forbidden".to_string()),
         last_error_by: Some("server".to_string()),
+        consecutive_failures: 1,
         is_active: true,
         created_at: now,
         unread_count: 0,
@@ -1011,6 +1015,37 @@ fn test_cross_stack_golden_vectors() {
     }
 
     #[derive(Deserialize)]
+    struct FeedPhaseOffsetVector {
+        feed_url: String,
+        poll_interval_mins: i64,
+        expected_phase_secs: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct BackoffScheduleVector {
+        poll_interval_mins: i64,
+        consecutive_failures: i64,
+        expected_target_delay_secs: i64,
+    }
+
+    #[derive(Deserialize)]
+    struct StaggeredPollScheduleVector {
+        feed_url: String,
+        poll_interval_mins: i64,
+        last_polled_epoch_secs: i64,
+        consecutive_failures: i64,
+        expected_next_due_epoch_secs: i64,
+    }
+
+    #[derive(Deserialize)]
+    #[allow(clippy::struct_field_names)]
+    struct ThroughputEwmaStepVector {
+        current_weight: f64,
+        sample_weight: f64,
+        expected_weight: f64,
+    }
+
+    #[derive(Deserialize)]
     struct GoldenVectors {
         canonical_urls: Vec<CanonicalUrlVector>,
         entity_ids: Vec<EntityIdVector>,
@@ -1023,6 +1058,10 @@ fn test_cross_stack_golden_vectors() {
         dynamic_collection_rules: Vec<DynamicRuleVector>,
         ranked_collection_parity: Vec<RankedParityVector>,
         hlc_vectors: HlcVectors,
+        feed_phase_offsets: Vec<FeedPhaseOffsetVector>,
+        backoff_schedules: Vec<BackoffScheduleVector>,
+        staggered_poll_schedules: Vec<StaggeredPollScheduleVector>,
+        throughput_ewma_steps: Vec<ThroughputEwmaStepVector>,
     }
 
     let vectors_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1192,6 +1231,59 @@ fn test_cross_stack_golden_vectors() {
     parsed_hlcs.sort();
     let encoded_sorted: Vec<String> = parsed_hlcs.iter().map(HlcTimestamp::encode).collect();
     assert_eq!(encoded_sorted, vectors.hlc_vectors.total_order.expected_sorted);
+
+    assert!(vectors.feed_phase_offsets.len() >= 5);
+    for case in &vectors.feed_phase_offsets {
+        assert_eq!(
+            feed_phase_offset_secs(&case.feed_url, case.poll_interval_mins),
+            case.expected_phase_secs,
+            "feed_phase_offset_secs mismatch for {} ({}m)",
+            case.feed_url,
+            case.poll_interval_mins
+        );
+    }
+
+    assert!(vectors.backoff_schedules.len() >= 10);
+    for case in &vectors.backoff_schedules {
+        assert_eq!(
+            target_poll_interval_secs(case.poll_interval_mins, case.consecutive_failures),
+            case.expected_target_delay_secs,
+            "target_poll_interval_secs mismatch for {}m, k={}",
+            case.poll_interval_mins,
+            case.consecutive_failures
+        );
+    }
+
+    assert!(vectors.staggered_poll_schedules.len() >= 7);
+    for case in &vectors.staggered_poll_schedules {
+        assert_eq!(
+            next_scheduled_poll_epoch_secs(
+                &case.feed_url,
+                case.poll_interval_mins,
+                case.last_polled_epoch_secs,
+                case.consecutive_failures,
+            ),
+            case.expected_next_due_epoch_secs,
+            "next_scheduled_poll_epoch_secs mismatch for {} ({}m, lp={}, k={})",
+            case.feed_url,
+            case.poll_interval_mins,
+            case.last_polled_epoch_secs,
+            case.consecutive_failures
+        );
+    }
+
+    assert!(vectors.throughput_ewma_steps.len() >= 5);
+    for case in &vectors.throughput_ewma_steps {
+        let actual = update_throughput_ewma(case.current_weight, case.sample_weight);
+        assert!(
+            (actual - case.expected_weight).abs() < 1e-9,
+            "update_throughput_ewma({}, {}): got {}, expected {}",
+            case.current_weight,
+            case.sample_weight,
+            actual,
+            case.expected_weight
+        );
+    }
 }
 
 #[tokio::test]
@@ -2554,4 +2646,449 @@ async fn test_peer_finish_draw_preserves_peer_next_draw_and_returns_conflict_win
         .expect("server must return winning generator when rejecting a stale differing draw");
     assert_eq!(returned.current_entry_id.as_deref(), Some(album_ids[1].as_str()));
     assert_eq!(returned.hlc, peer_gen_hlc);
+}
+
+#[test]
+fn test_staggered_phase_distribution_and_zero_post_refresh_all_pileup() {
+    let refresh_all_ts = 1_700_000_000_i64;
+    let interval_mins = 30_i64;
+    let interval_secs = interval_mins * 60;
+    let min_gap = 120_i64;
+
+    let mut phase_buckets = [0usize; 6]; // 5-minute buckets across 30m
+    let mut due_buckets = [0usize; 6];
+
+    for idx in 0..120 {
+        let url = format!("https://feeds.example.org/blog-{idx}/rss.xml");
+        let phase = feed_phase_offset_secs(&url, interval_mins);
+        assert!((0..interval_secs).contains(&phase));
+        let p_bucket = usize::try_from(phase / 300).unwrap();
+        phase_buckets[p_bucket] += 1;
+
+        // Post-Refresh-All at `refresh_all_ts`: every feed must land in [T + 2m, T + 32m)
+        // on its exact permanent phase slot, eliminating synchronized pileups at T + 30m.
+        let next_due = next_scheduled_poll_epoch_secs(&url, interval_mins, refresh_all_ts, 0);
+        assert!(
+            next_due >= refresh_all_ts + min_gap
+                && next_due < refresh_all_ts + min_gap + interval_secs,
+            "next_due={next_due} outside [T+2m, T+32m) for {url}"
+        );
+        assert_eq!(next_due.rem_euclid(interval_secs), phase);
+        let offset_from_earliest = next_due - (refresh_all_ts + min_gap);
+        let d_bucket = usize::try_from(offset_from_earliest / 300).unwrap();
+        due_buckets[d_bucket] += 1;
+
+        // Steady-state on-phase poll (5s after phase slot) advances by exactly 1 interval.
+        let steady_next = next_scheduled_poll_epoch_secs(&url, interval_mins, next_due + 5, 0);
+        assert_eq!(steady_next, next_due + interval_secs);
+    }
+
+    for (b, count) in phase_buckets.iter().enumerate() {
+        assert!(*count >= 8, "Phase bucket {b} under-populated ({count}/120)");
+    }
+    for (b, count) in due_buckets.iter().enumerate() {
+        assert!(*count >= 8, "Post-Refresh-All bucket {b} under-populated ({count}/120)");
+    }
+
+    // Phase-aligned HRW epoch keeps the same winner across the entire [slot_start, slot_start + interval)
+    // window even when crossing a wall-clock `:00` / `:30` boundary!
+    let url = "https://blog.rust-lang.org/feed.xml";
+    let phase = feed_phase_offset_secs(url, 30);
+    assert!(phase > 0 && phase < 1800);
+    let slot_start = next_phase_slot_at_or_after(1_700_000_000, phase, 1800);
+    let base_dt = DateTime::from_timestamp(slot_start, 0).unwrap();
+    let peers = vec![
+        PeerNode {
+            peer_id: "server".to_owned(),
+            device_name: "Server".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: 1.0,
+            last_seen_at: base_dt,
+        },
+        PeerNode {
+            peer_id: "android-pixel".to_owned(),
+            device_name: "Pixel".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: 1.0,
+            last_seen_at: base_dt,
+        },
+        PeerNode {
+            peer_id: "android-tablet".to_owned(),
+            device_name: "Tablet".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: 1.0,
+            last_seen_at: base_dt,
+        },
+    ];
+    let expected_winner =
+        select_feed_poller(&peers, url, 30, base_dt, None, None, None, None).unwrap();
+    for delta in [1_i64, 60, 600, 1200, 1799] {
+        let t = DateTime::from_timestamp(slot_start + delta, 0).unwrap();
+        let fresh_peers: Vec<PeerNode> = peers
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                p.last_seen_at = t;
+                p
+            })
+            .collect();
+        let winner = select_feed_poller(&fresh_peers, url, 30, t, None, None, None, None);
+        assert_eq!(
+            winner,
+            Some(expected_winner),
+            "HRW winner flipped mid-slot at +{delta}s from slot_start"
+        );
+    }
+}
+
+#[test]
+fn test_exponential_backoff_cap_and_cross_peer_rescue_prevents_ping_pong() {
+    // 30m feed progression: 1h, 2h, 4h, 8h, 16h, 24h cap
+    let expected_30m = [1800, 3600, 7200, 14400, 28800, 57600, 86400, 86400];
+    for (k, &exp) in expected_30m.iter().enumerate() {
+        assert_eq!(target_poll_interval_secs(30, i64::try_from(k).unwrap()), exp);
+    }
+    // 24h (1440m) feed: 48h, 96h (4x cap), 96h
+    assert_eq!(target_poll_interval_secs(1440, 0), 86_400);
+    assert_eq!(target_poll_interval_secs(1440, 1), 172_800);
+    assert_eq!(target_poll_interval_secs(1440, 2), 345_600);
+    assert_eq!(target_poll_interval_secs(1440, 5), 345_600);
+    // 48h (2880m) feed hits 7-day absolute cap
+    assert_eq!(target_poll_interval_secs(2880, 1), 345_600);
+    assert_eq!(target_poll_interval_secs(2880, 2), ABSOLUTE_MAX_BACKOFF_SECS);
+
+    let url = Url::parse("https://broken.example.org/rss.xml").unwrap();
+    let phase = feed_phase_offset_secs(url.as_str(), 30);
+    let slot_start = next_phase_slot_at_or_after(1_700_000_000, phase, 1800);
+    let last_polled = DateTime::from_timestamp(slot_start, 0).unwrap();
+    let now = DateTime::from_timestamp(slot_start + 60, 0).unwrap();
+    let peers = vec![
+        PeerNode {
+            peer_id: "server".to_owned(),
+            device_name: "Server".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: 1.0,
+            last_seen_at: now,
+        },
+        PeerNode {
+            peer_id: "android-1".to_owned(),
+            device_name: "Phone".to_owned(),
+            network_tier: NetworkTier::Wifi,
+            weight: 1.0,
+            last_seen_at: now,
+        },
+    ];
+
+    // Failure #1 by `server`: `android-1` gets immediate cross-peer rescue; `server` backs off.
+    let fail1 = Feed {
+        id: deterministic_feed_id(url.as_str()),
+        feed_type: FeedType::Rss,
+        url: url.clone(),
+        title: Some("Broken".to_owned()),
+        description: None,
+        language: None,
+        poll_interval: 30,
+        last_polled: Some(last_polled),
+        last_polled_by: Some("server".to_owned()),
+        last_error: Some("HTTP 500".to_owned()),
+        last_error_by: Some("server".to_owned()),
+        consecutive_failures: 1,
+        is_active: true,
+        created_at: last_polled,
+        unread_count: 0,
+    };
+    assert!(!should_peer_poll_feed("server", &peers, &fail1, now));
+    assert!(should_peer_poll_feed("android-1", &peers, &fail1, now));
+
+    // Failure #2 after `android-1` ALSO failed: immediate cross-peer rescue MUST STOP for BOTH peers!
+    let fail2 = Feed {
+        last_polled: Some(now),
+        last_error_by: Some("android-1".to_owned()),
+        consecutive_failures: 2,
+        ..fail1
+    };
+    let check_1m_later = DateTime::from_timestamp(now.timestamp() + 60, 0).unwrap();
+    let fresh_peers_1m: Vec<PeerNode> = peers
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.last_seen_at = check_1m_later;
+            p
+        })
+        .collect();
+    assert!(!should_peer_poll_feed("server", &fresh_peers_1m, &fail2, check_1m_later));
+    assert!(!should_peer_poll_feed("android-1", &fresh_peers_1m, &fail2, check_1m_later));
+
+    // Still backed off at +70m (2x interval < 2h target delay; must NOT prematurely overdue-rescue!).
+    let due_at_k2 = next_scheduled_poll_epoch_secs(url.as_str(), 30, now.timestamp(), 2);
+    let before_due = DateTime::from_timestamp(due_at_k2 - 60, 0).unwrap();
+    assert!(before_due.timestamp() - now.timestamp() > 3600);
+    let fresh_peers_before: Vec<PeerNode> = peers
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.last_seen_at = before_due;
+            p
+        })
+        .collect();
+    assert!(!should_peer_poll_feed("server", &fresh_peers_before, &fail2, before_due));
+    assert!(!should_peer_poll_feed("android-1", &fresh_peers_before, &fail2, before_due));
+
+    // At `due_at_k2`, exactly one peer claims the retry; at `due_at_k2 + 30m`, either peer can rescue.
+    let at_due = DateTime::from_timestamp(due_at_k2, 0).unwrap();
+    let fresh_peers_due: Vec<PeerNode> = peers
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.last_seen_at = at_due;
+            p
+        })
+        .collect();
+    let server_polls_due = should_peer_poll_feed("server", &fresh_peers_due, &fail2, at_due);
+    let android_polls_due = should_peer_poll_feed("android-1", &fresh_peers_due, &fail2, at_due);
+    assert_ne!(
+        server_polls_due, android_polls_due,
+        "Exactly one peer should own the backed-off retry at due_at"
+    );
+
+    let overdue_rescue_time = DateTime::from_timestamp(due_at_k2 + 1800, 0).unwrap();
+    let fresh_peers_overdue: Vec<PeerNode> = peers
+        .iter()
+        .cloned()
+        .map(|mut p| {
+            p.last_seen_at = overdue_rescue_time;
+            p
+        })
+        .collect();
+    assert!(should_peer_poll_feed("server", &fresh_peers_overdue, &fail2, overdue_rescue_time));
+    assert!(should_peer_poll_feed("android-1", &fresh_peers_overdue, &fail2, overdue_rescue_time));
+}
+
+#[tokio::test]
+async fn test_peer_sync_consecutive_failures_normalization_and_remote_unarchive_reset() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let feed_url = Url::parse("https://sync-backoff.example.org/rss.xml").unwrap();
+    let feed =
+        db.feeds().create(FeedType::Rss, &feed_url, Some("Backoff Feed"), None).await.unwrap();
+    let base_ts = SyncRepo::now_utc();
+    let hlc1 =
+        HlcTimestamp::from_datetime(base_ts + chrono::Duration::seconds(5), "phone-1").encode();
+
+    // 1. Wire backwards-compat: deserialize raw JSON `SyncFeedSource` OMITTING `"consecutive_failures"`
+    //    from a pre-upgrade peer with non-blank `last_error` -> serde defaults to 0, server normalizes
+    //    to 1 on merge and echoes 1 back.
+    let t1 = base_ts + chrono::Duration::seconds(5);
+    let legacy_fs_json = serde_json::json!({
+        "feed_url": feed_url.as_str(),
+        "source_type": "rss",
+        "feed_title": "Backoff Feed",
+        "language": "en",
+        "poll_interval": 30,
+        "is_active": true,
+        "last_polled_at": t1.to_rfc3339(),
+        "last_polled_by": "phone-1",
+        "last_error": "HTTP 503",
+        "last_error_by": "phone-1",
+        "hlc": hlc1
+    })
+    .to_string();
+    let legacy_fs: SyncFeedSource = serde_json::from_str(&legacy_fs_json).unwrap();
+    assert_eq!(legacy_fs.consecutive_failures, 0, "Omitted JSON field must deserialize to 0");
+    let mut legacy_entry = make_feed_sync_entry(
+        &feed.id,
+        feed_url.as_str(),
+        FeedType::Rss,
+        Some("Backoff Feed"),
+        None,
+        true,
+        Some(t1),
+        Some("phone-1"),
+        &hlc1,
+    );
+    legacy_entry.feed_source = Some(legacy_fs);
+    let (resp1, _) = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            entries: vec![legacy_entry],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let fs1 = resp1.entries.iter().find(|e| e.id == feed.id).unwrap().feed_source.as_ref().unwrap();
+    assert_eq!(fs1.consecutive_failures, 1);
+
+    // 2. Peer sends over-cap `consecutive_failures = 99` -> clamped to MAX_CONSECUTIVE_FAILURES (20).
+    let t2 = base_ts + chrono::Duration::seconds(10);
+    let mut cap_entry = make_feed_sync_entry(
+        &feed.id,
+        feed_url.as_str(),
+        FeedType::Rss,
+        Some("Backoff Feed"),
+        None,
+        true,
+        Some(t2),
+        Some("phone-1"),
+        &hlc1,
+    );
+    if let Some(ref mut fs) = cap_entry.feed_source {
+        fs.last_error = Some("HTTP 503".to_owned());
+        fs.last_error_by = Some("phone-1".to_owned());
+        fs.consecutive_failures = 99;
+    }
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            since_seq: resp1.sync_seq,
+            entries: vec![cap_entry],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        db.feeds().get(&feed.id).await.unwrap().unwrap().consecutive_failures,
+        MAX_CONSECUTIVE_FAILURES
+    );
+
+    // 3. Archive locally, then remote peer unarchives with newer config HLC and cleared error
+    //    (without a newer `last_polled_at`) -> server clears stale failure state!
+    assert!(db.feeds().archive(&feed.id).await.unwrap());
+    let unarchive_hlc =
+        HlcTimestamp::from_datetime(base_ts + chrono::Duration::minutes(2), "phone-1").encode();
+    let unarchive_entry = make_feed_sync_entry(
+        &feed.id,
+        feed_url.as_str(),
+        FeedType::Rss,
+        Some("Backoff Feed"),
+        None,
+        true,
+        Some(t2),
+        Some("phone-1"),
+        &unarchive_hlc,
+    );
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "phone-1".to_owned(),
+            entries: vec![unarchive_entry],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+    let unarchived = db.feeds().get(&feed.id).await.unwrap().unwrap();
+    assert!(unarchived.is_active);
+    assert_eq!(unarchived.consecutive_failures, 0);
+    assert!(unarchived.last_error.is_none());
+    assert!(unarchived.last_error_by.is_none());
+}
+
+#[tokio::test]
+async fn test_migration_017_backfill_and_trigger_hlc_separation() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("roche-v017-mig-test-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let db_path = temp_dir.join("roche.db");
+
+    // Apply migrations ONLY up to version 16
+    let opts =
+        SqliteConnectOptions::new().filename(&db_path).create_if_missing(true).foreign_keys(true);
+    let pre_pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.migrations.to_mut().retain(|m| m.version <= 16);
+    migrator.run(&pre_pool).await.unwrap();
+
+    let healthy_id = deterministic_feed_id("https://healthy.example.org/rss.xml");
+    let failing_id = deterministic_feed_id("https://failing.example.org/rss.xml");
+    for (id, url, err, err_by) in [
+        (&healthy_id, "https://healthy.example.org/rss.xml", None, None),
+        (&failing_id, "https://failing.example.org/rss.xml", Some("HTTP 503"), Some("server")),
+    ] {
+        sqlx::query("INSERT INTO entries (id, kind, title) VALUES (?, 'publication', ?)")
+            .bind(id)
+            .bind(url)
+            .execute(&pre_pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO collection_specs (collection_id, mode, collection_role, show_in_lists)
+             VALUES (?, 'feed', 'feed', 0)",
+        )
+        .bind(id)
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feed_sources
+             (collection_id, feed_url, source_type, poll_interval, is_active, last_error, last_error_by)
+             VALUES (?, ?, 'rss', 30, 1, ?, ?)",
+        )
+        .bind(id)
+        .bind(url)
+        .bind(err)
+        .bind(err_by)
+        .execute(&pre_pool)
+        .await
+        .unwrap();
+    }
+
+    let failing_hlc_before: String =
+        sqlx::query_scalar("SELECT hlc FROM feed_sources WHERE collection_id = ?")
+            .bind(&failing_id)
+            .fetch_one(&pre_pool)
+            .await
+            .unwrap();
+    pre_pool.close().await;
+
+    // Connect with `Db::connect` to apply migration 017
+    let db = Db::connect(&db_path).await.unwrap();
+    let healthy = db.feeds().get(&healthy_id).await.unwrap().unwrap();
+    let failing = db.feeds().get(&failing_id).await.unwrap().unwrap();
+    assert_eq!(healthy.consecutive_failures, 0);
+    assert_eq!(failing.consecutive_failures, 1);
+
+    let (hlc_after_mig, seq_before): (String, i64) = sqlx::query_as(
+        "SELECT fs.hlc, e.sync_seq
+         FROM feed_sources fs
+         JOIN entries e ON e.id = fs.collection_id
+         WHERE fs.collection_id = ?",
+    )
+    .bind(&failing_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(hlc_after_mig, failing_hlc_before, "Migration 017 must not bump config HLC");
+
+    // Updating ONLY `consecutive_failures` bumps `entries.sync_seq` WITHOUT bumping `feed_sources.hlc`
+    sqlx::query("UPDATE feed_sources SET consecutive_failures = 2 WHERE collection_id = ?")
+        .bind(&failing_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (hlc_after_bump, seq_after): (String, i64) = sqlx::query_as(
+        "SELECT fs.hlc, e.sync_seq
+         FROM feed_sources fs
+         JOIN entries e ON e.id = fs.collection_id
+         WHERE fs.collection_id = ?",
+    )
+    .bind(&failing_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(hlc_after_bump, failing_hlc_before, "Backoff telemetry must not bump config HLC");
+    assert!(seq_after > seq_before, "Updating consecutive_failures must bump entries.sync_seq");
+
+    // CHECK constraint rejects negative consecutive_failures
+    let neg_res =
+        sqlx::query("UPDATE feed_sources SET consecutive_failures = -1 WHERE collection_id = ?")
+            .bind(&failing_id)
+            .execute(db.pool())
+            .await;
+    assert!(neg_res.is_err(), "CHECK (consecutive_failures >= 0) must reject negative values");
+
+    db.pool().close().await;
+    drop(db);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

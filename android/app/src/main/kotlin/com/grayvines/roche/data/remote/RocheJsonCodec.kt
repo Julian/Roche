@@ -11,6 +11,7 @@ import com.grayvines.roche.data.SyncConsumptionLogDto
 import com.grayvines.roche.data.SyncEntryRecordDto
 import com.grayvines.roche.data.SyncTombstoneDto
 import com.grayvines.roche.data.inferFeedTypeWireValue
+import com.grayvines.roche.data.normalizeConsecutiveFailures
 import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
 import java.util.Locale
 import kotlinx.serialization.SerialName
@@ -110,10 +111,12 @@ internal data class WireFeedDto(
     @SerialName("last_polled_by") val lastPolledBy: String? = null,
     @SerialName("last_error") val lastError: String? = null,
     @SerialName("last_error_by") val lastErrorBy: String? = null,
+    @SerialName("consecutive_failures") val consecutiveFailures: Int = 0,
     @SerialName("is_active") val isActive: Boolean = true,
 ) {
-    fun toRemoteFeedDto(): RemoteFeedDto =
-        RemoteFeedDto(
+    fun toRemoteFeedDto(): RemoteFeedDto {
+        val cleanLastError = lastError.nullIfBlank()
+        return RemoteFeedDto(
             id = id.nullIfBlank().orEmpty(),
             title = title.nullIfBlank().orEmpty(),
             url = url.nullIfBlank().orEmpty(),
@@ -125,10 +128,12 @@ internal data class WireFeedDto(
             pollInterval = pollInterval,
             lastPolled = lastPolled.nullIfBlank(),
             lastPolledBy = lastPolledBy.nullIfBlank(),
-            lastError = lastError.nullIfBlank(),
-            lastErrorBy = lastErrorBy.nullIfBlank(),
+            lastError = cleanLastError,
+            lastErrorBy = cleanLastError?.let { lastErrorBy.nullIfBlank() },
+            consecutiveFailures = normalizeConsecutiveFailures(cleanLastError, consecutiveFailures),
             isActive = isActive,
         )
+    }
 }
 
 @Serializable

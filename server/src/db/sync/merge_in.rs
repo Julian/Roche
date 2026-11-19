@@ -9,7 +9,7 @@ use super::{
     SyncRepo,
     activity::SyncTombstone,
     hlc::{HlcClock, resolve_or_synthesize_hlc},
-    hrw::{NetworkTier, SERVER_PEER_ID},
+    hrw::{NetworkTier, SERVER_PEER_ID, normalize_consecutive_failures},
     identity::{
         canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
         deterministic_comparison_id, deterministic_entity_uuid, deterministic_feed_id,
@@ -865,6 +865,8 @@ impl SyncRepo<'_> {
         let clean_polled_by = fs.last_polled_by.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let clean_err_by = clean_err
             .and_then(|_| fs.last_error_by.as_deref().map(str::trim).filter(|s| !s.is_empty()));
+        let clean_consecutive_failures =
+            normalize_consecutive_failures(clean_err, fs.consecutive_failures);
         let interval = fs.poll_interval.clamp(5, 1440);
 
         if let Some((
@@ -905,6 +907,11 @@ impl SyncRepo<'_> {
             {
                 let target_active = if config_newer { fs.is_active } else { local_active };
                 let target_hlc = if config_newer { fs_hlc.as_str() } else { local_hlc.as_str() };
+                let clear_stale_errors_on_unarchive = config_newer
+                    && !local_active
+                    && target_active
+                    && !poll_newer
+                    && clean_err.is_none();
                 sqlx::query(
                     "UPDATE feed_sources
                      SET source_type = ?,
@@ -912,6 +919,9 @@ impl SyncRepo<'_> {
                          language = COALESCE(?, language),
                          poll_interval = CASE WHEN ? THEN ? ELSE poll_interval END,
                          is_active = ?,
+                         last_error = CASE WHEN ? THEN NULL ELSE last_error END,
+                         last_error_by = CASE WHEN ? THEN NULL ELSE last_error_by END,
+                         consecutive_failures = CASE WHEN ? THEN 0 ELSE consecutive_failures END,
                          hlc = ?
                      WHERE collection_id = ?",
                 )
@@ -921,6 +931,9 @@ impl SyncRepo<'_> {
                 .bind(config_newer)
                 .bind(interval)
                 .bind(target_active)
+                .bind(clear_stale_errors_on_unarchive)
+                .bind(clear_stale_errors_on_unarchive)
+                .bind(clear_stale_errors_on_unarchive)
                 .bind(target_hlc)
                 .bind(&local_id)
                 .execute(&mut *tx)
@@ -954,13 +967,15 @@ impl SyncRepo<'_> {
                      SET last_polled_at = ?,
                          last_polled_by = ?,
                          last_error = ?,
-                         last_error_by = ?
+                         last_error_by = ?,
+                         consecutive_failures = ?
                      WHERE collection_id = ?",
                 )
                 .bind(fs.last_polled_at)
                 .bind(clean_polled_by)
                 .bind(clean_err)
                 .bind(clean_err_by)
+                .bind(clean_consecutive_failures)
                 .bind(&local_id)
                 .execute(&mut *tx)
                 .await?;
@@ -989,6 +1004,7 @@ impl SyncRepo<'_> {
                     last_polled_by: clean_polled_by,
                     last_error: clean_err,
                     last_error_by: clean_err_by,
+                    consecutive_failures: clean_consecutive_failures,
                     created_at,
                     updated_at: now,
                 },

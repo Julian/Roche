@@ -21,6 +21,7 @@ import com.grayvines.roche.data.extractArxivIdentifier
 import com.grayvines.roche.data.extractYearPrefix
 import com.grayvines.roche.data.isSyncableItemUrl
 import com.grayvines.roche.data.nextLocalHlc
+import com.grayvines.roche.data.normalizeConsecutiveFailures
 import com.grayvines.roche.data.normalizeTagName
 import com.grayvines.roche.data.nowUtcIso
 import com.grayvines.roche.model.ContentType
@@ -367,6 +368,8 @@ private fun buildUpsertFeedSource(
         lastPolledBy = feed.lastPolledBy,
         lastError = feed.lastError,
         lastErrorBy = feed.lastErrorBy,
+        consecutiveFailures =
+            normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures),
         autoDownloadEpisodes = feed.autoDownloadEpisodes,
         customPlaybackSpeed = feed.customPlaybackSpeed,
         hlc = effectiveHlc,
@@ -401,7 +404,12 @@ internal suspend fun RocheDao.upsertItems(
     val deduped = items.associateBy { it.id }.values.map(::truncateInboxItemForStorage)
     executeInTransaction {
         for (item in deduped) {
-            writeSingleInboxItemInTx(item, markDirty = markDirty, hlcOverride = null, nodeId = nodeId)
+            writeSingleInboxItemInTx(
+                item,
+                markDirty = markDirty,
+                hlcOverride = null,
+                nodeId = nodeId,
+            )
         }
     }
 }
@@ -1009,13 +1017,24 @@ internal suspend fun RocheDao.updateFeedActiveGraph(
     executeInTransaction {
         val hlc = nextLocalHlc(this, nodeId)
         getFeedSourceById(feedId)?.let { source ->
-            upsertFeedSource(
-                source.copy(
-                    isActive = isActive,
-                    hlc = hlc,
-                    isLocalDirty = markDirty || source.isLocalDirty,
-                )
-            )
+            val updated =
+                if (isActive) {
+                    source.copy(
+                        isActive = true,
+                        lastError = null,
+                        lastErrorBy = null,
+                        consecutiveFailures = 0,
+                        hlc = hlc,
+                        isLocalDirty = markDirty || source.isLocalDirty,
+                    )
+                } else {
+                    source.copy(
+                        isActive = false,
+                        hlc = hlc,
+                        isLocalDirty = markDirty || source.isLocalDirty,
+                    )
+                }
+            upsertFeedSource(updated)
         }
     }
 }

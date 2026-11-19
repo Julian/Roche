@@ -164,6 +164,7 @@ private const val FEED_ROW_SELECT =
         "fs.lastPolledBy AS lastPolledBy, " +
         "fs.lastError AS lastError, " +
         "fs.lastErrorBy AS lastErrorBy, " +
+        "fs.consecutiveFailures AS consecutiveFailures, " +
         "fs.isActive AS isActive, " +
         "fs.autoDownloadEpisodes AS autoDownloadEpisodes, " +
         "fs.customPlaybackSpeed AS customPlaybackSpeed, " +

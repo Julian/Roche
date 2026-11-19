@@ -538,13 +538,27 @@ class RocheRssWorkflowTest {
                 )
 
             // 1. Pre-poll sync omits weight so previously measured throughput is preserved,
-            // then reports the measured throughput weight on the follow-up round after polling
+            // then reports the smoothed per-feed EWMA weight on the follow-up round after polling
             val bgSynced = peerRepo.runBackgroundPeerSyncAndPoll().getOrThrow()
             assertEquals(3, bgSynced)
             assertEquals(2, peerRepo.snapshot.first().activePeers.size)
             assertTrue(peerSyncBodies.first().contains(""""network_tier":"cellular""""))
             assertFalse(peerSyncBodies.first().contains(""""weight":"""))
-            assertTrue(peerSyncBodies.last().contains(""""weight":10.0"""))
+            val postPollJson =
+                kotlinx.serialization.json.Json.parseToJsonElement(peerSyncBodies.last())
+                    as kotlinx.serialization.json.JsonObject
+            val reportedWeight =
+                (postPollJson["weight"] as kotlinx.serialization.json.JsonPrimitive)
+                    .content
+                    .toDouble()
+            assertTrue(
+                reportedWeight > 0.6 && reportedWeight < 10.0,
+                "Expected EWMA-smoothed weight in (0.6, 10.0), got $reportedWeight",
+            )
+            assertEquals(
+                reportedWeight,
+                database.dao().getLocalSyncFlag(FLAG_LOCAL_THROUGHPUT_WEIGHT)?.toDouble(),
+            )
 
             // 2. When OFFLINE, background sync and manual on-device poll respect offline state
             currentTier = NetworkTier.OFFLINE
@@ -1167,18 +1181,21 @@ private suspend fun verifyRoomMigrationsPreserveData(tempDir: File) {
         RocheDatabase.MIGRATION_7_8.migrate(conn)
         RocheDatabase.MIGRATION_8_9.migrate(conn)
         RocheDatabase.MIGRATION_9_10.migrate(conn)
+        RocheDatabase.MIGRATION_10_11.migrate(conn)
         conn.prepare("SELECT COUNT(*) FROM entries WHERE id = 'i-1'").use { stmt ->
             assertTrue(stmt.step())
             assertEquals(1L, stmt.getLong(0))
         }
         conn
             .prepare(
-                "SELECT autoDownloadEpisodes, customPlaybackSpeed FROM feed_sources WHERE collectionId = 'f-1'"
+                "SELECT autoDownloadEpisodes, customPlaybackSpeed, consecutiveFailures " +
+                    "FROM feed_sources WHERE collectionId = 'f-1'"
             )
             .use { stmt ->
                 assertTrue(stmt.step())
                 assertEquals(0L, stmt.getLong(0))
                 assertTrue(stmt.isNull(1))
+                assertEquals(0L, stmt.getLong(2))
             }
         conn.prepare("SELECT audioUrl FROM entry_content WHERE entryId = 'i-1'").use { stmt ->
             assertTrue(stmt.step())

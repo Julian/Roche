@@ -7,7 +7,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 use super::{
     SyncRepo,
     activity::SyncTombstone,
-    hrw::SERVER_PEER_ID,
+    hrw::{SERVER_PEER_ID, normalize_consecutive_failures},
     identity::UP_NEXT_COLLECTION_ID,
     models::{
         MAX_PEER_SYNC_PAGE_BYTES, MAX_SYNC_INLINE_HTML_BYTES, PeerSyncResponse,
@@ -55,6 +55,7 @@ type RawFeedSourceRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
     String,
 );
 
@@ -452,7 +453,7 @@ impl SyncRepo<'_> {
             let mut fs_qb = QueryBuilder::<Sqlite>::new(
                 "SELECT collection_id, feed_url, source_type, feed_title, language,
                         poll_interval, is_active, last_polled_at, last_polled_by,
-                        last_error, last_error_by, hlc
+                        last_error, last_error_by, consecutive_failures, hlc
                  FROM feed_sources WHERE collection_id IN (",
             );
             let mut fs_sep = fs_qb.separated(", ");
@@ -474,9 +475,12 @@ impl SyncRepo<'_> {
                 last_polled_by,
                 last_error,
                 last_error_by,
+                consecutive_failures,
                 hlc,
             ) in fs_rows
             {
+                let norm_failures =
+                    normalize_consecutive_failures(last_error.as_deref(), consecutive_failures);
                 feed_map.insert(
                     cid,
                     SyncFeedSource {
@@ -490,6 +494,7 @@ impl SyncRepo<'_> {
                         last_polled_by,
                         last_error,
                         last_error_by,
+                        consecutive_failures: norm_failures,
                         hlc,
                     },
                 );

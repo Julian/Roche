@@ -32,16 +32,19 @@ pub use items::NewItem;
 pub use items::{Item, ItemFilter, ItemPage, ItemRepo, ManualItemInput};
 pub use media::{Media, MediaRepo, NewMediaSpec};
 pub use sync::{
-    ActivityEntry, DEFAULT_ONLINE_PEER_WEIGHT, HlcClock, HlcTimestamp, NetworkTier,
-    PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID,
+    ABSOLUTE_MAX_BACKOFF_SECS, ActivityEntry, DEFAULT_MAX_BACKOFF_SECS, DEFAULT_ONLINE_PEER_WEIGHT,
+    HlcClock, HlcTimestamp, MAX_CONSECUTIVE_FAILURES, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT,
+    NetworkTier, PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID,
     SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
     SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
-    SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, UP_NEXT_COLLECTION_ID,
-    WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WANT_TO_READ_TITLE, canonical_ordering_json,
-    canonicalize_sync_url, collection_entry_natural_key, compute_throughput_weight,
-    deterministic_comparison_id, deterministic_consumption_log_id, deterministic_feed_id,
-    deterministic_system_collection_id, deterministic_title_entry_id,
-    is_protected_system_collection_id, should_peer_poll_feed,
+    SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, THROUGHPUT_EWMA_ALPHA,
+    UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WANT_TO_READ_TITLE,
+    canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
+    compute_throughput_weight, deterministic_comparison_id, deterministic_consumption_log_id,
+    deterministic_feed_id, deterministic_system_collection_id, deterministic_title_entry_id,
+    feed_phase_offset_secs, is_protected_system_collection_id, next_phase_slot_at_or_after,
+    next_scheduled_poll_epoch_secs, should_peer_poll_feed, target_poll_interval_secs,
+    update_throughput_ewma,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{

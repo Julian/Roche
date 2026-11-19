@@ -118,6 +118,8 @@ internal fun buildSnapshot(
                     lastPolledBy = feed.lastPolledBy,
                     lastError = feed.lastError,
                     lastErrorBy = feed.lastErrorBy,
+                    consecutiveFailures =
+                        normalizeConsecutiveFailures(feed.lastError, feed.consecutiveFailures),
                     isActive = feed.isActive,
                     autoDownloadEpisodes = feed.autoDownloadEpisodes,
                     customPlaybackSpeed = feed.customPlaybackSpeed,
@@ -190,10 +192,23 @@ internal fun toRemoteFeedEntity(
     existing: FeedRow? = null,
 ): FeedRow {
     val useExistingPoll =
-        existing != null &&
-            existing.lastPolled != null &&
-            (remote.lastPolled == null || existing.lastPolled > remote.lastPolled)
+        existing != null && isLocalPollNewer(existing.lastPolled, remote.lastPolled)
     val pollSource = if (useExistingPoll) existing else null
+    val resolvedLastError =
+        (if (pollSource != null) pollSource.lastError else remote.lastError)?.takeIf {
+            it.isNotBlank()
+        }
+    val resolvedLastErrorBy =
+        when {
+            resolvedLastError == null -> null
+            pollSource != null -> pollSource.lastErrorBy
+            else -> remote.lastErrorBy
+        }
+    val resolvedConsecutiveFailures =
+        normalizeConsecutiveFailures(
+            resolvedLastError,
+            if (pollSource != null) pollSource.consecutiveFailures else remote.consecutiveFailures,
+        )
     val resolvedFeedType =
         if (
             existing?.feedType?.equals("podcast", ignoreCase = true) == true &&
@@ -212,10 +227,11 @@ internal fun toRemoteFeedEntity(
         description = remote.description ?: existing?.description,
         language = remote.language ?: existing?.language,
         pollInterval = remote.pollInterval,
-        lastPolled = pollSource?.lastPolled ?: remote.lastPolled,
-        lastPolledBy = pollSource?.lastPolledBy ?: remote.lastPolledBy,
-        lastError = pollSource?.lastError ?: remote.lastError,
-        lastErrorBy = pollSource?.lastErrorBy ?: remote.lastErrorBy,
+        lastPolled = if (pollSource != null) pollSource.lastPolled else remote.lastPolled,
+        lastPolledBy = if (pollSource != null) pollSource.lastPolledBy else remote.lastPolledBy,
+        lastError = resolvedLastError,
+        lastErrorBy = resolvedLastErrorBy,
+        consecutiveFailures = resolvedConsecutiveFailures,
         isActive = remote.isActive,
         autoDownloadEpisodes = existing?.autoDownloadEpisodes ?: false,
         customPlaybackSpeed = existing?.customPlaybackSpeed,

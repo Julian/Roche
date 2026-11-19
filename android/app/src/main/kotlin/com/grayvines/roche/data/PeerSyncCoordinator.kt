@@ -1,6 +1,7 @@
 package com.grayvines.roche.data
 
 import com.grayvines.roche.data.local.FeedRow
+import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.remote.PeerSyncRequestDto
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
@@ -17,10 +18,16 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 
 internal const val MAX_DELTA_CONTINUATION_PAGES = 20
+internal const val FLAG_LOCAL_THROUGHPUT_WEIGHT = "local_throughput_weight"
 private const val MAX_OVERFLOW_PUSH_ROUNDS = 25
 private const val HTTP_PAYLOAD_TOO_LARGE = 413
 private const val COOPERATIVE_POLL_SLICE_SIZE = 4
 private const val NANOS_PER_SECOND = 1_000_000_000.0
+
+internal data class FeedPollSample(
+    val itemsProcessed: Int,
+    val elapsedSeconds: Double,
+)
 
 internal data class CooperativePollOutcome(
     val polledFeedsCount: Int,
@@ -402,52 +409,90 @@ internal fun stripEntriesAndDependentEdgesFor413(request: PeerSyncRequestDto): P
     )
 }
 
+private suspend fun loadInitialThroughputWeight(
+    dao: RocheDao,
+    localPeerId: String,
+    activePeers: List<PeerNodeDto>,
+): Double {
+    val stored =
+        dao.getLocalSyncFlag(FLAG_LOCAL_THROUGHPUT_WEIGHT)?.trim()?.toDoubleOrNull()?.takeIf {
+            it.isFinite() && it > 0.0
+        }
+    if (stored != null) return stored.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT)
+    val fromPeers =
+        activePeers
+            .firstOrNull { it.peerId == localPeerId }
+            ?.weight
+            ?.takeIf { it.isFinite() && it > 0.0 }
+    return fromPeers?.coerceIn(MIN_PEER_WEIGHT, MAX_PEER_WEIGHT) ?: DEFAULT_ONLINE_PEER_WEIGHT
+}
+
+internal fun foldThroughputSamplesIntoEwma(
+    currentWeight: Double,
+    samples: List<FeedPollSample>,
+): Double {
+    var weight = currentWeight
+    for (sample in samples) {
+        val sampleWeight =
+            computeThroughputWeight(
+                feedsCompleted = 1,
+                itemsProcessed = sample.itemsProcessed,
+                elapsedSeconds = sample.elapsedSeconds,
+            )
+        weight = updateThroughputEwma(weight, sampleWeight)
+    }
+    return weight
+}
+
+@Suppress("LongParameterList")
 internal suspend fun pollCooperativeFeedsOnDevice(
     dao: RocheDao,
     apiClient: RocheApiClient,
     localPeerId: String,
     activePeers: List<PeerNodeDto>,
-    nowInstant: Instant = Instant.now().truncatedTo(ChronoUnit.SECONDS),
+    nowInstant: Instant? = null,
+    clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
 ): CooperativePollOutcome {
+    val effectiveClock: () -> Instant = nowInstant?.let { fixed -> { fixed } } ?: clock
     val attemptedIds = mutableSetOf<String>()
     var currentPeers = activePeers
     var polledFeedsCount = 0
-    var totalItemsProcessed = 0
+    var ewmaWeight = loadInitialThroughputWeight(dao, localPeerId, activePeers)
     var measuredWeight: Double? = null
-    val startedNanos = System.nanoTime()
 
     var keepPolling = true
     while (keepPolling) {
+        val sliceNow = effectiveClock()
         val slice =
             dao.getAllFeeds()
                 .filter {
                     it.id !in attemptedIds &&
-                        shouldPeerPollFeed(localPeerId, currentPeers, it, nowInstant)
+                        shouldPeerPollFeed(localPeerId, currentPeers, it, sliceNow)
                 }
                 .take(COOPERATIVE_POLL_SLICE_SIZE)
         if (slice.isEmpty()) {
             keepPolling = false
         } else {
             slice.forEach { attemptedIds.add(it.id) }
-            val succeededCounts =
-                pollCooperativeSlice(dao, apiClient, slice, localPeerId, nowInstant)
-            if (succeededCounts.isNotEmpty()) {
-                polledFeedsCount += succeededCounts.size
-                totalItemsProcessed += succeededCounts.sum()
-                val elapsedSeconds =
-                    (System.nanoTime() - startedNanos).toDouble() / NANOS_PER_SECOND
-                val updatedWeight =
-                    computeThroughputWeight(
-                        feedsCompleted = polledFeedsCount,
-                        itemsProcessed = totalItemsProcessed,
-                        elapsedSeconds = elapsedSeconds,
-                    )
-                measuredWeight = updatedWeight
+            val succeededSamples =
+                pollCooperativeSlice(dao, apiClient, slice, localPeerId, effectiveClock)
+            if (succeededSamples.isNotEmpty()) {
+                polledFeedsCount += succeededSamples.size
+                ewmaWeight = foldThroughputSamplesIntoEwma(ewmaWeight, succeededSamples)
+                measuredWeight = ewmaWeight
                 currentPeers = currentPeers.map { peer ->
-                    if (peer.peerId == localPeerId) peer.copy(weight = updatedWeight) else peer
+                    if (peer.peerId == localPeerId) peer.copy(weight = ewmaWeight) else peer
                 }
             }
         }
+    }
+    if (measuredWeight != null) {
+        dao.upsertLocalSyncFlag(
+            LocalSyncFlagEntity(
+                flagKey = FLAG_LOCAL_THROUGHPUT_WEIGHT,
+                flagValue = measuredWeight.toString(),
+            )
+        )
     }
     return CooperativePollOutcome(
         polledFeedsCount = polledFeedsCount,
@@ -461,22 +506,32 @@ internal suspend fun pollCooperativeSlice(
     apiClient: RocheApiClient,
     slice: List<FeedRow>,
     localPeerId: String,
-    nowInstant: Instant,
-): List<Int> = coroutineScope {
+    clock: () -> Instant = { Instant.now().truncatedTo(ChronoUnit.SECONDS) },
+): List<FeedPollSample> = coroutineScope {
     slice
         .map { feed ->
             async {
-                LocalFeedPoller.pollFeed(
-                    dao = dao,
-                    apiClient = apiClient,
-                    feed = feed,
-                    localPeerId = localPeerId,
-                    nowInstant = nowInstant,
-                )
+                val startedNanos = System.nanoTime()
+                val outcome =
+                    LocalFeedPoller.pollFeed(
+                        dao = dao,
+                        apiClient = apiClient,
+                        feed = feed,
+                        localPeerId = localPeerId,
+                        clock = clock,
+                    )
+                val elapsedSeconds =
+                    (System.nanoTime() - startedNanos).toDouble() / NANOS_PER_SECOND
+                outcome.getOrNull()?.let { itemsProcessed ->
+                    FeedPollSample(
+                        itemsProcessed = itemsProcessed,
+                        elapsedSeconds = elapsedSeconds,
+                    )
+                }
             }
         }
         .awaitAll()
-        .mapNotNull { it.getOrNull() }
+        .filterNotNull()
 }
 
 internal fun isOversizedResponseError(error: Throwable): Boolean =
