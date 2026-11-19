@@ -1084,8 +1084,7 @@ class MainViewModelTest {
             localVm.uiState.first { it.searchQuery == "Episode" }
             localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
             localVm.uiState.first {
-                it.playerState.currentEntryId == "ep-tier-1" &&
-                    it.activePlayerNotesContent != null
+                it.playerState.currentEntryId == "ep-tier-1" && it.activePlayerNotesContent != null
             }
             localVm.playerController.cancelAutoTickerForTest()
             localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
@@ -1890,6 +1889,109 @@ class MainViewModelTest {
                 )
             } finally {
                 collectJob.cancel()
+            }
+        }
+
+    @Test
+    fun `observeActiveEpisodeNotes cancels superseded slow hydration when skipping episodes`() =
+        runTest {
+            settings.update {
+                it.copy(
+                    serverUrl = "https://roche.internal:8080",
+                    bearerToken = "test-token",
+                )
+            }
+            val slowStarted = CompletableDeferred<Unit>()
+            val slowGate = CompletableDeferred<Unit>()
+            val slowCancelled = CompletableDeferred<Boolean>()
+            val apiClient = RocheApiClient { req ->
+                when {
+                    req.url.endsWith("/items/ep-slow") -> {
+                        slowStarted.complete(Unit)
+                        try {
+                            slowGate.await()
+                            HttpResponse(
+                                statusCode = 200,
+                                body =
+                                    """{"id":"ep-slow","title":"Slow Ep","url":"https://example.com/slow","content_html":"<p>Slow notes</p>","content_text":"Slow notes"}""",
+                            )
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            slowCancelled.complete(true)
+                            throw ce
+                        }
+                    }
+                    req.url.endsWith("/items/ep-fast") -> {
+                        HttpResponse(
+                            statusCode = 200,
+                            body =
+                                """{"id":"ep-fast","title":"Fast Ep","url":"https://example.com/fast","content_html":"<p>Fast notes</p>","content_text":"Fast notes"}""",
+                        )
+                    }
+                    else -> {
+                        HttpResponse(statusCode = 200, body = "{}")
+                    }
+                }
+            }
+            val localRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = apiClient,
+                    settings = settings,
+                    cacheDir = File(tempDir, "notes_collect_latest_cache"),
+                    backgroundScope = backgroundScope,
+                )
+            val localVm =
+                MainViewModel(
+                    repository = localRepo,
+                    settingsRepository = settings,
+                    playerBackend = FakeAudioPlayerBackend(),
+                    mediaSessionBridge = RecordingMediaSessionBridge(),
+                )
+            val collectJob = collectInBackground(localVm.uiState)
+            try {
+                val podcastFeed = testFeed("f-skip-pod", "Skip Cast").copy(feedType = "podcast")
+                val slowEp =
+                    testItem("ep-slow", "Slow Ep", "f-skip-pod")
+                        .copy(
+                            contentType = "audio",
+                            audioUrl = "https://example.com/slow.mp3",
+                            contentHtml = null,
+                            contentText = null,
+                        )
+                val fastEp =
+                    testItem("ep-fast", "Fast Ep", "f-skip-pod")
+                        .copy(
+                            contentType = "audio",
+                            audioUrl = "https://example.com/fast.mp3",
+                            contentHtml = null,
+                            contentText = null,
+                        )
+                database.dao().upsertFeeds(listOf(podcastFeed))
+                database.dao().upsertItems(listOf(slowEp, fastEp))
+                localVm.uiState.first { it.allEntries.size == 2 }
+
+                localVm.dispatch(MainAction.PlayAudioEntry("ep-slow"))
+                slowStarted.await()
+
+                // Skip immediately to ep-fast while ep-slow is still blocked on network.
+                localVm.dispatch(MainAction.PlayAudioEntry("ep-fast"))
+                val hydratedFast =
+                    localVm.uiState.first {
+                        it.playerState.currentEntryId == "ep-fast" &&
+                            it.activePlayerNotesContent?.itemId == "ep-fast" &&
+                            it.activePlayerNotesContent.contentHtml == "<p>Fast notes</p>"
+                    }
+                assertEquals(
+                    "<p>Fast notes</p>",
+                    hydratedFast.activePlayerNotesContent?.contentHtml,
+                )
+                assertTrue(slowCancelled.await())
+                assertFalse(slowGate.isCompleted)
+            } finally {
+                slowGate.complete(Unit)
+                localVm.playerController.cancelAutoTickerForTest()
+                collectJob.cancel()
+                localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 

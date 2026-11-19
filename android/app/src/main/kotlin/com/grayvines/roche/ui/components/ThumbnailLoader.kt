@@ -216,7 +216,7 @@ class ThumbnailLoader(
         decodeBytes: (ByteArray) -> ImageBitmap?,
         decodeFile: (File) -> ImageBitmap?,
     ): ImageBitmap? = loadPermits.withPermit {
-        val diskFile = findDiskCachedFile(cleanId)
+        val diskFile = findDiskCachedFile(cacheDir, cleanId)
         if (diskFile == null && isRecentlyFailed(cleanId)) {
             null
         } else {
@@ -226,21 +226,50 @@ class ThumbnailLoader(
                 } else {
                     fetchAndCacheRemotePayload(cleanId, policy)
                 }
-            val bitmap =
-                when (payload) {
-                    is FetchedImagePayload.FromFile ->
-                        runCatching { decodeFile(payload.file) }.getOrNull()
-                    is FetchedImagePayload.FromBytes ->
-                        runCatching { decodeBytes(payload.bytes) }.getOrNull()
-                    null -> null
-                }
-            if (bitmap != null) {
-                targetCache.put(cacheKey, bitmap)
-                failedKeys.remove(cleanId)
-            } else if (attemptedNetwork || diskFile != null) {
-                recordFailedKey(cleanId)
-            }
+            val bitmap = decodeImagePayload(payload, decodeBytes, decodeFile)
+            recordLoadOutcome(
+                cleanId = cleanId,
+                cacheKey = cacheKey,
+                targetCache = targetCache,
+                diskFile = diskFile,
+                payload = payload,
+                attemptedNetwork = attemptedNetwork,
+                bitmap = bitmap,
+            )
             bitmap
+        }
+    }
+
+    @Suppress("LongParameterList")
+    private fun recordLoadOutcome(
+        cleanId: String,
+        cacheKey: String,
+        targetCache: LruCache<String, ImageBitmap>,
+        diskFile: File?,
+        payload: FetchedImagePayload?,
+        attemptedNetwork: Boolean,
+        bitmap: ImageBitmap?,
+    ) {
+        if (bitmap != null) {
+            if (diskFile != null) {
+                runCatching { diskFile.setLastModified(clockMs()) }
+            }
+            targetCache.put(cacheKey, bitmap)
+            failedKeys.remove(cleanId)
+            return
+        }
+        if (payload is FetchedImagePayload.FromFile) {
+            synchronized(diskWriteLock) {
+                val deleted =
+                    payload.file.exists() &&
+                        runCatching { payload.file.delete() }.getOrDefault(false)
+                if (deleted && estimatedDiskFileCount > 0) {
+                    estimatedDiskFileCount--
+                }
+            }
+        }
+        if (attemptedNetwork || diskFile != null) {
+            recordFailedKey(cleanId)
         }
     }
 
@@ -265,20 +294,6 @@ class ThumbnailLoader(
         }
         failedKeys[key] = now
     }
-
-    private fun findDiskCachedFile(mediaId: String): File? = runCatching {
-        val rootDir = cacheDir ?: return null
-        val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
-        if (!thumbsDir.exists()) return null
-        val thumbFile = resolveSafeChildFile(thumbsDir, diskCacheKey(mediaId))
-        if (thumbFile.isFile && thumbFile.length() in 1..MAX_THUMBNAIL_BYTES) {
-            runCatching { thumbFile.setLastModified(clockMs()) }
-            thumbFile
-        } else {
-            null
-        }
-    }
-        .getOrNull()
 
     private suspend fun fetchAndCacheRemotePayload(
         mediaId: String,
@@ -362,7 +377,9 @@ class ThumbnailLoader(
                             }
                         }
                     }
-                if (streamed && stagingFile.isFile && stagingFile.length() in 1..MAX_THUMBNAIL_BYTES) {
+                if (
+                    streamed && stagingFile.isFile && stagingFile.length() in 1..MAX_THUMBNAIL_BYTES
+                ) {
                     commitStreamedCacheFile(thumbsDir, fileKey, stagingFile)
                 } else {
                     null
@@ -418,9 +435,7 @@ class ThumbnailLoader(
             targetFile.setLastModified(clockMs())
             if (estimatedDiskFileCount < 0) {
                 estimatedDiskFileCount =
-                    thumbsDir
-                        .listFiles()
-                        ?.count { it.isFile && !it.name.endsWith(".tmp") } ?: 1
+                    thumbsDir.listFiles()?.count { it.isFile && !it.name.endsWith(".tmp") } ?: 1
             } else if (!existedBefore) {
                 estimatedDiskFileCount++
             }
@@ -446,9 +461,39 @@ class ThumbnailLoader(
         private const val MAX_IMAGE_CACHE_KIB = 32 * 1024
         private const val MAX_FAVICON_CACHE_KIB = 4 * 1024
         private const val MAX_FAILED_THUMBNAILS = 256
-        private const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
+        internal const val MAX_THUMBNAIL_BYTES = 10L * 1024L * 1024L
     }
 }
+
+private fun findDiskCachedFile(cacheDir: File?, mediaId: String): File? = runCatching {
+    val rootDir = cacheDir ?: return null
+    val thumbsDir = File(rootDir, THUMBNAILS_SUBDIR)
+    if (!thumbsDir.exists()) return null
+    val thumbFile = resolveSafeChildFile(thumbsDir, diskCacheKey(mediaId))
+    if (thumbFile.isFile && thumbFile.length() in 1..ThumbnailLoader.MAX_THUMBNAIL_BYTES) {
+        thumbFile
+    } else {
+        null
+    }
+}
+    .getOrNull()
+
+private fun decodeImagePayload(
+    payload: FetchedImagePayload?,
+    decodeBytes: (ByteArray) -> ImageBitmap?,
+    decodeFile: (File) -> ImageBitmap?,
+): ImageBitmap? =
+    when (payload) {
+        is FetchedImagePayload.FromFile ->
+            runCatching { decodeFile(payload.file) }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+        is FetchedImagePayload.FromBytes ->
+            runCatching { decodeBytes(payload.bytes) }
+                .onFailure { if (it is CancellationException) throw it }
+                .getOrNull()
+        null -> null
+    }
 
 internal fun isHttpsImageUrl(url: String): Boolean =
     url.trim().startsWith("https://", ignoreCase = true)

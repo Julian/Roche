@@ -77,8 +77,6 @@ fun MediaCompanionScreen(
 ) {
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
-    val diaryListState = rememberLazyListState()
-    val wantListState = rememberLazyListState()
 
     Column(modifier = Modifier.fillMaxSize().testTag("lists_companion_screen")) {
         CompanionTopBar(state = state, onAction = onAction)
@@ -110,7 +108,7 @@ fun MediaCompanionScreen(
                     DiaryHistoryPane(
                         state = state,
                         diaryEntries = state.catalog.diaryEntries,
-                        listState = diaryListState,
+                        listState = listState,
                         onAction = onAction,
                         onOpenExternalUrl = onOpenExternalUrl,
                         onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
@@ -118,7 +116,7 @@ fun MediaCompanionScreen(
                 CompanionSubTab.WANT ->
                     WantQueuesPane(
                         state = state,
-                        listState = wantListState,
+                        listState = listState,
                         onAction = onAction,
                         onOpenExternalUrl = onOpenExternalUrl,
                     )
@@ -688,6 +686,7 @@ private fun RankedEntryHeaderRow(
         if (onRemoveFromList != null) {
             HeaderActionButton(
                 label = "✕",
+                contentDescription = "Remove ${item.entry.title} from list",
                 onClick = onRemoveFromList,
                 modifier = Modifier.testTag("companion_remove_list_entry_${item.entry.id}"),
             )
@@ -1087,6 +1086,7 @@ private fun WantQueueRowCard(
             Spacer(modifier = Modifier.width(2.dp))
             HeaderActionButton(
                 label = "✕",
+                contentDescription = "Remove ${item.entry.title} from Want Queue",
                 onClick = onRemove,
             )
         }

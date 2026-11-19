@@ -135,7 +135,6 @@ internal constructor(
     private val mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
     private val uriResolver: (String) -> Uri? = ::defaultPlaybackUri,
     private val httpEngineProvider: (() -> HttpEngine)? = null,
-    private val httpEngineExecutorProvider: (() -> Executor)? = null,
 ) : AudioPlayerBackend {
     private val parentJob: Job? = parentScope?.coroutineContext?.get(Job)
     private val scopeLock = Any()
@@ -212,6 +211,7 @@ internal constructor(
             listOf(File(context.applicationContext.filesDir, "offline_media"), context.cacheDir),
         parentScope: CoroutineScope? = null,
         httpEngineProvider: (() -> HttpEngine)? = null,
+        @Suppress("UNUSED_PARAMETER", "UnusedParameter")
         httpEngineExecutorProvider: (() -> Executor)? = null,
     ) : this(
         appContext = context.applicationContext,
@@ -220,7 +220,6 @@ internal constructor(
         mainDispatcher = Dispatchers.Main.immediate,
         uriResolver = ::defaultPlaybackUri,
         httpEngineProvider = httpEngineProvider,
-        httpEngineExecutorProvider = httpEngineExecutorProvider,
     )
 
     private fun createBackendScope(): CoroutineScope =
@@ -279,12 +278,11 @@ internal constructor(
             return it
         }
         val context = checkNotNull(appContext) { "Context required to build ExoPlayer" }
-        val (httpEngine, callbackExecutor) = resolveHttpEngineAndExecutor(context)
+        val httpEngine = resolveHttpEngine(context)
         val audioDataSourceFactory =
             createAudioDataSourceFactory(
                 context = context,
                 httpEngine = httpEngine,
-                callbackExecutor = callbackExecutor,
             )
         return ExoPlayer.Builder(context)
             .setMediaSourceFactory(
@@ -308,17 +306,14 @@ internal constructor(
             }
     }
 
-    private fun resolveHttpEngineAndExecutor(context: Context): Pair<HttpEngine, Executor> {
-        val providedEngine = httpEngineProvider?.invoke()
-        val providedExecutor = httpEngineExecutorProvider?.invoke()
-        if (providedEngine != null && providedExecutor != null) {
-            return providedEngine to providedExecutor
+    private fun resolveHttpEngine(context: Context): HttpEngine {
+        httpEngineProvider?.invoke()?.let {
+            return it
         }
         val fallback =
             ownedFallbackTransport
                 ?: HttpEngineTransport(context).also { ownedFallbackTransport = it }
-        return (providedEngine ?: fallback.sharedHttpEngine) to
-            (providedExecutor ?: fallback.sharedCallbackExecutor)
+        return fallback.sharedHttpEngine
     }
 
     override fun loadAndPlay(

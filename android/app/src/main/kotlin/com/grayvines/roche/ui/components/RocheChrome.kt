@@ -10,7 +10,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,6 +23,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
@@ -59,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.RocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 /** Crisp circular refresh arrow icon for feed rows and sync actions. */
@@ -317,6 +319,54 @@ enum class RocheButtonStyle {
     SECONDARY,
 }
 
+private const val DISABLED_PRIMARY_BG_ALPHA = 0.4f
+private const val DISABLED_SECONDARY_BG_ALPHA = 0.5f
+private const val DISABLED_PRIMARY_TEXT_ALPHA = 0.6f
+
+private data class HeaderActionColors(
+    val background: Color,
+    val border: Color,
+    val text: Color,
+)
+
+private fun resolveHeaderActionColors(
+    colors: RocheColors,
+    style: RocheButtonStyle,
+    enabled: Boolean,
+): HeaderActionColors =
+    when (style) {
+        RocheButtonStyle.PRIMARY -> {
+            val accent =
+                if (enabled) {
+                    colors.accentBlue
+                } else {
+                    colors.accentBlue.copy(alpha = DISABLED_PRIMARY_BG_ALPHA)
+                }
+            HeaderActionColors(
+                background = accent,
+                border = accent,
+                text =
+                    if (enabled) {
+                        Color.White
+                    } else {
+                        Color.White.copy(alpha = DISABLED_PRIMARY_TEXT_ALPHA)
+                    },
+            )
+        }
+        RocheButtonStyle.SECONDARY -> {
+            HeaderActionColors(
+                background =
+                    if (enabled) {
+                        colors.surfaceElevated
+                    } else {
+                        colors.surfaceElevated.copy(alpha = DISABLED_SECONDARY_BG_ALPHA)
+                    },
+                border = colors.border,
+                text = if (enabled) colors.textPrimary else colors.textMuted,
+            )
+        }
+    }
+
 @Composable
 fun HeaderActionButton(
     label: String,
@@ -327,27 +377,10 @@ fun HeaderActionButton(
     contentDescription: String? = null,
     enabled: Boolean = true,
 ) {
-    val colors = LocalRocheColors.current
+    val palette = resolveHeaderActionColors(LocalRocheColors.current, style, enabled)
     val shape = RoundedCornerShape(8.dp)
-    val bg =
-        when (style) {
-            RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
-            RocheButtonStyle.SECONDARY ->
-                if (enabled) colors.surfaceElevated else colors.surfaceElevated.copy(alpha = 0.5f)
-        }
-    val border =
-        when (style) {
-            RocheButtonStyle.PRIMARY ->
-                if (enabled) colors.accentBlue else colors.accentBlue.copy(alpha = 0.4f)
-            RocheButtonStyle.SECONDARY -> colors.border
-        }
-    val textColor =
-        when (style) {
-            RocheButtonStyle.PRIMARY -> if (enabled) Color.White else Color.White.copy(alpha = 0.6f)
-            RocheButtonStyle.SECONDARY ->
-                if (enabled) colors.textPrimary else colors.textMuted
-        }
+    val labelModifier =
+        if (contentDescription != null) Modifier.clearAndSetSemantics {} else Modifier
 
     Box(
         contentAlignment = Alignment.Center,
@@ -371,17 +404,18 @@ fun HeaderActionButton(
             modifier =
                 Modifier.height(36.dp)
                     .clip(shape)
-                    .background(bg)
-                    .border(1.dp, border, shape)
+                    .background(palette.background)
+                    .border(1.dp, palette.border, shape)
                     .padding(horizontal = horizontalPadding),
         ) {
             Text(
                 text = label,
-                color = textColor,
+                color = palette.text,
                 fontSize = 12.5.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = labelModifier,
             )
         }
     }
@@ -419,7 +453,12 @@ fun RocheIconActionButton(
                     this.contentDescription = contentDescription
                 },
     ) {
-        Box(contentAlignment = Alignment.Center, modifier = visualModifier) { content() }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = visualModifier.clearAndSetSemantics {},
+        ) {
+            content()
+        }
     }
 }
 
@@ -500,7 +539,12 @@ fun UndoOrStatusSnackbar(
                 onClick = onDismiss,
                 modifier = Modifier.semantics { contentDescription = "Dismiss message" },
             ) {
-                Text(text = "✕", color = colors.textMuted, fontSize = 12.sp)
+                Text(
+                    text = "✕",
+                    color = colors.textMuted,
+                    fontSize = 12.sp,
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
             }
         }
     }

@@ -24,6 +24,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,29 +58,56 @@ import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.theme.LocalRocheColors
 
-private data class RetainedSearchDisplay(
+internal data class RetainedSearchDisplay(
     val state: MainUiState,
     val canEditQuery: Boolean,
 )
+
+internal class SearchDisplayRetentionState(
+    var sawActiveSearch: Boolean,
+    var retainedState: MainUiState,
+)
+
+internal fun computeRetainedSearchDisplay(
+    holder: SearchDisplayRetentionState,
+    state: MainUiState,
+    isSearchActive: Boolean,
+): RetainedSearchDisplay {
+    val nextSawActive = holder.sawActiveSearch || isSearchActive
+    val effectiveState =
+        if (nextSawActive && !isSearchActive) {
+            holder.retainedState
+        } else {
+            state
+        }
+    return RetainedSearchDisplay(
+        state = effectiveState,
+        canEditQuery = !nextSawActive || isSearchActive,
+    )
+}
+
+internal fun commitRetainedSearchDisplay(
+    holder: SearchDisplayRetentionState,
+    state: MainUiState,
+    isSearchActive: Boolean,
+) {
+    if (isSearchActive) {
+        holder.sawActiveSearch = true
+        holder.retainedState = state
+    } else if (!holder.sawActiveSearch) {
+        holder.retainedState = state
+    }
+}
 
 @Composable
 private fun rememberSearchDisplayState(
     state: MainUiState,
     isSearchActive: Boolean,
 ): RetainedSearchDisplay {
-    var sawActiveSearch by remember { mutableStateOf(isSearchActive) }
-    var retainedState by remember { mutableStateOf(state) }
-    if (isSearchActive) {
-        sawActiveSearch = true
-        retainedState = state
-    } else if (!sawActiveSearch) {
-        retainedState = state
-    }
-    val effectiveState = if (sawActiveSearch && !isSearchActive) retainedState else state
-    return RetainedSearchDisplay(
-        state = effectiveState,
-        canEditQuery = !sawActiveSearch || isSearchActive,
-    )
+    val holder = remember { SearchDisplayRetentionState(isSearchActive, state) }
+    val display = computeRetainedSearchDisplay(holder, state, isSearchActive)
+    SideEffect { commitRetainedSearchDisplay(holder, state, isSearchActive) }
+    return display
 }
 
 @Composable

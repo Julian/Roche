@@ -71,12 +71,16 @@ internal fun SettingsServerPage(
         }
     }
     LaunchedEffect(state.settings.bearerToken) {
-        if (state.settings.bearerToken != lastSavedBearerToken) {
-            lastSavedBearerToken = state.settings.bearerToken
-            if (bearerToken.trim() != state.settings.bearerToken) {
-                bearerToken = state.settings.bearerToken
-            }
-        }
+        val synced =
+            syncSavedBearerTokenChange(
+                savedBearerToken = state.settings.bearerToken,
+                lastSavedBearerToken = lastSavedBearerToken,
+                currentBearerToken = bearerToken,
+                currentPairingCode = pairingCode,
+            )
+        lastSavedBearerToken = synced.lastSavedBearerToken
+        bearerToken = synced.bearerToken
+        pairingCode = synced.pairingCode
     }
     ServerConfigAutoSaveEffect(
         serverUrl = serverUrl,
@@ -561,6 +565,39 @@ private fun BearerTokenInputField(
                 PasswordVisualTransformation()
             },
         modifier = Modifier.fillMaxWidth().testTag("bearer_token_input"),
+    )
+}
+
+internal data class ServerCredentialSyncResult(
+    val lastSavedBearerToken: String,
+    val bearerToken: String,
+    val pairingCode: String,
+)
+
+internal fun syncSavedBearerTokenChange(
+    savedBearerToken: String,
+    lastSavedBearerToken: String,
+    currentBearerToken: String,
+    currentPairingCode: String,
+): ServerCredentialSyncResult {
+    if (savedBearerToken == lastSavedBearerToken) {
+        return ServerCredentialSyncResult(
+            lastSavedBearerToken = lastSavedBearerToken,
+            bearerToken = currentBearerToken,
+            pairingCode = currentPairingCode,
+        )
+    }
+    val nextBearerToken =
+        if (currentBearerToken.trim() != savedBearerToken) {
+            savedBearerToken
+        } else {
+            currentBearerToken
+        }
+    val nextPairingCode = if (savedBearerToken.isNotBlank()) "" else currentPairingCode
+    return ServerCredentialSyncResult(
+        lastSavedBearerToken = savedBearerToken,
+        bearerToken = nextBearerToken,
+        pairingCode = nextPairingCode,
     )
 }
 
