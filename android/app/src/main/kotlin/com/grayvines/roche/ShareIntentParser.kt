@@ -2,6 +2,7 @@ package com.grayvines.roche
 
 import android.content.Intent
 import android.net.Uri
+import com.grayvines.roche.core.LOCAL_PDF_SCHEME
 import com.grayvines.roche.model.ContentType
 import java.net.URI
 import java.nio.charset.StandardCharsets
@@ -177,7 +178,7 @@ private fun buildPdfStreamPayload(
             .take(MAX_PDF_SLUG_LEN)
             .ifEmpty { "document" }
     return SharedContentPayload(
-        url = "localpdf://$streamKey/$slug.pdf",
+        url = "$LOCAL_PDF_SCHEME$streamKey/$slug.pdf",
         title = rawLabel ?: "Shared PDF",
         forcedContentType = ContentType.PDF,
         pdfStreamUri = streamUri,

@@ -45,8 +45,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.RankClusterCandidate
-import com.grayvines.roche.data.RankSettlementSummary
+import com.grayvines.roche.data.catalog.RankClusterCandidate
+import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSurfaceCard

@@ -1,13 +1,13 @@
 package com.grayvines.roche.data.remote
 
 import android.security.NetworkSecurityPolicy
-import com.grayvines.roche.data.isAllowedPublicPort
-import com.grayvines.roche.data.isLoopbackHost
-import com.grayvines.roche.data.isPublicHost
-import com.grayvines.roche.data.isPublicInetAddress
-import com.grayvines.roche.data.isTailnetOnlyHost
-import com.grayvines.roche.data.isTailscaleHostOrIp
-import com.grayvines.roche.data.isTailscaleInetAddress
+import com.grayvines.roche.core.isAllowedPublicPort
+import com.grayvines.roche.core.isLoopbackHost
+import com.grayvines.roche.core.isPublicHost
+import com.grayvines.roche.core.isPublicInetAddress
+import com.grayvines.roche.core.isTailnetOnlyHost
+import com.grayvines.roche.core.isTailscaleHostOrIp
+import com.grayvines.roche.core.isTailscaleInetAddress
 import java.io.IOException
 import java.net.IDN
 import java.net.InetAddress

@@ -1,10 +1,10 @@
 package com.grayvines.roche.ui
 
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.RankClusterCandidate
-import com.grayvines.roche.data.UpsertCatalogEntryInput
-import com.grayvines.roche.data.runSuspendCatching
+import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankClusterCandidate
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock

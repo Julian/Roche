@@ -1,5 +1,33 @@
 package com.grayvines.roche.data
 
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.extractHostTitle
+import com.grayvines.roche.core.isLikelyFeedUrl
+import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isSyncableItemUrl
+import com.grayvines.roche.core.isSyncablePublicUrl
+import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.core.parseTagCsv
+import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CatalogStore
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.attachEntryIdentifiers
+import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
+import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
+import com.grayvines.roche.data.enrichment.withResolvedStreamingIds
+import com.grayvines.roche.data.feeds.copySharedPdfStreamToCache
+import com.grayvines.roche.data.feeds.discoverFeedFromUrl
+import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
+import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
@@ -12,6 +40,7 @@ import com.grayvines.roche.data.local.deleteItemPreservingHistory
 import com.grayvines.roche.data.local.ensureWantToReadSpecExists
 import com.grayvines.roche.data.local.extractFtsTokenQueries
 import com.grayvines.roche.data.local.insertItemTag
+import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.local.removeItemTag
 import com.grayvines.roche.data.local.setItemFavorite
 import com.grayvines.roche.data.local.setItemReadAt
@@ -29,12 +58,25 @@ import com.grayvines.roche.data.settings.keepTokenOnDiscovery
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.data.settings.parsePairingInput
 import com.grayvines.roche.data.settings.tailscaleHttpsUpgrades
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.data.sync.PeerNodeDto
+import com.grayvines.roche.data.sync.PeerSyncCoordinator
+import com.grayvines.roche.data.sync.buildLocalOpmlXml
+import com.grayvines.roche.data.sync.deleteFeedFromServerOrLocal
+import com.grayvines.roche.data.sync.pollCooperativeFeedsOnDevice
+import com.grayvines.roche.data.sync.refreshFeedOnlineOrOnDevice
+import com.grayvines.roche.data.sync.subscribeFeedBestEffort
+import com.grayvines.roche.media.OfflineCacheManager
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.resolveCachedAudioFile
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
+import com.grayvines.roche.model.inferContentType
 import java.io.File
 import java.io.InputStream
 import java.time.Instant
@@ -100,6 +142,7 @@ class RocheRepository(
     private val backgroundScope: CoroutineScope? = null,
     private val albumStreamingResolver: AlbumStreamingResolver? = null,
     private val thumbnailDiskCache: ThumbnailDiskCache = ThumbnailDiskCache(cacheDir),
+    catalogStore: CatalogStore? = null,
 ) {
     private val dao = database.dao()
     private val syncMutex = Mutex()
@@ -115,11 +158,8 @@ class RocheRepository(
         get() = backgroundScope != null
 
     val catalog: CatalogStore =
-        CatalogStore(
-            dao = dao,
-            onLocalMutation = ::triggerBackgroundSync,
-            localPeerIdProvider = ::currentLocalPeerId,
-        )
+        (catalogStore ?: CatalogStore(dao = dao, localPeerIdProvider = ::currentLocalPeerId))
+            .also { store -> store.setOnLocalMutation(::triggerBackgroundSync) }
     @Volatile
     internal var latestSnapshot: RepositorySnapshot? = null
         private set
@@ -202,23 +242,8 @@ class RocheRepository(
                 if (matchedItems.isEmpty()) {
                     emptyList()
                 } else {
-                    val tagsById = dao.getAllTags().associateBy { it.id }
                     val tagNamesByItemId =
-                        dao.getAllItemTags()
-                            .groupBy(
-                                keySelector = { it.itemId },
-                                valueTransform = { tagsById[it.tagId]?.name },
-                            )
-                            .mapValues { (_, names) ->
-                                names
-                                    .filterNotNull()
-                                    .sortedWith(
-                                        compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) {
-                                                it
-                                            }
-                                            .thenBy { it }
-                                    )
-                            }
+                        groupSortedTagNamesByItemId(dao.getAllTags(), dao.getAllItemTags())
                     matchedItems.map { entity ->
                         toInboxEntry(entity, tagNamesByItemId[entity.id].orEmpty())
                     }
@@ -789,7 +814,7 @@ class RocheRepository(
             check(normalizedUrl.isNotBlank()) { "Enter a valid URL" }
             val tags = parseTagCsv(tagCsv)
             val inferredType = forcedContentType ?: inferContentType(normalizedUrl)
-            val isLocalPdf = normalizedUrl.startsWith("localpdf://", ignoreCase = true)
+            val isLocalPdf = isLocalPdfUrl(normalizedUrl)
             val hostTitle = if (isLocalPdf) "Local PDF" else extractHostTitle(normalizedUrl)
             val cleanTitleOverride = titleOverride?.trim()?.takeIf { it.isNotBlank() }
             val resolvedTitle =
@@ -902,7 +927,7 @@ class RocheRepository(
         }
         dao.deleteTombstone("item", itemNaturalKey(null, normalizedUrl))
         dao.deleteTombstone(
-            COLLECTION_ENTRY_ENTITY,
+            TOMBSTONE_ENTITY_COLLECTION_ENTRY,
             collectionEntryNaturalKey(WANT_TO_READ_COLLECTION_ID, targetEntity.id),
         )
         dao.upsertItem(targetEntity, markDirty = isSyncable, hlcOverride = hlc, nodeId = nodeId)

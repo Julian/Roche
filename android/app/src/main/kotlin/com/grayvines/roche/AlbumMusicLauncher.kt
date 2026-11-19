@@ -10,9 +10,9 @@ import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
 import android.provider.MediaStore
 import androidx.core.net.toUri
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.candidateStreamingUrls
-import com.grayvines.roche.data.hasYoutubeAlbumBrowseId
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.candidateStreamingUrls
+import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
 
 internal data class MusicUrlCandidate(
     val packageName: String,

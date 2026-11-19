@@ -55,9 +55,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.CollectionGeneratorState
-import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry

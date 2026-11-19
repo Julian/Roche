@@ -2,6 +2,25 @@ package com.grayvines.roche.data
 
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.core.FLAG_LOCAL_HLC
+import com.grayvines.roche.core.HlcClock
+import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
+import com.grayvines.roche.core.MAX_HLC_COUNTER
+import com.grayvines.roche.core.MAX_HLC_WALL_MS
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.data.catalog.CatalogStore
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.SyncCollectionGeneratorDto
+import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.data.feeds.sanitizeFeedHtml
+import com.grayvines.roche.data.feeds.writeSharedPdfToItemDir
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
@@ -9,6 +28,7 @@ import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
 import com.grayvines.roche.data.remote.RocheApiClient
@@ -16,6 +36,14 @@ import com.grayvines.roche.data.remote.isCleartextAllowed
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.isPermanentKeyInvalidation
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerSyncCoordinator
+import com.grayvines.roche.data.sync.PeerSyncJobTracker
+import com.grayvines.roche.data.sync.PeerSyncRequestConfig
+import com.grayvines.roche.data.sync.PeerSyncScheduler
+import com.grayvines.roche.data.sync.SyncTombstoneDto
+import com.grayvines.roche.data.sync.buildPeerSyncRequest
+import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
 import com.grayvines.roche.isAllowedSharedContentUri
 import com.grayvines.roche.openValidatedPdfStream
 import java.io.ByteArrayInputStream
@@ -311,13 +339,13 @@ class DataSyncRemediationTest {
             val olderGenHlc = HlcTimestamp.create(1_600_000_000_000L, 0, "server").encode()
             val itemTombstone =
                 SyncTombstoneDto("item", itemNaturalKey(null, itemUrl), nowIso, newerHlc)
-            reconcileGeneratorSync(catalog, listId, nowIso, olderGenHlc, listOf(itemTombstone))
+            reconcileGeneratorSync(dao, listId, nowIso, olderGenHlc, listOf(itemTombstone))
             assertNull(dao.getEntryById(itemId))
             assertNull(dao.getCollectionGenerator(listId))
 
             // A newer incoming generator clears the tombstone and resurrects cleanly
             val resurrectHlc = HlcTimestamp.create(1_900_000_000_000L, 0, "server").encode()
-            reconcileGeneratorSync(catalog, listId, nowIso, resurrectHlc)
+            reconcileGeneratorSync(dao, listId, nowIso, resurrectHlc)
             assertNotNull(dao.getCollectionGenerator(listId))
             assertNull(dao.getTombstone(TOMBSTONE_ENTITY_COLLECTION_GENERATOR, listId))
         }
@@ -622,14 +650,14 @@ private suspend fun seedManualWantToReadItem(
 }
 
 private suspend fun reconcileGeneratorSync(
-    catalog: CatalogStore,
+    dao: RocheDao,
     listId: String,
     nowIso: String,
     generatorHlc: String,
     tombstones: List<SyncTombstoneDto> = emptyList(),
 ) {
     reconcilePeerSyncResponse(
-        dao = catalog.dao,
+        dao = dao,
         response =
             PeerSyncResponseDto(
                 serverPeerId = "server",
@@ -648,6 +676,6 @@ private suspend fun reconcileGeneratorSync(
                     ),
             ),
         localPeerId = "android-peer-1",
-        catalogStore = catalog,
+        catalogStore = CatalogStore(dao),
     )
 }

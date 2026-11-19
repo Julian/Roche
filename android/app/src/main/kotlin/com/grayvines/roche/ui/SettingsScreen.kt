@@ -40,7 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode

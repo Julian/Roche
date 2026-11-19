@@ -46,11 +46,17 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.isLocalPdfUrl
 import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.media.PdfRendererSession
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ThemeMode
+import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.extractPlainTextHeadings
+import com.grayvines.roche.reader.mapBlockHeadingIndices
+import com.grayvines.roche.reader.parseHtmlArticleBlocks
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
@@ -672,7 +678,7 @@ internal fun ReaderArticleBody(
 ) {
     val colors = LocalRocheColors.current
     val linkStyles = rememberReaderLinkStyles()
-    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
+    val isLocalPdf = isLocalPdfUrl(entry.url)
     val plainParagraphs =
         remember(entry.contentText, entry.summary) {
             (entry.contentText?.takeIf { it.isNotBlank() } ?: entry.summary.orEmpty())
@@ -704,7 +710,7 @@ internal fun ReaderArticleBody(
             linkStyles = linkStyles,
             onOpenExternalUrl = onOpenExternalUrl,
         )
-        if (!isLocalPdfUrl && entry.url.isNotBlank()) {
+        if (!isLocalPdf && entry.url.isNotBlank()) {
             item(key = "reader_footer") {
                 Column {
                     Spacer(modifier = Modifier.height(6.dp))
@@ -868,7 +874,7 @@ internal fun ReaderBodyContent(
             }
         }
     }
-    if (!entry.url.startsWith("localpdf://", ignoreCase = true) && entry.url.isNotBlank()) {
+    if (!isLocalPdfUrl(entry.url) && entry.url.isNotBlank()) {
         Spacer(modifier = Modifier.height(8.dp))
         HeaderActionButton(
             label = "Open Original Link ↗",

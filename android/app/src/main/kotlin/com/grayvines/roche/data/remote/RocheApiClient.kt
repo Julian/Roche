@@ -1,6 +1,7 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.data.runSuspendCatching
+import com.grayvines.roche.core.EXTERNAL_BROWSER_USER_AGENT
+import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.settings.tailscaleDiscoveryUrls
 import java.io.File
 
@@ -322,9 +323,7 @@ class RocheApiClient(
         private const val METHOD_GET = "GET"
         private const val METHOD_POST = "POST"
         private const val METHOD_DELETE = "DELETE"
-        private const val EXTERNAL_IMAGE_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/124.0.0.0 Mobile Safari/537.36"
+        private const val EXTERNAL_IMAGE_USER_AGENT = EXTERNAL_BROWSER_USER_AGENT
         private const val EXTERNAL_IMAGE_ACCEPT =
             "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
         private const val EXTERNAL_FEED_ACCEPT =

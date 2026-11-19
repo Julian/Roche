@@ -11,7 +11,7 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
-import com.grayvines.roche.data.runSuspendCatching
+import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode

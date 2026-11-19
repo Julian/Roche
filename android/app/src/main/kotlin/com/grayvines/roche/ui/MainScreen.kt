@@ -50,9 +50,9 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
-import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.generatorFor
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.PlusIcon

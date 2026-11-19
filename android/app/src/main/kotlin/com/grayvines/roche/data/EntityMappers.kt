@@ -2,15 +2,25 @@
 
 package com.grayvines.roche.data
 
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.isLocalPollNewer
+import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
+import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_TEXT_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.insertItemTag
 import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
+import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
@@ -18,6 +28,25 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.time.Instant
+
+internal fun groupSortedTagNamesByItemId(
+    tags: List<TagRow>,
+    itemTags: List<ItemTagRow>,
+): Map<String, List<String>> {
+    val tagsById = tags.associateBy { it.id }
+    return itemTags
+        .groupBy(
+            keySelector = { it.itemId },
+            valueTransform = { tagsById[it.tagId]?.name },
+        )
+        .mapValues { (_, names) ->
+            names
+                .filterNotNull()
+                .sortedWith(
+                    compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) { it }.thenBy { it }
+                )
+        }
+}
 
 internal class InboxEntryCache {
     private data class CachedEntry(
@@ -62,21 +91,7 @@ internal fun buildSnapshot(
     activePeers: List<PeerNodeDto> = emptyList(),
     entryCache: InboxEntryCache? = null,
 ): RepositorySnapshot {
-    val tagsById = tags.associateBy { it.id }
-    val tagNamesByItemId =
-        itemTags
-            .groupBy(
-                keySelector = { it.itemId },
-                valueTransform = { tagsById[it.tagId]?.name },
-            )
-            .mapValues { (_, names) ->
-                names
-                    .filterNotNull()
-                    .sortedWith(
-                        compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) { it }
-                            .thenBy { it }
-                    )
-            }
+    val tagNamesByItemId = groupSortedTagNamesByItemId(tags, itemTags)
 
     val domainEntries =
         if (entryCache != null) {
@@ -240,20 +255,6 @@ internal fun toRemoteFeedEntity(
     )
 }
 
-internal fun newerIsoTimestamp(first: String?, second: String?): String? {
-    val a = first?.trim()?.takeIf { it.isNotEmpty() }
-    val b = second?.trim()?.takeIf { it.isNotEmpty() }
-    if (a == null) return b
-    if (b == null) return a
-    val instA = runCatching { Instant.parse(a) }.getOrNull()
-    val instB = runCatching { Instant.parse(b) }.getOrNull()
-    return if (instA != null && instB != null) {
-        if (instB.isAfter(instA)) b else a
-    } else {
-        if (b > a) b else a
-    }
-}
-
 private fun String?.nonBlankOr(fallback: String?): String? =
     this?.takeIf { it.isNotBlank() } ?: fallback
 
@@ -338,7 +339,3 @@ internal suspend fun attachTagsLocally(
         }
     }
 }
-
-internal const val MAX_SQLITE_SUMMARY_CHARS = 16_384
-internal const val MAX_SQLITE_TEXT_CHARS = 262_144
-internal const val MAX_SQLITE_HTML_CHARS = 512_000

@@ -1,9 +1,9 @@
 package com.grayvines.roche.ui
 
+import com.grayvines.roche.core.isLikelyFeedUrl
+import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.isLikelyFeedUrl
-import com.grayvines.roche.data.normalizeUserSubmittedUrl
-import com.grayvines.roche.data.runSuspendCatching
+import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType

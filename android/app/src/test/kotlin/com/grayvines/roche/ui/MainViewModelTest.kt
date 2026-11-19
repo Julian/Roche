@@ -2,15 +2,12 @@
 
 package com.grayvines.roche.ui
 
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.data.collectInBackground
-import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
@@ -23,6 +20,15 @@ import com.grayvines.roche.data.local.upsertTags
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.media.BitmapLoader
+import com.grayvines.roche.media.ImageDecoders
+import com.grayvines.roche.media.MAX_BITMAP_DIMENSION_PX
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.ThumbnailLoader
+import com.grayvines.roche.media.computeProportionalTargetSize
+import com.grayvines.roche.media.pruneThumbnailDiskCache
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
@@ -30,12 +36,20 @@ import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
-import com.grayvines.roche.ui.components.MAX_BITMAP_DIMENSION_PX
-import com.grayvines.roche.ui.components.ThumbnailLoader
-import com.grayvines.roche.ui.components.computeProportionalTargetSize
-import com.grayvines.roche.ui.components.pruneThumbnailDiskCache
+import com.grayvines.roche.playback.AudioPlayerBackend
+import com.grayvines.roche.playback.MediaSessionCommand
+import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastMediaSessionCallbacks
+import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.PodcastPlayerState
+import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.extractPlainTextHeadings
+import com.grayvines.roche.reader.mapBlockHeadingIndices
+import com.grayvines.roche.reader.parseHtmlArticleBlocks
+import com.grayvines.roche.reader.resolveSafeAnchorHref
 import java.io.File
-import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlinx.coroutines.CompletableDeferred
@@ -668,7 +682,7 @@ class MainViewModelTest {
             assertNull(closedState.readerContent)
 
             val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
-            assertEquals("3m", com.grayvines.roche.model.formatArticleMinutes(mathPlainText))
+            assertEquals("3m", com.grayvines.roche.core.formatArticleMinutes(mathPlainText))
 
             collectJob.cancel()
         }
@@ -994,10 +1008,14 @@ class MainViewModelTest {
                 }
             }
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = flakyClient,
                     settings = settings,
-                    decoder = { fakeImageBitmap(width = 64, height = 64) },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = { FakeImage(width = 64, height = 64) },
+                            sizeOfKiB = { 16 },
+                        ),
                     clockMs = { nowMs },
                 )
             assertNull(loader.loadThumbnail("https://example.com/thumb.jpg"))
@@ -1479,15 +1497,19 @@ class MainViewModelTest {
             }
             var nowMs = 1_000_000L
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = coalescingClient,
                     settings = settings,
-                    cacheDir = coalescingCacheDir,
-                    decoder = {
-                        decodeCount.incrementAndGet()
-                        fakeImageBitmap(width = 128, height = 128)
-                    },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = {
+                                decodeCount.incrementAndGet()
+                                FakeImage(width = 128, height = 128)
+                            },
+                            sizeOfKiB = { 64 },
+                        ),
                     clockMs = { nowMs },
+                    diskCache = ThumbnailDiskCache(coalescingCacheDir, clockMs = { nowMs }),
                 )
 
             val jobs =
@@ -1520,7 +1542,7 @@ class MainViewModelTest {
                 )
             }
             val pruneLoader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient =
                         RocheApiClient {
                             HttpResponse(
@@ -1530,9 +1552,13 @@ class MainViewModelTest {
                             )
                         },
                     settings = settings,
-                    cacheDir = pruneCacheDir,
-                    decoder = { fakeImageBitmap(width = 32, height = 32) },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = { FakeImage(width = 32, height = 32) },
+                            sizeOfKiB = { 4 },
+                        ),
                     clockMs = { nowMs },
+                    diskCache = ThumbnailDiskCache(pruneCacheDir, clockMs = { nowMs }),
                 )
             val totalWritten = ThumbnailLoader.MAX_DISK_CACHED_FILES + 4
             for (idx in 1..totalWritten) {
@@ -1656,32 +1682,47 @@ class MainViewModelTest {
         runTest {
             val listId = repository.catalog.createCustomList("Essential Albums")
             listOf(
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "11111111-1111-4111-8111-111111111111",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "First Canon Album",
                         creators = listOf("Artist One"),
                         releaseYear = 1971,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp1")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp1",
+                                )
+                            ),
                     ),
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "22222222-2222-4222-8222-222222222222",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "Second Canon Album",
                         creators = listOf("Artist Two"),
                         releaseYear = 1975,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp2")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp2",
+                                )
+                            ),
                     ),
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "33333333-3333-4333-8333-333333333333",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "Third Canon Album",
                         creators = listOf("Artist Three"),
                         releaseYear = 1980,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp3")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp3",
+                                )
+                            ),
                     ),
                 )
                 .forEachIndexed { idx, input ->
@@ -1763,11 +1804,11 @@ class MainViewModelTest {
                 // Seed one consumed movie so completing a Want movie has >= 2 items to rank
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Arrival",
                         creatorsCsv = "Denis Villeneuve",
                         releaseYear = 2016,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "Great",
                         addToWant = false,
                         rankAfterLog = false,
@@ -1776,11 +1817,11 @@ class MainViewModelTest {
                 // Add two movies to Want Queue and immediately start ranking on Want Queue
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Stalker",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1979,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "",
                         addToWant = true,
                         rankAfterLog = false,
@@ -1788,11 +1829,11 @@ class MainViewModelTest {
                 )
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Solaris",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1972,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "",
                         addToWant = true,
                         rankAfterLog = false,
@@ -1847,11 +1888,11 @@ class MainViewModelTest {
                         .collectionId
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Mirror",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1975,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "Poetic",
                         addToWant = false,
                         rankAfterLog = false,
@@ -2044,21 +2085,7 @@ class MainViewModelTest {
         }
     }
 
-    private fun fakeImageBitmap(width: Int, height: Int): ImageBitmap =
-        Proxy.newProxyInstance(
-            ImageBitmap::class.java.classLoader,
-            arrayOf(ImageBitmap::class.java),
-        ) { proxy, method, args ->
-            when (method.name) {
-                "getWidth" -> width
-                "getHeight" -> height
-                "getHasAlpha" -> true
-                "equals" -> proxy === args?.firstOrNull()
-                "hashCode" -> System.identityHashCode(proxy)
-                "toString" -> "FakeImageBitmap(${width}x$height)"
-                else -> null
-            }
-        } as ImageBitmap
+    private class FakeImage(val width: Int, val height: Int)
 
     private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
         @Volatile var callbacks: PodcastMediaSessionCallbacks? = null

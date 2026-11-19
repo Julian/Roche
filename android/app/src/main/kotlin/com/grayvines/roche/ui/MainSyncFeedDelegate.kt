@@ -1,6 +1,6 @@
 package com.grayvines.roche.ui
 
-import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.data.remote.ProblemDetailsException
 import com.grayvines.roche.data.remote.RocheProblemTypes
 import com.grayvines.roche.data.remote.formatProblemDetailsMessage

@@ -2,12 +2,27 @@
 
 package com.grayvines.roche.data
 
-import androidx.compose.ui.graphics.ImageBitmap
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deterministicFeedId
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.extractHostTitle
+import com.grayvines.roche.core.inferFeedTypeWireValue
+import com.grayvines.roche.core.isLikelyFeedUrl
+import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.sanitizeCacheFileName
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.data.feeds.resolveCandidateContentType
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
 import com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS
 import com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
@@ -23,12 +38,21 @@ import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerSyncScheduler
+import com.grayvines.roche.data.sync.isActiveVpnTunnelInterface
+import com.grayvines.roche.data.sync.resolveActiveNetworkTier
+import com.grayvines.roche.media.BitmapLoader
+import com.grayvines.roche.media.ImageDecoders
+import com.grayvines.roche.media.OfflineCacheManager
+import com.grayvines.roche.media.THUMBNAILS_SUBDIR
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.diskCacheKey
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
-import com.grayvines.roche.ui.components.ThumbnailLoader
+import com.grayvines.roche.model.inferContentType
 import java.io.File
-import java.lang.reflect.Proxy
 import java.net.InetAddress
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -395,7 +419,7 @@ class RocheRepositoryTest {
                 database
                     .dao()
                     .getTombstone(
-                        COLLECTION_ENTRY_ENTITY,
+                        TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                         collectionEntryNaturalKey(deterministicTagId("ebpf"), "item-2"),
                     )
             assertTrue(tagTombstone?.isLocalDirty == true)
@@ -575,11 +599,9 @@ class RocheRepositoryTest {
             }
             assertEquals(
                 256 to 192,
-                com.grayvines.roche.ui.components.computeProportionalTargetSize(4000, 3000, 256),
+                com.grayvines.roche.media.computeProportionalTargetSize(4000, 3000, 256),
             )
-            assertNull(
-                com.grayvines.roche.ui.components.computeProportionalTargetSize(200, 150, 256)
-            )
+            assertNull(com.grayvines.roche.media.computeProportionalTargetSize(200, 150, 256))
         }
 
     @Test
@@ -1370,16 +1392,19 @@ class RocheRepositoryTest {
                     cacheDir = sharedCacheDir,
                     thumbnailDiskCache = sharedDiskCache,
                 )
-            val fakeBitmap = createTestImageBitmap()
-            val decoder: (ByteArray) -> androidx.compose.ui.graphics.ImageBitmap? = { bytes ->
-                if (bytes.contentEquals(payload)) fakeBitmap else null
-            }
+            val fakeBitmap = TestImage()
+            val decoders =
+                ImageDecoders(
+                    decodeBytes = { bytes ->
+                        if (bytes.contentEquals(payload)) fakeBitmap else null
+                    },
+                    sizeOfKiB = { 16 },
+                )
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = apiClient,
                     settings = settings,
-                    cacheDir = sharedCacheDir,
-                    decoder = decoder,
+                    decoders = decoders,
                     clockMs = { nowMs },
                     diskCache = sharedDiskCache,
                 )
@@ -1387,9 +1412,8 @@ class RocheRepositoryTest {
             runConcurrentSharedThumbWrites(
                 cacheManager = cacheManager,
                 apiClient = apiClient,
-                sharedCacheDir = sharedCacheDir,
                 sharedDiskCache = sharedDiskCache,
-                decoder = decoder,
+                decoders = decoders,
                 clockMs = { nowMs },
                 sharedUrl = sharedUrl,
             )
@@ -1421,9 +1445,8 @@ class RocheRepositoryTest {
     private suspend fun runConcurrentSharedThumbWrites(
         cacheManager: OfflineCacheManager,
         apiClient: RocheApiClient,
-        sharedCacheDir: File,
         sharedDiskCache: ThumbnailDiskCache,
-        decoder: (ByteArray) -> androidx.compose.ui.graphics.ImageBitmap?,
+        decoders: ImageDecoders<TestImage>,
         clockMs: () -> Long,
         sharedUrl: String,
     ) = coroutineScope {
@@ -1436,11 +1459,10 @@ class RocheRepositoryTest {
         val loaderJobs =
             (1..4).map {
                 async(Dispatchers.IO) {
-                    ThumbnailLoader(
+                    BitmapLoader(
                             apiClient = apiClient,
                             settings = settings,
-                            cacheDir = sharedCacheDir,
-                            decoder = decoder,
+                            decoders = decoders,
                             clockMs = clockMs,
                             diskCache = sharedDiskCache,
                         )
@@ -1496,18 +1518,7 @@ class RocheRepositoryTest {
         }
 }
 
-private fun createTestImageBitmap(): ImageBitmap =
-    Proxy.newProxyInstance(
-        ImageBitmap::class.java.classLoader,
-        arrayOf(ImageBitmap::class.java),
-    ) { _, method, _ ->
-        when (method.name) {
-            "getWidth",
-            "getHeight" -> 16
-            "toString" -> "TestImageBitmap(16x16)"
-            else -> 0
-        }
-    } as ImageBitmap
+private class TestImage
 
 private const val TEST_OVERFLOW_TOKEN_COUNT = 20
 

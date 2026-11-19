@@ -8,9 +8,9 @@ import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
 import androidx.room3.Update
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
-import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import kotlinx.coroutines.flow.Flow
 
 private const val FEED_ID_SUBQUERY =

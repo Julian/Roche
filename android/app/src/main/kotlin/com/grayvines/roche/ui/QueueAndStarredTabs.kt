@@ -47,9 +47,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.RankedCatalogEntry
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.EntryThumbnailPreview

@@ -12,8 +12,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToIndex
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -324,7 +324,7 @@ class MainScreenTest {
                         MainUiState(
                             activeTab = AppTab.HOME,
                             catalog =
-                                com.grayvines.roche.data.CatalogSnapshot(
+                                com.grayvines.roche.data.catalog.CatalogSnapshot(
                                     generators =
                                         listOf(
                                             CollectionGeneratorState(
@@ -519,7 +519,7 @@ class MainScreenTest {
                                     queueItemIds = listOf(audioEntry.id, articleEntry.id)
                                 ),
                             playerState =
-                                com.grayvines.roche.ui.PodcastPlayerState(
+                                com.grayvines.roche.playback.PodcastPlayerState(
                                     currentEntryId = audioEntry.id,
                                     isPlaying = true,
                                     positionMs = 120_000L,

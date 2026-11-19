@@ -1,8 +1,8 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.data.PeerSyncScheduler
-import com.grayvines.roche.data.isPublicInetAddress
-import com.grayvines.roche.data.isSyncablePublicUrl
+import com.grayvines.roche.core.isPublicInetAddress
+import com.grayvines.roche.core.isSyncablePublicUrl
+import com.grayvines.roche.data.sync.PeerSyncScheduler
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.InetAddress

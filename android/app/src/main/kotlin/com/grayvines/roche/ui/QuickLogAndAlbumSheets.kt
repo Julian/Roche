@@ -33,9 +33,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.CollectionGeneratorState
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.EntryKind
+import com.grayvines.roche.data.catalog.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle

@@ -42,14 +42,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.isLikelyFeedUrl
-import com.grayvines.roche.data.normalizeTagName
-import com.grayvines.roche.data.normalizeUserSubmittedUrl
+import com.grayvines.roche.core.isLikelyFeedUrl
+import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.data.feeds.normalizeUserSubmittedUrl
 import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.playback.formatPlaybackSpeedLabel
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
@@ -217,7 +219,7 @@ private fun ContextSheetActionsList(
     onOpenExternalUrl: () -> Unit,
 ) {
     val isAudio = entry.contentType == ContentType.AUDIO
-    val isLocalPdfUrl = entry.url.startsWith("localpdf://", ignoreCase = true)
+    val isLocalPdf = isLocalPdfUrl(entry.url)
     var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
 
     ContextSheetPrimaryActions(entry = entry, isAudio = isAudio, onAction = onAction)
@@ -233,7 +235,7 @@ private fun ContextSheetActionsList(
         label = if (entry.isRead) "Mark as Unread" else "Mark as Read",
         onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
     )
-    if (!isLocalPdfUrl) {
+    if (!isLocalPdf) {
         ContextActionItem(label = "Share…", onClick = onShare)
     }
     ContextActionItem(
@@ -249,7 +251,7 @@ private fun ContextSheetActionsList(
             onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
         )
     }
-    if (!isLocalPdfUrl && entry.url.isNotBlank()) {
+    if (!isLocalPdf && entry.url.isNotBlank()) {
         ContextActionItem(label = "Open Original URL", onClick = onOpenExternalUrl)
     }
     ContextActionItem(

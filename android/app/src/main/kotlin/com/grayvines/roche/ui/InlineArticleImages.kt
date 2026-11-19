@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextLinkStyles
@@ -32,15 +33,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.model.resolveArticleImageUrl
+import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.components.drawArticleImagePlaceholder
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
-import java.util.Locale
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Element
-import org.jsoup.nodes.Node
 
 internal sealed interface InlineImageLoadState {
     data object Loading : InlineImageLoadState
@@ -48,231 +45,6 @@ internal sealed interface InlineImageLoadState {
     data class Success(val bitmap: ImageBitmap) : InlineImageLoadState
 
     data object Error : InlineImageLoadState
-}
-
-internal fun parseFigureElement(
-    figure: Element,
-    baseUrl: String?,
-    out: MutableList<ArticleBlock>,
-) {
-    val figcaption = figure.selectFirst(TAG_FIGCAPTION)
-    val (explicitCaption, trailingCaptionBlocks) = splitFigcaptionContent(figcaption, baseUrl)
-    val withoutCaption = figure.clone()
-    withoutCaption.select(TAG_FIGCAPTION).remove()
-
-    val images = withoutCaption.select(TAG_IMG).mapNotNull { parseImgElement(it, baseUrl) }
-    val hasCompositeBlocks = withoutCaption.selectFirst(COMPOSITE_FIGURE_QUERY) != null
-    if (images.isNotEmpty() && !hasCompositeBlocks) {
-        val fallbackCaption =
-            if (explicitCaption == null) {
-                normalizeDomElementInlineHtml(withoutCaption).takeIf(::hasVisibleHtmlText)
-            } else {
-                null
-            }
-        val effectiveCaption = explicitCaption ?: fallbackCaption
-        images.forEachIndexed { index, img ->
-            val attachedCaption = if (index == images.lastIndex) effectiveCaption else null
-            out.add(img.copy(captionHtml = attachedCaption))
-        }
-    } else {
-        appendCompositeFigureBlocks(withoutCaption, explicitCaption, baseUrl, out)
-    }
-    out.addAll(trailingCaptionBlocks)
-}
-
-internal fun splitFigcaptionContent(
-    figcaption: Element?,
-    baseUrl: String?,
-): Pair<String?, List<ArticleBlock>> {
-    if (figcaption == null) return null to emptyList()
-    if (figcaption.selectFirst(COMPOSITE_FIGURE_QUERY) == null) {
-        val caption = normalizeDomElementInlineHtml(figcaption).takeIf(::hasVisibleHtmlText)
-        return caption to emptyList()
-    }
-    val captionBox = Element(TAG_DIV)
-    val remainderBox = Element(TAG_DIV)
-    var inRemainder = false
-    for (node in figcaption.childNodes()) {
-        val hasCaptionAlready = hasVisibleDomText(captionBox)
-        if (!inRemainder && shouldBreakFigcaption(node, hasCaptionAlready)) {
-            inRemainder = true
-        }
-        if (inRemainder) {
-            remainderBox.appendChild(node.clone())
-        } else {
-            captionBox.appendChild(node.clone())
-        }
-    }
-    val caption = normalizeDomElementInlineHtml(captionBox).takeIf(::hasVisibleHtmlText)
-    val trailingBlocks = mutableListOf<ArticleBlock>()
-    walkDomContainer(remainderBox, baseUrl, trailingBlocks)
-    return caption to trailingBlocks
-}
-
-internal fun shouldBreakFigcaption(node: Node, hasCaptionAlready: Boolean): Boolean {
-    if (node !is Element) return false
-    val tag = node.normalName()
-    val hasEmbeddedBlock = node.selectFirst(COMPOSITE_FIGURE_QUERY) != null
-    return hasEmbeddedBlock ||
-        tag in COMPOSITE_CAPTION_BREAK_TAGS ||
-        tag == "p" && hasCaptionAlready
-}
-
-internal fun appendCompositeFigureBlocks(
-    withoutCaption: Element,
-    explicitCaption: String?,
-    baseUrl: String?,
-    out: MutableList<ArticleBlock>,
-) {
-    val figureBlocks = mutableListOf<ArticleBlock>()
-    walkDomContainer(withoutCaption, baseUrl, figureBlocks)
-    if (figureBlocks.isNotEmpty()) {
-        if (explicitCaption != null) {
-            attachFigureCaption(figureBlocks, explicitCaption)
-        }
-        out.addAll(figureBlocks)
-    } else if (explicitCaption != null) {
-        out.add(italicCaptionParagraph(explicitCaption))
-    }
-}
-
-private fun italicCaptionParagraph(captionHtml: String): ArticleBlock.Paragraph =
-    ArticleBlock.Paragraph("<em>$captionHtml</em>")
-
-internal fun attachFigureCaption(blocks: MutableList<ArticleBlock>, captionHtml: String) {
-    val lastIdx = blocks.lastIndex
-    when (val last = blocks[lastIdx]) {
-        is ArticleBlock.ImageBlock -> {
-            if (last.captionHtml == null) {
-                blocks[lastIdx] = last.copy(captionHtml = captionHtml)
-            } else {
-                blocks.add(italicCaptionParagraph(captionHtml))
-            }
-        }
-        is ArticleBlock.Blockquote -> {
-            if (last.attributionHtml == null) {
-                blocks[lastIdx] = last.copy(attributionHtml = captionHtml)
-            } else {
-                blocks.add(italicCaptionParagraph(captionHtml))
-            }
-        }
-        else -> {
-            blocks.add(italicCaptionParagraph(captionHtml))
-        }
-    }
-}
-
-internal fun flushInlineNodes(
-    nodes: List<Node>,
-    baseUrl: String?,
-    out: MutableList<ArticleBlock>,
-    splitDoubleBrIntoParagraphs: Boolean = false,
-) {
-    if (nodes.isEmpty()) return
-    val scratchDoc = Jsoup.parseBodyFragment("")
-    scratchDoc.outputSettings().prettyPrint(false)
-    val buffer = scratchDoc.body()
-
-    for (node in nodes) {
-        if (node is Element && node.normalName() == TAG_IMG) {
-            flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
-            parseImgElement(node, baseUrl)?.let { out.add(it) }
-        } else if (node is Element && node.selectFirst(TAG_IMG) != null) {
-            appendElementWithImages(
-                element = node,
-                buffer = buffer,
-                baseUrl = baseUrl,
-                out = out,
-                splitDoubleBrIntoParagraphs = splitDoubleBrIntoParagraphs,
-            )
-        } else {
-            buffer.appendChild(node.clone())
-        }
-    }
-    flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
-}
-
-internal fun appendElementWithImages(
-    element: Element,
-    buffer: Element,
-    baseUrl: String?,
-    out: MutableList<ArticleBlock>,
-    splitDoubleBrIntoParagraphs: Boolean,
-) {
-    val images = element.select(TAG_IMG).mapNotNull { parseImgElement(it, baseUrl) }
-    if (hasVisibleDomText(element)) {
-        val textClone = element.clone()
-        textClone.select(TAG_IMG).remove()
-        buffer.appendChild(textClone)
-    }
-    flushInlineScratchBuffer(buffer, out, splitDoubleBrIntoParagraphs)
-    out.addAll(images)
-}
-
-internal fun flushInlineScratchBuffer(
-    buffer: Element,
-    out: MutableList<ArticleBlock>,
-    splitDoubleBrIntoParagraphs: Boolean,
-) {
-    if (buffer.childNodeSize() == 0) return
-    val normalized = normalizeDomElementInlineHtml(buffer)
-    buffer.empty()
-    if (!hasVisibleHtmlText(normalized)) return
-
-    if (splitDoubleBrIntoParagraphs && DOUBLE_BR_XHTML in normalized) {
-        for (segment in normalized.split(DOUBLE_BR_XHTML)) {
-            val trimmed = segment.trim()
-            if (hasVisibleHtmlText(trimmed)) {
-                out.add(ArticleBlock.Paragraph(trimmed))
-            }
-        }
-    } else {
-        out.add(ArticleBlock.Paragraph(normalized))
-    }
-}
-
-internal fun parseImgElement(img: Element, baseUrl: String?): ArticleBlock.ImageBlock? {
-    val rawSrc = img.attr("src").trim().takeIf { it.isNotEmpty() }
-    val width = img.attr("width").takeIf { it.isNotBlank() }?.let(::parseHtmlPixelDimension)
-    val height = img.attr("height").takeIf { it.isNotBlank() }?.let(::parseHtmlPixelDimension)
-    val classAttr = img.attr("class").lowercase(Locale.US)
-    val alt = img.attr("alt").ifBlank { img.attr("title") }.trim().takeIf { it.isNotEmpty() }
-
-    val resolvedUrl = rawSrc?.let { resolveArticleImageUrl(it, baseUrl) }
-    val isAllowedImage =
-        !isSmallIconDimension(width, height) &&
-            !isEmojiOrSmileyClass(classAttr) &&
-            !isFootnoteBackarrowAlt(alt)
-
-    return if (resolvedUrl != null && isAllowedImage) {
-        ArticleBlock.ImageBlock(
-            url = resolvedUrl,
-            alt = alt,
-            captionHtml = null,
-            width = width,
-            height = height,
-        )
-    } else {
-        null
-    }
-}
-
-private fun isSmallIconDimension(width: Int?, height: Int?): Boolean =
-    width != null && width <= MIN_INLINE_IMG_DIMENSION_PX ||
-        height != null && height <= MIN_INLINE_IMG_DIMENSION_PX
-
-private fun isEmojiOrSmileyClass(classAttr: String?): Boolean =
-    classAttr != null &&
-        (classAttr.contains("wp-smiley") ||
-            classAttr.contains("emoji") ||
-            classAttr.contains("smiley"))
-
-internal fun isFootnoteBackarrowAlt(alt: String?): Boolean = alt == "↩" || alt == "↩︎"
-
-internal fun parseHtmlPixelDimension(raw: String): Int? {
-    val trimmed = raw.trim()
-    if (trimmed.endsWith("%")) return null
-    return trimmed.removeSuffix("px").removeSuffix("PX").trim().toIntOrNull()?.takeIf { it > 0 }
 }
 
 @Composable
@@ -476,8 +248,11 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
     val cleanUrl = imageUrl.trim()
     val loader = LocalThumbnailLoader.current ?: return InlineImageLoadState.Error
     val initialState =
-        loader.getCachedInlineImage(cleanUrl)?.let { InlineImageLoadState.Success(it) }
-            ?: InlineImageLoadState.Loading
+        remember(cleanUrl, loader) {
+            loader.getCachedInlineImage(cleanUrl)?.let {
+                InlineImageLoadState.Success(it.asImageBitmap())
+            } ?: InlineImageLoadState.Loading
+        }
     val state by
         produceState<InlineImageLoadState>(
             initialValue = initialState,
@@ -489,7 +264,7 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
                 val loaded = loader.loadInlineImage(cleanUrl)
                 value =
                     if (loaded != null) {
-                        InlineImageLoadState.Success(loaded)
+                        InlineImageLoadState.Success(loaded.asImageBitmap())
                     } else {
                         InlineImageLoadState.Error
                     }
@@ -498,15 +273,7 @@ private fun rememberInlineImageState(imageUrl: String): InlineImageLoadState {
     return state
 }
 
-private const val MIN_INLINE_IMG_DIMENSION_PX = 32
 private const val MIN_INLINE_ASPECT_RATIO = 0.25f
 private const val MAX_INLINE_ASPECT_RATIO = 5.0f
 private const val DEFAULT_INLINE_ASPECT_RATIO = 1.777f
 private const val READER_INLINE_IMAGE_TAG = "reader_inline_image"
-private const val TAG_FIGCAPTION = "figcaption"
-private const val TAG_IMG = "img"
-private const val TAG_DIV = "div"
-private const val DOUBLE_BR_XHTML = "<br/><br/>"
-private const val COMPOSITE_FIGURE_QUERY = "blockquote, pre, table"
-private val COMPOSITE_CAPTION_BREAK_TAGS =
-    setOf("blockquote", "pre", "table", "ul", "ol", "hr", "figure", "div")

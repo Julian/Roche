@@ -15,16 +15,17 @@ import androidx.core.net.toUri
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.PeerSyncScheduler
-import com.grayvines.roche.data.remote.readBoundedText
+import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.readBoundedText
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.sync.PeerSyncScheduler
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.playback.PodcastPlaybackService
 import com.grayvines.roche.ui.CompanionSubTab
 import com.grayvines.roche.ui.LocalOfflineCacheDir
 import com.grayvines.roche.ui.MainAction
 import com.grayvines.roche.ui.MainScreen
 import com.grayvines.roche.ui.MainViewModel
-import com.grayvines.roche.ui.PodcastPlaybackService
 import com.grayvines.roche.ui.components.LocalThumbnailLoader
 import com.grayvines.roche.ui.theme.RocheTheme
 import kotlinx.coroutines.Dispatchers
@@ -127,7 +128,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun shareEntryViaSystemSheet(entry: InboxEntry) {
-        if (entry.url.startsWith("localpdf://", ignoreCase = true)) {
+        if (isLocalPdfUrl(entry.url)) {
             viewModel.showStatusMessage("Local PDF has no public web URL to share")
             return
         }

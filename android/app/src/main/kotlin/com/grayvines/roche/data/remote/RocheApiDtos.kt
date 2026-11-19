@@ -1,14 +1,14 @@
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerNodeDto
-import com.grayvines.roche.data.SyncCollectionEntryDto
-import com.grayvines.roche.data.SyncCollectionGeneratorDto
-import com.grayvines.roche.data.SyncComparisonDto
-import com.grayvines.roche.data.SyncConsumptionLogDto
-import com.grayvines.roche.data.SyncEntryRecordDto
-import com.grayvines.roche.data.SyncTombstoneDto
-import com.grayvines.roche.data.normalizeConsecutiveFailures
+import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
+import com.grayvines.roche.data.catalog.SyncCollectionGeneratorDto
+import com.grayvines.roche.data.catalog.SyncComparisonDto
+import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
+import com.grayvines.roche.data.catalog.SyncEntryRecordDto
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerNodeDto
+import com.grayvines.roche.data.sync.SyncTombstoneDto
 import java.io.IOException
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi

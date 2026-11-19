@@ -2,10 +2,11 @@
 
 package com.grayvines.roche.data.remote
 
-import com.grayvines.roche.data.inferFeedTypeWireValue
-import com.grayvines.roche.data.normalized
+import com.grayvines.roche.core.coreJson
+import com.grayvines.roche.core.formatDurationSecondsLabel
+import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.data.settings.validateCanonicalDiscoveryUrl
-import java.util.Locale
+import com.grayvines.roche.data.sync.normalized
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -15,12 +16,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 
-internal val rocheJson = Json {
-    ignoreUnknownKeys = true
-    isLenient = true
-    coerceInputValues = true
-    explicitNulls = false
-}
+internal val rocheJson: Json = coreJson
 
 internal const val DEFAULT_POLL_INTERVAL = 30
 internal const val DEFAULT_ERROR_TITLE = "HTTP Error"
@@ -30,7 +26,6 @@ internal const val DEFAULT_ITEM_STATUS = "unread"
 internal const val ARCHIVED_ITEM_STATUS = "archived"
 internal const val DEFAULT_MEDIA_TYPE = "thumbnail"
 internal const val EPOCH_ISO_TIMESTAMP = "1970-01-01T00:00:00Z"
-internal const val SECONDS_PER_MINUTE = 60L
 
 @Serializable
 internal data class PairDeviceWireRequest(
@@ -328,13 +323,6 @@ internal fun formatWireDuration(duration: JsonPrimitive?): String? {
     val raw = duration?.contentOrNull?.nullIfBlank() ?: return null
     val seconds = raw.toLongOrNull() ?: return raw
     return formatDurationSecondsLabel(seconds)
-}
-
-internal fun formatDurationSecondsLabel(seconds: Long): String? {
-    if (seconds <= 0L) return null
-    val minutes = seconds / SECONDS_PER_MINUTE
-    val remSeconds = seconds % SECONDS_PER_MINUTE
-    return "%d:%02d".format(Locale.US, minutes, remSeconds)
 }
 
 internal fun String?.nullIfBlank(): String? = this?.takeIf { it.isNotBlank() }

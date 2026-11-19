@@ -65,6 +65,7 @@ import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
+import com.grayvines.roche.reader.extractInboxSnippet
 import com.grayvines.roche.ui.components.BottomTabIcon
 import com.grayvines.roche.ui.components.DownloadTrayIcon
 import com.grayvines.roche.ui.components.EntryThumbnailPreview
