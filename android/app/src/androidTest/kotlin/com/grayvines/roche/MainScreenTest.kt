@@ -6,6 +6,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -224,7 +227,12 @@ class MainScreenTest {
         composeRule.onNodeWithText("← Search").assertExists()
         composeRule.onNodeWithTag("reader_typography_btn").performClick()
         composeRule.onNodeWithTag("reader_typography_drawer").assertExists()
-        composeRule.onNodeWithText("Architecture").assertExists()
+        composeRule.onNodeWithText("SECTIONS (1)").assertExists()
+        composeRule
+            .onNode(
+                hasText("Architecture") and hasAnyAncestor(hasTestTag("reader_typography_drawer"))
+            )
+            .assertExists()
         composeRule.onNodeWithTag("reader_font_larger_btn").performClick()
         org.junit.Assert.assertTrue(dispatched.any { it is MainAction.SetReaderFontScale })
     }
@@ -505,7 +513,7 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("inbox_loading_state").assertExists()
         composeRule.onNodeWithText("Loading inbox…").assertExists()
-        composeRule.onNodeWithText("Loading…").assertExists()
+        composeRule.onNodeWithText("0").assertDoesNotExist()
         composeRule.onNodeWithText("Your inbox is empty.").assertDoesNotExist()
     }
 
