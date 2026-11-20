@@ -167,16 +167,26 @@ class MainViewModel(
                         }
                         .distinctUntilChanged(),
                     playerController.state.map { it.currentEntryId }.distinctUntilChanged(),
-                ) { entries, slice, activeAudioId ->
-                    PlayerControllerSyncTarget(
-                        hasNextQueuedAudio =
-                            hasNextQueuedAudio(entries, slice.queueItemIds, activeAudioId),
-                        smartRewindEnabled = slice.smartRewindEnabled,
-                        skipSilenceEnabled = slice.skipSilenceEnabled,
-                    )
+                ) { entries, slice, _ ->
+                    entries to slice
                 }
-                .distinctUntilChanged()
-                .collect { target ->
+                .collect { (entries, slice) ->
+                    val latestEntries = repository.latestSnapshot?.entries ?: entries
+                    val latestSettings = settingsRepository.latestSettings
+                    val effectiveQueueIds = latestSettings?.queueItemIds ?: slice.queueItemIds
+                    val target =
+                        PlayerControllerSyncTarget(
+                            hasNextQueuedAudio =
+                                hasNextQueuedAudio(
+                                    latestEntries,
+                                    effectiveQueueIds,
+                                    playerController.state.value.currentEntryId,
+                                ),
+                            smartRewindEnabled =
+                                latestSettings?.smartRewindEnabled ?: slice.smartRewindEnabled,
+                            skipSilenceEnabled =
+                                latestSettings?.skipSilenceEnabled ?: slice.skipSilenceEnabled,
+                        )
                     playerController.updateHasNextQueuedAudio(target.hasNextQueuedAudio)
                     playerController.updateSmartRewindEnabled(target.smartRewindEnabled)
                     playerController.syncSkipSilenceFromSettings(target.skipSilenceEnabled)

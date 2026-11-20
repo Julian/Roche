@@ -18,6 +18,7 @@ import com.grayvines.roche.model.ThemeMode
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
@@ -31,6 +32,7 @@ internal constructor(
 ) {
     private val fallbackPeerId = "android-${UUID.randomUUID()}"
     private val peerIdPersistAttempted = AtomicBoolean(false)
+    private val persistedEditCount = AtomicLong(0L)
     @Volatile private var cachedDecodedToken: Pair<String, String>? = null
     @Volatile
     internal var latestSettings: Settings? = null
@@ -46,7 +48,14 @@ internal constructor(
                     throw exception
                 }
             }
-            .map { prefs -> prefs.toSettings().also { latestSettings = it } }
+            .map { prefs ->
+                val editsBefore = persistedEditCount.get()
+                prefs.toSettings().also { parsed ->
+                    if (editsBefore == 0L && persistedEditCount.get() == 0L) {
+                        latestSettings = parsed
+                    }
+                }
+            }
 
     constructor(
         dataStore: DataStore<Preferences>
@@ -121,6 +130,7 @@ internal constructor(
             prefs[KEY_SKIP_SILENCE_ENABLED] = updated.skipSilenceEnabled
             prefs[KEY_SMART_REWIND_ENABLED] = updated.smartRewindEnabled
             prefs[KEY_SHOW_COLLECTION_DRAWS_ON_HOME] = updated.showCollectionDrawsOnHome
+            persistedEditCount.incrementAndGet()
             latestSettings = updated
         }
     }
