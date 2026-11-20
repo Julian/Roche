@@ -95,6 +95,7 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
         .route("/entries/{id}", get(views_catalog::entry_detail_get::<F>))
         .route("/web/entries/{id}/log", post(views_catalog::post_entry_log::<F>))
         .route("/web/entries/{id}/list-add", post(views_catalog::post_entry_list_add::<F>))
+        .route("/web/entries/{id}/add-album", post(views_catalog::post_artist_add_album::<F>))
         .route("/web/entries/{id}/merge", post(views_catalog::post_entry_merge::<F>))
         .route("/diary", get(views_catalog::diary_get::<F>))
         .route("/queue", get(views_catalog::queue_get::<F>))

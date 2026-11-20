@@ -402,7 +402,7 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
       expectedPath: '/lists/design-classics',
       checkSelector: 'table.ranked',
     },
-    { route: '/diary', expectedPath: '/diary', checkSelector: '.diary-row' },
+    { route: '/diary', expectedPath: '/diary', checkSelector: '.diary-entry-row' },
     { route: '/queue', expectedPath: '/queue', checkSelector: 'main#roche-main h2' },
     { route: '/rank', expectedPath: '/rank', checkSelector: 'text=Design Classics' },
   ];

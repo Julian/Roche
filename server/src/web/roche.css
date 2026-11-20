@@ -1646,14 +1646,16 @@ details.editorial-panel[open] > summary {
   margin: 0;
 }
 
-.rail-editorial-panel {
+.rail-editorial-panel,
+.rail-card > details.editorial-panel {
   margin: 0;
   padding: 0;
   border: none;
   background: transparent;
 }
 
-.rail-editorial-panel > summary {
+.rail-editorial-panel > summary,
+.rail-card > details.editorial-panel > summary {
   display: inline-flex;
   align-items: center;
   min-height: 26px;
@@ -1665,7 +1667,8 @@ details.editorial-panel[open] > summary {
   padding: 0.1rem 0;
 }
 
-.rail-editorial-panel[open] > summary {
+.rail-editorial-panel[open] > summary,
+.rail-card > details.editorial-panel[open] > summary {
   margin-bottom: 0.65rem;
   padding-bottom: 0.4rem;
   border-bottom: 1px solid var(--rule-soft);
@@ -3741,6 +3744,106 @@ table.tracklist td.track-dur {
   font-size: 0.8rem;
 }
 
+.discography-card-wrap {
+  position: relative;
+}
+
+.discography-card-external {
+  display: flex;
+  flex-direction: column;
+  padding: 0.55rem;
+  margin: -0.55rem;
+  border-radius: 5px;
+  color: var(--ink);
+  transition: background 140ms ease;
+}
+
+.discography-card-external .discography-cover-wrap {
+  opacity: 0.48;
+  filter: saturate(0.35);
+  border-style: dashed;
+  transition: opacity 150ms ease, filter 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+
+.discography-card-external .discography-title {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.discography-card-external .discography-meta {
+  color: var(--ink-faint);
+}
+
+.discography-card-external:hover,
+.discography-card-external:focus-within {
+  background: var(--paper-deep);
+}
+
+.discography-card-external:hover .discography-cover-wrap,
+.discography-card-external:focus-within .discography-cover-wrap {
+  opacity: 1;
+  filter: none;
+  border-style: solid;
+  box-shadow: 0 6px 16px rgba(27, 23, 19, 0.14);
+  transform: translateY(-1px);
+}
+
+.discography-card-external:hover .discography-title,
+.discography-card-external:focus-within .discography-title {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.discography-card-external:hover .discography-meta,
+.discography-card-external:focus-within .discography-meta {
+  color: var(--ink-soft);
+}
+
+.discography-add-form {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.45rem;
+  margin: 0;
+  z-index: 2;
+  opacity: 0.92;
+  transition: opacity 140ms ease;
+}
+
+.discography-card-external:hover .discography-add-form,
+.discography-card-external:focus-within .discography-add-form {
+  opacity: 1;
+}
+
+.discography-add-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 0.14rem 0.5rem;
+  border: 1px solid var(--control-border);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(27, 23, 19, 0.18);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.discography-add-btn:hover {
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
+  color: var(--accent-on-fill);
+}
+
+.discography-in-lib-mark {
+  font-size: 0.72rem;
+  color: var(--tier-A);
+  font-weight: 600;
+}
+
 .entry-history-list {
   list-style: none;
   margin: 0 0 0.8rem;
@@ -3909,9 +4012,375 @@ ul.external-links a:hover .icon {
 
 /* --- Diary --- */
 
-.diary-month {
-  margin-bottom: 1.75rem;
+/* --- Two-Column Diary & Queue Layouts --- */
+
+.diary-grid,
+.queue-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 56rem) minmax(20rem, 24.5rem);
+  justify-content: space-between;
+  gap: 2.5rem;
+  align-items: start;
 }
+
+.diary-main,
+.diary-rail,
+.queue-main,
+.queue-rail {
+  min-width: 0;
+}
+
+.diary-rail > .rail-block + .rail-block,
+.queue-rail > .rail-block + .rail-block {
+  margin-top: 1.4rem;
+}
+
+.diary-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem 1rem;
+  padding-bottom: 0.65rem;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 1rem;
+}
+
+.diary-toolbar-pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.diary-toolbar input.diary-filter-input {
+  width: 13rem;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.84rem;
+  background: var(--paper-input);
+  border-color: var(--rule);
+}
+
+.diary-month {
+  margin-bottom: 1.85rem;
+}
+
+.diary-month-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.3rem;
+  margin: 0 0 0.15rem;
+}
+
+.diary-month-head h3 {
+  margin: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+  color: var(--ink-soft);
+}
+
+.diary-month-count {
+  font-size: 0.78rem;
+  color: var(--ink-faint);
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.diary-entry-row {
+  display: grid;
+  grid-template-columns: 3.6rem minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  padding: 0.58rem 0;
+  border-bottom: 1px solid var(--rule-soft);
+  align-items: center;
+}
+
+.diary-entry-row:last-child {
+  border-bottom-color: var(--rule);
+}
+
+.diary-entry-date {
+  font-size: 0.82rem;
+  color: var(--ink-faint);
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+  font-variant-numeric: lining-nums tabular-nums;
+  white-space: nowrap;
+}
+
+.diary-entry-body {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+}
+
+.diary-thumb-link {
+  flex-shrink: 0;
+  display: block;
+  text-decoration: none;
+}
+
+.diary-thumb {
+  width: 2.25rem;
+  height: 2.25rem;
+  object-fit: cover;
+  border-radius: 2px;
+  border: 1px solid var(--rule);
+  background: var(--paper-deep);
+  display: block;
+}
+
+.diary-entry-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.diary-entry-title-line {
+  line-height: 1.32;
+}
+
+.diary-entry-title {
+  font-weight: 600;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.diary-entry-title:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+}
+
+.diary-entry-by {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.diary-entry-by a {
+  color: var(--ink-soft);
+  text-decoration: none;
+}
+
+.diary-entry-by a:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+.diary-entry-note {
+  margin: 0.14rem 0 0;
+  font-size: 0.84rem;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+.diary-entry-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-shrink: 0;
+}
+
+.diary-entry-kind {
+  font-size: 0.7rem;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+}
+
+.diary-cadence {
+  display: flex;
+  flex-direction: column;
+  gap: 0.34rem;
+  margin-top: 0.35rem;
+}
+
+.diary-cadence-row {
+  display: grid;
+  grid-template-columns: 2.5rem 1fr 2rem;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.78rem;
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.diary-cadence-label {
+  color: var(--ink-soft);
+}
+
+.diary-cadence-val {
+  text-align: right;
+  color: var(--ink-faint);
+}
+
+.diary-cadence-bar {
+  display: block;
+  width: 100%;
+  height: 5px;
+  border: none;
+  border-radius: 2px;
+  background: var(--rule-soft);
+  color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.diary-cadence-bar::-webkit-progress-bar {
+  background: var(--rule-soft);
+  border-radius: 2px;
+}
+
+.diary-cadence-bar::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.diary-cadence-bar::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.year-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.year-links a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.45rem;
+  border-radius: 2px;
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 0.88rem;
+  min-height: 28px;
+}
+
+.year-links a:hover {
+  background: var(--paper);
+  color: var(--accent);
+}
+
+.year-links a.is-active {
+  background: var(--paper);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Queue cards & rows */
+.queue-section {
+  margin-bottom: 1.85rem;
+}
+
+.queue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.85rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.queue-item-row:last-child {
+  border-bottom-color: var(--rule);
+}
+
+.queue-item-left {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.queue-rank-num {
+  width: 1.6rem;
+  text-align: right;
+  font-size: 0.82rem;
+  color: var(--ink-faint);
+  flex-shrink: 0;
+  font-feature-settings: "kern" 1, "liga" 1, "lnum" 1, "tnum" 1;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.queue-item-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.queue-item-title {
+  font-weight: 600;
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.queue-item-title a {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.queue-item-title a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+}
+
+.queue-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.45rem;
+  margin-top: 0.16rem;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}
+
+.queue-item-meta a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+.queue-item-meta a:hover {
+  text-decoration: underline;
+}
+
+.queue-item-meta .byline-item + .byline-item::before {
+  content: "·";
+  margin-right: 0.45rem;
+  color: var(--ink-faint);
+}
+
+@media (max-width: 880px) {
+  .diary-grid,
+  .queue-grid {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+  .diary-toolbar input.diary-filter-input {
+    width: 100%;
+  }
+  .diary-entry-kind {
+    display: none;
+  }
+  .queue-item-row {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+}
+
+/* --- Legacy compact Diary Row (Home rail) --- */
 
 .diary-row {
   display: grid;

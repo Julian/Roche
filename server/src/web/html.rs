@@ -225,15 +225,6 @@ pub(super) fn render_inline_csrf_form_with_class(
     out.push_str("</form>");
 }
 
-pub(super) fn render_diary_row(
-    out: &mut String,
-    row: &ConsumptionLogView,
-    artist_links: &HashMap<String, String>,
-    show_notes: bool,
-) {
-    render_diary_row_with_tier(out, row, artist_links, show_notes, None);
-}
-
 pub(super) fn render_diary_row_with_tier(
     out: &mut String,
     row: &ConsumptionLogView,

@@ -10,24 +10,29 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use super::{EntryAddToListForm, EntryLogForm, EntryMergeForm, parse_consumption_status};
+use super::{
+    AddArtistAlbumForm, EntryAddToListForm, EntryLogForm, EntryMergeForm, parse_consumption_status,
+    parse_optional_year,
+};
 use crate::{
     db::{
         CatalogEntry, CollectionMode, CollectionRole, CollectionSummary, ConsumptionStatus,
-        EntryDetailView, EntryKind,
+        EntryDetailView, EntryIdentifier, EntryKind, UpsertEntryInput,
     },
     error::ApiError,
     scheduler::FeedFetcher,
     service::RocheService,
     web::{
         artist_enrich::{
-            AlbumTrack, extract_album_tracks, spawn_album_tracklist_enrichment_if_needed,
+            AlbumTrack, DiscographyAlbum, extract_album_tracks, extract_artist_discography,
+            normalize_album_match_key, spawn_album_tracklist_enrichment_if_needed,
             spawn_artist_enrichment_if_needed,
         },
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_with_flash, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, esc, redirect_with_flash,
+            render_inline_csrf_form_with_class, render_page, safe_local_redirect, urlencode,
+            web_api_error_response,
         },
         links::{
             WebLinkIcon, collect_web_external_links, extract_entry_tags,
@@ -277,18 +282,12 @@ fn render_entry_hero(out: &mut String, ctx: &EntryRenderCtx<'_>) {
         );
     }
 
-    let kicker = if entry.kind == EntryKind::Artist {
-        let album_cnt = ctx.detail.children.iter().filter(|c| c.kind == EntryKind::Album).count();
-        if album_cnt > 0 {
-            let word = if album_cnt == 1 { "album" } else { "albums" };
-            format!("Artist &middot; {album_cnt} {word} in library")
-        } else {
-            "Artist".to_owned()
-        }
-    } else {
-        esc(entry.kind.display_label()).to_string()
-    };
-    let _ = writeln!(out, "<p class=\"entry-kicker\">{kicker}</p>\n<h2>{}</h2>", esc(&entry.title));
+    let _ = writeln!(
+        out,
+        "<p class=\"entry-kicker\">{}</p>\n<h2>{}</h2>",
+        esc(entry.kind.display_label()),
+        esc(&entry.title),
+    );
 
     render_entry_meta_line(out, entry, ctx.tracks, ctx.artist_links);
 
@@ -460,72 +459,182 @@ fn render_album_tracklist(out: &mut String, album: &CatalogEntry, tracks: &[Albu
     );
 }
 
+enum DiscographyCardItem<'a> {
+    InLibrary(&'a CatalogEntry),
+    External(DiscographyAlbum),
+}
+
+impl DiscographyCardItem<'_> {
+    const fn release_year(&self) -> Option<i32> {
+        match self {
+            Self::InLibrary(c) => c.release_year,
+            Self::External(e) => e.release_year,
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            Self::InLibrary(c) => &c.title,
+            Self::External(e) => &e.title,
+        }
+    }
+}
+
 fn render_entry_discography_or_children(out: &mut String, ctx: &EntryRenderCtx<'_>) {
-    let mut children: Vec<&CatalogEntry> =
+    let is_artist = ctx.detail.entry.kind == EntryKind::Artist;
+    let in_lib_children: Vec<&CatalogEntry> =
         ctx.detail.children.iter().filter(|c| c.kind != EntryKind::Song).collect();
-    if children.is_empty() {
+    let external_albums: Vec<DiscographyAlbum> = if is_artist {
+        let owned_keys: HashSet<String> =
+            in_lib_children.iter().map(|c| normalize_album_match_key(&c.title)).collect();
+        extract_artist_discography(&ctx.detail.entry)
+            .into_iter()
+            .filter(|ext| !owned_keys.contains(&normalize_album_match_key(&ext.title)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if in_lib_children.is_empty() && external_albums.is_empty() {
         return;
     }
 
-    if ctx.detail.entry.kind == EntryKind::Artist {
-        children.sort_by(|a, b| {
-            b.release_year
-                .cmp(&a.release_year)
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    let in_lib_count = in_lib_children.len();
+    let has_external = !external_albums.is_empty();
+    let mut items: Vec<DiscographyCardItem<'_>> = in_lib_children
+        .into_iter()
+        .map(DiscographyCardItem::InLibrary)
+        .chain(external_albums.into_iter().map(DiscographyCardItem::External))
+        .collect();
+    if is_artist {
+        items.sort_by(|a, b| {
+            b.release_year()
+                .cmp(&a.release_year())
+                .then_with(|| a.title().to_lowercase().cmp(&b.title().to_lowercase()))
         });
     }
 
-    let heading =
-        if ctx.detail.entry.kind == EntryKind::Artist { "Discography" } else { "Contains" };
+    let heading = if is_artist { "Discography" } else { "Contains" };
+    let count_label = if has_external {
+        format!("{in_lib_count} of {} in library", items.len())
+    } else {
+        in_lib_count.to_string()
+    };
     let _ = writeln!(
         out,
         "<section class=\"entry-section\" aria-label=\"{heading}\">\n\
-           <div class=\"section-head\"><h3>{heading}</h3><span class=\"section-action\">{}</span></div>\n\
+           <div class=\"section-head\"><h3>{heading}</h3><span class=\"section-action\">{count_label}</span></div>\n\
            <ul class=\"discography-grid\">",
-        children.len(),
     );
 
-    for child in children.into_iter().take(100) {
-        let href = format!("/entries/{}", urlencode(&child.id));
-        let cover_html = child
-            .thumbnail_url
-            .as_deref()
-            .and_then(sanitize_non_local_href)
-            .map_or_else(
-                || {
-                    let initial = child
-                        .title
-                        .chars()
-                        .find(|c| c.is_alphanumeric())
-                        .map_or('?', |c| c.to_ascii_uppercase());
-                    format!("<span class=\"discography-cover-fallback\" aria-hidden=\"true\">{initial}</span>")
-                },
-                |thumb| {
-                    format!(
-                        "<img class=\"discography-cover\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
-                        esc(thumb),
-                    )
-                },
-            );
-        let meta_left = child.release_year.map_or_else(
-            || esc(child.kind.display_label()).to_string(),
-            |yr| format!("{yr} &middot; {}", esc(child.kind.display_label())),
-        );
-        let tier_html = ctx.child_tiers.get(&child.id).copied().map_or_else(String::new, |t| {
-            format!("<span class=\"discography-tier tier-{t}\" title=\"Tier {t}\">{t}</span>")
-        });
-        let _ = writeln!(
-            out,
-            "<li><a class=\"discography-card\" href=\"{}\">\
-               <div class=\"discography-cover-wrap\">{cover_html}</div>\
-               <span class=\"discography-title\">{}</span>\
-               <span class=\"discography-meta\"><span>{meta_left}</span>{tier_html}</span>\
-             </a></li>",
-            esc(&href),
-            esc(&child.title),
-        );
+    let artist_id_enc = urlencode(&ctx.detail.entry.id);
+    for item in items.into_iter().take(100) {
+        match item {
+            DiscographyCardItem::InLibrary(child) => {
+                render_in_library_discog_card(out, child, ctx.child_tiers.get(&child.id).copied());
+            }
+            DiscographyCardItem::External(ext) => {
+                render_external_discog_card(out, &artist_id_enc, &ext, ctx.csrf);
+            }
+        }
     }
     out.push_str("</ul>\n</section>\n");
+}
+
+fn discog_cover_html(title: &str, raw_thumb: Option<&str>) -> String {
+    raw_thumb.and_then(sanitize_non_local_href).map_or_else(
+        || {
+            let initial = title
+                .chars()
+                .find(|c| c.is_alphanumeric())
+                .map_or('?', |c| c.to_ascii_uppercase());
+            format!("<span class=\"discography-cover-fallback\" aria-hidden=\"true\">{initial}</span>")
+        },
+        |thumb| {
+            format!(
+                "<img class=\"discography-cover\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+                esc(thumb),
+            )
+        },
+    )
+}
+
+fn render_in_library_discog_card(out: &mut String, child: &CatalogEntry, tier: Option<char>) {
+    let href = format!("/entries/{}", urlencode(&child.id));
+    let cover_html = discog_cover_html(&child.title, child.thumbnail_url.as_deref());
+    let meta_left = child.release_year.map_or_else(
+        || esc(child.kind.display_label()).to_string(),
+        |yr| format!("{yr} &middot; {}", esc(child.kind.display_label())),
+    );
+    let right_badge = tier.map_or_else(
+        || {
+            "<span class=\"discography-in-lib-mark\" title=\"In your library\">&#10003;</span>"
+                .to_owned()
+        },
+        |t| format!("<span class=\"discography-tier tier-{t}\" title=\"Tier {t}\">{t}</span>"),
+    );
+    let _ = writeln!(
+        out,
+        "<li class=\"discography-card-wrap\"><a class=\"discography-card\" href=\"{}\">\
+           <div class=\"discography-cover-wrap\">{cover_html}</div>\
+           <span class=\"discography-title\">{}</span>\
+           <span class=\"discography-meta\"><span>{meta_left}</span>{right_badge}</span>\
+         </a></li>",
+        esc(&href),
+        esc(&child.title),
+    );
+}
+
+fn render_external_discog_card(
+    out: &mut String,
+    artist_id_enc: &str,
+    ext: &DiscographyAlbum,
+    csrf: &str,
+) {
+    let cover_html = discog_cover_html(&ext.title, ext.thumbnail_url.as_deref());
+    let meta_left =
+        ext.release_year.map_or_else(|| "Album".to_owned(), |yr| format!("{yr} &middot; Album"));
+    let year_str = ext.release_year.map_or_else(String::new, |y| y.to_string());
+    let thumb_str = ext.thumbnail_url.as_deref().unwrap_or("");
+    let am_str = ext.apple_music_id.as_deref().unwrap_or("");
+    let add_action = format!("/web/entries/{artist_id_enc}/add-album");
+    let add_btn = format!(
+        "<button type=\"submit\" class=\"discography-add-btn\" title=\"Add {t} to library\" aria-label=\"Add {t} to library\">+ Add</button>",
+        t = esc(&ext.title),
+    );
+
+    let _ = write!(
+        out,
+        "<li class=\"discography-card-wrap\"><div class=\"discography-card-external\">\
+           <div class=\"discography-cover-wrap\">{cover_html}",
+    );
+    let mut hidden: Vec<(&str, &str)> = vec![("title", ext.title.as_str())];
+    if !year_str.is_empty() {
+        hidden.push(("release_year", year_str.as_str()));
+    }
+    if !thumb_str.is_empty() {
+        hidden.push(("thumbnail_url", thumb_str));
+    }
+    if !am_str.is_empty() {
+        hidden.push(("apple_music_id", am_str));
+    }
+    render_inline_csrf_form_with_class(
+        out,
+        &add_action,
+        csrf,
+        Some("discography-add-form"),
+        &hidden,
+        None,
+        &add_btn,
+    );
+    let _ = writeln!(
+        out,
+        "</div>\
+           <span class=\"discography-title\">{}</span>\
+           <span class=\"discography-meta\"><span>{meta_left}</span></span>\
+         </div></li>",
+        esc(&ext.title),
+    );
 }
 
 fn render_entry_rail(out: &mut String, ctx: &EntryRenderCtx<'_>) {
@@ -819,6 +928,66 @@ pub(in crate::web) async fn post_entry_merge<F: FeedFetcher>(
             &format!("/entries/{}", urlencode(&canon.id)),
             "notice",
             "Merged duplicate into canonical entry",
+        ),
+        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+    }
+}
+
+pub(in crate::web) async fn post_artist_add_album<F: FeedFetcher>(
+    State(service): State<Arc<RocheService<F>>>,
+    Extension(session): Extension<WebSession>,
+    Path(artist_id): Path<String>,
+    Form(form): Form<AddArtistAlbumForm>,
+) -> Response {
+    let artist_detail = match service.catalog().get_entry_detail(&artist_id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return web_api_error_response(
+                &ApiError::not_found(format!("Entry '{artist_id}' not found")),
+                Some(&session.csrf_token),
+            );
+        }
+        Err(err) => {
+            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
+        }
+    };
+    let clean_title = form.title.trim();
+    if clean_title.is_empty() {
+        return redirect_with_flash(
+            &format!("/entries/{}", urlencode(&artist_id)),
+            "err",
+            "Album title cannot be empty",
+        );
+    }
+
+    let release_year = parse_optional_year(form.release_year.as_deref());
+    let thumbnail_url =
+        form.thumbnail_url.as_deref().and_then(sanitize_non_local_href).map(ToOwned::to_owned);
+    let mut identifiers = Vec::new();
+    if let Some(am_id) = form
+        .apple_music_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        identifiers
+            .push(EntryIdentifier { scheme: "apple_music".to_owned(), value: am_id.to_owned() });
+    }
+
+    let input = UpsertEntryInput {
+        kind: Some(EntryKind::Album),
+        title: clean_title.to_owned(),
+        creators: vec![artist_detail.entry.title.clone()],
+        release_year,
+        thumbnail_url,
+        identifiers,
+        ..UpsertEntryInput::default()
+    };
+    match service.catalog().upsert_entry(&input).await {
+        Ok(album) => redirect_with_flash(
+            &format!("/entries/{}", urlencode(&artist_id)),
+            "notice",
+            &format!("Added '{}' to library", album.title),
         ),
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }

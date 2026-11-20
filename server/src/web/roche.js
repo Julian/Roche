@@ -1628,6 +1628,26 @@
     }
   };
 
+  const initDiaryFilter = () => {
+    const input = document.getElementById("roche-diary-search");
+    const root = document.getElementById("roche-diary-months");
+    if (!input || !root || input.dataset.bound === "1") return;
+    input.dataset.bound = "1";
+    input.addEventListener("input", () => {
+      const q = input.value.trim().toLowerCase();
+      for (const sec of root.querySelectorAll(".diary-month")) {
+        let visible = 0;
+        for (const row of sec.querySelectorAll(".diary-entry-row")) {
+          const hay = (row.getAttribute("data-diary-search") || "").toLowerCase();
+          const hide = Boolean(q && !hay.includes(q));
+          row.hidden = hide;
+          if (!hide) visible += 1;
+        }
+        sec.hidden = visible === 0;
+      }
+    });
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
     initReaderExtras();
@@ -1639,6 +1659,7 @@
     initFeedsFilter();
     initListFilter();
     initListsViewToggle();
+    initDiaryFilter();
     initFaviconFallbacks();
     initOptimisticStars();
   };

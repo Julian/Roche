@@ -1411,7 +1411,7 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
     assert!(!inbox_html.contains("LSM Compaction"));
 
     let queue_html = resp_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains("Want to Read (1)"));
+    assert!(queue_html.contains("Want to Read <span class=\"list-count-badge\">1</span>"));
     assert!(queue_html.contains("LSM Compaction"));
     assert!(queue_html.contains(">Read</a>"));
 
@@ -2691,7 +2691,7 @@ async fn test_album_tracklist_enrichment_and_artist_discography_render() {
     };
 
     let (db, app) = setup_web_app(Config::default()).await;
-    let (cookie, _csrf) = login_browser(&db, &app).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
 
     let sp_html = r#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"title":"Come Together","subtitle":"The Beatles","duration":259000,"uri":"spotify:track:2EqlS6tkEnglzr7tkKAAYD"},{"title":"Something","subtitle":"The Beatles","duration":182000,"uri":"spotify:track:0pNeVovbiZHkulpGeOx1Gj"}]}}}}}}</script></html>"#;
     let sp_tracks = parse_spotify_embed_tracks(sp_html);
@@ -2747,4 +2747,55 @@ async fn test_album_tracklist_enrichment_and_artist_discography_render() {
     assert!(artist_html.contains("class=\"discography-grid\""));
     assert!(artist_html.contains("Abbey Road"));
     assert!(artist_html.contains("1969 &middot; Album"));
+
+    // Artist external discography enrichment + one-click "+ Add" to library
+    let itunes_discog = r#"{"results":[
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Abbey Road (Remastered)","releaseDate":"1969-09-26T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/100x100bb.jpg","collectionId":1441164426},
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Let It Be","releaseDate":"1970-05-08T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/letitbe/100x100bb.jpg","collectionId":1441164495},
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Hey Jude - Single","releaseDate":"1968-08-26T07:00:00Z","collectionId":999}
+    ]}"#;
+    let parsed_discog =
+        super::artist_enrich::parse_itunes_artist_discography(itunes_discog, "Beatles");
+    assert_eq!(parsed_discog.len(), 2);
+    assert_eq!(parsed_discog[0].title, "Let It Be");
+    assert_eq!(parsed_discog[0].release_year, Some(1970));
+
+    let mut artist_detail = db.catalog().get_entry_detail(beatles_id).await.unwrap().unwrap();
+    let discog_fetcher = |url: &Url| -> Option<String> {
+        if url.as_str().contains("itunes.apple.com/search") {
+            Some(itunes_discog.to_owned())
+        } else {
+            None
+        }
+    };
+    super::artist_enrich::enrich_artist_detail_with_fetcher(
+        &svc,
+        &mut artist_detail,
+        &discog_fetcher,
+    )
+    .await;
+
+    let enriched_artist_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(enriched_artist_html.contains("1 of 2 in library"));
+    assert!(enriched_artist_html.contains("discography-card-external"));
+    assert!(enriched_artist_html.contains("Let It Be"));
+
+    let add_resp = post_form(
+        &app,
+        &format!("/web/entries/{beatles_id}/add-album"),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("title", "Let It Be"),
+            ("release_year", "1970"),
+            ("apple_music_id", "1441164495"),
+        ],
+    )
+    .await;
+    assert_eq!(add_resp.status(), StatusCode::SEE_OTHER);
+    let after_add_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(!after_add_html.contains("discography-card-external"));
+    assert!(after_add_html.contains("Let It Be"));
 }
