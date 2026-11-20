@@ -649,40 +649,63 @@ class MainViewModelTest {
                         .copy(contentHtml = oversizedHtml, contentText = "B".repeat(90_000))
                 )
 
-            assertTrue(viewModel.uiState.value.isInitialLoading)
-            assertTrue(viewModel.uiState.value.visibleEntries.isEmpty())
+            // Construct a cold repository + ViewModel against the already-persisted Room DB so the
+            // first snapshot load observes the persisted row instead of an empty @BeforeEach DB.
+            val coldRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = RocheApiClient { HttpResponse(statusCode = 200, body = "{}") },
+                    settings = settings,
+                )
+            val coldViewModel =
+                MainViewModel(
+                    repository = coldRepo,
+                    settingsRepository = settings,
+                    playerBackend = FakeAudioPlayerBackend(),
+                    mediaSessionBridge = RecordingMediaSessionBridge(),
+                )
+            try {
+                assertTrue(coldViewModel.uiState.value.isInitialLoading)
+                assertTrue(coldViewModel.uiState.value.visibleEntries.isEmpty())
 
-            val collectJob = collectInBackground(viewModel.uiState)
-            val loadedState = viewModel.uiState.first { !it.isInitialLoading }
-            assertFalse(loadedState.isInitialLoading)
-            assertEquals(1, loadedState.visibleEntries.size)
-            val listEntry = loadedState.visibleEntries.single()
-            assertEquals("Persisted Oversized Entry", listEntry.title)
-            assertEquals(
-                com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS,
-                listEntry.contentHtml?.length,
-            )
-            assertEquals(
-                com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS,
-                listEntry.contentText?.length,
-            )
+                val collectJob = collectInBackground(coldViewModel.uiState)
+                val loadedState = coldViewModel.uiState.first { !it.isInitialLoading }
+                assertFalse(loadedState.isInitialLoading)
+                assertEquals(1, loadedState.visibleEntries.size)
+                val listEntry = loadedState.visibleEntries.single()
+                assertEquals("Persisted Oversized Entry", listEntry.title)
+                assertEquals(
+                    com.grayvines.roche.data.local.LIST_PREVIEW_HTML_CHARS,
+                    listEntry.contentHtml?.length,
+                )
+                assertEquals(
+                    com.grayvines.roche.data.local.LIST_PREVIEW_TEXT_CHARS,
+                    listEntry.contentText?.length,
+                )
 
-            viewModel.dispatch(MainAction.OpenReader("item-large"))
-            val readerState =
-                viewModel.uiState.first {
-                    it.activeReaderEntry?.isRead == true &&
-                        it.activeReaderEntry?.contentHtml?.contains("Tail Marker") == true
-                }
-            assertEquals(oversizedHtml.length, readerState.activeReaderEntry?.contentHtml?.length)
+                coldViewModel.dispatch(MainAction.OpenReader("item-large"))
+                val readerState =
+                    coldViewModel.uiState.first {
+                        it.activeReaderEntry?.isRead == true &&
+                            it.activeReaderEntry?.contentHtml?.contains("Tail Marker") == true
+                    }
+                assertEquals(
+                    oversizedHtml.length,
+                    readerState.activeReaderEntry?.contentHtml?.length,
+                )
 
-            viewModel.dispatch(MainAction.CloseReader)
-            val closedState = viewModel.uiState.first { it.selectedReaderEntryId == null }
-            assertNull(closedState.readerContent)
+                coldViewModel.dispatch(MainAction.CloseReader)
+                val closedState = coldViewModel.uiState.first { it.selectedReaderEntryId == null }
+                assertNull(closedState.readerContent)
 
-            val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
-            assertEquals("3m", com.grayvines.roche.core.formatArticleMinutes(mathPlainText))
+                val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
+                assertEquals("3m", com.grayvines.roche.core.formatArticleMinutes(mathPlainText))
 
-            collectJob.cancel()
+                collectJob.cancel()
+            } finally {
+                coldViewModel.playerController.releaseController()
+                coldViewModel.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
         }
 
     @Test
