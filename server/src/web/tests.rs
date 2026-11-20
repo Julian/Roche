@@ -2683,3 +2683,68 @@ async fn test_feeds_page_suppresses_paused_errors_and_separates_status_and_kind_
     assert!(!html.contains("HTTP 403 Forbidden"));
     assert!(!html.contains(&format!("/web/feeds/{}/refresh", paused.id)));
 }
+
+#[tokio::test]
+async fn test_album_tracklist_enrichment_and_artist_discography_render() {
+    use super::artist_enrich::{
+        enrich_album_tracklist_with_fetcher, parse_itunes_lookup_tracks, parse_spotify_embed_tracks,
+    };
+
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let sp_html = r#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"title":"Come Together","subtitle":"The Beatles","duration":259000,"uri":"spotify:track:2EqlS6tkEnglzr7tkKAAYD"},{"title":"Something","subtitle":"The Beatles","duration":182000,"uri":"spotify:track:0pNeVovbiZHkulpGeOx1Gj"}]}}}}}}</script></html>"#;
+    let sp_tracks = parse_spotify_embed_tracks(sp_html);
+    assert_eq!(sp_tracks.len(), 2);
+    assert_eq!(sp_tracks[0].title, "Come Together");
+    assert_eq!(sp_tracks[0].duration_ms, Some(259_000));
+
+    let itunes_json = r#"{"results":[{"wrapperType":"collection"},{"wrapperType":"track","kind":"song","discNumber":1,"trackNumber":1,"trackName":"Hot Rats Theme","artistName":"Frank Zappa","trackTimeMillis":215000}]}"#;
+    let it_tracks = parse_itunes_lookup_tracks(itunes_json);
+    assert_eq!(it_tracks.len(), 1);
+    assert_eq!(it_tracks[0].title, "Hot Rats Theme");
+
+    let album = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Abbey Road".to_owned(),
+            creators: vec!["Beatles".to_owned()],
+            release_year: Some(1969),
+            thumbnail_url: Some("https://i.scdn.co/image/abbey".to_owned()),
+            identifiers: vec![crate::db::EntryIdentifier {
+                scheme: "spotify".to_owned(),
+                value: "spotify:album:0ETFjACtuP2ADo6LFhL6HN".to_owned(),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let svc = crate::service::RocheService::new(db.clone(), DummyWebFetcher, Config::default());
+    let mut detail = db.catalog().get_entry_detail(&album.id).await.unwrap().unwrap();
+    let mock_fetcher = |url: &Url| -> Option<String> {
+        if url.as_str().contains("open.spotify.com/embed/album/0ETFjACtuP2ADo6LFhL6HN") {
+            Some(sp_html.to_owned())
+        } else {
+            None
+        }
+    };
+    enrich_album_tracklist_with_fetcher(&svc, &mut detail, &mock_fetcher).await;
+
+    let album_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", album.id), &cookie).await).await;
+    assert!(album_html.contains("table class=\"tracklist\""));
+    assert!(album_html.contains("Come Together"));
+    assert!(album_html.contains("4:19"));
+    assert!(album_html.contains("https://open.spotify.com/track/2EqlS6tkEnglzr7tkKAAYD"));
+    assert!(album_html.contains("2 songs, 7 min 21 sec"));
+
+    let artists = db.catalog().find_artist_ids_by_names(&["Beatles".to_owned()]).await.unwrap();
+    let beatles_id = artists.get("beatles").expect("synthesized Beatles artist");
+    let artist_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(artist_html.contains("class=\"discography-grid\""));
+    assert!(artist_html.contains("Abbey Road"));
+    assert!(artist_html.contains("1969 &middot; Album"));
+}

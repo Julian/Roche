@@ -897,3 +897,388 @@ fn truncate_summary(raw: &str) -> String {
         format!("{}…", collected.trim_end())
     }
 }
+
+/* --- Album Tracklist Extraction & Lazy Enrichment --- */
+
+const MAX_ITUNES_JSON_BYTES: usize = 512 * 1024;
+const MAX_ALBUM_TRACKS: usize = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::web) struct AlbumTrack {
+    pub number: u32,
+    pub disc: u32,
+    pub title: String,
+    pub duration_ms: Option<u64>,
+    pub artists: Vec<String>,
+    pub spotify_uri: Option<String>,
+    pub entry_id: Option<String>,
+}
+
+impl AlbumTrack {
+    #[must_use]
+    pub fn spotify_web_url(&self) -> Option<String> {
+        let uri = self.spotify_uri.as_deref()?.trim();
+        let id = uri.strip_prefix("spotify:track:")?;
+        let valid =
+            !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+        valid.then(|| format!("https://open.spotify.com/track/{id}"))
+    }
+}
+
+/// Returns the album's tracks from either explicit child `Song` entries or cached `metadata.tracks`.
+#[must_use]
+pub(in crate::web) fn extract_album_tracks(detail: &EntryDetailView) -> Vec<AlbumTrack> {
+    let song_children: Vec<&CatalogEntry> =
+        detail.children.iter().filter(|c| c.kind == EntryKind::Song).collect();
+    if !song_children.is_empty() {
+        return song_children
+            .into_iter()
+            .enumerate()
+            .map(|(idx, child)| {
+                let disc = child
+                    .metadata
+                    .get("disc_number")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&d| d > 0)
+                    .unwrap_or(1);
+                let number = child
+                    .metadata
+                    .get("track_number")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(1));
+                let duration_ms =
+                    child.metadata.get("duration_ms").and_then(Value::as_u64).filter(|&ms| ms > 0);
+                let spotify_uri = child
+                    .identifier("spotify")
+                    .map(str::trim)
+                    .filter(|s| s.starts_with("spotify:track:"))
+                    .map(ToOwned::to_owned);
+                AlbumTrack {
+                    number,
+                    disc,
+                    title: child.title.clone(),
+                    duration_ms,
+                    artists: child.creators.clone(),
+                    spotify_uri,
+                    entry_id: Some(child.id.clone()),
+                }
+            })
+            .collect();
+    }
+
+    let Some(arr) = detail.entry.metadata.get("tracks").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut tracks = Vec::with_capacity(arr.len().min(MAX_ALBUM_TRACKS));
+    for (idx, item) in arr.iter().take(MAX_ALBUM_TRACKS).enumerate() {
+        let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let disc = item
+            .get("disc")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(1);
+        let number = item
+            .get("number")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(1));
+        let duration_ms = item.get("duration_ms").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let artists = item.get("artists").and_then(Value::as_array).map_or_default(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        });
+        let spotify_uri = item
+            .get("spotify_uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("spotify:track:"))
+            .map(ToOwned::to_owned);
+        tracks.push(AlbumTrack {
+            number,
+            disc,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri,
+            entry_id: None,
+        });
+    }
+    tracks
+}
+
+#[cfg(not(test))]
+pub(in crate::web) fn spawn_album_tracklist_enrichment_if_needed<F: FeedFetcher>(
+    service: &Arc<RocheService<F>>,
+    detail: &EntryDetailView,
+) {
+    if !should_attempt_album_tracklist_enrichment(detail) {
+        return;
+    }
+    let Some(client) = ENRICH_HTTP_CLIENT.as_ref() else {
+        return;
+    };
+    let attempt_key = format!("album-tracks|{}", detail.entry.id);
+    let Some(permit) = try_reserve_enrichment_slot(
+        &ENRICH_SEMAPHORE,
+        &ATTEMPTED_ARTIST_KEYS,
+        attempt_key,
+        Instant::now(),
+        FAILED_ENRICH_TTL,
+    ) else {
+        return;
+    };
+    let svc = Arc::clone(service);
+    let mut detail_bg = detail.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(4),
+            enrich_album_tracklist_with_fetcher(&svc, &mut detail_bg, client),
+        )
+        .await;
+    });
+}
+
+#[cfg(test)]
+pub(in crate::web) const fn spawn_album_tracklist_enrichment_if_needed<F: FeedFetcher>(
+    _service: &std::sync::Arc<RocheService<F>>,
+    _detail: &EntryDetailView,
+) {
+}
+
+fn should_attempt_album_tracklist_enrichment(detail: &EntryDetailView) -> bool {
+    if detail.entry.kind != EntryKind::Album {
+        return false;
+    }
+    if !extract_album_tracks(detail).is_empty() {
+        return false;
+    }
+    extract_spotify_album_id(&detail.entry).is_some()
+        || extract_apple_music_album_id(&detail.entry).is_some()
+}
+
+pub(in crate::web) async fn enrich_album_tracklist_with_fetcher<F, M>(
+    service: &RocheService<F>,
+    detail: &mut EntryDetailView,
+    fetcher: &M,
+) where
+    F: FeedFetcher,
+    M: ArtistMetadataFetcher,
+{
+    if !should_attempt_album_tracklist_enrichment(detail) {
+        return;
+    }
+
+    let mut tracks = if let Some(sp_id) = extract_spotify_album_id(&detail.entry)
+        && let Ok(url) = Url::parse(&format!("https://open.spotify.com/embed/album/{sp_id}"))
+        && let Some(html) = fetcher.fetch_text(&url, MAX_SPOTIFY_HTML_BYTES).await
+    {
+        parse_spotify_embed_tracks(&html)
+    } else {
+        Vec::new()
+    };
+
+    if tracks.is_empty()
+        && let Some(am_id) = extract_apple_music_album_id(&detail.entry)
+        && let Ok(url) =
+            Url::parse(&format!("https://itunes.apple.com/lookup?id={am_id}&entity=song"))
+        && let Some(json_str) = fetcher.fetch_text(&url, MAX_ITUNES_JSON_BYTES).await
+    {
+        tracks = parse_itunes_lookup_tracks(&json_str);
+    }
+
+    if tracks.is_empty() {
+        return;
+    }
+
+    let serialized: Vec<Value> = tracks
+        .iter()
+        .map(|t| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("number".to_owned(), Value::from(t.number));
+            obj.insert("disc".to_owned(), Value::from(t.disc));
+            obj.insert("title".to_owned(), Value::from(t.title.clone()));
+            if let Some(ms) = t.duration_ms {
+                obj.insert("duration_ms".to_owned(), Value::from(ms));
+            }
+            if !t.artists.is_empty() {
+                obj.insert("artists".to_owned(), Value::from(t.artists.clone()));
+            }
+            if let Some(uri) = &t.spotify_uri {
+                obj.insert("spotify_uri".to_owned(), Value::from(uri.clone()));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    let mut merged_meta = match &detail.entry.metadata {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    merged_meta.insert("tracks".to_owned(), Value::Array(serialized));
+
+    let entry_id = detail.entry.id.clone();
+    let input = UpsertEntryInput {
+        id: Some(entry_id.clone()),
+        kind: Some(EntryKind::Album),
+        title: detail.entry.title.clone(),
+        metadata: Some(Value::Object(merged_meta)),
+        ..UpsertEntryInput::default()
+    };
+    if service.catalog().upsert_entry(&input).await.is_ok()
+        && let Ok(Some(refreshed)) = service.catalog().get_entry_detail(&entry_id).await
+    {
+        *detail = refreshed;
+    }
+}
+
+fn extract_spotify_album_id(entry: &CatalogEntry) -> Option<String> {
+    let raw = entry.identifier("spotify")?.trim();
+    let owned = if let Some(rest) = raw.strip_prefix("spotify:album:") {
+        rest.to_owned()
+    } else if let Ok(url) = Url::parse(raw) {
+        url.path().strip_prefix("/album/")?.split('/').next()?.to_owned()
+    } else {
+        return None;
+    };
+    let clean = owned.split('?').next().unwrap_or(&owned).trim();
+    let valid =
+        !clean.is_empty() && clean.len() <= 64 && clean.bytes().all(|b| b.is_ascii_alphanumeric());
+    valid.then(|| clean.to_owned())
+}
+
+fn extract_apple_music_album_id(entry: &CatalogEntry) -> Option<String> {
+    let raw = entry.identifier("apple_music")?.trim();
+    let clean = raw.rsplit('/').next().unwrap_or(raw).split('?').next().unwrap_or(raw).trim();
+    let valid = !clean.is_empty() && clean.len() <= 32 && clean.bytes().all(|b| b.is_ascii_digit());
+    valid.then(|| clean.to_owned())
+}
+
+#[must_use]
+pub(in crate::web) fn parse_spotify_embed_tracks(html: &str) -> Vec<AlbumTrack> {
+    let Some(script_idx) = html.find("id=\"__NEXT_DATA__\"") else {
+        return Vec::new();
+    };
+    let after_id = &html[script_idx..];
+    let Some(open_end) = after_id.find('>') else {
+        return Vec::new();
+    };
+    let json_start = &after_id[open_end + 1..];
+    let Some(close_idx) = json_start.find("</script>") else {
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_str::<Value>(json_start[..close_idx].trim()) else {
+        return Vec::new();
+    };
+    let Some(list) =
+        val.pointer("/props/pageProps/state/data/entity/trackList").and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(list.len().min(MAX_ALBUM_TRACKS));
+    for (idx, item) in list.iter().take(MAX_ALBUM_TRACKS).enumerate() {
+        let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let duration_ms = item.get("duration").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let subtitle = item.get("subtitle").and_then(Value::as_str).unwrap_or("");
+        let artists: Vec<String> = subtitle
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let spotify_uri = item
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("spotify:track:"))
+            .map(ToOwned::to_owned);
+        out.push(AlbumTrack {
+            number: u32::try_from(idx + 1).unwrap_or(1),
+            disc: 1,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri,
+            entry_id: None,
+        });
+    }
+    out
+}
+
+#[must_use]
+pub(in crate::web) fn parse_itunes_lookup_tracks(json_str: &str) -> Vec<AlbumTrack> {
+    let Ok(val) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(results) = val.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in results {
+        if item.get("wrapperType").and_then(Value::as_str) != Some("track") {
+            continue;
+        }
+        if item.get("kind").and_then(Value::as_str).is_some_and(|k| k != "song") {
+            continue;
+        }
+        let Some(title) = item.get("trackName").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let disc = item
+            .get("discNumber")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(1);
+        let number = item
+            .get("trackNumber")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| u32::try_from(out.len() + 1).unwrap_or(1));
+        let duration_ms = item.get("trackTimeMillis").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let artists = item
+            .get("artistName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_default(|a| vec![a.to_owned()]);
+        out.push(AlbumTrack {
+            number,
+            disc,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri: None,
+            entry_id: None,
+        });
+        if out.len() >= MAX_ALBUM_TRACKS {
+            break;
+        }
+    }
+    out.sort_by_key(|t| (t.disc, t.number));
+    out
+}
