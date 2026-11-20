@@ -802,6 +802,85 @@ impl CatalogRepo<'_> {
 
         self.hydrate_entries(raw_rows).await
     }
+
+    /// Loads up to `per_collection_limit` `(title, thumbnail_url)` previews for each
+    /// non-empty collection in `collections`, honoring generator consumption filters and
+    /// dynamic collection rules.
+    pub async fn load_collection_preview_thumbnails(
+        &self,
+        collections: &[CollectionSummary],
+        per_collection_limit: usize,
+    ) -> CatalogResult<HashMap<String, Vec<(String, String)>>> {
+        let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        if per_collection_limit == 0 {
+            return Ok(out);
+        }
+        let limit_i64 = i64::try_from(per_collection_limit).unwrap_or(5);
+        for col in collections {
+            if col.member_count == 0 {
+                continue;
+            }
+            let rows: Vec<(String, String)> = match col.mode {
+                CollectionMode::Manual | CollectionMode::Feed => {
+                    let mut qb = QueryBuilder::<Sqlite>::new(
+                        "SELECT e.title, e.thumbnail_url
+                         FROM collection_entries ce
+                         JOIN entries e ON e.id = ce.entry_id
+                         WHERE ce.collection_id = ",
+                    );
+                    qb.push_bind(&col.id).push(
+                        " AND e.merged_into_id IS NULL
+                          AND e.thumbnail_url IS NOT NULL
+                          AND TRIM(e.thumbnail_url) != ''",
+                    );
+                    if col.has_generator {
+                        qb.push(
+                            " AND EXISTS (
+                                SELECT 1 FROM consumption_log cl
+                                WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                              )
+                              ORDER BY (
+                                SELECT MAX(cl.ts) FROM consumption_log cl
+                                WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                              ) DESC, e.title ASC LIMIT ",
+                        );
+                    } else {
+                        qb.push(
+                            " ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC LIMIT ",
+                        );
+                    }
+                    qb.push_bind(limit_i64);
+                    qb.build_query_as().fetch_all(self.pool).await?
+                }
+                CollectionMode::Dynamic => {
+                    let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
+                        continue;
+                    };
+                    let mut qb = QueryBuilder::<Sqlite>::new(
+                        "SELECT e.title, e.thumbnail_url
+                         FROM entries e
+                         WHERE e.merged_into_id IS NULL
+                           AND e.kind != 'collection'
+                           AND e.thumbnail_url IS NOT NULL
+                           AND TRIM(e.thumbnail_url) != ''",
+                    );
+                    append_dynamic_rule_sql_filters(&mut qb, &rule);
+                    qb.push(
+                        " ORDER BY COALESCE(
+                            (SELECT MAX(cl.ts) FROM consumption_log cl WHERE cl.entry_id = e.id),
+                            e.updated_at
+                          ) DESC, e.title ASC LIMIT ",
+                    )
+                    .push_bind(limit_i64);
+                    qb.build_query_as().fetch_all(self.pool).await?
+                }
+            };
+            if !rows.is_empty() {
+                out.insert(col.id.clone(), rows);
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn with_want_notes(base: Option<serde_json::Value>, note_text: &str) -> serde_json::Value {

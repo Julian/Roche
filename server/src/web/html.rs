@@ -13,7 +13,7 @@ use serde::Deserialize;
 use super::{auth::WebSession, links::render_creator_links};
 use crate::{
     db::{CatalogError, ConflictError, ConsumptionLogView},
-    domain::{ConsumptionStatus, ContentType, FeedType},
+    domain::{ConsumptionStatus, ContentType},
     service::AppError,
     util::url_guard::SsrfBlockedError,
 };
@@ -159,6 +159,8 @@ pub(super) fn rank_collection_href(slug: &str, want: bool) -> String {
 
 pub(super) const ARCHIVE_BOX_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"12\" height=\"3\" rx=\"0.75\"/><path d=\"M3 5.5v7a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-7\"/><path d=\"M6.25 8.75h3.5\"/></svg>";
 
+pub(super) const REFRESH_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+
 #[must_use]
 pub(super) const fn content_type_label(ct: ContentType) -> &'static str {
     match ct {
@@ -187,6 +189,15 @@ pub(super) fn render_feed_favicon(
     label: &str,
     small: bool,
 ) {
+    render_feed_favicon_with_class(out, raw_url, label, if small { "feed-favicon-sm" } else { "" });
+}
+
+pub(super) fn render_feed_favicon_with_class(
+    out: &mut String,
+    raw_url: Option<&str>,
+    label: &str,
+    size_class: &str,
+) {
     let host = raw_url
         .and_then(|u| url::Url::parse(u).ok())
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
@@ -198,7 +209,7 @@ pub(super) fn render_feed_favicon(
         .find(|c| c.is_alphanumeric())
         .map_or('?', |c| c.to_ascii_uppercase());
     let tone = seed.bytes().fold(0usize, |acc, b| acc.wrapping_add(usize::from(b))) % 5;
-    let sz_cls = if small { " feed-favicon-sm" } else { "" };
+    let sz_cls = if size_class.is_empty() { String::new() } else { format!(" {size_class}") };
     let _ = write!(
         out,
         "<span class=\"feed-favicon{sz_cls} fav-tone-{tone}\" aria-hidden=\"true\">{letter}"
@@ -213,24 +224,12 @@ pub(super) fn render_feed_favicon(
     out.push_str("</span>");
 }
 
-#[must_use]
-pub(super) const fn feed_type_label(ft: FeedType) -> &'static str {
-    match ft {
-        FeedType::Rss => "RSS",
-        FeedType::Podcast => "Podcast",
-        FeedType::Youtube => "YouTube",
-        FeedType::Arxiv => "arXiv",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CreatorYearStyle {
     /// Inline ` <span class="text-soft">&mdash; ...</span>` + optional ` <span class="text-faint">(YYYY)</span>`.
     InlineSoft { open_new_tab: bool },
     /// Ranked table cell `<span class="by">...</span>` + optional `<span class="year">(YYYY)</span>`.
     TableByYear,
-    /// Inline Want queue ` <span class="by">&mdash; ...</span>`.
-    QueueDash,
     /// Draw sleeve block `<div class="album-artist">... (YYYY)</div>\n`.
     DrawArtistBlock,
 }
@@ -264,13 +263,6 @@ pub(super) fn render_creator_year_meta(
                 let _ = write!(out, "<span class=\"year\">({yr})</span>");
             }
         }
-        CreatorYearStyle::QueueDash => {
-            if !creators.is_empty() {
-                out.push_str(" <span class=\"by\">&mdash; ");
-                render_creator_links(out, creators, artist_links, false);
-                out.push_str("</span>");
-            }
-        }
         CreatorYearStyle::DrawArtistBlock => {
             if !creators.is_empty() || release_year.is_some() {
                 out.push_str("<div class=\"album-artist\">");
@@ -287,7 +279,6 @@ pub(super) fn render_creator_year_meta(
         }
     }
 }
-
 pub(super) fn render_inline_csrf_form(
     out: &mut String,
     action: &str,
@@ -334,15 +325,6 @@ pub(super) fn render_inline_csrf_form_with_class(
     }
     out.push_str(button_html);
     out.push_str("</form>");
-}
-
-pub(super) fn render_diary_row(
-    out: &mut String,
-    row: &ConsumptionLogView,
-    artist_links: &HashMap<String, String>,
-    show_notes: bool,
-) {
-    render_diary_row_with_tier(out, row, artist_links, show_notes, None);
 }
 
 pub(super) fn render_diary_row_with_tier(
@@ -393,7 +375,6 @@ pub(super) enum NavSection {
     Starred,
     Feeds,
     Lists,
-    Rank,
     Diary,
     Queue,
     None,
@@ -409,7 +390,6 @@ impl NavSection {
             Self::Lists => "/lists",
             Self::Queue => "/queue",
             Self::Diary => "/diary",
-            Self::Rank => "/rank",
         }
     }
 }
@@ -431,7 +411,7 @@ pub(super) struct PageShell<'a> {
     pub body_html: &'a str,
 }
 
-const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
+const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
     (NavSection::Home, "/", "Home"),
     (NavSection::Inbox, "/inbox", "Inbox"),
     (NavSection::Starred, "/starred", "Starred"),
@@ -439,7 +419,6 @@ const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
     (NavSection::Lists, "/lists", "Lists"),
     (NavSection::Queue, "/queue", "Queue"),
     (NavSection::Diary, "/diary", "Diary"),
-    (NavSection::Rank, "/rank", "Rank"),
 ];
 
 pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {
@@ -532,7 +511,7 @@ fn render_masthead(out: &mut String, shell: &PageShell<'_>) {
                  <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
                  <input type=\"hidden\" name=\"return_to\" value=\"{refresh_return}\">\n\
                  <button type=\"submit\" class=\"util-btn\" title=\"Refresh all feeds\" aria-label=\"Refresh all feeds\">\n\
-                   <svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><path d=\"M13.5 8a5.5 5.5 0 1 1-1.4-3.7\" stroke-linecap=\"round\"/><path d=\"M13.5 2.5v2.8h-2.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>\n\
+                   {REFRESH_SVG}\n\
                    <span class=\"util-label\">Refresh</span>\n\
                  </button>\n\
                </form>\n\

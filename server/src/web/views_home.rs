@@ -13,7 +13,7 @@ use super::{
         ARCHIVE_BOX_SVG, CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError,
         WithWebCsrf as _, content_type_badge_class, content_type_label, esc, parse_form_bool,
         redirect_with_flash, render_creator_year_meta, render_diary_row_with_tier,
-        render_feed_favicon, render_inline_csrf_form, render_page, urlencode,
+        render_feed_favicon, render_inline_csrf_form, render_page, safe_local_redirect, urlencode,
     },
     links::{
         WebLinkIcon, collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
@@ -38,12 +38,16 @@ pub(super) struct GeneratorToggleForm {
     pub enabled: String,
     #[serde(default)]
     pub redirect_list: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct GeneratorNotesForm {
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 pub(super) async fn home_get(
@@ -667,8 +671,10 @@ pub(super) async fn post_generator_toggle(
     } else {
         format!("Paused active draw for '{}'", state.collection_title)
     };
-    let to_list = parse_form_bool(form.redirect_list.as_deref());
-    if to_list {
+    if form.return_to.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        let target = safe_local_redirect(form.return_to.as_deref(), "/");
+        Ok(redirect_with_flash(&target, "notice", &msg))
+    } else if parse_form_bool(form.redirect_list.as_deref()) {
         let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
         Ok(redirect_with_flash(&format!("/lists/{}", urlencode(list_key)), "notice", &msg))
     } else {
@@ -728,5 +734,6 @@ pub(super) async fn post_generator_abandon(
         .as_ref()
         .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
     let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
-    Ok(redirect_with_flash("/", "notice", &notice))
+    let target = safe_local_redirect(form.return_to.as_deref(), "/");
+    Ok(redirect_with_flash(&target, "notice", &notice))
 }

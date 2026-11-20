@@ -402,9 +402,9 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
       expectedPath: '/lists/design-classics',
       checkSelector: 'table.ranked',
     },
-    { route: '/diary', expectedPath: '/diary', checkSelector: '.diary-row' },
+    { route: '/diary', expectedPath: '/diary', checkSelector: '.diary-entry-row' },
     { route: '/queue', expectedPath: '/queue', checkSelector: 'main#roche-main h2' },
-    { route: '/rank', expectedPath: '/rank', checkSelector: 'text=Design Classics' },
+    { route: '/rank', expectedPath: '/lists', checkSelector: 'text=Design Classics' },
   ];
 
   for (const { route, expectedPath, checkSelector } of populatedRoutes) {
@@ -433,11 +433,11 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
 
     // 2. Real form flow: create a manual list and add a work via the actual template controls
     await gotoAndAssertOk(page, baseUrl, '/lists', '/lists');
-    const createSummary = page.locator('details.editorial-panel > summary', {
-      hasText: 'New Manual List',
+    const createToggle = page.locator('button.js-new-list-toggle', {
+      hasText: 'New List',
     });
-    await expect(createSummary).toBeVisible();
-    await createSummary.click();
+    await expect(createToggle).toBeVisible();
+    await createToggle.click();
     const listTitleInput = page.locator('#list-title');
     await expect(listTitleInput).toBeVisible();
     await listTitleInput.fill('Accessibility Audit List');

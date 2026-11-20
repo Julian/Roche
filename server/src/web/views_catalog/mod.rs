@@ -16,7 +16,9 @@ use crate::{
 pub(super) use diary_queue::{
     diary_get, post_quick_log, post_want_complete, post_want_remove, queue_get,
 };
-pub(super) use entry::{entry_detail_get, post_entry_list_add, post_entry_log, post_entry_merge};
+pub(super) use entry::{
+    entry_detail_get, post_artist_add_album, post_entry_list_add, post_entry_log, post_entry_merge,
+};
 pub(super) use lists::{
     list_detail_get, lists_get, post_list_add_entry, post_list_create, post_list_remove_entry,
 };
@@ -83,6 +85,17 @@ pub(super) struct EntryAddToListForm {
 #[derive(Debug, Deserialize)]
 pub(super) struct EntryMergeForm {
     pub canonical_query: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AddArtistAlbumForm {
+    pub title: String,
+    #[serde(default)]
+    pub release_year: Option<String>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub apple_music_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

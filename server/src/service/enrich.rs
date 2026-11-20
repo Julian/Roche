@@ -310,6 +310,35 @@ impl EnrichService<'_> {
             .await;
         });
     }
+
+    pub fn spawn_album_tracklist_enrichment_if_needed(&self, detail: &EntryDetailView) {
+        let enricher = &self.service.artist_enricher;
+        if !enricher.enabled || !should_attempt_album_tracklist_enrichment(detail) {
+            return;
+        }
+        if enricher.http_client.is_none() {
+            return;
+        }
+        let attempt_key = format!("album-tracks|{}", detail.entry.id);
+        let Some(permit) =
+            enricher.try_reserve_slot(attempt_key, Instant::now(), enricher.failed_ttl)
+        else {
+            return;
+        };
+        let svc = self.service.clone();
+        let mut detail_bg = detail.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(client) = svc.artist_enricher.http_client.as_ref() else {
+                return;
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(4),
+                enrich_album_tracklist_with_fetcher(&svc, &mut detail_bg, client),
+            )
+            .await;
+        });
+    }
 }
 
 pub async fn enrich_artist_detail_with_fetcher<M>(
@@ -328,6 +357,7 @@ pub async fn enrich_artist_detail_with_fetcher<M>(
     let missing_thumb =
         detail.entry.thumbnail_url.as_deref().and_then(sanitize_public_http_href).is_none();
     let missing_summary = detail.entry.summary.as_deref().map(str::trim).is_none_or(str::is_empty);
+    let missing_discog = detail.entry.metadata.get("discography").is_none();
 
     let spotify_fut = async {
         if missing_spotify {
@@ -344,8 +374,16 @@ pub async fn enrich_artist_detail_with_fetcher<M>(
             (None, None)
         }
     };
+    let discog_fut = async {
+        if missing_discog {
+            resolve_itunes_artist_discography(&detail.entry.title, fetcher).await
+        } else {
+            Vec::new()
+        }
+    };
 
-    let (spotify_uri, (wiki_slug, wiki_summary)) = tokio::join!(spotify_fut, wiki_fut);
+    let (spotify_uri, (wiki_slug, wiki_summary), discog) =
+        tokio::join!(spotify_fut, wiki_fut, discog_fut);
 
     let mut new_identifiers = Vec::new();
     if let Some(slug) = wiki_slug {
@@ -357,8 +395,22 @@ pub async fn enrich_artist_detail_with_fetcher<M>(
     let new_thumb =
         wiki_summary.as_ref().and_then(|s| s.thumbnail_url.clone()).filter(|_| missing_thumb);
     let new_extract = wiki_summary.and_then(|s| s.extract).filter(|_| missing_summary);
+    let new_metadata = if discog.is_empty() {
+        None
+    } else {
+        let mut merged = match &detail.entry.metadata {
+            Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        merged.insert("discography".to_owned(), Value::Array(serialize_discography(&discog)));
+        Some(Value::Object(merged))
+    };
 
-    if new_identifiers.is_empty() && new_thumb.is_none() && new_extract.is_none() {
+    if new_identifiers.is_empty()
+        && new_thumb.is_none()
+        && new_extract.is_none()
+        && new_metadata.is_none()
+    {
         return;
     }
 
@@ -369,6 +421,7 @@ pub async fn enrich_artist_detail_with_fetcher<M>(
         title: detail.entry.title.clone(),
         summary: new_extract,
         thumbnail_url: new_thumb,
+        metadata: new_metadata,
         identifiers: new_identifiers,
         ..UpsertEntryInput::default()
     };
@@ -394,7 +447,8 @@ fn should_attempt_enrichment(detail: &EntryDetailView) -> bool {
     let missing_thumb =
         entry.thumbnail_url.as_deref().and_then(sanitize_public_http_href).is_none();
     let missing_summary = entry.summary.as_deref().map(str::trim).is_none_or(str::is_empty);
-    missing_wiki || missing_spotify || missing_thumb || missing_summary
+    let missing_discog = entry.metadata.get("discography").is_none();
+    missing_wiki || missing_spotify || missing_thumb || missing_summary || missing_discog
 }
 
 async fn resolve_spotify_artist_from_children<M: ArtistMetadataFetcher>(
@@ -967,6 +1021,540 @@ fn truncate_summary(raw: &str) -> String {
     } else {
         format!("{}…", collected.trim_end())
     }
+}
+
+/* --- Album Tracklist Extraction & Lazy Enrichment --- */
+
+const MAX_ITUNES_JSON_BYTES: usize = 512 * 1024;
+const MAX_ALBUM_TRACKS: usize = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTrack {
+    pub number: u32,
+    pub disc: u32,
+    pub title: String,
+    pub duration_ms: Option<u64>,
+    pub artists: Vec<String>,
+    pub spotify_uri: Option<String>,
+    pub entry_id: Option<String>,
+}
+
+impl AlbumTrack {
+    #[must_use]
+    pub fn spotify_web_url(&self) -> Option<String> {
+        let uri = self.spotify_uri.as_deref()?.trim();
+        let id = uri.strip_prefix("spotify:track:")?;
+        let valid =
+            !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+        valid.then(|| format!("https://open.spotify.com/track/{id}"))
+    }
+}
+
+/// Returns the album's tracks from either explicit child `Song` entries or cached `metadata.tracks`.
+#[must_use]
+pub fn extract_album_tracks(detail: &EntryDetailView) -> Vec<AlbumTrack> {
+    let song_children: Vec<&CatalogEntry> =
+        detail.children.iter().filter(|c| c.kind == EntryKind::Song).collect();
+    if !song_children.is_empty() {
+        return song_children
+            .into_iter()
+            .enumerate()
+            .map(|(idx, child)| {
+                let disc = child
+                    .metadata
+                    .get("disc_number")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&d| d > 0)
+                    .unwrap_or(1);
+                let number = child
+                    .metadata
+                    .get("track_number")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&n| n > 0)
+                    .unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(1));
+                let duration_ms =
+                    child.metadata.get("duration_ms").and_then(Value::as_u64).filter(|&ms| ms > 0);
+                let spotify_uri = child
+                    .identifier("spotify")
+                    .map(str::trim)
+                    .filter(|s| s.starts_with("spotify:track:"))
+                    .map(ToOwned::to_owned);
+                AlbumTrack {
+                    number,
+                    disc,
+                    title: child.title.clone(),
+                    duration_ms,
+                    artists: child.creators.clone(),
+                    spotify_uri,
+                    entry_id: Some(child.id.clone()),
+                }
+            })
+            .collect();
+    }
+
+    let Some(arr) = detail.entry.metadata.get("tracks").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut tracks = Vec::with_capacity(arr.len().min(MAX_ALBUM_TRACKS));
+    for (idx, item) in arr.iter().take(MAX_ALBUM_TRACKS).enumerate() {
+        let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let disc = item
+            .get("disc")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(1);
+        let number = item
+            .get("number")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(1));
+        let duration_ms = item.get("duration_ms").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let artists = item.get("artists").and_then(Value::as_array).map_or_default(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        });
+        let spotify_uri = item
+            .get("spotify_uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("spotify:track:"))
+            .map(ToOwned::to_owned);
+        tracks.push(AlbumTrack {
+            number,
+            disc,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri,
+            entry_id: None,
+        });
+    }
+    tracks
+}
+
+fn should_attempt_album_tracklist_enrichment(detail: &EntryDetailView) -> bool {
+    if detail.entry.kind != EntryKind::Album {
+        return false;
+    }
+    if !extract_album_tracks(detail).is_empty() {
+        return false;
+    }
+    extract_spotify_album_id(&detail.entry).is_some()
+        || extract_apple_music_album_id(&detail.entry).is_some()
+}
+
+pub async fn enrich_album_tracklist_with_fetcher<M>(
+    service: &RocheService,
+    detail: &mut EntryDetailView,
+    fetcher: &M,
+) where
+    M: ArtistMetadataFetcher,
+{
+    if !should_attempt_album_tracklist_enrichment(detail) {
+        return;
+    }
+
+    let mut tracks = if let Some(sp_id) = extract_spotify_album_id(&detail.entry)
+        && let Ok(url) = Url::parse(&format!("https://open.spotify.com/embed/album/{sp_id}"))
+        && let Some(html) = fetcher.fetch_text(&url, MAX_SPOTIFY_HTML_BYTES).await
+    {
+        parse_spotify_embed_tracks(&html)
+    } else {
+        Vec::new()
+    };
+
+    if tracks.is_empty()
+        && let Some(am_id) = extract_apple_music_album_id(&detail.entry)
+        && let Ok(url) =
+            Url::parse(&format!("https://itunes.apple.com/lookup?id={am_id}&entity=song"))
+        && let Some(json_str) = fetcher.fetch_text(&url, MAX_ITUNES_JSON_BYTES).await
+    {
+        tracks = parse_itunes_lookup_tracks(&json_str);
+    }
+
+    if tracks.is_empty() {
+        return;
+    }
+
+    let serialized: Vec<Value> = tracks
+        .iter()
+        .map(|t| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("number".to_owned(), Value::from(t.number));
+            obj.insert("disc".to_owned(), Value::from(t.disc));
+            obj.insert("title".to_owned(), Value::from(t.title.clone()));
+            if let Some(ms) = t.duration_ms {
+                obj.insert("duration_ms".to_owned(), Value::from(ms));
+            }
+            if !t.artists.is_empty() {
+                obj.insert("artists".to_owned(), Value::from(t.artists.clone()));
+            }
+            if let Some(uri) = &t.spotify_uri {
+                obj.insert("spotify_uri".to_owned(), Value::from(uri.clone()));
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    let mut merged_meta = match &detail.entry.metadata {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    merged_meta.insert("tracks".to_owned(), Value::Array(serialized));
+
+    let entry_id = detail.entry.id.clone();
+    let input = UpsertEntryInput {
+        id: Some(entry_id.clone()),
+        kind: Some(EntryKind::Album),
+        title: detail.entry.title.clone(),
+        metadata: Some(Value::Object(merged_meta)),
+        ..UpsertEntryInput::default()
+    };
+    if service.catalog().upsert_entry(&input).await.is_ok()
+        && let Ok(Some(refreshed)) = service.catalog().get_entry_detail(&entry_id).await
+    {
+        *detail = refreshed;
+    }
+}
+
+fn extract_spotify_album_id(entry: &CatalogEntry) -> Option<String> {
+    let raw = entry.identifier("spotify")?.trim();
+    let owned = if let Some(rest) = raw.strip_prefix("spotify:album:") {
+        rest.to_owned()
+    } else if let Ok(url) = Url::parse(raw) {
+        url.path().strip_prefix("/album/")?.split('/').next()?.to_owned()
+    } else {
+        return None;
+    };
+    let clean = owned.split('?').next().unwrap_or(&owned).trim();
+    let valid =
+        !clean.is_empty() && clean.len() <= 64 && clean.bytes().all(|b| b.is_ascii_alphanumeric());
+    valid.then(|| clean.to_owned())
+}
+
+fn extract_apple_music_album_id(entry: &CatalogEntry) -> Option<String> {
+    let raw = entry.identifier("apple_music")?.trim();
+    let clean = raw.rsplit('/').next().unwrap_or(raw).split('?').next().unwrap_or(raw).trim();
+    let valid = !clean.is_empty() && clean.len() <= 32 && clean.bytes().all(|b| b.is_ascii_digit());
+    valid.then(|| clean.to_owned())
+}
+
+#[must_use]
+pub fn parse_spotify_embed_tracks(html: &str) -> Vec<AlbumTrack> {
+    let Some(script_idx) = html.find("id=\"__NEXT_DATA__\"") else {
+        return Vec::new();
+    };
+    let after_id = &html[script_idx..];
+    let Some(open_end) = after_id.find('>') else {
+        return Vec::new();
+    };
+    let json_start = &after_id[open_end + 1..];
+    let Some(close_idx) = json_start.find("</script>") else {
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_str::<Value>(json_start[..close_idx].trim()) else {
+        return Vec::new();
+    };
+    let Some(list) =
+        val.pointer("/props/pageProps/state/data/entity/trackList").and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(list.len().min(MAX_ALBUM_TRACKS));
+    for (idx, item) in list.iter().take(MAX_ALBUM_TRACKS).enumerate() {
+        let Some(title) = item.get("title").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let duration_ms = item.get("duration").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let subtitle = item.get("subtitle").and_then(Value::as_str).unwrap_or("");
+        let artists: Vec<String> = subtitle
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let spotify_uri = item
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("spotify:track:"))
+            .map(ToOwned::to_owned);
+        out.push(AlbumTrack {
+            number: u32::try_from(idx + 1).unwrap_or(1),
+            disc: 1,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri,
+            entry_id: None,
+        });
+    }
+    out
+}
+
+#[must_use]
+pub fn parse_itunes_lookup_tracks(json_str: &str) -> Vec<AlbumTrack> {
+    let Ok(val) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(results) = val.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in results {
+        if item.get("wrapperType").and_then(Value::as_str) != Some("track") {
+            continue;
+        }
+        if item.get("kind").and_then(Value::as_str).is_some_and(|k| k != "song") {
+            continue;
+        }
+        let Some(title) = item.get("trackName").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let disc = item
+            .get("discNumber")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(1);
+        let number = item
+            .get("trackNumber")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| u32::try_from(out.len() + 1).unwrap_or(1));
+        let duration_ms = item.get("trackTimeMillis").and_then(Value::as_u64).filter(|&ms| ms > 0);
+        let artists = item
+            .get("artistName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_default(|a| vec![a.to_owned()]);
+        out.push(AlbumTrack {
+            number,
+            disc,
+            title: title.to_owned(),
+            duration_ms,
+            artists,
+            spotify_uri: None,
+            entry_id: None,
+        });
+        if out.len() >= MAX_ALBUM_TRACKS {
+            break;
+        }
+    }
+    out.sort_by_key(|t| (t.disc, t.number));
+    out
+}
+
+/* --- Artist External Discography Enrichment --- */
+
+const MAX_DISCOGRAPHY_ALBUMS: usize = 40;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscographyAlbum {
+    pub title: String,
+    pub release_year: Option<i32>,
+    pub thumbnail_url: Option<String>,
+    pub apple_music_id: Option<String>,
+}
+
+#[must_use]
+pub fn normalize_album_match_key(title: &str) -> String {
+    let stripped = strip_album_edition_suffix(title);
+    let norm = normalize_artist_tokens(&stripped);
+    strip_leading_the(&norm).to_owned()
+}
+
+#[must_use]
+pub fn extract_artist_discography(entry: &CatalogEntry) -> Vec<DiscographyAlbum> {
+    let Some(arr) = entry.metadata.get("discography").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(MAX_DISCOGRAPHY_ALBUMS)
+        .filter_map(|item| {
+            let title = item.get("title").and_then(Value::as_str).map(str::trim)?;
+            if title.is_empty() {
+                return None;
+            }
+            let release_year = item
+                .get("release_year")
+                .and_then(Value::as_i64)
+                .and_then(|y| i32::try_from(y).ok())
+                .filter(|&y| (1900..=2100).contains(&y));
+            let thumbnail_url = item
+                .get("thumbnail_url")
+                .and_then(Value::as_str)
+                .and_then(sanitize_public_http_href)
+                .map(ToOwned::to_owned);
+            let apple_music_id = item
+                .get("apple_music_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .map(ToOwned::to_owned);
+            Some(DiscographyAlbum {
+                title: title.to_owned(),
+                release_year,
+                thumbnail_url,
+                apple_music_id,
+            })
+        })
+        .collect()
+}
+
+fn serialize_discography(albums: &[DiscographyAlbum]) -> Vec<Value> {
+    albums
+        .iter()
+        .map(|a| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("title".to_owned(), Value::from(a.title.clone()));
+            if let Some(yr) = a.release_year {
+                obj.insert("release_year".to_owned(), Value::from(yr));
+            }
+            if let Some(thumb) = &a.thumbnail_url {
+                obj.insert("thumbnail_url".to_owned(), Value::from(thumb.clone()));
+            }
+            if let Some(am_id) = &a.apple_music_id {
+                obj.insert("apple_music_id".to_owned(), Value::from(am_id.clone()));
+            }
+            Value::Object(obj)
+        })
+        .collect()
+}
+
+async fn resolve_itunes_artist_discography<M: ArtistMetadataFetcher>(
+    artist_name: &str,
+    fetcher: &M,
+) -> Vec<DiscographyAlbum> {
+    let trimmed = artist_name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let encoded: String = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect();
+    let url_str = format!(
+        "https://itunes.apple.com/search?term={encoded}&entity=album&attribute=artistTerm&limit=50",
+    );
+    let Ok(url) = Url::parse(&url_str) else {
+        return Vec::new();
+    };
+    let Some(json_str) = fetcher.fetch_text(&url, MAX_ITUNES_JSON_BYTES).await else {
+        return Vec::new();
+    };
+    parse_itunes_artist_discography(&json_str, trimmed)
+}
+
+#[must_use]
+pub fn parse_itunes_artist_discography(json_str: &str, artist_name: &str) -> Vec<DiscographyAlbum> {
+    let Ok(val) = serde_json::from_str::<Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(results) = val.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let target_artist = strip_leading_the(&normalize_artist_tokens(artist_name)).to_owned();
+    if target_artist.is_empty() {
+        return Vec::new();
+    }
+
+    let mut by_key: HashMap<String, DiscographyAlbum> = HashMap::new();
+    for item in results {
+        if item.get("wrapperType").and_then(Value::as_str) != Some("collection") {
+            continue;
+        }
+        if item.get("collectionType").and_then(Value::as_str).is_some_and(|t| t != "Album") {
+            continue;
+        }
+        let Some(found_artist) = item.get("artistName").and_then(Value::as_str) else {
+            continue;
+        };
+        if strip_leading_the(&normalize_artist_tokens(found_artist)) != target_artist {
+            continue;
+        }
+        let Some(raw_title) = item.get("collectionName").and_then(Value::as_str).map(str::trim)
+        else {
+            continue;
+        };
+        let lower_title = raw_title.to_ascii_lowercase();
+        if raw_title.is_empty()
+            || lower_title.ends_with("- single")
+            || lower_title.ends_with("- ep")
+            || lower_title.contains("karaoke")
+        {
+            continue;
+        }
+        let clean_title = strip_album_edition_suffix(raw_title);
+        let display_title = if clean_title.is_empty() { raw_title.to_owned() } else { clean_title };
+        let key = normalize_album_match_key(&display_title);
+        if key.is_empty() {
+            continue;
+        }
+        let release_year = item
+            .get("releaseDate")
+            .and_then(Value::as_str)
+            .and_then(|d| d.get(..4))
+            .and_then(|y| y.parse::<i32>().ok())
+            .filter(|&y| (1900..=2100).contains(&y));
+        let thumbnail_url = item
+            .get("artworkUrl100")
+            .and_then(Value::as_str)
+            .map(|u| u.replace("100x100bb", "600x600bb"))
+            .and_then(|u| sanitize_public_http_href(&u).map(ToOwned::to_owned));
+        let apple_music_id =
+            item.get("collectionId").and_then(Value::as_u64).map(|id| id.to_string());
+
+        let candidate =
+            DiscographyAlbum { title: display_title, release_year, thumbnail_url, apple_music_id };
+        match by_key.get_mut(&key) {
+            Some(existing) => {
+                // Keep earliest original release year and prefer entries with artwork
+                let earlier = match (candidate.release_year, existing.release_year) {
+                    (Some(cy), Some(ey)) => cy < ey,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if earlier {
+                    existing.release_year = candidate.release_year;
+                }
+                if existing.thumbnail_url.is_none() && candidate.thumbnail_url.is_some() {
+                    existing.thumbnail_url = candidate.thumbnail_url;
+                }
+            }
+            None => {
+                by_key.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut out: Vec<DiscographyAlbum> = by_key.into_values().collect();
+    out.sort_by(|a, b| {
+        b.release_year
+            .cmp(&a.release_year)
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+    out.truncate(MAX_DISCOGRAPHY_ALBUMS);
+    out
 }
 
 #[cfg(test)]

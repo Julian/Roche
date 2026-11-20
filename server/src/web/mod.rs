@@ -88,6 +88,7 @@ pub fn router(service: Arc<RocheService>) -> Router<Arc<RocheService>> {
         .route("/entries/{id}", get(views_catalog::entry_detail_get))
         .route("/web/entries/{id}/log", post(views_catalog::post_entry_log))
         .route("/web/entries/{id}/list-add", post(views_catalog::post_entry_list_add))
+        .route("/web/entries/{id}/add-album", post(views_catalog::post_artist_add_album))
         .route("/web/entries/{id}/merge", post(views_catalog::post_entry_merge))
         .route("/diary", get(views_catalog::diary_get))
         .route("/queue", get(views_catalog::queue_get))

@@ -66,6 +66,14 @@ impl<'a> CatalogService<'a> {
         Ok(self.repo.list_collections(include_want, include_system).await?)
     }
 
+    pub async fn load_collection_preview_thumbnails(
+        &self,
+        collections: &[CollectionSummary],
+        max_per_collection: usize,
+    ) -> Result<HashMap<String, Vec<(String, String)>>, AppError> {
+        Ok(self.repo.load_collection_preview_thumbnails(collections, max_per_collection).await?)
+    }
+
     pub async fn create_manual_collection(
         &self,
         title: &str,

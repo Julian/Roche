@@ -16,9 +16,12 @@ use super::{
     render_search_kind_options,
 };
 use crate::{
-    db::{CatalogEntry, CollectionGeneratorState, RankedCollectionView, UpsertEntryInput},
+    db::{
+        CatalogEntry, CollectionGeneratorState, CollectionSummary, RankedCollectionView,
+        RankedEntryRow, UpsertEntryInput,
+    },
     domain::{CollectionMode, CollectionRole, EntryKind},
-    service::RocheService,
+    service::{AppError, RocheService},
     web::{
         auth::WebSession,
         html::{
@@ -26,13 +29,24 @@ use crate::{
             parse_csv_list, rank_collection_href, redirect_with_flash, render_creator_year_meta,
             render_inline_csrf_form, render_page, urlencode,
         },
-        links::load_artist_id_by_lower_name,
+        links::{load_artist_id_by_lower_name, sanitize_non_local_href},
         views_home::render_collection_draw_section,
     },
 };
 
 const LIST_PAGE_SIZE: usize = 200;
 const CATALOG_SEARCH_LIMIT: usize = 80;
+const LIST_PREVIEW_THUMB_LIMIT: usize = 5;
+
+const COMPACT_VIEW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M2.5 4h11M2.5 8h11M2.5 12h11\"/></svg>";
+const PREVIEWS_VIEW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"2\" y=\"2.5\" width=\"5\" height=\"5\" rx=\"0.8\"/><rect x=\"9\" y=\"2.5\" width=\"5\" height=\"5\" rx=\"0.8\"/><rect x=\"2\" y=\"9\" width=\"5\" height=\"4.5\" rx=\"0.8\"/><rect x=\"9\" y=\"9\" width=\"5\" height=\"4.5\" rx=\"0.8\"/></svg>";
+
+struct ListsOverviewData<'a> {
+    collections: &'a [CollectionSummary],
+    previews: &'a HashMap<String, Vec<(String, String)>>,
+    generators: &'a HashMap<String, CollectionGeneratorState>,
+    csrf: &'a str,
+}
 
 pub(in crate::web) async fn lists_get(
     State(service): State<Arc<RocheService>>,
@@ -50,44 +64,29 @@ pub(in crate::web) async fn lists_get(
         });
     let is_searching = clean_q.is_some() || parsed_kind.is_some() || invalid_kind.is_some();
 
-    let search_bundle = if invalid_kind.is_some() {
-        Some((Vec::new(), HashMap::new(), false))
-    } else if is_searching {
-        let fetch_limit = if parsed_kind.is_none() { 500 } else { CATALOG_SEARCH_LIMIT + 1 };
-        let non_collections = service
-            .catalog()
-            .search_entries(clean_q, parsed_kind, fetch_limit)
+    let search_bundle =
+        load_catalog_search_bundle(&service, clean_q, parsed_kind, invalid_kind, is_searching)
             .await
-            .web_err(&session)?
-            .into_iter()
-            .filter(|e| e.kind != EntryKind::Collection)
-            .take(CATALOG_SEARCH_LIMIT + 1)
-            .collect::<Vec<_>>();
-        let truncated = non_collections.len() > CATALOG_SEARCH_LIMIT;
-        let matched: Vec<CatalogEntry> =
-            non_collections.into_iter().take(CATALOG_SEARCH_LIMIT).collect();
-        let creators: Vec<String> =
-            matched.iter().flat_map(|e| e.creators.iter().cloned()).collect();
-        let artist_links = load_artist_id_by_lower_name(&service, &creators).await;
-        Some((matched, artist_links, truncated))
-    } else {
-        None
-    };
+            .web_err(&session)?;
 
-    let mut body = String::with_capacity(6_144);
-    body.push_str(
-        "<h2>Lists</h2>\n\
-         <p class=\"lede\">Global quality rankings across media collections, inferred from tie-aware k-way comparisons.</p>\n",
-    );
-    render_catalog_search_form(&mut body, clean_q, parsed_kind, is_searching);
-    if let Some((ref matched, ref artist_links, truncated)) = search_bundle {
-        render_catalog_search_results(&mut body, matched, artist_links, truncated);
-    }
-    render_new_manual_list_panel(&mut body, &session.csrf_token);
-    if is_searching {
-        body.push_str("<h3>All Lists</h3>\n");
-    }
-    render_lists_overview_table(&mut body, &collections);
+    let previews = service
+        .catalog()
+        .load_collection_preview_thumbnails(&collections, LIST_PREVIEW_THUMB_LIMIT)
+        .await
+        .unwrap_or_default();
+    let generators = load_overview_generators(&service, &collections).await;
+
+    let mut body = String::with_capacity(8_192);
+    let data = ListsOverviewData {
+        collections: &collections,
+        previews: &previews,
+        generators: &generators,
+        csrf: &session.csrf_token,
+    };
+    body.push_str("<div class=\"lists-grid\">\n");
+    render_lists_main(&mut body, &data, search_bundle.as_ref());
+    render_lists_rail(&mut body, &collections, clean_q, parsed_kind, is_searching);
+    body.push_str("</div>\n");
 
     let err = query
         .flash
@@ -105,25 +104,398 @@ pub(in crate::web) async fn lists_get(
     .into_response())
 }
 
-fn render_catalog_search_form(
+type SearchBundle = (Vec<CatalogEntry>, HashMap<String, String>, bool);
+
+async fn load_catalog_search_bundle(
+    service: &RocheService,
+    clean_q: Option<&str>,
+    parsed_kind: Option<EntryKind>,
+    invalid_kind: Option<&str>,
+    is_searching: bool,
+) -> Result<Option<SearchBundle>, AppError> {
+    if invalid_kind.is_some() {
+        return Ok(Some((Vec::new(), HashMap::new(), false)));
+    }
+    if !is_searching {
+        return Ok(None);
+    }
+    let fetch_limit = if parsed_kind.is_none() { 500 } else { CATALOG_SEARCH_LIMIT + 1 };
+    let non_collections = service
+        .catalog()
+        .search_entries(clean_q, parsed_kind, fetch_limit)
+        .await?
+        .into_iter()
+        .filter(|e| e.kind != EntryKind::Collection)
+        .take(CATALOG_SEARCH_LIMIT + 1)
+        .collect::<Vec<_>>();
+    let truncated = non_collections.len() > CATALOG_SEARCH_LIMIT;
+    let matched: Vec<CatalogEntry> =
+        non_collections.into_iter().take(CATALOG_SEARCH_LIMIT).collect();
+    let creators: Vec<String> = matched.iter().flat_map(|e| e.creators.iter().cloned()).collect();
+    let artist_links = load_artist_id_by_lower_name(service, &creators).await;
+    Ok(Some((matched, artist_links, truncated)))
+}
+
+async fn load_overview_generators(
+    service: &RocheService,
+    collections: &[CollectionSummary],
+) -> HashMap<String, CollectionGeneratorState> {
+    let mut out = HashMap::new();
+    for col in collections {
+        if col.has_generator
+            && let Ok(state) = service.catalog().get_collection_generator(&col.id).await
+        {
+            out.insert(col.id.clone(), state);
+        }
+    }
+    out
+}
+
+fn render_lists_main(
     out: &mut String,
+    data: &ListsOverviewData<'_>,
+    search_bundle: Option<&SearchBundle>,
+) {
+    let mut manual_lists: Vec<&CollectionSummary> =
+        data.collections.iter().filter(|c| c.mode == CollectionMode::Manual).collect();
+    manual_lists.sort_by(|a, b| {
+        b.comparison_count
+            .cmp(&a.comparison_count)
+            .then_with(|| b.member_count.cmp(&a.member_count))
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+
+    let mut media_active: Vec<&CollectionSummary> = data
+        .collections
+        .iter()
+        .filter(|c| c.mode == CollectionMode::Dynamic && c.member_count > 0)
+        .collect();
+    media_active.sort_by(|a, b| {
+        b.comparison_count
+            .cmp(&a.comparison_count)
+            .then_with(|| b.member_count.cmp(&a.member_count))
+            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+    });
+
+    let mut media_empty: Vec<&CollectionSummary> = data
+        .collections
+        .iter()
+        .filter(|c| c.mode == CollectionMode::Dynamic && c.member_count == 0)
+        .collect();
+    media_empty.sort_by_key(|a| a.title.to_lowercase());
+
+    let _ = write!(
+        out,
+        "<section class=\"lists-main\" id=\"roche-lists-main\" data-lists-view=\"previews\" aria-label=\"Lists\">\n\
+           <div class=\"lists-top-bar\">\n\
+             <h2>Lists</h2>\n\
+             <div class=\"view-mode-switch\" role=\"group\" aria-label=\"Display density\">\n\
+               <button type=\"button\" class=\"view-mode-btn is-active js-lists-view-btn\" data-view=\"previews\" aria-pressed=\"true\">{PREVIEWS_VIEW_SVG}<span>Previews</span></button>\n\
+               <button type=\"button\" class=\"view-mode-btn js-lists-view-btn\" data-view=\"compact\" aria-pressed=\"false\">{COMPACT_VIEW_SVG}<span>Compact</span></button>\n\
+             </div>\n\
+           </div>\n",
+    );
+
+    if let Some((matched, artist_links, truncated)) = search_bundle {
+        render_catalog_search_results(out, matched, artist_links, *truncated);
+    }
+
+    render_new_list_section_head(out, data.csrf);
+    if manual_lists.is_empty() {
+        out.push_str("<p class=\"empty\">No custom lists yet. Use + New List to start one.</p>\n");
+    } else {
+        out.push_str("<ul class=\"lists-active-list\">\n");
+        for col in &manual_lists {
+            render_overview_row(out, col, data);
+        }
+        out.push_str("</ul>\n");
+    }
+
+    if !media_active.is_empty() || !media_empty.is_empty() {
+        let _ = writeln!(
+            out,
+            "<div class=\"section-head\"><h3>By Media Type</h3>\
+             <span class=\"section-action\">{} active &middot; {} empty</span></div>\n\
+             <ul class=\"lists-media-grid\">",
+            media_active.len(),
+            media_empty.len(),
+        );
+        for col in &media_active {
+            render_overview_row(out, col, data);
+        }
+        for col in &media_empty {
+            let slug = col.slug.as_deref().unwrap_or(&col.id);
+            let _ = writeln!(
+                out,
+                "<li class=\"list-empty-tile\"><a class=\"empty-list-link\" href=\"/lists/{}\"><span>{}</span><span class=\"empty-list-zero\">0</span></a></li>",
+                esc(&urlencode(slug)),
+                esc(&col.title),
+            );
+        }
+        out.push_str("</ul>\n");
+    }
+
+    out.push_str("</section>\n");
+}
+
+fn render_new_list_section_head(out: &mut String, csrf: &str) {
+    let _ = write!(
+        out,
+        "<div class=\"lists-section-head\">\n\
+           <h3>Your Lists</h3>\n\
+           <button type=\"button\" class=\"new-list-trigger js-new-list-toggle\" aria-expanded=\"false\" aria-controls=\"roche-new-list-form\">+ New List</button>\n\
+         </div>\n\
+         <form method=\"post\" action=\"/web/lists/create\" id=\"roche-new-list-form\" class=\"new-list-inline-form\" hidden>\n\
+           <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+           <div class=\"new-list-inline-grid\">\n\
+             <div class=\"field\">\n\
+               <label for=\"list-title\">Title</label>\n\
+               <input id=\"list-title\" name=\"title\" type=\"text\" required placeholder=\"e.g. Sci-Fi Canon\">\n\
+             </div>\n\
+             <div class=\"field\">\n\
+               <label for=\"list-summary\">Description (optional)</label>\n\
+               <input id=\"list-summary\" name=\"summary\" type=\"text\" placeholder=\"Favorite speculative fiction\">\n\
+             </div>\n\
+             <button type=\"submit\" class=\"btn btn-primary btn-small\">Create List</button>\n\
+           </div>\n\
+         </form>\n",
+        csrf = esc(csrf),
+    );
+}
+
+fn render_overview_row(out: &mut String, col: &CollectionSummary, data: &ListsOverviewData<'_>) {
+    let slug = col.slug.as_deref().unwrap_or(&col.id);
+    let slug_enc = urlencode(slug);
+    let href = format!("/lists/{slug_enc}");
+
+    let _ = write!(
+        out,
+        "<li class=\"list-overview-row\">\n\
+           <div class=\"list-overview-main\">\n\
+             <div class=\"list-overview-title-row\">\n\
+               <a class=\"list-overview-title\" href=\"{href}\">{title}</a>\n\
+               <span class=\"list-overview-title-badges\">\n\
+                 <span class=\"list-count-badge\">{members}</span>",
+        href = esc(&href),
+        title = esc(&col.title),
+        members = col.member_count,
+    );
+    if let Some(gs) = data.generators.get(&col.id) {
+        render_overview_draw_popover(out, slug, gs, data.csrf);
+    }
+    out.push_str("</span>\n</div>\n");
+    if let Some(summary) = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = writeln!(out, "<p class=\"list-overview-summary\">{}</p>", esc(summary));
+    }
+    out.push_str("</div>\n<div class=\"list-overview-right\">\n");
+
+    if let Some(thumbs) = data.previews.get(&col.id) {
+        let safe_thumbs: Vec<(&str, &str)> = thumbs
+            .iter()
+            .filter_map(|(title, raw_url)| {
+                sanitize_non_local_href(raw_url).map(|safe| (title.as_str(), safe))
+            })
+            .collect();
+        if !safe_thumbs.is_empty() {
+            out.push_str("<div class=\"list-preview-strip\">");
+            for (item_title, img_url) in safe_thumbs {
+                let _ = write!(
+                    out,
+                    "<a href=\"{}\" title=\"{}\"><img class=\"list-preview-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+                    esc(&href),
+                    esc(item_title),
+                    esc(img_url),
+                );
+            }
+            out.push_str("</div>\n");
+        }
+    }
+
+    if col.member_count >= 2 {
+        let rank_href = rank_collection_href(slug, col.role == CollectionRole::Want);
+        if col.comparison_count > 0 {
+            let comp_word = if col.comparison_count == 1 { "comparison" } else { "comparisons" };
+            let _ = writeln!(
+                out,
+                "<a class=\"btn btn-small btn-rank-list\" href=\"{href}\" title=\"{c} {comp_word}\" aria-label=\"Rank {t} ({c} {comp_word})\"><span>Rank</span><span class=\"btn-rank-comps\">&middot; {c}</span></a>",
+                href = esc(&rank_href),
+                t = esc(&col.title),
+                c = col.comparison_count,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "<a class=\"btn btn-small btn-rank-list\" href=\"{href}\" aria-label=\"Rank {t}\"><span>Rank</span></a>",
+                href = esc(&rank_href),
+                t = esc(&col.title),
+            );
+        }
+    } else {
+        out.push_str(
+            "<button type=\"button\" class=\"btn btn-small btn-rank-list\" disabled title=\"Need at least 2 items to rank\"><span>Rank</span></button>\n",
+        );
+    }
+
+    out.push_str("</div>\n</li>\n");
+}
+
+fn render_overview_draw_popover(
+    out: &mut String,
+    slug: &str,
+    gs: &CollectionGeneratorState,
+    csrf: &str,
+) {
+    let slug_enc = urlencode(slug);
+    let paused_cls = if gs.enabled { "" } else { " is-paused" };
+    let tip = if gs.enabled {
+        "Daily draw active — click to Rank, Skip, or Pause"
+    } else {
+        "Daily draw paused — click to resume"
+    };
+    let _ = writeln!(
+        out,
+        "<details class=\"draw-badge-details{paused_cls}\">\n\
+           <summary title=\"{tip}\"><span class=\"draw-dot\" aria-hidden=\"true\"></span><span>Draw</span></summary>\n\
+           <div class=\"draw-popover\">",
+    );
+    if gs.enabled {
+        if let Some(entry) = &gs.current_entry {
+            let entry_href = format!("/entries/{}", urlencode(&entry.id));
+            out.push_str("<div class=\"draw-popover-current\">");
+            if let Some(thumb) = entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+                let _ = write!(
+                    out,
+                    "<a href=\"{}\" title=\"Open {}\"><img class=\"draw-popover-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+                    esc(&entry_href),
+                    esc(&entry.title),
+                    esc(thumb),
+                );
+            }
+            let _ = write!(
+                out,
+                "<div class=\"draw-popover-info\">\
+                   <div class=\"draw-popover-kicker\">Current Draw &middot; #{} of {}</div>\
+                   <div class=\"draw-popover-title\"><a href=\"{}\">{}</a></div>",
+                gs.consumed_count,
+                gs.total_pool,
+                esc(&entry_href),
+                esc(&entry.title),
+            );
+            if !entry.creators.is_empty() {
+                let _ = write!(
+                    out,
+                    "<div class=\"draw-popover-sub\">{}</div>",
+                    esc(&entry.creators.join(", ")),
+                );
+            }
+            out.push_str("</div></div>\n<div class=\"draw-popover-actions\">\n<div class=\"flex-row flex-center\">");
+            render_inline_csrf_form(
+                out,
+                &format!("/web/lists/{slug_enc}/generator/finish"),
+                csrf,
+                &[],
+                None,
+                "<button type=\"submit\" class=\"btn btn-small btn-primary\">Rank</button>",
+            );
+            render_inline_csrf_form(
+                out,
+                &format!("/web/lists/{slug_enc}/generator/abandon"),
+                csrf,
+                &[("return_to", "/lists")],
+                None,
+                "<button type=\"submit\" class=\"btn btn-small btn-ghost\">Skip</button>",
+            );
+            out.push_str("</div>");
+        } else {
+            let _ = writeln!(
+                out,
+                "<p class=\"rail-note\">All {} entries completed.</p>\n<div class=\"draw-popover-actions\">",
+                gs.total_pool,
+            );
+        }
+        render_inline_csrf_form(
+            out,
+            &format!("/web/lists/{slug_enc}/generator/toggle"),
+            csrf,
+            &[("enabled", "false"), ("return_to", "/lists")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-ghost btn-quiet\">Pause Draw</button>",
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "<p class=\"rail-note\">Draw paused &middot; #{} of {} completed.</p>\n<div class=\"draw-popover-actions\">",
+            gs.consumed_count, gs.total_pool,
+        );
+        render_inline_csrf_form(
+            out,
+            &format!("/web/lists/{slug_enc}/generator/toggle"),
+            csrf,
+            &[("enabled", "true"), ("return_to", "/lists")],
+            None,
+            "<button type=\"submit\" class=\"btn btn-small btn-primary\">Resume Draw</button>",
+        );
+    }
+    out.push_str("</div>\n</div>\n</details>");
+}
+
+fn render_lists_rail(
+    out: &mut String,
+    collections: &[CollectionSummary],
     clean_q: Option<&str>,
     parsed_kind: Option<EntryKind>,
     is_searching: bool,
 ) {
+    let active_count = collections.iter().filter(|c| c.member_count > 0).count();
+    let media_entries: usize = collections
+        .iter()
+        .filter(|c| c.mode == CollectionMode::Dynamic)
+        .map(|c| c.member_count)
+        .sum();
+    let total_entries = if media_entries > 0 {
+        media_entries
+    } else {
+        collections.iter().map(|c| c.member_count).sum()
+    };
+    let max_comps = collections.iter().map(|c| c.comparison_count).max().unwrap_or(0);
+
     let _ = write!(
         out,
-        "<form method=\"get\" action=\"/lists\" class=\"search-form\">\n\
-           <input type=\"search\" name=\"q\" aria-label=\"Search catalog\" value=\"{}\" placeholder=\"Search catalog works, artists, creators, identifiers...\" class=\"search-input\">\n\
-           <select name=\"kind\" aria-label=\"Filter by kind\">{}</select>\n\
-           <button type=\"submit\" class=\"btn\">Search</button>",
-        esc(clean_q.unwrap_or("")),
-        render_search_kind_options(parsed_kind),
+        "<div class=\"lists-rail\">\n\
+           <section class=\"rail-block rail-card\">\n\
+             <div class=\"section-head\"><h2>Search Catalog</h2></div>\n\
+             <form method=\"get\" action=\"/lists\" class=\"rail-form\">\n\
+               <div class=\"field\">\n\
+                 <label for=\"cat-q\">Titles, Creators, or Identifiers</label>\n\
+                 <input id=\"cat-q\" name=\"q\" type=\"search\" aria-label=\"Search catalog\" value=\"{q}\" placeholder=\"e.g. Frank Zappa, Abbey Road…\">\n\
+               </div>\n\
+               <div class=\"field\">\n\
+                 <label for=\"cat-kind\">Kind</label>\n\
+                 <select id=\"cat-kind\" name=\"kind\" aria-label=\"Filter by kind\">{kind_opts}</select>\n\
+               </div>\n\
+               <div class=\"flex-row flex-center\">\n\
+                 <button type=\"submit\" class=\"btn btn-primary btn-small\">Search</button>",
+        q = esc(clean_q.unwrap_or("")),
+        kind_opts = render_search_kind_options(parsed_kind),
     );
     if is_searching {
-        out.push_str("\n<a class=\"btn btn-ghost\" href=\"/lists\">Clear</a>");
+        out.push_str("<a class=\"btn btn-small btn-ghost\" href=\"/lists\">Clear</a>");
     }
-    out.push_str("\n</form>\n");
+    let _ = write!(
+        out,
+        "      </div>\n\
+             </form>\n\
+           </section>\n\
+           <section class=\"rail-block rail-card\">\n\
+             <div class=\"section-head\"><h2>Library</h2></div>\n\
+             <div class=\"rail-stats\">\n\
+               <div><span class=\"rail-stat-num\">{active_count}</span><span class=\"rail-stat-label\">Active</span></div>\n\
+               <div><span class=\"rail-stat-num\">{total_entries}</span><span class=\"rail-stat-label\">Entries</span></div>\n\
+               <div><span class=\"rail-stat-num\">{max_comps}</span><span class=\"rail-stat-label\">Ranked</span></div>\n\
+             </div>\n\
+           </section>\n\
+         </div>\n",
+    );
 }
 
 fn render_catalog_search_results(
@@ -162,67 +534,6 @@ fn render_catalog_search_results(
             writeln!(out, " <span class=\"badge\">{}</span></li>", esc(entry.kind.display_label()));
     }
     out.push_str("</ul>\n");
-}
-
-fn render_new_manual_list_panel(out: &mut String, csrf: &str) {
-    let _ = write!(
-        out,
-        "<details class=\"editorial-panel\">\n\
-           <summary>+ New Manual List</summary>\n\
-           <form method=\"post\" action=\"/web/lists/create\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"form-grid\">\n\
-               <div class=\"field\"><label for=\"list-title\">Title</label>\
-                 <input id=\"list-title\" name=\"title\" type=\"text\" required placeholder=\"e.g. Sci-Fi Canon\"></div>\n\
-               <div class=\"field\"><label for=\"list-summary\">Description (optional)</label>\
-                 <input id=\"list-summary\" name=\"summary\" type=\"text\" placeholder=\"Favorite speculative fiction\"></div>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn btn-primary\">Create List</button>\n\
-           </form>\n\
-         </details>\n",
-        csrf = esc(csrf),
-    );
-}
-
-fn render_lists_overview_table(out: &mut String, collections: &[crate::db::CollectionSummary]) {
-    if collections.is_empty() {
-        out.push_str("<p class=\"empty\">No lists yet.</p>\n");
-        return;
-    }
-    out.push_str(
-        "<table class=\"lists\">\n\
-         <thead class=\"sr-only\"><tr>\
-           <th scope=\"col\">List</th>\
-           <th scope=\"col\">Works</th>\
-           <th scope=\"col\">Comparisons</th>\
-           <th scope=\"col\">Actions</th>\
-         </tr></thead>\n\
-         <tbody>\n",
-    );
-    for col in collections {
-        let slug = col.slug.as_deref().unwrap_or(&col.id);
-        let _ = write!(
-            out,
-            "<tr>\n\
-               <td class=\"name\"><a href=\"/lists/{slug_enc}\">{title}</a></td>\n\
-               <td class=\"stat\">{members} works</td>\n\
-               <td class=\"stat\">{comps} comparisons</td>\n\
-               <td class=\"stat\">",
-            slug_enc = esc(&urlencode(slug)),
-            title = esc(&col.title),
-            members = col.member_count,
-            comps = col.comparison_count,
-        );
-        if col.member_count >= 2 {
-            let _ = write!(
-                out,
-                "<a class=\"btn btn-small\" href=\"/rank/{}\">Compare</a>",
-                esc(&urlencode(slug))
-            );
-        }
-        out.push_str("</td>\n</tr>\n");
-    }
-    out.push_str("</tbody>\n</table>\n");
 }
 
 pub(in crate::web) async fn post_list_create(
@@ -280,7 +591,7 @@ pub(in crate::web) async fn list_detail_get(
         ),
     );
 
-    let mut body = String::with_capacity(12_288);
+    let mut body = String::with_capacity(14_336);
     render_ranked_list_body(
         &mut body,
         &view,
@@ -308,6 +619,21 @@ pub(in crate::web) async fn list_detail_get(
     .into_response())
 }
 
+fn count_tiers(rows: &[RankedEntryRow]) -> [usize; 5] {
+    let mut counts = [0usize; 5];
+    for row in rows {
+        match row.tier {
+            Some('S') => counts[0] += 1,
+            Some('A') => counts[1] += 1,
+            Some('B') => counts[2] += 1,
+            Some('C') => counts[3] += 1,
+            Some('D') => counts[4] += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_ranked_list_body(
     out: &mut String,
@@ -320,97 +646,156 @@ fn render_ranked_list_body(
     csrf: &str,
 ) {
     let slug = view.collection.slug.as_deref().unwrap_or(&view.collection.id);
-    let slug_enc = urlencode(slug);
     let is_manual_list = view.collection.mode == CollectionMode::Manual
         && view.collection.role == CollectionRole::List;
     let is_editable_manual = is_manual_list && !view.collection.has_generator;
+    let ranked_mode = view.comparison_count > 0;
 
+    let start = (page_num - 1) * LIST_PAGE_SIZE;
+    let end = (start + LIST_PAGE_SIZE).min(view.rows.len());
+    let slice = &view.rows[start..end];
+    let page_tiers = count_tiers(slice);
+
+    out.push_str(
+        "<div class=\"lists-grid\">\n<section class=\"lists-main\" aria-label=\"List entries\">\n",
+    );
     let _ = write!(
         out,
-        "<div class=\"page-head\">\n\
-           <h2>{}</h2>\n\
-           <div class=\"flex-row flex-center\">",
-        esc(&view.collection.title)
+        "<div class=\"list-detail-crumb\"><a class=\"reader-back-link\" href=\"/lists\">&larr; All Lists</a></div>\n\
+         <div class=\"list-detail-head\">\n\
+           <div class=\"list-detail-title-group\">\n\
+             <h2>{}</h2>\n\
+             <span class=\"list-count-badge\">{}</span>\n\
+           </div>",
+        esc(&view.collection.title),
+        view.rows.len(),
     );
-    if let Some(gs) = gen_state {
-        let next_enabled = if gs.enabled { "false" } else { "true" };
-        let label = if gs.enabled { "Pause Draw" } else { "Enable Draw" };
-        let toggle_action = format!("/web/lists/{slug_enc}/generator/toggle");
-        let btn_html = format!("<button type=\"submit\" class=\"btn btn-small\">{label}</button>");
-        render_inline_csrf_form(
-            out,
-            &toggle_action,
-            csrf,
-            &[("enabled", next_enabled), ("redirect_list", "true")],
-            None,
-            &btn_html,
-        );
-    }
     if view.rows.len() >= 2 {
         let rank_href = rank_collection_href(slug, view.collection.role == CollectionRole::Want);
         let _ = write!(
             out,
-            "<a class=\"btn btn-primary btn-small\" href=\"{}\">Compare &amp; Rank</a>",
-            esc(&rank_href)
+            "<a class=\"btn btn-primary btn-small\" href=\"{}\">Rank</a>",
+            esc(&rank_href),
         );
     }
-    out.push_str("</div></div>\n");
+    out.push_str("</div>\n");
 
-    let _ = writeln!(
-        out,
-        "<p class=\"lede\"><em>{}</em> works &middot; <em>{}</em> comparisons{}</p>",
-        view.rows.len(),
-        view.comparison_count,
-        view.collection
-            .summary
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map_or_else(String::new, |s| format!(" &mdash; {}", esc(s))),
-    );
-
-    if let Some(gs) = gen_state
-        && gs.enabled
-    {
-        render_collection_draw_section(out, gs, artist_links, csrf);
-    }
-
-    if is_editable_manual {
-        render_manual_list_add_panel(out, slug, csrf);
-    }
+    render_list_detail_lede(out, view);
 
     if total_pages > 1 {
         render_list_pager(out, slug, page_num, total_pages, "Pagination (top)");
     }
 
     if view.rows.is_empty() {
-        out.push_str("<p class=\"empty\">No works in this list yet.</p>\n");
-        return;
+        out.push_str("<p class=\"empty\">No entries in this list yet.</p>\n");
+    } else {
+        render_list_toolbar(out, slice.len(), ranked_mode, page_tiers);
+        render_ranked_table(
+            out,
+            slice,
+            ranked_mode,
+            is_editable_manual,
+            slug,
+            artist_links,
+            reader_item_ids,
+            csrf,
+        );
     }
 
-    let start = (page_num - 1) * LIST_PAGE_SIZE;
-    let end = (start + LIST_PAGE_SIZE).min(view.rows.len());
-    let slice = &view.rows[start..end];
+    if total_pages > 1 {
+        render_list_pager(out, slug, page_num, total_pages, "Pagination (bottom)");
+    }
+    out.push_str("</section>\n");
 
-    out.push_str(
-        "<table class=\"ranked\">\n\
-         <thead><tr>\
-           <th scope=\"col\" class=\"num\">#</th>\
-           <th scope=\"col\">Tier</th>\
-           <th scope=\"col\">Work</th>\
-           <th scope=\"col\" class=\"score num\">Score</th>",
+    render_list_detail_rail(
+        out,
+        view,
+        slug,
+        gen_state,
+        ranked_mode,
+        page_tiers,
+        is_editable_manual,
+        artist_links,
+        csrf,
     );
+    out.push_str("</div>\n");
+}
+
+fn render_list_detail_lede(out: &mut String, view: &RankedCollectionView) {
+    let summary = view.collection.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if view.comparison_count == 0 && summary.is_none() {
+        return;
+    }
+    out.push_str("<p class=\"list-detail-lede\">");
+    if view.comparison_count > 0 {
+        let word = if view.comparison_count == 1 { "comparison" } else { "comparisons" };
+        let _ = write!(out, "<em>{}</em> {word}", view.comparison_count);
+        if let Some(s) = summary {
+            let _ = write!(out, " &mdash; {}", esc(s));
+        }
+    } else if let Some(s) = summary {
+        let _ = write!(out, "{}", esc(s));
+    }
+    out.push_str("</p>\n");
+}
+
+fn render_list_toolbar(out: &mut String, row_count: usize, ranked_mode: bool, tiers: [usize; 5]) {
+    out.push_str("<div class=\"list-toolbar\">\n");
+    if ranked_mode {
+        let _ = writeln!(
+            out,
+            "<div class=\"list-tier-pills\" role=\"group\" aria-label=\"Filter by tier\">\n\
+               <button type=\"button\" class=\"pill is-active js-tier-pill\" data-tier=\"all\" aria-pressed=\"true\">All ({row_count})</button>",
+        );
+        for (idx, letter) in ['S', 'A', 'B', 'C', 'D'].into_iter().enumerate() {
+            if tiers[idx] > 0 {
+                let _ = writeln!(
+                    out,
+                    "<button type=\"button\" class=\"pill pill-tier-{letter} js-tier-pill\" data-tier=\"{letter}\" aria-pressed=\"false\">{letter} ({})</button>",
+                    tiers[idx],
+                );
+            }
+        }
+        out.push_str("</div>\n");
+    }
+    out.push_str(
+        "<input type=\"search\" id=\"roche-list-search\" class=\"list-filter-input\" placeholder=\"Filter list…\" aria-label=\"Filter entries in this list\">\n\
+       </div>\n",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_ranked_table(
+    out: &mut String,
+    slice: &[RankedEntryRow],
+    ranked_mode: bool,
+    is_editable_manual: bool,
+    slug: &str,
+    artist_links: &HashMap<String, String>,
+    reader_item_ids: &HashSet<String>,
+    csrf: &str,
+) {
+    out.push_str("<table class=\"ranked\">\n<thead><tr><th scope=\"col\" class=\"num\">#</th>");
+    if ranked_mode {
+        out.push_str(
+            "<th scope=\"col\">Tier</th><th scope=\"col\">Title</th><th scope=\"col\" class=\"score num\">Score</th>",
+        );
+    } else {
+        out.push_str("<th scope=\"col\">Title</th>");
+    }
     if is_editable_manual {
         out.push_str("<th scope=\"col\"><span class=\"sr-only\">Actions</span></th>");
     }
-    out.push_str("</tr></thead>\n<tbody>\n");
+    out.push_str("</tr></thead>\n<tbody id=\"roche-ranked-tbody\">\n");
 
     let mut prev_tier: Option<char> = None;
     for (idx, row) in slice.iter().enumerate() {
-        let tier_break = idx > 0 && row.tier != prev_tier;
+        let tier_break = ranked_mode && idx > 0 && row.tier != prev_tier;
         prev_tier = row.tier;
         render_ranked_table_row(
             out,
             row,
+            ranked_mode,
             tier_break,
             is_editable_manual,
             slug,
@@ -420,16 +805,13 @@ fn render_ranked_list_body(
         );
     }
     out.push_str("</tbody>\n</table>\n");
-
-    if total_pages > 1 {
-        render_list_pager(out, slug, page_num, total_pages, "Pagination (bottom)");
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_ranked_table_row(
     out: &mut String,
-    row: &crate::db::RankedEntryRow,
+    row: &RankedEntryRow,
+    ranked_mode: bool,
     tier_break: bool,
     is_editable_manual: bool,
     slug: &str,
@@ -438,20 +820,39 @@ fn render_ranked_table_row(
     csrf: &str,
 ) {
     let tr_cls = if tier_break { " class=\"tier-break\"" } else { "" };
-    let tier_char = row.tier.unwrap_or('·');
-    let tier_cls = row.tier.map_or_else(String::new, |t| format!(" tier-{t}"));
-    let tick_pct = row.bar_pct.clamp(4.0, 96.0);
-    let sigma = row.score.variance.max(0.0).sqrt();
+    let tier_attr = row.tier.map_or_else(String::new, |t| t.to_string());
+    let creators_joined = row.entry.creators.join(" ");
+    let year_str = row.entry.release_year.map_or_else(String::new, |y| y.to_string());
+    let search_blob = format!("{} {creators_joined} {year_str}", row.entry.title);
+    let entry_id_enc = urlencode(&row.entry.id);
+    let entry_href = format!("/entries/{entry_id_enc}");
 
     let _ = write!(
         out,
-        "<tr{tr_cls}>\
-           <td class=\"rank num\">{rank}</td>\
-           <td class=\"tier{tier_cls}\">{tier_char}</td>\
-           <td class=\"work\"><span class=\"title\"><a href=\"/entries/{id}\">{title}</a></span>",
-        rank = row.rank,
-        id = esc(&urlencode(&row.entry.id)),
-        title = esc(&row.entry.title),
+        "<tr{tr_cls} data-tier=\"{tier_attr}\" data-work-search=\"{}\"><td class=\"rank num\">{}</td>",
+        esc(&search_blob),
+        row.rank,
+    );
+    if ranked_mode {
+        let tier_char = row.tier.unwrap_or('·');
+        let tier_cls = row.tier.map_or_else(String::new, |t| format!(" tier-{t}"));
+        let _ = write!(out, "<td class=\"tier{tier_cls}\">{tier_char}</td>");
+    }
+
+    out.push_str("<td class=\"work\"><div class=\"ranked-work-cell\">");
+    if let Some(thumb) = row.entry.thumbnail_url.as_deref().and_then(sanitize_non_local_href) {
+        let _ = write!(
+            out,
+            "<a class=\"ranked-thumb-link\" href=\"{}\"><img class=\"ranked-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></a>",
+            esc(&entry_href),
+            esc(thumb),
+        );
+    }
+    let _ = write!(
+        out,
+        "<div class=\"ranked-work-text\"><span class=\"title\"><a href=\"{}\">{}</a></span>",
+        esc(&entry_href),
+        esc(&row.entry.title),
     );
     render_creator_year_meta(
         out,
@@ -463,25 +864,34 @@ fn render_ranked_table_row(
     if reader_item_ids.contains(&row.entry.id) {
         let _ = write!(
             out,
-            " <a class=\"badge ml-xs\" href=\"/reader/{id}\">Read &rarr;</a>",
-            id = esc(&urlencode(&row.entry.id)),
+            " <a class=\"badge ml-xs\" href=\"/reader/{}\">Read &rarr;</a>",
+            esc(&entry_id_enc),
         );
     }
-    let _ = write!(
-        out,
-        "</td>\
-         <td class=\"score\"><div class=\"score-mark-wrap\" title=\"μ = {mean:.2}, σ = {sigma:.2}\">\
-           <span class=\"sr-only\">Score {mean:.2} (±{sigma:.2})</span>\
-           <svg class=\"score-mark\" viewBox=\"0 0 100 12\" width=\"100\" height=\"12\" aria-hidden=\"true\">\
-             <line class=\"score-axis\" x1=\"0\" y1=\"6\" x2=\"100\" y2=\"6\"/>\
-             <line class=\"score-mid\" x1=\"50\" y1=\"2\" x2=\"50\" y2=\"10\"/>\
-             <circle class=\"tick\" cx=\"{tick_pct:.1}\" cy=\"6\" r=\"3.5\"/>\
-           </svg></div></td>",
-        mean = row.score.mean,
-    );
+    out.push_str("</div></div></td>");
+
+    if ranked_mode {
+        let tick_pct = row.bar_pct.clamp(4.0, 96.0);
+        let sigma = row.score.variance.max(0.0).sqrt();
+        let half_w = (sigma * 14.0).clamp(3.0, 22.0);
+        let ci_x1 = (tick_pct - half_w).max(2.0);
+        let ci_x2 = (tick_pct + half_w).min(98.0);
+        let _ = write!(
+            out,
+            "<td class=\"score\"><div class=\"score-mark-wrap\" title=\"μ = {mean:.2}, σ = {sigma:.2}\">\
+               <span class=\"sr-only\">Score {mean:.2} (±{sigma:.2})</span>\
+               <svg class=\"score-mark\" viewBox=\"0 0 100 12\" width=\"100\" height=\"12\" aria-hidden=\"true\">\
+                 <line class=\"score-axis\" x1=\"0\" y1=\"6\" x2=\"100\" y2=\"6\"/>\
+                 <line class=\"score-mid\" x1=\"50\" y1=\"2\" x2=\"50\" y2=\"10\"/>\
+                 <line class=\"score-ci\" x1=\"{ci_x1:.1}\" y1=\"6\" x2=\"{ci_x2:.1}\" y2=\"6\"/>\
+                 <circle class=\"tick\" cx=\"{tick_pct:.1}\" cy=\"6\" r=\"3.4\"/>\
+               </svg></div></td>",
+            mean = row.score.mean,
+        );
+    }
+
     if is_editable_manual {
-        let remove_action =
-            format!("/web/lists/{}/remove/{}", urlencode(slug), urlencode(&row.entry.id));
+        let remove_action = format!("/web/lists/{}/remove/{entry_id_enc}", urlencode(slug));
         let remove_btn = format!(
             "<button type=\"submit\" class=\"link-btn\" title=\"Remove from list\" aria-label=\"Remove {} from list\"><span aria-hidden=\"true\">&times;</span></button>",
             esc(&row.entry.title)
@@ -493,26 +903,118 @@ fn render_ranked_table_row(
     out.push_str("</tr>\n");
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_list_detail_rail(
+    out: &mut String,
+    view: &RankedCollectionView,
+    slug: &str,
+    gen_state: Option<&CollectionGeneratorState>,
+    ranked_mode: bool,
+    page_tiers: [usize; 5],
+    is_editable_manual: bool,
+    artist_links: &HashMap<String, String>,
+    csrf: &str,
+) {
+    out.push_str("<div class=\"lists-rail\">\n");
+    if let Some(gs) = gen_state
+        && gs.enabled
+    {
+        render_collection_draw_section(out, gs, artist_links, csrf);
+    }
+
+    if ranked_mode {
+        let max_tc = page_tiers.into_iter().max().unwrap_or(1).max(1);
+        out.push_str(
+            "<section class=\"rail-block rail-card\">\n\
+               <div class=\"section-head\"><h3>Tier Distribution</h3></div>\n\
+               <div class=\"tier-dist\">\n",
+        );
+        for (idx, letter) in ['S', 'A', 'B', 'C', 'D'].into_iter().enumerate() {
+            let cnt = page_tiers[idx];
+            let _ = writeln!(
+                out,
+                "<button type=\"button\" class=\"tier-dist-row js-tier-dist-btn\" data-tier=\"{letter}\" aria-pressed=\"false\">\
+                   <span class=\"tier-dist-letter tier-{letter}\">{letter}</span>\
+                   <progress class=\"tier-bar tier-bar-{letter}\" value=\"{cnt}\" max=\"{max_tc}\"></progress>\
+                   <span class=\"tier-dist-count\">{cnt}</span>\
+                 </button>",
+            );
+        }
+        out.push_str("</div>\n</section>\n");
+    }
+
+    if let Some(gs) = gen_state {
+        let slug_enc = urlencode(slug);
+        let next_enabled = if gs.enabled { "false" } else { "true" };
+        let label = if gs.enabled { "Pause Draw" } else { "Enable Draw" };
+        let status_txt = if gs.enabled { "Daily draw active" } else { "Daily draw paused" };
+        let toggle_action = format!("/web/lists/{slug_enc}/generator/toggle");
+        let btn_html =
+            format!("<button type=\"submit\" class=\"btn btn-small btn-ghost\">{label}</button>");
+        let _ = write!(
+            out,
+            "<section class=\"rail-block rail-card\">\n\
+               <div class=\"section-head\"><h3>Collection Draw</h3></div>\n\
+               <div class=\"rail-opml-actions\">\n\
+                 <span class=\"text-soft rail-opml-note\">{status_txt}</span>",
+        );
+        render_inline_csrf_form(
+            out,
+            &toggle_action,
+            csrf,
+            &[("enabled", next_enabled), ("redirect_list", "true")],
+            None,
+            &btn_html,
+        );
+        out.push_str("</div>\n</section>\n");
+    } else if !ranked_mode {
+        out.push_str(
+            "<section class=\"rail-block rail-card\">\n\
+               <div class=\"section-head\"><h3>Rankings</h3></div>\n\
+               <p class=\"rail-note\">Compare entries head-to-head to infer S–D tiers and scores.</p>",
+        );
+        if view.rows.len() >= 2 {
+            let rank_href =
+                rank_collection_href(slug, view.collection.role == CollectionRole::Want);
+            let _ = writeln!(
+                out,
+                "<a class=\"btn btn-primary btn-small\" href=\"{}\">Start Ranking</a>",
+                esc(&rank_href),
+            );
+        } else {
+            out.push_str(
+                "<span class=\"text-faint rail-opml-note\">Add at least 2 entries to rank.</span>",
+            );
+        }
+        out.push_str("</section>\n");
+    }
+
+    if is_editable_manual {
+        render_manual_list_add_panel(out, slug, csrf);
+    }
+    out.push_str("</div>\n");
+}
+
 fn render_manual_list_add_panel(out: &mut String, slug: &str, csrf: &str) {
     let _ = write!(
         out,
-        "<details class=\"editorial-panel\">\n\
-           <summary>+ Add Work to List</summary>\n\
-           <form method=\"post\" action=\"/web/lists/{slug_enc}/add\">\n\
-             <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
-             <div class=\"form-grid\">\n\
-               <div class=\"field\"><label for=\"add-title\">Title or Existing Entry ID</label>\
+        "<section class=\"rail-block rail-card\">\n\
+           <details class=\"editorial-panel rail-editorial-panel\">\n\
+             <summary>+ Add Work to List</summary>\n\
+             <form method=\"post\" action=\"/web/lists/{slug_enc}/add\" class=\"rail-form\">\n\
+               <input type=\"hidden\" name=\"_csrf\" value=\"{csrf}\">\n\
+               <div class=\"field\"><label for=\"add-title\">Title or Existing Entry ID</label>\n\
                  <input id=\"add-title\" name=\"title_or_id\" type=\"text\" required placeholder=\"e.g. Stalker\"></div>\n\
-               <div class=\"field\"><label for=\"add-kind\">Kind (if creating new)</label>\
+               <div class=\"field\"><label for=\"add-kind\">Kind (if creating new)</label>\n\
                  <select id=\"add-kind\" name=\"kind\">{kind_opts}</select></div>\n\
-               <div class=\"field\"><label for=\"add-creators\">Creators (comma-separated)</label>\
+               <div class=\"field\"><label for=\"add-creators\">Creators (comma-separated)</label>\n\
                  <input id=\"add-creators\" name=\"creators\" type=\"text\" placeholder=\"Andrei Tarkovsky\"></div>\n\
-               <div class=\"field\"><label for=\"add-year\">Year</label>\
+               <div class=\"field\"><label for=\"add-year\">Year</label>\n\
                  <input id=\"add-year\" name=\"release_year\" type=\"number\" min=\"1000\" max=\"2100\" placeholder=\"1979\"></div>\n\
-             </div>\n\
-             <button type=\"submit\" class=\"btn btn-primary\">Add to List</button>\n\
-           </form>\n\
-         </details>\n",
+               <button type=\"submit\" class=\"btn btn-primary btn-small\">Add to List</button>\n\
+             </form>\n\
+           </details>\n\
+         </section>\n",
         slug_enc = esc(&urlencode(slug)),
         csrf = esc(csrf),
         kind_opts = render_kind_options(EntryKind::Movie),

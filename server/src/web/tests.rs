@@ -183,13 +183,17 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(unauth.headers().get(header::LOCATION).unwrap(), "/login");
 
     let (cookie, csrf) = login_browser(&db, &app).await;
-    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue", "/rank"] {
+    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue"] {
         let resp = get_authed(&app, path, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {path}");
     }
     let starred_redir = get_authed(&app, "/starred", &cookie).await;
     assert_eq!(starred_redir.status(), StatusCode::SEE_OTHER);
     assert_eq!(starred_redir.headers().get(header::LOCATION).unwrap(), "/lists/starred");
+
+    let rank_redir = get_authed(&app, "/rank", &cookie).await;
+    assert_eq!(rank_redir.status(), StatusCode::SEE_OTHER);
+    assert_eq!(rank_redir.headers().get(header::LOCATION).unwrap(), "/lists");
 
     let missing_csrf = post_form(&app, "/web/lists/create", &cookie, &[("title", "My List")]).await;
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
@@ -1420,7 +1424,7 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
     assert!(!inbox_html.contains("LSM Compaction"));
 
     let queue_html = resp_html(get_authed(&app, "/queue", &cookie).await).await;
-    assert!(queue_html.contains("Want to Read (1)"));
+    assert!(queue_html.contains("Want to Read <span class=\"list-count-badge\">1</span>"));
     assert!(queue_html.contains("LSM Compaction"));
     assert!(queue_html.contains(">Read</a>"));
 
@@ -1787,7 +1791,33 @@ async fn test_web_csp_a11y_and_reader_link_existence() {
         read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
     assert!(articles_list_html.contains("Quick Logged Article"));
     assert!(!articles_list_html.contains(&format!("/reader/{}", quick_logged_art.id)));
-    assert!(articles_list_html.contains("<span class=\"sr-only\">Score "));
+    // Unranked lists omit empty Tier/Score columns until comparisons exist
+    assert!(!articles_list_html.contains("<span class=\"sr-only\">Score "));
+
+    let second_art = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Second Logged Article".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&second_art.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    db.catalog()
+        .append_comparison(
+            None,
+            &[vec![quick_logged_art.id.clone()], vec![second_art.id.clone()]],
+            None,
+        )
+        .await
+        .unwrap();
+    let ranked_articles_html =
+        read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
+    assert!(ranked_articles_html.contains("<span class=\"sr-only\">Score "));
 
     let manual_list = db
         .catalog()
@@ -2211,7 +2241,6 @@ async fn web_pages_include_core_accessibility_landmarks() {
         format!("/reader/{item_id}"),
         "/diary".to_owned(),
         "/queue".to_owned(),
-        "/rank".to_owned(),
         format!("/rank/{col_slug}"),
     ];
 
@@ -2395,9 +2424,10 @@ async fn test_round2_web_ux_panels_pills_and_roche_js_guards() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, _csrf) = login_browser(&db, &app).await;
 
-    // 1. Default-open panels on /feeds and /queue carry `data-default-open` and roche.js honors it
+    // 1. Subscribe rail on /feeds is directly visible (no unguarded `<details open>`) and default-open panel on /queue carries `data-default-open`
     let feeds_html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
-    assert!(feeds_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
+    assert!(feeds_html.contains("action=\"/web/feeds/create\""));
+    assert!(!feeds_html.contains("<details class=\"rail-details\" open>"));
     let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
     assert!(queue_html.contains("<details class=\"editorial-panel\" open data-default-open>"));
     assert!(super::ROCHE_JS.contains("details[open]:not([data-default-open])"));
@@ -2707,4 +2737,150 @@ fn test_flattened_flash_query_deserialization() {
     assert_eq!(rank_defaults.round, None);
     assert_eq!(rank_defaults.random, None);
     assert_eq!(rank_defaults.flash.notice, None);
+}
+
+#[tokio::test]
+async fn test_feeds_page_suppresses_paused_errors_and_separates_status_and_kind_filters() {
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, _csrf) = login_browser(&db, &app).await;
+
+    let active_url = Url::parse("https://active.example/rss.xml").unwrap();
+    let active = db
+        .feeds()
+        .create(FeedType::Rss, &active_url, Some("Active Broken Feed"), None)
+        .await
+        .unwrap();
+    db.feeds().mark_error(&active.id, "Upstream feed error: unable to parse feed").await.unwrap();
+
+    let paused_url = Url::parse("https://paused.example/podcast.xml").unwrap();
+    let paused = db
+        .feeds()
+        .create(FeedType::Podcast, &paused_url, Some("Paused Podcast"), None)
+        .await
+        .unwrap();
+    db.feeds().mark_error(&paused.id, "Upstream server returned HTTP 403 Forbidden").await.unwrap();
+    db.feeds().archive(&paused.id).await.unwrap();
+
+    let html = read_body_html(get_authed(&app, "/feeds", &cookie).await).await;
+    assert!(html.contains(">All (2)</button>"));
+    assert!(html.contains(">Active (1)</button>"));
+    assert!(html.contains(">Errors (1)</button>"));
+    assert!(html.contains(">Paused (1)</button>"));
+    assert!(html.contains("id=\"roche-feeds-kind\""));
+    assert!(html.contains("<option value=\"rss\">RSS (1)</option>"));
+    assert!(html.contains("<option value=\"podcast\">Podcasts (1)</option>"));
+    assert!(html.contains("unable to parse feed"));
+    assert!(!html.contains("HTTP 403 Forbidden"));
+    assert!(!html.contains(&format!("/web/feeds/{}/refresh", paused.id)));
+}
+
+#[tokio::test]
+async fn test_album_tracklist_enrichment_and_artist_discography_render() {
+    use crate::service::enrich::{
+        enrich_album_tracklist_with_fetcher, enrich_artist_detail_with_fetcher,
+        parse_itunes_artist_discography, parse_itunes_lookup_tracks, parse_spotify_embed_tracks,
+    };
+
+    let (db, app) = setup_web_app(Config::default()).await;
+    let (cookie, csrf) = login_browser(&db, &app).await;
+
+    let sp_html = r#"<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"title":"Come Together","subtitle":"The Beatles","duration":259000,"uri":"spotify:track:2EqlS6tkEnglzr7tkKAAYD"},{"title":"Something","subtitle":"The Beatles","duration":182000,"uri":"spotify:track:0pNeVovbiZHkulpGeOx1Gj"}]}}}}}}</script></html>"#;
+    let sp_tracks = parse_spotify_embed_tracks(sp_html);
+    assert_eq!(sp_tracks.len(), 2);
+    assert_eq!(sp_tracks[0].title, "Come Together");
+    assert_eq!(sp_tracks[0].duration_ms, Some(259_000));
+
+    let itunes_json = r#"{"results":[{"wrapperType":"collection"},{"wrapperType":"track","kind":"song","discNumber":1,"trackNumber":1,"trackName":"Hot Rats Theme","artistName":"Frank Zappa","trackTimeMillis":215000}]}"#;
+    let it_tracks = parse_itunes_lookup_tracks(itunes_json);
+    assert_eq!(it_tracks.len(), 1);
+    assert_eq!(it_tracks[0].title, "Hot Rats Theme");
+
+    let album = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Abbey Road".to_owned(),
+            creators: vec!["Beatles".to_owned()],
+            release_year: Some(1969),
+            thumbnail_url: Some("https://i.scdn.co/image/abbey".to_owned()),
+            identifiers: vec![crate::db::EntryIdentifier {
+                scheme: "spotify".to_owned(),
+                value: "spotify:album:0ETFjACtuP2ADo6LFhL6HN".to_owned(),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let svc = crate::service::RocheService::new(db.clone(), DummyWebFetcher, Config::default());
+    let mut detail = db.catalog().get_entry_detail(&album.id).await.unwrap().unwrap();
+    let mock_fetcher = |url: &Url| -> Option<String> {
+        if url.as_str().contains("open.spotify.com/embed/album/0ETFjACtuP2ADo6LFhL6HN") {
+            Some(sp_html.to_owned())
+        } else {
+            None
+        }
+    };
+    enrich_album_tracklist_with_fetcher(&svc, &mut detail, &mock_fetcher).await;
+
+    let album_html =
+        read_body_html(get_authed(&app, &format!("/entries/{}", album.id), &cookie).await).await;
+    assert!(album_html.contains("table class=\"tracklist\""));
+    assert!(album_html.contains("Come Together"));
+    assert!(album_html.contains("4:19"));
+    assert!(album_html.contains("https://open.spotify.com/track/2EqlS6tkEnglzr7tkKAAYD"));
+    assert!(album_html.contains("2 songs, 7 min 21 sec"));
+
+    let artists = db.catalog().find_artist_ids_by_names(&["Beatles".to_owned()]).await.unwrap();
+    let beatles_id = artists.get("beatles").expect("synthesized Beatles artist");
+    let artist_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(artist_html.contains("class=\"discography-grid\""));
+    assert!(artist_html.contains("Abbey Road"));
+    assert!(artist_html.contains("1969 &middot; Album"));
+
+    // Artist external discography enrichment + one-click "+ Add" to library
+    let itunes_discog = r#"{"results":[
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Abbey Road (Remastered)","releaseDate":"1969-09-26T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/100x100bb.jpg","collectionId":1441164426},
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Let It Be","releaseDate":"1970-05-08T07:00:00Z","artworkUrl100":"https://is1-ssl.mzstatic.com/image/letitbe/100x100bb.jpg","collectionId":1441164495},
+        {"wrapperType":"collection","collectionType":"Album","artistName":"The Beatles","collectionName":"Hey Jude - Single","releaseDate":"1968-08-26T07:00:00Z","collectionId":999}
+    ]}"#;
+    let parsed_discog = parse_itunes_artist_discography(itunes_discog, "Beatles");
+    assert_eq!(parsed_discog.len(), 2);
+    assert_eq!(parsed_discog[0].title, "Let It Be");
+    assert_eq!(parsed_discog[0].release_year, Some(1970));
+
+    let mut artist_detail = db.catalog().get_entry_detail(beatles_id).await.unwrap().unwrap();
+    let discog_fetcher = |url: &Url| -> Option<String> {
+        if url.as_str().contains("itunes.apple.com/search") {
+            Some(itunes_discog.to_owned())
+        } else {
+            None
+        }
+    };
+    enrich_artist_detail_with_fetcher(&svc, &mut artist_detail, &discog_fetcher).await;
+
+    let enriched_artist_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(enriched_artist_html.contains("1 of 2 in library"));
+    assert!(enriched_artist_html.contains("discography-card-external"));
+    assert!(enriched_artist_html.contains("Let It Be"));
+
+    let add_resp = post_form(
+        &app,
+        &format!("/web/entries/{beatles_id}/add-album"),
+        &cookie,
+        &[
+            ("_csrf", &csrf),
+            ("title", "Let It Be"),
+            ("release_year", "1970"),
+            ("apple_music_id", "1441164495"),
+        ],
+    )
+    .await;
+    assert_eq!(add_resp.status(), StatusCode::SEE_OTHER);
+    let after_add_html =
+        read_body_html(get_authed(&app, &format!("/entries/{beatles_id}"), &cookie).await).await;
+    assert!(!after_add_html.contains("discography-card-external"));
+    assert!(after_add_html.contains("Let It Be"));
 }
