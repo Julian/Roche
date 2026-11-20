@@ -362,8 +362,8 @@ fn render_in_progress_section(out: &mut String, unread_items: &[Item]) {
     }
 
     out.push_str(
-        "<div class=\"section-head\"><h2>Continue Reading &amp; Listening</h2>\
-         <a class=\"section-action\" href=\"/inbox\">Inbox &rarr;</a></div>\n\
+        "<div class=\"section-head section-head-link\"><h2><a class=\"section-head-anchor\" href=\"/inbox\">Continue Reading &amp; Listening</a></h2>\
+         <span class=\"section-action\" aria-hidden=\"true\">Inbox &rarr;</span></div>\n\
          <ul class=\"inbox-list mb-lg\">\n",
     );
     for item in in_progress {
@@ -409,8 +409,8 @@ fn render_want_to_read_section(
     let _ = writeln!(
         out,
         "<section class=\"rail-block rail-card\">\n\
-         <div class=\"section-head\"><h2>Queue ({total_count})</h2>\
-         <a class=\"section-action\" href=\"/queue\">All Queues &rarr;</a></div>"
+         <div class=\"section-head section-head-link\"><h2><a class=\"section-head-anchor\" href=\"/queue\">Queue ({total_count})</a></h2>\
+         <span class=\"section-action\" aria-hidden=\"true\">All Queues &rarr;</span></div>"
     );
     let _ = write!(
         out,
@@ -484,8 +484,8 @@ fn render_want_to_read_section(
 fn render_unread_summary_section(out: &mut String, items: &[Item], total_unread: i64, csrf: &str) {
     let _ = writeln!(
         out,
-        "<div class=\"section-head\"><h2>Feed Inbox ({total_unread})</h2>\
-         <a class=\"section-action\" href=\"/inbox\">Open Feed Inbox &rarr;</a></div>"
+        "<div class=\"section-head section-head-link\"><h2><a class=\"section-head-anchor\" href=\"/inbox\">Feed Inbox ({total_unread})</a></h2>\
+         <span class=\"section-action\" aria-hidden=\"true\">Open Feed Inbox &rarr;</span></div>"
     );
     if items.is_empty() {
         out.push_str(
@@ -634,8 +634,8 @@ fn render_recent_diary_section(
 ) {
     out.push_str(
         "<section class=\"rail-block\">\n\
-         <div class=\"section-head\"><h2>Recent Diary</h2>\
-         <a class=\"section-action\" href=\"/diary\">Full Diary &rarr;</a></div>\n",
+         <div class=\"section-head section-head-link\"><h2><a class=\"section-head-anchor\" href=\"/diary\">Recent Diary</a></h2>\
+         <span class=\"section-action\" aria-hidden=\"true\">Full Diary &rarr;</span></div>\n",
     );
     if diary.is_empty() {
         out.push_str(

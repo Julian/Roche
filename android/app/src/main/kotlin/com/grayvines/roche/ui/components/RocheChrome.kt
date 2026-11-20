@@ -629,26 +629,28 @@ internal fun RocheSectionHeader(
     onActionClick: (() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
-    if (actionLabel == null || onActionClick == null) {
+    if (onActionClick == null) {
         Box(modifier = modifier.padding(horizontal = 2.dp)) {
             SectionHeaderLabelGroup(label = label, badgeText = badgeText)
         }
         return
     }
-    val actionMod =
-        Modifier.minimumInteractiveComponentSize()
+    val rowMod =
+        modifier
+            .fillMaxWidth()
+            .minimumInteractiveComponentSize()
             .clip(RoundedCornerShape(6.dp))
             .clickable(onClick = onActionClick)
             .semantics { role = Role.Button }
-            .padding(horizontal = 4.dp, vertical = 2.dp)
+            .padding(horizontal = 4.dp, vertical = 4.dp)
             .let { base -> if (actionTestTag != null) base.testTag(actionTestTag) else base }
     Row(
-        modifier = modifier.fillMaxWidth().padding(horizontal = 2.dp),
+        modifier = rowMod,
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         SectionHeaderLabelGroup(label = label, badgeText = badgeText)
-        Box(contentAlignment = Alignment.Center, modifier = actionMod) {
+        if (!actionLabel.isNullOrBlank()) {
             Text(
                 text = actionLabel,
                 color = colors.accentBlue,

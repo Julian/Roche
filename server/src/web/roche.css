@@ -479,6 +479,26 @@ a:hover {
   color: var(--accent);
 }
 
+.section-head-link {
+  position: relative;
+}
+
+.section-head-anchor {
+  color: inherit;
+  text-decoration: none;
+}
+
+.section-head-anchor::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.section-head-link:hover .section-head-anchor,
+.section-head-link:hover .section-action {
+  color: var(--accent);
+}
+
 /* --- Flash Banners --- */
 
 .notice {
