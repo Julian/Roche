@@ -14,13 +14,13 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        FlashQuery, NavSection, PageShell, esc, rank_collection_href, redirect_see_other,
-        redirect_with_flash, render_page, urlencode, web_api_error_response,
+        FlashQuery, NavSection, PageShell, esc, redirect_see_other, redirect_with_flash,
+        render_page, safe_external_href, urlencode, web_api_error_response,
     },
     links::{load_artist_id_by_lower_name, render_creator_links, web_primary_open_url},
 };
 use crate::{
-    db::{CatalogEntry, ClusterSelectFilter, CollectionRole, CollectionSummary},
+    db::{CatalogEntry, ClusterSelectFilter, RankedCollectionView},
     error::ApiError,
     scheduler::FeedFetcher,
     service::RocheService,
@@ -28,6 +28,10 @@ use crate::{
 
 const MAX_FOCUSED_ROUNDS: usize = 5;
 const MAX_COVERED_CLUSTERS: usize = 12;
+
+const GRIP_SVG: &str = "<svg class=\"rank-grip-icon\" viewBox=\"0 0 12 18\" fill=\"currentColor\" aria-hidden=\"true\"><circle cx=\"3.5\" cy=\"4\" r=\"1.25\"/><circle cx=\"8.5\" cy=\"4\" r=\"1.25\"/><circle cx=\"3.5\" cy=\"9\" r=\"1.25\"/><circle cx=\"8.5\" cy=\"9\" r=\"1.25\"/><circle cx=\"3.5\" cy=\"14\" r=\"1.25\"/><circle cx=\"8.5\" cy=\"14\" r=\"1.25\"/></svg>";
+
+const EXT_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M6.5 3.5H3.5v9h9v-3\"/><path d=\"M9.5 3.5h3v3\"/><path d=\"M8 8l4.5-4.5\"/></svg>";
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct RankSessionQuery {
@@ -41,112 +45,14 @@ pub(super) struct RankSessionQuery {
     pub err: Option<String>,
 }
 
-pub(super) async fn rank_picker_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
-    Extension(session): Extension<WebSession>,
-    Query(flash): Query<FlashQuery>,
-) -> Response {
-    let collections = match service.catalog().list_collections(true, false).await {
-        Ok(c) => c,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
-
-    let quality_lists: Vec<&CollectionSummary> = collections
-        .iter()
-        .filter(|c| c.role != CollectionRole::Want && c.member_count >= 2)
-        .collect();
-    let want_queues: Vec<&CollectionSummary> = collections
-        .iter()
-        .filter(|c| c.role == CollectionRole::Want && c.member_count >= 2)
-        .collect();
-
-    let mut body = String::with_capacity(4_096);
-    body.push_str(
-        "<h2>Compare &amp; Rank</h2>\n\
-         <p class=\"lede\">Select a collection to refine via active-learning k-way comparisons (keyboard <code>j/k</code>, <code>J/K</code>, <code>1&ndash;5</code>, <code>=</code>, <code>t</code>, <code>s</code>, <code>Enter</code> or touch/mouse).</p>\n",
-    );
-
-    if quality_lists.is_empty() && want_queues.is_empty() {
-        body.push_str(
-            "<p class=\"empty\">At least two works are needed in a list or Want queue before comparing. \
-             <a href=\"/queue\">Log works or add to a Want queue &rarr;</a></p>\n",
-        );
-    } else {
-        if !quality_lists.is_empty() {
-            body.push_str(
-                "<h3>Global Quality Lists</h3>\n\
-                 <table class=\"lists\">\n\
-                 <thead class=\"sr-only\"><tr>\
-                   <th scope=\"col\">List</th>\
-                   <th scope=\"col\">Works</th>\
-                   <th scope=\"col\">Comparisons</th>\
-                   <th scope=\"col\">Actions</th>\
-                 </tr></thead>\n\
-                 <tbody>\n",
-            );
-            for col in quality_lists {
-                let slug = col.slug.as_deref().unwrap_or(&col.id);
-                let _ = writeln!(
-                    body,
-                    "<tr>\
-                       <td class=\"name\"><a href=\"/rank/{s}\">{title}</a></td>\
-                       <td class=\"stat\">{m} works</td>\
-                       <td class=\"stat\">{c} comparisons</td>\
-                       <td class=\"stat\"><a class=\"btn btn-primary btn-small\" href=\"/rank/{s}\">Start Session</a></td>\
-                     </tr>",
-                    s = esc(&urlencode(slug)),
-                    title = esc(&col.title),
-                    m = col.member_count,
-                    c = col.comparison_count,
-                );
-            }
-            body.push_str("</tbody>\n</table>\n");
-        }
-
-        if !want_queues.is_empty() {
-            body.push_str(
-                "<h3>Want Queues (Local Priority)</h3>\n\
-                 <table class=\"lists\">\n\
-                 <thead class=\"sr-only\"><tr>\
-                   <th scope=\"col\">Queue</th>\
-                   <th scope=\"col\">Queued</th>\
-                   <th scope=\"col\">Comparisons</th>\
-                   <th scope=\"col\">Actions</th>\
-                 </tr></thead>\n\
-                 <tbody>\n",
-            );
-            for col in want_queues {
-                let raw_slug = col.slug.as_deref().unwrap_or(&col.id);
-                let href = rank_collection_href(raw_slug, true);
-                let _ = writeln!(
-                    body,
-                    "<tr>\
-                       <td class=\"name\"><a href=\"{href}\">{title}</a></td>\
-                       <td class=\"stat\">{m} queued</td>\
-                       <td class=\"stat\">{c} priority comparisons</td>\
-                       <td class=\"stat\"><a class=\"btn btn-small\" href=\"{href}\">Prioritize</a></td>\
-                     </tr>",
-                    href = esc(&href),
-                    title = esc(&col.title),
-                    m = col.member_count,
-                    c = col.comparison_count,
-                );
-            }
-            body.push_str("</tbody>\n</table>\n");
-        }
+pub(super) async fn rank_picker_get(Query(flash): Query<FlashQuery>) -> Response {
+    if let Some(err) = flash.err.as_deref().filter(|s| !s.is_empty()) {
+        return redirect_with_flash("/lists", "err", err);
     }
-
-    render_page(&PageShell {
-        title: "Rank",
-        active: NavSection::Rank,
-        csrf_token: &session.csrf_token,
-        flash: &flash,
-        is_refreshing: service.is_refreshing(),
-        body_html: &body,
-    })
-    .into_response()
+    if let Some(notice) = flash.notice.as_deref().filter(|s| !s.is_empty()) {
+        return redirect_with_flash("/lists", "notice", notice);
+    }
+    redirect_see_other("/lists")
 }
 
 pub(super) async fn rank_session_get<F: FeedFetcher>(
@@ -166,8 +72,8 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
         }
     };
 
-    let focus_is_member =
-        focus_clean.is_some_and(|fid| ranked_view.rows.iter().any(|r| r.entry.id == fid));
+    let focus_row = focus_clean.and_then(|fid| ranked_view.rows.iter().find(|r| r.entry.id == fid));
+    let focus_is_member = focus_row.is_some();
     let focus_missing_from_list = focus_clean.is_some() && !focus_is_member;
 
     let focus_ids: Vec<String> = if q.random == Some(1) || !focus_is_member {
@@ -215,13 +121,16 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
         let cluster_creators: Vec<String> =
             cluster.iter().flat_map(|e| e.creators.iter().cloned()).collect();
         let artist_links = load_artist_id_by_lower_name(&service, &cluster_creators).await;
+        let focus_title = focus_row.map(|r| r.entry.title.as_str());
         render_active_cluster_view(
             &mut body,
             &ActiveClusterCtx {
                 slug: &slug,
                 q: &q,
                 is_want: effective_want,
-                collection_title: &ranked_view.collection.title,
+                ranked_view: &ranked_view,
+                focus_id: if q.random == Some(1) { None } else { focus_clean },
+                focus_title: if q.random == Some(1) { None } else { focus_title },
                 cluster: &cluster,
                 artist_links: &artist_links,
                 csrf: &session.csrf_token,
@@ -230,9 +139,10 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
     }
 
     let flash = FlashQuery { notice: q.notice, err: q.err };
+    let active = if effective_want { NavSection::Queue } else { NavSection::Lists };
     render_page(&PageShell {
         title: &format!("Rank: {}", ranked_view.collection.title),
-        active: NavSection::Rank,
+        active,
         csrf_token: &session.csrf_token,
         flash: &flash,
         is_refreshing: service.is_refreshing(),
@@ -241,14 +151,35 @@ pub(super) async fn rank_session_get<F: FeedFetcher>(
     .into_response()
 }
 
+fn render_rank_breadcrumb(out: &mut String, slug: &str, want: bool, view: &RankedCollectionView) {
+    out.push_str("<nav class=\"rank-crumb\" aria-label=\"Breadcrumb\">\n");
+    if want {
+        let _ = writeln!(
+            out,
+            "<a href=\"/queue\">Queue</a> <span aria-hidden=\"true\">/</span> <span>{}</span>",
+            esc(&view.collection.title),
+        );
+    } else {
+        let list_slug = view.collection.slug.as_deref().unwrap_or(slug);
+        let _ = writeln!(
+            out,
+            "<a href=\"/lists\">Lists</a> <span aria-hidden=\"true\">/</span> <a href=\"/lists/{}\">{}</a>",
+            esc(&urlencode(list_slug)),
+            esc(&view.collection.title),
+        );
+    }
+    out.push_str("</nav>\n");
+}
+
 fn render_settled_rank_view(
     out: &mut String,
     slug: &str,
     want: bool,
     focus_id: Option<&str>,
     round: usize,
-    ranked_view: &crate::db::RankedCollectionView,
+    ranked_view: &RankedCollectionView,
 ) {
+    render_rank_breadcrumb(out, slug, want, ranked_view);
     let _ = writeln!(out, "<h2>{}</h2>", esc(&ranked_view.collection.title));
     out.push_str("<div class=\"settled-card\">\n");
 
@@ -312,7 +243,9 @@ struct ActiveClusterCtx<'a> {
     slug: &'a str,
     q: &'a RankSessionQuery,
     is_want: bool,
-    collection_title: &'a str,
+    ranked_view: &'a RankedCollectionView,
+    focus_id: Option<&'a str>,
+    focus_title: Option<&'a str>,
     cluster: &'a [CatalogEntry],
     artist_links: &'a HashMap<String, String>,
     csrf: &'a str,
@@ -320,18 +253,30 @@ struct ActiveClusterCtx<'a> {
 
 fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
     let round = ctx.q.round.unwrap_or(0);
-    let mode_label = if ctx.is_want { "Local Queue Priority" } else { "Global Quality" };
+    let round_label = if ctx.focus_title.is_some() {
+        format!("Round {} of {MAX_FOCUSED_ROUNDS}", round + 1)
+    } else if ctx.is_want {
+        format!("Queue Priority &middot; Round {}", round + 1)
+    } else {
+        format!("Round {}", round + 1)
+    };
+    let heading_verb = if ctx.is_want { "Prioritize" } else { "Rank" };
+    let lede = if ctx.is_want {
+        "Drag cards to order from <strong>#1</strong> (next up) to last &mdash; drop one onto another to <strong>tie side-by-side</strong>."
+    } else {
+        "Drag cards to order from <strong>#1</strong> (best) to worst &mdash; drop one onto another to <strong>tie side-by-side</strong>."
+    };
+
+    out.push_str("<div class=\"rank-session-grid\">\n<section class=\"rank-session-main\" aria-label=\"Comparison board\">\n");
+    render_rank_breadcrumb(out, ctx.slug, ctx.is_want, ctx.ranked_view);
     let _ = writeln!(
         out,
-        "<div class=\"page-head\">\
-           <h2>{}</h2>\
-           <span class=\"badge\">{} &middot; Round {}</span>\
+        "<div class=\"rank-session-head\">\n\
+           <h2>{heading_verb} {}</h2>\n\
+           <span class=\"rank-round-pill\">{round_label}</span>\n\
          </div>\n\
-         <p class=\"lede\">Order from best (#1) to worst (#{}). Mark genuinely equal works with <strong>= Tie</strong>.</p>",
-        esc(ctx.collection_title),
-        mode_label,
-        round + 1,
-        ctx.cluster.len(),
+         <p class=\"rank-session-lede\">{lede}</p>",
+        esc(&ctx.ranked_view.collection.title),
     );
 
     let default_groups: Vec<Vec<&str>> = ctx.cluster.iter().map(|e| vec![e.id.as_str()]).collect();
@@ -349,7 +294,7 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
            <input type=\"hidden\" name=\"ordering_json\" value=\"{ord_json}\">\n\
            <div id=\"rank-live-status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\" aria-atomic=\"true\"></div>\n\
-           <ul class=\"rank-board js-rank-list\" aria-label=\"Ranking comparison board\">\n",
+           <ol class=\"rank-board js-rank-list\" aria-label=\"Ranking comparison board\">\n",
         slug_enc = esc(&urlencode(ctx.slug)),
         csrf = esc(ctx.csrf),
         want = if ctx.is_want { "true" } else { "false" },
@@ -359,14 +304,18 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
     );
 
     for (idx, item) in ctx.cluster.iter().enumerate() {
-        render_cluster_card(out, idx, item, ctx.cluster.len(), ctx.artist_links);
+        let is_focus = ctx.focus_id == Some(item.id.as_str());
+        render_cluster_card(out, idx, item, ctx.cluster.len(), is_focus, ctx.artist_links);
     }
 
     out.push_str(
-        "</ul>\n\
-         <div class=\"flex-row flex-center\">\n\
-           <button type=\"submit\" class=\"btn btn-primary\">Submit Comparison</button>\n\
-           <button type=\"button\" class=\"btn js-rank-tie-all\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie All</button>\n\
+        "</ol>\n\
+         <div class=\"rank-action-bar\">\n\
+           <div class=\"rank-action-primary\">\n\
+             <button type=\"submit\" class=\"btn btn-primary\">Submit Comparison</button>\n\
+             <button type=\"button\" class=\"btn js-rank-tie-all\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie All</button>\n\
+           </div>\n\
+           <button type=\"submit\" form=\"rank-skip-form\" class=\"btn btn-small btn-ghost btn-quiet rank-skip-btn\" title=\"Skip this round (s)\"><span>Skip</span><kbd aria-hidden=\"true\">s</kbd></button>\n\
          </div>\n\
          </form>\n",
     );
@@ -374,21 +323,90 @@ fn render_active_cluster_view(out: &mut String, ctx: &ActiveClusterCtx<'_>) {
     // Skip form (GET to next round with covered signature recorded so cluster doesn't immediately repeat)
     let _ = write!(
         out,
-        "<form method=\"get\" action=\"/rank/{slug_enc}\" class=\"js-rank-skip-form mt-sm\">\n\
+        "<form id=\"rank-skip-form\" method=\"get\" action=\"/rank/{slug_enc}\" class=\"js-rank-skip-form\">\n\
            <input type=\"hidden\" name=\"want\" value=\"{want}\">\n\
            <input type=\"hidden\" name=\"focus\" value=\"{focus}\">\n\
            <input type=\"hidden\" name=\"round\" value=\"{next_round}\">\n\
            <input type=\"hidden\" name=\"random\" value=\"1\">\n\
            <input type=\"hidden\" name=\"covered\" value=\"{covered}\">\n\
-           <button type=\"submit\" class=\"btn btn-small btn-ghost\">Skip Cluster (s)</button>\n\
          </form>\n\
-         <p class=\"rank-shortcuts\">Shortcuts (when board focused): j/k select &middot; J/K move &middot; 1&ndash;{k} jump &middot; = tie &middot; t tie all &middot; s skip &middot; o open link &middot; Enter submit</p>\n",
+         </section>\n",
         slug_enc = esc(&urlencode(ctx.slug)),
         want = if ctx.is_want { "true" } else { "false" },
         focus = esc(ctx.q.focus.as_deref().unwrap_or("")),
         next_round = round + 1,
         covered = esc(&next_covered),
-        k = ctx.cluster.len(),
+    );
+
+    render_rank_session_rail(out, ctx, round);
+    out.push_str("</div>\n");
+}
+
+fn render_rank_session_rail(out: &mut String, ctx: &ActiveClusterCtx<'_>, round: usize) {
+    let total_items = ctx.ranked_view.rows.len();
+    let comp_count = ctx.ranked_view.comparison_count;
+    let item_word = if total_items == 1 { "item" } else { "items" };
+    let comp_word = if comp_count == 1 { "comparison" } else { "comparisons" };
+    let k = ctx.cluster.len();
+
+    out.push_str("<div class=\"rank-session-rail\">\n<section class=\"rail-block rail-card\">\n<div class=\"section-head\"><h3>Session</h3></div>\n");
+    let _ = writeln!(
+        out,
+        "<p class=\"rank-rail-meta\">{total_items} {item_word} &middot; {comp_count} {comp_word}</p>",
+    );
+
+    if let Some(focus_title) = ctx.focus_title {
+        let cur_round = (round + 1).min(MAX_FOCUSED_ROUNDS);
+        let _ = writeln!(
+            out,
+            "<div class=\"rank-focus-box\">\n\
+               <div class=\"rank-focus-kicker\">Placing &middot; Round {cur_round} of {MAX_FOCUSED_ROUNDS}</div>\n\
+               <div class=\"rank-focus-title\">{}</div>\n\
+               <progress class=\"sleeve-progress rank-focus-progress\" value=\"{cur_round}\" max=\"{MAX_FOCUSED_ROUNDS}\"></progress>\n\
+             </div>",
+            esc(focus_title),
+        );
+    }
+
+    out.push_str("<div class=\"rank-rail-links\">\n");
+    if ctx.is_want {
+        out.push_str("<a href=\"/queue\"><span>Back to Queue</span><span aria-hidden=\"true\">&rarr;</span></a>\n");
+    } else {
+        let list_slug = ctx.ranked_view.collection.slug.as_deref().unwrap_or(ctx.slug);
+        let _ = writeln!(
+            out,
+            "<a href=\"/lists/{}\"><span>View Ranked List</span><span aria-hidden=\"true\">&rarr;</span></a>",
+            esc(&urlencode(list_slug)),
+        );
+    }
+    out.push_str(
+        "<a href=\"/lists\"><span>All Lists</span><span aria-hidden=\"true\">&rarr;</span></a>\n\
+         </div>\n</section>\n",
+    );
+
+    let _ = writeln!(
+        out,
+        "<section class=\"rail-block rail-card\">\n\
+           <div class=\"section-head\"><h3>How to Order</h3></div>\n\
+           <ul class=\"rank-tips-list\">\n\
+             <li><strong>Reorder:</strong> drag a card between rows (or use &uarr; / &darr;).</li>\n\
+             <li><strong>Tie:</strong> drop a card directly onto another row to place them side-by-side.</li>\n\
+             <li><strong>Untie:</strong> drag a card to the top or bottom edge, or click <em>Untie</em>.</li>\n\
+           </ul>\n\
+           <details class=\"rank-kbd-details\">\n\
+             <summary>Keyboard shortcuts</summary>\n\
+             <dl class=\"rank-kbd-list\">\n\
+               <dt><kbd>j</kbd><kbd>k</kbd></dt><dd>Select item</dd>\n\
+               <dt><kbd>J</kbd><kbd>K</kbd></dt><dd>Move up / down</dd>\n\
+               <dt><kbd>1</kbd>&ndash;<kbd>{k}</kbd></dt><dd>Jump to rank</dd>\n\
+               <dt><kbd>=</kbd></dt><dd>Tie / untie</dd>\n\
+               <dt><kbd>t</kbd></dt><dd>Tie all</dd>\n\
+               <dt><kbd>s</kbd></dt><dd>Skip round</dd>\n\
+               <dt><kbd>o</kbd></dt><dd>Open link</dd>\n\
+               <dt><kbd>Enter</kbd></dt><dd>Submit</dd>\n\
+             </dl>\n\
+           </details>\n\
+         </section>\n</div>",
     );
 }
 
@@ -397,6 +415,7 @@ fn render_cluster_card(
     idx: usize,
     item: &CatalogEntry,
     cluster_len: usize,
+    is_focus: bool,
     artist_links: &HashMap<String, String>,
 ) {
     let rank_num = idx + 1;
@@ -406,24 +425,73 @@ fn render_cluster_card(
 
     let _ = write!(
         out,
-        "<li class=\"rank-card js-rank-card{sel_cls}\" tabindex=\"0\"{aria_cur} data-entry-id=\"{id}\" data-title=\"{title}\" data-tied=\"0\" data-open-url=\"{open_url}\">\n\
-           <div class=\"rank-left\">\n\
+        "<li class=\"rank-bucket\" data-bucket-index=\"{idx}\">\n\
+           <div class=\"rank-bucket-gutter\" aria-hidden=\"true\">\n\
              <span class=\"rank-pos js-rank-pos\">#{rank_num}</span>\n\
-             <div>\n\
-               <strong><a href=\"/entries/{id_enc}\" target=\"_blank\" rel=\"noopener\">{title}</a></strong>",
+             <span class=\"rank-tie-tag\">tie</span>\n\
+           </div>\n\
+           <div class=\"rank-bucket-cards\">\n\
+             <div class=\"rank-card js-rank-card{sel_cls}\" tabindex=\"0\" draggable=\"true\"{aria_cur} data-entry-id=\"{id}\" data-title=\"{title}\" data-tied=\"0\" data-open-url=\"{open_url}\">\n\
+               <div class=\"rank-left\">\n\
+                 <span class=\"rank-grip\" aria-hidden=\"true\" title=\"Drag to reorder or drop onto another card to tie\">{GRIP_SVG}</span>\n",
         id = esc(&item.id),
         open_url = esc(&open_url),
+        title = esc(&item.title),
+    );
+
+    if let Some(thumb) = item.thumbnail_url.as_deref().and_then(safe_external_href) {
+        let _ = writeln!(
+            out,
+            "<img class=\"rank-thumb\" src=\"{}\" alt=\"\" loading=\"lazy\" draggable=\"false\">",
+            esc(thumb),
+        );
+    } else {
+        let initial = item
+            .title
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map_or('?', |c| c.to_ascii_uppercase());
+        let _ = writeln!(
+            out,
+            "<span class=\"rank-thumb-fallback\" aria-hidden=\"true\">{initial}</span>",
+        );
+    }
+
+    let _ = write!(
+        out,
+        "<div class=\"rank-meta\">\n\
+           <div class=\"rank-title-row\">\n\
+             <strong><a href=\"/entries/{id_enc}\" target=\"_blank\" rel=\"noopener\" draggable=\"false\">{title}</a></strong>",
         id_enc = esc(&urlencode(&item.id)),
         title = esc(&item.title),
     );
-    if !item.creators.is_empty() {
-        out.push_str(" <span class=\"text-soft\">&mdash; ");
-        render_creator_links(out, &item.creators, artist_links, true);
-        out.push_str("</span>");
+    if is_focus {
+        out.push_str(" <span class=\"rank-focus-pill\">Placing</span>");
     }
-    if let Some(yr) = item.release_year {
-        let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
+    out.push_str("</div>\n");
+
+    let has_sub = !item.creators.is_empty()
+        || item.release_year.is_some()
+        || safe_external_href(&open_url).is_some();
+    if has_sub {
+        out.push_str("<div class=\"rank-sub\">");
+        if !item.creators.is_empty() {
+            render_creator_links(out, &item.creators, artist_links, true);
+        }
+        if let Some(yr) = item.release_year {
+            let _ = write!(out, " <span>({yr})</span>");
+        }
+        if let Some(href) = safe_external_href(&open_url) {
+            let _ = write!(
+                out,
+                " <a class=\"rank-ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener\" draggable=\"false\" title=\"Open link (o)\" aria-label=\"Open {} external link\">{EXT_SVG}</a>",
+                esc(href),
+                esc(&item.title),
+            );
+        }
+        out.push_str("</div>\n");
     }
+
     out.push_str("</div>\n</div>\n<div class=\"rank-controls\">\n");
 
     let _ = write!(
@@ -441,10 +509,10 @@ fn render_cluster_card(
     let tie_disabled = if idx == 0 { " disabled" } else { "" };
     let _ = writeln!(
         out,
-        "<button type=\"button\" class=\"btn btn-small js-card-up\" title=\"Move Up (K)\" aria-label=\"Move {title} up\"><span aria-hidden=\"true\">&uarr;</span></button>\
-         <button type=\"button\" class=\"btn btn-small js-card-down\" title=\"Move Down (J)\" aria-label=\"Move {title} down\"><span aria-hidden=\"true\">&darr;</span></button>\
+        "<button type=\"button\" class=\"btn btn-small btn-ghost js-card-up\" title=\"Move Up (K)\" aria-label=\"Move {title} up\"><span aria-hidden=\"true\">&uarr;</span></button>\
+         <button type=\"button\" class=\"btn btn-small btn-ghost js-card-down\" title=\"Move Down (J)\" aria-label=\"Move {title} down\"><span aria-hidden=\"true\">&darr;</span></button>\
          <button type=\"button\" class=\"btn btn-small btn-ghost js-card-tie\"{tie_disabled} title=\"Tie with above (=)\" aria-label=\"Tie {title} with above\" aria-pressed=\"false\"><span aria-hidden=\"true\">=</span> Tie</button>\
-         </div>\n</li>",
+         </div>\n</div>\n</div>\n</li>",
         title = esc(&item.title),
     );
 }

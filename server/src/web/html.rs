@@ -271,7 +271,6 @@ pub(super) enum NavSection {
     Starred,
     Feeds,
     Lists,
-    Rank,
     Diary,
     Queue,
     None,
@@ -287,7 +286,6 @@ impl NavSection {
             Self::Lists => "/lists",
             Self::Queue => "/queue",
             Self::Diary => "/diary",
-            Self::Rank => "/rank",
         }
     }
 }
@@ -307,7 +305,7 @@ pub(super) struct PageShell<'a> {
     pub body_html: &'a str,
 }
 
-const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
+const NAV_ITEMS: [(NavSection, &str, &str); 7] = [
     (NavSection::Home, "/", "Home"),
     (NavSection::Inbox, "/inbox", "Inbox"),
     (NavSection::Starred, "/starred", "Starred"),
@@ -315,7 +313,6 @@ const NAV_ITEMS: [(NavSection, &str, &str); 8] = [
     (NavSection::Lists, "/lists", "Lists"),
     (NavSection::Queue, "/queue", "Queue"),
     (NavSection::Diary, "/diary", "Diary"),
-    (NavSection::Rank, "/rank", "Rank"),
 ];
 
 pub(super) fn render_page(shell: &PageShell<'_>) -> Html<String> {

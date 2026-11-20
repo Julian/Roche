@@ -105,7 +105,7 @@ pub fn router<F: FeedFetcher>(service: Arc<RocheService<F>>) -> Router<Arc<Roche
             post(views_catalog::post_want_complete::<F>),
         )
         .route("/web/want/{queue}/remove/{entry_id}", post(views_catalog::post_want_remove::<F>))
-        .route("/rank", get(views_rank::rank_picker_get::<F>))
+        .route("/rank", get(views_rank::rank_picker_get))
         .route(
             "/rank/{slug}",
             get(views_rank::rank_session_get::<F>).post(views_rank::rank_session_post::<F>),

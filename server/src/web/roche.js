@@ -648,7 +648,7 @@
     };
   };
 
-  /* --- 3. Interactive k-Way Ranking Board (Explicit Tie-Bucket Model) --- */
+  /* --- 3. Interactive k-Way Ranking Board (Side-by-Side Tie Buckets + Drag & Drop) --- */
   let rankKeyCleanup = null;
   const initRankBoard = () => {
     if (rankKeyCleanup) {
@@ -675,6 +675,8 @@
       }
     }
     let selectedCard = initialCards[0];
+    let draggedCard = null;
+    let dropTarget = null;
 
     const flatCards = () => buckets.flat();
 
@@ -698,53 +700,104 @@
     const cardTitle = (card) =>
       card?.getAttribute("data-title") || card?.querySelector("strong")?.textContent?.trim() || "Item";
 
+    const clearDropHints = () => {
+      dropTarget = null;
+      for (const el of list.querySelectorAll(".rank-bucket")) {
+        el.classList.remove("is-drop-before", "is-drop-after", "is-drop-tie");
+      }
+    };
+
+    const syncSelection = (announcement = "") => {
+      for (const card of flatCards()) {
+        const isSelected = card === selectedCard;
+        card.classList.toggle("is-selected", isSelected);
+        if (isSelected) {
+          card.setAttribute("aria-current", "true");
+        } else {
+          card.removeAttribute("aria-current");
+        }
+      }
+      if (announcement) announce(announcement);
+    };
+
     const syncBoard = (announcement = "") => {
       const previouslyFocused = document.activeElement;
       const shouldRestoreFocus = Boolean(previouslyFocused && list.contains(previouslyFocused));
       const groups = [];
       let flatIdx = 0;
-      for (const bucket of buckets) {
-        if (bucket.length === 0) continue;
+      const frag = document.createDocumentFragment();
+
+      buckets = buckets.filter((b) => b.length > 0);
+
+      for (const [bIdx, bucket] of buckets.entries()) {
         const displayRank = flatIdx + 1;
+        const isTiedBucket = bucket.length > 1;
         const ids = [];
+
+        const bucketEl = document.createElement("li");
+        bucketEl.className = `rank-bucket${isTiedBucket ? " is-tied-bucket" : ""}`;
+        bucketEl.dataset.bucketIndex = String(bIdx);
+
+        const gutter = document.createElement("div");
+        gutter.className = "rank-bucket-gutter";
+        gutter.setAttribute("aria-hidden", "true");
+
+        const posEl = document.createElement("span");
+        posEl.className = "rank-pos js-rank-pos";
+        posEl.textContent = `#${displayRank}`;
+
+        const tieTag = document.createElement("span");
+        tieTag.className = "rank-tie-tag";
+        tieTag.textContent = "tie";
+
+        gutter.append(posEl, tieTag);
+
+        const cardsWrap = document.createElement("div");
+        cardsWrap.className = "rank-bucket-cards";
+
         for (const [idxInBucket, card] of bucket.entries()) {
-          if (list.children[flatIdx] !== card) {
-            list.insertBefore(card, list.children[flatIdx] || null);
-          }
-          const tied = idxInBucket > 0;
+          const tiedAfterFirst = idxInBucket > 0;
           const isSelected = card === selectedCard;
-          card.setAttribute("data-tied", tied ? "1" : "0");
-          card.classList.toggle("is-tied", tied);
+          card.setAttribute("data-tied", tiedAfterFirst ? "1" : "0");
+          card.classList.toggle("is-tied", isTiedBucket);
           card.classList.toggle("is-selected", isSelected);
           if (isSelected) {
             card.setAttribute("aria-current", "true");
           } else {
             card.removeAttribute("aria-current");
           }
-          const posEl = card.querySelector(".js-rank-pos");
-          if (posEl) posEl.textContent = `${tied ? "= " : ""}#${displayRank}`;
           const tieBtn = card.querySelector(".js-card-tie");
           if (tieBtn) {
             const title = cardTitle(card);
-            tieBtn.disabled = flatIdx === 0;
+            tieBtn.disabled = !isTiedBucket && bIdx === 0;
             tieBtn.replaceChildren();
-            if (tied) {
+            if (isTiedBucket) {
               tieBtn.append(document.createTextNode("Untie"));
-              tieBtn.setAttribute("aria-label", `Untie ${title} from above`);
+              tieBtn.setAttribute("aria-label", `Untie ${title}`);
+              tieBtn.setAttribute("aria-pressed", "true");
+              tieBtn.title = "Split into its own rank (=)";
             } else {
               const eqSpan = document.createElement("span");
               eqSpan.setAttribute("aria-hidden", "true");
               eqSpan.textContent = "=";
               tieBtn.append(eqSpan, document.createTextNode(" Tie"));
               tieBtn.setAttribute("aria-label", `Tie ${title} with above`);
+              tieBtn.setAttribute("aria-pressed", "false");
+              tieBtn.title = "Tie with rank above (=)";
             }
-            tieBtn.setAttribute("aria-pressed", tied ? "true" : "false");
           }
+          cardsWrap.appendChild(card);
           ids.push(card.getAttribute("data-entry-id"));
           flatIdx += 1;
         }
+
+        bucketEl.append(gutter, cardsWrap);
+        frag.appendChild(bucketEl);
         groups.push(ids);
       }
+
+      list.replaceChildren(frag);
+
       if (tieAllBtn) {
         const allTied = buckets.length === 1 && flatIdx > 1;
         tieAllBtn.setAttribute("aria-pressed", allTied ? "true" : "false");
@@ -837,14 +890,14 @@
       const coords = findCoords(card);
       if (!coords) return;
       let msg = "";
-      if (coords.i > 0) {
-        const tail = buckets[coords.b].splice(coords.i);
-        buckets.splice(coords.b + 1, 0, tail);
-        msg = `Untied ${cardTitle(card)} from above`;
+      if (buckets[coords.b].length > 1) {
+        buckets[coords.b].splice(coords.i, 1);
+        buckets.splice(coords.b + 1, 0, [card]);
+        msg = `Untied ${cardTitle(card)}`;
       } else if (coords.b > 0) {
         const [cur] = buckets.splice(coords.b, 1);
         buckets[coords.b - 1] = buckets[coords.b - 1].concat(cur);
-        msg = `Tied ${cardTitle(card)} with above`;
+        msg = `Tied ${cardTitle(card)} side-by-side with rank above`;
       }
       selectedCard = card;
       syncBoard(msg);
@@ -858,11 +911,131 @@
       syncBoard(untying ? "Untied all items" : "Tied all items");
     };
 
+    const applyDrop = (card, targetBucketIdx, mode) => {
+      const src = findCoords(card);
+      if (!src) return;
+      const srcWasSolo = buckets[src.b].length === 1;
+      if (mode === "tie" && src.b === targetBucketIdx) return;
+      if (srcWasSolo && src.b === targetBucketIdx) return;
+
+      buckets[src.b].splice(src.i, 1);
+      let adjustedTarget = targetBucketIdx;
+      if (buckets[src.b].length === 0) {
+        buckets.splice(src.b, 1);
+        if (src.b < adjustedTarget) adjustedTarget -= 1;
+      }
+      adjustedTarget = Math.max(0, Math.min(buckets.length - 1, adjustedTarget));
+
+      if (mode === "tie") {
+        buckets[adjustedTarget].push(card);
+        selectedCard = card;
+        syncBoard(`Tied ${cardTitle(card)} side-by-side`);
+      } else if (mode === "before") {
+        buckets.splice(adjustedTarget, 0, [card]);
+        selectedCard = card;
+        syncBoard(`Moved ${cardTitle(card)} above`);
+      } else {
+        buckets.splice(adjustedTarget + 1, 0, [card]);
+        selectedCard = card;
+        syncBoard(`Moved ${cardTitle(card)} below`);
+      }
+    };
+
+    list.addEventListener("dragstart", (ev) => {
+      if (ev.target?.closest?.("a, button")) {
+        ev.preventDefault();
+        return;
+      }
+      const card = ev.target?.closest?.(".js-rank-card");
+      if (!card) return;
+      draggedCard = card;
+      selectedCard = card;
+      card.classList.add("is-dragging");
+      if (ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", card.getAttribute("data-entry-id") || "");
+      }
+    });
+
+    list.addEventListener("dragover", (ev) => {
+      if (!draggedCard) return;
+      const bucketEl = ev.target?.closest?.(".rank-bucket");
+      if (!bucketEl) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+
+      const bIdx = Number.parseInt(bucketEl.dataset.bucketIndex || "0", 10);
+      const src = findCoords(draggedCard);
+      if (!src) return;
+      const srcSolo = buckets[src.b].length === 1;
+
+      const rect = bucketEl.getBoundingClientRect();
+      const relY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+
+      let mode = "tie";
+      if (relY < 0.27) {
+        mode = "before";
+      } else if (relY > 0.73) {
+        mode = "after";
+      } else if (src.b === bIdx) {
+        clearDropHints();
+        return;
+      }
+
+      if (srcSolo && src.b === bIdx) {
+        clearDropHints();
+        return;
+      }
+      if (srcSolo && mode === "before" && bIdx === src.b + 1) {
+        clearDropHints();
+        return;
+      }
+      if (srcSolo && mode === "after" && bIdx === src.b - 1) {
+        clearDropHints();
+        return;
+      }
+
+      if (dropTarget && dropTarget.bucketIndex === bIdx && dropTarget.mode === mode) {
+        return;
+      }
+
+      clearDropHints();
+      dropTarget = { bucketIndex: bIdx, mode };
+      bucketEl.classList.add(
+        mode === "before" ? "is-drop-before" : mode === "after" ? "is-drop-after" : "is-drop-tie"
+      );
+    });
+
+    list.addEventListener("dragleave", (ev) => {
+      if (!list.contains(ev.relatedTarget)) {
+        clearDropHints();
+      }
+    });
+
+    list.addEventListener("drop", (ev) => {
+      if (!draggedCard) return;
+      ev.preventDefault();
+      const card = draggedCard;
+      const target = dropTarget;
+      card.classList.remove("is-dragging");
+      draggedCard = null;
+      clearDropHints();
+      if (target) {
+        applyDrop(card, target.bucketIndex, target.mode);
+      }
+    });
+
+    list.addEventListener("dragend", () => {
+      if (draggedCard) draggedCard.classList.remove("is-dragging");
+      draggedCard = null;
+      clearDropHints();
+    });
+
     list.addEventListener("focusin", (ev) => {
       const card = ev.target?.closest?.(".js-rank-card");
       if (card && card !== selectedCard) {
         selectedCard = card;
-        syncBoard();
+        syncSelection();
       }
     });
 
@@ -881,7 +1054,7 @@
         ev.preventDefault();
         toggleTieWithAbove(card);
       } else {
-        syncBoard();
+        syncSelection();
       }
     });
 
@@ -906,14 +1079,14 @@
       if (ev.key === "j" || (ev.key === "ArrowDown" && !ev.shiftKey)) {
         ev.preventDefault();
         selectedCard = cards[Math.min(cards.length - 1, curIdx + 1)];
-        syncBoard(`Selected ${cardTitle(selectedCard)}`);
+        syncSelection(`Selected ${cardTitle(selectedCard)}`);
         if (ev.target.classList?.contains("js-rank-card")) {
           selectedCard.focus({ preventScroll: true });
         }
       } else if (ev.key === "k" || (ev.key === "ArrowUp" && !ev.shiftKey)) {
         ev.preventDefault();
         selectedCard = cards[Math.max(0, curIdx - 1)];
-        syncBoard(`Selected ${cardTitle(selectedCard)}`);
+        syncSelection(`Selected ${cardTitle(selectedCard)}`);
         if (ev.target.classList?.contains("js-rank-card")) {
           selectedCard.focus({ preventScroll: true });
         }
@@ -933,7 +1106,7 @@
           const newIdx = afterCards.indexOf(moved);
           if (newIdx !== -1 && newIdx + 1 < afterCards.length) {
             selectedCard = afterCards[newIdx + 1];
-            syncBoard();
+            syncSelection();
           }
         }
       } else if (ev.key === "=") {

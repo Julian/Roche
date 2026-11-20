@@ -183,13 +183,17 @@ async fn test_web_static_login_csrf_and_logout_revocation() {
     assert_eq!(unauth.headers().get(header::LOCATION).unwrap(), "/login");
 
     let (cookie, csrf) = login_browser(&db, &app).await;
-    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue", "/rank"] {
+    for path in ["/inbox", "/lists/starred", "/feeds", "/lists", "/diary", "/queue"] {
         let resp = get_authed(&app, path, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "expected 200 OK on {path}");
     }
     let starred_redir = get_authed(&app, "/starred", &cookie).await;
     assert_eq!(starred_redir.status(), StatusCode::SEE_OTHER);
     assert_eq!(starred_redir.headers().get(header::LOCATION).unwrap(), "/lists/starred");
+
+    let rank_redir = get_authed(&app, "/rank", &cookie).await;
+    assert_eq!(rank_redir.status(), StatusCode::SEE_OTHER);
+    assert_eq!(rank_redir.headers().get(header::LOCATION).unwrap(), "/lists");
 
     let missing_csrf = post_form(&app, "/web/lists/create", &cookie, &[("title", "My List")]).await;
     assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
@@ -2217,7 +2221,6 @@ async fn web_pages_include_core_accessibility_landmarks() {
         format!("/reader/{item_id}"),
         "/diary".to_owned(),
         "/queue".to_owned(),
-        "/rank".to_owned(),
         format!("/rank/{col_slug}"),
     ];
 
