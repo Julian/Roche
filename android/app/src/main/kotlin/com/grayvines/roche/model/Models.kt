@@ -140,6 +140,16 @@ enum class FeedSortOrder(val label: String) {
     UNREAD_FIRST("Sort: Unread First"),
 }
 
+enum class FeedListFilter(val label: String) {
+    ALL("All"),
+    UNREAD("Unread"),
+    ERRORS("Errors"),
+    RSS("RSS"),
+    PODCAST("Podcasts"),
+    YOUTUBE("YouTube"),
+    ARXIV("arXiv"),
+}
+
 data class FeedItem(
     val id: String,
     val title: String,

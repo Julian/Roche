@@ -124,20 +124,22 @@ class MainScreenTest {
         composeRule.onNodeWithTag("feeds_filter_drawer").assertDoesNotExist()
         composeRule.onNodeWithTag("feed_row_feed-1").assertExists()
         composeRule.onNodeWithText("arxiv.org").assertExists()
-        composeRule.onNodeWithTag("archived_feeds_header").assertExists()
         composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertDoesNotExist()
 
-        composeRule.onNodeWithTag("archived_feeds_header").performClick()
+        composeRule.onNodeWithTag("feeds_sort_btn").performClick()
+        composeRule.onNodeWithTag("feeds_sort_unread").assertExists().performClick()
+
+        composeRule.onNodeWithTag("feeds_filter_btn").performClick()
+        composeRule.onNodeWithTag("feeds_filter_drawer").assertExists()
+        composeRule.onNodeWithText("#ml-systems (2)").assertExists()
+        composeRule.onNodeWithTag("feeds_show_archived_chip").assertExists().performClick()
+
         composeRule.onNodeWithTag("archived_feed_row_feed-archived-1").assertExists()
         composeRule.onNodeWithText("legacy.example.com · 1 unread").assertExists()
         composeRule.onNodeWithTag("unarchive_feed_feed-archived-1").performClick()
         org.junit.Assert.assertTrue(
             dispatched.contains(MainAction.ToggleFeedArchive("feed-archived-1"))
         )
-
-        composeRule.onNodeWithTag("feeds_filter_btn").performClick()
-        composeRule.onNodeWithTag("feeds_filter_drawer").assertExists()
-        composeRule.onNodeWithText("#ml-systems (2)").assertExists()
     }
 
     @Test
@@ -212,8 +214,8 @@ class MainScreenTest {
         composeRule.onNodeWithText("← Search").assertExists()
         composeRule.onNodeWithTag("reader_typography_btn").performClick()
         composeRule.onNodeWithTag("reader_typography_drawer").assertExists()
-        composeRule.onNodeWithText("§ Architecture").assertExists()
-        composeRule.onNodeWithTag("reader_font_larger_btn").performScrollTo().performClick()
+        composeRule.onNodeWithText("Architecture").assertExists()
+        composeRule.onNodeWithTag("reader_font_larger_btn").performClick()
         org.junit.Assert.assertTrue(dispatched.any { it is MainAction.SetReaderFontScale })
     }
 
@@ -470,9 +472,12 @@ class MainScreenTest {
         }
 
         composeRule
-            .onNodeWithText("No active feeds. Expand Archived Feeds below to unarchive.")
+            .onNodeWithText(
+                "No active feeds. Enable Show archived in Filter to view archived feeds."
+            )
             .assertExists()
-        composeRule.onNodeWithTag("archived_feeds_header").assertExists()
+        composeRule.onNodeWithTag("empty_show_archived_btn").assertExists().performClick()
+        composeRule.onNodeWithTag("archived_feed_row_feed-archived-only").assertExists()
     }
 
     @Test

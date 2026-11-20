@@ -1,29 +1,40 @@
-@file:Suppress("TooManyFunctions", "MatchingDeclarationName")
+@file:Suppress("TooManyFunctions", "MatchingDeclarationName", "MagicNumber")
 
 package com.grayvines.roche.ui
 
 import androidx.collection.LruCache
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -39,9 +50,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.core.isLocalPdfUrl
@@ -50,7 +69,6 @@ import com.grayvines.roche.media.PdfRendererSession
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.model.ThemeMode
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.extractPlainTextHeadings
 import com.grayvines.roche.reader.mapBlockHeadingIndices
@@ -58,9 +76,12 @@ import com.grayvines.roche.reader.parseHtmlArticleBlocks
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheSurfaceCard
+import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -209,7 +230,6 @@ fun ReaderView(
             showTypographyDrawer = showTypographyDrawer,
             onToggleTypography = { showTypographyDrawer = !showTypographyDrawer },
             onAction = onAction,
-            onShare = { onShareEntry(entry) },
         )
         ReaderScrollProgressBar(listState = listState, fallbackProgress = entry.readProgress)
         ReaderTypographySection(
@@ -226,7 +246,15 @@ fun ReaderView(
             pdfSession = pdfSession,
             isHydrating = awaitingBlankHydration,
             listState = listState,
+            onSelectFeed = { fid ->
+                onAction(MainAction.CloseReader)
+                onAction(MainAction.FilterByFeed(fid))
+            },
             onSelectTag = { onAction(MainAction.FilterByTag(it)) },
+            onToggleArchive = {
+                flushAndToggleReaderArchive(entry, listState, awaitingContent, onAction)
+            },
+            onShare = { onShareEntry(entry) },
             onOpenExternalUrl = onOpenExternalUrl,
         )
     }
@@ -445,27 +473,21 @@ private fun ReaderTopToolbar(
     showTypographyDrawer: Boolean,
     onToggleTypography: () -> Unit,
     onAction: (MainAction) -> Unit,
-    onShare: () -> Unit,
 ) {
+    val colors = LocalRocheColors.current
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Box(
-            modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp),
-            contentAlignment = Alignment.CenterStart,
-        ) {
-            HeaderActionButton(
-                label = backLabel,
-                horizontalPadding = 10.dp,
-                onClick = { onAction(MainAction.CloseReader) },
-                modifier = Modifier.testTag("reader_back_btn"),
-            )
-        }
+        ReaderBackLinkButton(
+            backLabel = backLabel,
+            onClick = { onAction(MainAction.CloseReader) },
+            modifier = Modifier.weight(1f, fill = false),
+        )
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(0.dp),
         ) {
             if (entry.contentType == ContentType.VIDEO || !entry.inFeedInbox) {
                 HeaderActionButton(
@@ -476,30 +498,89 @@ private fun ReaderTopToolbar(
                     modifier = Modifier.testTag("reader_video_finished_btn"),
                 )
             }
-            val aaStyle =
-                if (showTypographyDrawer) RocheButtonStyle.PRIMARY else RocheButtonStyle.SECONDARY
-            HeaderActionButton(
-                label = "Aa",
-                contentDescription = "Typography settings",
-                style = aaStyle,
-                horizontalPadding = 9.dp,
+            ReaderTypographyToggleButton(
+                active = showTypographyDrawer,
                 onClick = onToggleTypography,
-                modifier = Modifier.testTag("reader_typography_btn"),
             )
             CompactStarAndArchiveButtons(
                 entry = entry,
                 tagPrefix = "reader",
+                outlined = false,
                 onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
                 onToggleArchive = {
                     flushAndToggleReaderArchive(entry, listState, isAwaitingContent, onAction)
                 },
             )
-            HeaderActionButton(label = "Share", horizontalPadding = 9.dp, onClick = onShare)
-            HeaderActionButton(
-                label = "•••",
+            RocheIconActionButton(
                 contentDescription = "More entry actions",
-                horizontalPadding = 9.dp,
+                outlined = false,
                 onClick = { onAction(MainAction.OpenContextSheet(entry.id)) },
+                modifier = Modifier.testTag("reader_more_btn"),
+            ) {
+                MoreDotsIcon(tint = colors.textSecondary, size = 17.dp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReaderBackLinkButton(
+    backLabel: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Box(
+        contentAlignment = Alignment.CenterStart,
+        modifier =
+            modifier
+                .minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+                .testTag("reader_back_btn"),
+    ) {
+        Text(
+            text = backLabel,
+            color = colors.textSecondary,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ReaderTypographyToggleButton(active: Boolean, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    val bg = if (active) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val textColor = if (active) colors.accentBlue else colors.textSecondary
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Typography settings"
+                }
+                .testTag("reader_typography_btn"),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.heightIn(min = 34.dp).widthIn(min = 34.dp).clip(shape).background(bg),
+        ) {
+            Text(
+                text = "Aa",
+                color = textColor,
+                fontFamily = FontFamily.Serif,
+                fontSize = 14.sp,
+                fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
             )
         }
     }
@@ -522,21 +603,20 @@ internal fun ReaderTypographyDrawer(
             modifier
                 .fillMaxWidth()
                 .background(colors.surface)
-                .padding(horizontal = 16.dp, vertical = 10.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp)
                 .testTag("reader_typography_drawer"),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = "TEXT SIZE (${(scale * PERCENT_MULTIPLIER).roundToInt()}%)",
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 10.5.sp,
-        )
-        ReaderFontScaleControlsRow(currentScale = scale, onAction = onAction)
-        ReaderAppearanceQuickToggleRow(settings = settings, onAction = onAction)
-
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            ReaderFontSizeStepper(currentScale = scale, onAction = onAction)
+            ReaderFontFamilySwitch(currentFont = settings.headlineFont, onAction = onAction)
+        }
         if (headings.isNotEmpty()) {
-            ReaderSectionsOutlineStrip(
+            ReaderSectionsOutlineList(
                 headings = headings,
                 onSelectHeading = onJumpToSection,
             )
@@ -546,52 +626,26 @@ internal fun ReaderTypographyDrawer(
 }
 
 @Composable
-internal fun ReaderAppearanceQuickToggleRow(
-    settings: Settings,
-    onAction: (MainAction) -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        FilterChipPill(
-            label = if (settings.themeMode == ThemeMode.LIGHT) "☀ Paper" else "☾ Dark Ink",
-            selected = false,
-            onClick = {
-                val next =
-                    if (settings.themeMode == ThemeMode.DARK) ThemeMode.LIGHT else ThemeMode.DARK
-                onAction(MainAction.SetThemeMode(next))
-            },
-        )
-        FilterChipPill(
-            label = if (settings.headlineFont == HeadlineFont.SERIF) "Aa Serif" else "Aa Sans",
-            selected = false,
-            onClick = {
-                val next =
-                    if (settings.headlineFont == HeadlineFont.SERIF) {
-                        HeadlineFont.SANS
-                    } else {
-                        HeadlineFont.SERIF
-                    }
-                onAction(MainAction.SetHeadlineFont(next))
-            },
-        )
-    }
-}
-
-@Composable
-internal fun ReaderFontScaleControlsRow(
+private fun ReaderFontSizeStepper(
     currentScale: Float,
     onAction: (MainAction) -> Unit,
 ) {
+    val colors = LocalRocheColors.current
+    val pct = (currentScale * PERCENT_MULTIPLIER).roundToInt()
+    val shape = RoundedCornerShape(8.dp)
     Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        modifier =
+            Modifier.clip(shape)
+                .background(colors.background)
+                .border(1.dp, colors.border, shape)
+                .padding(horizontal = 2.dp),
     ) {
-        HeaderActionButton(
+        ReaderStepperButton(
             label = "A−",
             contentDescription = "Decrease font size",
+            testTag = "reader_font_smaller_btn",
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -601,19 +655,19 @@ internal fun ReaderFontScaleControlsRow(
                     )
                 )
             },
-            modifier = Modifier.testTag("reader_font_smaller_btn"),
         )
-        READER_FONT_PRESETS.forEach { preset ->
-            val pct = (preset * PERCENT_MULTIPLIER).roundToInt()
-            FilterChipPill(
-                label = "$pct%",
-                selected = abs(currentScale - preset) < READER_SCALE_EPSILON,
-                onClick = { onAction(MainAction.SetReaderFontScale(preset)) },
-            )
-        }
-        HeaderActionButton(
+        Text(
+            text = "$pct%",
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.5.sp,
+            fontWeight = FontWeight.Normal,
+            modifier = Modifier.widthIn(min = 38.dp),
+        )
+        ReaderStepperButton(
             label = "A+",
             contentDescription = "Increase font size",
+            testTag = "reader_font_larger_btn",
             onClick = {
                 onAction(
                     MainAction.SetReaderFontScale(
@@ -623,33 +677,155 @@ internal fun ReaderFontScaleControlsRow(
                     )
                 )
             },
-            modifier = Modifier.testTag("reader_font_larger_btn"),
         )
     }
 }
 
 @Composable
-internal fun ReaderSectionsOutlineStrip(
+private fun ReaderStepperButton(
+    label: String,
+    contentDescription: String,
+    testTag: String,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    this.contentDescription = contentDescription
+                }
+                .testTag(testTag),
+    ) {
+        Text(
+            text = label,
+            color = colors.textPrimary,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Normal,
+        )
+    }
+}
+
+@Composable
+private fun ReaderFontFamilySwitch(
+    currentFont: HeadlineFont,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    Row(
+        modifier =
+            Modifier.clip(shape)
+                .background(colors.background)
+                .border(1.dp, colors.border, shape)
+                .padding(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ReaderFontOptionTab(
+            label = "Serif",
+            selected = currentFont == HeadlineFont.SERIF,
+            onClick = { onAction(MainAction.SetHeadlineFont(HeadlineFont.SERIF)) },
+        )
+        ReaderFontOptionTab(
+            label = "Sans",
+            selected = currentFont == HeadlineFont.SANS,
+            onClick = { onAction(MainAction.SetHeadlineFont(HeadlineFont.SANS)) },
+        )
+    }
+}
+
+@Composable
+private fun ReaderFontOptionTab(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(6.dp)
+    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val fg = if (selected) colors.accentBlue else colors.textSecondary
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Tab
+                    this.selected = selected
+                },
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.heightIn(min = 32.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+        ) {
+            Text(
+                text = label,
+                color = fg,
+                fontSize = 12.sp,
+                fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReaderSectionsOutlineList(
     headings: List<String>,
     onSelectHeading: (headingIndex: Int) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Text(
-        text = "ARTICLE SECTIONS (${headings.size})",
-        color = colors.textMuted,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 10.5.sp,
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        headings.forEachIndexed { index, heading ->
-            FilterChipPill(
-                label = "§ ${heading.take(MAX_SECTION_LABEL_CHARS)}",
-                selected = false,
-                onClick = { onSelectHeading(index) },
-            )
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "SECTIONS (${headings.size})",
+            color = colors.textMuted,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+        )
+        Column(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .heightIn(max = 192.dp)
+                    .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            headings.forEachIndexed { index, heading ->
+                Row(
+                    modifier =
+                        Modifier.fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { onSelectHeading(index) }
+                            .padding(horizontal = 6.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "${index + 1}.",
+                        color = colors.textMuted,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                    )
+                    Text(
+                        text = heading,
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
         }
     }
 }
@@ -660,15 +836,17 @@ internal fun CompactStarAndArchiveButtons(
     tagPrefix: String,
     onToggleStar: () -> Unit,
     onToggleArchive: () -> Unit,
+    outlined: Boolean = true,
 ) {
     val colors = LocalRocheColors.current
     val starTint = if (entry.isFavorite) colors.accentEcru else colors.textSecondary
     val starDesc = if (entry.isFavorite) "Remove Star" else "Star Entry"
     val archiveDesc = if (entry.isArchived) "Unarchive to Inbox" else "Archive Entry"
 
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(horizontalArrangement = Arrangement.spacedBy(if (outlined) 6.dp else 0.dp)) {
         RocheIconActionButton(
             contentDescription = starDesc,
+            outlined = outlined,
             onClick = onToggleStar,
             modifier = Modifier.testTag("${tagPrefix}_star_btn"),
         ) {
@@ -676,6 +854,7 @@ internal fun CompactStarAndArchiveButtons(
         }
         RocheIconActionButton(
             contentDescription = archiveDesc,
+            outlined = outlined,
             onClick = onToggleArchive,
             modifier = Modifier.testTag("${tagPrefix}_archive_btn"),
         ) {
@@ -696,7 +875,10 @@ internal fun ReaderArticleBody(
     pdfSession: PdfRendererSession? = null,
     isHydrating: Boolean,
     listState: LazyListState,
+    onSelectFeed: (String) -> Unit = {},
     onSelectTag: (String) -> Unit,
+    onToggleArchive: () -> Unit = {},
+    onShare: () -> Unit = {},
     onOpenExternalUrl: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -710,39 +892,49 @@ internal fun ReaderArticleBody(
                 .filter { it.isNotBlank() }
         }
 
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize().testTag("reader_article_list"),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        item(key = "reader_header") {
-            ReaderHeaderItem(
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val horizontalPadding =
+            if (maxWidth > MAX_READER_PROSE_WIDTH) {
+                ((maxWidth - MAX_READER_PROSE_WIDTH) / 2f).coerceAtLeast(24.dp)
+            } else if (maxWidth >= 500.dp) {
+                28.dp
+            } else {
+                18.dp
+            }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize().testTag("reader_article_list"),
+            contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item(key = "reader_header") {
+                ReaderHeaderItem(
+                    entry = entry,
+                    isLocalPdf = isLocalPdf,
+                    dividerColor = colors.border,
+                    onSelectFeed = onSelectFeed,
+                    onSelectTag = onSelectTag,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
+            }
+            readerArticleBodyContentItems(
                 entry = entry,
-                dividerColor = colors.border,
-                onSelectTag = onSelectTag,
+                parsedState = parsedState,
+                pdfSession = pdfSession,
+                isHydrating = isHydrating,
+                plainParagraphs = plainParagraphs,
+                mutedColor = colors.textMuted,
+                linkStyles = linkStyles,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
-        }
-        readerArticleBodyContentItems(
-            entry = entry,
-            parsedState = parsedState,
-            pdfSession = pdfSession,
-            isHydrating = isHydrating,
-            plainParagraphs = plainParagraphs,
-            mutedColor = colors.textMuted,
-            linkStyles = linkStyles,
-            onOpenExternalUrl = onOpenExternalUrl,
-        )
-        if (!isLocalPdf && entry.url.isNotBlank()) {
             item(key = "reader_footer") {
-                Column {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    HeaderActionButton(
-                        label = "Open Original Link ↗",
-                        onClick = { onOpenExternalUrl(entry.url) },
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                }
+                ReaderEndCard(
+                    entry = entry,
+                    isLocalPdf = isLocalPdf,
+                    onToggleArchive = onToggleArchive,
+                    onShare = onShare,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
             }
         }
     }
@@ -798,11 +990,19 @@ private fun LazyListScope.readerArticleBodyContentItems(
 @Composable
 private fun ReaderHeaderItem(
     entry: InboxEntry,
-    dividerColor: androidx.compose.ui.graphics.Color,
+    isLocalPdf: Boolean,
+    dividerColor: Color,
+    onSelectFeed: (String) -> Unit,
     onSelectTag: (String) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     Column {
-        ReaderArticleHeader(entry = entry)
+        ReaderArticleHeader(
+            entry = entry,
+            isLocalPdf = isLocalPdf,
+            onSelectFeed = onSelectFeed,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
         if (entry.tags.isNotEmpty()) {
             Spacer(modifier = Modifier.height(10.dp))
             Row(
@@ -818,9 +1018,63 @@ private fun ReaderHeaderItem(
                 }
             }
         }
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
         HorizontalDivider(color = dividerColor, thickness = 1.dp)
         Spacer(modifier = Modifier.height(2.dp))
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ReaderEndCard(
+    entry: InboxEntry,
+    isLocalPdf: Boolean,
+    onToggleArchive: () -> Unit,
+    onShare: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headingText = if (entry.isArchived) "Archived" else "Finished reading?"
+    val archiveLabel = if (entry.isArchived) "Unarchive" else "Archive & Done"
+    val archiveStyle =
+        if (entry.isArchived) RocheButtonStyle.SECONDARY else RocheButtonStyle.PRIMARY
+    val externalUrl = entry.url.takeIf { !isLocalPdf && it.isNotBlank() }
+
+    Column(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 20.dp)) {
+        HorizontalDivider(color = colors.border, thickness = 1.dp)
+        Spacer(modifier = Modifier.height(16.dp))
+        RocheSurfaceCard {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = headingText,
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Normal,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    HeaderActionButton(
+                        label = archiveLabel,
+                        style = archiveStyle,
+                        onClick = onToggleArchive,
+                        modifier = Modifier.testTag("reader_end_archive_btn"),
+                    )
+                    HeaderActionButton(label = "Share", onClick = onShare)
+                    if (externalUrl != null) {
+                        HeaderActionButton(
+                            label = "Original ↗",
+                            onClick = { onOpenExternalUrl(externalUrl) },
+                            modifier = Modifier.testTag("reader_end_original_btn"),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -837,37 +1091,101 @@ private fun ReaderPlainParagraphItem(paragraph: String) {
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun ReaderArticleHeader(entry: InboxEntry) {
+internal fun ReaderArticleHeader(
+    entry: InboxEntry,
+    isLocalPdf: Boolean = isLocalPdfUrl(entry.url),
+    onSelectFeed: (String) -> Unit = {},
+    onOpenExternalUrl: (String) -> Unit = {},
+) {
     val colors = LocalRocheColors.current
     val scale = LocalReaderFontScale.current
     val headlineFamily = currentHeadlineFontFamily()
-    SelectionContainer {
-        Column {
-            Text(
-                text =
-                    "${entry.feedTitle} · ${entry.contentType.wireValue.uppercase()} · ${entry.readEstimateLabel}",
-                color = colors.accentBlue,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            Spacer(modifier = Modifier.height(8.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SelectionContainer {
             Text(
                 text = entry.title,
                 color = colors.textPrimary,
                 fontFamily = headlineFamily,
                 fontSize = (23f * scale).sp,
-                lineHeight = (29f * scale).sp,
+                lineHeight = (29.5f * scale).sp,
                 fontWeight = FontWeight.Medium,
             )
-            Spacer(modifier = Modifier.height(8.dp))
+        }
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            itemVerticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            ReaderBylineFeedChip(entry = entry, onSelectFeed = onSelectFeed)
             Text(
                 text = formatReaderByline(entry),
-                color = colors.textSecondary,
+                color = colors.textMuted,
                 fontSize = 12.sp,
+                fontWeight = FontWeight.Normal,
             )
+            if (!isLocalPdf && entry.url.isNotBlank()) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier =
+                        Modifier.minimumInteractiveComponentSize()
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { onOpenExternalUrl(entry.url) }
+                            .semantics { role = Role.Button }
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                            .testTag("reader_byline_original_btn"),
+                ) {
+                    Text(
+                        text = "Original ↗",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Normal,
+                    )
+                }
+            }
         }
+    }
+}
+
+@Composable
+private fun ReaderBylineFeedChip(
+    entry: InboxEntry,
+    onSelectFeed: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val feedId = entry.feedId
+    val baseMod =
+        if (feedId != null) {
+            Modifier.minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(6.dp))
+                .clickable { onSelectFeed(feedId) }
+                .semantics { role = Role.Button }
+                .padding(end = 4.dp, top = 2.dp, bottom = 2.dp)
+        } else {
+            Modifier
+        }
+    Row(
+        modifier = baseMod,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        SiteFaviconBadge(
+            primaryFaviconUrl = entry.faviconUrl,
+            fallbackFaviconUrl = entry.fallbackFaviconUrl,
+            domain = entry.displayDomain,
+            title = entry.feedTitle,
+            size = 15.dp,
+        )
+        Text(
+            text = entry.feedTitle,
+            color = colors.accentBlue,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -933,14 +1251,17 @@ internal fun resolveReaderHtmlBody(entry: InboxEntry): String? =
     entry.contentHtml?.takeIf { it.isNotBlank() }
         ?: entry.summary?.takeIf { "<" in it || "&" in it }
 
-private fun formatReaderByline(entry: InboxEntry): String = buildString {
-    entry.author?.let { append("$it · ") }
-    append(entry.formattedPublishedLabel)
+private fun formatReaderByline(entry: InboxEntry): String = buildList {
+    entry.author?.takeIf { it.isNotBlank() }?.let { add(it) }
+    add(entry.formattedPublishedLabel)
+    add(entry.readEstimateLabel)
     if (entry.isCachedOffline) {
-        append(" · Cached offline")
+        add("Offline")
     }
 }
+    .joinToString(" · ", prefix = "· ")
 
+private val MAX_READER_PROSE_WIDTH = 520.dp
 private const val HEADER_ITEM_COUNT = 1
 private const val MAX_CACHED_PARSED_DOCS = 32
 private const val MAX_IN_FLIGHT_SCROLL_FRACTION = 0.999
@@ -949,6 +1270,3 @@ private const val READ_PROGRESS_MIN_DELTA = 0.05
 private const val ARCHIVE_COMPLETION_THRESHOLD = 0.90
 private const val PERCENT_MULTIPLIER = 100
 private const val READER_SCALE_STEP = 0.10f
-private const val READER_SCALE_EPSILON = 0.03f
-private const val MAX_SECTION_LABEL_CHARS = 32
-private val READER_FONT_PRESETS = listOf(0.88f, 1.0f, 1.15f, 1.30f)

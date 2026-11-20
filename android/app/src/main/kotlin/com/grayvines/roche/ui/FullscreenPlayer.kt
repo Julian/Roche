@@ -41,6 +41,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -53,9 +54,10 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.playback.PlayerDrawerTab
 import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.playback.formatPlaybackSpeedLabel
+import com.grayvines.roche.ui.components.ChevronDownIcon
 import com.grayvines.roche.ui.components.FastForwardIcon
-import com.grayvines.roche.ui.components.FilterChipPill
-import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.MoonSleepIcon
+import com.grayvines.roche.ui.components.MoreDotsIcon
 import com.grayvines.roche.ui.components.PlayPauseIcon
 import com.grayvines.roche.ui.components.PodcastArtworkBox
 import com.grayvines.roche.ui.components.RewindIcon
@@ -100,14 +102,15 @@ fun DockedMiniPlayer(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            PodcastArtworkBox(entry = entry, size = 40.dp, cornerRadius = 8.dp)
+            PodcastArtworkBox(entry = entry, size = 38.dp, cornerRadius = 7.dp)
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = entry.title,
                     color = colors.textPrimary,
+                    fontFamily = currentHeadlineFontFamily(),
                     fontSize = 13.5.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = FontWeight.Normal,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -119,8 +122,8 @@ fun DockedMiniPlayer(
                             "${entry.feedTitle} · ${playerState.formattedMiniRemaining}"
                         },
                     color = colors.textMuted,
-                    fontFamily = FontFamily.Monospace,
                     fontSize = 11.sp,
+                    fontWeight = FontWeight.Normal,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -158,7 +161,9 @@ fun DockedMiniPlayer(
                     Box(
                         contentAlignment = Alignment.Center,
                         modifier =
-                            Modifier.size(34.dp).clip(CircleShape).background(colors.accentBlue),
+                            Modifier.size(34.dp)
+                                .clip(CircleShape)
+                                .background(colors.accentBlueFilled),
                     ) {
                         if (playerState.isBuffering) {
                             CircularProgressIndicator(
@@ -210,7 +215,7 @@ fun FullscreenPodcastPlayer(
                 .fillMaxSize()
                 .background(colors.background)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 12.dp)
+                .padding(horizontal = 20.dp, vertical = 10.dp)
                 .testTag("fullscreen_podcast_player"),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween,
@@ -223,36 +228,31 @@ fun FullscreenPodcastPlayer(
             onOpenExternalUrl = onOpenExternalUrl,
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
-
-        FullscreenPlayerArtworkAndMeta(
-            entry = entry,
-            playerState = playerState,
-            onAction = onAction,
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        PlayerScrubberSection(
-            playerState = playerState,
-            onAction = onAction,
-        )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        FullscreenPlayerTransportRow(
-            playerState = playerState,
-            hasNextQueuedAudio = nextQueuedAudioEntry != null,
-            onAction = onAction,
-        )
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        FullscreenPlayerDrawerBar(
-            playerState = playerState,
-            activeDrawerTab = activeDrawerTab,
-            onAction = onAction,
-        )
+        Column(
+            modifier = Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(vertical = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            FullscreenPlayerArtworkAndMeta(
+                entry = entry,
+                playerState = playerState,
+                onAction = onAction,
+            )
+            PlayerScrubberSection(
+                playerState = playerState,
+                onAction = onAction,
+            )
+            FullscreenPlayerTransportRow(
+                playerState = playerState,
+                hasNextQueuedAudio = nextQueuedAudioEntry != null,
+                onAction = onAction,
+            )
+            FullscreenPlayerDrawerBar(
+                playerState = playerState,
+                activeDrawerTab = activeDrawerTab,
+                onAction = onAction,
+            )
+        }
     }
 
     if (isSpeedSheetOpen) {
@@ -291,40 +291,31 @@ private fun FullscreenPlayerTopBar(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        HeaderActionButton(
-            label = "⌄",
+        RocheIconActionButton(
             contentDescription = "Collapse player",
+            outlined = false,
             onClick = { onAction(MainAction.CloseFullscreenPlayer) },
             modifier = Modifier.testTag("player_collapse_btn"),
-        )
+        ) {
+            ChevronDownIcon(tint = colors.textSecondary, size = 19.dp)
+        }
 
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             RocheIconActionButton(
                 contentDescription = if (entry.isFavorite) "Remove Star" else "Star Episode",
+                outlined = false,
                 onClick = { onAction(MainAction.ToggleStar(entry.id)) },
                 modifier = Modifier.testTag("player_star_btn"),
             ) {
-                StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 16.dp)
+                StarIcon(tint = starTint, isStarred = entry.isFavorite, size = 17.dp)
             }
 
             PlayerSleepTimerMenuButton(
                 activeRemaining = playerState.sleepTimerRemainingMinutes,
                 onSelectMinutes = { mins -> onAction(MainAction.SetSleepTimerMinutes(mins)) },
-            )
-
-            HeaderActionButton(
-                label = "Cast",
-                onClick = { onAction(MainAction.RequestAudioOutputCast) },
-                modifier = Modifier.testTag("player_cast_btn"),
-            )
-
-            HeaderActionButton(
-                label = "Share",
-                onClick = { onShareEntry(entry) },
-                modifier = Modifier.testTag("player_share_btn"),
             )
 
             PlayerOverflowMenuButton(
@@ -347,13 +338,25 @@ private fun PlayerSleepTimerMenuButton(
     var showSleepMenu by rememberSaveable { mutableStateOf(false) }
 
     Box {
-        HeaderActionButton(
-            label = activeRemaining?.let { "Zz ${it}m" } ?: "Zz",
+        RocheIconActionButton(
             contentDescription =
                 activeRemaining?.let { "Sleep timer, $it minutes remaining" } ?: "Sleep timer",
+            outlined = false,
             onClick = { showSleepMenu = true },
             modifier = Modifier.testTag("player_sleep_btn"),
-        )
+        ) {
+            if (activeRemaining != null) {
+                Text(
+                    text = "${activeRemaining}m",
+                    color = colors.accentBlue,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            } else {
+                MoonSleepIcon(tint = colors.textSecondary, size = 17.dp)
+            }
+        }
         DropdownMenu(
             expanded = showSleepMenu,
             onDismissRequest = { showSleepMenu = false },
@@ -373,13 +376,13 @@ private fun PlayerSleepTimerMenuButton(
                                 text = label,
                                 color =
                                     if (isSelected) {
-                                        colors.accentEcru
+                                        colors.accentBlue
                                     } else {
                                         colors.textPrimary
                                     },
                                 fontWeight =
                                     if (isSelected) {
-                                        FontWeight.SemiBold
+                                        FontWeight.Medium
                                     } else {
                                         FontWeight.Normal
                                     },
@@ -407,16 +410,34 @@ private fun PlayerOverflowMenuButton(
     var showOverflowMenu by rememberSaveable { mutableStateOf(false) }
 
     Box {
-        HeaderActionButton(
-            label = "•••",
+        RocheIconActionButton(
             contentDescription = "More player options",
+            outlined = false,
             onClick = { showOverflowMenu = true },
             modifier = Modifier.testTag("player_overflow_btn"),
-        )
+        ) {
+            MoreDotsIcon(tint = colors.textSecondary, size = 17.dp)
+        }
         DropdownMenu(
             expanded = showOverflowMenu,
             onDismissRequest = { showOverflowMenu = false },
         ) {
+            DropdownMenuItem(
+                text = { Text("Cast / Audio Output") },
+                onClick = {
+                    showOverflowMenu = false
+                    onAction(MainAction.RequestAudioOutputCast)
+                },
+                modifier = Modifier.testTag("player_cast_btn"),
+            )
+            DropdownMenuItem(
+                text = { Text("Share Episode") },
+                onClick = {
+                    showOverflowMenu = false
+                    onShareEntry(entry)
+                },
+                modifier = Modifier.testTag("player_share_btn"),
+            )
             DropdownMenuItem(
                 text = { Text("Open Full Show Notes in Reader") },
                 onClick = {
@@ -525,8 +546,8 @@ private fun FullscreenPlayerArtworkAndMeta(
     ) {
         PodcastArtworkBox(
             entry = entry,
-            size = 264.dp,
-            cornerRadius = 18.dp,
+            size = 240.dp,
+            cornerRadius = 16.dp,
             modifier =
                 Modifier.clickable { onAction(MainAction.TogglePlayPause) }
                     .semantics {
@@ -558,7 +579,7 @@ private fun FullscreenPlayerArtworkAndMeta(
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         Box(
             contentAlignment = Alignment.Center,
@@ -571,20 +592,19 @@ private fun FullscreenPlayerArtworkAndMeta(
                             onAction(MainAction.FilterByFeed(fid))
                         }
                     }
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
         ) {
             Text(
                 text = entry.feedTitle,
                 color = colors.accentBlue,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.Normal,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
+        Spacer(modifier = Modifier.height(2.dp))
 
         Text(
             text = entry.title,
@@ -600,25 +620,25 @@ private fun FullscreenPlayerArtworkAndMeta(
         )
 
         if (currentChapter != null) {
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Box(
                 contentAlignment = Alignment.Center,
                 modifier =
                     Modifier.minimumInteractiveComponentSize()
                         .clip(RoundedCornerShape(99.dp))
-                        .background(colors.surfaceElevated)
-                        .border(1.dp, colors.controlOutline, RoundedCornerShape(99.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, RoundedCornerShape(99.dp))
                         .clickable {
                             onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.CHAPTERS))
                         }
-                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                        .padding(horizontal = 12.dp, vertical = 5.dp)
                         .testTag("player_chapter_pill"),
             ) {
                 Text(
                     text = "Ch. ${currentChapter.index} · ${currentChapter.title} ›",
                     color = colors.textSecondary,
-                    fontFamily = FontFamily.Monospace,
                     fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Normal,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -692,7 +712,7 @@ private fun FullscreenPlayerTransportRow(
 ) {
     val colors = LocalRocheColors.current
     val speedLabel = formatPlaybackSpeedLabel(playerState.playbackSpeed)
-    val speedPillShape = RoundedCornerShape(14.dp)
+    val speedPillShape = RoundedCornerShape(10.dp)
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -714,31 +734,30 @@ private fun FullscreenPlayerTransportRow(
             Box(
                 contentAlignment = Alignment.Center,
                 modifier =
-                    Modifier.heightIn(min = 42.dp)
-                        .widthIn(min = 62.dp)
+                    Modifier.heightIn(min = 36.dp)
+                        .widthIn(min = 52.dp)
                         .clip(speedPillShape)
-                        .background(colors.surfaceElevated)
-                        .border(1.dp, colors.accentBlue, speedPillShape)
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, speedPillShape)
+                        .padding(horizontal = 9.dp, vertical = 6.dp),
             ) {
                 Text(
                     text = speedLabel,
                     color = colors.accentBlue,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 12.5.sp,
-                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
                     modifier = Modifier.clearAndSetSemantics {},
                 )
             }
         }
 
-        Box(
-            contentAlignment = Alignment.Center,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
             modifier =
                 Modifier.size(48.dp)
                     .clip(CircleShape)
-                    .background(colors.surfaceElevated)
-                    .border(1.dp, colors.border, CircleShape)
                     .clickable { onAction(MainAction.SkipPlayerBySeconds(-15)) }
                     .semantics {
                         role = Role.Button
@@ -747,14 +766,21 @@ private fun FullscreenPlayerTransportRow(
                     .testTag("player_rewind_btn"),
         ) {
             RewindIcon(tint = colors.textPrimary, size = 20.dp)
+            Text(
+                text = "15",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 9.5.sp,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
         }
 
         Box(
             contentAlignment = Alignment.Center,
             modifier =
-                Modifier.size(68.dp)
+                Modifier.size(64.dp)
                     .clip(CircleShape)
-                    .background(colors.accentBlue)
+                    .background(colors.accentBlueFilled)
                     .clickable { onAction(MainAction.TogglePlayPause) }
                     .semantics {
                         role = Role.Button
@@ -777,18 +803,17 @@ private fun FullscreenPlayerTransportRow(
                 PlayPauseIcon(
                     isPlaying = playerState.isPlaying,
                     tint = Color.White,
-                    size = 28.dp,
+                    size = 26.dp,
                 )
             }
         }
 
-        Box(
-            contentAlignment = Alignment.Center,
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
             modifier =
                 Modifier.size(48.dp)
                     .clip(CircleShape)
-                    .background(colors.surfaceElevated)
-                    .border(1.dp, colors.border, CircleShape)
                     .clickable { onAction(MainAction.SkipPlayerBySeconds(30)) }
                     .semantics {
                         role = Role.Button
@@ -797,31 +822,23 @@ private fun FullscreenPlayerTransportRow(
                     .testTag("player_ff_btn"),
         ) {
             FastForwardIcon(tint = colors.textPrimary, size = 20.dp)
+            Text(
+                text = "30",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 9.5.sp,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
         }
 
         val skipTint = if (hasNextQueuedAudio) colors.textPrimary else colors.textMuted
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.minimumInteractiveComponentSize()
-                    .clip(CircleShape)
-                    .clickable { onAction(MainAction.SkipToNextQueuedAudio) }
-                    .semantics {
-                        role = Role.Button
-                        contentDescription = "Skip to next episode in Queue"
-                    }
-                    .testTag("player_skip_next_btn"),
+        RocheIconActionButton(
+            contentDescription = "Skip to next episode in Queue",
+            outlined = false,
+            onClick = { onAction(MainAction.SkipToNextQueuedAudio) },
+            modifier = Modifier.testTag("player_skip_next_btn"),
         ) {
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier =
-                    Modifier.size(42.dp)
-                        .clip(CircleShape)
-                        .background(colors.surfaceElevated)
-                        .border(1.dp, colors.border, CircleShape),
-            ) {
-                SkipNextIcon(tint = skipTint, size = 18.dp)
-            }
+            SkipNextIcon(tint = skipTint, size = 18.dp)
         }
     }
 }
@@ -832,27 +849,78 @@ internal fun FullscreenPlayerDrawerBar(
     activeDrawerTab: PlayerDrawerTab?,
     onAction: (MainAction) -> Unit,
 ) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(10.dp)
     Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .background(colors.surface)
+                .border(1.dp, colors.border, shape)
+                .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        FilterChipPill(
+        PlayerDrawerSegmentTab(
             label = "Show Notes",
             selected = activeDrawerTab == PlayerDrawerTab.SHOW_NOTES,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.SHOW_NOTES)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_shownotes"),
         )
-        FilterChipPill(
+        PlayerDrawerSegmentTab(
             label = "Chapters (${playerState.chapters.size})",
             selected = activeDrawerTab == PlayerDrawerTab.CHAPTERS,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.CHAPTERS)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_chapters"),
         )
-        FilterChipPill(
+        PlayerDrawerSegmentTab(
             label = "Transcript",
             selected = activeDrawerTab == PlayerDrawerTab.TRANSCRIPT,
             onClick = { onAction(MainAction.SelectPlayerDrawerTab(PlayerDrawerTab.TRANSCRIPT)) },
             modifier = Modifier.weight(1f).testTag("player_drawer_transcript"),
         )
+    }
+}
+
+@Composable
+private fun PlayerDrawerSegmentTab(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(7.dp)
+    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val fg = if (selected) colors.accentBlue else colors.textSecondary
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Tab
+                    this.selected = selected
+                },
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.fillMaxWidth()
+                    .heightIn(min = 34.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = label,
+                color = fg,
+                fontSize = 12.sp,
+                fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }

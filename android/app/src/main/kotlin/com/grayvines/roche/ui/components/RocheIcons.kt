@@ -721,6 +721,94 @@ fun SkipNextIcon(
     }
 }
 
+/** Three-dot horizontal overflow (`•••`) icon for quiet toolbar menus. */
+@Composable
+fun MoreDotsIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    Canvas(modifier = modifier.size(size)) {
+        val r = this.size.minDimension * 0.085f
+        val cy = this.size.height * 0.5f
+        drawCircle(color = tint, radius = r, center = Offset(this.size.width * 0.22f, cy))
+        drawCircle(color = tint, radius = r, center = Offset(this.size.width * 0.50f, cy))
+        drawCircle(color = tint, radius = r, center = Offset(this.size.width * 0.78f, cy))
+    }
+}
+
+/** Downward chevron (`⌄`) icon for collapsing fullscreen overlays and players. */
+@Composable
+fun ChevronDownIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    val path = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        path.rewind()
+        path.moveTo(w * 0.22f, h * 0.36f)
+        path.lineTo(w * 0.50f, h * 0.66f)
+        path.lineTo(w * 0.78f, h * 0.36f)
+        drawPath(path = path, color = tint, style = stroke)
+    }
+}
+
+/** Opposing vertical arrows (`⇅`) icon for list sort menus. */
+@Composable
+fun SortArrowsIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 16.dp,
+) {
+    val arrows = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        arrows.rewind()
+        arrows.moveTo(w * 0.34f, h * 0.78f)
+        arrows.lineTo(w * 0.34f, h * 0.22f)
+        arrows.moveTo(w * 0.19f, h * 0.37f)
+        arrows.lineTo(w * 0.34f, h * 0.22f)
+        arrows.lineTo(w * 0.49f, h * 0.37f)
+        arrows.moveTo(w * 0.66f, h * 0.22f)
+        arrows.lineTo(w * 0.66f, h * 0.78f)
+        arrows.moveTo(w * 0.51f, h * 0.63f)
+        arrows.lineTo(w * 0.66f, h * 0.78f)
+        arrows.lineTo(w * 0.81f, h * 0.63f)
+        drawPath(path = arrows, color = tint, style = stroke)
+    }
+}
+
+/** Crescent moon icon for the podcast player sleep timer. */
+@Composable
+fun MoonSleepIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 18.dp,
+) {
+    val path = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        path.rewind()
+        path.moveTo(w * 0.78f, h * 0.60f)
+        path.cubicTo(w * 0.70f, h * 0.78f, w * 0.46f, h * 0.84f, w * 0.30f, h * 0.70f)
+        path.cubicTo(w * 0.16f, h * 0.56f, w * 0.20f, h * 0.30f, w * 0.40f, h * 0.22f)
+        path.cubicTo(w * 0.34f, h * 0.40f, w * 0.46f, h * 0.62f, w * 0.78f, h * 0.60f)
+        path.close()
+        drawPath(path = path, color = tint, style = stroke)
+    }
+}
+
 /** Quiet stroked Skip (`⏭`) icon for skipping a daily collection draw. */
 @Composable
 fun SkipDrawIcon(
