@@ -22,7 +22,7 @@ use super::{IndexedTag, MergeContext};
 use crate::db::{
     ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole, ContentType,
     EntryIdentifier, EntryKind, FeedRepo, FeedType, HexColor, InboxState, MediaRepo,
-    PollItemCandidate, UpsertEntryInput,
+    PollItemCandidate, UpsertEntryInput, entries_core,
     feeds::{NewFeedRow, entry_kind_for_feed_type, resolve_dedup_entry_id},
 };
 
@@ -500,13 +500,8 @@ impl SyncRepo<'_> {
         let det_id = deterministic_tag_id(clean_name);
         let tag_slug = format!("tag:{nat_key}");
         let rec_id = rec.id.trim();
-        let parsed_color: Option<String> = cs
-            .color
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|c| HexColor::parse(c).ok())
-            .map(String::from);
+        let parsed_color: Option<String> =
+            HexColor::from_stored_tolerant(cs.color.as_deref()).map(String::from);
 
         ctx.tag_index.ensure_loaded(&mut *tx).await?;
         let found = ctx.tag_index.find_live_for_merge(&det_id, &tag_slug, &nat_key, rec_id);
@@ -562,18 +557,8 @@ impl SyncRepo<'_> {
                     .bind(&local_id)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("DELETE FROM entry_identifiers WHERE scheme = 'tag' AND entry_id = ?")
-                    .bind(&local_id)
-                    .execute(&mut *tx)
+                entries_core::replace_entry_identifier_in_tx(tx, &local_id, "tag", input.nat_key)
                     .await?;
-                sqlx::query(
-                    "INSERT OR REPLACE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('tag', ?, ?)",
-                )
-                .bind(input.nat_key)
-                .bind(&local_id)
-                .execute(&mut *tx)
-                .await?;
                 existing.slug = Some(input.tag_slug);
             }
             sqlx::query("UPDATE entries SET title = ?, updated_at = ?, hlc = ? WHERE id = ?")
@@ -633,14 +618,7 @@ impl SyncRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('tag', ?, ?)",
-        )
-        .bind(input.nat_key)
-        .bind(&det_id)
-        .execute(&mut *tx)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(tx, &det_id, "tag", input.nat_key).await?;
 
         Self::record_activity(
             tx,
@@ -1120,13 +1098,7 @@ impl SyncRepo<'_> {
             if val.is_empty() {
                 continue;
             }
-            let found: Option<String> = sqlx::query_scalar(
-                "SELECT entry_id FROM entry_identifiers WHERE scheme = ? AND value = ? LIMIT 1",
-            )
-            .bind(&scheme)
-            .bind(&val)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let found = entries_core::find_entry_id_by_identifier_in_tx(tx, &scheme, &val).await?;
             if let Some(raw_eid) = found
                 && let Some(canon) = CatalogRepo::follow_merged_id_in_tx(tx, &raw_eid).await?
             {
@@ -1194,15 +1166,7 @@ impl SyncRepo<'_> {
             if scheme.is_empty() || val.is_empty() {
                 continue;
             }
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&scheme)
-            .bind(&val)
-            .bind(existing_id)
-            .execute(&mut *tx)
-            .await?;
+            entries_core::upsert_entry_identifier_in_tx(tx, existing_id, &scheme, &val).await?;
         }
         Ok(())
     }

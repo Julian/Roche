@@ -12,6 +12,7 @@ import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deriveCollectionIdentity
 import com.grayvines.roche.core.deterministicComparisonId
 import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.data.local.CatalogStampRow
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
@@ -28,11 +29,9 @@ import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -46,28 +45,31 @@ class CatalogStore(
     private val localMutationCallback = AtomicReference(onLocalMutation)
     private val seeder = CatalogSeeder(dao = dao, localPeerIdProvider = ::resolveLocalPeerId)
     private val mutationMutex = Mutex()
+    private val snapshotCacheMutex = Mutex()
+    internal val epScoreCache = EpScoreCache()
+    private var cachedState: CachedCatalogState? = null
+
+    internal val epCacheStats: EpScoreCacheStats
+        get() = epScoreCache.stats
+
+    @Volatile
+    internal var catalogSnapshotBuilds: Int = 0
+        private set
+
+    @Volatile
+    internal var catalogTableReloads: Int = 0
+        private set
+
+    @Volatile
+    internal var catalogSnapshotCacheHits: Int = 0
+        private set
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val snapshot: Flow<CatalogSnapshot> =
-        combine(
-                combine(
-                    dao.observeEntriesStamp(),
-                    dao.observeIdentsStamp(),
-                    dao.observeSpecsStamp(),
-                    dao.observeMembersStamp(),
-                ) { _, _, _, _ ->
-                    Unit
-                },
-                dao.observeGeneratorsStamp(),
-                dao.observeLogsStamp(),
-                dao.observeComparisonsStamp(),
-            ) { _, _, _, _ ->
-                Unit
-            }
+        dao.observeCatalogStamp()
             .conflate()
-            .mapLatest { loadConsistentRawTables() }
             .distinctUntilChanged()
-            .map(::buildCatalogSnapshot)
+            .mapLatest { getOrBuildCatalogSnapshot() }
             .flowOn(Dispatchers.Default)
 
     internal suspend fun resolveLocalPeerId(): String =
@@ -538,7 +540,7 @@ class CatalogStore(
     ): List<RankClusterCandidate> = mutationMutex.withLock {
         ensureSystemSeeded()
         val spec = resolveCollectionSpec(collectionIdOrSlug)
-        val snap = buildCatalogSnapshot(loadRawCatalogTables())
+        val snap = getOrBuildCatalogSnapshot()
         val members = spec?.let { snap.entriesByCollectionId[it.collectionId] }.orEmpty()
         if (members.size < EpRankingEngine.MIN_K) {
             emptyList()
@@ -610,7 +612,7 @@ class CatalogStore(
     ): RankSettlementSummary? = mutationMutex.withLock {
         ensureSystemSeeded()
         val resolved = followMergedId(entryId) ?: entryId
-        val snap = buildCatalogSnapshot(loadRawCatalogTables())
+        val snap = getOrBuildCatalogSnapshot()
         val preferredSpec = preferredCollectionIdOrSlug?.let { resolveCollectionSpec(it) }
         val rawEntry = dao.getEntryById(resolved)
         val fallbackSpec = rawEntry?.let {
@@ -797,19 +799,120 @@ class CatalogStore(
     internal suspend fun followMergedId(entryId: String): String? =
         followMergedIdInDao(dao, entryId)
 
-    private suspend fun resolveDrawSnapshot(
+    internal suspend fun resolveDrawSnapshot(
         collectionId: String,
         entryId: String,
     ): CollectionDrawSnapshot? {
-        val snap = buildCatalogSnapshot(loadRawCatalogTables())
+        val snap = getOrBuildCatalogSnapshot()
         return snap.generatorFor(collectionId)?.currentDraw?.takeIf { it.entryId == entryId }
     }
 
-    private suspend fun loadConsistentRawTables(): RawCatalogTables {
-        var tables: RawCatalogTables? = null
-        dao.executeInTransaction { tables = loadRawCatalogTables() }
-        return checkNotNull(tables)
+    internal suspend fun resolveFromPreloadedTables(
+        stamp: CatalogStampRow,
+        tables: RawCatalogTables,
+    ): CatalogSnapshot = snapshotCacheMutex.withLock {
+        val existing = cachedState
+        if (existing != null && existing.stamp == stamp) {
+            catalogSnapshotCacheHits += 1
+            existing.snapshot
+        } else {
+            val built = buildCatalogSnapshot(tables, epScoreCache)
+            catalogSnapshotBuilds += 1
+            cachedState = CachedCatalogState(stamp, tables, built)
+            built
+        }
     }
+
+    internal suspend fun getOrBuildCatalogSnapshot(): CatalogSnapshot =
+        snapshotCacheMutex.withLock {
+            var loadedStamp: CatalogStampRow? = null
+            var loadedTables: RawCatalogTables? = null
+            val existing = cachedState
+            dao.executeInTransaction {
+                val currentStamp = dao.getCatalogStamp()
+                loadedStamp = currentStamp
+                if (existing == null || existing.stamp != currentStamp) {
+                    loadedTables = loadIncrementalCatalogTables(currentStamp, existing)
+                }
+            }
+            val finalStamp = checkNotNull(loadedStamp)
+            val freshTables = loadedTables
+            if (freshTables == null && existing != null && existing.stamp == finalStamp) {
+                catalogSnapshotCacheHits += 1
+                existing.snapshot
+            } else {
+                val tables = checkNotNull(freshTables)
+                val built = buildCatalogSnapshot(tables, epScoreCache)
+                catalogSnapshotBuilds += 1
+                cachedState = CachedCatalogState(finalStamp, tables, built)
+                built
+            }
+        }
+
+    private suspend fun loadIncrementalCatalogTables(
+        stamp: CatalogStampRow,
+        previous: CachedCatalogState?,
+    ): RawCatalogTables {
+        val prevStamp = previous?.stamp
+        val prevTables = previous?.tables
+        return RawCatalogTables(
+            entries =
+                reloadIfChanged(
+                    stamp.entriesStamp != prevStamp?.entriesStamp,
+                    prevTables?.entries,
+                ) {
+                    dao.getAllEntries()
+                },
+            identifiers =
+                reloadIfChanged(
+                    stamp.identsStamp != prevStamp?.identsStamp,
+                    prevTables?.identifiers,
+                ) {
+                    dao.getAllEntryIdentifiers()
+                },
+            specs =
+                reloadIfChanged(stamp.specsStamp != prevStamp?.specsStamp, prevTables?.specs) {
+                    dao.getAllCollectionSpecs()
+                },
+            memberships =
+                reloadIfChanged(
+                    stamp.membersStamp != prevStamp?.membersStamp,
+                    prevTables?.memberships,
+                ) {
+                    dao.getAllCollectionEntries()
+                },
+            generators =
+                reloadIfChanged(
+                    stamp.generatorsStamp != prevStamp?.generatorsStamp,
+                    prevTables?.generators,
+                ) {
+                    dao.getAllCollectionGenerators()
+                },
+            logs =
+                reloadIfChanged(stamp.logsStamp != prevStamp?.logsStamp, prevTables?.logs) {
+                    dao.getAllConsumptionLogs()
+                },
+            comparisons =
+                reloadIfChanged(
+                    stamp.comparisonsStamp != prevStamp?.comparisonsStamp,
+                    prevTables?.comparisons,
+                ) {
+                    dao.getAllComparisons()
+                },
+        )
+    }
+
+    private suspend fun <T> reloadIfChanged(
+        changed: Boolean,
+        previous: T?,
+        loader: suspend () -> T,
+    ): T =
+        if (!changed && previous != null) {
+            previous
+        } else {
+            catalogTableReloads += 1
+            loader()
+        }
 
     internal suspend fun loadRawCatalogTables(): RawCatalogTables =
         RawCatalogTables(
@@ -822,6 +925,12 @@ class CatalogStore(
             comparisons = dao.getAllComparisons(),
         )
 }
+
+internal data class CachedCatalogState(
+    val stamp: CatalogStampRow,
+    val tables: RawCatalogTables,
+    val snapshot: CatalogSnapshot,
+)
 
 internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
     RankClusterCandidate(

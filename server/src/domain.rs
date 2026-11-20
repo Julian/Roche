@@ -3,6 +3,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+/// Reader scroll / playback progress threshold (`>= 0.98`) at which an item is automatically
+/// marked read (and podcast episodes auto-log completion).
+pub const READER_AUTO_READ_THRESHOLD: f64 = 0.98;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
@@ -474,6 +478,28 @@ impl HexColor {
         }
         anyhow::bail!("Invalid hex color '{trimmed}': expected #RRGGBB format")
     }
+
+    /// Validates and normalizes an optional CSS hex color (`#RRGGBB`).
+    ///
+    /// Empty or whitespace-only inputs normalize to `Ok(None)`.
+    pub fn parse_optional(raw: Option<&str>) -> Result<Option<Self>> {
+        let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        Self::parse(trimmed).map(Some)
+    }
+
+    /// Tolerantly normalizes a persisted color value loaded from storage, returning `None`
+    /// for empty or invalid legacy rows rather than failing decoding.
+    #[must_use]
+    pub fn from_stored_tolerant(raw: Option<&str>) -> Option<Self> {
+        raw.map(str::trim).filter(|s| !s.is_empty()).and_then(|c| Self::parse(c).ok())
+    }
+
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 impl TryFrom<String> for HexColor {
@@ -543,5 +569,33 @@ mod tests {
         assert_eq!(EntryKind::Article.parent_kind(), Some(EntryKind::Publication));
         assert_eq!(EntryKind::Video.parent_kind(), Some(EntryKind::Channel));
         assert_eq!(EntryKind::Movie.parent_kind(), None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_hex_color_parse_optional_and_tolerant_read() {
+        assert_eq!(HexColor::parse("#3b82f6").unwrap().as_str(), "#3b82f6");
+        assert_eq!(HexColor::parse("  #ABCDEF  ").unwrap().as_str(), "#abcdef");
+        assert_eq!(HexColor::parse_optional(None).unwrap(), None);
+        assert_eq!(HexColor::parse_optional(Some("")).unwrap(), None);
+        assert_eq!(HexColor::parse_optional(Some("   \t ")).unwrap(), None);
+        assert_eq!(
+            HexColor::parse_optional(Some("#10B981")).unwrap().as_ref().map(HexColor::as_str),
+            Some("#10b981")
+        );
+
+        for invalid in ["not-a-color", "javascript:alert(1)", "#12345", "#123", "#gggggg", "3b82f6"]
+        {
+            assert!(HexColor::parse(invalid).is_err(), "expected '{invalid}' to fail");
+            assert!(HexColor::parse_optional(Some(invalid)).is_err());
+            assert_eq!(HexColor::from_stored_tolerant(Some(invalid)), None);
+        }
+
+        assert_eq!(
+            HexColor::from_stored_tolerant(Some(" #AA11BB ")).as_ref().map(HexColor::as_str),
+            Some("#aa11bb")
+        );
+        assert_eq!(HexColor::from_stored_tolerant(Some("   ")), None);
+        assert_eq!(HexColor::from_stored_tolerant(None), None);
     }
 }

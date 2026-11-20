@@ -51,17 +51,20 @@ use crate::{
         ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
         ConsumptionLogView, ConsumptionStatus, EntryKind, InboxState, ItemStatus, MediaRepo,
         ReadAtPatch, SyncRepo, Tag, TagRepo,
+        entries_core::{self, EntryInsertParams, EntryStateUpsert},
         feeds::resolve_dedup_entry_id,
         sync::{
             STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID,
             canonicalize_sync_url, deterministic_item_id, item_natural_key,
         },
     },
+    domain::READER_AUTO_READ_THRESHOLD,
     util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
 /// Auto-logs feed / reader completion (`consumed`) when:
-/// - a `podcast_episode` reaches audio playback completion (`progress >= 0.98`, or archived/finished with `>= 0.9`), or
+/// - a `podcast_episode` reaches audio playback completion (`progress >= READER_AUTO_READ_THRESHOLD`,
+///   or archived/finished with `>= 0.9`), or
 /// - an `article` or `paper` is archived/finished with `progress >= 0.9`.
 ///
 /// Delegates to `CatalogRepo::ensure_auto_consumed_with_parents_in_tx` so auto-completion uses
@@ -77,7 +80,9 @@ pub(super) async fn maybe_auto_log_feed_completion_in_tx(
 ) -> std::result::Result<(), sqlx::Error> {
     let is_dismissed_or_done = matches!(inbox_state, InboxState::Dismissed | InboxState::None);
     let should_log = match entry_kind {
-        EntryKind::PodcastEpisode => progress >= 0.98 || (is_dismissed_or_done && progress >= 0.9),
+        EntryKind::PodcastEpisode => {
+            progress >= READER_AUTO_READ_THRESHOLD || (is_dismissed_or_done && progress >= 0.9)
+        }
         EntryKind::Article | EntryKind::Paper => is_dismissed_or_done && progress >= 0.9,
         _ => false,
     };
@@ -219,50 +224,21 @@ impl ItemRepo<'_> {
         canon_url: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let url_str = new_item.url.as_str();
-        sqlx::query!(
-            "INSERT INTO entries
-             (id, kind, title, creators_json, url, published_at, summary, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            id,
-            entry_kind as _,
-            new_item.title,
-            creators_json,
-            url_str,
-            new_item.published_at as _,
-            new_item.summary,
-            now as _,
-            now as _,
+        entries_core::insert_entry_row_in_tx(
+            tx,
+            &EntryInsertParams {
+                creators_json,
+                url: Some(new_item.url.as_str()),
+                published_at: new_item.published_at,
+                summary: new_item.summary,
+                ..EntryInsertParams::minimal(id, entry_kind, new_item.title, now, now)
+            },
         )
-        .execute(&mut *tx)
         .await?;
 
-        sqlx::query!(
-            "INSERT INTO entry_content (entry_id, content_html, content_type)
-             VALUES (?, NULL, ?)",
-            id,
-            new_item.content_type as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!(
-            "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-             VALUES (?, 'unread', 0.0, ?)",
-            id,
-            now as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('url', ?, ?)",
-            canon_url,
-            id,
-        )
-        .execute(&mut *tx)
-        .await?;
+        entries_core::insert_entry_content_in_tx(tx, id, None, new_item.content_type).await?;
+        entries_core::ensure_entry_state_in_tx(tx, id, InboxState::Unread, now).await?;
+        entries_core::upsert_entry_identifier_in_tx(tx, id, "url", canon_url).await?;
 
         if let Some(fid) = new_item.feed_id {
             sqlx::query!(
@@ -352,25 +328,13 @@ impl ItemRepo<'_> {
         )
         .await?;
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('url', ?, ?)",
+        entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+            &mut tx,
+            &final_item_id,
+            &canon_url,
+            arxiv_id.as_deref(),
         )
-        .bind(&canon_url)
-        .bind(&final_item_id)
-        .execute(&mut *tx)
         .await?;
-
-        if let Some(ref aid) = arxiv_id {
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('arxiv', ?, ?)",
-            )
-            .bind(aid)
-            .bind(&final_item_id)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         MediaRepo::upsert_audio_enclosure_in_tx(
             &mut tx,
@@ -418,41 +382,24 @@ impl ItemRepo<'_> {
         input: &ManualItemInput<'_>,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO entries
-             (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
-             VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
+        entries_core::insert_entry_row_in_tx(
+            tx,
+            &EntryInsertParams {
+                url: Some(input.url.as_str()),
+                summary: input.summary,
+                thumbnail_url: input.thumbnail_url,
+                ..EntryInsertParams::minimal(det_item_id, entry_kind, input.title, now, now)
+            },
         )
-        .bind(det_item_id)
-        .bind(entry_kind)
-        .bind(input.title)
-        .bind(input.url.as_str())
-        .bind(input.summary)
-        .bind(input.thumbnail_url)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
-
-        sqlx::query(
-            "INSERT INTO entry_content (entry_id, content_html, content_type)
-             VALUES (?, ?, ?)",
+        entries_core::insert_entry_content_in_tx(
+            tx,
+            det_item_id,
+            input.content_html,
+            input.content_type,
         )
-        .bind(det_item_id)
-        .bind(input.content_html)
-        .bind(input.content_type)
-        .execute(&mut *tx)
         .await?;
-
-        sqlx::query(
-            "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-             VALUES (?, 'none', 0.0, ?)",
-        )
-        .bind(det_item_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        Ok(())
+        entries_core::ensure_entry_state_in_tx(tx, det_item_id, InboxState::None, now).await
     }
 
     async fn update_existing_manual_item_in_tx(
@@ -693,6 +640,8 @@ impl ItemRepo<'_> {
                 ReadAtPatch::Unchanged => {
                     if current_status == ItemStatus::Archived {
                         None
+                    } else if read_progress.is_some_and(|p| p >= READER_AUTO_READ_THRESHOLD) {
+                        current_read_at.or(Some(now))
                     } else {
                         current_read_at
                     }
@@ -713,23 +662,17 @@ impl ItemRepo<'_> {
             return Ok(true);
         }
 
-        sqlx::query(
-            "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(entry_id) DO UPDATE SET
-                 inbox_state = excluded.inbox_state,
-                 read_at = excluded.read_at,
-                 progress = excluded.progress,
-                 interaction_updated_at = excluded.interaction_updated_at,
-                 updated_at = excluded.updated_at",
+        entries_core::upsert_entry_state_in_tx(
+            tx,
+            &EntryStateUpsert {
+                entry_id: id,
+                inbox_state: target_inbox,
+                read_at: target_read_at,
+                progress: target_progress,
+                interaction_updated_at: Some(now),
+                updated_at: now,
+            },
         )
-        .bind(id)
-        .bind(target_inbox)
-        .bind(target_read_at)
-        .bind(target_progress)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
 
         sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")

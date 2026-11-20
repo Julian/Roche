@@ -1983,3 +1983,254 @@ async fn test_not_found_html_vs_api_problem_details_boundary() {
             .unwrap();
     assert_eq!(headless_problem["type"], "about:blank");
 }
+
+#[tokio::test]
+async fn test_api_collection_hex_color_validation() {
+    let (app, auth) = setup_app().await;
+
+    // POST /api/v1/catalog/lists normalizes valid uppercase hex color to lowercase
+    let create_ok = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/lists")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"title":"Accent List","color":" #3B82F6 "}"#))
+        .unwrap();
+    let ok_res = app.clone().oneshot(create_ok).await.unwrap();
+    assert_eq!(ok_res.status(), StatusCode::CREATED);
+    let ok_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ok_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(ok_body["color"], "#3b82f6");
+
+    // Whitespace-only color normalizes to null
+    let create_blank = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/lists")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"title":"Blank Color","color":"   "}"#))
+        .unwrap();
+    let blank_res = app.clone().oneshot(create_blank).await.unwrap();
+    assert_eq!(blank_res.status(), StatusCode::CREATED);
+    let blank_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(blank_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(blank_body["color"].is_null());
+
+    // Invalid colors return 400 Bad Request Problem Details
+    for invalid in ["not-a-color", "javascript:alert(1)", "#12345"] {
+        let create_bad = Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalog/lists")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "title": "Bad Color", "color": invalid }).to_string(),
+            ))
+            .unwrap();
+        let bad_res = app.clone().oneshot(create_bad).await.unwrap();
+        assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_api_item_patch_respects_reader_auto_read_threshold() {
+    let (app, auth) = setup_app().await;
+
+    let save_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/items/save")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"url":"https://example.com/threshold-test","title":"Threshold"}"#))
+        .unwrap();
+    let save_response = app.clone().oneshot(save_request).await.unwrap();
+    assert_eq!(save_response.status(), StatusCode::CREATED);
+    let save_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(save_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let item_id = save_body["id"].as_str().unwrap();
+    assert!(save_body["read_at"].is_null());
+
+    let patch_done = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/items/{item_id}"))
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "read_progress": crate::domain::READER_AUTO_READ_THRESHOLD })
+                .to_string(),
+        ))
+        .unwrap();
+    let done_res = app.clone().oneshot(patch_done).await.unwrap();
+    assert_eq!(done_res.status(), StatusCode::OK);
+    let done_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(done_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(done_body["read_at"].is_string());
+
+    // Explicit read_at: null still overrides auto-read threshold
+    let patch_unread = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/items/{item_id}"))
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"read_progress":1.0,"read_at":null}"#))
+        .unwrap();
+    let unread_res = app.oneshot(patch_unread).await.unwrap();
+    assert_eq!(unread_res.status(), StatusCode::OK);
+    let unread_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(unread_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(unread_body["read_at"].is_null());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_export_data_includes_legacy_and_unified_catalog_fields_backward_compatibly() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("export-test", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let service = RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+    let app = ApiRoutes::router_with_service(service.clone());
+
+    // Seed legacy feed + saved item + tag
+    let feed_url = Url::parse("https://example.com/export-feed.xml").unwrap();
+    let feed = db
+        .feeds()
+        .create(crate::db::FeedType::Rss, &feed_url, Some("Export Feed"), None)
+        .await
+        .unwrap();
+    let item_url = Url::parse("https://example.com/export-article").unwrap();
+    let (saved_item, _) = db
+        .items()
+        .save_manual_with_tags(&item_url, "Exported Post", &["rust".to_owned()])
+        .await
+        .unwrap();
+
+    // Seed unified catalog entities: manual list, two entries, consumption log, comparison, generator
+    let catalog = db.catalog();
+    let canon = catalog
+        .create_manual_collection(
+            "Film Canon",
+            Some("film_canon"),
+            crate::db::CollectionRole::List,
+            Some("Great films"),
+            Some("#10B981"),
+        )
+        .await
+        .unwrap();
+    let m1 = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Movie),
+            title: "Stalker".to_owned(),
+            creators: vec!["Andrei Tarkovsky".to_owned()],
+            release_year: Some(1979),
+            parent_collection_id: Some(canon.id.clone()),
+            parent_position: Some(1.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let m2 = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Movie),
+            title: "Mirror".to_owned(),
+            creators: vec!["Andrei Tarkovsky".to_owned()],
+            release_year: Some(1975),
+            parent_collection_id: Some(canon.id.clone()),
+            parent_position: Some(2.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(&m1.id, crate::db::ConsumptionStatus::Consumed, Some("Masterpiece"), None)
+        .await
+        .unwrap();
+    catalog
+        .append_comparison(None, &[vec![m1.id.clone()], vec![m2.id.clone()]], None)
+        .await
+        .unwrap();
+    catalog.update_collection_generator(&canon.id, Some(true), Some(&m2.id), None).await.unwrap();
+
+    // 1. Verify RocheService::export_data directly
+    let direct_bundle = service.export_data().await.unwrap();
+    assert_eq!(direct_bundle.version, "1.0");
+    assert_eq!(direct_bundle.feeds.len(), 1);
+    assert_eq!(direct_bundle.feeds[0].id, feed.id);
+    assert!(direct_bundle.items.iter().any(|i| i.id == saved_item.id));
+    assert!(direct_bundle.tags.iter().any(|t| t.name == "rust"));
+    assert!(direct_bundle.entries.iter().any(|e| e.id == m1.id && e.release_year == Some(1979)));
+    assert!(direct_bundle.collections.iter().any(|c| {
+        c.id == canon.id && c.color.as_ref().map(crate::domain::HexColor::as_str) == Some("#10b981")
+    }));
+    assert!(
+        direct_bundle
+            .collection_entries
+            .iter()
+            .any(|ce| { ce.collection_id == canon.id && ce.entry_id == m1.id })
+    );
+    assert!(
+        direct_bundle
+            .consumption_log
+            .iter()
+            .any(|cl| { cl.entry_id == m1.id && cl.notes.as_deref() == Some("Masterpiece") })
+    );
+    assert_eq!(direct_bundle.comparisons.len(), 1);
+    assert_eq!(direct_bundle.collection_generators.len(), 1);
+    assert_eq!(direct_bundle.collection_generators[0].collection_id, canon.id);
+
+    // 2. Verify GET /api/v1/export/data emits all legacy + unified catalog JSON keys and roundtrips
+    let export_request = Request::builder()
+        .uri("/api/v1/export/data")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    let export_response = app.oneshot(export_request).await.unwrap();
+    assert_eq!(export_response.status(), StatusCode::OK);
+    let bytes = to_bytes(export_response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for key in [
+        "version",
+        "exported_at",
+        "feeds",
+        "items",
+        "tags",
+        "item_tags",
+        "activity",
+        "entries",
+        "collections",
+        "collection_entries",
+        "consumption_log",
+        "comparisons",
+        "collection_generators",
+    ] {
+        assert!(json.get(key).is_some(), "export JSON missing expected key '{key}'");
+    }
+    let roundtripped: crate::service::ExportBundle = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(roundtripped.comparisons.len(), 1);
+    assert_eq!(roundtripped.collection_generators.len(), 1);
+
+    // 3. Verify backward compatibility: legacy export JSON without catalog keys still deserializes
+    let legacy_json = serde_json::json!({
+        "version": "1.0",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "feeds": [],
+        "items": [],
+        "tags": [],
+        "item_tags": [],
+        "activity": []
+    });
+    let legacy_bundle: crate::service::ExportBundle = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy_bundle.version, "1.0");
+    assert_eq!(legacy_bundle.entries.len(), 0);
+    assert_eq!(legacy_bundle.collections.len(), 0);
+    assert_eq!(legacy_bundle.collection_entries.len(), 0);
+    assert_eq!(legacy_bundle.consumption_log.len(), 0);
+    assert_eq!(legacy_bundle.comparisons.len(), 0);
+    assert_eq!(legacy_bundle.collection_generators.len(), 0);
+}

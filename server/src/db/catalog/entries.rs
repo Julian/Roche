@@ -15,6 +15,7 @@ use super::{
     },
 };
 use crate::db::{
+    entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, deterministic_title_entry_id},
     types::{ActivityAction, ActivityEntityType, CollectionMode, ConsumptionStatus, EntryKind},
 };
@@ -376,14 +377,11 @@ impl CatalogRepo<'_> {
         // 2. Upfront deduplication across all normalized identifiers (walking merged chains)
         if matched_id.is_none() {
             for ident in &normalized_idents {
-                let raw_owner = sqlx::query_scalar!(
-                    r#"SELECT entry_id as "entry_id!" FROM entry_identifiers
-                       WHERE scheme = ? AND value = ?
-                       LIMIT 1"#,
+                let raw_owner = entries_core::find_entry_id_by_identifier_in_tx(
+                    tx,
                     &ident.scheme,
                     &ident.value,
                 )
-                .fetch_optional(&mut *tx)
                 .await?;
                 if let Some(owner_id) = raw_owner
                     && let Some(canon_owner) = Self::follow_merged_id_in_tx(tx, &owner_id).await?
@@ -587,40 +585,27 @@ impl CatalogRepo<'_> {
             if let Some(found_det) = Self::follow_merged_id_in_tx(tx, &det_id).await? {
                 (found_det, ActivityAction::Update)
             } else {
-                sqlx::query!(
-                    "INSERT INTO entries
-                     (id, kind, title, creators_json, url, published_at, release_year, summary,
-                      thumbnail_url, metadata_json, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    &det_id,
-                    kind as _,
-                    title,
-                    &creators_json,
-                    clean_url_ref,
-                    input.published_at as _,
-                    input.release_year as _,
-                    clean_summary,
-                    clean_thumb,
-                    &metadata_json,
-                    now as _,
-                    now as _,
+                entries_core::insert_entry_row_in_tx(
+                    tx,
+                    &EntryInsertParams {
+                        creators_json: &creators_json,
+                        url: clean_url_ref,
+                        published_at: input.published_at,
+                        release_year: input.release_year,
+                        summary: clean_summary,
+                        thumbnail_url: clean_thumb,
+                        metadata_json: &metadata_json,
+                        ..EntryInsertParams::minimal(&det_id, kind, title, now, now)
+                    },
                 )
-                .execute(&mut *tx)
                 .await?;
                 (det_id, ActivityAction::Create)
             }
         };
 
         for ident in &normalized_idents {
-            sqlx::query!(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES (?, ?, ?)",
-                &ident.scheme,
-                &ident.value,
-                &final_id,
-            )
-            .execute(&mut *tx)
-            .await?;
+            entries_core::upsert_entry_identifier_in_tx(tx, &final_id, &ident.scheme, &ident.value)
+                .await?;
         }
 
         if let Some(canon_parent) = resolved_parent_id {
@@ -699,17 +684,12 @@ impl CatalogRepo<'_> {
             return Ok(canon_artist_id);
         }
 
-        let res = sqlx::query!(
-            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'artist', ?, ?, ?)",
-            &det_artist_id,
-            trimmed,
-            now as _,
-            now as _,
+        let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
+            tx,
+            &EntryInsertParams::minimal(&det_artist_id, EntryKind::Artist, trimmed, now, now),
         )
-        .execute(&mut *tx)
         .await?;
-        if res.rows_affected() > 0 {
+        if inserted {
             SyncRepo::record_activity(
                 tx,
                 ActivityEntityType::Entry,
@@ -779,6 +759,17 @@ impl CatalogRepo<'_> {
         if raw_rows.is_empty() {
             return Ok(Vec::new());
         }
+        let mut conn = self.pool.acquire().await?;
+        Self::hydrate_entries_in_tx(&mut conn, raw_rows).await
+    }
+
+    pub(super) async fn hydrate_entries_in_tx(
+        conn: &mut SqliteConnection,
+        raw_rows: Vec<RawEntryRow>,
+    ) -> CatalogResult<Vec<CatalogEntry>> {
+        if raw_rows.is_empty() {
+            return Ok(Vec::new());
+        }
         let ids: Vec<&str> = raw_rows.iter().map(|r| r.id.as_str()).collect();
         let mut ident_map: BTreeMap<String, Vec<EntryIdentifier>> = BTreeMap::new();
         for chunk in ids.chunks(400) {
@@ -791,7 +782,7 @@ impl CatalogRepo<'_> {
             }
             sep.push_unseparated(") ORDER BY scheme ASC, value ASC");
             let rows: Vec<(String, String, String)> =
-                qb.build_query_as().fetch_all(self.pool).await?;
+                qb.build_query_as().fetch_all(&mut *conn).await?;
             for (eid, scheme, value) in rows {
                 ident_map.entry(eid).or_default().push(EntryIdentifier { scheme, value });
             }

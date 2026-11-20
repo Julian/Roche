@@ -11,8 +11,11 @@ use super::{
     },
 };
 use crate::db::{
+    entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, collection_entry_natural_key, deterministic_system_collection_id},
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+    types::{
+        ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
+    },
 };
 
 impl CatalogRepo<'_> {
@@ -169,7 +172,9 @@ impl CatalogRepo<'_> {
         let now = crate::util::clock::now_utc();
         let show_in_lists = role == CollectionRole::List;
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        let clean_color = color.map(str::trim).filter(|s| !s.is_empty());
+        let validated_color = HexColor::parse_optional(color)
+            .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
+        let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
         let mut tx = crate::db::begin_write(self.pool).await?;
         let existing = sqlx::query_scalar!(
@@ -183,16 +188,13 @@ impl CatalogRepo<'_> {
                 "Collection with slug '{derived_slug}' already exists"
             )));
         }
-        sqlx::query!(
-            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?, ?)",
-            &id,
-            clean_title,
-            clean_summary,
-            now as _,
-            now as _,
+        entries_core::insert_entry_row_in_tx(
+            &mut tx,
+            &EntryInsertParams {
+                summary: clean_summary,
+                ..EntryInsertParams::minimal(&id, EntryKind::Collection, clean_title, now, now)
+            },
         )
-        .execute(&mut *tx)
         .await?;
 
         sqlx::query!(
@@ -208,14 +210,7 @@ impl CatalogRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-            &derived_slug,
-            &id,
-        )
-        .execute(&mut *tx)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(&mut tx, &id, "slug", &derived_slug).await?;
 
         SyncRepo::record_activity(
             &mut tx,
@@ -289,15 +284,10 @@ impl CatalogRepo<'_> {
         }
 
         let id = deterministic_system_collection_id(&want_slug);
-        let res = sqlx::query!(
-            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?)",
-            &id,
-            &pretty_label,
-            now as _,
-            now as _,
+        let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
+            tx,
+            &EntryInsertParams::minimal(&id, EntryKind::Collection, &pretty_label, now, now),
         )
-        .execute(&mut *tx)
         .await?;
         sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
@@ -308,15 +298,8 @@ impl CatalogRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-            &want_slug,
-            &id,
-        )
-        .execute(&mut *tx)
-        .await?;
-        if res.rows_affected() > 0 {
+        entries_core::upsert_entry_identifier_in_tx(tx, &id, "slug", &want_slug).await?;
+        if inserted {
             SyncRepo::record_activity(
                 tx,
                 ActivityEntityType::Entry,

@@ -85,14 +85,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -173,30 +177,22 @@ class RocheRepository(
             thumbnailDiskCache = thumbnailDiskCache,
         )
 
-    private val inboxSnapshotFlow: Flow<RepositorySnapshot> =
-        combine(
-            dao.observeItems(),
-            dao.observeFeeds(),
-            dao.observeTags(),
-            dao.observeItemTags(),
-            activePeersFlow,
-        ) { items, feeds, tags, itemTags, activePeers ->
-            buildSnapshot(
-                items = items,
-                feeds = feeds,
-                tags = tags,
-                itemTags = itemTags,
-                activePeers = activePeers,
-                entryCache = entryCache,
-            )
-        }
+    internal val unifiedSnapshotLoader =
+        UnifiedSnapshotLoader(dao = dao, catalog = catalog, entryCache = entryCache)
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     val snapshot: Flow<RepositorySnapshot> =
         combine(
-                inboxSnapshotFlow,
-                catalog.snapshot.onStart { catalog.ensureSystemSeeded() },
-            ) { base, catalogSnap ->
-                base.copy(catalog = catalogSnap).also { latestSnapshot = it }
+                dao.observeRepositoryStamp()
+                    .onStart { catalog.ensureSystemSeeded() }
+                    .distinctUntilChanged(),
+                activePeersFlow,
+            ) { stamp, activePeers ->
+                stamp to activePeers
+            }
+            .conflate()
+            .mapLatest { (_, activePeers) ->
+                unifiedSnapshotLoader.loadSnapshot(activePeers).also { latestSnapshot = it }
             }
             .flowOn(Dispatchers.Default)
 

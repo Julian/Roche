@@ -7,6 +7,7 @@ use url::Url;
 use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
     ItemRepo, MediaRepo, SyncRepo,
+    entries_core::{self, EntryInsertParams},
     sync::{
         MAX_CONSECUTIVE_FAILURES, SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id,
         deterministic_item_id, feed_natural_key, item_natural_key, normalize_consecutive_failures,
@@ -17,6 +18,8 @@ use crate::{
     util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
+/// Read-only feed subscription projection over the unified `entries` + `collection_specs`
+/// (`mode = 'feed'`, `collection_role = 'feed'`) + `feed_sources` tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Feed {
@@ -200,35 +203,21 @@ pub(super) async fn resolve_dedup_entry_id(
         return Ok(Some(found));
     }
 
-    let by_ident: Option<String> = if let Some(aid) = arxiv_id {
-        sqlx::query_scalar!(
-            "SELECT COALESCE(e.merged_into_id, e.id) AS \"id!: String\"
-             FROM entry_identifiers ei
-             JOIN entries e ON e.id = ei.entry_id
-             WHERE (ei.scheme = 'arxiv' AND ei.value = ?)
-                OR (ei.scheme = 'url' AND ei.value = ?)
-             LIMIT 1",
-            aid,
-            canon_url,
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-    } else {
-        sqlx::query_scalar!(
-            "SELECT COALESCE(e.merged_into_id, e.id) AS \"id!: String\"
-             FROM entry_identifiers ei
-             JOIN entries e ON e.id = ei.entry_id
-             WHERE ei.scheme = 'url' AND ei.value = ?
-             LIMIT 1",
-            canon_url,
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-    };
-
-    if let Some(found) = by_ident {
-        return CatalogRepo::follow_merged_id_in_tx(&mut *conn, &found).await;
+    if let Some(aid) = arxiv_id
+        && let Some(raw_id) =
+            entries_core::find_entry_id_by_identifier_in_tx(&mut *conn, "arxiv", aid).await?
+        && let Some(canon) = CatalogRepo::follow_merged_id_in_tx(&mut *conn, &raw_id).await?
+    {
+        return Ok(Some(canon));
     }
+
+    if let Some(raw_id) =
+        entries_core::find_entry_id_by_identifier_in_tx(&mut *conn, "url", canon_url).await?
+        && let Some(canon) = CatalogRepo::follow_merged_id_in_tx(&mut *conn, &raw_id).await?
+    {
+        return Ok(Some(canon));
+    }
+
     Ok(None)
 }
 
@@ -487,14 +476,8 @@ impl<'a> FeedRepo<'a> {
         .execute(&mut *conn)
         .await?;
 
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('feed_url', ?, ?)",
-            nat_key,
-            row.id,
-        )
-        .execute(&mut *conn)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(&mut *conn, row.id, "feed_url", &nat_key)
+            .await?;
 
         SyncRepo::record_activity(
             &mut *conn,
@@ -987,34 +970,21 @@ impl<'a> FeedRepo<'a> {
                     .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                         VALUES (?, 'unread', 0.0, ?)",
-                        existing_id,
-                        now as _,
+                    entries_core::ensure_entry_state_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        InboxState::Unread,
+                        now,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                         VALUES ('url', ?, ?)",
-                        canon_url,
-                        existing_id,
+                    entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        &canon_url,
+                        arxiv_id.as_deref(),
                     )
-                    .execute(&mut *tx)
                     .await?;
-
-                    if let Some(ref aid) = arxiv_id {
-                        sqlx::query!(
-                            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                             VALUES ('arxiv', ?, ?)",
-                            aid,
-                            existing_id,
-                        )
-                        .execute(&mut *tx)
-                        .await?;
-                    }
 
                     MediaRepo::upsert_audio_enclosure_in_tx(
                         &mut tx,
@@ -1058,63 +1028,43 @@ impl<'a> FeedRepo<'a> {
                 let creators_json = crate::db::serialize_creators_json(&item.creators)
                     .unwrap_or_else(|| "[]".to_owned());
 
-                let res = sqlx::query!(
-                    "INSERT OR IGNORE INTO entries
-                     (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    det_id,
-                    entry_kind as _,
-                    item.title,
-                    creators_json,
-                    item_url_str,
-                    item.published_at as _,
-                    item.summary,
-                    item_thumb,
-                    now as _,
-                    now as _,
+                let inserted_entry = entries_core::insert_entry_row_or_ignore_in_tx(
+                    &mut tx,
+                    &EntryInsertParams {
+                        creators_json: &creators_json,
+                        url: Some(item_url_str),
+                        published_at: item.published_at,
+                        summary: Some(item.summary.as_str()),
+                        thumbnail_url: item_thumb,
+                        ..EntryInsertParams::minimal(&det_id, entry_kind, &item.title, now, now)
+                    },
                 )
-                .execute(&mut *tx)
                 .await?;
 
-                if res.rows_affected() > 0 {
-                    sqlx::query!(
-                        "INSERT INTO entry_content (entry_id, content_html, content_type)
-                         VALUES (?, ?, ?)",
-                        det_id,
+                if inserted_entry {
+                    entries_core::insert_entry_content_in_tx(
+                        &mut tx,
+                        &det_id,
                         item_content_html,
-                        item.content_type as _,
+                        item.content_type,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                         VALUES (?, 'unread', 0.0, ?)",
-                        det_id,
-                        now as _,
+                    entries_core::ensure_entry_state_in_tx(
+                        &mut tx,
+                        &det_id,
+                        InboxState::Unread,
+                        now,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                         VALUES ('url', ?, ?)",
-                        canon_url,
-                        det_id,
+                    entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+                        &mut tx,
+                        &det_id,
+                        &canon_url,
+                        arxiv_id.as_deref(),
                     )
-                    .execute(&mut *tx)
                     .await?;
-
-                    if let Some(ref aid) = arxiv_id {
-                        sqlx::query!(
-                            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                             VALUES ('arxiv', ?, ?)",
-                            aid,
-                            det_id,
-                        )
-                        .execute(&mut *tx)
-                        .await?;
-                    }
 
                     sqlx::query!(
                         "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)

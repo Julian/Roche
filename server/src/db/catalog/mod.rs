@@ -4,6 +4,7 @@ mod batch;
 mod collections;
 mod consumption;
 mod entries;
+mod export;
 mod generators;
 mod identity_norm;
 mod merge;
@@ -25,10 +26,11 @@ pub use identity_norm::{
 pub use models::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
-    CatalogError, CatalogResult, ClusterSelectFilter, CollectionGeneratorState,
-    CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
-    ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput,
+    CatalogError, CatalogExportSnapshot, CatalogResult, ClusterSelectFilter,
+    CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
+    ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
+    ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
+    ExportConsumptionLog, RankedCollectionView, RankedEntryRow, UpsertEntryInput,
 };
 
 #[derive(Clone, Copy)]

@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{
     db::{ItemFilter, ItemPage},
-    domain::{ItemStatus, ReadAtPatch},
+    domain::{ItemStatus, READER_AUTO_READ_THRESHOLD, ReadAtPatch},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
     service::{ItemDetail, RocheService},
     util::clock::now_utc,
@@ -92,6 +92,9 @@ pub(super) async fn items_update(
         None => match req.is_read {
             Some(true) => ReadAtPatch::MarkRead(now_utc()),
             Some(false) => ReadAtPatch::MarkUnread,
+            None if req.read_progress.is_some_and(|p| p >= READER_AUTO_READ_THRESHOLD) => {
+                ReadAtPatch::MarkRead(now_utc())
+            }
             None => ReadAtPatch::Unchanged,
         },
     };

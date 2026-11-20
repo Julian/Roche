@@ -17,7 +17,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use self::{
@@ -38,7 +38,11 @@ pub use self::{
 use crate::{
     config::Config,
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
-    db::{ActivityEntry, Db, Feed, Item, ItemTag, SyncRepo, Tag},
+    db::{
+        ActivityEntry, CatalogEntry, CatalogRepo, CollectionSummary, ComparisonRecord,
+        ConsumptionLogRow, Db, ExportCollectionEntry, ExportCollectionGenerator, Feed, Item,
+        ItemTag, SyncRepo, Tag,
+    },
     media::{MediaStore, ytdlp::YtDlpWorker},
     scheduler::{DynFeedFetcher, FeedFetcher, FeedPollLocks, MediaIngestContext},
     util::{clock::now_utc, media_urls::youtube_thumbnail_url},
@@ -84,15 +88,27 @@ pub fn extract_backfill_thumbnail(
         .or_else(|| base_url.and_then(youtube_thumbnail_url))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportBundle {
-    pub version: &'static str,
+    pub version: String,
     pub exported_at: DateTime<Utc>,
     pub feeds: Vec<Feed>,
     pub items: Vec<Item>,
     pub tags: Vec<Tag>,
     pub item_tags: Vec<ItemTag>,
     pub activity: Vec<ActivityEntry>,
+    #[serde(default)]
+    pub entries: Vec<CatalogEntry>,
+    #[serde(default)]
+    pub collections: Vec<CollectionSummary>,
+    #[serde(default)]
+    pub collection_entries: Vec<ExportCollectionEntry>,
+    #[serde(default)]
+    pub consumption_log: Vec<ConsumptionLogRow>,
+    #[serde(default)]
+    pub comparisons: Vec<ComparisonRecord>,
+    #[serde(default)]
+    pub collection_generators: Vec<ExportCollectionGenerator>,
 }
 
 struct ActiveRefreshGuard {
@@ -269,16 +285,23 @@ impl RocheService {
         let item_tags =
             crate::db::TagRepo::list_item_tags_for_items_in_tx(&mut tx, &item_ids).await?;
         let activity = SyncRepo::list_activity_in_tx(&mut tx).await?;
+        let catalog = CatalogRepo::export_catalog_snapshot_in_tx(&mut tx).await?;
         tx.commit().await?;
 
         Ok(ExportBundle {
-            version: "1.0",
+            version: "1.0".to_owned(),
             exported_at: now_utc(),
             feeds,
             items,
             tags,
             item_tags,
             activity,
+            entries: catalog.entries,
+            collections: catalog.collections,
+            collection_entries: catalog.collection_entries,
+            consumption_log: catalog.consumption_log,
+            comparisons: catalog.comparisons,
+            collection_generators: catalog.collection_generators,
         })
     }
 }

@@ -805,6 +805,19 @@ private fun resolveEnrichedDuration(
     return src.takeIf { it.isNotBlank() }?.let(::formatArticleMinutes)
 }
 
+private suspend fun RocheDao.resolveOrInitEntryState(
+    itemId: String,
+    nowIso: String,
+): EntryStateEntity? =
+    getEntryStateById(itemId)
+        ?: getEntryById(itemId)?.let {
+            EntryStateEntity(
+                entryId = itemId,
+                inboxState = "none",
+                updatedAt = nowIso,
+            )
+        }
+
 internal suspend fun RocheDao.setItemStatusAndReadAt(
     itemId: String,
     status: String,
@@ -812,9 +825,9 @@ internal suspend fun RocheDao.setItemStatusAndReadAt(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             val isNonFeed = existing.inboxState.equals("none", ignoreCase = true)
             val isArchived = status.equals("archived", ignoreCase = true)
@@ -891,9 +904,9 @@ internal suspend fun RocheDao.setItemReadAt(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             upsertEntryState(
                 existing.copy(
@@ -915,9 +928,9 @@ internal suspend fun RocheDao.setItemReadProgress(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             upsertEntryState(
                 existing.copy(

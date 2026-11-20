@@ -877,3 +877,233 @@ async fn test_merge_entries_escapes_like_wildcards_in_comparisons() {
     .unwrap();
     assert_eq!(rewritten_count, 1);
 }
+
+#[tokio::test]
+async fn test_collection_hex_color_validation_normalization_and_tolerant_read() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    // Valid colors are accepted and normalized consistently with Tag.color (lowercase #rrggbb)
+    let blue = catalog
+        .create_manual_collection(
+            "Blue List",
+            Some("blue_list"),
+            CollectionRole::List,
+            None,
+            Some("#3b82f6"),
+        )
+        .await
+        .unwrap();
+    let expected_blue = crate::db::HexColor::parse("#3b82f6").unwrap();
+    assert_eq!(blue.color, Some(expected_blue.clone()));
+    let tag = db.tags().create("blue-tag", Some(&expected_blue)).await.unwrap();
+    assert_eq!(blue.color, tag.color);
+
+    let upper = catalog
+        .create_manual_collection(
+            "Upper Hex List",
+            Some("upper_hex_list"),
+            CollectionRole::List,
+            None,
+            Some("  #ABCDEF  "),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upper.color, Some(crate::db::HexColor::parse("#abcdef").unwrap()));
+
+    // Empty / whitespace-only colors normalize to None
+    let blank = catalog
+        .create_manual_collection(
+            "Blank Color List",
+            Some("blank_color_list"),
+            CollectionRole::List,
+            None,
+            Some("   "),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank.color, None);
+
+    // Invalid colors are rejected with CatalogError::InvalidInput
+    for invalid in ["not-a-color", "javascript:alert(1)", "#12345", "#gggggg", "3b82f6"] {
+        let err = catalog
+            .create_manual_collection(
+                "Invalid Color List",
+                Some("invalid_color_list"),
+                CollectionRole::List,
+                None,
+                Some(invalid),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::InvalidInput(_)),
+            "expected InvalidInput for '{invalid}', got {err:?}"
+        );
+    }
+
+    // Batch collection creation enforces the exact same HexColor rules
+    let valid_batch = CatalogBatchInput {
+        collections: vec![
+            BatchCollectionInput {
+                ref_key: None,
+                id: None,
+                title: "Batch Colored".to_owned(),
+                slug: Some("batch_colored".to_owned()),
+                role: CollectionRole::List,
+                summary: None,
+                color: Some("#10B981".to_owned()),
+                members: Vec::new(),
+            },
+            BatchCollectionInput {
+                ref_key: None,
+                id: None,
+                title: "Batch Blank Color".to_owned(),
+                slug: Some("batch_blank_color".to_owned()),
+                role: CollectionRole::List,
+                summary: None,
+                color: Some("  \t ".to_owned()),
+                members: Vec::new(),
+            },
+        ],
+        ..CatalogBatchInput::default()
+    };
+    catalog.apply_batch(&valid_batch).await.unwrap();
+    let batch_colored = catalog.get_collection_summary("batch_colored").await.unwrap();
+    assert_eq!(batch_colored.color, Some(crate::db::HexColor::parse("#10b981").unwrap()));
+    let batch_blank = catalog.get_collection_summary("batch_blank_color").await.unwrap();
+    assert_eq!(batch_blank.color, None);
+
+    let bad_batch = CatalogBatchInput {
+        collections: vec![BatchCollectionInput {
+            ref_key: None,
+            id: None,
+            title: "Bad Batch Color".to_owned(),
+            slug: Some("bad_batch_color".to_owned()),
+            role: CollectionRole::List,
+            summary: None,
+            color: Some("javascript:alert(1)".to_owned()),
+            members: Vec::new(),
+        }],
+        ..CatalogBatchInput::default()
+    };
+    let batch_err = catalog.apply_batch(&bad_batch).await.unwrap_err();
+    assert!(matches!(batch_err, CatalogError::InvalidInput(_)));
+    assert!(catalog.get_collection_summary("bad_batch_color").await.is_err());
+
+    // Legacy / malformed rows in collection_specs.color remain readable tolerantly
+    sqlx::query("UPDATE collection_specs SET color = 'not-a-color' WHERE collection_id = ?")
+        .bind(&blue.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE collection_specs SET color = ' #AA11BB ' WHERE collection_id = ?")
+        .bind(&upper.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let blue_legacy = catalog.get_collection_summary(&blue.id).await.unwrap();
+    assert_eq!(blue_legacy.color, None);
+    let upper_legacy = catalog.get_collection_summary(&upper.id).await.unwrap();
+    assert_eq!(upper_legacy.color, Some(crate::db::HexColor::parse("#aa11bb").unwrap()));
+}
+
+#[tokio::test]
+async fn test_export_catalog_snapshot_includes_full_graph_and_excludes_merged() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let list = catalog
+        .create_manual_collection(
+            "Sci-Fi Canon",
+            Some("scifi_canon"),
+            CollectionRole::List,
+            Some("Best speculative works"),
+            Some("#3B82F6"),
+        )
+        .await
+        .unwrap();
+    let book1 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Dune".to_owned(),
+            creators: vec!["Frank Herbert".to_owned()],
+            release_year: Some(1965),
+            identifiers: vec![EntryIdentifier {
+                scheme: "isbn".to_owned(),
+                value: "9780441172719".to_owned(),
+            }],
+            metadata: Some(serde_json::json!({ "pages": 412 })),
+            parent_collection_id: Some(list.id.clone()),
+            parent_position: Some(1.0),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let book2 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Solaris".to_owned(),
+            creators: vec!["Stanislaw Lem".to_owned()],
+            release_year: Some(1961),
+            parent_collection_id: Some(list.id.clone()),
+            parent_position: Some(2.0),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let dup_book = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Dune Duplicate".to_owned(),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.merge_entries(&dup_book.id, &book1.id).await.unwrap();
+
+    catalog
+        .log_consumption(&book1.id, ConsumptionStatus::Consumed, Some("Classic"), None)
+        .await
+        .unwrap();
+    catalog
+        .append_comparison(None, &[vec![book1.id.clone()], vec![book2.id.clone()]], None)
+        .await
+        .unwrap();
+    catalog.update_collection_generator(&list.id, Some(true), Some(&book2.id), None).await.unwrap();
+
+    let snap = catalog.export_catalog_snapshot().await.unwrap();
+    assert!(snap.entries.iter().any(|e| {
+        e.id == book1.id
+            && e.release_year == Some(1965)
+            && e.creators == vec!["Frank Herbert".to_owned()]
+            && e.metadata["pages"] == 412
+            && e.identifiers.iter().any(|i| i.scheme == "isbn" && i.value == "9780441172719")
+    }));
+    assert!(
+        !snap.entries.iter().any(|e| e.id == dup_book.id),
+        "merged duplicate tombstones must be excluded from catalog export entries"
+    );
+
+    let exported_list = snap.collections.iter().find(|c| c.id == list.id).unwrap();
+    assert_eq!(exported_list.color, Some(crate::db::HexColor::parse("#3b82f6").unwrap()));
+    assert!(exported_list.has_generator);
+    assert_eq!(exported_list.member_count, 1);
+    assert_eq!(exported_list.comparison_count, 1);
+
+    assert!(snap.collection_entries.iter().any(|ce| {
+        ce.collection_id == list.id && ce.entry_id == book1.id && ce.position == Some(1.0)
+    }));
+    assert!(snap.consumption_log.iter().any(|cl| {
+        cl.entry_id == book1.id
+            && cl.status == ConsumptionStatus::Consumed
+            && cl.notes.as_deref() == Some("Classic")
+    }));
+    assert_eq!(snap.comparisons.len(), 1);
+    assert_eq!(snap.comparisons[0].ordering, vec![vec![book1.id.clone()], vec![book2.id.clone()]]);
+    assert_eq!(snap.collection_generators.len(), 1);
+    assert_eq!(snap.collection_generators[0].collection_id, list.id);
+    assert!(snap.collection_generators[0].enabled);
+    assert_eq!(snap.collection_generators[0].current_entry_id.as_deref(), Some(book2.id.as_str()));
+}

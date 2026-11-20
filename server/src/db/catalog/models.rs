@@ -6,7 +6,7 @@ use super::identity_norm::{
     EXTERNAL_ID_DISPLAY_ORDER, external_identifier_label, external_identifier_url,
 };
 use crate::{
-    db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
+    db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, HexColor},
     ranking::Score,
 };
 
@@ -240,7 +240,7 @@ pub struct CollectionSummary {
     pub role: CollectionRole,
     pub rule_json: Option<String>,
     pub show_in_lists: bool,
-    pub color: Option<String>,
+    pub color: Option<HexColor>,
     pub member_count: usize,
     pub comparison_count: usize,
     pub has_generator: bool,
@@ -357,7 +357,7 @@ impl RawCollectionRow {
             role: self.collection_role,
             rule_json: self.rule_json,
             show_in_lists: self.show_in_lists,
-            color: self.color,
+            color: HexColor::from_stored_tolerant(self.color.as_deref()),
             member_count,
             comparison_count,
             has_generator: self.has_generator,
@@ -468,4 +468,43 @@ pub struct CollectionRankingInputs {
     pub collection: CollectionSummary,
     pub is_priority_scope: bool,
     pub members: Vec<CatalogEntry>,
+}
+
+/// Exported catalog entry record (alias for [`CatalogEntry`]).
+pub type ExportCatalogEntry = CatalogEntry;
+
+/// Exported consumption log record (alias for [`ConsumptionLogRow`]).
+pub type ExportConsumptionLog = ConsumptionLogRow;
+
+/// Exported comparison ordering record (alias for [`ComparisonRecord`]).
+pub type ExportComparison = ComparisonRecord;
+
+/// Exported `collection_entries` membership row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExportCollectionEntry {
+    pub collection_id: String,
+    pub entry_id: String,
+    pub position: Option<f64>,
+    pub added_at: DateTime<Utc>,
+}
+
+/// Exported `collection_generators` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExportCollectionGenerator {
+    pub collection_id: String,
+    pub enabled: bool,
+    pub current_entry_id: Option<String>,
+    pub drawn_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Complete, point-in-time snapshot of unified catalog tables for full data export.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogExportSnapshot {
+    pub entries: Vec<CatalogEntry>,
+    pub collections: Vec<CollectionSummary>,
+    pub collection_entries: Vec<ExportCollectionEntry>,
+    pub consumption_log: Vec<ConsumptionLogRow>,
+    pub comparisons: Vec<ComparisonRecord>,
+    pub collection_generators: Vec<ExportCollectionGenerator>,
 }

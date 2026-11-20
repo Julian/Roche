@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::{
-    ActivityAction, ActivityEntityType, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
+    ActivityAction, ActivityEntityType, EntryKind, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
+    entries_core::{self, EntryInsertParams},
     sync::{deterministic_tag_id, tag_natural_key},
 };
 
@@ -206,17 +207,7 @@ impl<'a> TagRepo<'a> {
             sqlx::query!("UPDATE collection_specs SET slug = ? WHERE collection_id = ?", slug, id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query!("DELETE FROM entry_identifiers WHERE scheme = 'tag' AND entry_id = ?", id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query!(
-                "INSERT OR REPLACE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('tag', ?, ?)",
-                nat_key,
-                id,
-            )
-            .execute(&mut *tx)
-            .await?;
+            entries_core::replace_entry_identifier_in_tx(&mut tx, id, "tag", &nat_key).await?;
             sqlx::query!(
                 "UPDATE entries SET updated_at = ?
                  WHERE id IN (SELECT entry_id FROM collection_entries WHERE collection_id = ?)",
@@ -333,18 +324,13 @@ impl<'a> TagRepo<'a> {
             return Ok(id);
         }
 
-        let tag_insert = sqlx::query!(
-            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?)",
-            new_tag_id,
-            name,
-            created_at as _,
-            now as _,
+        let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
+            &mut *conn,
+            &EntryInsertParams::minimal(&new_tag_id, EntryKind::Collection, name, created_at, now),
         )
-        .execute(&mut *conn)
         .await?;
 
-        if tag_insert.rows_affected() > 0 {
+        if inserted {
             sqlx::query!(
                 "INSERT OR IGNORE INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
                  VALUES (?, ?, 'manual', 'tag', 0, ?)",
@@ -354,14 +340,8 @@ impl<'a> TagRepo<'a> {
             )
             .execute(&mut *conn)
             .await?;
-            sqlx::query!(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('tag', ?, ?)",
-                nat_key,
-                new_tag_id,
-            )
-            .execute(&mut *conn)
-            .await?;
+            entries_core::upsert_entry_identifier_in_tx(&mut *conn, &new_tag_id, "tag", &nat_key)
+                .await?;
             SyncRepo::record_activity(
                 &mut *conn,
                 ActivityEntityType::Tag,

@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -93,9 +94,16 @@ class MainViewModel(
 
     val playerState: StateFlow<PodcastPlayerState> = playerController.state
 
+    private val sharedSnapshotFlow =
+        repository.snapshot.shareIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(),
+            replay = 1,
+        )
+
     private val baseUiStateFlow =
         combine(
-            repository.snapshot,
+            sharedSnapshotFlow,
             settingsForUi,
             transientState,
             repository.isSyncActive,
@@ -148,7 +156,7 @@ class MainViewModel(
     private fun observePlayerControllerSync() {
         viewModelScope.launch {
             combine(
-                    repository.snapshot.map { it.entries }.distinctUntilChanged(),
+                    sharedSnapshotFlow.map { it.entries }.distinctUntilChanged(),
                     settingsForUi
                         .map { settings ->
                             PlayerSettingsSlice(
@@ -178,7 +186,7 @@ class MainViewModel(
 
     private fun observeSettledStars() {
         viewModelScope.launch {
-            repository.snapshot
+            sharedSnapshotFlow
                 .map { snap -> snap.entries.associate { it.id to it.isFavorite } }
                 .distinctUntilChanged()
                 .collect { persistedById ->
@@ -189,7 +197,7 @@ class MainViewModel(
 
     private fun observeActiveCollectionDraws() {
         viewModelScope.launch {
-            repository.snapshot
+            sharedSnapshotFlow
                 .map { snap ->
                     snap.catalog.generators
                         .filter { it.enabled }
@@ -376,7 +384,7 @@ class MainViewModel(
     }
 
     private suspend fun reconcileRestoredSelection(restored: SavedNavigationUiState) {
-        val snapshot = repository.snapshot.first()
+        val snapshot = sharedSnapshotFlow.first()
         val missingReaderId =
             restored.selectedReaderEntryId?.takeIf { targetId ->
                 snapshot.entries.none { it.id == targetId }

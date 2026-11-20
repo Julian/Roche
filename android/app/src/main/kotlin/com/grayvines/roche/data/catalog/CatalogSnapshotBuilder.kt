@@ -39,81 +39,95 @@ internal data class RawCatalogTables(
     val comparisons: List<ComparisonEntity>,
 )
 
-internal fun buildCatalogSnapshot(tables: RawCatalogTables): CatalogSnapshot {
+private data class PreparedComparisons(
+    val globalEp: CachedEpScores,
+    val scopedByColId: Map<String, List<ComparisonEntity>>,
+)
+
+internal fun buildCatalogSnapshot(
+    tables: RawCatalogTables,
+    epScoreCache: EpScoreCache? = null,
+): CatalogSnapshot {
     val activeEntries =
         tables.entries.filter { it.mergedIntoId.isNullOrBlank() }.associateBy { it.id }
-    val titlesByEntryId = tables.entries.associate { it.id to it.title }
-    val domainEntries = buildDomainEntries(activeEntries, tables.identifiers)
-    val logsByEntryId = tables.logs.groupBy { it.entryId }
-    val statusesByEntryId = logsByEntryId.mapValues { (_, list) ->
-        list.map { ConsumptionStatus.fromWireValue(it.status) }.toHashSet()
-    }
-    val consumedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.CONSUMED)
-    val abandonedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.ABANDONED)
-    val (globalOrderings, globalScores) =
-        inferGlobalCatalogScores(domainEntries, tables.comparisons)
-    val membershipsByCollection = groupSortedMemberships(tables.memberships)
-    val generatorsByCollection = tables.generators.associateBy { it.collectionId }
-
-    val collectionBundle =
-        buildRankedCollections(
-            RankedCollectionsInput(
-                specs = tables.specs,
-                titlesByEntryId = titlesByEntryId,
-                membershipsByCollection = membershipsByCollection,
-                generatorsByCollection = generatorsByCollection,
-                domainEntries = domainEntries,
-                consumedIds = consumedIds,
-                abandonedIds = abandonedIds,
-                statusesByEntryId = statusesByEntryId,
-                logsByEntryId = logsByEntryId,
-                globalOrderings = globalOrderings,
-                globalScores = globalScores,
-                allComparisons = tables.comparisons,
-            )
-        )
+    val rankedInput = buildRankedCollectionsInput(tables, activeEntries, epScoreCache)
+    val collectionBundle = buildRankedCollections(rankedInput)
     val globalTiers =
-        computePerKindGlobalTiers(domainEntries, consumedIds, globalScores, globalOrderings)
-    val diaryItems = buildDiaryItems(tables.logs, domainEntries, globalTiers)
-    val generatorStates =
-        buildCollectionGeneratorStates(
-            specs = tables.specs,
-            titlesByEntryId = titlesByEntryId,
-            generatorsByCollection = generatorsByCollection,
-            membershipsByCollection = membershipsByCollection,
-            rawEntries = activeEntries,
-            domainEntries = domainEntries,
-            consumedIds = consumedIds,
-            abandonedIds = abandonedIds,
+        computePerKindGlobalTiers(
+            rankedInput.domainEntries,
+            rankedInput.consumedIds,
+            rankedInput.globalScores,
+            rankedInput.globalOrderings,
         )
-
     return CatalogSnapshot(
         lists = collectionBundle.sortedLists,
         wantQueues = collectionBundle.sortedWants,
         entriesByCollectionId = collectionBundle.entriesByCollectionId,
-        diaryEntries = diaryItems,
-        generators = generatorStates,
+        diaryEntries = buildDiaryItems(tables.logs, rankedInput.domainEntries, globalTiers),
+        generators =
+            buildCollectionGeneratorStates(
+                specs = tables.specs,
+                titlesByEntryId = rankedInput.titlesByEntryId,
+                generatorsByCollection = rankedInput.generatorsByCollection,
+                membershipsByCollection = rankedInput.membershipsByCollection,
+                rawEntries = activeEntries,
+                domainEntries = rankedInput.domainEntries,
+                consumedIds = rankedInput.consumedIds,
+                abandonedIds = rankedInput.abandonedIds,
+            ),
         comparisonCount = tables.comparisons.size,
     )
 }
 
-private fun inferGlobalCatalogScores(
-    domainEntries: Map<String, CatalogEntryItem>,
+private fun buildRankedCollectionsInput(
+    tables: RawCatalogTables,
+    activeEntries: Map<String, EntryEntity>,
+    epScoreCache: EpScoreCache?,
+): RankedCollectionsInput {
+    val mergeRedirects = buildCatalogMergeRedirects(tables.entries)
+    val logsByEntryId = tables.logs.groupBy { it.entryId }
+    val prepared = prepareComparisons(tables.comparisons, mergeRedirects, epScoreCache)
+    return RankedCollectionsInput(
+        specs = tables.specs,
+        titlesByEntryId = tables.entries.associate { it.id to it.title },
+        membershipsByCollection = groupSortedMemberships(tables.memberships),
+        generatorsByCollection = tables.generators.associateBy { it.collectionId },
+        domainEntries = buildDomainEntries(activeEntries, tables.identifiers),
+        consumedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.CONSUMED),
+        abandonedIds = extractEntryIdsWithStatus(tables.logs, ConsumptionStatus.ABANDONED),
+        statusesByEntryId =
+            logsByEntryId.mapValues { (_, list) ->
+                list.map { ConsumptionStatus.fromWireValue(it.status) }.toHashSet()
+            },
+        logsByEntryId = logsByEntryId,
+        globalOrderings = prepared.globalEp.orderings,
+        globalScores = prepared.globalEp.scores,
+        scopedComparisonsByColId = prepared.scopedByColId,
+        mergeRedirects = mergeRedirects,
+        epScoreCache = epScoreCache,
+    )
+}
+
+private fun prepareComparisons(
     comparisons: List<ComparisonEntity>,
-): Pair<List<List<List<String>>>, Map<String, EpRankingEngine.Score>> {
-    val globalOrderings =
-        comparisons
-            .filter { it.scopeCollectionId.isNullOrBlank() }
-            .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
-    val comparedIds =
-        globalOrderings
-            .asSequence()
-            .flatten()
-            .flatten()
-            .filter { it in domainEntries }
-            .distinct()
-            .toList()
-    return globalOrderings to EpRankingEngine.inferScores(comparedIds, globalOrderings)
+    mergeRedirects: Map<String, String>,
+    epScoreCache: EpScoreCache?,
+): PreparedComparisons {
+    val global = ArrayList<ComparisonEntity>()
+    val scoped = HashMap<String, MutableList<ComparisonEntity>>()
+    for (comp in comparisons) {
+        val rawScope = comp.scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
+        if (rawScope == null) {
+            global.add(comp)
+        } else {
+            val canonScope = followCatalogMergeRedirect(rawScope, mergeRedirects)
+            scoped.getOrPut(canonScope) { ArrayList() }.add(comp)
+        }
+    }
+    val globalEp =
+        epScoreCache?.resolveGlobal(global, mergeRedirects)
+            ?: computeEpScoresCold(global, mergeRedirects)
+    return PreparedComparisons(globalEp = globalEp, scopedByColId = scoped)
 }
 
 internal fun resolveSpecTitle(
@@ -173,13 +187,16 @@ private data class RankedCollectionsInput(
     val logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
     val globalOrderings: List<List<List<String>>>,
     val globalScores: Map<String, EpRankingEngine.Score>,
-    val allComparisons: List<ComparisonEntity>,
+    val scopedComparisonsByColId: Map<String, List<ComparisonEntity>>,
+    val mergeRedirects: Map<String, String>,
+    val epScoreCache: EpScoreCache?,
 )
 
 private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollectionsBundle {
     val entriesByCollectionId = LinkedHashMap<String, List<RankedCatalogEntry>>()
     val listSummaries = ArrayList<CatalogListSummary>()
     val wantSummaries = ArrayList<CatalogListSummary>()
+    val activeWantScopeIds = HashSet<String>()
 
     for (spec in input.specs) {
         val rawRole = CollectionRole.fromWireValue(spec.role)
@@ -187,6 +204,9 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
         if (role == CollectionRole.FEED || role == CollectionRole.TAG) continue
         val mode = CollectionMode.fromWireValue(spec.mode)
         val isWant = role == CollectionRole.WANT || spec.collectionId == UP_NEXT_COLLECTION_ID
+        if (isWant) {
+            activeWantScopeIds.add(spec.collectionId)
+        }
         val effectiveGen =
             input.generatorsByCollection[spec.collectionId]?.takeIf { isGeneratorEligible(spec) }
         val rawMemberships = input.membershipsByCollection[spec.collectionId].orEmpty()
@@ -216,6 +236,8 @@ private fun buildRankedCollections(input: RankedCollectionsInput): RankedCollect
             listSummaries,
         )
     }
+
+    input.epScoreCache?.evictUnusedScopes(activeWantScopeIds)
 
     return RankedCollectionsBundle(
         entriesByCollectionId = entriesByCollectionId,
@@ -247,10 +269,7 @@ private fun resolveAndRankSpec(
         specId = spec.collectionId,
         isWant = isWant,
         memberEntries = memberIds.mapNotNull { input.domainEntries[it] },
-        allComparisons = input.allComparisons,
-        globalOrderings = input.globalOrderings,
-        globalScores = input.globalScores,
-        logsByEntryId = input.logsByEntryId,
+        input = input,
     )
 }
 
@@ -285,30 +304,29 @@ private fun toCatalogListSummary(
     )
 }
 
-@Suppress("LongParameterList")
 private fun rankSpecEntries(
     specId: String,
     isWant: Boolean,
     memberEntries: List<CatalogEntryItem>,
-    allComparisons: List<ComparisonEntity>,
-    globalOrderings: List<List<List<String>>>,
-    globalScores: Map<String, EpRankingEngine.Score>,
-    logsByEntryId: Map<String, List<ConsumptionLogEntity>>,
+    input: RankedCollectionsInput,
 ): List<RankedCatalogEntry> {
-    val orderings =
+    if (memberEntries.isEmpty()) return emptyList()
+    val (orderings, precomputedScores) =
         if (isWant) {
-            allComparisons
-                .filter { it.scopeCollectionId == specId }
-                .mapNotNull { decodeComparisonOrdering(it.orderingJson) }
+            val scopedComparisons = input.scopedComparisonsByColId[specId].orEmpty()
+            val localEp =
+                input.epScoreCache?.resolveLocal(specId, scopedComparisons, input.mergeRedirects)
+                    ?: computeEpScoresCold(scopedComparisons, input.mergeRedirects)
+            localEp.orderings to localEp.scores
         } else {
-            globalOrderings
+            input.globalOrderings to input.globalScores
         }
     return rankEntriesByOrderings(
         entries = memberEntries,
         isPriorityScoped = isWant,
         orderings = orderings,
-        precomputedGlobalScores = if (isWant) null else globalScores,
-        logsByEntryId = logsByEntryId,
+        precomputedScores = precomputedScores,
+        logsByEntryId = input.logsByEntryId,
     )
 }
 
@@ -439,12 +457,11 @@ private fun parseRuleTargetStatus(rule: DynamicCollectionRuleDto): Set<Consumpti
     return setOf(parsed)
 }
 
-@Suppress("LongParameterList")
 internal fun rankEntriesByOrderings(
     entries: List<CatalogEntryItem>,
     isPriorityScoped: Boolean,
     orderings: List<List<List<String>>>,
-    precomputedGlobalScores: Map<String, EpRankingEngine.Score>? = null,
+    precomputedScores: Map<String, EpRankingEngine.Score>? = null,
     logsByEntryId: Map<String, List<ConsumptionLogEntity>> = emptyMap(),
 ): List<RankedCatalogEntry> {
     if (entries.isEmpty()) return emptyList()
@@ -454,10 +471,10 @@ internal fun rankEntriesByOrderings(
         ord.any { group -> group.any { it in memberSet } }
     }
     val localScores =
-        if (isPriorityScoped || precomputedGlobalScores == null) {
-            EpRankingEngine.inferScores(memberIds, orderings)
+        if (precomputedScores != null) {
+            memberIds.associateWith { precomputedScores[it] ?: EpRankingEngine.Score() }
         } else {
-            memberIds.associateWith { precomputedGlobalScores[it] ?: EpRankingEngine.Score() }
+            EpRankingEngine.inferScores(memberIds, orderings)
         }
     val sortedEntries = sortEntriesByScoreAndTitle(entries, localScores)
     val quantiles =

@@ -14,8 +14,11 @@ use super::{
 };
 use crate::{
     db::{
+        entries_core,
         sync::SyncRepo,
-        types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+        types::{
+            ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
+        },
     },
     ranking::validate_ordering,
 };
@@ -164,7 +167,9 @@ impl CatalogRepo<'_> {
 
         let show_in_lists = col.role == CollectionRole::List;
         let clean_summary = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let clean_color = col.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let validated_color = HexColor::parse_optional(col.color.as_deref())
+            .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
+        let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
         sqlx::query(
             "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
@@ -199,14 +204,7 @@ impl CatalogRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-        )
-        .bind(&derived_slug)
-        .bind(&target_id)
-        .execute(&mut *tx)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &derived_slug).await?;
 
         SyncRepo::record_activity(
             tx,
@@ -356,15 +354,9 @@ impl CatalogRepo<'_> {
                     if !tried_vals.insert(norm_val.clone()) {
                         continue;
                     }
-                    if let Some(found) = sqlx::query_scalar::<_, String>(
-                        "SELECT entry_id FROM entry_identifiers
-                         WHERE scheme = ? AND value = ?
-                         LIMIT 1",
-                    )
-                    .bind(&scheme)
-                    .bind(&norm_val)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                    if let Some(found) =
+                        entries_core::find_entry_id_by_identifier_in_tx(tx, &scheme, &norm_val)
+                            .await?
                         && let Some(canon) = Self::follow_merged_id_in_tx(tx, &found).await?
                     {
                         return Ok(canon);

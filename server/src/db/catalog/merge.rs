@@ -9,11 +9,12 @@ use super::{
 };
 use crate::db::{
     MediaRepo,
+    entries_core::{self, EntryStateUpsert},
     sync::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
         deterministic_comparison_id,
     },
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
+    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, InboxState},
 };
 
 impl CatalogRepo<'_> {
@@ -302,45 +303,45 @@ impl CatalogRepo<'_> {
             .fetch_optional(&mut *tx)
             .await?;
 
-            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) =
-                if let Some(cs) = canon_state {
-                    let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
-                        "dismissed".to_owned()
-                    } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
-                        "unread".to_owned()
-                    } else {
-                        "none".to_owned()
-                    };
-                    let read_at = match (cs.read_at, ds.read_at) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    };
-                    let progress = cs.progress.max(ds.progress);
-                    let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
-                    (inbox, read_at, progress, inter_ts)
+            let parse_inbox = |raw: &str| match raw {
+                "dismissed" => InboxState::Dismissed,
+                "unread" => InboxState::Unread,
+                _ => InboxState::None,
+            };
+            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) = if let Some(cs) =
+                canon_state
+            {
+                let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
+                    InboxState::Dismissed
+                } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
+                    InboxState::Unread
                 } else {
-                    (ds.inbox_state, ds.read_at, ds.progress, ds.interaction_updated_at)
+                    InboxState::None
                 };
+                let read_at = match (cs.read_at, ds.read_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let progress = cs.progress.max(ds.progress);
+                let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
+                (inbox, read_at, progress, inter_ts)
+            } else {
+                (parse_inbox(&ds.inbox_state), ds.read_at, ds.progress, ds.interaction_updated_at)
+            };
 
-            sqlx::query!(
-                "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(entry_id) DO UPDATE SET
-                    inbox_state = excluded.inbox_state,
-                    read_at = excluded.read_at,
-                    progress = excluded.progress,
-                    interaction_updated_at = excluded.interaction_updated_at,
-                    updated_at = excluded.updated_at",
-                canon_resolved,
-                &merged_inbox,
-                merged_read_at as _,
-                merged_progress,
-                merged_inter_ts as _,
-                now as _,
+            entries_core::upsert_entry_state_in_tx(
+                tx,
+                &EntryStateUpsert {
+                    entry_id: canon_resolved,
+                    inbox_state: merged_inbox,
+                    read_at: merged_read_at,
+                    progress: merged_progress,
+                    interaction_updated_at: merged_inter_ts,
+                    updated_at: now,
+                },
             )
-            .execute(&mut *tx)
             .await?;
             sqlx::query!("DELETE FROM entry_state WHERE entry_id = ?", dup_resolved)
                 .execute(&mut *tx)

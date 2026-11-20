@@ -22,7 +22,8 @@ use super::MergeContext;
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
-        ConsumptionStatus,
+        ConsumptionStatus, HexColor,
+        entries_core::{self, EntryInsertParams},
     },
     ranking::validate_ordering,
 };
@@ -111,7 +112,8 @@ impl SyncRepo<'_> {
             return Ok(());
         }
 
-        let clean_color = cs.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let validated_color = HexColor::from_stored_tolerant(cs.color.as_deref());
+        let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
         sqlx::query(
             "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
@@ -158,14 +160,7 @@ impl SyncRepo<'_> {
         .await?;
 
         if let Some(slug) = effective_slug {
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('slug', ?, ?)",
-            )
-            .bind(slug)
-            .bind(&target_id)
-            .execute(&mut *tx)
-            .await?;
+            entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &slug).await?;
         }
         Ok(())
     }
@@ -251,18 +246,14 @@ impl SyncRepo<'_> {
                     let clean_title = rec.title.trim();
                     let title = if clean_title.is_empty() { raw_dup } else { clean_title };
                     let created = rec.created_at.unwrap_or(ctx.now);
-                    sqlx::query(
-                        "INSERT INTO entries (id, kind, title, merged_into_id, created_at, updated_at, hlc)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    entries_core::insert_entry_row_in_tx(
+                        tx,
+                        &EntryInsertParams {
+                            merged_into_id: Some(&canon_resolved),
+                            hlc: Some(&entry_hlc),
+                            ..EntryInsertParams::minimal(raw_dup, rec.kind, title, created, ctx.now)
+                        },
                     )
-                    .bind(raw_dup)
-                    .bind(rec.kind)
-                    .bind(title)
-                    .bind(&canon_resolved)
-                    .bind(created)
-                    .bind(ctx.now)
-                    .bind(&entry_hlc)
-                    .execute(&mut *tx)
                     .await?;
                 }
                 Some(None) => {

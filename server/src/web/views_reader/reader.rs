@@ -10,7 +10,10 @@ use axum::{
 use super::{AddTagForm, FinishItemForm, ProgressForm, render_audio_play_button};
 use crate::{
     content::HtmlSanitizer,
-    domain::{ConsumptionStatus, EntryKind, ItemStatus, MediaType, ReadAtPatch},
+    domain::{
+        ConsumptionStatus, EntryKind, ItemStatus, MediaType, READER_AUTO_READ_THRESHOLD,
+        ReadAtPatch,
+    },
     service::{AppError, ItemDetail, RocheService},
     util::clock::now_utc,
     web::{
@@ -289,7 +292,11 @@ pub(in crate::web) async fn post_item_progress(
     Form(form): Form<ProgressForm>,
 ) -> Result<Response, WebError> {
     let p = if form.progress.is_finite() { form.progress.clamp(0.0, 1.0) } else { 0.0 };
-    let patch = if p >= 0.98 { ReadAtPatch::MarkRead(now_utc()) } else { ReadAtPatch::Unchanged };
+    let patch = if p >= READER_AUTO_READ_THRESHOLD {
+        ReadAtPatch::MarkRead(now_utc())
+    } else {
+        ReadAtPatch::Unchanged
+    };
     let _ = service.items().update(&id, None, None, Some(p), patch).await.web_err(&session)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
