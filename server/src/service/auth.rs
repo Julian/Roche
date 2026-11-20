@@ -17,8 +17,10 @@ use crate::{
 };
 
 const MAX_DEVICE_NAME_LEN: usize = 128;
+const MAX_TAILSCALE_LOGIN_KEY_LEN: usize = 256;
 const PAIR_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const PAIR_RATE_LIMIT_MAX_FAILURES: usize = 4;
+const PAIR_PRE_DB_MAX_ATTEMPTS: usize = 12;
 const MAX_TRACKED_PAIRING_IPS: usize = 4_096;
 const MAX_TAILSCALE_WEB_TOKENS_PER_USER: i64 = 3;
 
@@ -32,6 +34,7 @@ pub enum PairingClientKey {
 struct PairingRateLimiterState {
     active_hash: Option<String>,
     by_client: HashMap<PairingClientKey, Vec<Instant>>,
+    pre_db_by_client: HashMap<PairingClientKey, Vec<Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -40,56 +43,82 @@ pub(super) struct PairingRateLimiter {
 }
 
 impl PairingRateLimiter {
-    fn check_and_record(&self, active_hash: &str, client: PairingClientKey) -> Result<(), u64> {
-        let now = Instant::now();
-        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.active_hash.as_deref() != Some(active_hash) {
-            guard.active_hash = Some(active_hash.to_owned());
-            guard.by_client.clear();
+    fn compute_retry_after(now: Instant, timestamps: &[Instant]) -> u64 {
+        let remaining = timestamps
+            .iter()
+            .copied()
+            .min()
+            .and_then(|oldest| PAIR_RATE_LIMIT_WINDOW.checked_sub(now.duration_since(oldest)))
+            .unwrap_or(Duration::ZERO);
+        if remaining.subsec_nanos() > 0 {
+            remaining.as_secs().saturating_add(1)
+        } else {
+            remaining.as_secs()
         }
-        guard.by_client.retain(|_, timestamps| {
+        .clamp(1, PAIR_RATE_LIMIT_WINDOW.as_secs())
+    }
+
+    fn record_in_map(
+        map: &mut HashMap<PairingClientKey, Vec<Instant>>,
+        client: PairingClientKey,
+        now: Instant,
+        max_attempts: usize,
+    ) -> Result<(), u64> {
+        map.retain(|_, timestamps| {
             timestamps.retain(|&ts| now.duration_since(ts) < PAIR_RATE_LIMIT_WINDOW);
             !timestamps.is_empty()
         });
-        if let Some(timestamps) = guard.by_client.get_mut(&client) {
-            if timestamps.len() >= PAIR_RATE_LIMIT_MAX_FAILURES {
-                let remaining = timestamps
-                    .iter()
-                    .copied()
-                    .min()
-                    .and_then(|oldest| {
-                        PAIR_RATE_LIMIT_WINDOW.checked_sub(now.duration_since(oldest))
-                    })
-                    .unwrap_or(Duration::ZERO);
-                let retry_after_secs = if remaining.subsec_nanos() > 0 {
-                    remaining.as_secs().saturating_add(1)
-                } else {
-                    remaining.as_secs()
-                }
-                .clamp(1, PAIR_RATE_LIMIT_WINDOW.as_secs());
-                return Err(retry_after_secs);
+        if let Some(timestamps) = map.get_mut(&client) {
+            if timestamps.len() >= max_attempts {
+                return Err(Self::compute_retry_after(now, timestamps));
             }
             timestamps.push(now);
             return Ok(());
         }
-        if guard.by_client.len() >= MAX_TRACKED_PAIRING_IPS
-            && let Some(oldest_key) = guard
-                .by_client
+        if map.len() >= MAX_TRACKED_PAIRING_IPS
+            && let Some(oldest_key) = map
                 .iter()
                 .min_by_key(|(_, ts)| ts.last().copied().unwrap_or(now))
                 .map(|(k, _)| k.clone())
         {
-            guard.by_client.remove(&oldest_key);
+            map.remove(&oldest_key);
         }
-        guard.by_client.insert(client, vec![now]);
-        drop(guard);
+        map.insert(client, vec![now]);
         Ok(())
+    }
+
+    /// Lightweight in-memory flood guard checked BEFORE touching SQLite so sustained
+    /// unauthenticated bursts cannot force unbounded DB reads.
+    fn check_pre_db(&self, client: &PairingClientKey) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::record_in_map(
+            &mut guard.pre_db_by_client,
+            client.clone(),
+            now,
+            PAIR_PRE_DB_MAX_ATTEMPTS,
+        )
+    }
+
+    fn check_and_record(
+        &self,
+        active_hash: Option<&str>,
+        client: PairingClientKey,
+    ) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.active_hash.as_deref() != active_hash {
+            guard.active_hash = active_hash.map(str::to_owned);
+            guard.by_client.clear();
+        }
+        Self::record_in_map(&mut guard.by_client, client, now, PAIR_RATE_LIMIT_MAX_FAILURES)
     }
 
     fn reset(&self) {
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.active_hash = None;
         guard.by_client.clear();
+        guard.pre_db_by_client.clear();
     }
 }
 
@@ -106,11 +135,15 @@ impl AuthService<'_> {
         x_forwarded_for: Option<&str>,
     ) -> PairingClientKey {
         if self.service.config.tailscale.enabled
-            && peer_addr.is_some_and(|addr| addr.ip().is_loopback())
+            && peer_addr.is_some_and(|addr| addr.ip().to_canonical().is_loopback())
         {
-            if let Some(ts_login) = tailscale_user_login
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
+            if let Some(ts_login) =
+                tailscale_user_login.map(|s| s.trim().to_ascii_lowercase()).filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= MAX_TAILSCALE_LOGIN_KEY_LEN
+                        && !s.contains(',')
+                        && !s.chars().any(char::is_control)
+                })
             {
                 return PairingClientKey::TailscaleLogin(ts_login);
             }
@@ -118,11 +151,11 @@ impl AuthService<'_> {
                 .and_then(|s| s.rsplit(',').next())
                 .and_then(|raw| raw.trim().parse::<IpAddr>().ok())
             {
-                return PairingClientKey::DirectIp(fwd_ip);
+                return PairingClientKey::DirectIp(fwd_ip.to_canonical());
             }
         }
         PairingClientKey::DirectIp(
-            peer_addr.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip()),
+            peer_addr.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip().to_canonical()),
         )
     }
 
@@ -161,17 +194,26 @@ impl AuthService<'_> {
             )));
         }
 
-        let Some(active_hash) = self.service.db.auth().active_pairing_code_hash().await? else {
-            return Err(AppError::pairing_code_invalid("Invalid or expired pairing code"));
-        };
+        if let Err(retry_after_secs) = self.service.pairing_limiter.check_pre_db(&client_key) {
+            return Err(AppError::pairing_rate_limited(
+                "Too many failed pairing attempts; please wait before retrying",
+                retry_after_secs,
+            ));
+        }
+
+        let active_hash = self.service.db.auth().active_pairing_code_hash().await?;
 
         if let Err(retry_after_secs) =
-            self.service.pairing_limiter.check_and_record(&active_hash, client_key)
+            self.service.pairing_limiter.check_and_record(active_hash.as_deref(), client_key)
         {
             return Err(AppError::pairing_rate_limited(
                 "Too many failed pairing attempts; please wait before retrying",
                 retry_after_secs,
             ));
+        }
+
+        if active_hash.is_none() {
+            return Err(AppError::pairing_code_invalid("Invalid or expired pairing code"));
         }
 
         let pairing = PairingManager::new(self.service.db.auth());
@@ -291,7 +333,7 @@ mod tests {
     #[test]
     fn test_pairing_rate_limiter_bounds_tracked_ips_and_evicts_oldest() {
         let limiter = PairingRateLimiter::default();
-        let active_hash = "hash-1";
+        let active_hash = Some("hash-1");
 
         for idx in 0..(MAX_TRACKED_PAIRING_IPS + 8) {
             let hi = u8::try_from((idx >> 8) & 0xff).unwrap();
@@ -307,7 +349,7 @@ mod tests {
     #[test]
     fn test_pairing_rate_limiter_isolates_tailscale_logins_behind_loopback() {
         let limiter = PairingRateLimiter::default();
-        let active_hash = "hash-ts";
+        let active_hash = Some("hash-ts");
 
         for _ in 0..PAIR_RATE_LIMIT_MAX_FAILURES {
             assert!(

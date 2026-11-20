@@ -191,6 +191,43 @@ const fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Sanitizes an upstream fetch/parse error before returning it to HTTP clients or persisting it
+/// in `feeds.last_error`, preventing internal DNS IP oracle leaks from `SafeDnsResolver` or
+/// `reqwest` socket errors while leaving full details in server `tracing` logs.
+#[must_use]
+pub fn sanitize_upstream_error(err: &anyhow::Error) -> String {
+    for cause in err.chain() {
+        if let Some(ssrf) = cause.downcast_ref::<SsrfBlockedError>() {
+            return ssrf.0.clone();
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            return "Upstream host resolved to a disallowed network address".to_owned();
+        }
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            if req_err.is_timeout() {
+                return "Upstream request timed out".to_owned();
+            }
+            if let Some(status) = req_err.status() {
+                return format!("Upstream server returned HTTP {}", status.as_u16());
+            }
+            if req_err.is_redirect() {
+                return "Upstream redirect blocked or exceeded redirect limit".to_owned();
+            }
+            if req_err.is_connect() {
+                return "Unable to connect to upstream host".to_owned();
+            }
+            return "Upstream HTTP request failed".to_owned();
+        }
+    }
+    let rendered = err.to_string();
+    if rendered.contains("disallowed IP address") {
+        return "Upstream host resolved to a disallowed network address".to_owned();
+    }
+    rendered
+}
+
 /// Wraps an unbracketed IPv6 literal in `[...]` for `host:port` formatting.
 #[must_use]
 pub fn bracket_ipv6_host(host: &str) -> Cow<'_, str> {
@@ -251,5 +288,27 @@ mod tests {
         assert_eq!(bracket_ipv6_host("127.0.0.1"), "127.0.0.1");
         assert_eq!(bracket_ipv6_host("::1"), "[::1]");
         assert_eq!(bracket_ipv6_host("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn test_sanitize_upstream_error_scrubs_resolved_internal_ips() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Host 'rebind.example' resolved to disallowed IP address 100.64.0.42",
+        );
+        let err = anyhow::Error::new(io_err).context("GET https://rebind.example/feed");
+        let safe = sanitize_upstream_error(&err);
+        assert!(!safe.contains("100.64.0.42"));
+        assert!(safe.contains("disallowed network address"));
+    }
+
+    #[test]
+    fn test_extract_arxiv_id_rejects_query_injection() {
+        use crate::util::media_urls::extract_arxiv_id;
+        assert_eq!(extract_arxiv_id("2301.07041v2").as_deref(), Some("2301.07041v2"));
+        assert_eq!(extract_arxiv_id("hep-th/9901001").as_deref(), Some("hep-th/9901001"));
+        assert!(extract_arxiv_id("2301.07041&max_results=999").is_none());
+        assert!(extract_arxiv_id("2301.07041%26search_query=all").is_none());
+        assert!(extract_arxiv_id("../etc/passwd").is_none());
     }
 }

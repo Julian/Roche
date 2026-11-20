@@ -11,8 +11,8 @@ use crate::{
     feeds::ArxivParser,
     scheduler::{FeedFetcher, FeedIngester},
     util::{
-        media_urls::{extract_arxiv_id, youtube_thumbnail_url},
-        url_guard::{parse_public_url, validate_public_url},
+        media_urls::{extract_arxiv_id, is_valid_arxiv_id, youtube_thumbnail_url},
+        url_guard::validate_public_url,
     },
 };
 
@@ -123,8 +123,10 @@ impl<'a> ItemService<'a> {
         has_explicit_title: bool,
     ) {
         if let Some(aid) = arxiv_id
+            && is_valid_arxiv_id(aid)
             && let Ok(api_url) =
-                parse_public_url(&format!("https://export.arxiv.org/api/query?id_list={aid}"))
+                Url::parse_with_params("https://export.arxiv.org/api/query", &[("id_list", aid)])
+            && validate_public_url(&api_url).is_ok()
             && let Ok(Ok(xml)) =
                 tokio::time::timeout(Duration::from_secs(10), service.fetcher.fetch_feed(&api_url))
                     .await

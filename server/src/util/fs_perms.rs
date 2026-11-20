@@ -21,14 +21,18 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 /// Creates `dir` recursively with `0700` permissions on Unix and tightens existing dedicated
-/// directories to `0700` (skipping shared system/home/temp/cwd roots).
+/// directories to `0700` (skipping shared system/home/temp/cwd roots and symlinks).
 pub async fn ensure_private_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
         builder.create(dir).await?;
-        if is_safe_to_chmod_dir(dir) {
+        if is_safe_to_chmod_dir(dir)
+            && tokio::fs::symlink_metadata(dir)
+                .await
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        {
             use std::os::unix::fs::PermissionsExt;
             let _ = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
         }
@@ -40,16 +44,24 @@ pub async fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Creates `file` if missing with `0600` permissions on Unix and tightens existing file mode to `0600`.
+/// Creates `file` if missing with `0600` permissions on Unix and tightens existing file mode
+/// to `0600` via file-descriptor `fchmod` (refusing to follow symlinks).
 pub async fn precreate_or_tighten_private_file(file: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = tokio::fs::symlink_metadata(file).await
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!("Refusing to open or chmod symlinked private file: {}", file.display());
+        }
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(false).mode(0o600);
         let handle = opts.open(file).await?;
-        drop(handle);
-        let _ = tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
+        let meta = handle.metadata().await?;
+        if meta.is_file() {
+            let _ = handle.set_permissions(std::fs::Permissions::from_mode(0o600)).await;
+        }
     }
     #[cfg(not(unix))]
     {
@@ -64,13 +76,22 @@ pub async fn precreate_or_tighten_private_file(file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Tightens `file` permissions to `0600` on Unix if the file exists.
+/// Tightens `file` permissions to `0600` on Unix if the file exists (using `fchmod` on the opened
+/// file descriptor and refusing symlinks).
 pub async fn tighten_private_file_if_exists(file: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if tokio::fs::try_exists(file).await.unwrap_or(false) {
-            let _ = tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
+        let is_regular = tokio::fs::symlink_metadata(file)
+            .await
+            .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink());
+        if !is_regular {
+            return;
+        }
+        if let Ok(handle) = tokio::fs::OpenOptions::new().read(true).open(file).await
+            && handle.metadata().await.is_ok_and(|m| m.is_file())
+        {
+            let _ = handle.set_permissions(std::fs::Permissions::from_mode(0o600)).await;
         }
     }
     #[cfg(not(unix))]

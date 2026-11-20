@@ -17,6 +17,21 @@ pub fn is_arxiv_host(host: Option<&str>) -> bool {
 }
 
 #[must_use]
+pub fn is_valid_arxiv_id(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 64
+        && !candidate.contains("..")
+        && !candidate.starts_with('/')
+        && !candidate.ends_with('/')
+        && !candidate.starts_with('.')
+        && !candidate.ends_with('.')
+        && candidate.matches('/').count() <= 1
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+}
+
+#[must_use]
 pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
     let trimmed = url_or_id.trim();
     let is_http = trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
@@ -46,7 +61,7 @@ pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
     let cleaned = id_part.split(&['?', '#'][..]).next().unwrap_or(id_part);
     let cleaned = cleaned.strip_suffix(".pdf").unwrap_or(cleaned).trim_matches('/');
 
-    if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+    is_valid_arxiv_id(cleaned).then(|| cleaned.to_string())
 }
 
 /// Strips a trailing arXiv version suffix (`v1`, `v2`, ...) from an arXiv identifier
@@ -73,13 +88,7 @@ pub fn canonical_arxiv_abstract_url(raw_url: &Url) -> Option<Url> {
     }
     let arxiv_id = extract_arxiv_id(raw_url.as_str())?;
     let versionless = strip_arxiv_version(&arxiv_id);
-    if versionless.is_empty()
-        || versionless.contains("..")
-        || versionless.matches('/').count() > 1
-        || !versionless
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
-    {
+    if !is_valid_arxiv_id(versionless) {
         return None;
     }
     Url::parse(&format!("https://arxiv.org/abs/{versionless}")).ok()
@@ -95,12 +104,7 @@ pub fn arxiv_pdf_url(paper_url: &Url) -> Option<Url> {
         return None;
     }
     let arxiv_id = extract_arxiv_id(paper_url.as_str())?;
-    if arxiv_id.contains("..")
-        || arxiv_id.matches('/').count() > 1
-        || !arxiv_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
-    {
+    if !is_valid_arxiv_id(&arxiv_id) {
         return None;
     }
     Url::parse(&format!("https://arxiv.org/pdf/{arxiv_id}.pdf")).ok()

@@ -586,6 +586,7 @@ pub async fn discover_on_tailnet(
 
 fn build_probe_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
+        .no_proxy()
         .timeout(PROBE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -691,20 +692,40 @@ async fn run_tailscale_serve_status(tailscale_bin: &Path) -> Result<String> {
     .await
 }
 
+const TRUSTED_TAILSCALE_PATHS: [&str; 4] = [
+    "/usr/bin/tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    MACOS_APP_TAILSCALE_BIN,
+];
+
+fn resolve_tailscale_bin(configured: &Path) -> &Path {
+    if configured == Path::new("tailscale") {
+        for candidate in TRUSTED_TAILSCALE_PATHS {
+            let path = Path::new(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+    configured
+}
+
 async fn run_tailscale_cmd(
     tailscale_bin: &Path,
     args: &[&str],
     timeout: Duration,
 ) -> std::result::Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    let resolved = resolve_tailscale_bin(tailscale_bin);
     let first = tokio::time::timeout(
         timeout,
-        Command::new(tailscale_bin).args(args).kill_on_drop(true).output(),
+        Command::new(resolved).args(args).kill_on_drop(true).output(),
     )
     .await?;
     match first {
         Err(ref e)
             if e.kind() == std::io::ErrorKind::NotFound
-                && tailscale_bin == Path::new("tailscale")
+                && resolved == Path::new("tailscale")
                 && Path::new(MACOS_APP_TAILSCALE_BIN).exists() =>
         {
             tokio::time::timeout(

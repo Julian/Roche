@@ -309,7 +309,8 @@ impl<'a> CatalogService<'a> {
             },
         );
 
-        let max_abs = scores.values().map(|s| s.mean.abs()).fold(0.0_f64, f64::max);
+        let max_abs =
+            scores.values().map(|s| s.mean.abs()).filter(|v| v.is_finite()).fold(0.0_f64, f64::max);
         let scale = if max_abs > 0.0 { max_abs } else { 1.0 };
 
         let rows: Vec<RankedEntryRow> = sorted_members
@@ -677,7 +678,7 @@ impl<'a> CatalogService<'a> {
         let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
             return (None, Vec::new());
         };
-        if s.starts_with("spotify:") || s.contains("open.spotify.com/") {
+        if s.starts_with("spotify:") || is_spotify_web_url(s) {
             let url_opt =
                 (s.starts_with("https://") || s.starts_with("http://")).then(|| s.to_owned());
             return (
@@ -725,6 +726,16 @@ impl<'a> CatalogService<'a> {
         }
         (None, vec![EntryIdentifier { scheme: "external".to_owned(), value: s.to_owned() }])
     }
+}
+
+fn is_spotify_web_url(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some_and(|h| {
+                let norm = h.trim_end_matches('.').to_ascii_lowercase();
+                norm == "open.spotify.com" || norm == "play.spotify.com"
+            })
+    })
 }
 
 fn count_relevant_comparisons(member_ids: &[String], orderings: &[Vec<Vec<String>>]) -> usize {

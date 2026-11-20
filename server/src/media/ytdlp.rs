@@ -76,8 +76,7 @@ impl YtDlpWorker {
         Self::validate_item_id(item_id)?;
         let canonical_url = canonical_youtube_watch_url(url)
             .ok_or_else(|| anyhow::anyhow!("URL is not a valid YouTube watch URL: {url}"))?;
-        let output_template = output_dir.join("video.%(ext)s");
-        let template_str = output_template
+        let output_dir_str = output_dir
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Output directory path is not valid UTF-8"))?;
         let max_mb = max_video_size_mb.max(1);
@@ -97,8 +96,10 @@ impl YtDlpWorker {
             "mp4".to_string(),
             "--write-thumbnail".to_string(),
             "--write-info-json".to_string(),
+            "--paths".to_string(),
+            output_dir_str.to_string(),
             "--output".to_string(),
-            template_str.to_string(),
+            "video.%(ext)s".to_string(),
             "--".to_string(),
             canonical_url.into(),
         ])
@@ -538,16 +539,21 @@ mod tests {
 
         let script = format!(
             "#!/bin/sh\n\
+             dir=\"\"\n\
              out=\"\"\n\
              while [ $# -gt 0 ]; do\n\
-               if [ \"$1\" = \"--output\" ]; then\n\
+               if [ \"$1\" = \"--paths\" ]; then\n\
+                 shift\n\
+                 dir=\"$1\"\n\
+               elif [ \"$1\" = \"--output\" ]; then\n\
                  shift\n\
                  out=\"$1\"\n\
-                 break\n\
                fi\n\
                shift\n\
              done\n\
-             dir=$(dirname \"$out\")\n\
+             if [ -z \"$dir\" ]; then\n\
+               dir=$(dirname \"$out\")\n\
+             fi\n\
              {actions}\n"
         );
         tokio::fs::write(path, script).await.unwrap();
@@ -670,11 +676,13 @@ mod tests {
             b"first-valid-thumb"
         );
 
-        // 3. Re-download into an existing downloads/<item_id> preserves sibling files cleanly.
+        // 3. Re-download into an existing downloads/<item_id> preserves sibling files cleanly
+        //    and updates existing media rows in-place instead of creating duplicates.
         let keep_sibling = item_dir.join("existing.jpg");
         tokio::fs::write(&keep_sibling, b"sibling-file").await.unwrap();
         assert!(ok_worker.download_for_item(&db.media(), &item_id, &watch_url).await.is_ok());
         assert!(keep_sibling.exists());
+        assert_eq!(db.media().list_for_item(&item_id).await.unwrap().len(), 2);
 
         assert_no_leftover_staging_dirs(&downloads_dir).await;
         let _ = tokio::fs::remove_dir_all(&temp_base).await;

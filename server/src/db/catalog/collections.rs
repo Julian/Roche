@@ -243,6 +243,26 @@ impl CatalogRepo<'_> {
         self.summarize_collection_row(raw).await
     }
 
+    /// Read-only lookup of an existing `Want` queue collection for `target` without creating rows.
+    pub(super) async fn lookup_want_collection_row(
+        &self,
+        target: &str,
+    ) -> CatalogResult<Option<RawCollectionRow>> {
+        let trimmed = target.trim();
+        if let Ok(existing) = self.lookup_collection_row(trimmed, true).await
+            && existing.collection_role == CollectionRole::Want
+        {
+            return Ok(Some(existing));
+        }
+
+        let (want_slug, _) = derive_want_collection_slug_and_label(trimmed)?;
+        match self.lookup_collection_row(&want_slug, false).await {
+            Ok(existing) => Ok(Some(existing)),
+            Err(CatalogError::NotFound(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     pub(super) async fn ensure_want_collection_row(
         &self,
         target: &str,

@@ -24,7 +24,12 @@ impl RocheServer {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
         service::run_content_startup_maintenance(&db).await;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
-        let (listen_cfg, ts_identity) = Self::prepare_tailscale(&cfg).await?;
+        let (listen_cfg, mut ts_identity) = Self::resolve_listen_config(&cfg).await?;
+
+        let addr = listen_cfg.listen_addr();
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+        Self::expose_tailscale_node(&cfg, &listen_cfg, &mut ts_identity).await;
         let bootstrap_canonical_url =
             ts_identity.as_ref().and_then(tailscale::NodeIdentity::canonical_url);
 
@@ -39,9 +44,6 @@ impl RocheServer {
                 "tailscale.auto_auth_users enabled; ensure this is a single-user host fronted exclusively by `tailscale serve`"
             );
         }
-
-        let addr = listen_cfg.listen_addr();
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         Self::maybe_issue_bootstrap_code(
             &roche_service,
@@ -97,10 +99,12 @@ impl RocheServer {
         Ok(())
     }
 
-    async fn prepare_tailscale(
+    /// Read-only inspection of the local Tailscale node to determine the bind address before
+    /// binding `TcpListener` (never mutates `tailscale serve` prior to successful bind).
+    async fn resolve_listen_config(
         cfg: &config::Config,
     ) -> anyhow::Result<(config::ServerConfig, Option<tailscale::NodeIdentity>)> {
-        let mut ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
+        let ts_identity = tailscale::inspect_local_node(&cfg.tailscale).await;
         let listen_host = if cfg.server.host.trim().eq_ignore_ascii_case("tailscale") {
             let ts_ip = ts_identity.as_ref().and_then(|id| id.ipv4.as_deref()).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -112,21 +116,25 @@ impl RocheServer {
             cfg.server.host.clone()
         };
         let listen_cfg = config::ServerConfig { host: listen_host, port: cfg.server.port };
+        Ok((listen_cfg, ts_identity))
+    }
 
-        if ts_identity.is_some() {
+    async fn expose_tailscale_node(
+        cfg: &config::Config,
+        listen_cfg: &config::ServerConfig,
+        ts_identity: &mut Option<tailscale::NodeIdentity>,
+    ) {
+        if let Some(identity) = ts_identity.as_mut() {
             let exposure =
                 tailscale::expose_over_tailscale(&cfg.tailscale, &listen_cfg.host, cfg.server.port)
                     .await;
-            if let Some(identity) = &mut ts_identity {
-                identity.service_name = exposure.service_name;
-                identity.node_https_port = exposure.node_https_port;
-                let urls = identity.candidate_urls();
-                if !urls.is_empty() {
-                    tracing::info!(tailscale_https_urls = ?urls, "Exposed Roche peer over Tailscale HTTPS");
-                }
+            identity.service_name = exposure.service_name;
+            identity.node_https_port = exposure.node_https_port;
+            let urls = identity.candidate_urls();
+            if !urls.is_empty() {
+                tracing::info!(tailscale_https_urls = ?urls, "Exposed Roche peer over Tailscale HTTPS");
             }
         }
-        Ok((listen_cfg, ts_identity))
     }
 
     async fn prepare_startup_media(db: &db::Db, cfg: &config::Config) {
@@ -463,7 +471,8 @@ mod tests {
         cfg.tailscale.tailscale_bin = script_path;
         cfg.tailscale.advertise_service = Some("svc:roche".to_string());
 
-        let (_listen_cfg, ts_identity) = RocheServer::prepare_tailscale(&cfg).await.unwrap();
+        let (listen_cfg, mut ts_identity) = RocheServer::resolve_listen_config(&cfg).await.unwrap();
+        RocheServer::expose_tailscale_node(&cfg, &listen_cfg, &mut ts_identity).await;
         let identity = ts_identity.unwrap();
         assert_eq!(identity.node_https_port, None);
         assert!(identity.node_https_url().is_none());
@@ -471,5 +480,56 @@ mod tests {
         assert!(identity.canonical_url().is_none());
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_run_does_not_delete_staging_dirs_or_expose_tailscale_when_bind_fails() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("roche-bind-safe-{}", uuid::Uuid::new_v4()));
+        let media_dir = temp_dir.join("media");
+        let downloads_dir = media_dir.join("downloads");
+        let active_staging = downloads_dir.join(".tmp-live-download");
+        tokio::fs::create_dir_all(&active_staging).await.unwrap();
+        let sentinel = active_staging.join("video.mp4.part");
+        tokio::fs::write(&sentinel, b"in-flight").await.unwrap();
+
+        let mut cfg = config::Config::default();
+        cfg.server.host = "127.0.0.1".to_string();
+        cfg.server.port = occupied_port;
+        cfg.storage.data_dir = temp_dir.clone();
+        cfg.storage.database_path = temp_dir.join("roche.db");
+        cfg.storage.media_dir = media_dir;
+        cfg.media.download_dir = downloads_dir;
+        cfg.media.ytdlp_path = temp_dir.join("nonexistent-yt-dlp");
+        cfg.tailscale.enabled = false;
+
+        assert!(RocheServer::run(cfg).await.is_err());
+        drop(occupied);
+
+        assert!(
+            sentinel.exists(),
+            "startup media cleanup must NOT run when TcpListener::bind fails"
+        );
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_load_want_ranking_inputs_is_read_only_for_missing_queue() {
+        let db = db::Db::connect("sqlite::memory:").await.unwrap();
+        let svc = service::CatalogService::new(&db);
+
+        // Missing want queue must return NotFound without creating a persistent `want:*` row
+        assert!(svc.get_ranked_collection("nonexistent-queue", true).await.is_err());
+        assert!(!svc.can_rank_collection("nonexistent-queue", true).await.unwrap());
+        let exists: Option<String> = sqlx::query_scalar(
+            "SELECT collection_id FROM collection_specs WHERE slug = 'want:nonexistent_queue'",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        assert!(exists.is_none(), "read-only GET ranking must not insert collection_specs rows");
     }
 }

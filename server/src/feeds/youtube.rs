@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use quick_xml::{Reader, events::Event};
 use url::Url;
 
-use super::extract_entry_timestamp;
+use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp};
 use crate::{
     content::xml_util,
     util::{media_urls, url_guard::parse_public_url},
@@ -57,7 +57,8 @@ impl YouTubeParser {
     }
 
     pub fn parse(content: &str) -> Result<YouTubeFeed> {
-        let feed = feed_rs::parser::parse(content.as_bytes())?;
+        let mut feed = feed_rs::parser::parse(content.as_bytes())?;
+        feed.entries.truncate(MAX_PARSED_FEED_ENTRIES);
 
         let channel_title = feed.title.map_or_default(|t| t.content);
         let fallback_descriptions = Self::extract_all_media_descriptions(content);
@@ -108,8 +109,12 @@ impl YouTubeParser {
         let mut map = HashMap::new();
         let mut current_video_id = None;
         let mut current_desc = None;
+        let mut seen_entries = 0usize;
 
         loop {
+            if seen_entries >= MAX_PARSED_FEED_ENTRIES {
+                break;
+            }
             match reader.read_event() {
                 Ok(Event::Start(tag)) => match tag.name().as_ref() {
                     "entry" => {
@@ -141,6 +146,7 @@ impl YouTubeParser {
                     _ => {}
                 },
                 Ok(Event::End(tag)) if tag.name().as_ref() == "entry" => {
+                    seen_entries += 1;
                     if let (Some(vid), Some(desc)) = (current_video_id.take(), current_desc.take())
                         && media_urls::is_valid_youtube_video_id(&vid)
                     {

@@ -17,6 +17,8 @@ use crate::{
     util::{media_urls::is_direct_pdf_url, url_guard::parse_public_url},
 };
 
+pub const MAX_PARSED_FEED_ENTRIES: usize = 1_000;
+
 /// Validated feed creation source: either a full [`Url`] or a 24-character `YouTube` channel ID (`UC...`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]

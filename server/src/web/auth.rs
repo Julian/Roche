@@ -68,14 +68,66 @@ pub(super) fn has_logged_out_cookie(headers: &HeaderMap) -> bool {
 /// Trusts `X-Forwarded-Proto: https` ONLY when the immediate TCP peer is loopback
 /// (e.g. local `tailscale serve` or local TLS reverse proxy), preventing direct LAN/HTTP
 /// peers from spoofing `X-Forwarded-Proto: https` and setting `Secure` cookies that browsers drop over HTTP.
+/// Reads the last `X-Forwarded-Proto` header and its rightmost comma-separated token so
+/// client-supplied leading entries cannot spoof the proxy-appended value.
 #[must_use]
 fn is_forwarded_https(peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> bool {
-    peer_addr.is_some_and(|addr| addr.ip().is_loopback())
+    peer_addr.is_some_and(|addr| addr.ip().to_canonical().is_loopback())
         && headers
-            .get("x-forwarded-proto")
+            .get_all("x-forwarded-proto")
+            .iter()
+            .next_back()
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.rsplit(',').next())
             .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+}
+
+/// Returns `Some` only when there is a single valid `Tailscale-User-Login` header value
+/// (rejecting duplicate/ambiguous headers or header smuggling).
+#[must_use]
+fn extract_single_tailscale_login(headers: &HeaderMap) -> Option<&str> {
+    let mut iter = headers.get_all(TAILSCALE_LOGIN_HEADER).iter();
+    let first = iter.next()?.to_str().ok()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    let trimmed = first.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.contains(',')
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+#[must_use]
+fn extract_last_forwarded_for(headers: &HeaderMap) -> Option<&str> {
+    headers.get_all("x-forwarded-for").iter().next_back().and_then(|v| v.to_str().ok())
+}
+
+/// Requires browser Fetch Metadata headers proving a direct/same-origin top-level document
+/// navigation before passively minting a `roche_session` from `Tailscale-User-Login`.
+///
+/// This blocks cross-site subresource `GET` requests (e.g. `<img>`, `no-cors` `fetch`) that omit
+/// `SameSite=Lax` `roche_logged_out=1` cookies from silently re-authenticating an explicitly
+/// logged-out browser.
+#[must_use]
+fn is_navigational_tailscale_auto_login(headers: &HeaderMap) -> bool {
+    let mode_ok = headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("navigate"));
+    let dest_ok = headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("document"));
+    let site_ok = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()).is_some_and(|v| {
+        let clean = v.trim();
+        clean.eq_ignore_ascii_case("none") || clean.eq_ignore_ascii_case("same-origin")
+    });
+    mode_ok && dest_ok && site_ok
 }
 
 #[must_use]
@@ -159,8 +211,9 @@ pub(super) fn is_same_origin_post(headers: &HeaderMap, expected_https: bool) -> 
 }
 
 /// Checks whether `Tailscale-User-Login` can be trusted:
-/// strictly requires a loopback TCP peer (`127.0.0.1` / `::1`, i.e. local `tailscale serve` reverse proxy),
-/// `tailscale.enabled == true`, and membership in `tailscale.auto_auth_users`.
+/// strictly requires a loopback TCP peer (`127.0.0.1` / `::1` / `::ffff:127.0.0.1`, i.e. local
+/// `tailscale serve` reverse proxy), `tailscale.enabled == true`, a single valid header value,
+/// and membership in `tailscale.auto_auth_users`.
 #[must_use]
 fn verified_tailscale_login(
     service: &RocheService,
@@ -172,14 +225,11 @@ fn verified_tailscale_login(
         return None;
     }
     let addr = peer_addr?;
-    if !addr.ip().is_loopback() {
+    if !addr.ip().to_canonical().is_loopback() {
         return None;
     }
-    let raw_login = headers.get(TAILSCALE_LOGIN_HEADER)?.to_str().ok()?;
-    let normalized = raw_login.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
+    let raw_login = extract_single_tailscale_login(headers)?;
+    let normalized = raw_login.to_ascii_lowercase();
     cfg.auto_auth_users.iter().any(|allowed| allowed == &normalized).then_some(normalized)
 }
 
@@ -197,6 +247,7 @@ pub(super) async fn login_get(
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
     let ts_login = verified_tailscale_login(&service, peer_addr, &headers);
     if !has_logged_out_cookie(&headers)
+        && is_navigational_tailscale_auto_login(&headers)
         && let Some(ref login) = ts_login
         && let Ok(minted) = service.auth().mint_tailscale_web_session(login).await
     {
@@ -228,8 +279,8 @@ pub(super) async fn login_post(
     let ts_login = verified_tailscale_login(&service, peer_addr, &headers);
     let label =
         form.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Roche Web");
-    let raw_ts_login_hdr = headers.get(TAILSCALE_LOGIN_HEADER).and_then(|v| v.to_str().ok());
-    let x_forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let raw_ts_login_hdr = extract_single_tailscale_login(&headers);
+    let x_forwarded_for = extract_last_forwarded_for(&headers);
 
     match service
         .auth()
@@ -362,12 +413,13 @@ pub(super) async fn require_web_auth_and_csrf(
         active_token = Some(cookie_tok);
     }
 
-    // Only auto-mint a Tailscale session on safe navigational requests when not explicitly logged out;
-    // state-changing POSTs must already hold a session cookie + matching CSRF token so cross-site POSTs
-    // cannot ride Tailscale headers.
+    // Only auto-mint a Tailscale session on direct/same-origin top-level navigational GETs when
+    // not explicitly logged out; cross-site subresource GETs and state-changing POSTs cannot ride
+    // Tailscale headers to bypass logout or CSRF.
     if active_token.is_none()
         && is_safe_method
         && !has_logged_out_cookie(req.headers())
+        && is_navigational_tailscale_auto_login(req.headers())
         && let Some(ts_login) = verified_tailscale_login(&service, peer_addr, req.headers())
         && let Ok(minted) = service.auth().mint_tailscale_web_session(&ts_login).await
     {

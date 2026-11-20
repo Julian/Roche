@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use quick_xml::{Reader, events::Event};
 use url::Url;
@@ -6,7 +6,7 @@ use url::Url;
 use super::xml_util;
 use crate::util::{
     media_urls::{extract_youtube_channel_id, is_youtube_host, youtube_feed_url_for_channel_id},
-    url_guard::validate_public_url,
+    url_guard::{sanitize_public_http_href, validate_public_url},
 };
 
 pub const MAX_SUMMARY_CHARS: usize = 320;
@@ -30,15 +30,58 @@ impl HtmlSanitizer {
 
     #[must_use]
     pub fn clean_with_base(html: &str, base_url: Option<&Url>) -> String {
+        let valid_base = base_url.filter(|base| validate_public_url(base).is_ok()).cloned();
+        let filter_base = valid_base.clone();
+
         let mut builder = ammonia::Builder::default();
+        builder.url_schemes(HashSet::from(["http", "https", "mailto"]));
         builder.add_clean_content_tags(["head", "title", "noscript", "template", "svg", "math"]);
         builder.set_tag_attribute_value("img", "referrerpolicy", "no-referrer");
         builder.set_tag_attribute_value("img", "loading", "lazy");
         builder.set_tag_attribute_value("img", "decoding", "async");
-        if let Some(base) = base_url {
-            builder.url_relative(ammonia::UrlRelative::RewriteWithBase(base.clone()));
+        if let Some(base) = valid_base {
+            builder.url_relative(ammonia::UrlRelative::RewriteWithBase(base));
         }
+        builder.attribute_filter(move |element, attribute, value| {
+            Self::filter_sanitized_url_attr(element, attribute, value, filter_base.as_ref())
+        });
         builder.clean(html).to_string()
+    }
+
+    fn filter_sanitized_url_attr<'a>(
+        element: &str,
+        attribute: &str,
+        value: &'a str,
+        valid_base: Option<&Url>,
+    ) -> Option<Cow<'a, str>> {
+        let is_href = attribute.eq_ignore_ascii_case("href");
+        let is_media_or_cite = attribute.eq_ignore_ascii_case("src")
+            || attribute.eq_ignore_ascii_case("poster")
+            || attribute.eq_ignore_ascii_case("cite");
+        if !is_href && !is_media_or_cite {
+            return Some(Cow::Borrowed(value));
+        }
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if is_href && (element.eq_ignore_ascii_case("a") || element.eq_ignore_ascii_case("area")) {
+            if trimmed.starts_with('#') {
+                return Some(Cow::Borrowed(trimmed));
+            }
+            if trimmed.len() > "mailto:".len()
+                && trimmed.get(.."mailto:".len()).is_some_and(|p| p.eq_ignore_ascii_case("mailto:"))
+            {
+                return Some(Cow::Borrowed(trimmed));
+            }
+        }
+        let resolved = match Url::parse(trimmed) {
+            Ok(url) => url,
+            Err(url::ParseError::RelativeUrlWithoutBase) => valid_base?.join(trimmed).ok()?,
+            Err(_) => return None,
+        };
+        sanitize_public_http_href(resolved.as_str())?;
+        Some(Cow::Owned(resolved.into()))
     }
 
     /// Converts raw HTML into a single-line plain-text excerpt of at most `max_chars` characters.
@@ -842,5 +885,43 @@ mod tests {
             .as_deref(),
             Some("https://blog.example.com/hero.webp")
         );
+    }
+
+    #[test]
+    fn test_clean_with_base_blocks_private_tailnet_and_exotic_schemes() {
+        let base = Url::parse("https://blog.example.com/posts/demo/").unwrap();
+        let dirty = r##"
+            <p><img src="https://secret.tail1234.ts.net/pixel.png"></p>
+            <p><img src="http://127.0.0.1:8080/internal.png"></p>
+            <p><img src="mailto:user@example.com"></p>
+            <p><img src="/assets/diagram.png"></p>
+            <p><a href="irc://irc.example.com/room">IRC</a></p>
+            <p><a href="https://nas.local/admin">Local</a></p>
+            <p><a href="mailto:author@example.com">Email</a></p>
+            <p><a href="#fn1">Footnote</a></p>
+            <p><a href="/about">About</a></p>
+        "##;
+        let cleaned = HtmlSanitizer::clean_with_base(dirty, Some(&base));
+        assert!(!cleaned.contains("tail1234.ts.net"));
+        assert!(!cleaned.contains("127.0.0.1"));
+        assert!(!cleaned.contains("irc://"));
+        assert!(!cleaned.contains("nas.local"));
+        assert!(!cleaned.contains(r#"src="mailto:"#));
+        assert!(cleaned.contains("https://blog.example.com/assets/diagram.png"));
+        assert!(cleaned.contains("mailto:author@example.com"));
+        assert!(cleaned.contains("https://blog.example.com/posts/demo/#fn1"));
+        assert!(cleaned.contains("https://blog.example.com/about"));
+        assert!(
+            HtmlSanitizer::clean(r##"<a href="#fn1">Footnote</a>"##).contains(r##"href="#fn1""##)
+        );
+
+        // Private base_url is ignored so relative img/a URLs cannot rewrite to Tailnet/loopback
+        let private_base = Url::parse("https://roche.tail1234.ts.net/items/1").unwrap();
+        let cleaned_priv = HtmlSanitizer::clean_with_base(
+            r#"<img src="/secret.png"><a href="/logout">Out</a>"#,
+            Some(&private_base),
+        );
+        assert!(!cleaned_priv.contains("secret.png"));
+        assert!(!cleaned_priv.contains("logout"));
     }
 }

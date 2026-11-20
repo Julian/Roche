@@ -520,7 +520,13 @@ impl FeedIngester {
                     "Feed poll failed"
                 );
                 if record_db_errors || matches!(err, PollError::Upstream(_)) {
-                    let _ = feed_repo.mark_error(&feed.id, &err.to_string()).await;
+                    let stored_err = match &err {
+                        PollError::Upstream(upstream) => {
+                            crate::util::url_guard::sanitize_upstream_error(upstream)
+                        }
+                        PollError::Database(db_err) => db_err.to_string(),
+                    };
+                    let _ = feed_repo.mark_error(&feed.id, &stored_err).await;
                 }
                 Err(err)
             }

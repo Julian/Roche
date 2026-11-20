@@ -228,15 +228,59 @@ impl Config {
                 anyhow::bail!("configuration file not found: {}", explicit.display());
             }
             figment = figment.merge(Toml::file(explicit));
-        } else {
-            let default_path = Path::new("config.toml");
-            if default_path.exists() {
-                figment = figment.merge(Toml::file(default_path));
-            }
+        } else if let Some(default_path) = Self::resolve_default_config_path() {
+            figment = figment.merge(Toml::file(default_path));
         }
 
         figment = figment.merge(Self::env_provider()).merge(cli_provider);
         Self::from_figment(&figment)
+    }
+
+    /// Prefers user-owned XDG config paths (`$XDG_CONFIG_HOME/roche/config.toml` or
+    /// `$HOME/.config/roche/config.toml`) over an implicit `./config.toml` in the working
+    /// directory, and refuses symlinked or world-writable `./config.toml` files.
+    fn resolve_default_config_path() -> Option<PathBuf> {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let trimmed = xdg.trim();
+            if !trimmed.is_empty() {
+                let candidate = PathBuf::from(trimmed).join("roche").join("config.toml");
+                if candidate.is_absolute() && candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let trimmed = home.trim();
+            if !trimmed.is_empty() {
+                let candidate =
+                    PathBuf::from(trimmed).join(".config").join("roche").join("config.toml");
+                if candidate.is_absolute() && candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        let cwd_path = Path::new("config.toml");
+        if Self::is_safe_implicit_cwd_config(cwd_path) {
+            return Some(cwd_path.to_path_buf());
+        }
+        None
+    }
+
+    fn is_safe_implicit_cwd_config(path: &Path) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if (meta.permissions().mode() & 0o002) != 0 {
+                return false;
+            }
+        }
+        true
     }
 
     #[must_use]
@@ -345,8 +389,14 @@ impl Config {
         }
         let norm_media = crate::util::fs_perms::normalize_lexical(&self.storage.media_dir);
         let norm_downloads = crate::util::fs_perms::normalize_lexical(&self.media.download_dir);
-        if !norm_downloads.starts_with(&norm_media) {
-            anyhow::bail!("media.download_dir must be inside storage.media_dir");
+        if !norm_downloads.starts_with(&norm_media)
+            || norm_downloads == norm_media
+            || norm_downloads == norm_media.join("pdfs")
+            || norm_downloads == norm_media.join("thumbnails")
+        {
+            anyhow::bail!(
+                "media.download_dir must be a dedicated subdirectory inside storage.media_dir"
+            );
         }
         if self.sync.op_log_prune_after <= 0 {
             anyhow::bail!("sync.op_log_prune_after must be greater than 0");
@@ -537,5 +587,20 @@ auto_auth_users = [" Alice@Example.com ", "", "bob@github", "alice@example.com"]
             cfg_csv.tailscale.auto_auth_users,
             vec!["alice@example.com".to_string(), "bob@github".to_string()]
         );
+    }
+
+    #[test]
+    fn test_download_dir_cannot_alias_media_dir_or_reserved_subdirs() {
+        for bad in
+            ["/var/lib/roche/media", "/var/lib/roche/media/pdfs", "/var/lib/roche/media/thumbnails"]
+        {
+            let fig = Figment::new()
+                .merge(("storage.media_dir", "/var/lib/roche/media"))
+                .merge(("media.download_dir", bad));
+            assert!(
+                Config::from_figment(&fig).is_err(),
+                "expected validation failure for download_dir={bad}"
+            );
+        }
     }
 }

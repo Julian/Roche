@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use url::Url;
 
-use super::{extract_entry_timestamp, select_entry_link};
+use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp, select_entry_link};
 use crate::util::{media_urls, url_guard::parse_public_url};
 
 #[derive(Debug, Clone)]
@@ -30,7 +30,8 @@ impl ArxivParser {
     }
 
     pub fn parse(content: &str) -> Result<ArxivFeed> {
-        let feed = feed_rs::parser::parse(content.as_bytes())?;
+        let mut feed = feed_rs::parser::parse(content.as_bytes())?;
+        feed.entries.truncate(MAX_PARSED_FEED_ENTRIES);
 
         let title = feed.title.map_or_default(|t| t.content);
 

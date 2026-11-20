@@ -108,13 +108,18 @@ impl CatalogRepo<'_> {
     }
 
     /// Loads a collection and its rankable members without running EP inference.
+    ///
+    /// Strictly read-only: when `want == true` and the queue does not yet exist, returns
+    /// [`CatalogError::NotFound`] rather than creating rows on `GET`.
     pub async fn load_collection_ranking_inputs(
         &self,
         slug_or_id: &str,
         want: bool,
     ) -> CatalogResult<CollectionRankingInputs> {
         let raw_col = if want {
-            self.ensure_want_collection_row(slug_or_id).await?
+            self.lookup_want_collection_row(slug_or_id).await?.ok_or_else(|| {
+                CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found"))
+            })?
         } else {
             self.lookup_collection_row(slug_or_id, true).await?
         };
@@ -125,14 +130,17 @@ impl CatalogRepo<'_> {
     }
 
     /// Lightweight count of rankable members in `slug_or_id` without hydrating entries,
-    /// loading comparisons, or running EP inference.
+    /// loading comparisons, or running EP inference. Strictly read-only.
     pub async fn count_rankable_members(
         &self,
         slug_or_id: &str,
         want: bool,
     ) -> CatalogResult<usize> {
         let raw_col = if want {
-            self.ensure_want_collection_row(slug_or_id).await?
+            let Some(col) = self.lookup_want_collection_row(slug_or_id).await? else {
+                return Ok(0);
+            };
+            col
         } else {
             self.lookup_collection_row(slug_or_id, true).await?
         };

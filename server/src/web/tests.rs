@@ -260,6 +260,9 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
     let mut valid_ts_req = Request::builder()
         .uri("/")
         .header("Tailscale-User-Login", "READER@example.ts.net")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
         .body(Body::empty())
         .unwrap();
     valid_ts_req
@@ -276,6 +279,69 @@ async fn test_tailscale_auto_auth_strictly_requires_loopback_and_allowlist() {
             .unwrap()
             .contains("roche_session=")
     );
+}
+
+#[tokio::test]
+async fn test_tailscale_auto_auth_blocks_subresource_dup_headers_and_accepts_mapped_ipv6() {
+    let mut cfg = Config::default();
+    cfg.tailscale.enabled = true;
+    cfg.tailscale.auto_auth_users = vec!["reader@example.ts.net".to_string()];
+    let (_db, app) = setup_web_app(cfg).await;
+
+    // Cross-site subresource GET (without roche_logged_out cookie) must NOT mint a session
+    let mut cross_site_img = Request::builder()
+        .uri("/")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("Sec-Fetch-Mode", "no-cors")
+        .header("Sec-Fetch-Dest", "image")
+        .header("Sec-Fetch-Site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    cross_site_img
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51238)));
+    let cross_site_resp = app.clone().oneshot(cross_site_img).await.unwrap();
+    assert_eq!(cross_site_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(cross_site_resp.headers().get(header::LOCATION).unwrap(), "/login");
+    assert!(cross_site_resp.headers().get(header::SET_COOKIE).is_none());
+
+    // Duplicate Tailscale-User-Login headers are rejected
+    let mut dup_ts_req = Request::builder()
+        .uri("/")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("Tailscale-User-Login", "other@example.ts.net")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
+        .body(Body::empty())
+        .unwrap();
+    dup_ts_req
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51239)));
+    let dup_ts_resp = app.clone().oneshot(dup_ts_req).await.unwrap();
+    assert_eq!(dup_ts_resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(dup_ts_resp.headers().get(header::LOCATION).unwrap(), "/login");
+
+    // IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) is recognized as loopback on dual-stack hosts
+    let mut mapped_v6_req = Request::builder()
+        .uri("/")
+        .header("Tailscale-User-Login", "reader@example.ts.net")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Site", "none")
+        .header("X-Forwarded-Proto", "http, https")
+        .body(Body::empty())
+        .unwrap();
+    mapped_v6_req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        51240,
+    )));
+    let mapped_v6_resp = app.clone().oneshot(mapped_v6_req).await.unwrap();
+    assert_eq!(mapped_v6_resp.status(), StatusCode::OK);
+    let set_cookie_str =
+        mapped_v6_resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+    assert!(set_cookie_str.contains("roche_session="));
+    assert!(set_cookie_str.contains("; Secure"));
 }
 
 async fn seed_album_queue_pool(db: &crate::db::Db) {
@@ -770,8 +836,12 @@ async fn test_web_cache_control_tailscale_session_reuse_and_explicit_logout() {
     assert_eq!(js_resp.headers().get(header::CACHE_CONTROL).unwrap(), "public, max-age=3600");
 
     let ts_get = |cookie_hdr: Option<String>| {
-        let mut builder =
-            Request::builder().uri("/").header("Tailscale-User-Login", "reader@example.ts.net");
+        let mut builder = Request::builder()
+            .uri("/")
+            .header("Tailscale-User-Login", "reader@example.ts.net")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Site", "none");
         if let Some(c) = cookie_hdr {
             builder = builder.header(header::COOKIE, c);
         }

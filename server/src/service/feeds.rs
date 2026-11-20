@@ -254,7 +254,8 @@ impl FeedService<'_> {
             Err(err) => {
                 return match err {
                     PollError::Upstream(upstream) => {
-                        Err(AppError::bad_gateway(format!("Failed to refresh feed: {upstream}")))
+                        let safe_msg = crate::util::url_guard::sanitize_upstream_error(&upstream);
+                        Err(AppError::bad_gateway(format!("Failed to refresh feed: {safe_msg}")))
                     }
                     PollError::Database(db_err) => Err(AppError::Database(db_err)),
                 };

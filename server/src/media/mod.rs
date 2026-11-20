@@ -28,12 +28,17 @@ impl MediaStore {
         &self.base_dir
     }
 
-    /// Resolves `download_dir` inside `base_dir`, falling back to `<base_dir>/downloads`
-    /// if the configured path escapes `base_dir`.
+    /// Resolves `download_dir` inside a dedicated subdirectory of `base_dir`, falling back to
+    /// `<base_dir>/downloads` if the configured path escapes `base_dir` or aliases `base_dir`,
+    /// `pdfs/`, or `thumbnails/`.
     #[must_use]
     pub fn resolve_download_dir(&self, download_dir: &Path) -> PathBuf {
         let normalized = normalize_lexical(download_dir);
-        if normalized.starts_with(&self.base_dir) {
+        if normalized.starts_with(&self.base_dir)
+            && normalized != self.base_dir
+            && normalized != self.base_dir.join("pdfs")
+            && normalized != self.base_dir.join("thumbnails")
+        {
             normalized
         } else {
             self.base_dir.join("downloads")
@@ -90,13 +95,18 @@ impl MediaStore {
             }
         }
 
-        if let Some(base_ancestor) = self.base_dir.ancestors().find(|a| a.exists())
-            && let Ok(canon_base_anc) = std::fs::canonicalize(base_ancestor)
-            && let Some(cand_ancestor) = norm_cand.ancestors().find(|a| a.exists())
-            && let Ok(canon_cand_anc) = std::fs::canonicalize(cand_ancestor)
-            && !canon_cand_anc.starts_with(&canon_base_anc)
-        {
-            anyhow::bail!("Canonical media path escapes configured media_dir");
+        if let Some(base_ancestor) = self.base_dir.ancestors().find(|a| a.exists()) {
+            let canon_base_anc = std::fs::canonicalize(base_ancestor)
+                .map_err(|e| anyhow::anyhow!("Failed to canonicalize media_dir ancestor: {e}"))?;
+            let Some(cand_ancestor) = norm_cand.ancestors().find(|a| a.exists()) else {
+                anyhow::bail!("Candidate media path has no resolvable ancestor");
+            };
+            let canon_cand_anc = std::fs::canonicalize(cand_ancestor).map_err(|e| {
+                anyhow::anyhow!("Failed to canonicalize candidate media path ancestor: {e}")
+            })?;
+            if !canon_cand_anc.starts_with(&canon_base_anc) {
+                anyhow::bail!("Canonical media path escapes configured media_dir");
+            }
         }
 
         Ok(norm_cand)

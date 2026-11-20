@@ -25,8 +25,13 @@ pub(super) async fn auth_pair(
     ProblemJson(req): ProblemJson<PairRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let peer_addr = connect_info.ok().map(|ConnectInfo(addr)| addr);
-    let tailscale_user_login = headers.get("tailscale-user-login").and_then(|v| v.to_str().ok());
-    let x_forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let mut ts_headers = headers.get_all("tailscale-user-login").iter();
+    let tailscale_user_login = match (ts_headers.next(), ts_headers.next()) {
+        (Some(single), None) => single.to_str().ok(),
+        _ => None,
+    };
+    let x_forwarded_for =
+        headers.get_all("x-forwarded-for").iter().next_back().and_then(|v| v.to_str().ok());
     let token = service
         .auth()
         .pair_device_for_request(

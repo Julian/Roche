@@ -43,6 +43,45 @@ impl<'a> MediaRepo<'a> {
         spec: &NewMediaSpec<'_>,
         now: DateTime<Utc>,
     ) -> Result<Media> {
+        if let Some(existing_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM entry_media WHERE entry_id = ? AND local_path = ? LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(spec.path)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            sqlx::query(
+                "UPDATE entry_media
+                 SET media_type = ?, file_size = ?, duration = ?
+                 WHERE id = ?",
+            )
+            .bind(spec.media_type)
+            .bind(spec.file_size)
+            .bind(spec.duration)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+
+            SyncRepo::record_activity(
+                tx,
+                ActivityEntityType::Media,
+                &existing_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+
+            return Ok(Media {
+                id: existing_id,
+                item_id: item_id.to_owned(),
+                media_type: spec.media_type,
+                path: spec.path.to_owned(),
+                file_size: spec.file_size,
+                duration: spec.duration,
+            });
+        }
+
         let id = Uuid::new_v4().to_string();
         sqlx::query!(
             "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)

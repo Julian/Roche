@@ -198,10 +198,26 @@ pub(super) fn render_feed_favicon_with_class(
     label: &str,
     size_class: &str,
 ) {
-    let host = raw_url
-        .and_then(|u| url::Url::parse(u).ok())
+    let parsed_url = raw_url.and_then(|u| url::Url::parse(u).ok());
+    let host = parsed_url
+        .as_ref()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
         .filter(|h| !h.is_empty());
+    let public_favicon_host = parsed_url.as_ref().and_then(|u| {
+        if !matches!(u.scheme(), "http" | "https") {
+            return None;
+        }
+        match u.host()? {
+            url::Host::Domain(domain) => {
+                let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+                (!normalized.is_empty()
+                    && normalized.contains('.')
+                    && !crate::util::url_guard::is_local_or_tailnet_domain(&normalized))
+                .then_some(normalized)
+            }
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+        }
+    });
     let seed = host.as_deref().unwrap_or(label);
     let letter = label
         .chars()
@@ -214,7 +230,7 @@ pub(super) fn render_feed_favicon_with_class(
         out,
         "<span class=\"feed-favicon{sz_cls} fav-tone-{tone}\" aria-hidden=\"true\">{letter}"
     );
-    if let Some(h) = host {
+    if let Some(h) = public_favicon_host {
         let _ = write!(
             out,
             "<img src=\"https://icons.duckduckgo.com/ip3/{}.ico\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">",
@@ -798,5 +814,32 @@ impl IntoResponse for WebError {
             resp.headers_mut().insert(header::RETRY_AFTER, val);
         }
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_feed_favicon;
+
+    #[test]
+    fn test_render_feed_favicon_omits_duckduckgo_img_for_private_and_tailnet_hosts() {
+        let mut pub_html = String::new();
+        render_feed_favicon(&mut pub_html, Some("https://example.com/rss.xml"), "Example", false);
+        assert!(pub_html.contains("https://icons.duckduckgo.com/ip3/example.com.ico"));
+
+        for private_url in [
+            "https://my-node.tail9876.ts.net/rss.xml",
+            "http://192.168.1.5/feed.xml",
+            "http://127.0.0.1:8080/feed.xml",
+            "http://intranet.local/feed.xml",
+            "http://internal-host/feed.xml",
+        ] {
+            let mut priv_html = String::new();
+            render_feed_favicon(&mut priv_html, Some(private_url), "Private", false);
+            assert!(
+                !priv_html.contains("duckduckgo.com"),
+                "must not leak private host to DuckDuckGo for {private_url}: {priv_html}"
+            );
+        }
     }
 }

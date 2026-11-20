@@ -18,6 +18,7 @@ pub const PRIOR_ALPHA: f64 = 1.0;
 pub const COLD_START_VARIANCE: f64 = 1.0 / PRIOR_ALPHA;
 pub const MIN_K: usize = 2;
 pub const MAX_K_DEFAULT: usize = 5;
+pub const MAX_COMPARISON_WIDTH: usize = 64;
 pub const MIN_CONFUSABILITY: f64 = 0.15;
 pub const RANDOM_SEED_EVERY: usize = 5;
 pub const N_QUANTILES: usize = 5;
@@ -91,7 +92,8 @@ pub const fn tier_label(quantile: usize) -> char {
     if quantile < N_QUANTILES { TIER_LETTERS[quantile] } else { 'S' }
 }
 
-/// Validates a k-way comparison ordering (list of non-empty tie groups with distinct IDs, total >= 2).
+/// Validates a k-way comparison ordering (list of non-empty tie groups with distinct IDs,
+/// `MIN_K <= total <= MAX_COMPARISON_WIDTH`).
 pub fn validate_ordering(ordering: &[Vec<String>]) -> Result<(), String> {
     let mut seen = HashSet::new();
     let mut total = 0usize;
@@ -108,6 +110,11 @@ pub fn validate_ordering(ordering: &[Vec<String>]) -> Result<(), String> {
                 return Err(format!("ordering must not repeat entry ID '{trimmed}'"));
             }
             total += 1;
+            if total > MAX_COMPARISON_WIDTH {
+                return Err(format!(
+                    "a comparison cannot include more than {MAX_COMPARISON_WIDTH} entries"
+                ));
+            }
         }
     }
     if total < MIN_K {
@@ -156,7 +163,23 @@ pub fn infer_scores(item_ids: &[String], orderings: &[Vec<Vec<String>>]) -> Hash
         return scores;
     }
 
-    let raw_pairs: Vec<(String, String)> = orderings.iter().flat_map(|ord| to_pairs(ord)).collect();
+    let raw_pairs: Vec<(String, String)> = orderings
+        .iter()
+        .filter(|ord| {
+            let width: usize = ord.iter().map(Vec::len).sum();
+            if width > MAX_COMPARISON_WIDTH {
+                tracing::warn!(
+                    width,
+                    max_width = MAX_COMPARISON_WIDTH,
+                    "Ignoring oversized comparison ordering during EP inference"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .flat_map(|ord| to_pairs(ord))
+        .collect();
     if raw_pairs.is_empty() {
         return scores;
     }
@@ -434,11 +457,42 @@ fn ep_pairwise_component(
             let mean_cav = cov_cav * nu_cav;
 
             let (_, dlogpart, d2logpart) = match_moments_logit(mean_cav, cov_cav);
+            if !dlogpart.is_finite() || !d2logpart.is_finite() {
+                tracing::warn!(
+                    n_items,
+                    n_pairs = pairs.len(),
+                    dlogpart,
+                    d2logpart,
+                    "EP pairwise inference aborted due to non-finite moment derivatives"
+                );
+                return None;
+            }
             let denom = 1.0 + d2logpart / tau_cav;
+            if !denom.is_finite() || denom.abs() <= f64::EPSILON {
+                tracing::warn!(
+                    n_items,
+                    n_pairs = pairs.len(),
+                    denom,
+                    "EP pairwise inference aborted due to degenerate site update denominator"
+                );
+                return None;
+            }
             tau[i] = -d2logpart / denom;
             let delta_tau = tau[i] - tau_old[i];
             nu[i] = (dlogpart - (nu_cav / tau_cav) * d2logpart) / denom;
             let delta_nu = nu[i] - nu_old[i];
+            if !tau[i].is_finite()
+                || !nu[i].is_finite()
+                || !delta_tau.is_finite()
+                || !delta_nu.is_finite()
+            {
+                tracing::warn!(
+                    n_items,
+                    n_pairs = pairs.len(),
+                    "EP pairwise inference aborted due to non-finite site parameters"
+                );
+                return None;
+            }
 
             prec[a * n_items + a] += delta_tau;
             prec[a * n_items + b] -= delta_tau;
@@ -448,7 +502,17 @@ fn ep_pairwise_component(
             xs[b] -= delta_nu;
 
             if delta_tau.abs() > 0.0 {
-                let scale = -1.0 / ((1.0 / delta_tau) + f_var);
+                let scale_denom = (1.0 / delta_tau) + f_var;
+                if !scale_denom.is_finite() || scale_denom.abs() <= f64::EPSILON {
+                    tracing::warn!(
+                        n_items,
+                        n_pairs = pairs.len(),
+                        scale_denom,
+                        "EP pairwise inference aborted due to degenerate rank-1 covariance update"
+                    );
+                    return None;
+                }
+                let scale = -1.0 / scale_denom;
                 for k in 0..n_items {
                     diff_col[k] = cov[a * n_items + k] - cov[b * n_items + k];
                 }
@@ -478,11 +542,27 @@ fn ep_pairwise_component(
         cov = inv_cov;
         mat_vec_mul(&cov, &xs, &mut mean, n_items);
 
-        let max_dt = tau.iter().zip(&tau_old).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max);
-        let max_dn = nu.iter().zip(&nu_old).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max);
-        if max_dt.max(max_dn) <= THRESHOLD {
-            let variances = (0..n_items).map(|k| cov[k * n_items + k]).collect();
-            return Some((mean, variances));
+        let Some(max_delta) = max_finite_site_delta(&tau, &tau_old, &nu, &nu_old) else {
+            tracing::warn!(
+                n_items,
+                n_pairs = pairs.len(),
+                "EP pairwise inference aborted due to non-finite site delta"
+            );
+            return None;
+        };
+        if max_delta <= THRESHOLD {
+            let variances: Vec<f64> = (0..n_items).map(|k| cov[k * n_items + k]).collect();
+            if mean.iter().all(|v| v.is_finite())
+                && variances.iter().all(|v| v.is_finite() && *v >= 0.0)
+            {
+                return Some((mean, variances));
+            }
+            tracing::warn!(
+                n_items,
+                n_pairs = pairs.len(),
+                "EP pairwise inference aborted due to non-finite posterior mean or variance"
+            );
+            return None;
         }
     }
     tracing::warn!(
@@ -492,6 +572,23 @@ fn ep_pairwise_component(
         "EP pairwise inference did not converge within max_iter; falling back to prior scores"
     );
     None
+}
+
+fn max_finite_site_delta(tau: &[f64], tau_old: &[f64], nu: &[f64], nu_old: &[f64]) -> Option<f64> {
+    let mut max_delta = 0.0_f64;
+    for (&x, &y) in tau.iter().zip(tau_old).chain(nu.iter().zip(nu_old)) {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let diff = (x - y).abs();
+        if !diff.is_finite() {
+            return None;
+        }
+        if diff > max_delta {
+            max_delta = diff;
+        }
+    }
+    Some(max_delta)
 }
 
 fn mat_vec_mul(mat: &[f64], vec_x: &[f64], out: &mut [f64], n: usize) {
@@ -577,6 +674,25 @@ fn match_moments_probit(mean_cav: f64, cov_cav: f64) -> (f64, f64, f64) {
 }
 
 fn match_moments_logit(mean_cav: f64, cov_cav: f64) -> (f64, f64, f64) {
+    let exponent = -10.0 * (mean_cav.abs() - (196.0 / 200.0) * cov_cav - 4.0);
+    let (lambd, logpart2, dlogpart2, d2logpart2) = if exponent < 500.0 {
+        let l = 1.0 / (1.0 + exponent.exp());
+        let lp2_raw = (cov_cav / 2.0 - mean_cav.abs()).min(-0.1);
+        if mean_cav > 0.0 {
+            (l, (1.0 - lp2_raw.exp()).ln(), 0.0, 0.0)
+        } else {
+            (l, lp2_raw, 1.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+
+    // Short-circuit in the pure asymptotic tail so `0.0 * NaN` from extreme probit evaluations
+    // can never poison the blended moments.
+    if 1.0 - lambd < 1e-15 {
+        return (logpart2, dlogpart2, d2logpart2);
+    }
+
     let mut arr1 = [0.0; 5];
     let mut arr2 = [0.0; 5];
     let mut arr3 = [0.0; 5];
@@ -604,22 +720,17 @@ fn match_moments_logit(mean_cav: f64, cov_cav: f64) -> (f64, f64, f64) {
         num2 += w * (arr2[i] * arr2[i] + arr3[i]) * lam * lam;
     }
 
+    if !denom.is_finite() || denom <= 0.0 {
+        return if lambd > 0.0 {
+            (logpart2, dlogpart2, d2logpart2)
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+    }
+
     let logpart1 = max_a1 + denom.ln();
     let dlogpart1 = num1 / denom;
     let d2logpart1 = (num2 / denom) - (dlogpart1 * dlogpart1);
-
-    let exponent = -10.0 * (mean_cav.abs() - (196.0 / 200.0) * cov_cav - 4.0);
-    let (lambd, logpart2, dlogpart2, d2logpart2) = if exponent < 500.0 {
-        let l = 1.0 / (1.0 + exponent.exp());
-        let lp2_raw = (cov_cav / 2.0 - mean_cav.abs()).min(-0.1);
-        if mean_cav > 0.0 {
-            (l, (1.0 - lp2_raw.exp()).ln(), 0.0, 0.0)
-        } else {
-            (l, lp2_raw, 1.0, 0.0)
-        }
-    } else {
-        (0.0, 0.0, 0.0, 0.0)
-    };
 
     let logpart = (1.0 - lambd) * logpart1 + lambd * logpart2;
     let dlogpart = (1.0 - lambd) * dlogpart1 + lambd * dlogpart2;
@@ -833,5 +944,32 @@ mod tests {
 
         let ordered_ids: Vec<&str> = items.iter().map(|&(id, _)| id).collect();
         assert_eq!(ordered_ids, vec!["id-a", "id-z", "id-unscored-a", "id-unscored-b", "id-low"]);
+    }
+
+    #[test]
+    fn test_validate_ordering_caps_comparison_width() {
+        let ok: Vec<Vec<String>> =
+            (0..MAX_COMPARISON_WIDTH).map(|i| vec![format!("e{i}")]).collect();
+        assert!(validate_ordering(&ok).is_ok());
+
+        let too_wide: Vec<Vec<String>> =
+            (0..=MAX_COMPARISON_WIDTH).map(|i| vec![format!("e{i}")]).collect();
+        assert!(validate_ordering(&too_wide).is_err());
+    }
+
+    #[test]
+    fn test_match_moments_logit_and_site_delta_resist_nan_poisoning() {
+        // Extreme positive/negative tail must return finite values without `0.0 * NaN`
+        for mean_cav in [-1000.0, -50.0, 50.0, 1000.0] {
+            let (lp, dlp, d2lp) = match_moments_logit(mean_cav, 1.0);
+            assert!(lp.is_finite(), "logpart non-finite for mean_cav={mean_cav}: {lp}");
+            assert!(dlp.is_finite(), "dlogpart non-finite for mean_cav={mean_cav}: {dlp}");
+            assert!(d2lp.is_finite(), "d2logpart non-finite for mean_cav={mean_cav}: {d2lp}");
+        }
+
+        // Non-finite site values must fail convergence check instead of collapsing to 0.0 via f64::max
+        assert!(max_finite_site_delta(&[f64::NAN], &[0.0], &[0.0], &[0.0]).is_none());
+        assert!(max_finite_site_delta(&[0.0], &[0.0], &[f64::INFINITY], &[0.0]).is_none());
+        assert_eq!(max_finite_site_delta(&[0.1], &[0.0], &[0.0], &[0.2]), Some(0.2));
     }
 }

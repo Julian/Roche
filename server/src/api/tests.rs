@@ -1065,8 +1065,9 @@ async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
     let service = RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
     let app = ApiRoutes::router_with_service(service.clone());
 
-    // Bogus attempts before any pairing code exists return 401 without pre-filling the rate limiter
-    for i in 0..6 {
+    // Bogus attempts before any pairing code exists follow the exact same 4x 401 -> 429 rate
+    // limit as an active code (no active-code oracle), and issuing a code resets the limiter.
+    for i in 0..4 {
         let unissued_request = Request::builder()
             .method("POST")
             .uri("/auth/pair")
@@ -1076,6 +1077,16 @@ async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
         let unissued_response = app.clone().oneshot(unissued_request).await.unwrap();
         assert_eq!(unissued_response.status(), StatusCode::UNAUTHORIZED);
     }
+    let unissued_throttled = Request::builder()
+        .method("POST")
+        .uri("/auth/pair")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"device_name":"pre-4","pairing_code":"0000-wrong"}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unissued_throttled).await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 
     let valid_code = service.auth().issue_pairing_code().await.unwrap();
 

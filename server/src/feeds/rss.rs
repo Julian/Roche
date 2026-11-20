@@ -1,9 +1,11 @@
+use std::collections::{HashMap, VecDeque};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use quick_xml::{Reader, events::Event};
 use url::Url;
 
-use super::{extract_entry_timestamp, select_entry_link};
+use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp, select_entry_link};
 use crate::{
     content::HtmlSanitizer,
     util::{
@@ -59,10 +61,23 @@ struct SupplementalXmlState {
     in_channel_image: bool,
     active_text_tag: Option<&'static str>,
     text_buf: String,
+    entry_limit_reached: bool,
 }
 
 impl SupplementalXmlState {
+    fn push_entry(&mut self, entry: SupplementalEntryMeta) {
+        if self.meta.entries.len() < MAX_PARSED_FEED_ENTRIES {
+            self.meta.entries.push(entry);
+        }
+        if self.meta.entries.len() >= MAX_PARSED_FEED_ENTRIES {
+            self.entry_limit_reached = true;
+        }
+    }
+
     fn handle_open_tag(&mut self, tag: &quick_xml::events::BytesStart<'_>, is_empty: bool) {
+        if self.entry_limit_reached {
+            return;
+        }
         let qname = tag.name();
         let raw_name = qname.as_ref();
         if RssParser::is_source_tag(raw_name) {
@@ -78,10 +93,14 @@ impl SupplementalXmlState {
 
         if RssParser::is_entry_tag(raw_name) {
             if let Some(unfinished) = self.current_entry.take() {
-                self.meta.entries.push(unfinished);
+                self.push_entry(unfinished);
+                if self.entry_limit_reached {
+                    self.active_text_tag = None;
+                    return;
+                }
             }
             if is_empty {
-                self.meta.entries.push(SupplementalEntryMeta::default());
+                self.push_entry(SupplementalEntryMeta::default());
             } else {
                 let mut next_entry = SupplementalEntryMeta::default();
                 if (raw_name.eq_ignore_ascii_case("item")
@@ -177,7 +196,7 @@ impl SupplementalXmlState {
         }
         if RssParser::is_entry_tag(raw_name) {
             if let Some(finished) = self.current_entry.take() {
-                self.meta.entries.push(finished);
+                self.push_entry(finished);
             }
             self.entry_child_depth = 0;
             self.current_entry_has_alt_link = false;
@@ -247,9 +266,78 @@ impl SupplementalXmlState {
 
     fn finish(mut self) -> SupplementalFeedMeta {
         if let Some(unfinished) = self.current_entry.take() {
-            self.meta.entries.push(unfinished);
+            self.push_entry(unfinished);
         }
         self.meta
+    }
+}
+
+struct SupplementalIndex<'a> {
+    entries: &'a [SupplementalEntryMeta],
+    by_id: HashMap<&'a str, VecDeque<usize>>,
+    by_link_without_id: HashMap<&'a str, VecDeque<usize>>,
+    used: Vec<bool>,
+}
+
+impl<'a> SupplementalIndex<'a> {
+    fn new(entries: &'a [SupplementalEntryMeta]) -> Self {
+        let mut by_id: HashMap<&'a str, VecDeque<usize>> = HashMap::new();
+        let mut by_link_without_id: HashMap<&'a str, VecDeque<usize>> = HashMap::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            if let Some(id) = entry.entry_id.as_deref() {
+                by_id.entry(id).or_default().push_back(idx);
+            } else if let Some(link) = entry.entry_link.as_deref() {
+                by_link_without_id.entry(link).or_default().push_back(idx);
+            }
+        }
+        Self { entries, by_id, by_link_without_id, used: vec![false; entries.len()] }
+    }
+
+    fn take_first_unused(queue: &mut VecDeque<usize>, used: &mut [bool]) -> Option<usize> {
+        while let Some(idx) = queue.pop_front() {
+            if !used[idx] {
+                used[idx] = true;
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn match_entry(
+        &mut self,
+        idx: usize,
+        norm_entry_id: Option<&str>,
+        norm_entry_link: Option<&str>,
+    ) -> Option<&'a SupplementalEntryMeta> {
+        if let Some(eid) = norm_entry_id
+            && let Some(queue) = self.by_id.get_mut(eid)
+            && let Some(found_idx) = Self::take_first_unused(queue, &mut self.used)
+        {
+            return Some(&self.entries[found_idx]);
+        }
+
+        // Any unused entry whose `entry_id == norm_entry_id` would already have matched above,
+        // so an ID-compatible link fallback can only match supplemental entries with no `entry_id`.
+        if let Some(elink) = norm_entry_link
+            && let Some(queue) = self.by_link_without_id.get_mut(elink)
+            && let Some(found_idx) = Self::take_first_unused(queue, &mut self.used)
+        {
+            return Some(&self.entries[found_idx]);
+        }
+
+        if let Some(candidate) = self.entries.get(idx)
+            && !self.used[idx]
+        {
+            let id_conflict =
+                candidate.entry_id.as_deref().is_some_and(|cid| norm_entry_id != Some(cid));
+            let link_conflict = candidate.entry_link.as_deref() != norm_entry_link;
+            if !id_conflict && !link_conflict {
+                self.used[idx] = true;
+                return Some(candidate);
+            }
+        }
+
+        None
     }
 }
 
@@ -257,7 +345,8 @@ pub struct RssParser;
 
 impl RssParser {
     pub fn parse(content: &str) -> Result<(RssFeed, Vec<RssItem>)> {
-        let feed = feed_rs::parser::parse(content.as_bytes())?;
+        let mut feed = feed_rs::parser::parse(content.as_bytes())?;
+        feed.entries.truncate(MAX_PARSED_FEED_ENTRIES);
         let mut supplemental = Self::extract_supplemental_xml_metadata(content);
 
         let feed_base_url = select_entry_link(&feed.links);
@@ -294,7 +383,7 @@ impl RssParser {
             language: feed.language.unwrap_or_default(),
         };
 
-        let mut used_supplemental = vec![false; supplemental.entries.len()];
+        let mut supp_index = SupplementalIndex::new(&supplemental.entries);
         let items = feed
             .entries
             .into_iter()
@@ -303,13 +392,7 @@ impl RssParser {
                 let norm_entry_id = Self::normalize_entry_id(&entry.id);
                 let primary_link = select_entry_link(&entry.links);
                 let norm_entry_link = primary_link.as_ref().map(Url::as_str);
-                let supp = Self::match_supplemental_entry(
-                    idx,
-                    norm_entry_id.as_deref(),
-                    norm_entry_link,
-                    &supplemental.entries,
-                    &mut used_supplemental,
-                );
+                let supp = supp_index.match_entry(idx, norm_entry_id.as_deref(), norm_entry_link);
                 let pub_date = extract_entry_timestamp(&entry);
                 let (media_audio_url, media_duration) = Self::extract_entry_audio(&entry);
                 let audio_url =
@@ -379,49 +462,6 @@ impl RssParser {
             authors.push(fallback.to_owned());
         }
         authors
-    }
-
-    fn match_supplemental_entry<'a>(
-        idx: usize,
-        norm_entry_id: Option<&str>,
-        norm_entry_link: Option<&str>,
-        entries: &'a [SupplementalEntryMeta],
-        used: &mut [bool],
-    ) -> Option<&'a SupplementalEntryMeta> {
-        if let Some(eid) = norm_entry_id
-            && let Some(found_idx) = entries
-                .iter()
-                .enumerate()
-                .find_map(|(i, s)| (!used[i] && s.entry_id.as_deref() == Some(eid)).then_some(i))
-        {
-            used[found_idx] = true;
-            return Some(&entries[found_idx]);
-        }
-
-        if let Some(elink) = norm_entry_link
-            && let Some(found_idx) = entries.iter().enumerate().find_map(|(i, s)| {
-                let id_compatible =
-                    s.entry_id.as_deref().is_none_or(|sid| Some(sid) == norm_entry_id);
-                (!used[i] && id_compatible && s.entry_link.as_deref() == Some(elink)).then_some(i)
-            })
-        {
-            used[found_idx] = true;
-            return Some(&entries[found_idx]);
-        }
-
-        if let Some(candidate) = entries.get(idx)
-            && !used[idx]
-        {
-            let id_conflict =
-                candidate.entry_id.as_deref().is_some_and(|cid| norm_entry_id != Some(cid));
-            let link_conflict = candidate.entry_link.as_deref() != norm_entry_link;
-            if !id_conflict && !link_conflict {
-                used[idx] = true;
-                return Some(candidate);
-            }
-        }
-
-        None
     }
 
     fn normalize_entry_id(raw: &str) -> Option<String> {
@@ -521,6 +561,9 @@ impl RssParser {
         let mut state = SupplementalXmlState::default();
 
         loop {
+            if state.entry_limit_reached && state.current_entry.is_none() {
+                break;
+            }
             match reader.read_event() {
                 Ok(Event::Start(tag)) => state.handle_open_tag(&tag, false),
                 Ok(Event::Empty(tag)) => state.handle_open_tag(&tag, true),
@@ -920,39 +963,51 @@ mod tests {
                 ..SupplementalEntryMeta::default()
             },
         ];
-        let mut used = vec![false; entries.len()];
+        let mut index = SupplementalIndex::new(&entries);
 
         // 1. Reordered entry matches by ID despite shifted index
-        let m1 = RssParser::match_supplemental_entry(
-            0,
-            Some("ep-by-id"),
-            Some("https://podcast.example.com/shared"),
-            &entries,
-            &mut used,
-        )
-        .unwrap();
+        let m1 = index
+            .match_entry(0, Some("ep-by-id"), Some("https://podcast.example.com/shared"))
+            .unwrap();
         assert_eq!(m1.duration_secs, Some(360));
 
         // 2. Entry with synthesized/non-matching feed-rs ID matches unused entry by primary link
-        let m2 = RssParser::match_supplemental_entry(
-            1,
-            Some("synthesized-feed-rs-hash"),
-            Some("https://podcast.example.com/ep-by-link"),
-            &entries,
-            &mut used,
-        )
-        .unwrap();
+        let m2 = index
+            .match_entry(
+                1,
+                Some("synthesized-feed-rs-hash"),
+                Some("https://podcast.example.com/ep-by-link"),
+            )
+            .unwrap();
         assert_eq!(m2.duration_secs, Some(240));
 
         // 3. Mismatched ID and link at idx 0 must NOT steal ep-skipped via positional fallback
-        let m3 = RssParser::match_supplemental_entry(
+        let m3 = index.match_entry(
             0,
             Some("ep-different"),
             Some("https://podcast.example.com/ep-different"),
-            &entries,
-            &mut used,
         );
         assert!(m3.is_none());
-        assert!(!used[0]);
+        assert!(!index.used[0]);
+    }
+
+    #[test]
+    fn test_rss_parser_caps_and_linearly_parses_large_feeds() {
+        use std::fmt::Write as _;
+
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Big</title>"#,
+        );
+        for i in 0..1_250 {
+            let _ = write!(
+                xml,
+                "<item><title>Item {i}</title><guid>g-{i}</guid><link>https://example.com/{i}</link></item>"
+            );
+        }
+        xml.push_str("</channel></rss>");
+
+        let (_feed, items) = RssParser::parse(&xml).unwrap();
+        assert_eq!(items.len(), MAX_PARSED_FEED_ENTRIES);
+        assert_eq!(items[0].title, "Item 0");
     }
 }
