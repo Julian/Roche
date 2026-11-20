@@ -116,6 +116,15 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
         }
     }
 
+    fun dropOnto(entryId: String, target: RankDropTarget): RankBoardState {
+        val coords = findBucketCoords(buckets, entryId)
+        return if (coords == null || target.bucketIndex !in buckets.indices) {
+            this
+        } else {
+            applyRankBoardDrop(this, coords.first, coords.second, target)
+        }
+    }
+
     internal companion object {
         fun fromCandidates(
             items: List<RankClusterCandidate>,
@@ -134,6 +143,101 @@ internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>
         }
     }
 }
+
+internal enum class RankDropZone {
+    BEFORE,
+    TIE,
+    AFTER,
+}
+
+internal data class RankDropTarget(
+    val bucketIndex: Int,
+    val zone: RankDropZone,
+)
+
+internal fun applyRankBoardDrop(
+    board: RankBoardState,
+    srcB: Int,
+    srcI: Int,
+    target: RankDropTarget,
+): RankBoardState {
+    if (target.zone == RankDropZone.TIE && srcB == target.bucketIndex) return board
+    val next = board.buckets.map { it.toMutableList() }.toMutableList()
+    val item = next[srcB].removeAt(srcI)
+    if (target.zone == RankDropZone.TIE) {
+        next[target.bucketIndex].add(item)
+        return RankBoardState(next.filter { it.isNotEmpty() })
+    }
+    val removedSrcBucket = next[srcB].isEmpty()
+    if (removedSrcBucket) {
+        next.removeAt(srcB)
+    }
+    val rawInsert =
+        if (target.zone == RankDropZone.BEFORE) target.bucketIndex else target.bucketIndex + 1
+    val adjusted = if (removedSrcBucket && srcB < rawInsert) rawInsert - 1 else rawInsert
+    next.add(adjusted.coerceIn(0, next.size), mutableListOf(item))
+    return RankBoardState(next)
+}
+
+internal fun resolveRankDropTarget(
+    pointerY: Float,
+    sourceBucketIndex: Int,
+    bucketBounds: List<Pair<Float, Float>>,
+): RankDropTarget? =
+    when {
+        bucketBounds.isEmpty() -> null
+        pointerY < bucketBounds.first().first -> RankDropTarget(0, RankDropZone.BEFORE)
+        pointerY > bucketBounds.last().second ->
+            RankDropTarget(bucketBounds.lastIndex, RankDropZone.AFTER)
+        else -> resolveInteriorDropTarget(pointerY, sourceBucketIndex, bucketBounds)
+    }
+
+private fun resolveInteriorDropTarget(
+    pointerY: Float,
+    sourceBucketIndex: Int,
+    bucketBounds: List<Pair<Float, Float>>,
+): RankDropTarget {
+    val hitIndex = bucketBounds.indexOfFirst { (top, bottom) -> pointerY in top..bottom }
+    if (hitIndex >= 0) {
+        return resolveZoneWithinBucket(
+            pointerY,
+            hitIndex,
+            sourceBucketIndex,
+            bucketBounds[hitIndex],
+        )
+    }
+    val nextIndex = bucketBounds.indexOfFirst { (top, _) -> pointerY < top }.coerceAtLeast(1)
+    val midpoint =
+        (bucketBounds[nextIndex - 1].second + bucketBounds[nextIndex].first) * DROP_MIDPOINT
+    return if (pointerY < midpoint) {
+        RankDropTarget(nextIndex - 1, RankDropZone.AFTER)
+    } else {
+        RankDropTarget(nextIndex, RankDropZone.BEFORE)
+    }
+}
+
+private fun resolveZoneWithinBucket(
+    pointerY: Float,
+    bucketIndex: Int,
+    sourceBucketIndex: Int,
+    bounds: Pair<Float, Float>,
+): RankDropTarget {
+    val height = (bounds.second - bounds.first).coerceAtLeast(1f)
+    val frac = ((pointerY - bounds.first) / height).coerceIn(0f, 1f)
+    val canTie = bucketIndex != sourceBucketIndex
+    val zone =
+        when {
+            frac < DROP_EDGE_THRESHOLD -> RankDropZone.BEFORE
+            frac > 1f - DROP_EDGE_THRESHOLD -> RankDropZone.AFTER
+            canTie -> RankDropZone.TIE
+            frac < DROP_MIDPOINT -> RankDropZone.BEFORE
+            else -> RankDropZone.AFTER
+        }
+    return RankDropTarget(bucketIndex, zone)
+}
+
+private const val DROP_EDGE_THRESHOLD = 0.28f
+private const val DROP_MIDPOINT = 0.5f
 
 internal data class RankBoardRowState(
     val candidate: RankClusterCandidate,

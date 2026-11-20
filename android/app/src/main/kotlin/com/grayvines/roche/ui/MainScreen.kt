@@ -596,6 +596,7 @@ internal fun MainOverlaySheets(
         FocusedRankBottomSheet(
             session = activeRankSession,
             onAction = onAction,
+            catalog = state.catalog,
         )
     }
 
