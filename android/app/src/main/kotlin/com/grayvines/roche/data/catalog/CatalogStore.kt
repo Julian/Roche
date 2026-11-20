@@ -11,6 +11,7 @@ import com.grayvines.roche.core.canonicalOrderingJson
 import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deriveCollectionIdentity
 import com.grayvines.roche.core.deterministicComparisonId
+import com.grayvines.roche.core.formatUtcMillisIso
 import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.data.local.CatalogStampRow
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
@@ -503,7 +504,7 @@ class CatalogStore(
             EpRankingEngine.validateOrdering(resolvedGroups).getOrThrow()
             val cleanScope = scopeCollectionId?.trim()?.takeIf { it.isNotEmpty() }
             val now = Instant.now()
-            val nowIso = now.toString()
+            val nowIso = formatUtcMillisIso(now)
             val nodeId = resolveLocalPeerId()
             val id =
                 deterministicComparisonId(

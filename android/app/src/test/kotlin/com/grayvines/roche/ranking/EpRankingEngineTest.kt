@@ -105,6 +105,15 @@ class EpRankingEngineTest {
         )
         assertTrue(EpRankingEngine.validateOrdering(listOf(listOf("a"), listOf("a"))).isFailure)
     }
+
+    @Test
+    fun `confusability treats zero-variance means within machine epsilon as tied`() {
+        val base = EpRankingEngine.Score(mean = 1.0, variance = 0.0)
+        val withinEps = EpRankingEngine.Score(mean = 1.0 + Math.ulp(1.0) * 0.5, variance = 0.0)
+        val outsideEps = EpRankingEngine.Score(mean = 1.0 + 1e-12, variance = 0.0)
+        assertEquals(0.5, EpRankingEngine.confusability(base, withinEps), 0.0)
+        assertEquals(0.0, EpRankingEngine.confusability(base, outsideEps), 0.0)
+    }
 }
 
 private const val TOLERANCE = 1e-6

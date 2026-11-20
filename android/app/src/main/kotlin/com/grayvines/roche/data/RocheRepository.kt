@@ -79,8 +79,6 @@ import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.model.inferContentType
 import java.io.File
 import java.io.InputStream
-import java.time.Instant
-import java.time.temporal.ChronoUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
@@ -289,9 +287,9 @@ class RocheRepository(
         val newReadAt =
             if (archived) {
                 if (isAudioItem) {
-                    Instant.now().toString()
+                    nowUtcIso()
                 } else {
-                    current.readAt?.takeIf { it.isNotBlank() } ?: Instant.now().toString()
+                    current.readAt?.takeIf { it.isNotBlank() } ?: nowUtcIso()
                 }
             } else {
                 null
@@ -344,7 +342,7 @@ class RocheRepository(
             if (status == ItemStatus.ARCHIVED) {
                 readAt?.takeIf { it.isNotBlank() }
                     ?: current.readAt?.takeIf { it.isNotBlank() }
-                    ?: Instant.now().toString()
+                    ?: nowUtcIso()
             } else {
                 readAt?.takeIf { it.isNotBlank() }
             }
@@ -359,7 +357,7 @@ class RocheRepository(
             if (current == null || currentlyRead == isRead) {
                 false
             } else {
-                val nextReadAt = if (isRead) Instant.now().toString() else null
+                val nextReadAt = if (isRead) nowUtcIso() else null
                 dao.setItemReadAt(itemId, nextReadAt, currentLocalPeerId())
                 true
             }
@@ -377,7 +375,7 @@ class RocheRepository(
                 false
             } else {
                 val targetRead = current.readAt.isNullOrBlank()
-                val nextReadAt = if (targetRead) Instant.now().toString() else null
+                val nextReadAt = if (targetRead) nowUtcIso() else null
                 dao.setItemReadAt(itemId, nextReadAt, currentLocalPeerId())
                 updated = true
                 targetRead
@@ -457,7 +455,7 @@ class RocheRepository(
             if (unarchivedItems.isEmpty()) {
                 emptyList()
             } else {
-                val nowIso = Instant.now().toString()
+                val nowIso = nowUtcIso()
                 val nodeId = currentLocalPeerId()
                 val batchSnapshots = unarchivedItems.map { item ->
                     val isAudio =
@@ -567,7 +565,7 @@ class RocheRepository(
                 false
             } else {
                 val clamped = progress.coerceIn(MIN_READ_PROGRESS, MAX_READ_PROGRESS)
-                val explicitReadAt = if (recordPlayedTimestamp) Instant.now().toString() else null
+                val explicitReadAt = if (recordPlayedTimestamp) nowUtcIso() else null
                 dao.setItemReadProgress(itemId, clamped, explicitReadAt, currentLocalPeerId())
                 maybeAutoLogFeedItemCompletion(itemId)
                 true
@@ -583,7 +581,7 @@ class RocheRepository(
             if (dao.getItemStateById(itemId) == null) {
                 false
             } else {
-                val nowIso = Instant.now().toString()
+                val nowIso = nowUtcIso()
                 dao.setItemReadAt(itemId, nowIso, currentLocalPeerId())
                 true
             }
@@ -739,7 +737,7 @@ class RocheRepository(
                             val feedUrl =
                                 existing.feedUrl
                                     ?: existing.feedId?.let { fid -> dao.getFeedById(fid)?.url }
-                            val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+                            val nowIso = nowUtcIso()
                             val hlc = nextLocalHlc(dao, nodeId)
                             dao.upsertTombstone(
                                 TombstoneEntity(

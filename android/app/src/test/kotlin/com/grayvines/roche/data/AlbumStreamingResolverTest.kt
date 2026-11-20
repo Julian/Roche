@@ -23,13 +23,17 @@ import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.sync.PeerSyncRequestConfig
 import com.grayvines.roche.data.sync.buildPeerSyncRequest
 import java.io.File
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -212,6 +216,45 @@ class AlbumStreamingResolverTest {
                 db.close()
                 dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
             }
+        }
+
+    @Test
+    fun `cancelling in-flight resolution removes key and does not deadlock subsequent callers`() =
+        runTest {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            var attempt = 0
+            val transport = HttpTransport { req ->
+                attempt++
+                if (attempt == 1) {
+                    firstStarted.complete(Unit)
+                    firstGate.await()
+                }
+                if (req.url.contains("song.link")) {
+                    HttpResponse(statusCode = 200, body = SAMPLE_PERSIST_ODESLI_JSON)
+                } else {
+                    HttpResponse(statusCode = 200, body = "{}")
+                }
+            }
+            val resolver = AlbumStreamingResolver(transport = transport)
+            val album =
+                CollectionDrawSnapshot(
+                    entryId = "album-cancel-test",
+                    title = "In the Wee Small Hours",
+                    creator = "Frank Sinatra",
+                    spotifyId = "spotify:album:abc123",
+                )
+
+            val ownerJob = launch { resolver.resolveStreamingIds(album) }
+            firstStarted.await()
+            val waiter = async { resolver.resolveStreamingIds(album) }
+            ownerJob.cancelAndJoin()
+
+            val waiterResult = withTimeout(2_000L) { waiter.await() }
+            assertEquals(emptyMap<String, String>(), waiterResult)
+
+            val freshResult = withTimeout(2_000L) { resolver.resolveStreamingIds(album) }
+            assertEquals("MPREb_persisted_1", freshResult["youtube_music"])
         }
 }
 

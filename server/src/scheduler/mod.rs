@@ -709,7 +709,9 @@ impl FeedIngester {
                 let parsed_items = items
                     .into_iter()
                     .filter_map(|item| {
-                        let url = item.link?;
+                        let raw_url = item.link?;
+                        let url = crate::util::media_urls::canonical_arxiv_abstract_url(&raw_url)
+                            .unwrap_or(raw_url);
                         let content_type = if item.audio_url.is_some() {
                             ContentType::Audio
                         } else {

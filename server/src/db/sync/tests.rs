@@ -3663,3 +3663,157 @@ async fn test_consumption_log_tombstone_cleared_on_newer_sync_resurrection() {
         "ConsumptionLog tombstone must be cleared on newer resurrection"
     );
 }
+
+#[tokio::test]
+async fn test_graph_tombstones_resolve_remapped_ids_in_same_sync_batch() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    // Verify retired 1001_albums placeholder UUID is no longer protected
+    assert!(
+        !crate::db::is_protected_system_collection_id("9eb44de7-bdfb-5bea-85d1-be913c542d8b"),
+        "retired 1001_albums placeholder must not be protected after migration 013"
+    );
+
+    let list = catalog
+        .create_manual_collection(
+            "Weekend Watch",
+            Some("weekend_watch"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let canon = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Stalker".to_owned(),
+            release_year: Some(1979),
+            identifiers: vec![crate::db::EntryIdentifier {
+                scheme: "imdb".to_owned(),
+                value: "tt0079944".to_owned(),
+            }],
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let dup = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Movie),
+            title: "Stalker (Dup)".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.add_collection_entry(&list.id, &canon.id, None).await.unwrap();
+    catalog.update_collection_generator(&list.id, Some(true), Some(&canon.id), None).await.unwrap();
+
+    // A peer sends in ONE batch:
+    //  1. `dup` merged into `canon` (populating `id_resolver` during `merge_incoming_entries_in_tx`)
+    //  2. `CollectionEntry` tombstone referencing `(list_alias -> list.id, dup.id)`
+    //  3. `CollectionGenerator` tombstone referencing a remapped manual collection alias
+    let future_ts = Utc::now() + chrono::Duration::seconds(30);
+    let merge_hlc = HlcTimestamp::from_datetime(future_ts, "peer-merge").encode();
+    let tomb_hlc =
+        HlcTimestamp::from_datetime(future_ts + chrono::Duration::seconds(5), "peer-merge")
+            .encode();
+    let list_alias_id = "peer-local-weekend-watch-alias";
+
+    db.sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-merge".to_owned(),
+            entries: vec![
+                SyncEntryRecord {
+                    id: list_alias_id.to_owned(),
+                    kind: EntryKind::Collection,
+                    title: "Weekend Watch".to_owned(),
+                    creators: Vec::new(),
+                    url: None,
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: None,
+                    created_at: Some(future_ts),
+                    updated_at: Some(future_ts),
+                    hlc: merge_hlc.clone(),
+                    content: None,
+                    state: None,
+                    collection_spec: Some(SyncCollectionSpec {
+                        slug: Some("weekend_watch".to_owned()),
+                        mode: CollectionMode::Manual,
+                        role: CollectionRole::List,
+                        rule_json: None,
+                        show_in_lists: true,
+                        color: None,
+                    }),
+                    feed_source: None,
+                },
+                SyncEntryRecord {
+                    id: dup.id.clone(),
+                    kind: EntryKind::Movie,
+                    title: "Stalker (Dup)".to_owned(),
+                    creators: Vec::new(),
+                    url: None,
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    identifiers: Vec::new(),
+                    merged_into_id: Some(canon.id.clone()),
+                    created_at: Some(future_ts),
+                    updated_at: Some(future_ts),
+                    hlc: merge_hlc,
+                    content: None,
+                    state: None,
+                    collection_spec: None,
+                    feed_source: None,
+                },
+            ],
+            tombstones: vec![
+                SyncTombstone {
+                    entity_type: ActivityEntityType::CollectionEntry,
+                    natural_key: crate::db::collection_entry_natural_key(list_alias_id, &dup.id),
+                    deleted_at: future_ts + chrono::Duration::seconds(5),
+                    hlc: tomb_hlc.clone(),
+                },
+                SyncTombstone {
+                    entity_type: ActivityEntityType::CollectionGenerator,
+                    natural_key: list_alias_id.to_owned(),
+                    deleted_at: future_ts + chrono::Duration::seconds(5),
+                    hlc: tomb_hlc,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let member_still_present: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
+    )
+    .bind(&list.id)
+    .bind(&canon.id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        member_still_present.is_none(),
+        "CollectionEntry tombstone using remapped list & merged entry IDs must remove canonical membership"
+    );
+
+    let gen_still_present: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+            .bind(&list.id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        gen_still_present.is_none(),
+        "CollectionGenerator tombstone using remapped list ID must delete canonical generator"
+    );
+}

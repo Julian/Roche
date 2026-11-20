@@ -32,6 +32,7 @@ import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.normalizeIdentifierScheme
 import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.core.resolveArticleDuration
 import com.grayvines.roche.core.sanitizeHttpUrl
 import com.grayvines.roche.core.tagNaturalKey
@@ -1482,35 +1483,178 @@ private suspend fun mergeEntryStateRowInDao(
             serverNode,
             nowMs,
         )
-    val stateWins =
-        shouldIncomingWinHlc(stateHlc, existingState?.hlc, existingState?.isLocalDirty == true)
-    if (existingState != null && !stateWins) return
-
-    val resolvedReadAt =
-        if (stateDto.inboxState.equals(INBOX_STATE_DISMISSED, ignoreCase = true)) {
-            stateDto.readAt?.takeIf { it.isNotBlank() }
-                ?: existingState?.readAt?.takeIf { it.isNotBlank() }
-                ?: mergedEntry.createdAt.ifBlank { nowIso }
+    val incProgress = clampFiniteProgress(stateDto.progress)
+    val incomingInbox = normalizeInboxState(stateDto.inboxState, fallback = INBOX_STATE_UNREAD)
+    val hlcCmp =
+        if (existingState == null || existingState.hlc.isBlank()) {
+            1
         } else {
-            stateDto.readAt?.takeIf { it.isNotBlank() }
+            compareHlc(stateHlc, existingState.hlc)
         }
-    dao.upsertEntryState(
-        EntryStateEntity(
-            entryId = targetId,
-            inboxState = stateDto.inboxState.ifBlank { INBOX_STATE_UNREAD },
-            readAt = resolvedReadAt,
-            progress = stateDto.progress,
-            interactionUpdatedAt =
-                newerIsoTimestamp(
-                    stateDto.interactionUpdatedAt,
-                    existingState?.interactionUpdatedAt,
-                ),
-            updatedAt = stateDto.interactionUpdatedAt ?: mergedEntry.updatedAt.ifBlank { nowIso },
-            isCachedOffline = existingState?.isCachedOffline ?: false,
-            hlc = maxHlc(stateHlc, existingState?.hlc),
-            isLocalDirty = false,
+    if (existingState != null && hlcCmp < 0) return
+
+    val fallbackCreatedAt = mergedEntry.createdAt.ifBlank { nowIso }
+    val nextState =
+        if (existingState != null && hlcCmp == 0) {
+            mergeEqualHlcEntryState(
+                targetId = targetId,
+                existingState = existingState,
+                stateDto = stateDto,
+                incomingInbox = incomingInbox,
+                incProgress = incProgress,
+                mergedUpdatedAt =
+                    stateDto.interactionUpdatedAt ?: mergedEntry.updatedAt.ifBlank { nowIso },
+                fallbackCreatedAt = fallbackCreatedAt,
+            )
+        } else {
+            buildIncomingEntryState(
+                targetId = targetId,
+                existingState = existingState,
+                stateDto = stateDto,
+                incomingInbox = incomingInbox,
+                incProgress = incProgress,
+                stateHlc = stateHlc,
+                mergedUpdatedAt =
+                    stateDto.interactionUpdatedAt ?: mergedEntry.updatedAt.ifBlank { nowIso },
+                fallbackCreatedAt = fallbackCreatedAt,
+            )
+        }
+    dao.upsertEntryState(nextState)
+}
+
+@Suppress("LongParameterList")
+private fun buildIncomingEntryState(
+    targetId: String,
+    existingState: EntryStateEntity?,
+    stateDto: SyncEntryStateDto,
+    incomingInbox: String,
+    incProgress: Double,
+    stateHlc: String,
+    mergedUpdatedAt: String,
+    fallbackCreatedAt: String,
+): EntryStateEntity {
+    val mergedInteraction =
+        newerIsoTimestamp(stateDto.interactionUpdatedAt, existingState?.interactionUpdatedAt)
+    val resolvedReadAt =
+        resolveStateReadAt(
+            inboxState = incomingInbox,
+            primaryReadAt = stateDto.readAt?.takeIf { it.isNotBlank() },
+            existingReadAt = existingState?.readAt,
+            incomingReadAt = stateDto.readAt,
+            interactionUpdatedAt = mergedInteraction,
+            fallbackCreatedAt = fallbackCreatedAt,
         )
+    return EntryStateEntity(
+        entryId = targetId,
+        inboxState = incomingInbox,
+        readAt = resolvedReadAt,
+        progress = incProgress,
+        interactionUpdatedAt = mergedInteraction,
+        updatedAt = mergedUpdatedAt,
+        isCachedOffline = existingState?.isCachedOffline ?: false,
+        hlc = maxHlc(stateHlc, existingState?.hlc),
+        isLocalDirty = false,
     )
+}
+
+@Suppress("LongParameterList")
+private fun mergeEqualHlcEntryState(
+    targetId: String,
+    existingState: EntryStateEntity,
+    stateDto: SyncEntryStateDto,
+    incomingInbox: String,
+    incProgress: Double,
+    mergedUpdatedAt: String,
+    fallbackCreatedAt: String,
+): EntryStateEntity {
+    val existingInbox = normalizeInboxState(existingState.inboxState, fallback = INBOX_STATE_NONE)
+    val mergedInbox = joinInboxState(existingInbox, incomingInbox)
+    val mergedProgress = maxOf(clampFiniteProgress(existingState.progress), incProgress)
+    val mergedRawReadAt = newerIsoTimestamp(existingState.readAt, stateDto.readAt)
+    val mergedInteraction =
+        newerIsoTimestamp(existingState.interactionUpdatedAt, stateDto.interactionUpdatedAt)
+    val resolvedReadAt =
+        resolveStateReadAt(
+            inboxState = mergedInbox,
+            primaryReadAt = mergedRawReadAt,
+            existingReadAt = existingState.readAt,
+            incomingReadAt = stateDto.readAt,
+            interactionUpdatedAt = mergedInteraction,
+            fallbackCreatedAt = fallbackCreatedAt,
+        )
+    val incomingEffectiveReadAt =
+        resolveStateReadAt(
+            inboxState = incomingInbox,
+            primaryReadAt = stateDto.readAt?.takeIf { it.isNotBlank() },
+            existingReadAt = null,
+            incomingReadAt = stateDto.readAt,
+            interactionUpdatedAt = stateDto.interactionUpdatedAt,
+            fallbackCreatedAt = fallbackCreatedAt,
+        )
+    val mergedMatchesIncoming =
+        mergedInbox == incomingInbox &&
+            mergedProgress == incProgress &&
+            sameOptionalTimestamp(resolvedReadAt, incomingEffectiveReadAt)
+    return EntryStateEntity(
+        entryId = targetId,
+        inboxState = mergedInbox,
+        readAt = resolvedReadAt,
+        progress = mergedProgress,
+        interactionUpdatedAt = mergedInteraction,
+        updatedAt = mergedUpdatedAt,
+        isCachedOffline = existingState.isCachedOffline,
+        hlc = existingState.hlc,
+        isLocalDirty = !mergedMatchesIncoming,
+    )
+}
+
+internal fun clampFiniteProgress(raw: Double): Double =
+    if (raw.isFinite()) raw.coerceIn(0.0, 1.0) else 0.0
+
+internal fun normalizeInboxState(raw: String?, fallback: String): String {
+    val clean = raw?.trim()?.lowercase().orEmpty()
+    return when (clean) {
+        INBOX_STATE_DISMISSED -> INBOX_STATE_DISMISSED
+        INBOX_STATE_UNREAD -> INBOX_STATE_UNREAD
+        INBOX_STATE_NONE -> INBOX_STATE_NONE
+        else -> fallback
+    }
+}
+
+internal fun joinInboxState(a: String, b: String): String =
+    when {
+        a == INBOX_STATE_DISMISSED || b == INBOX_STATE_DISMISSED -> INBOX_STATE_DISMISSED
+        a == INBOX_STATE_UNREAD || b == INBOX_STATE_UNREAD -> INBOX_STATE_UNREAD
+        else -> INBOX_STATE_NONE
+    }
+
+@Suppress("LongParameterList")
+private fun resolveStateReadAt(
+    inboxState: String,
+    primaryReadAt: String?,
+    existingReadAt: String?,
+    incomingReadAt: String?,
+    interactionUpdatedAt: String?,
+    fallbackCreatedAt: String,
+): String? =
+    if (inboxState == INBOX_STATE_DISMISSED) {
+        primaryReadAt?.takeIf { it.isNotBlank() }
+            ?: existingReadAt?.takeIf { it.isNotBlank() }
+            ?: incomingReadAt?.takeIf { it.isNotBlank() }
+            ?: interactionUpdatedAt?.takeIf { it.isNotBlank() }
+            ?: fallbackCreatedAt
+    } else {
+        primaryReadAt?.takeIf { it.isNotBlank() }
+    }
+
+private fun sameOptionalTimestamp(a: String?, b: String?): Boolean {
+    val cleanA = a?.trim()?.takeIf { it.isNotEmpty() }
+    val cleanB = b?.trim()?.takeIf { it.isNotEmpty() }
+    if (cleanA == cleanB) return true
+    if (cleanA == null || cleanB == null) return false
+    val instA = parseIsoInstant(cleanA)
+    val instB = parseIsoInstant(cleanB)
+    return instA != null && instB != null && instA == instB
 }
 
 @Suppress("LongParameterList")

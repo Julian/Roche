@@ -49,6 +49,42 @@ pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
     if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
 }
 
+/// Strips a trailing arXiv version suffix (`v1`, `v2`, ...) from an arXiv identifier
+/// (for example `"2301.07041v2"` -> `"2301.07041"`, `"hep-th/9901001v1"` -> `"hep-th/9901001"`).
+#[must_use]
+pub fn strip_arxiv_version(arxiv_id: &str) -> &str {
+    let trimmed = arxiv_id.trim();
+    if let Some((base, suffix)) = trimmed.rsplit_once('v')
+        && !base.is_empty()
+        && !suffix.is_empty()
+        && suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return base;
+    }
+    trimmed
+}
+
+/// Canonicalizes an arXiv `/abs/` URL to HTTPS without a `vN` version suffix
+/// (`https://arxiv.org/abs/<id>`) so Rust and Android generate identical deterministic item UUIDs.
+#[must_use]
+pub fn canonical_arxiv_abstract_url(raw_url: &Url) -> Option<Url> {
+    if !is_arxiv_host(raw_url.host_str()) || !raw_url.path().starts_with("/abs/") {
+        return None;
+    }
+    let arxiv_id = extract_arxiv_id(raw_url.as_str())?;
+    let versionless = strip_arxiv_version(&arxiv_id);
+    if versionless.is_empty()
+        || versionless.contains("..")
+        || versionless.matches('/').count() > 1
+        || !versionless
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    {
+        return None;
+    }
+    Url::parse(&format!("https://arxiv.org/abs/{versionless}")).ok()
+}
+
 #[must_use]
 pub fn arxiv_pdf_url(paper_url: &Url) -> Option<Url> {
     if !is_arxiv_host(paper_url.host_str()) {

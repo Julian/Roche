@@ -9,9 +9,11 @@ import com.grayvines.roche.core.buildYoutubeChannelFeedUrl
 import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.decodeHtmlEntities
 import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.extractArxivIdentifier
 import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.extractYoutubeChannelId
 import com.grayvines.roche.core.formatDurationSecondsLabel
+import com.grayvines.roche.core.formatUtcMillisIso
 import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isArxivUrl
 import com.grayvines.roche.core.isDirectAudioUrl
@@ -120,7 +122,7 @@ internal object LocalFeedPoller {
                             dao = dao,
                             feed = feed,
                             localPeerId = localPeerId,
-                            completedIso = resolveNow().toString(),
+                            completedIso = formatUtcMillisIso(resolveNow()),
                             errorMessage = sanitizeFeedFetchError(error),
                             syncableFeed = syncableFeed,
                             nodeId = effectiveNodeId,
@@ -135,7 +137,7 @@ internal object LocalFeedPoller {
                             dao = dao,
                             feed = feed,
                             localPeerId = localPeerId,
-                            completedIso = resolveNow().toString(),
+                            completedIso = formatUtcMillisIso(resolveNow()),
                             errorMessage = "Feed XML parse failed",
                             syncableFeed = syncableFeed,
                             nodeId = effectiveNodeId,
@@ -144,7 +146,7 @@ internal object LocalFeedPoller {
                     }
             }
 
-        val nowIso = resolveNow().toString()
+        val nowIso = formatUtcMillisIso(resolveNow())
         val updatedFeed = buildUpdatedPolledFeed(feed, batch, nowIso, localPeerId, syncableFeed)
         val configChanged = updatedFeed.title != feed.title || updatedFeed.feedType != feed.feedType
         dao.upsertFeed(
@@ -786,12 +788,34 @@ internal fun extractChannelArtworkUrl(channel: Element, baseUrl: String): String
 
 internal fun canonicalizeEntryUrl(rawUrl: String, feedType: String): String {
     val trimmed = rawUrl.trim()
-    if (feedType.equals("arxiv", ignoreCase = true) || trimmed.contains("arxiv.org/abs/")) {
-        val withoutVersion = trimmed.replace(Regex("""(arxiv\.org/abs/\d{4}\.\d{4,5})v\d+"""), "$1")
-        return withoutVersion.replace("http://arxiv.org/", "https://arxiv.org/")
+    val shouldCheckArxiv =
+        feedType.equals("arxiv", ignoreCase = true) ||
+            trimmed.contains("arxiv.org/abs/", ignoreCase = true)
+    if (shouldCheckArxiv && trimmed.contains("/abs/", ignoreCase = true)) {
+        val arxivId = extractArxivIdentifier(trimmed)
+        if (arxivId != null) {
+            val versionless = stripArxivVersionSuffix(arxivId)
+            if (isSafeArxivId(versionless)) {
+                return "https://arxiv.org/abs/$versionless"
+            }
+        }
     }
     return trimmed
 }
+
+private fun stripArxivVersionSuffix(arxivId: String): String {
+    val clean = arxivId.trim()
+    val vIdx = clean.lastIndexOf('v')
+    val hasVersionDigits =
+        vIdx > 0 && vIdx < clean.lastIndex && clean.substring(vIdx + 1).all(Char::isDigit)
+    return if (hasVersionDigits) clean.substring(0, vIdx) else clean
+}
+
+private fun isSafeArxivId(id: String): Boolean =
+    id.isNotEmpty() &&
+        ".." !in id &&
+        id.count { it == '/' } <= 1 &&
+        id.all { it.isLetterOrDigit() || it in "._-/" }
 
 internal fun extractAtomLink(
     parent: Element,

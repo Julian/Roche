@@ -24,9 +24,11 @@ import java.net.URI
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -64,8 +66,13 @@ class AlbumStreamingResolver(
                     .getOrDefault(emptyMap())
             deferred.complete(result)
         } finally {
-            inFlightMutex.withLock { inFlightByKey.remove(key) }
-            deferred.complete(emptyMap())
+            try {
+                withContext(NonCancellable) {
+                    inFlightMutex.withLock { inFlightByKey.remove(key) }
+                }
+            } finally {
+                deferred.complete(emptyMap())
+            }
         }
         scheduleArtistEnrichment(album)
         return result
@@ -166,8 +173,13 @@ class AlbumStreamingResolver(
             deferred.complete(result)
             result
         } finally {
-            inFlightMutex.withLock { inFlightByKey.remove(key) }
-            deferred.complete(emptyMap())
+            try {
+                withContext(NonCancellable) {
+                    inFlightMutex.withLock { inFlightByKey.remove(key) }
+                }
+            } finally {
+                deferred.complete(emptyMap())
+            }
         }
     }
 

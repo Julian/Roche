@@ -29,7 +29,9 @@ struct ItemTombstoneCandidate {
 }
 
 impl SyncRepo<'_> {
-    pub(super) async fn apply_incoming_tombstones(
+    /// Applies entry-level tombstones (`feed`, `item`, `tag`, `entry`) prior to
+    /// `merge_incoming_entries_in_tx` so tombstones suppress resurrected entries in the same batch.
+    pub(super) async fn apply_incoming_entry_tombstones(
         conn: &mut SqliteConnection,
         tombstones: &[SyncTombstone],
         ctx: &mut MergeContext<'_>,
@@ -67,6 +69,39 @@ impl SyncRepo<'_> {
                     Self::apply_tag_tombstone_in_tx(conn, key, tomb.deleted_at, &tomb_hlc, ctx)
                         .await?;
                 }
+                ActivityEntityType::Entry => {
+                    Self::apply_entry_tombstone_in_tx(conn, key, tomb.deleted_at, &tomb_hlc, ctx)
+                        .await?;
+                }
+                ActivityEntityType::CollectionEntry
+                | ActivityEntityType::CollectionGenerator
+                | ActivityEntityType::ConsumptionLog
+                | ActivityEntityType::Media
+                | ActivityEntityType::Collection
+                | ActivityEntityType::Comparison => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies graph-level tombstones (`collection_entry`, `collection_generator`,
+    /// `consumption_log`) *after* `merge_incoming_entries_in_tx` populates `ctx.id_resolver`
+    /// and *before* incoming memberships, consumption logs, and generators merge, then completes
+    /// any deferred `entry` deletions whose catalog references were removed in this phase.
+    pub(super) async fn apply_incoming_graph_tombstones(
+        conn: &mut SqliteConnection,
+        tombstones: &[SyncTombstone],
+        ctx: &mut MergeContext<'_>,
+    ) -> Result<()> {
+        for tomb in tombstones {
+            let key = tomb.natural_key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let tomb_hlc =
+                resolve_or_synthesize_hlc(&tomb.hlc, Some(tomb.deleted_at), ctx.now, ctx.peer_id);
+
+            match tomb.entity_type {
                 ActivityEntityType::CollectionEntry => {
                     Self::apply_collection_entry_tombstone_in_tx(
                         conn,
@@ -76,10 +111,6 @@ impl SyncRepo<'_> {
                         ctx,
                     )
                     .await?;
-                }
-                ActivityEntityType::Entry => {
-                    Self::apply_entry_tombstone_in_tx(conn, key, tomb.deleted_at, &tomb_hlc, ctx)
-                        .await?;
                 }
                 ActivityEntityType::CollectionGenerator => {
                     Self::apply_collection_generator_tombstone_in_tx(
@@ -100,9 +131,42 @@ impl SyncRepo<'_> {
                     )
                     .await?;
                 }
-                ActivityEntityType::Media
+                ActivityEntityType::Feed
+                | ActivityEntityType::Item
+                | ActivityEntityType::Tag
+                | ActivityEntityType::Entry
+                | ActivityEntityType::Media
                 | ActivityEntityType::Collection
                 | ActivityEntityType::Comparison => {}
+            }
+        }
+        Self::finalize_deferred_entry_deletes_in_tx(conn, ctx).await?;
+        Ok(())
+    }
+
+    async fn finalize_deferred_entry_deletes_in_tx(
+        conn: &mut SqliteConnection,
+        ctx: &mut MergeContext<'_>,
+    ) -> Result<()> {
+        let deferred = std::mem::take(&mut ctx.deferred_entry_deletes);
+        for (raw_key, tomb_hlc) in deferred {
+            let key = ctx.id_resolver.resolve_or_fallback_in_tx(&mut *conn, &raw_key).await?;
+            let existing_hlc: Option<String> =
+                sqlx::query_scalar("SELECT hlc FROM entries WHERE id = ?")
+                    .bind(&key)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+            if existing_hlc.as_deref().is_some_and(|h| h > tomb_hlc.as_str()) {
+                continue;
+            }
+            if !ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, &key).await? {
+                sqlx::query("DELETE FROM entries WHERE id = ?")
+                    .bind(&key)
+                    .execute(&mut *conn)
+                    .await?;
+                if ctx.tag_index.is_loaded() {
+                    ctx.tag_index.remove(&key);
+                }
             }
         }
         Ok(())
@@ -366,7 +430,9 @@ impl SyncRepo<'_> {
         if existing_hlc.as_deref().is_some_and(|h| h > tomb_hlc) {
             return Ok(());
         }
-        if !ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, key).await? {
+        if ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, key).await? {
+            ctx.deferred_entry_deletes.push((key.to_owned(), tomb_hlc.to_owned()));
+        } else {
             sqlx::query("DELETE FROM entries WHERE id = ?").bind(key).execute(&mut *conn).await?;
             if ctx.tag_index.is_loaded() {
                 ctx.tag_index.remove(key);

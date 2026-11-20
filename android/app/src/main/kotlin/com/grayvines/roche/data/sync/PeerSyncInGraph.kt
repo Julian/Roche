@@ -17,7 +17,9 @@ import com.grayvines.roche.core.collectionEntryNaturalKey
 import com.grayvines.roche.core.deterministicAutoLogId
 import com.grayvines.roche.core.deterministicComparisonId
 import com.grayvines.roche.core.deterministicConsumptionLogId
+import com.grayvines.roche.core.earlierIsoTimestamp
 import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.newerIsoTimestamp
 import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.CollectionRole
@@ -34,6 +36,7 @@ import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.EntryContentEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.FeedSourceEntity
@@ -831,7 +834,12 @@ internal suspend fun foldMergedDuplicateInDao(
     cache: DuplicateFoldBatchCache? = null,
 ) {
     val batch = cache ?: DuplicateFoldBatchCache(dao)
+    dao.repointMergedIntoEntries(dupId = dupId, canonId = canonId, updatedAt = nowIso)
+    backfillCanonicalEntryOnFold(dao = dao, dupId = dupId, canonId = canonId, nowIso = nowIso)
+    dao.deleteManualCollectionSpec(dupId)
     dao.repointIdentifiersToEntry(dupId, canonId)
+    mergeFoldedEntryContentInDao(dao = dao, dupId = dupId, canonId = canonId)
+    mergeFoldedEntryStateInDao(dao = dao, dupId = dupId, canonId = canonId, nowIso = nowIso)
     repointMergedMembershipsInDao(dao, batch, dupId, canonId, nowIso)
     dao.repointConsumptionLogsToEntry(dupId, canonId)
     repointMergedComparisonsInDao(dao, batch, dupId, canonId)
@@ -847,6 +855,117 @@ internal suspend fun foldMergedDuplicateInDao(
     for (updated in updatedGenerators) {
         generators[updated.collectionId] = updated
     }
+}
+
+private suspend fun backfillCanonicalEntryOnFold(
+    dao: RocheDao,
+    dupId: String,
+    canonId: String,
+    nowIso: String,
+) {
+    val dup = dao.getEntryById(dupId) ?: return
+    val canon = dao.getEntryById(canonId) ?: return
+    val updated =
+        canon.copy(
+            creatorsJson = pickNonEmptyJson(canon.creatorsJson, dup.creatorsJson, "[]"),
+            url = firstNonBlank(canon.url, dup.url),
+            publishedAt = firstNonBlank(canon.publishedAt, dup.publishedAt),
+            releaseYear = canon.releaseYear ?: dup.releaseYear,
+            summary = firstNonBlank(canon.summary, dup.summary),
+            thumbnailUrl = firstNonBlank(canon.thumbnailUrl, dup.thumbnailUrl),
+            metadataJson = pickNonEmptyJson(canon.metadataJson, dup.metadataJson, "{}"),
+            updatedAt = nowIso,
+        )
+    if (updated != canon) {
+        dao.upsertEntry(updated)
+    }
+}
+
+private fun pickNonEmptyJson(canon: String, dup: String, emptyLiteral: String): String {
+    val canonEmpty = isEmptyJsonLiteral(canon, emptyLiteral)
+    val dupEmpty = isEmptyJsonLiteral(dup, emptyLiteral)
+    return if (canonEmpty && !dupEmpty) dup else canon
+}
+
+private fun isEmptyJsonLiteral(raw: String, emptyLiteral: String): Boolean {
+    val trimmed = raw.trim()
+    return trimmed.isEmpty() || trimmed == emptyLiteral
+}
+
+private fun firstNonBlank(primary: String?, fallback: String?): String? =
+    primary?.takeIf { it.isNotBlank() } ?: fallback
+
+private suspend fun mergeFoldedEntryContentInDao(
+    dao: RocheDao,
+    dupId: String,
+    canonId: String,
+) {
+    val dupContent = dao.getEntryContentById(dupId) ?: return
+    val canonContent = dao.getEntryContentById(canonId)
+    val merged =
+        if (canonContent == null) {
+            dupContent.copy(entryId = canonId)
+        } else {
+            EntryContentEntity(
+                entryId = canonId,
+                contentType = canonContent.contentType.ifBlank { dupContent.contentType },
+                contentText =
+                    canonContent.contentText?.takeIf { it.isNotBlank() } ?: dupContent.contentText,
+                contentHtml =
+                    canonContent.contentHtml?.takeIf { it.isNotBlank() } ?: dupContent.contentHtml,
+                audioUrl = canonContent.audioUrl?.takeIf { it.isNotBlank() } ?: dupContent.audioUrl,
+                duration = canonContent.duration?.takeIf { it.isNotBlank() } ?: dupContent.duration,
+                thumbnailMediaId =
+                    canonContent.thumbnailMediaId?.takeIf { it.isNotBlank() }
+                        ?: dupContent.thumbnailMediaId,
+                fallbackFeedTitle =
+                    canonContent.fallbackFeedTitle?.takeIf { it.isNotBlank() }
+                        ?: dupContent.fallbackFeedTitle,
+            )
+        }
+    dao.upsertEntryContent(merged)
+    dao.deleteEntryContentById(dupId)
+}
+
+private suspend fun mergeFoldedEntryStateInDao(
+    dao: RocheDao,
+    dupId: String,
+    canonId: String,
+    nowIso: String,
+) {
+    val dupState = dao.getEntryStateById(dupId) ?: return
+    val canonState = dao.getEntryStateById(canonId)
+    val merged =
+        if (canonState == null) {
+            dupState.copy(entryId = canonId, updatedAt = nowIso)
+        } else {
+            val mergedInbox =
+                joinInboxState(
+                    normalizeInboxState(canonState.inboxState, fallback = "none"),
+                    normalizeInboxState(dupState.inboxState, fallback = "none"),
+                )
+            EntryStateEntity(
+                entryId = canonId,
+                inboxState = mergedInbox,
+                readAt = earlierIsoTimestamp(canonState.readAt, dupState.readAt),
+                progress =
+                    maxOf(
+                        clampFiniteProgress(canonState.progress),
+                        clampFiniteProgress(dupState.progress),
+                    ),
+                interactionUpdatedAt =
+                    newerIsoTimestamp(
+                        canonState.interactionUpdatedAt,
+                        dupState.interactionUpdatedAt,
+                    ),
+                updatedAt = nowIso,
+                isCachedOffline = canonState.isCachedOffline || dupState.isCachedOffline,
+                hlc = maxHlc(canonState.hlc, dupState.hlc),
+                isLocalDirty = canonState.isLocalDirty || dupState.isLocalDirty,
+            )
+        }
+    dao.upsertEntryState(merged)
+    dao.deleteEntryStateById(dupId)
 }
 
 private suspend fun repointMergedMembershipsInDao(

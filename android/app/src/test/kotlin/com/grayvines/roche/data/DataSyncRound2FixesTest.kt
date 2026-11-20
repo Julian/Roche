@@ -19,6 +19,7 @@ import com.grayvines.roche.core.canonicalizeSyncUrl
 import com.grayvines.roche.core.deterministicFeedId
 import com.grayvines.roche.core.deterministicItemId
 import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.formatUtcMillisIso
 import com.grayvines.roche.core.itemNaturalKey
 import com.grayvines.roche.data.catalog.CatalogStore
 import com.grayvines.roche.data.catalog.EntryKind
@@ -31,9 +32,11 @@ import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
 import com.grayvines.roche.data.feeds.LocalFeedPoller
 import com.grayvines.roche.data.feeds.ParsedFeedBatch
 import com.grayvines.roche.data.feeds.ParsedFeedCandidateItem
+import com.grayvines.roche.data.feeds.canonicalizeEntryUrl
 import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
+import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
 import com.grayvines.roche.data.local.EntryContentEntity
 import com.grayvines.roche.data.local.EntryEntity
@@ -1144,4 +1147,257 @@ class DataSyncRound2FixesTest {
                 .exceptionOrNull()
             assertTrue(genericIoErr is IOException)
         }
+
+    @Test
+    fun `equal-HLC entry_state uses monotonic join and clamps progress`() = runTest {
+        val dao = database.dao()
+        val entryId = "entry-eq-hlc"
+        val sharedHlc = "001780000001000-0000-server"
+        val nowIso = "2026-06-15T12:00:00.000Z"
+
+        dao.upsertEntry(
+            EntryEntity(
+                id = entryId,
+                kind = "article",
+                title = "Monotonic State",
+                url = "https://example.com/monotonic",
+                createdAt = nowIso,
+                updatedAt = nowIso,
+                hlc = sharedHlc,
+            )
+        )
+        dao.upsertEntryState(
+            EntryStateEntity(
+                entryId = entryId,
+                inboxState = "dismissed",
+                readAt = "2026-06-15T11:50:00.000Z",
+                progress = 0.8,
+                interactionUpdatedAt = "2026-06-15T11:50:00.000Z",
+                updatedAt = nowIso,
+                hlc = sharedHlc,
+                isLocalDirty = false,
+            )
+        )
+
+        // Incoming at EQUAL HLC has weaker inboxState ('unread') and lower progress (0.2),
+        // but later readAt. Join must keep 'dismissed', progress 0.8, later readAt, and stay dirty.
+        reconcilePeerSyncResponse(
+            dao = dao,
+            response =
+                PeerSyncResponseDto(
+                    serverPeerId = "server",
+                    syncTimestamp = nowIso,
+                    entries =
+                        listOf(
+                            SyncEntryRecordDto(
+                                id = entryId,
+                                kind = "article",
+                                title = "Monotonic State",
+                                url = "https://example.com/monotonic",
+                                createdAt = nowIso,
+                                updatedAt = nowIso,
+                                hlc = sharedHlc,
+                                state =
+                                    SyncEntryStateDto(
+                                        inboxState = "unread",
+                                        readAt = "2026-06-15T11:55:00.000Z",
+                                        progress = 0.2,
+                                        interactionUpdatedAt = "2026-06-15T11:55:00.000Z",
+                                        hlc = sharedHlc,
+                                    ),
+                            )
+                        ),
+                ),
+        )
+        val joined = checkNotNull(dao.getEntryStateById(entryId))
+        assertEquals("dismissed", joined.inboxState)
+        assertEquals(0.8, joined.progress, 1e-6)
+        assertEquals("2026-06-15T11:55:00.000Z", joined.readAt)
+        assertTrue(joined.isLocalDirty)
+
+        // Incoming at newer HLC with out-of-range progress (>1.0 / NaN) must clamp to [0.0, 1.0]
+        val newerHlc = "001780000002000-0000-server"
+        reconcilePeerSyncResponse(
+            dao = dao,
+            response =
+                PeerSyncResponseDto(
+                    serverPeerId = "server",
+                    syncTimestamp = nowIso,
+                    entries =
+                        listOf(
+                            SyncEntryRecordDto(
+                                id = entryId,
+                                kind = "article",
+                                title = "Monotonic State",
+                                url = "https://example.com/monotonic",
+                                createdAt = nowIso,
+                                updatedAt = nowIso,
+                                hlc = newerHlc,
+                                state =
+                                    SyncEntryStateDto(
+                                        inboxState = "unread",
+                                        progress = 2.5,
+                                        hlc = newerHlc,
+                                    ),
+                            )
+                        ),
+                ),
+        )
+        val clamped = checkNotNull(dao.getEntryStateById(entryId))
+        assertEquals(1.0, clamped.progress, 1e-6)
+        assertFalse(clamped.isLocalDirty)
+    }
+
+    @Test
+    fun `foldMergedDuplicateInDao compresses chains backfills metadata and merges content and state`() =
+        runTest {
+            val dao = database.dao()
+            val nowIso = "2026-06-15T12:00:00.000Z"
+            val hlc = "001780000001000-0000-server"
+            val canonId = "entry-canon"
+            val dupId = "entry-dup"
+            val grandDupId = "entry-grand-dup"
+
+            dao.upsertEntry(
+                EntryEntity(
+                    id = canonId,
+                    kind = "article",
+                    title = "Canonical",
+                    creatorsJson = "[]",
+                    metadataJson = "{}",
+                    createdAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                )
+            )
+            dao.upsertEntry(
+                EntryEntity(
+                    id = dupId,
+                    kind = "article",
+                    title = "Duplicate",
+                    creatorsJson = """["Ada Lovelace"]""",
+                    url = "https://example.com/canon",
+                    releaseYear = 2025,
+                    summary = "Backfilled summary",
+                    thumbnailUrl = "https://example.com/thumb.jpg",
+                    metadataJson = """{"source":"dup"}""",
+                    createdAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                )
+            )
+            dao.upsertEntry(
+                EntryEntity(
+                    id = grandDupId,
+                    kind = "article",
+                    title = "Grandchild Dup",
+                    mergedIntoId = dupId,
+                    createdAt = nowIso,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                )
+            )
+            dao.upsertCollectionSpec(
+                CollectionSpecEntity(
+                    collectionId = dupId,
+                    slug = "dup_list",
+                    mode = "manual",
+                    role = "list",
+                )
+            )
+            dao.upsertEntryContent(
+                EntryContentEntity(
+                    entryId = dupId,
+                    contentType = "article",
+                    contentHtml = "<p>Rich body from dup</p>",
+                    audioUrl = "https://example.com/ep.mp3",
+                )
+            )
+            dao.upsertEntryState(
+                EntryStateEntity(
+                    entryId = canonId,
+                    inboxState = "unread",
+                    readAt = "2026-06-15T11:30:00.000Z",
+                    progress = 0.25,
+                    updatedAt = nowIso,
+                    hlc = hlc,
+                )
+            )
+            dao.upsertEntryState(
+                EntryStateEntity(
+                    entryId = dupId,
+                    inboxState = "dismissed",
+                    readAt = "2026-06-15T11:00:00.000Z",
+                    progress = 0.9,
+                    updatedAt = nowIso,
+                    isCachedOffline = true,
+                    hlc = "001780000002000-0000-server",
+                )
+            )
+
+            val mergeHlc = "001780000003000-0000-server"
+            reconcilePeerSyncResponse(
+                dao = dao,
+                response =
+                    PeerSyncResponseDto(
+                        serverPeerId = "server",
+                        syncTimestamp = nowIso,
+                        entries =
+                            listOf(
+                                SyncEntryRecordDto(
+                                    id = dupId,
+                                    kind = "article",
+                                    title = "Duplicate",
+                                    mergedIntoId = canonId,
+                                    createdAt = nowIso,
+                                    updatedAt = nowIso,
+                                    hlc = mergeHlc,
+                                )
+                            ),
+                    ),
+            )
+
+            // Chain compression
+            assertEquals(canonId, dao.getEntryById(grandDupId)!!.mergedIntoId)
+            // Canonical metadata backfill
+            val canon = checkNotNull(dao.getEntryById(canonId))
+            assertEquals("""["Ada Lovelace"]""", canon.creatorsJson)
+            assertEquals("https://example.com/canon", canon.url)
+            assertEquals(2025, canon.releaseYear)
+            assertEquals("Backfilled summary", canon.summary)
+            assertEquals("https://example.com/thumb.jpg", canon.thumbnailUrl)
+            assertEquals("""{"source":"dup"}""", canon.metadataJson)
+            // Duplicate manual collection_spec deleted
+            assertNull(dao.getCollectionSpecById(dupId))
+            // Content merged onto canonical & deleted from dup
+            assertNull(dao.getEntryContentById(dupId))
+            val canonContent = checkNotNull(dao.getEntryContentById(canonId))
+            assertEquals("<p>Rich body from dup</p>", canonContent.contentHtml)
+            assertEquals("https://example.com/ep.mp3", canonContent.audioUrl)
+            // State merged onto canonical & deleted from dup
+            assertNull(dao.getEntryStateById(dupId))
+            val canonState = checkNotNull(dao.getEntryStateById(canonId))
+            assertEquals("dismissed", canonState.inboxState)
+            assertEquals("2026-06-15T11:00:00.000Z", canonState.readAt)
+            assertEquals(0.9, canonState.progress, 1e-6)
+            assertTrue(canonState.isCachedOffline)
+        }
+
+    @Test
+    fun `formatUtcMillisIso sorts lexicographically across whole and fractional seconds and arXiv canonicalizer handles old-style IDs`() {
+        val wholeSec = formatUtcMillisIso(java.time.Instant.parse("2026-06-15T12:00:00Z"))
+        val halfSec = formatUtcMillisIso(java.time.Instant.parse("2026-06-15T12:00:00.500Z"))
+        assertEquals("2026-06-15T12:00:00.000Z", wholeSec)
+        assertEquals("2026-06-15T12:00:00.500Z", halfSec)
+        assertTrue(wholeSec < halfSec)
+
+        assertEquals(
+            "https://arxiv.org/abs/hep-th/9901001",
+            canonicalizeEntryUrl("http://arxiv.org/abs/hep-th/9901001v2", "arxiv"),
+        )
+        assertEquals(
+            "https://arxiv.org/abs/2603.11842",
+            canonicalizeEntryUrl("http://export.arxiv.org/abs/2603.11842v1", "rss"),
+        )
+    }
 }

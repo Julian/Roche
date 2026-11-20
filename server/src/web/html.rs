@@ -736,6 +736,7 @@ fn classify_web_sqlx_error(
             None,
         );
     }
+    tracing::error!(error = %sqlx_err, "Web database error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "Server Error",
@@ -764,17 +765,21 @@ fn classify_web_internal_error(
             CatalogError::ImmutableCollection { .. } | CatalogError::InvalidInput(_) => {
                 (StatusCode::BAD_REQUEST, "Invalid Request", cat.to_string(), None)
             }
-            CatalogError::Internal(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Server Error",
-                "An internal error occurred while processing your request.".to_owned(),
-                None,
-            ),
+            CatalogError::Internal(_) => {
+                tracing::error!(error = %cat, "Web catalog internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Server Error",
+                    "An internal error occurred while processing your request.".to_owned(),
+                    None,
+                )
+            }
         };
     }
     if let Some(sqlx_err) = inner.downcast_ref::<sqlx::Error>() {
         return classify_web_sqlx_error(sqlx_err);
     }
+    tracing::error!(error = %inner, "Web internal server error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "Server Error",

@@ -8,6 +8,7 @@ import com.grayvines.roche.core.extractHostTitle
 import com.grayvines.roche.core.feedNaturalKey
 import com.grayvines.roche.core.inferFeedTypeWireValue
 import com.grayvines.roche.core.isSyncablePublicUrl
+import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.core.runSuspendCatching
 import com.grayvines.roche.data.feeds.LocalFeedPoller
 import com.grayvines.roche.data.feeds.ParsedFeedBatch
@@ -27,8 +28,6 @@ import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.data.toRemoteFeedEntity
 import com.grayvines.roche.media.OfflineCacheManager
-import java.time.Instant
-import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.flow.first
 
 private const val HTTP_NOT_FOUND = 404
@@ -182,7 +181,7 @@ private fun buildSubscribedFeedRow(
             existingLocal,
         )
     }
-    val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+    val nowIso = nowUtcIso()
     return existingLocal?.copy(
         title = spec.cleanTitleOverride ?: existingLocal.title,
         isActive = true,
@@ -227,7 +226,7 @@ internal suspend fun deleteFeedFromServerOrLocal(
     feedId: String,
 ): String {
     val existing = dao.getFeedById(feedId)
-    val nowIso = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString()
+    val nowIso = nowUtcIso()
     val isLocalOnly = existing != null && !isSyncablePublicUrl(existing.url)
     val currentSettings = settings.settings.first()
     val nodeId = currentSettings.peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }

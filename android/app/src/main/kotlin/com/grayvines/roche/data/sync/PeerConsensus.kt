@@ -11,6 +11,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Instant
+import kotlin.math.abs
 import kotlin.math.ln
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -209,18 +210,22 @@ internal fun effectivePeerWeight(
     }
     var factor = 1.0
     val hasError = !lastError.isNullOrBlank()
+    val cleanErrorBy = lastErrorBy?.trim()?.takeIf { it.isNotEmpty() }
+    val cleanPolledBy = lastPolledBy?.trim()?.takeIf { it.isNotEmpty() }
     if (hasError) {
         factor *=
-            if (lastErrorBy == peer.peerId) {
+            if (cleanErrorBy == peer.peerId) {
                 FAILING_PEER_PENALTY_FACTOR
             } else {
                 RESCUE_PEER_BOOST_FACTOR
             }
-    } else if (lastPolledBy == peer.peerId) {
+    } else if (cleanPolledBy == peer.peerId) {
         factor *= HEALTHY_AFFINITY_FACTOR
     }
     return base * factor
 }
+
+private val HRW_SCORE_EPSILON: Double = Math.ulp(1.0)
 
 @Suppress("LongParameterList")
 internal fun selectFeedPoller(
@@ -253,7 +258,9 @@ internal fun selectFeedPoller(
         val u = rendezvousUniformUnit(peer.peerId, feedUrl, epoch)
         val score = -weight / ln(u)
         val isBetter =
-            bestPeer == null || score > bestScore || score == bestScore && peer.peerId < bestPeer
+            bestPeer == null ||
+                score > bestScore ||
+                abs(score - bestScore) <= HRW_SCORE_EPSILON && peer.peerId < bestPeer
         if (isBetter) {
             bestScore = score
             bestPeer = peer.peerId

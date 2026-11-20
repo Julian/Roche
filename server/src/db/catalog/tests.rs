@@ -1107,3 +1107,57 @@ async fn test_export_catalog_snapshot_includes_full_graph_and_excludes_merged() 
     assert!(snap.collection_generators[0].enabled);
     assert_eq!(snap.collection_generators[0].current_entry_id.as_deref(), Some(book2.id.as_str()));
 }
+
+#[tokio::test]
+async fn test_load_collection_preview_thumbnails_honors_dynamic_creator_filter() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let b1 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Dune".to_owned(),
+            creators: vec!["Frank Herbert".to_owned()],
+            thumbnail_url: Some("https://example.com/dune.jpg".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let b2 = catalog
+        .upsert_entry(&UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Solaris".to_owned(),
+            creators: vec!["Stanislaw Lem".to_owned()],
+            thumbnail_url: Some("https://example.com/solaris.jpg".to_owned()),
+            ..UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.log_consumption(&b1.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+    catalog.log_consumption(&b2.id, ConsumptionStatus::Consumed, None, None).await.unwrap();
+
+    // Seed a dynamic collection filtered by creator = "Herbert"
+    let dyn_id = "dyn-herbert-books";
+    sqlx::query("INSERT INTO entries (id, kind, title) VALUES (?, 'collection', 'Herbert Books')")
+        .bind(dyn_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO collection_specs (collection_id, slug, mode, collection_role, rule_json, show_in_lists)
+         VALUES (?, 'herbert_books', 'dynamic', 'list', '{\"kind\":\"book\",\"consumed\":true,\"creator\":\"herbert\"}', 1)",
+    )
+    .bind(dyn_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let cols = catalog.list_collections(false, false).await.unwrap();
+    let herbert = cols.iter().find(|c| c.id == dyn_id).unwrap();
+    assert_eq!(herbert.member_count, 1);
+
+    let previews =
+        catalog.load_collection_preview_thumbnails(std::slice::from_ref(herbert), 4).await.unwrap();
+    let thumbs = previews.get(dyn_id).unwrap();
+    assert_eq!(thumbs, &vec![("Dune".to_owned(), "https://example.com/dune.jpg".to_owned())]);
+}

@@ -424,6 +424,12 @@ interface RocheDao {
 
     @Query("DELETE FROM entries WHERE id = :id") suspend fun deleteRawEntryById(id: String)
 
+    @Query(
+        "UPDATE entries SET mergedIntoId = :canonId, updatedAt = :updatedAt " +
+            "WHERE mergedIntoId = :dupId AND id != :canonId"
+    )
+    suspend fun repointMergedIntoEntries(dupId: String, canonId: String, updatedAt: String)
+
     @Query("UPDATE entries SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
     suspend fun clearEntryDirtyIfSameHlc(id: String, expectedHlc: String)
 
@@ -821,6 +827,12 @@ interface RocheDao {
 
     @Query("DELETE FROM collection_specs WHERE collectionId = :collectionId")
     suspend fun deleteCollectionSpec(collectionId: String)
+
+    @Query(
+        "DELETE FROM collection_specs " +
+            "WHERE collectionId = :dupId AND mode = 'manual' AND role IN ('list', 'want')"
+    )
+    suspend fun deleteManualCollectionSpec(dupId: String)
 
     @Query("SELECT * FROM collection_entries")
     suspend fun getAllCollectionEntries(): List<CollectionEntryEntity>

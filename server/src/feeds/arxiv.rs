@@ -39,11 +39,14 @@ impl ArxivParser {
             .into_iter()
             .map(|entry| {
                 let published_at = extract_entry_timestamp(&entry);
-                let abstract_url = select_entry_link(&entry.links).or_else(|| {
-                    Self::extract_arxiv_id(&entry.id).and_then(|id| {
-                        parse_public_url(&format!("https://arxiv.org/abs/{id}")).ok()
-                    })
-                });
+                let abstract_url = select_entry_link(&entry.links)
+                    .map(|url| media_urls::canonical_arxiv_abstract_url(&url).unwrap_or(url))
+                    .or_else(|| {
+                        Self::extract_arxiv_id(&entry.id).and_then(|id| {
+                            let versionless = media_urls::strip_arxiv_version(&id);
+                            parse_public_url(&format!("https://arxiv.org/abs/{versionless}")).ok()
+                        })
+                    });
                 let title = entry.title.map_or_default(|t| t.content);
 
                 let authors: Vec<String> = entry
@@ -131,8 +134,43 @@ mod tests {
         assert_eq!(feed.items[0].title, "Attention Is All You Need");
         assert_eq!(
             feed.items[0].abstract_url.as_ref().map(Url::as_str),
-            Some("http://arxiv.org/abs/2301.07041")
+            Some("https://arxiv.org/abs/2301.07041")
         );
         assert_eq!(feed.items[0].authors, vec!["Vaswani, Ashish"]);
+    }
+
+    #[test]
+    fn test_parse_arxiv_feed_canonicalizes_http_and_version_suffix() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                 xmlns="http://purl.org/rss/1.0/"
+                 xmlns:dc="http://purl.org/dc/elements/1.1/">
+         <channel rdf:about="http://arxiv.org/rss/cs.LG">
+          <title>cs.LG updates on arXiv.org</title>
+          <link>http://arxiv.org/rss/cs.LG</link>
+          <description>arXiv cs.LG updates</description>
+         </channel>
+         <item rdf:about="http://arxiv.org/abs/2603.11842v1">
+          <title>Speculative Decoding</title>
+          <link>http://arxiv.org/abs/2603.11842v1</link>
+          <description>Abstract</description>
+         </item>
+         <item rdf:about="http://arxiv.org/abs/hep-th/9901001v2">
+          <title>Classic Paper</title>
+          <link>http://arxiv.org/abs/hep-th/9901001v2</link>
+          <description>Abstract</description>
+         </item>
+        </rdf:RDF>"#;
+
+        let feed = ArxivParser::parse(xml).unwrap();
+        assert_eq!(feed.items.len(), 2);
+        assert_eq!(
+            feed.items[0].abstract_url.as_ref().map(Url::as_str),
+            Some("https://arxiv.org/abs/2603.11842")
+        );
+        assert_eq!(
+            feed.items[1].abstract_url.as_ref().map(Url::as_str),
+            Some("https://arxiv.org/abs/hep-th/9901001")
+        );
     }
 }

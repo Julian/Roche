@@ -8,6 +8,7 @@ import com.grayvines.roche.core.deterministicTagId
 import com.grayvines.roche.core.isLocalPollNewer
 import com.grayvines.roche.core.normalizeConsecutiveFailures
 import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.core.nowUtcIso
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
@@ -27,7 +28,6 @@ import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
-import java.time.Instant
 
 internal fun groupSortedTagNamesByItemId(
     tags: List<TagRow>,
@@ -307,7 +307,7 @@ internal fun createSavedItemEntity(
         isFavorite = false,
         isCachedOffline = false,
         publishedAt = null,
-        createdAt = Instant.now().toString(),
+        createdAt = nowUtcIso(),
         readProgress = 0.0,
         thumbnailMediaId = null,
         duration = null,

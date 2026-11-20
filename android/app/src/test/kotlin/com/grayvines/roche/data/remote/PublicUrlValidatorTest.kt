@@ -94,8 +94,13 @@ class PublicUrlValidatorTest {
             PublicUrlValidator.ensureResolvedServerTarget(
                 rawUrl = "http://100.64.0.9:8080/health",
                 resolveAddresses = { arrayOf(InetAddress.getByName("100.64.0.9")) },
-                isCleartextPermitted = { false },
             )
+        }
+        assertThrows(IOException::class.java) {
+            PublicUrlValidator.ensurePublicUrlSyntax("https://user@bad_host/feed.xml")
+        }
+        assertThrows(IOException::class.java) {
+            PublicUrlValidator.ensureSafeServerEndpoint("https://user@bad_host/health") { true }
         }
         assertEquals(
             "https://export.arxiv.org/rss/cs.LG",

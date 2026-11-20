@@ -69,21 +69,20 @@ internal object PublicUrlValidator {
     fun ensureResolvedServerTarget(
         rawUrl: String,
         resolveAddresses: (String) -> Array<InetAddress> = InetAddress::getAllByName,
-        isCleartextPermitted: (String) -> Boolean = ::isCleartextAllowed,
     ) {
         val uri = parseHttpUriOrThrow(rawUrl)
         val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return
         val asciiHost = extractAsciiHostOrThrow(uri)
         if (isLoopbackHost(asciiHost)) return
         val lookupHost = asciiHost.trim('[', ']')
-        checkCleartextServerPolicy(scheme, asciiHost, lookupHost, isCleartextPermitted)
+        checkCleartextServerPolicy(scheme, asciiHost)
         val resolved = runCatching {
             resolveAddresses(lookupHost)
         }
             .getOrElse { err ->
                 throw IOException("Failed to resolve server host: $asciiHost", err)
             }
-        val addrViolation = serverAddrViolation(scheme, asciiHost, resolved)
+        val addrViolation = serverAddrViolation(asciiHost, resolved)
         if (addrViolation != null) {
             throw IOException(addrViolation)
         }
@@ -136,11 +135,8 @@ internal fun serverEndpointViolation(
 internal fun checkCleartextServerPolicy(
     scheme: String,
     asciiHost: String,
-    lookupHost: String,
-    isCleartextPermitted: (String) -> Boolean,
 ) {
-    if (scheme != SCHEME_HTTP) return
-    if (!isLoopbackHost(asciiHost) || !isCleartextPermitted(lookupHost)) {
+    if (scheme != SCHEME_HTTPS) {
         throw IOException(
             "HTTPS required for $asciiHost; run 'roche serve' and tap Discover on Tailnet"
         )
@@ -148,13 +144,12 @@ internal fun checkCleartextServerPolicy(
 }
 
 internal fun serverAddrViolation(
-    scheme: String,
     asciiHost: String,
     resolved: Array<InetAddress>,
 ): String? =
     when {
         resolved.isEmpty() -> "Server host $asciiHost resolved to no addresses"
-        scheme == SCHEME_HTTP || asciiHost == "roche" ->
+        asciiHost == "roche" ->
             if (resolved.any { !isTailscaleInetAddress(it) }) {
                 "Server host $asciiHost did not resolve to a Tailscale IP"
             } else {
@@ -192,7 +187,7 @@ private fun validateHttpUriInvariants(uri: URI) {
     if (scheme != SCHEME_HTTP && scheme != SCHEME_HTTPS) {
         throw IOException("URL must use http:// or https://")
     }
-    if (uri.rawUserInfo != null) {
+    if (uri.rawUserInfo != null || uri.rawAuthority?.contains('@') == true) {
         throw IOException("URL must not contain embedded credentials")
     }
 }
@@ -225,8 +220,7 @@ internal fun extractAsciiHostOrThrow(uri: URI): String {
 
 internal fun extractPortOrThrow(uri: URI): Int {
     if (uri.host != null) return uri.port
-    val authority = uri.rawAuthority?.trim().orEmpty()
-    val hostAndPort = authority.substringAfterLast('@')
+    val hostAndPort = uri.rawAuthority?.trim().orEmpty()
     val portPart =
         when {
             hostAndPort.startsWith("[") -> hostAndPort.substringAfter(']', "").removePrefix(":")

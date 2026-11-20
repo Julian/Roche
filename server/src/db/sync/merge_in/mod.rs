@@ -24,11 +24,18 @@ pub(super) struct MergeContext<'a> {
     pub now: DateTime<Utc>,
     pub id_resolver: IdResolver,
     pub tag_index: TagIndex,
+    pub deferred_entry_deletes: Vec<(String, String)>,
 }
 
 impl<'a> MergeContext<'a> {
     pub fn new(peer_id: &'a str, now: DateTime<Utc>) -> Self {
-        Self { peer_id, now, id_resolver: IdResolver::default(), tag_index: TagIndex::default() }
+        Self {
+            peer_id,
+            now,
+            id_resolver: IdResolver::default(),
+            tag_index: TagIndex::default(),
+            deferred_entry_deletes: Vec::new(),
+        }
     }
 }
 
@@ -279,7 +286,7 @@ impl SyncRepo<'_> {
 
         let mut ctx = MergeContext::new(safe_peer, now);
 
-        Self::apply_incoming_tombstones(&mut tx, &req.tombstones, &mut ctx).await?;
+        Self::apply_incoming_entry_tombstones(&mut tx, &req.tombstones, &mut ctx).await?;
 
         let inserted_candidates = Self::merge_incoming_entries_in_tx(
             &mut tx,
@@ -288,6 +295,8 @@ impl SyncRepo<'_> {
             &mut ctx,
         )
         .await?;
+
+        Self::apply_incoming_graph_tombstones(&mut tx, &req.tombstones, &mut ctx).await?;
 
         if !req.collection_entries.is_empty() {
             Self::merge_incoming_collection_entries_in_tx(&mut tx, &req.collection_entries, &ctx)

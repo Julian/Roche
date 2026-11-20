@@ -62,13 +62,7 @@ pub const WANT_TO_READ_COLLECTION_ID: &str = "2ef71101-a716-5331-9515-cb7b5ce8b3
 
 #[must_use]
 pub fn is_protected_system_collection_id(id: &str) -> bool {
-    matches!(
-        id.trim(),
-        STARRED_COLLECTION_ID
-            | UP_NEXT_COLLECTION_ID
-            | WANT_TO_READ_COLLECTION_ID
-            | "9eb44de7-bdfb-5bea-85d1-be913c542d8b"
-    )
+    matches!(id.trim(), STARRED_COLLECTION_ID | UP_NEXT_COLLECTION_ID | WANT_TO_READ_COLLECTION_ID)
 }
 
 #[must_use]

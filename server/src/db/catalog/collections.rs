@@ -719,11 +719,7 @@ impl CatalogRepo<'_> {
                     Ok(rows
                         .into_iter()
                         .filter_map(|(id, creators_json)| {
-                            let creators: Vec<String> =
-                                serde_json::from_str(&creators_json).unwrap_or_default();
-                            creators
-                                .iter()
-                                .any(|c| c.to_lowercase().contains(&lower_needle))
+                            creators_json_matches_needle(&creators_json, &lower_needle)
                                 .then_some(id)
                         })
                         .collect())
@@ -790,11 +786,8 @@ impl CatalogRepo<'_> {
                     rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 {
                     let lower_needle = creator_needle.to_lowercase();
-                    fetched.retain(|r| {
-                        let creators: Vec<String> =
-                            serde_json::from_str(&r.creators_json).unwrap_or_default();
-                        creators.iter().any(|c| c.to_lowercase().contains(&lower_needle))
-                    });
+                    fetched
+                        .retain(|r| creators_json_matches_needle(&r.creators_json, &lower_needle));
                 }
                 fetched
             }
@@ -856,23 +849,8 @@ impl CatalogRepo<'_> {
                     let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
                         continue;
                     };
-                    let mut qb = QueryBuilder::<Sqlite>::new(
-                        "SELECT e.title, e.thumbnail_url
-                         FROM entries e
-                         WHERE e.merged_into_id IS NULL
-                           AND e.kind != 'collection'
-                           AND e.thumbnail_url IS NOT NULL
-                           AND TRIM(e.thumbnail_url) != ''",
-                    );
-                    append_dynamic_rule_sql_filters(&mut qb, &rule);
-                    qb.push(
-                        " ORDER BY COALESCE(
-                            (SELECT MAX(cl.ts) FROM consumption_log cl WHERE cl.entry_id = e.id),
-                            e.updated_at
-                          ) DESC, e.title ASC LIMIT ",
-                    )
-                    .push_bind(limit_i64);
-                    qb.build_query_as().fetch_all(self.pool).await?
+                    self.load_dynamic_preview_thumbnails(&rule, per_collection_limit, limit_i64)
+                        .await?
                 }
             };
             if !rows.is_empty() {
@@ -881,6 +859,67 @@ impl CatalogRepo<'_> {
         }
         Ok(out)
     }
+
+    async fn load_dynamic_preview_thumbnails(
+        &self,
+        rule: &DynamicCollectionRule,
+        per_collection_limit: usize,
+        limit_i64: i64,
+    ) -> CatalogResult<Vec<(String, String)>> {
+        if let Some(creator_needle) =
+            rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            let lower_needle = creator_needle.to_lowercase();
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT e.title, e.thumbnail_url, e.creators_json
+                 FROM entries e
+                 WHERE e.merged_into_id IS NULL
+                   AND e.kind != 'collection'
+                   AND e.thumbnail_url IS NOT NULL
+                   AND TRIM(e.thumbnail_url) != ''",
+            );
+            append_dynamic_rule_sql_filters(&mut qb, rule);
+            qb.push(
+                " ORDER BY COALESCE(
+                    (SELECT MAX(cl.ts) FROM consumption_log cl WHERE cl.entry_id = e.id),
+                    e.updated_at
+                  ) DESC, e.title ASC",
+            );
+            let candidates: Vec<(String, String, String)> =
+                qb.build_query_as().fetch_all(self.pool).await?;
+            return Ok(candidates
+                .into_iter()
+                .filter(|(_, _, creators_json)| {
+                    creators_json_matches_needle(creators_json, &lower_needle)
+                })
+                .take(per_collection_limit)
+                .map(|(title, thumb, _)| (title, thumb))
+                .collect());
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT e.title, e.thumbnail_url
+             FROM entries e
+             WHERE e.merged_into_id IS NULL
+               AND e.kind != 'collection'
+               AND e.thumbnail_url IS NOT NULL
+               AND TRIM(e.thumbnail_url) != ''",
+        );
+        append_dynamic_rule_sql_filters(&mut qb, rule);
+        qb.push(
+            " ORDER BY COALESCE(
+                (SELECT MAX(cl.ts) FROM consumption_log cl WHERE cl.entry_id = e.id),
+                e.updated_at
+              ) DESC, e.title ASC LIMIT ",
+        )
+        .push_bind(limit_i64);
+        Ok(qb.build_query_as().fetch_all(self.pool).await?)
+    }
+}
+
+fn creators_json_matches_needle(creators_json: &str, lower_needle: &str) -> bool {
+    let creators: Vec<String> = serde_json::from_str(creators_json).unwrap_or_default();
+    creators.iter().any(|c| c.to_lowercase().contains(lower_needle))
 }
 
 fn with_want_notes(base: Option<serde_json::Value>, note_text: &str) -> serde_json::Value {

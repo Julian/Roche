@@ -22,6 +22,7 @@ object EpRankingEngine {
 
     private const val ZERO_MEAN_SNAP: Double = 1e-12
     private const val DEFAULT_MAX_ITER: Int = 100
+    private val MACHINE_EPSILON: Double = Math.ulp(1.0)
 
     data class Score(
         val mean: Double = 0.0,
@@ -210,7 +211,7 @@ object EpRankingEngine {
     fun confusability(a: Score, b: Score): Double {
         val diffVar = a.variance + b.variance
         if (diffVar <= 0.0) {
-            return if (abs(a.mean - b.mean) <= Double.MIN_VALUE) 0.5 else 0.0
+            return if (abs(a.mean - b.mean) <= MACHINE_EPSILON) 0.5 else 0.0
         }
         val z = abs(a.mean - b.mean) / sqrt(diffVar)
         return 0.5 * EpGaussianMath.codyErfc(z / EpGaussianMath.SQRT2)
