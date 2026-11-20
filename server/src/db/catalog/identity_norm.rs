@@ -92,6 +92,12 @@ pub fn external_identifier_label(scheme: &str) -> &str {
         "qobuz" => "Qobuz",
         "amazon_music" => "Amazon Music",
         "bandcamp" => "Bandcamp",
+        "rym" => "RYM",
+        "letterboxd" => "Letterboxd",
+        "steam" => "Steam",
+        "doi" => "DOI",
+        "wikidata" => "Wikidata",
+        "youtube" => "YouTube",
         "url" => "Web",
         "feed_url" => "Feed",
         other => other,
@@ -100,53 +106,227 @@ pub fn external_identifier_label(scheme: &str) -> &str {
 
 fn is_http_url(v: &str) -> bool {
     let lower = v.to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
+    (lower.starts_with("http://") && v.len() > "http://".len())
+        || (lower.starts_with("https://") && v.len() > "https://".len())
+}
+
+fn is_disallowed_uri_scheme(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
+    lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("file:")
+        || lower.starts_with("ftp:")
 }
 
 fn direct_or_prefixed_url(prefix: &str, v: &str) -> String {
     if is_http_url(v) { v.to_owned() } else { format!("{prefix}{v}") }
 }
 
+fn strip_youtube_playlist_prefix(id: &str) -> &str {
+    if id.starts_with("VLOLAK5uy_") || id.starts_with("VLPL") { &id[2..] } else { id }
+}
+
+fn sanitize_youtube_music_token(raw: &str) -> String {
+    let valid = raw
+        .trim()
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | '?'))
+        .map(|part| strip_youtube_playlist_prefix(part.trim()))
+        .find(|token| {
+            !token.is_empty()
+                && token.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                && (token.starts_with("MPREb")
+                    || (token.starts_with("OLAK5uy_") && token.len() > 8)
+                    || (token.starts_with("PL") && token.len() > 2))
+        });
+    valid.map_or_else(
+        || {
+            let head = raw.trim().split(&['&', '?'][..]).next().unwrap_or("").trim();
+            strip_youtube_playlist_prefix(head).to_owned()
+        },
+        str::to_owned,
+    )
+}
+
 fn format_youtube_music_url(v: &str) -> String {
     if is_http_url(v) {
+        if let Ok(parsed) = url::Url::parse(v) {
+            let browse_seg = parsed
+                .path()
+                .split_once("/browse/")
+                .map(|(_, rest)| sanitize_youtube_music_token(rest.trim_matches('/')))
+                .filter(|s| !s.is_empty());
+            let list_param = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "list")
+                .map(|(_, val)| sanitize_youtube_music_token(&val))
+                .filter(|s| !s.is_empty());
+            if let Some(ref seg) = browse_seg
+                && seg.starts_with("MPREb")
+            {
+                return format!("https://music.youtube.com/browse/{seg}");
+            }
+            if let Some(list) = list_param {
+                return format!("https://music.youtube.com/playlist?list={list}");
+            }
+            if let Some(seg) = browse_seg {
+                return format!("https://music.youtube.com/playlist?list={seg}");
+            }
+        }
         return v.to_owned();
     }
-    let stripped = if v.starts_with("VLOLAK5uy_") || v.starts_with("VLPL") { &v[2..] } else { v };
-    if stripped.starts_with("MPREb") {
-        format!("https://music.youtube.com/browse/{stripped}")
+    let normalized = sanitize_youtube_music_token(v);
+    if normalized.starts_with("MPREb") {
+        format!("https://music.youtube.com/browse/{normalized}")
     } else {
-        format!("https://music.youtube.com/playlist?list={stripped}")
+        format!("https://music.youtube.com/playlist?list={normalized}")
     }
+}
+
+fn extract_spotify_web_entity_and_id(raw: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host_ok = parsed.host_str().is_some_and(|h| {
+        h.eq_ignore_ascii_case("open.spotify.com") || h.eq_ignore_ascii_case("play.spotify.com")
+    });
+    if !host_ok {
+        return None;
+    }
+    let segments: Vec<&str> =
+        parsed.path_segments().map_or_default(|it| it.filter(|s| !s.is_empty()).collect());
+    if segments.len() < 2 {
+        return None;
+    }
+    let entity = segments[segments.len() - 2].to_ascii_lowercase();
+    let ident = segments[segments.len() - 1];
+    (matches!(entity.as_str(), "album" | "track" | "artist" | "episode" | "show" | "playlist")
+        && !ident.is_empty())
+    .then(|| (entity, ident.to_owned()))
+}
+
+const fn spotify_default_entity_for_kind(kind: Option<EntryKind>) -> &'static str {
+    match kind {
+        Some(EntryKind::Song) => "track",
+        Some(EntryKind::Artist) => "artist",
+        Some(EntryKind::Podcast) => "show",
+        Some(EntryKind::PodcastEpisode) => "episode",
+        Some(EntryKind::Collection) => "playlist",
+        _ => "album",
+    }
+}
+
+const fn tmdb_prefix_for_kind(kind: Option<EntryKind>) -> Option<&'static str> {
+    match kind {
+        Some(EntryKind::Tv) => Some("https://www.themoviedb.org/tv/"),
+        Some(EntryKind::Artist) => Some("https://www.themoviedb.org/person/"),
+        Some(EntryKind::Movie) | None => Some("https://www.themoviedb.org/movie/"),
+        _ => None,
+    }
+}
+
+const fn musicbrainz_prefix_for_kind(kind: Option<EntryKind>) -> Option<&'static str> {
+    match kind {
+        Some(EntryKind::Artist) => Some("https://musicbrainz.org/artist/"),
+        Some(EntryKind::Song) => Some("https://musicbrainz.org/recording/"),
+        Some(EntryKind::Album) | None => Some("https://musicbrainz.org/release/"),
+        _ => None,
+    }
+}
+
+fn format_spotify_external_url(v: &str, kind: Option<EntryKind>) -> Option<String> {
+    if let Some(rest) = v.strip_prefix("spotify:") {
+        let parts: Vec<&str> = rest.split(':').filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 4
+            && parts[0].eq_ignore_ascii_case("user")
+            && parts[2].eq_ignore_ascii_case("playlist")
+        {
+            return Some(format!("https://open.spotify.com/playlist/{}", parts[3]));
+        }
+        return (parts.len() >= 2).then(|| {
+            format!("https://open.spotify.com/{}/{}", parts[0].to_ascii_lowercase(), parts[1])
+        });
+    }
+    if let Some((entity, id)) = extract_spotify_web_entity_and_id(v) {
+        return Some(format!("https://open.spotify.com/{entity}/{id}"));
+    }
+    if is_http_url(v) {
+        return Some(v.to_owned());
+    }
+    if v.contains(':') || v.contains('/') || v.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("https://open.spotify.com/{}/{v}", spotify_default_entity_for_kind(kind)))
+}
+
+fn format_youtube_external_url(v: &str) -> String {
+    if is_http_url(v) {
+        v.to_owned()
+    } else if crate::util::media_urls::is_valid_youtube_channel_id(v) {
+        format!("https://www.youtube.com/channel/{v}")
+    } else {
+        format!("https://www.youtube.com/watch?v={v}")
+    }
+}
+
+fn format_doi_external_url(v: &str) -> Option<String> {
+    if is_http_url(v) {
+        return Some(v.to_owned());
+    }
+    let clean = v
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("doi:"))
+        .map_or(v, |_| &v[4..])
+        .trim();
+    (!clean.is_empty()).then(|| format!("https://doi.org/{clean}"))
+}
+
+fn prefixed_external_url(scheme: &str, v: &str, kind: Option<EntryKind>) -> Option<String> {
+    let prefix = match scheme {
+        "tmdb_movie" => "https://www.themoviedb.org/movie/",
+        "tmdb_tv" => "https://www.themoviedb.org/tv/",
+        "tmdb" => tmdb_prefix_for_kind(kind)?,
+        "letterboxd" => "https://letterboxd.com/film/",
+        "isbn" => "https://openlibrary.org/isbn/",
+        "openlibrary" => "https://openlibrary.org/works/",
+        "goodreads" => "https://www.goodreads.com/book/show/",
+        "steam" => "https://store.steampowered.com/app/",
+        "igdb" => "https://www.igdb.com/games/",
+        "discogs" => "https://www.discogs.com/release/",
+        "arxiv" => "https://arxiv.org/abs/",
+        "wikidata" => "https://www.wikidata.org/wiki/",
+        "musicbrainz_release" => "https://musicbrainz.org/release/",
+        "musicbrainz_artist" => "https://musicbrainz.org/artist/",
+        "musicbrainz_recording" => "https://musicbrainz.org/recording/",
+        "musicbrainz" => musicbrainz_prefix_for_kind(kind)?,
+        "apple_music" => "https://music.apple.com/album/",
+        "tidal" => "https://tidal.com/browse/album/",
+        "deezer" => "https://www.deezer.com/album/",
+        "qobuz" => "https://open.qobuz.com/album/",
+        "amazon_music" => "https://music.amazon.com/albums/",
+        _ => return None,
+    };
+    Some(direct_or_prefixed_url(prefix, v))
 }
 
 #[must_use]
 pub fn external_identifier_url(scheme: &str, value: &str) -> Option<String> {
+    external_identifier_url_for_kind(scheme, value, None)
+}
+
+#[must_use]
+pub fn external_identifier_url_for_kind(
+    scheme: &str,
+    value: &str,
+    kind: Option<EntryKind>,
+) -> Option<String> {
     let v = value.trim();
-    if v.is_empty() {
+    if v.is_empty() || is_disallowed_uri_scheme(v) {
         return None;
     }
-    match scheme {
-        "spotify" => {
-            if let Some(rest) = v.strip_prefix("spotify:") {
-                let parts: Vec<&str> = rest.split(':').filter(|s| !s.is_empty()).collect();
-                if parts.len() >= 4
-                    && parts[0].eq_ignore_ascii_case("user")
-                    && parts[2].eq_ignore_ascii_case("playlist")
-                {
-                    return Some(format!("https://open.spotify.com/playlist/{}", parts[3]));
-                }
-                if parts.len() >= 2 {
-                    return Some(format!(
-                        "https://open.spotify.com/{}/{}",
-                        parts[0].to_ascii_lowercase(),
-                        parts[1]
-                    ));
-                }
-                None
-            } else {
-                Some(direct_or_prefixed_url("https://open.spotify.com/album/", v))
-            }
-        }
+    let norm_scheme = normalize_identifier_scheme(scheme);
+    match norm_scheme.as_str() {
+        "spotify" => format_spotify_external_url(v, kind),
+        "youtube_music" => Some(format_youtube_music_url(v)),
+        "youtube" => Some(format_youtube_external_url(v)),
         "imdb" => {
             if is_http_url(v) {
                 Some(v.to_owned())
@@ -154,13 +334,6 @@ pub fn external_identifier_url(scheme: &str, value: &str) -> Option<String> {
                 Some(format!("https://www.imdb.com/title/{v}/"))
             }
         }
-        "tmdb_movie" => Some(direct_or_prefixed_url("https://www.themoviedb.org/movie/", v)),
-        "tmdb_tv" => Some(direct_or_prefixed_url("https://www.themoviedb.org/tv/", v)),
-        "isbn" => Some(direct_or_prefixed_url("https://openlibrary.org/isbn/", v)),
-        "openlibrary" => Some(direct_or_prefixed_url("https://openlibrary.org/works/", v)),
-        "goodreads" => Some(direct_or_prefixed_url("https://www.goodreads.com/book/show/", v)),
-        "igdb" => Some(direct_or_prefixed_url("https://www.igdb.com/games/", v)),
-        "discogs" => Some(direct_or_prefixed_url("https://www.discogs.com/release/", v)),
         "wikipedia" => {
             if is_http_url(v) {
                 Some(v.to_owned())
@@ -169,22 +342,9 @@ pub fn external_identifier_url(scheme: &str, value: &str) -> Option<String> {
                 Some(format!("https://en.wikipedia.org/wiki/{encoded}"))
             }
         }
-        "arxiv" => Some(direct_or_prefixed_url("https://arxiv.org/abs/", v)),
-        "musicbrainz_release" => {
-            Some(direct_or_prefixed_url("https://musicbrainz.org/release/", v))
-        }
-        "musicbrainz_artist" => Some(direct_or_prefixed_url("https://musicbrainz.org/artist/", v)),
-        "musicbrainz_recording" => {
-            Some(direct_or_prefixed_url("https://musicbrainz.org/recording/", v))
-        }
-        "apple_music" => Some(direct_or_prefixed_url("https://music.apple.com/album/", v)),
-        "tidal" => Some(direct_or_prefixed_url("https://tidal.com/browse/album/", v)),
-        "deezer" => Some(direct_or_prefixed_url("https://www.deezer.com/album/", v)),
-        "qobuz" => Some(direct_or_prefixed_url("https://open.qobuz.com/album/", v)),
-        "amazon_music" => Some(direct_or_prefixed_url("https://music.amazon.com/albums/", v)),
-        "youtube_music" => Some(format_youtube_music_url(v)),
-        "url" | "feed_url" if is_http_url(v) => Some(v.to_owned()),
-        _ => None,
+        "doi" => format_doi_external_url(v),
+        "bandcamp" | "rym" | "url" | "feed_url" => is_http_url(v).then(|| v.to_owned()),
+        other => prefixed_external_url(other, v, kind),
     }
 }
 
@@ -227,24 +387,8 @@ pub(super) fn normalize_spotify_identifier(kind: EntryKind, raw: &str) -> String
         }
         return raw.to_owned();
     }
-    if let Ok(parsed) = url::Url::parse(raw)
-        && parsed.host_str().is_some_and(|h| {
-            h.eq_ignore_ascii_case("open.spotify.com") || h.eq_ignore_ascii_case("play.spotify.com")
-        })
-    {
-        let segments: Vec<&str> =
-            parsed.path_segments().map_or_default(|it| it.filter(|s| !s.is_empty()).collect());
-        if segments.len() >= 2 {
-            let entity = segments[segments.len() - 2].to_ascii_lowercase();
-            let ident = segments[segments.len() - 1];
-            if matches!(
-                entity.as_str(),
-                "album" | "track" | "artist" | "episode" | "show" | "playlist"
-            ) && !ident.is_empty()
-            {
-                return format!("spotify:{entity}:{ident}");
-            }
-        }
+    if let Some((entity, ident)) = extract_spotify_web_entity_and_id(raw) {
+        return format!("spotify:{entity}:{ident}");
     }
     let spotify_entity = match kind {
         EntryKind::Album => Some("album"),

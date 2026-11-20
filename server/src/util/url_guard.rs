@@ -121,6 +121,9 @@ pub fn is_local_or_tailnet_domain(normalized_domain: &str) -> bool {
 /// CGNAT, ULA, NAT64, Teredo, 6to4, documentation, and IPv4-mapped/compatible private targets).
 #[must_use]
 pub fn is_global_ip(ip: IpAddr) -> bool {
+    if ip.is_multicast() {
+        return false;
+    }
     if let IpAddr::V6(v6) = ip {
         if let Some(v4) = v6.to_ipv4_mapped() {
             return is_global_ip(IpAddr::V4(v4));
@@ -131,6 +134,7 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
         // SIIT IPv4-translated (::ffff:0:0/96)
         // Discard-Only (100::/64)
         // Teredo (2001:0000::/32)
+        // Benchmarking (2001:0002::/48)
         // ORCHIDv2 (2001:20::/28)
         // Documentation (2001:db8::/32)
         // 6to4 (2002::/16) — can embed private/loopback IPv4 addresses
@@ -140,6 +144,7 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
             || s[0..6] == [0, 0, 0, 0, 0xffff, 0]
             || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
             || (s[0] == 0x2001 && s[1] == 0x0000)
+            || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0)
             || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
             || (s[0] == 0x2001 && s[1] == 0x0db8)
             || s[0] == 0x2002

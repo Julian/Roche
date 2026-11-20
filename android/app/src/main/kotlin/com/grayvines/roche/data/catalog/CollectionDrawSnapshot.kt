@@ -6,9 +6,9 @@ import com.grayvines.roche.core.SCHEME_DEEZER
 import com.grayvines.roche.core.SCHEME_QOBUZ
 import com.grayvines.roche.core.SCHEME_SPOTIFY
 import com.grayvines.roche.core.SCHEME_TIDAL
+import com.grayvines.roche.core.SCHEME_YOUTUBE_MUSIC
 import com.grayvines.roche.core.YT_MUSIC_BROWSE_PREFIX
 import com.grayvines.roche.core.YT_MUSIC_ORIGIN
-import com.grayvines.roche.core.buildYoutubeMusicAlbumUrl
 import com.grayvines.roche.core.encodeQueryValue
 import com.grayvines.roche.core.externalIdentifierUrl
 import com.grayvines.roche.core.sanitizeHttpUrl
@@ -55,7 +55,8 @@ data class CollectionDrawSnapshot(
             return if (cleanId == null) {
                 youtubeMusicSearchUrl
             } else {
-                buildYoutubeMusicAlbumUrl(cleanId)
+                externalIdentifierUrl(SCHEME_YOUTUBE_MUSIC, cleanId, kind.wireValue)
+                    ?: youtubeMusicSearchUrl
             }
         }
 
@@ -72,15 +73,16 @@ internal val CollectionDrawSnapshot.hasYoutubeAlbumBrowseId: Boolean
             youtubeMusicUrl.startsWith("$YT_MUSIC_ORIGIN/browse/$YT_MUSIC_BROWSE_PREFIX")
 
 internal fun CollectionDrawSnapshot.candidateStreamingUrls(): List<String> = buildList {
+    val entryKind = kind.wireValue
     if (!youtubeMusicId.isNullOrBlank()) {
         add(youtubeMusicUrl)
     }
-    spotifyId?.let { externalIdentifierUrl(SCHEME_SPOTIFY, it)?.let(::add) }
-    appleMusicId?.let { externalIdentifierUrl(SCHEME_APPLE_MUSIC, it)?.let(::add) }
+    spotifyId?.let { externalIdentifierUrl(SCHEME_SPOTIFY, it, entryKind)?.let(::add) }
+    appleMusicId?.let { externalIdentifierUrl(SCHEME_APPLE_MUSIC, it, entryKind)?.let(::add) }
     addTidalCandidateUrls(tidalId)
-    qobuzId?.let { externalIdentifierUrl(SCHEME_QOBUZ, it)?.let(::add) }
-    deezerId?.let { externalIdentifierUrl(SCHEME_DEEZER, it)?.let(::add) }
-    amazonMusicId?.let { externalIdentifierUrl(SCHEME_AMAZON_MUSIC, it)?.let(::add) }
+    qobuzId?.let { externalIdentifierUrl(SCHEME_QOBUZ, it, entryKind)?.let(::add) }
+    deezerId?.let { externalIdentifierUrl(SCHEME_DEEZER, it, entryKind)?.let(::add) }
+    amazonMusicId?.let { externalIdentifierUrl(SCHEME_AMAZON_MUSIC, it, entryKind)?.let(::add) }
 }
     .distinct()
 

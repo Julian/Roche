@@ -699,7 +699,7 @@ private suspend fun reconcileSingleGeneratorInDao(
         base = base.copy(currentEntryId = activeId)
     }
     if (allowLocalAutoAdvance) {
-        if (!activeId.isNullOrBlank() && dao.countTerminalLogsForEntry(activeId) > 0) {
+        if (!activeId.isNullOrBlank() && !isDrawnEntryStillEligible(dao, colId, activeId)) {
             val hlc = nextLocalHlc(dao, localPeerId)
             base =
                 base.copy(
@@ -726,6 +726,17 @@ private suspend fun reconcileSingleGeneratorInDao(
         }
     }
     return base
+}
+
+private suspend fun isDrawnEntryStillEligible(
+    dao: RocheDao,
+    colId: String,
+    entryId: String,
+): Boolean {
+    val entry = dao.getEntryById(entryId) ?: return false
+    val isLive = entry.mergedIntoId.isNullOrBlank()
+    val inPool = dao.getCollectionEntry(colId, entryId) != null
+    return isLive && inPool && dao.countTerminalLogsForEntry(entryId) == 0
 }
 
 @Suppress("LongParameterList")

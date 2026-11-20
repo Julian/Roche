@@ -26,6 +26,7 @@ import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
+import com.grayvines.roche.ranking.RankBoardState
 import com.grayvines.roche.reader.ArticleBlock
 import com.grayvines.roche.reader.extractPlainTextHeadings
 import java.io.File

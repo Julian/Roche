@@ -84,6 +84,9 @@ const REJECTED_DISAMBIG_WORDS: &[&str] = &[
     "asteroid",
     "painting",
     "disambiguation",
+    "footballer",
+    "politician",
+    "municipality",
 ];
 
 const MUSIC_BIO_WORDS: &[&str] = &[
@@ -554,6 +557,9 @@ pub fn select_best_artist_wikipedia_slug(
     artist_name: &str,
     child_titles: &[String],
 ) -> Option<String> {
+    if artist_name.trim().eq_ignore_ascii_case("various artists") {
+        return None;
+    }
     let norm_artist = normalize_artist_tokens(artist_name);
     if norm_artist.is_empty() || hits.is_empty() {
         return None;
@@ -574,6 +580,28 @@ pub fn select_best_artist_wikipedia_slug(
         }
     }
     best_hit.map(|h| h.title.trim().replace(' ', "_")).filter(|slug| !slug.is_empty())
+}
+
+#[cfg(test)]
+#[must_use]
+pub fn score_artist_wikipedia_hit_for_artist(
+    hit: &WikipediaSearchHit,
+    artist_name: &str,
+    child_titles: &[String],
+) -> i32 {
+    if artist_name.trim().eq_ignore_ascii_case("various artists") {
+        return 0;
+    }
+    let norm_artist = normalize_artist_tokens(artist_name);
+    if norm_artist.is_empty() {
+        return 0;
+    }
+    let norm_children: Vec<String> = child_titles
+        .iter()
+        .map(|t| normalize_artist_tokens(&strip_album_edition_suffix(t)))
+        .filter(|t| t.len() >= 3)
+        .collect();
+    score_artist_wikipedia_hit(hit, &norm_artist, &norm_children)
 }
 
 fn score_artist_wikipedia_hit(
@@ -702,9 +730,13 @@ pub fn extract_spotify_artist_uri_from_album_html(
     artist_name: &str,
     allow_single_fallback: bool,
 ) -> Option<String> {
+    if artist_name.trim().eq_ignore_ascii_case("various artists") {
+        return None;
+    }
+    let cleaned_html = strip_script_and_style_blocks(html);
     let target_norm = normalize_artist_tokens(artist_name);
     if !target_norm.is_empty()
-        && let Some(id) = find_anchor_matching_artist_id(html, &target_norm)
+        && let Some(id) = find_anchor_matching_artist_id(&cleaned_html, &target_norm)
     {
         return Some(format!("spotify:artist:{id}"));
     }
@@ -715,7 +747,7 @@ pub fn extract_spotify_artist_uri_from_album_html(
 
     let mut unique_ids = HashSet::new();
     for marker in ["open.spotify.com/artist/", "href=\"/artist/", "href='/artist/"] {
-        let mut rest = html;
+        let mut rest = cleaned_html.as_str();
         while let Some(idx) = rest.find(marker) {
             rest = &rest[idx + marker.len()..];
             let token: String = rest.chars().take_while(char::is_ascii_alphanumeric).collect();
@@ -728,6 +760,49 @@ pub fn extract_spotify_artist_uri_from_album_html(
         }
     }
     unique_ids.into_iter().next().map(|id| format!("spotify:artist:{id}"))
+}
+
+fn strip_script_and_style_blocks(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut pos = 0;
+    while pos < html.len() {
+        let rest = &lower[pos..];
+        let found = match (rest.find("<script"), rest.find("<style")) {
+            (Some(script_off), Some(style_off)) => {
+                if script_off <= style_off {
+                    Some((pos + script_off, "<script", "</script>"))
+                } else {
+                    Some((pos + style_off, "<style", "</style>"))
+                }
+            }
+            (Some(script_off), None) => Some((pos + script_off, "<script", "</script>")),
+            (None, Some(style_off)) => Some((pos + style_off, "<style", "</style>")),
+            (None, None) => None,
+        };
+        let Some((tag_start, open_tag, close_tag)) = found else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let after_name = tag_start + open_tag.len();
+        let is_boundary = bytes
+            .get(after_name)
+            .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'));
+        if !is_boundary {
+            out.push_str(&html[pos..after_name]);
+            pos = after_name;
+            continue;
+        }
+        out.push_str(&html[pos..tag_start]);
+        let Some(rel_close) = lower[after_name..].find(close_tag) else {
+            out.push_str(&html[tag_start..]);
+            break;
+        };
+        out.push(' ');
+        pos = after_name + rel_close + close_tag.len();
+    }
+    out
 }
 
 fn find_anchor_matching_artist_id(html: &str, target_norm: &str) -> Option<String> {

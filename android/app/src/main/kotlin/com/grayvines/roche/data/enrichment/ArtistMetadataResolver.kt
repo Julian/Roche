@@ -53,26 +53,57 @@ internal fun selectBestArtistWikiSlug(
     hits: List<WikipediaSearchHit>,
     artistName: String,
     albumTitle: String = "",
+): String? =
+    selectBestArtistWikiSlug(
+        hits = hits,
+        artistName = artistName,
+        childTitles = if (albumTitle.isBlank()) emptyList() else listOf(albumTitle),
+    )
+
+internal fun selectBestArtistWikiSlug(
+    hits: List<WikipediaSearchHit>,
+    artistName: String,
+    childTitles: List<String>,
 ): String? {
-    if (artistName.trim().equals(VARIOUS_ARTISTS_NAME, ignoreCase = true)) return null
     val normArtist = normalizeArtistTokens(artistName)
-    if (normArtist.isEmpty() || hits.isEmpty()) return null
-    val normAlbum =
-        normalizeArtistTokens(stripAlbumEditionSuffix(albumTitle)).takeIf {
-            it.length >= MIN_CHILD_TITLE_LEN
-        }
-    val scored =
+    val ineligible =
+        artistName.trim().equals(VARIOUS_ARTISTS_NAME, ignoreCase = true) ||
+            normArtist.isEmpty() ||
+            hits.isEmpty()
+    if (ineligible) return null
+    val normChildren =
+        childTitles
+            .map { normalizeArtistTokens(stripAlbumEditionSuffix(it)) }
+            .filter { it.length >= MIN_CHILD_TITLE_LEN }
+    val best =
         hits
-            .map { hit -> hit to scoreArtistWikiHit(hit, normArtist, normAlbum) }
+            .map { hit -> hit to scoreArtistWikiHit(hit, normArtist, normChildren) }
             .filter { (_, score) -> score > 0 }
-    val best = scored.maxByOrNull { (_, score) -> score }?.first ?: return null
-    return best.title.trim().replace(' ', '_').takeIf(String::isNotEmpty)
+            .maxByOrNull { (_, score) -> score }
+            ?.first
+    return best?.title?.trim()?.replace(' ', '_')?.takeIf(String::isNotEmpty)
+}
+
+internal fun scoreArtistWikiCandidate(
+    hit: WikipediaSearchHit,
+    artistName: String,
+    childTitles: List<String> = emptyList(),
+): Int {
+    val normArtist = normalizeArtistTokens(artistName)
+    if (artistName.trim().equals(VARIOUS_ARTISTS_NAME, ignoreCase = true) || normArtist.isEmpty()) {
+        return 0
+    }
+    val normChildren =
+        childTitles
+            .map { normalizeArtistTokens(stripAlbumEditionSuffix(it)) }
+            .filter { it.length >= MIN_CHILD_TITLE_LEN }
+    return scoreArtistWikiHit(hit, normArtist, normChildren)
 }
 
 private fun scoreArtistWikiHit(
     hit: WikipediaSearchHit,
     normArtist: String,
-    normAlbum: String?,
+    normChildren: List<String>,
 ): Int {
     val rawTitle = hit.title.trim()
     val (baseTitle, disambiguator) = splitWikipediaDisambiguator(rawTitle)
@@ -86,7 +117,7 @@ private fun scoreArtistWikiHit(
     if (!baseMatches || !validContext) {
         return 0
     }
-    return computeArtistWikiScore(normBase, normArtist, normDisambig, normSnippet, normAlbum)
+    return computeArtistWikiScore(normBase, normArtist, normDisambig, normSnippet, normChildren)
 }
 
 private fun matchesArtistBaseTitle(
@@ -132,7 +163,7 @@ private fun computeArtistWikiScore(
     normArtist: String,
     normDisambig: String,
     normSnippet: String,
-    normAlbum: String?,
+    normChildren: List<String>,
 ): Int {
     var score = if (normBase == normArtist) EXACT_ARTIST_BASE_SCORE else ALT_ARTIST_BASE_SCORE
     if (ARTIST_DISAMBIG_WORDS.any { containsWord(normDisambig, it) }) {
@@ -141,7 +172,7 @@ private fun computeArtistWikiScore(
     if (MUSIC_BIO_WORDS.any { containsWord(normSnippet, it) } || "hip hop" in normSnippet) {
         score += ARTIST_SNIPPET_BONUS
     }
-    if (normAlbum != null && normAlbum in normSnippet) {
+    if (normChildren.any { it in normSnippet }) {
         score += ARTIST_ALBUM_BONUS
     }
     return score
@@ -323,6 +354,9 @@ private val REJECTED_ARTIST_DISAMBIG =
         "asteroid",
         "painting",
         "disambiguation",
+        "footballer",
+        "politician",
+        "municipality",
     )
 private val MUSIC_BIO_WORDS =
     setOf(

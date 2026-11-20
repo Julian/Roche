@@ -849,7 +849,7 @@ fn derive_want_collection_slug_and_label(trimmed: &str) -> CatalogResult<(String
     } else {
         let base_slug =
             trimmed.strip_prefix("want:").unwrap_or(trimmed).to_ascii_lowercase().replace('-', "_");
-        if base_slug == "read" || base_slug == "articles" || base_slug == "papers" {
+        if is_want_to_read_base_slug(&base_slug) {
             Ok((crate::db::WANT_TO_READ_SLUG.to_owned(), crate::db::WANT_TO_READ_TITLE.to_owned()))
         } else {
             let slug = format!("want:{base_slug}");
@@ -951,7 +951,11 @@ fn append_dynamic_rule_sql_filters(qb: &mut QueryBuilder<Sqlite>, rule: &Dynamic
     }
 }
 
-pub(super) fn derive_manual_collection_slug_and_id(
+fn is_want_to_read_base_slug(base_slug: &str) -> bool {
+    matches!(base_slug, "read" | "article" | "articles" | "paper" | "papers")
+}
+
+pub fn derive_manual_collection_slug_and_id(
     title: &str,
     slug: Option<&str>,
     role: CollectionRole,
@@ -980,7 +984,11 @@ pub(super) fn derive_manual_collection_slug_and_id(
     }
 
     let (derived_slug, id) = if role == CollectionRole::Want {
-        let full_slug = format!("want:{base_slug}");
+        let full_slug = if is_want_to_read_base_slug(&base_slug) {
+            crate::db::WANT_TO_READ_SLUG.to_owned()
+        } else {
+            format!("want:{base_slug}")
+        };
         let det_id = deterministic_system_collection_id(&full_slug);
         (full_slug, det_id)
     } else {

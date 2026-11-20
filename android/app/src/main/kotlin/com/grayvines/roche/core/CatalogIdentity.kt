@@ -1,8 +1,9 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("MatchingDeclarationName", "TooManyFunctions")
 
 package com.grayvines.roche.core
 
 import java.net.URI
+import java.util.Locale
 
 internal val EDITION_KEYWORDS: List<String> =
     listOf(
@@ -32,13 +33,24 @@ internal const val SCHEME_DEEZER = "deezer"
 internal const val SCHEME_QOBUZ = "qobuz"
 internal const val SCHEME_AMAZON_MUSIC = "amazon_music"
 internal const val SCHEME_BANDCAMP = "bandcamp"
+internal const val SCHEME_YOUTUBE = "youtube"
 
 internal const val YT_MUSIC_ORIGIN = "https://music.youtube.com"
 internal const val YT_MUSIC_BROWSE_PREFIX = "MPREb"
 
+internal val WANT_TO_READ_BASE_SLUGS: Set<String> =
+    setOf("read", "article", "articles", "paper", "papers")
+
+private const val ROLE_LIST = "list"
+private const val ROLE_WANT = "want"
+private const val WANT_SLUG_PREFIX = "want:"
+private const val DOI_PREFIX = "doi:"
 private const val SCHEME_ARXIV = "arxiv"
+private const val SCHEME_FEED_URL = "feed_url"
 private const val ENTITY_ALBUM = "album"
 private const val ENTITY_ARTIST = "artist"
+private const val ENTITY_TRACK = "track"
+private const val ENTITY_EPISODE = "episode"
 private const val SPOTIFY_URI_PREFIX = "spotify:"
 private const val SPOTIFY_PLAYLIST = "playlist"
 private const val ARXIV_ABS_MARKER = "/abs/"
@@ -47,6 +59,11 @@ private const val YT_OLAK_TOKEN_PREFIX = "OLAK5uy_"
 private const val YT_OLAK_PREFIX_LEN = 8
 private const val YT_PL_TOKEN_PREFIX = "PL"
 private const val YT_PL_PREFIX_LEN = 2
+
+internal data class DerivedCollectionId(
+    val slug: String,
+    val collectionId: String,
+)
 
 internal val PREFERRED_IDENTIFIER_SCHEMES: List<String> =
     listOf(
@@ -62,25 +79,37 @@ internal val PREFERRED_IDENTIFIER_SCHEMES: List<String> =
         "igdb",
         SCHEME_ARXIV,
         SCHEME_WIKIPEDIA,
-        "feed_url",
+        SCHEME_FEED_URL,
         "url",
     )
 
 private val SPOTIFY_ENTITY_TYPES: Set<String> =
-    setOf(ENTITY_ALBUM, "track", ENTITY_ARTIST, "episode", "show", SPOTIFY_PLAYLIST)
+    setOf(ENTITY_ALBUM, ENTITY_TRACK, ENTITY_ARTIST, ENTITY_EPISODE, "show", SPOTIFY_PLAYLIST)
 
-private val ARXIV_HOSTS: Set<String> = setOf("arxiv.org", "rss.arxiv.org", "export.arxiv.org")
+private val ARXIV_HOSTS: Set<String> =
+    setOf("arxiv.org", "www.arxiv.org", "rss.arxiv.org", "export.arxiv.org")
+
+private val HTTP_ONLY_EXTERNAL_SCHEMES: Set<String> =
+    setOf(SCHEME_BANDCAMP, "rym", "url", SCHEME_FEED_URL)
+
+private val DISALLOWED_URI_SCHEME_PREFIXES: List<String> =
+    listOf("javascript:", "data:", "vbscript:", "file:", "ftp:")
+
+private val NON_SLUG_REGEX = Regex("[^a-z0-9]+")
 
 private val EXTERNAL_ID_URL_PREFIXES: Map<String, String> =
     mapOf(
         "tmdb_movie" to "https://www.themoviedb.org/movie/",
         "tmdb_tv" to "https://www.themoviedb.org/tv/",
+        "letterboxd" to "https://letterboxd.com/film/",
         "isbn" to "https://openlibrary.org/isbn/",
         "openlibrary" to "https://openlibrary.org/works/",
         "goodreads" to "https://www.goodreads.com/book/show/",
+        "steam" to "https://store.steampowered.com/app/",
         "igdb" to "https://www.igdb.com/games/",
         "discogs" to "https://www.discogs.com/release/",
         SCHEME_ARXIV to "https://arxiv.org/abs/",
+        "wikidata" to "https://www.wikidata.org/wiki/",
         "musicbrainz_release" to "https://musicbrainz.org/release/",
         "musicbrainz_artist" to "https://musicbrainz.org/artist/",
         "musicbrainz_recording" to "https://musicbrainz.org/recording/",
@@ -111,7 +140,7 @@ internal fun normalizeIdentifierValueRaw(
     if (trimmed.isEmpty()) return ""
     return when (normalizeIdentifierScheme(scheme)) {
         "url",
-        "feed_url" -> canonicalizeSyncUrl(trimmed)
+        SCHEME_FEED_URL -> canonicalizeSyncUrl(trimmed)
         "slug",
         "tag" -> trimmed.lowercase()
         SCHEME_SPOTIFY -> normalizeSpotifyIdentifier(kindWireValue, trimmed)
@@ -168,9 +197,9 @@ private fun formatBareSpotifyIdentifier(kindWireValue: String, raw: String): Str
     val defaultEntity =
         when (kindWireValue.trim().lowercase()) {
             ENTITY_ALBUM -> ENTITY_ALBUM
-            "song" -> "track"
+            "song" -> ENTITY_TRACK
             ENTITY_ARTIST -> ENTITY_ARTIST
-            "podcast_episode" -> "episode"
+            "podcast_episode" -> ENTITY_EPISODE
             "podcast" -> "show"
             else -> null
         }
@@ -281,49 +310,171 @@ internal fun sanitizeYoutubeMusicToken(raw: String): String {
             .split(YT_TOKEN_DELIMITER_REGEX)
             .map { stripYoutubePlaylistPrefix(it.trim()) }
             .filter { it.isNotEmpty() }
-    val valid = candidates.firstOrNull { token ->
-        token.matches(YT_VALID_TOKEN_REGEX) &&
-            (token.startsWith(YT_MUSIC_BROWSE_PREFIX) ||
-                token.startsWith(YT_OLAK_TOKEN_PREFIX) && token.length > YT_OLAK_PREFIX_LEN ||
-                token.startsWith(YT_PL_TOKEN_PREFIX) && token.length > YT_PL_PREFIX_LEN)
-    }
+    val valid = candidates.firstOrNull(::isValidYoutubeMusicToken)
     return valid
         ?: stripYoutubePlaylistPrefix(raw.trim().substringBefore('&').substringBefore('?').trim())
+}
+
+private fun isValidYoutubeMusicToken(token: String): Boolean {
+    if (!token.matches(YT_VALID_TOKEN_REGEX)) return false
+    val isOlak = token.startsWith(YT_OLAK_TOKEN_PREFIX) && token.length > YT_OLAK_PREFIX_LEN
+    val isPl = token.startsWith(YT_PL_TOKEN_PREFIX) && token.length > YT_PL_PREFIX_LEN
+    return token.startsWith(YT_MUSIC_BROWSE_PREFIX) || isOlak || isPl
 }
 
 internal fun stripYoutubePlaylistPrefix(id: String): String =
     if (id.startsWith("VLOLAK5uy_") || id.startsWith("VLPL")) id.removePrefix("VL") else id
 
-internal fun externalIdentifierUrl(scheme: String, value: String): String? {
+internal fun slugifyTitle(raw: String): String =
+    raw.trim().lowercase(Locale.ROOT).replace(NON_SLUG_REGEX, "_").trim('_')
+
+internal fun deriveCollectionIdentity(
+    title: String,
+    roleWireValue: String,
+): DerivedCollectionId? {
+    val cleanTitle = title.trim()
+    val normRole = roleWireValue.trim().lowercase(Locale.ROOT)
+    val validRole = normRole == ROLE_LIST || normRole == ROLE_WANT
+    val baseSlug =
+        if (cleanTitle.isEmpty() || !validRole) {
+            ""
+        } else {
+            val hasWantPrefix =
+                normRole == ROLE_WANT && cleanTitle.startsWith(WANT_SLUG_PREFIX, ignoreCase = true)
+            val slugSource =
+                if (hasWantPrefix) cleanTitle.substring(WANT_SLUG_PREFIX.length) else cleanTitle
+            slugifyTitle(slugSource)
+        }
+    if (baseSlug.isEmpty()) return null
+    return if (normRole == ROLE_WANT) {
+        val fullSlug =
+            if (baseSlug in WANT_TO_READ_BASE_SLUGS) {
+                WANT_TO_READ_SLUG
+            } else {
+                "$WANT_SLUG_PREFIX$baseSlug"
+            }
+        DerivedCollectionId(slug = fullSlug, collectionId = systemCollectionUuid(fullSlug))
+    } else {
+        DerivedCollectionId(
+            slug = baseSlug,
+            collectionId = systemCollectionUuid("custom:$baseSlug"),
+        )
+    }
+}
+
+internal fun externalIdentifierUrl(
+    scheme: String,
+    value: String,
+    entryKind: String? = null,
+): String? {
     val clean = value.trim()
-    if (clean.isEmpty()) return null
-    val http = sanitizeHttpUrl(clean)
+    if (clean.isEmpty() || isDisallowedUriScheme(clean)) return null
+    val http = sanitizeHttpUrl(clean)?.takeIf { it.substringAfter("://").isNotBlank() }
     val normalizedScheme = normalizeIdentifierScheme(scheme)
     return when (normalizedScheme) {
         SCHEME_WIKIPEDIA ->
             http ?: "https://en.wikipedia.org/wiki/${clean.replace("#", "%23").replace("?", "%3F")}"
-        SCHEME_SPOTIFY ->
-            extractSpotifyEntityAndId(clean)?.let { (entity, id) ->
-                "https://open.spotify.com/$entity/${encodeQueryValue(id)}"
-            } ?: http ?: "https://open.spotify.com/album/${encodeQueryValue(clean)}"
+        SCHEME_SPOTIFY -> resolveSpotifyExternalUrl(clean, http, entryKind)
         SCHEME_YOUTUBE_MUSIC -> buildYoutubeMusicAlbumUrl(clean)
+        SCHEME_YOUTUBE -> resolveYoutubeExternalUrl(clean, http)
         "imdb" -> http ?: "https://www.imdb.com/title/${encodePathSegmentOrKeep(clean)}/"
-        else -> resolvePrefixOrHttpUrl(normalizedScheme, clean, http)
+        "doi" -> resolveDoiExternalUrl(clean, http)
+        in HTTP_ONLY_EXTERNAL_SCHEMES -> http
+        else -> resolvePrefixedExternalUrl(normalizedScheme, clean, http, entryKind)
     }
 }
 
-private fun resolvePrefixOrHttpUrl(
+private fun isDisallowedUriScheme(raw: String): Boolean {
+    val lower = raw.lowercase(Locale.ROOT)
+    return DISALLOWED_URI_SCHEME_PREFIXES.any { lower.startsWith(it) }
+}
+
+private fun resolveSpotifyExternalUrl(
+    clean: String,
+    http: String?,
+    entryKind: String?,
+): String? {
+    if (clean.startsWith(SPOTIFY_URI_PREFIX)) {
+        val parsed = extractSpotifyFromColonUri(clean)
+        return parsed?.let {
+            "https://open.spotify.com/${it.first}/${encodeQueryValue(it.second)}"
+        }
+    }
+    val webParsed = extractSpotifyFromWebUrl(clean)
+    return when {
+        webParsed != null ->
+            "https://open.spotify.com/${webParsed.first}/${encodeQueryValue(webParsed.second)}"
+        http != null -> http
+        ':' in clean || '/' in clean || clean.any(Char::isWhitespace) -> null
+        else ->
+            "https://open.spotify.com/${spotifyDefaultEntity(entryKind)}/${encodeQueryValue(clean)}"
+    }
+}
+
+private fun spotifyDefaultEntity(entryKind: String?): String =
+    when (entryKind?.trim()?.lowercase(Locale.ROOT)) {
+        "song" -> ENTITY_TRACK
+        ENTITY_ARTIST -> ENTITY_ARTIST
+        "podcast" -> "show"
+        "podcast_episode" -> ENTITY_EPISODE
+        "collection" -> SPOTIFY_PLAYLIST
+        else -> ENTITY_ALBUM
+    }
+
+private fun resolveYoutubeExternalUrl(clean: String, http: String?): String =
+    when {
+        http != null -> http
+        isYoutubeChannelId(clean) -> "https://www.youtube.com/channel/${encodeQueryValue(clean)}"
+        else -> "https://www.youtube.com/watch?v=${encodeQueryValue(clean)}"
+    }
+
+private fun resolveDoiExternalUrl(clean: String, http: String?): String? {
+    if (http != null) return http
+    val stripped =
+        if (clean.startsWith(DOI_PREFIX, ignoreCase = true)) {
+            clean.substring(DOI_PREFIX.length).trim()
+        } else {
+            clean
+        }
+    return stripped
+        .takeIf { it.isNotEmpty() }
+        ?.let { "https://doi.org/${encodePathSegmentOrKeep(it)}" }
+}
+
+private fun resolvePrefixedExternalUrl(
     normalizedScheme: String,
     clean: String,
     http: String?,
+    entryKind: String?,
 ): String? {
-    val prefix = EXTERNAL_ID_URL_PREFIXES[normalizedScheme]
-    return when {
-        http != null -> http
-        prefix != null -> "$prefix${encodePathSegmentOrKeep(clean)}"
+    val prefix =
+        when (normalizedScheme) {
+            "tmdb" -> tmdbPrefixForKind(entryKind)
+            "musicbrainz" -> musicbrainzPrefixForKind(entryKind)
+            else -> EXTERNAL_ID_URL_PREFIXES[normalizedScheme]
+        } ?: return null
+    return http ?: "$prefix${encodePathSegmentOrKeep(clean)}"
+}
+
+private fun tmdbPrefixForKind(entryKind: String?): String? =
+    when (entryKind?.trim()?.lowercase(Locale.ROOT)) {
+        "tv" -> "https://www.themoviedb.org/tv/"
+        ENTITY_ARTIST -> "https://www.themoviedb.org/person/"
+        "movie",
+        null,
+        "" -> "https://www.themoviedb.org/movie/"
         else -> null
     }
-}
+
+private fun musicbrainzPrefixForKind(entryKind: String?): String? =
+    when (entryKind?.trim()?.lowercase(Locale.ROOT)) {
+        ENTITY_ARTIST -> "https://musicbrainz.org/artist/"
+        "song" -> "https://musicbrainz.org/recording/"
+        ENTITY_ALBUM,
+        null,
+        "" -> "https://musicbrainz.org/release/"
+        else -> null
+    }
 
 private fun encodePathSegmentOrKeep(raw: String): String =
     if ('/' in raw) raw else encodeQueryValue(raw)

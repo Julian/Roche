@@ -52,6 +52,18 @@ pub fn is_valid_pdf_bytes(bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+#[must_use]
+pub fn infer_feed_type(url: &Url) -> crate::domain::FeedType {
+    if crate::util::media_urls::is_arxiv_host(url.host_str()) {
+        crate::domain::FeedType::Arxiv
+    } else if crate::util::media_urls::is_youtube_url(url) {
+        crate::domain::FeedType::Youtube
+    } else {
+        crate::domain::FeedType::Rss
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

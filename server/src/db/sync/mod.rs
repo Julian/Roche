@@ -1,4 +1,6 @@
 mod activity;
+#[cfg(test)]
+mod cross_stack_tests;
 mod hlc;
 mod hrw;
 mod identity;

@@ -46,13 +46,12 @@ private const val IPV6_SEGMENT_SHIFT = 8
 private const val IPV6_ULA_SEG_MASK = 0xfe00
 private const val IPV6_ULA_SEG_PREFIX = 0xfc00
 private const val IPV6_EMBEDDED_LEAD_ZERO_SEGMENTS = 5
+private const val IPV6_SIIT_SEG_INDEX = 4
 private const val IPV6_MAPPED_SEG_INDEX = 5
 private const val IPV6_MAPPED_SEG_VALUE = 0xffff
 private const val IPV6_EMBEDDED_IPV4_OFFSET = 12
 private const val IPV6_NAT64_SEG0 = 0x0064
 private const val IPV6_NAT64_SEG1 = 0xff9b
-private const val IPV6_NAT64_LOCAL_SEG2 = 0x0001
-private const val IPV6_NAT64_WELL_KNOWN_ZERO_END = 6
 private const val IPV6_DISCARD_SEG0 = 0x0100
 private const val IPV6_DISCARD_ZERO_END = 4
 private const val IPV6_2001_SEG0 = 0x2001
@@ -62,6 +61,7 @@ private const val IPV6_ORCHID_MASK = 0xfff0
 private const val IPV6_ORCHID_V2_PREFIX = 0x0020
 private const val IPV6_6TO4_SEG0 = 0x2002
 private const val TS_NET_SUFFIX = ".ts.net"
+private const val HOME_ARPA_DOMAIN = "home.arpa"
 private val TAILSCALE_ULA_PREFIX =
     intArrayOf(
         TAILSCALE_ULA_B0,
@@ -73,6 +73,7 @@ private val TAILSCALE_ULA_PREFIX =
     )
 private val DISALLOWED_DOMAIN_SUFFIXES =
     listOf(".local", ".lan", ".internal", ".home.arpa", TS_NET_SUFFIX, ".localhost", ".home")
+private val IPV6_LITERAL_CHARS_REGEX = Regex("^[0-9a-fA-F:.]+$")
 
 internal fun isAllowedPublicPort(port: Int): Boolean = port == -1 || port in ALLOWED_PUBLIC_PORTS
 
@@ -105,7 +106,19 @@ internal fun isPublicHost(rawHost: String): Boolean {
         normalized.isEmpty() || '.' !in normalized || labels.any { it.isEmpty() } -> false
         normalized.all { it.isDigit() || it == '.' } -> isPublicIpv4Literal(normalized)
         labels.last().all { it.isDigit() } -> false
-        else -> DISALLOWED_DOMAIN_SUFFIXES.none { normalized.endsWith(it) }
+        else ->
+            normalized != HOME_ARPA_DOMAIN &&
+                DISALLOWED_DOMAIN_SUFFIXES.none { normalized.endsWith(it) }
+    }
+}
+
+internal fun isPublicIpAddress(rawIp: String): Boolean {
+    val trimmed = rawIp.trim().trim('[', ']')
+    if (trimmed.isEmpty()) return false
+    return if (':' in trimmed) {
+        isValidIpv6LiteralSyntax(trimmed) && isPublicIpv6Literal("[$trimmed]")
+    } else {
+        isPublicIpv4Literal(trimmed)
     }
 }
 
@@ -217,6 +230,9 @@ private fun isIpv4TestNet2Or3OrBenchmark(first: Int, second: Int, third: Int): B
     return isTestNet2 || isTestNet3 || isBenchmark
 }
 
+private fun isValidIpv6LiteralSyntax(unbracketed: String): Boolean =
+    IPV6_LITERAL_CHARS_REGEX.matches(unbracketed)
+
 private fun isPublicIpv6Literal(bracketedHost: String): Boolean = runCatching {
     isPublicInetAddress(InetAddress.getByName(bracketedHost))
 }
@@ -233,7 +249,7 @@ private fun isPublicIpv6Address(addr: InetAddress): Boolean {
     val bytes = addr.address
     return when {
         bytes.size != IPV6_BYTE_COUNT || isStandardNonGlobalIpv6(addr, bytes) -> false
-        hasEmbeddedIpv4Prefix(bytes) -> isPublicIpv4Bytes(bytes, offset = IPV6_EMBEDDED_IPV4_OFFSET)
+        isIpv4MappedPrefix(bytes) -> isPublicIpv4Bytes(bytes, offset = IPV6_EMBEDDED_IPV4_OFFSET)
         else -> !isSpecialPurposeIpv6(bytes)
     }
 }
@@ -249,31 +265,30 @@ private fun isStandardNonGlobalIpv6(addr: InetAddress, bytes: ByteArray): Boolea
     }
 }
 
-private fun hasEmbeddedIpv4Prefix(bytes: ByteArray): Boolean {
-    val leadZero =
-        (0 until IPV6_EMBEDDED_LEAD_ZERO_SEGMENTS).all { idx -> ipv6Segment(bytes, idx) == 0 }
-    if (!leadZero) return false
-    val sixthSeg = ipv6Segment(bytes, IPV6_MAPPED_SEG_INDEX)
-    return sixthSeg == 0 || sixthSeg == IPV6_MAPPED_SEG_VALUE
-}
+private fun isIpv4MappedPrefix(bytes: ByteArray): Boolean =
+    (0 until IPV6_EMBEDDED_LEAD_ZERO_SEGMENTS).all { idx -> ipv6Segment(bytes, idx) == 0 } &&
+        ipv6Segment(bytes, IPV6_MAPPED_SEG_INDEX) == IPV6_MAPPED_SEG_VALUE
+
+private fun isDeprecatedIpv4Compat(bytes: ByteArray): Boolean =
+    (0..IPV6_MAPPED_SEG_INDEX).all { idx -> ipv6Segment(bytes, idx) == 0 }
+
+private fun isSiitIpv4Translated(bytes: ByteArray): Boolean =
+    (0 until IPV6_SIIT_SEG_INDEX).all { idx -> ipv6Segment(bytes, idx) == 0 } &&
+        ipv6Segment(bytes, IPV6_SIIT_SEG_INDEX) == IPV6_MAPPED_SEG_VALUE &&
+        ipv6Segment(bytes, IPV6_MAPPED_SEG_INDEX) == 0
 
 private fun isSpecialPurposeIpv6(bytes: ByteArray): Boolean {
     val s0 = ipv6Segment(bytes, 0)
     val s1 = ipv6Segment(bytes, 1)
     val s2 = ipv6Segment(bytes, 2)
     return when {
-        isNat64Ipv6(bytes, s0, s1, s2) -> true
+        isDeprecatedIpv4Compat(bytes) || isSiitIpv4Translated(bytes) -> true
+        s0 == IPV6_NAT64_SEG0 && s1 == IPV6_NAT64_SEG1 -> true
         isDiscardIpv6(bytes, s0) -> true
         is2001SpecialIpv6(s0, s1, s2) -> true
         s0 == IPV6_6TO4_SEG0 -> true
         else -> false
     }
-}
-
-private fun isNat64Ipv6(bytes: ByteArray, s0: Int, s1: Int, s2: Int): Boolean {
-    if (s0 != IPV6_NAT64_SEG0 || s1 != IPV6_NAT64_SEG1) return false
-    if (s2 == IPV6_NAT64_LOCAL_SEG2) return true
-    return (2 until IPV6_NAT64_WELL_KNOWN_ZERO_END).all { idx -> ipv6Segment(bytes, idx) == 0 }
 }
 
 private fun isDiscardIpv6(bytes: ByteArray, s0: Int): Boolean =

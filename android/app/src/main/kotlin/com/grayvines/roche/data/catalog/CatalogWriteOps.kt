@@ -7,6 +7,7 @@ import com.grayvines.roche.core.HlcTimestamp
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
 import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_BASE_SLUGS
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_SLUG
 import com.grayvines.roche.core.WANT_TO_READ_TITLE
@@ -513,7 +514,7 @@ internal suspend fun ensureWantCollectionInDao(
         explicit?.removePrefix("want:")?.lowercase()?.replace('-', '_') ?: kind.systemListSlug
     val isWantToRead =
         explicit == null && (kind == EntryKind.ARTICLE || kind == EntryKind.PAPER) ||
-            rawBase in setOf("read", "articles", "papers")
+            rawBase in WANT_TO_READ_BASE_SLUGS
     val baseSlug =
         if (isWantToRead) {
             "read"

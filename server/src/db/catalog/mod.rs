@@ -13,11 +13,14 @@ mod rankings;
 #[allow(clippy::unwrap_used, clippy::float_cmp, clippy::too_many_lines)]
 mod tests;
 
-pub use collections::{matches_dynamic_collection_rule, parse_dynamic_collection_rule};
+pub use collections::{
+    derive_manual_collection_slug_and_id, matches_dynamic_collection_rule,
+    parse_dynamic_collection_rule,
+};
 pub use identity_norm::{
     PREFERRED_IDENTIFIER_SCHEMES, choose_deterministic_entry_id, external_identifier_label,
-    external_identifier_url, normalize_identifier_scheme, normalize_identifier_value,
-    strip_album_edition_suffix,
+    external_identifier_url, external_identifier_url_for_kind, normalize_identifier_scheme,
+    normalize_identifier_value, strip_album_edition_suffix,
 };
 pub use models::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,

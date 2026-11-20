@@ -7,7 +7,13 @@ use super::url_guard::parse_public_url;
 
 #[must_use]
 pub fn is_arxiv_host(host: Option<&str>) -> bool {
-    matches!(host, Some("arxiv.org" | "rss.arxiv.org" | "export.arxiv.org"))
+    host.is_some_and(|raw| {
+        let trimmed = raw.trim_end_matches('.');
+        trimmed.eq_ignore_ascii_case("arxiv.org")
+            || trimmed.eq_ignore_ascii_case("www.arxiv.org")
+            || trimmed.eq_ignore_ascii_case("rss.arxiv.org")
+            || trimmed.eq_ignore_ascii_case("export.arxiv.org")
+    })
 }
 
 #[must_use]
@@ -66,7 +72,26 @@ pub fn arxiv_pdf_url(paper_url: &Url) -> Option<Url> {
 
 #[must_use]
 pub fn is_youtube_host(host: Option<&str>) -> bool {
-    matches!(host, Some("youtube.com" | "www.youtube.com" | "m.youtube.com"))
+    host.is_some_and(|raw| {
+        let trimmed = raw.trim_end_matches('.');
+        trimmed.eq_ignore_ascii_case("youtube.com")
+            || trimmed.eq_ignore_ascii_case("www.youtube.com")
+            || trimmed.eq_ignore_ascii_case("m.youtube.com")
+            || trimmed.eq_ignore_ascii_case("music.youtube.com")
+    })
+}
+
+fn is_youtu_be_host(host: Option<&str>) -> bool {
+    host.is_some_and(|raw| {
+        let trimmed = raw.trim_end_matches('.');
+        trimmed.eq_ignore_ascii_case("youtu.be") || trimmed.eq_ignore_ascii_case("www.youtu.be")
+    })
+}
+
+#[cfg(test)]
+#[must_use]
+pub fn is_youtube_url(url: &Url) -> bool {
+    is_youtube_host(url.host_str()) || is_youtu_be_host(url.host_str())
 }
 
 #[must_use]
@@ -142,7 +167,7 @@ pub fn extract_youtube_video_id(url: &Url) -> Option<String> {
         {
             return Some(candidate.to_string());
         }
-    } else if host.eq_ignore_ascii_case("youtu.be")
+    } else if is_youtu_be_host(Some(host))
         && let Some(mut segments) = url.path_segments()
         && let Some(candidate) = segments.next()
         && is_valid_youtube_video_id(candidate)

@@ -9,9 +9,9 @@ import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
 import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
 import com.grayvines.roche.core.canonicalOrderingJson
 import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deriveCollectionIdentity
 import com.grayvines.roche.core.deterministicComparisonId
 import com.grayvines.roche.core.nowUtcIso
-import com.grayvines.roche.core.systemCollectionUuid
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
@@ -23,7 +23,6 @@ import com.grayvines.roche.data.local.deleteCollectionGeneratorWithTombstone
 import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.ranking.EpRankingEngine
 import java.time.Instant
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
 import kotlinx.coroutines.Dispatchers
@@ -345,42 +344,24 @@ class CatalogStore(
             ensureSystemSeeded()
             val cleanTitle = title.trim()
             require(cleanTitle.isNotEmpty()) { "Collection title cannot be empty" }
-            val slug = buildCustomCollectionSlug(cleanTitle, role)
-            val existing = dao.getCollectionSpecBySlug(slug)
+            val derived =
+                requireNotNull(deriveCollectionIdentity(cleanTitle, role.wireValue)) {
+                    "Collection slug cannot be empty"
+                }
+            val existing = dao.getCollectionSpecBySlug(derived.slug)
             if (existing != null) {
                 ensureCollectionEntryRow(existing.collectionId, cleanTitle)
                 existing.collectionId
             } else {
-                val newId =
-                    if (role == CollectionRole.WANT) {
-                        systemCollectionUuid(slug)
-                    } else {
-                        systemCollectionUuid("custom:$slug")
-                    }
-                insertNewCustomCollectionInTx(newId, cleanTitle, slug, role)
+                insertNewCustomCollectionInTx(derived.collectionId, cleanTitle, derived.slug, role)
                 created = true
-                newId
+                derived.collectionId
             }
         }
         if (created) {
             notifyLocalMutation()
         }
         return id
-    }
-
-    private fun buildCustomCollectionSlug(cleanTitle: String, role: CollectionRole): String {
-        val slugSource =
-            if (
-                role == CollectionRole.WANT &&
-                    cleanTitle.startsWith(WANT_SLUG_PREFIX, ignoreCase = true)
-            ) {
-                cleanTitle.substring(WANT_SLUG_PREFIX.length)
-            } else {
-                cleanTitle
-            }
-        val rawSlug = slugifyTitle(slugSource)
-        require(rawSlug.isNotEmpty()) { "Collection slug cannot be empty" }
-        return if (role == CollectionRole.WANT) "$WANT_SLUG_PREFIX$rawSlug" else rawSlug
     }
 
     private suspend fun ensureCollectionEntryRow(collectionId: String, cleanTitle: String) {
@@ -842,9 +823,6 @@ class CatalogStore(
         )
 }
 
-internal fun slugifyTitle(raw: String): String =
-    raw.trim().lowercase(Locale.ROOT).replace(NON_SLUG_REGEX, "_").trim('_')
-
 internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
     RankClusterCandidate(
         entryId = entry.id,
@@ -856,4 +834,3 @@ internal fun RankedCatalogEntry.toRankCandidate(): RankClusterCandidate =
     )
 
 private const val WANT_SLUG_PREFIX = "want:"
-private val NON_SLUG_REGEX = Regex("[^a-z0-9]+")
