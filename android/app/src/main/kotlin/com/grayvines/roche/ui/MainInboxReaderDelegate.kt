@@ -77,8 +77,8 @@ internal class MainInboxReaderDelegate(private val host: InboxReaderHost) {
     }
 
     private suspend fun performSetSkipSilence(enabled: Boolean) {
-        host.playerController.setSkipSilence(enabled)
         host.settingsRepository.update { it.copy(skipSilenceEnabled = enabled) }
+        host.playerController.setSkipSilence(enabled)
     }
 
     private suspend fun performSetSmartRewind(enabled: Boolean) {
