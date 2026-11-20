@@ -1,5 +1,9 @@
 package com.grayvines.roche.data
 
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CollectionMode
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
@@ -45,6 +49,7 @@ internal fun matchesInboxFilter(entry: InboxEntry, filter: InboxFilter): Boolean
 
 internal enum class SearchScopeFilter(val label: String) {
     ALL("All"),
+    CATALOG("Catalog"),
     UNREAD("Unread"),
     STARRED("Starred"),
     ARTICLES("Articles"),
@@ -53,9 +58,15 @@ internal enum class SearchScopeFilter(val label: String) {
     PODCASTS("Podcasts"),
 }
 
+internal data class CatalogSearchMatch(
+    val entry: CatalogEntryItem,
+    val tier: Char? = null,
+)
+
 internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilter): Boolean =
     when (scope) {
         SearchScopeFilter.ALL -> true
+        SearchScopeFilter.CATALOG -> false
         SearchScopeFilter.UNREAD -> entry.isUnread
         SearchScopeFilter.STARRED -> entry.isFavorite
         SearchScopeFilter.ARTICLES -> entry.contentType == ContentType.ARTICLE
@@ -63,6 +74,77 @@ internal fun matchesSearchScopeFilter(entry: InboxEntry, scope: SearchScopeFilte
         SearchScopeFilter.VIDEOS -> entry.contentType == ContentType.VIDEO
         SearchScopeFilter.PODCASTS -> entry.contentType == ContentType.AUDIO
     }
+
+internal fun searchCatalogEntries(
+    catalog: CatalogSnapshot,
+    rawQuery: String,
+    includeWhenBlank: Boolean = false,
+    limit: Int = MAX_CATALOG_SEARCH_RESULTS,
+): List<CatalogSearchMatch> {
+    val cleanQuery = rawQuery.trim().trimStart('#').trim()
+    if (cleanQuery.isEmpty() && !includeWhenBlank) return emptyList()
+    val tierById = buildCatalogTierIndex(catalog)
+    val allCatalog = collectCatalogSearchEntries(catalog)
+    return allCatalog
+        .asSequence()
+        .filter { entry -> cleanQuery.isEmpty() || matchesCatalogQuery(entry, cleanQuery) }
+        .sortedWith(catalogSearchComparator(cleanQuery, tierById))
+        .take(limit)
+        .map { entry -> CatalogSearchMatch(entry = entry, tier = tierById[entry.id]) }
+        .toList()
+}
+
+private fun buildCatalogTierIndex(catalog: CatalogSnapshot): Map<String, Char> = buildMap {
+    catalog.lists
+        .filter { it.mode == CollectionMode.DYNAMIC }
+        .forEach { summary ->
+            catalog.entriesByCollectionId[summary.collectionId].orEmpty().forEach { ranked ->
+                if (ranked.tier != null) put(ranked.entry.id, ranked.tier)
+            }
+        }
+}
+
+private fun collectCatalogSearchEntries(catalog: CatalogSnapshot): List<CatalogEntryItem> {
+    val byId = LinkedHashMap<String, CatalogEntryItem>()
+    catalog.entriesById.values
+        .filter { it.kind in SEARCHABLE_CATALOG_KINDS }
+        .forEach { byId[it.id] = it }
+    catalog.entriesByCollectionId.values
+        .asSequence()
+        .flatten()
+        .map { it.entry }
+        .filter { it.kind in SEARCHABLE_CATALOG_KINDS }
+        .forEach { byId.putIfAbsent(it.id, it) }
+    return byId.values.toList()
+}
+
+private fun matchesCatalogQuery(entry: CatalogEntryItem, cleanQuery: String): Boolean =
+    entry.title.contains(cleanQuery, ignoreCase = true) ||
+        entry.creators.any { it.contains(cleanQuery, ignoreCase = true) } ||
+        entry.releaseYear?.toString()?.contains(cleanQuery) == true ||
+        entry.kind.displayLabel.contains(cleanQuery, ignoreCase = true)
+
+private fun catalogSearchComparator(
+    cleanQuery: String,
+    tierById: Map<String, Char>,
+): Comparator<CatalogEntryItem> =
+    compareByDescending<CatalogEntryItem> {
+            cleanQuery.isNotEmpty() && it.title.startsWith(cleanQuery, ignoreCase = true)
+        }
+        .thenByDescending { it.id in tierById }
+        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
+
+private const val MAX_CATALOG_SEARCH_RESULTS = 24
+private val SEARCHABLE_CATALOG_KINDS =
+    setOf(
+        EntryKind.ALBUM,
+        EntryKind.ARTIST,
+        EntryKind.MOVIE,
+        EntryKind.TV,
+        EntryKind.BOOK,
+        EntryKind.GAME,
+        EntryKind.SONG,
+    )
 
 internal fun matchesSearchQuery(entry: InboxEntry, normalizedQuery: String): Boolean {
     if (normalizedQuery.isBlank()) return true

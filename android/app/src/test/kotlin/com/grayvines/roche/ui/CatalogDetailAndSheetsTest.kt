@@ -1,8 +1,11 @@
 package com.grayvines.roche.ui
 
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CatalogSnapshot
 import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.catalog.extractAlbumTracks
 import com.grayvines.roche.data.catalog.extractArtistDiscography
+import com.grayvines.roche.data.searchCatalogEntries
 import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -82,5 +85,44 @@ class CatalogDetailAndSheetsTest {
             )
             ?.invoke()
         assertEquals("reader:art-1", target)
+    }
+
+    @Test
+    fun `searchCatalogEntries matches catalog media and resolveHoveredDockSlot hits non-source slots`() {
+        val album =
+            CatalogEntryItem(
+                id = "alb-ir",
+                kind = EntryKind.ALBUM,
+                title = "In Rainbows",
+                creators = listOf("Radiohead"),
+                url = null,
+                publishedAt = null,
+                releaseYear = 2007,
+                summary = null,
+                thumbnailUrl = null,
+                identifiers = emptyList(),
+            )
+        val snapshot = CatalogSnapshot(entriesById = mapOf(album.id to album))
+        assertTrue(searchCatalogEntries(snapshot, "").isEmpty())
+        assertEquals(1, searchCatalogEntries(snapshot, "", includeWhenBlank = true).size)
+        assertEquals("alb-ir", searchCatalogEntries(snapshot, "radiohead").single().entry.id)
+        assertEquals("alb-ir", searchCatalogEntries(snapshot, "2007").single().entry.id)
+
+        val bounds =
+            mapOf(
+                0 to DockSlotBounds(0f, 100f, 100f, 180f),
+                1 to DockSlotBounds(110f, 100f, 210f, 180f),
+                2 to DockSlotBounds(220f, 100f, 320f, 180f),
+            )
+        assertEquals(
+            2,
+            resolveHoveredDockSlot(250f, 140f, sourceSlotIndex = 0, slotBounds = bounds),
+        )
+        assertNull(resolveHoveredDockSlot(50f, 140f, sourceSlotIndex = 0, slotBounds = bounds))
+        assertEquals(
+            1,
+            resolveHoveredDockSlot(150f, 140f, sourceSlotIndex = null, slotBounds = bounds),
+        )
+        assertNull(resolveHoveredDockSlot(150f, 300f, sourceSlotIndex = null, slotBounds = bounds))
     }
 }

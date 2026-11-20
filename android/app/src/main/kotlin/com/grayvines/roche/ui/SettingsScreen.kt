@@ -1,3 +1,5 @@
+@file:Suppress("TooManyFunctions", "MagicNumber")
+
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.background
@@ -15,12 +17,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -54,6 +58,7 @@ import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.ServerRackIcon
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @Composable
 fun SettingsTabContent(
@@ -68,6 +73,11 @@ fun SettingsTabContent(
             settingsBackStack.removeLastOrNull()
         }
     }
+    val openSubpage: (SettingsNavKey) -> Unit = { key ->
+        if (settingsBackStack.lastOrNull() != key) {
+            settingsBackStack.add(key)
+        }
+    }
 
     NavDisplay(
         backStack = settingsBackStack,
@@ -78,31 +88,27 @@ fun SettingsTabContent(
                     SettingsHubPage(
                         state = state,
                         onAction = onAction,
-                        onOpenServerPage = {
-                            if (settingsBackStack.lastOrNull() != SettingsNavKey.Server) {
-                                settingsBackStack.add(SettingsNavKey.Server)
-                            }
-                        },
-                        onOpenNavPage = {
-                            if (settingsBackStack.lastOrNull() != SettingsNavKey.Navigation) {
-                                settingsBackStack.add(SettingsNavKey.Navigation)
-                            }
-                        },
-                        onImportOpml = onImportOpml,
-                        onExportOpml = onExportOpml,
+                        onOpenSubpage = openSubpage,
                     )
                 }
                 entry<SettingsNavKey.Server> {
-                    SettingsServerPage(
-                        state = state,
-                        onAction = onAction,
-                        onBack = popSubpage,
-                    )
+                    SettingsServerPage(state = state, onAction = onAction, onBack = popSubpage)
+                }
+                entry<SettingsNavKey.Appearance> {
+                    SettingsAppearancePage(state = state, onAction = onAction, onBack = popSubpage)
                 }
                 entry<SettingsNavKey.Navigation> {
                     SettingsNavigationBarPage(
                         state = state,
                         onAction = onAction,
+                        onBack = popSubpage,
+                    )
+                }
+                entry<SettingsNavKey.Data> {
+                    SettingsDataPage(
+                        feedCount = state.feeds.size,
+                        onImportOpml = onImportOpml,
+                        onExportOpml = onExportOpml,
                         onBack = popSubpage,
                     )
                 }
@@ -114,10 +120,7 @@ fun SettingsTabContent(
 internal fun SettingsHubPage(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
-    onOpenServerPage: () -> Unit,
-    onOpenNavPage: () -> Unit,
-    onImportOpml: () -> Unit,
-    onExportOpml: () -> Unit,
+    onOpenSubpage: (SettingsNavKey) -> Unit,
 ) {
     val colors = LocalRocheColors.current
     Column(modifier = Modifier.fillMaxSize()) {
@@ -128,39 +131,85 @@ internal fun SettingsHubPage(
             modifier =
                 Modifier.fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 14.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+                    .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            ServerSummaryCardSection(
+            SettingsPreferencesIndexCard(
                 state = state,
                 onAction = onAction,
-                onOpenServerPage = onOpenServerPage,
+                onOpenSubpage = onOpenSubpage,
             )
-            AppearanceCardSection(state = state, onAction = onAction)
-            NavigationSummaryCardSection(
-                state = state,
-                onAction = onAction,
-                onOpenNavPage = onOpenNavPage,
-            )
-            HomeWidgetsCardSection(
-                state = state,
-                onAction = onAction,
-            )
-            SubscriptionsCardSection(
-                feedCount = state.feeds.size,
-                onImportOpml = onImportOpml,
-                onExportOpml = onExportOpml,
-            )
+            SettingsMoreViewsCard(state = state, onAction = onAction)
             Spacer(modifier = Modifier.height(24.dp))
         }
     }
 }
 
 @Composable
-internal fun ServerSummaryCardSection(
+private fun SettingsPreferencesIndexCard(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
-    onOpenServerPage: () -> Unit,
+    onOpenSubpage: (SettingsNavKey) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val navSummary =
+        remember(state.settings.bottomNavTabs) {
+            AppTab.normalizeBottomTabs(state.settings.bottomNavTabs).joinToString(" · ") {
+                it.label
+            }
+        }
+    val appearanceSummary = buildAppearanceSummary(state)
+    val dataSummary = "${state.feeds.size} feeds · OPML import & export"
+
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        RocheSectionHeader(label = "Preferences")
+        RocheSurfaceCard {
+            SettingsServerHubRow(
+                state = state,
+                onSync = { onAction(MainAction.SyncNow) },
+                onClick = { onOpenSubpage(SettingsNavKey.Server) },
+            )
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            SettingsDrilldownRow(
+                title = "Appearance & Reading",
+                subtitle = appearanceSummary,
+                onClick = { onOpenSubpage(SettingsNavKey.Appearance) },
+                modifier = Modifier.testTag("settings_appearance_row"),
+            ) {
+                Text(
+                    text = "Aa",
+                    color = colors.accentBlue,
+                    fontFamily = FontFamily.Serif,
+                    fontSize = 15.sp,
+                )
+            }
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            SettingsDrilldownRow(
+                title = "Navigation Bar",
+                subtitle = navSummary,
+                onClick = { onOpenSubpage(SettingsNavKey.Navigation) },
+                modifier = Modifier.testTag("settings_nav_row"),
+            ) {
+                BottomTabIcon(tab = AppTab.HOME, tint = colors.accentBlue, size = 17.dp)
+            }
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            SettingsDrilldownRow(
+                title = "Subscriptions & Data",
+                subtitle = dataSummary,
+                onClick = { onOpenSubpage(SettingsNavKey.Data) },
+                modifier = Modifier.testTag("settings_data_row"),
+            ) {
+                DocumentOpmlIcon(tint = colors.textSecondary, size = 17.dp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsServerHubRow(
+    state: MainUiState,
+    onSync: () -> Unit,
+    onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
     val isConfigured =
@@ -170,105 +219,251 @@ internal fun ServerSummaryCardSection(
     val subtitle = resolveServerSummarySubtitle(state = state, isConfigured = isConfigured)
     val dotColor = if (isConfigured) colors.accentVerdigris else colors.accentEcru
 
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        RocheSectionHeader(label = "Server & Sync")
-        RocheSurfaceCard {
-            Row(
-                modifier =
-                    Modifier.fillMaxWidth()
-                        .clickable(onClick = onOpenServerPage)
-                        .semantics { role = Role.Button }
-                        .padding(horizontal = 14.dp, vertical = 13.dp)
-                        .testTag("settings_server_row"),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                SettingsIconContainer {
-                    ServerRackIcon(tint = colors.accentVerdigris, size = 18.dp)
-                }
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(7.dp),
-                    ) {
-                        Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(dotColor))
-                        Text(
-                            text = hostLabel,
-                            color = colors.textPrimary,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Text(
-                        text = subtitle,
-                        color = colors.textMuted,
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                HeaderActionButton(
-                    label = "Sync",
-                    onClick = { onAction(MainAction.SyncNow) },
-                )
-                Text(text = "›", color = colors.textMuted, fontSize = 18.sp)
-            }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 14.dp, vertical = 13.dp)
+                .testTag("settings_server_row"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        SettingsIconContainer {
+            ServerRackIcon(tint = colors.accentVerdigris, size = 17.dp)
         }
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(dotColor))
+                Text(
+                    text = hostLabel,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = subtitle,
+                color = colors.textMuted,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        HeaderActionButton(label = "Sync", onClick = onSync)
+        Text(text = "›", color = colors.textMuted, fontSize = 18.sp)
     }
 }
 
-private fun resolveServerSummarySubtitle(
-    state: MainUiState,
-    isConfigured: Boolean,
-): String {
-    if (!isConfigured) return "Tap to pair device or set Server URL"
-    if (state.activePeers.isEmpty()) return "Paired via Tailscale · Tap to configure"
-    val peerNoun = if (state.activePeers.size == 1) "peer" else "peers"
-    return "${state.activePeers.size} active $peerNoun · Cooperative sync"
-}
-
 @Composable
-internal fun AppearanceCardSection(
+private fun SettingsMoreViewsCard(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        RocheSectionHeader(label = "Appearance & Reading")
+    val currentTabs = AppTab.normalizeBottomTabs(state.settings.bottomNavTabs)
+    val unpinnedTabs =
+        AppTab.bottomTabCandidates.filter { it !in currentTabs && it != AppTab.SETTINGS }
+    if (unpinnedTabs.isEmpty()) return
+
+    val totalStarred =
+        remember(state.starredEntries, state.catalog.entriesByCollectionId) {
+            (state.starredEntries.map { it.id } +
+                    state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID].orEmpty().map {
+                        it.entry.id
+                    })
+                .distinct()
+                .size
+        }
+
+    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        RocheSectionHeader(label = "More Views")
         RocheSurfaceCard {
-            ThemeAndFontPickers(state = state, onAction = onAction)
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            SegmentedSettingBlock(
-                title = "Inbox Row Density",
-                currentLabel =
-                    if (state.settings.ultraDenseRows) "1-line compact" else "2-line + snippet",
-            ) {
-                SegmentedOptionButton(
-                    label = "Comfortable",
-                    selected = !state.settings.ultraDenseRows,
-                    onClick = { onAction(MainAction.SetUltraDenseRows(false)) },
-                    modifier = Modifier.testTag("density_comfortable_btn"),
-                )
-                SegmentedOptionButton(
-                    label = "Compact 1-Line",
-                    selected = state.settings.ultraDenseRows,
-                    onClick = { onAction(MainAction.SetUltraDenseRows(true)) },
-                    modifier = Modifier.testTag("density_compact_btn"),
-                )
-            }
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
-                SettingToggleRow(
-                    title = "Swipe-Left to Archive",
-                    subtitle = "Swipe rows in Inbox alongside the archive icon",
-                    checked = state.settings.swipeToArchive,
-                    onCheckedChange = { onAction(MainAction.SetSwipeToArchive(it)) },
-                )
+            unpinnedTabs.forEachIndexed { idx, tab ->
+                if (idx > 0) {
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
+                }
+                SettingsDrilldownRow(
+                    title = "Open ${tab.label}",
+                    subtitle = resolveUnpinnedTabSubtitle(tab, state, totalStarred),
+                    onClick = { onAction(MainAction.SelectTab(tab)) },
+                    modifier = Modifier.testTag("settings_unpinned_tab_${tab.name.lowercase()}"),
+                ) {
+                    BottomTabIcon(tab = tab, tint = colors.accentEcru, size = 17.dp)
+                }
             }
         }
     }
+}
+
+@Composable
+internal fun SettingsAppearancePage(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        SettingsSubPageHeader(title = "Appearance & Reading", onBack = onBack)
+        Column(
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                RocheSectionHeader(label = "Theme & Typography")
+                RocheSurfaceCard {
+                    ThemeAndFontPickers(state = state, onAction = onAction)
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                RocheSectionHeader(label = "Inbox & Home")
+                RocheSurfaceCard {
+                    InboxAndHomeSettingsContent(state = state, onAction = onAction)
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
+
+@Composable
+private fun InboxAndHomeSettingsContent(
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    SegmentedSettingBlock(
+        title = "Inbox Row Density",
+        currentLabel = if (state.settings.ultraDenseRows) "1-line compact" else "2-line + snippet",
+    ) {
+        SegmentedOptionButton(
+            label = "Comfortable",
+            selected = !state.settings.ultraDenseRows,
+            onClick = { onAction(MainAction.SetUltraDenseRows(false)) },
+            modifier = Modifier.testTag("density_comfortable_btn"),
+        )
+        SegmentedOptionButton(
+            label = "Compact 1-Line",
+            selected = state.settings.ultraDenseRows,
+            onClick = { onAction(MainAction.SetUltraDenseRows(true)) },
+            modifier = Modifier.testTag("density_compact_btn"),
+        )
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) {
+        SettingToggleRow(
+            title = "Swipe-Left to Archive",
+            subtitle = "Swipe rows in Inbox alongside the archive icon",
+            checked = state.settings.swipeToArchive,
+            onCheckedChange = { onAction(MainAction.SetSwipeToArchive(it)) },
+        )
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
+    Column(
+        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        SettingToggleRow(
+            title = "Active List Draws on Home",
+            subtitle = "Show random daily draws from generator-enabled lists on Home.",
+            checked = state.settings.showCollectionDrawsOnHome,
+            onCheckedChange = { onAction(MainAction.SetShowCollectionDrawsOnHome(it)) },
+            modifier = Modifier.testTag("collection_draws_home_toggle"),
+        )
+        HomeDrawsStatusLines(state = state)
+    }
+}
+
+@Composable
+internal fun SettingsDataPage(
+    feedCount: Int,
+    onImportOpml: () -> Unit,
+    onExportOpml: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(modifier = Modifier.fillMaxSize()) {
+        SettingsSubPageHeader(title = "Subscriptions & Data", onBack = onBack)
+        Column(
+            modifier =
+                Modifier.fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            RocheSectionHeader(label = "OPML Feeds")
+            RocheSurfaceCard {
+                SettingsDrilldownRow(
+                    title = "Import OPML Subscriptions…",
+                    subtitle = "Import RSS, Podcasts, YouTube & arXiv feeds from an .opml file",
+                    onClick = onImportOpml,
+                    modifier = Modifier.testTag("import_opml_btn"),
+                ) {
+                    DocumentOpmlIcon(tint = colors.textSecondary, size = 17.dp)
+                }
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+                SettingsDrilldownRow(
+                    title = "Export OPML Backup…",
+                    subtitle = "Save all $feedCount subscribed feeds as XML",
+                    onClick = onExportOpml,
+                    modifier = Modifier.testTag("export_opml_btn"),
+                ) {
+                    DocumentOpmlIcon(tint = colors.textSecondary, size = 17.dp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun SettingsSubPageHeader(
+    title: String,
+    onBack: () -> Unit,
+    content: (@Composable () -> Unit)? = null,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .statusBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.minimumInteractiveComponentSize()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onBack)
+                    .semantics { role = Role.Button }
+                    .padding(horizontal = 4.dp, vertical = 4.dp)
+                    .testTag("settings_subpage_back_btn"),
+        ) {
+            Text(text = "← Settings", color = colors.accentBlue, fontSize = 13.sp)
+        }
+        Text(
+            text = title,
+            color = colors.textPrimary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 17.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (content != null) {
+            content()
+        }
+    }
+    HorizontalDivider(color = colors.border, thickness = 1.dp)
 }
 
 @Composable
@@ -322,94 +517,6 @@ internal fun ThemeAndFontPickers(
 }
 
 @Composable
-internal fun NavigationSummaryCardSection(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-    onOpenNavPage: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    val currentTabs = AppTab.normalizeBottomTabs(state.settings.bottomNavTabs)
-    val summary = currentTabs.joinToString(" · ") { it.label }
-    val unpinnedTabs =
-        AppTab.bottomTabCandidates.filter { it !in currentTabs && it != AppTab.SETTINGS }
-
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        RocheSectionHeader(label = "Navigation")
-        RocheSurfaceCard {
-            SettingsDrilldownRow(
-                title = "Bottom Navigation Bar",
-                subtitle = summary,
-                onClick = onOpenNavPage,
-                modifier = Modifier.testTag("settings_nav_row"),
-            ) {
-                BottomTabIcon(tab = AppTab.HOME, tint = colors.accentBlue, size = 18.dp)
-            }
-            val totalStarred =
-                remember(state.starredEntries, state.catalog.entriesByCollectionId) {
-                    (state.starredEntries.map { it.id } +
-                            state.catalog.entriesByCollectionId[STARRED_COLLECTION_ID]
-                                .orEmpty()
-                                .map { it.entry.id })
-                        .distinct()
-                        .size
-                }
-            unpinnedTabs.forEach { unpinnedTab ->
-                val unpinnedSubtitle =
-                    when (unpinnedTab) {
-                        AppTab.HOME -> "Quick access to your unpinned Home widgets"
-                        AppTab.INBOX -> "Read-only chronological stream from subscribed feeds"
-                        AppTab.DIARY ->
-                            "Chronological consumption log (${state.catalog.consumedCount} logged)"
-                        AppTab.QUEUE ->
-                            "${state.queueEntries.size} up next · ${state.catalog.wantItemCount} want"
-                        AppTab.OFFLINE ->
-                            "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
-                        AppTab.STARRED ->
-                            "Quick access to your unpinned tab ($totalStarred starred)"
-                        AppTab.LISTS -> "Ranked collections & custom lists"
-                        else -> "Quick access to your unpinned tab"
-                    }
-                HorizontalDivider(color = colors.border, thickness = 1.dp)
-                SettingsDrilldownRow(
-                    title = "Open ${unpinnedTab.label}",
-                    subtitle = unpinnedSubtitle,
-                    onClick = { onAction(MainAction.SelectTab(unpinnedTab)) },
-                    modifier =
-                        Modifier.testTag("settings_unpinned_tab_${unpinnedTab.name.lowercase()}"),
-                ) {
-                    BottomTabIcon(tab = unpinnedTab, tint = colors.accentEcru, size = 18.dp)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-internal fun HomeWidgetsCardSection(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        RocheSectionHeader(label = "Home Widgets")
-        RocheSurfaceCard {
-            Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                SettingToggleRow(
-                    title = "Active List Draws",
-                    subtitle = "Show active random draws from generator-enabled lists on Home.",
-                    checked = state.settings.showCollectionDrawsOnHome,
-                    onCheckedChange = { onAction(MainAction.SetShowCollectionDrawsOnHome(it)) },
-                    modifier = Modifier.testTag("collection_draws_home_toggle"),
-                )
-                HomeDrawsStatusLines(state = state)
-            }
-        }
-    }
-}
-
-@Composable
 internal fun HomeDrawsStatusLines(state: MainUiState) {
     val enabled = state.enabledGenerators
     if (!state.settings.showCollectionDrawsOnHome || enabled.isEmpty()) return
@@ -419,8 +526,7 @@ internal fun HomeDrawsStatusLines(state: MainUiState) {
         val summary =
             if (draw != null) {
                 val byPart = draw.creator.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
-                "${gen.collectionTitle} (${gen.completedCount}/${gen.totalCount}): " +
-                    "${draw.title}$byPart"
+                "${gen.collectionTitle} (${gen.completedCount}/${gen.totalCount}): ${draw.title}$byPart"
             } else {
                 "${gen.collectionTitle}: pool complete (${gen.completedCount}/${gen.totalCount})"
             }
@@ -436,37 +542,6 @@ internal fun HomeDrawsStatusLines(state: MainUiState) {
 }
 
 @Composable
-internal fun SubscriptionsCardSection(
-    feedCount: Int,
-    onImportOpml: () -> Unit,
-    onExportOpml: () -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        RocheSectionHeader(label = "Subscriptions & Data")
-        RocheSurfaceCard {
-            SettingsDrilldownRow(
-                title = "Import OPML Subscriptions…",
-                subtitle = "Import RSS, YouTube & arXiv feeds from an .opml file",
-                onClick = onImportOpml,
-                modifier = Modifier.testTag("import_opml_btn"),
-            ) {
-                DocumentOpmlIcon(tint = colors.textSecondary, size = 18.dp)
-            }
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
-            SettingsDrilldownRow(
-                title = "Export OPML Backup…",
-                subtitle = "Save all $feedCount subscribed feeds as XML",
-                onClick = onExportOpml,
-                modifier = Modifier.testTag("export_opml_btn"),
-            ) {
-                DocumentOpmlIcon(tint = colors.textSecondary, size = 18.dp)
-            }
-        }
-    }
-}
-
-@Composable
 internal fun SegmentedSettingBlock(
     title: String,
     currentLabel: String,
@@ -475,20 +550,15 @@ internal fun SegmentedSettingBlock(
     val colors = LocalRocheColors.current
     val pickerShape = RoundedCornerShape(9.dp)
     Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 13.dp),
+        verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = title,
-                color = colors.textPrimary,
-                fontSize = 13.5.sp,
-                fontWeight = FontWeight.Medium,
-            )
+            Text(text = title, color = colors.textPrimary, fontSize = 14.sp)
             Text(text = currentLabel, color = colors.textMuted, fontSize = 11.5.sp)
         }
         Row(
@@ -498,7 +568,7 @@ internal fun SegmentedSettingBlock(
                     .background(colors.background)
                     .border(1.dp, colors.border, pickerShape)
                     .padding(3.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
             content = content,
         )
     }
@@ -515,10 +585,9 @@ internal fun RowScope.SegmentedOptionButton(
 ) {
     val colors = LocalRocheColors.current
     val shape = RoundedCornerShape(6.dp)
-    val bg = if (selected) colors.surfaceElevated else Color.Transparent
-    val border = if (selected) colors.accentBlue else Color.Transparent
-    val textColor = if (selected) colors.textPrimary else colors.textSecondary
-    val weight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val textColor = if (selected) colors.accentBlue else colors.textSecondary
+    val weight = if (selected) FontWeight.Medium else FontWeight.Normal
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -526,10 +595,9 @@ internal fun RowScope.SegmentedOptionButton(
         modifier =
             modifier
                 .weight(1f)
-                .heightIn(min = 48.dp)
+                .heightIn(min = 42.dp)
                 .clip(shape)
                 .background(bg)
-                .border(1.dp, border, shape)
                 .clickable(onClick = onClick)
                 .semantics {
                     role = Role.Tab
@@ -540,7 +608,7 @@ internal fun RowScope.SegmentedOptionButton(
         if (swatchColor != null) {
             Box(
                 modifier =
-                    Modifier.size(10.dp)
+                    Modifier.size(9.dp)
                         .clip(CircleShape)
                         .background(swatchColor)
                         .border(0.75.dp, colors.controlOutline, CircleShape)
@@ -551,7 +619,7 @@ internal fun RowScope.SegmentedOptionButton(
             text = label,
             color = textColor,
             fontFamily = fontFamily,
-            fontSize = 12.sp,
+            fontSize = 12.5.sp,
             fontWeight = weight,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -579,12 +647,12 @@ internal fun SettingsDrilldownRow(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         SettingsIconContainer(content = content)
-        Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = title,
                 color = colors.textPrimary,
                 fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
+                fontWeight = FontWeight.Normal,
             )
             Text(
                 text = subtitle,
@@ -613,6 +681,39 @@ internal fun SettingsIconContainer(content: @Composable () -> Unit) {
         content()
     }
 }
+
+private fun buildAppearanceSummary(state: MainUiState): String {
+    val theme = if (state.settings.themeMode == ThemeMode.LIGHT) "Paper Light" else "Dark Ink"
+    val font = if (state.settings.headlineFont == HeadlineFont.SERIF) "Serif" else "Sans"
+    val density = if (state.settings.ultraDenseRows) "Compact" else "Comfortable"
+    return "$theme · $font · $density"
+}
+
+private fun resolveServerSummarySubtitle(
+    state: MainUiState,
+    isConfigured: Boolean,
+): String {
+    if (!isConfigured) return "Tap to pair device or set Server URL"
+    if (state.activePeers.isEmpty()) return "Paired via Tailscale · Tap to configure"
+    val peerNoun = if (state.activePeers.size == 1) "peer" else "peers"
+    return "${state.activePeers.size} active $peerNoun · Cooperative sync"
+}
+
+private fun resolveUnpinnedTabSubtitle(
+    tab: AppTab,
+    state: MainUiState,
+    totalStarred: Int,
+): String =
+    when (tab) {
+        AppTab.HOME -> "Quick access to Home widgets"
+        AppTab.INBOX -> "Chronological stream from subscribed feeds"
+        AppTab.DIARY -> "Chronological consumption log (${state.catalog.consumedCount} logged)"
+        AppTab.QUEUE -> "${state.queueEntries.size} up next · ${state.catalog.wantItemCount} want"
+        AppTab.OFFLINE -> "${state.offlineEntries.size} cached articles & episodes"
+        AppTab.STARRED -> "$totalStarred starred entries"
+        AppTab.LISTS -> "Ranked collections & custom lists"
+        else -> "Open ${tab.label}"
+    }
 
 private const val DARK_INK_SWATCH = 0xFF141413
 private const val PAPER_LIGHT_SWATCH = 0xFFE4DFDA

@@ -47,7 +47,6 @@ import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
-import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import java.net.URI
 import kotlinx.coroutines.delay
@@ -58,7 +57,6 @@ internal fun SettingsServerPage(
     onAction: (MainAction) -> Unit,
     onBack: () -> Unit,
 ) {
-    val colors = LocalRocheColors.current
     var serverUrl by rememberSaveable { mutableStateOf(state.settings.serverUrl) }
     var bearerToken by remember { mutableStateOf(state.settings.bearerToken) }
     var lastSavedBearerToken by remember { mutableStateOf(state.settings.bearerToken) }
@@ -91,18 +89,7 @@ internal fun SettingsServerPage(
     )
 
     Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(
-            title = "Server & Pairing",
-            navigationAction = {
-                HeaderActionButton(
-                    label = "←",
-                    contentDescription = "Back",
-                    onClick = onBack,
-                    modifier = Modifier.testTag("settings_subpage_back_btn"),
-                )
-            },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
+        SettingsSubPageHeader(title = "Server & Pairing", onBack = onBack)
 
         ServerPageScrollBody(
             state = state,

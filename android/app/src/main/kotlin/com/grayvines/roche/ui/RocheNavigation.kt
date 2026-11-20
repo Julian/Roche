@@ -30,7 +30,11 @@ sealed interface SettingsNavKey : NavKey {
 
     @Serializable data object Server : SettingsNavKey
 
+    @Serializable data object Appearance : SettingsNavKey
+
     @Serializable data object Navigation : SettingsNavKey
+
+    @Serializable data object Data : SettingsNavKey
 }
 
 internal fun deriveRocheBackStack(

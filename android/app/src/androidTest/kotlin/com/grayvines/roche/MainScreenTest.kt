@@ -157,7 +157,9 @@ class MainScreenTest {
         }
 
         composeRule.onNodeWithTag("settings_server_row").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_appearance_row").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_nav_row").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_data_row").performScrollTo().assertExists()
         composeRule
             .onNodeWithText("Home · Inbox · Lists · Feeds · Stars")
             .performScrollTo()
@@ -166,9 +168,16 @@ class MainScreenTest {
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_settings").assertDoesNotExist()
+
+        composeRule.onNodeWithTag("settings_appearance_row").performScrollTo().performClick()
+        composeRule.onNodeWithTag("theme_dark_btn").assertExists()
         composeRule.onNodeWithTag("collection_draws_home_toggle").performScrollTo().assertExists()
-        composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
-        composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_subpage_back_btn").performClick()
+
+        composeRule.onNodeWithTag("settings_data_row").performScrollTo().performClick()
+        composeRule.onNodeWithTag("import_opml_btn").assertExists()
+        composeRule.onNodeWithTag("export_opml_btn").assertExists()
+        composeRule.onNodeWithTag("settings_subpage_back_btn").performClick()
 
         composeRule.onNodeWithTag("settings_nav_row").performScrollTo().performClick()
         composeRule.onNodeWithText("Navigation Bar").assertExists()
