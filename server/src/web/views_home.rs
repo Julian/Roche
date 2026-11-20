@@ -12,7 +12,7 @@ use super::{
     html::{
         ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, content_type_badge_class,
         content_type_label, esc, redirect_with_flash, render_diary_row_with_tier,
-        render_feed_favicon, render_inline_csrf_form, render_page, urlencode,
+        render_feed_favicon, render_inline_csrf_form, render_page, safe_local_redirect, urlencode,
         web_api_error_response,
     },
     links::{
@@ -40,12 +40,16 @@ pub(super) struct GeneratorToggleForm {
     pub enabled: String,
     #[serde(default)]
     pub redirect_list: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct GeneratorNotesForm {
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 pub(super) async fn home_get<F: FeedFetcher>(
@@ -673,8 +677,10 @@ pub(super) async fn post_generator_toggle<F: FeedFetcher>(
             } else {
                 format!("Paused active draw for '{}'", state.collection_title)
             };
-            let to_list = form.redirect_list.as_deref().is_some_and(|v| v == "true" || v == "1");
-            if to_list {
+            if form.return_to.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                let target = safe_local_redirect(form.return_to.as_deref(), "/");
+                redirect_with_flash(&target, "notice", &msg)
+            } else if form.redirect_list.as_deref().is_some_and(|v| v == "true" || v == "1") {
                 let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
                 redirect_with_flash(&format!("/lists/{}", urlencode(list_key)), "notice", &msg)
             } else {
@@ -741,7 +747,8 @@ pub(super) async fn post_generator_abandon<F: FeedFetcher>(
                 .as_ref()
                 .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
             let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
-            redirect_with_flash("/", "notice", &notice)
+            let target = safe_local_redirect(form.return_to.as_deref(), "/");
+            redirect_with_flash(&target, "notice", &notice)
         }
         Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
     }

@@ -1517,6 +1517,117 @@
     }
   };
 
+  const initListFilter = () => {
+    const tbody = document.getElementById("roche-ranked-tbody");
+    if (!tbody || tbody.dataset.bound === "1") return;
+    tbody.dataset.bound = "1";
+    const input = document.getElementById("roche-list-search");
+    const pills = Array.from(document.querySelectorAll(".js-tier-pill"));
+    const distRows = Array.from(document.querySelectorAll(".js-tier-dist-btn"));
+    let activeTier = "all";
+
+    const syncButtons = () => {
+      for (const p of pills) {
+        const isCur = (p.getAttribute("data-tier") || "all") === activeTier;
+        p.classList.toggle("is-active", isCur);
+        p.setAttribute("aria-pressed", isCur ? "true" : "false");
+      }
+      for (const r of distRows) {
+        const isCur = (r.getAttribute("data-tier") || "") === activeTier;
+        r.classList.toggle("is-active", isCur);
+        r.setAttribute("aria-pressed", isCur ? "true" : "false");
+      }
+    };
+
+    const apply = () => {
+      const q = (input?.value || "").trim().toLowerCase();
+      for (const row of tbody.children) {
+        const hay = (row.getAttribute("data-work-search") || "").toLowerCase();
+        const tier = row.getAttribute("data-tier") || "";
+        const matchTier = activeTier === "all" || tier === activeTier;
+        const matchQuery = !q || hay.includes(q);
+        row.hidden = !(matchTier && matchQuery);
+      }
+    };
+
+    input?.addEventListener("input", apply);
+    for (const pill of pills) {
+      pill.addEventListener("click", () => {
+        activeTier = pill.getAttribute("data-tier") || "all";
+        syncButtons();
+        apply();
+      });
+    }
+    for (const btn of distRows) {
+      btn.addEventListener("click", () => {
+        const t = btn.getAttribute("data-tier") || "all";
+        activeTier = activeTier === t ? "all" : t;
+        syncButtons();
+        apply();
+      });
+    }
+  };
+
+  const initListsViewToggle = () => {
+    const root = document.getElementById("roche-lists-main");
+    const btns = Array.from(document.querySelectorAll(".js-lists-view-btn"));
+    if (!root || btns.length === 0 || root.dataset.viewBound === "1") return;
+    root.dataset.viewBound = "1";
+    const VIEW_KEY = "roche_lists_view_v1";
+
+    const applyView = (mode) => {
+      const normalized = mode === "compact" ? "compact" : "previews";
+      root.setAttribute("data-lists-view", normalized);
+      for (const b of btns) {
+        const active = b.getAttribute("data-view") === normalized;
+        b.classList.toggle("is-active", active);
+        b.setAttribute("aria-pressed", active ? "true" : "false");
+      }
+    };
+
+    try {
+      const saved = localStorage.getItem(VIEW_KEY);
+      if (saved === "compact" || saved === "previews") applyView(saved);
+    } catch {}
+
+    for (const b of btns) {
+      b.addEventListener("click", () => {
+        const mode = b.getAttribute("data-view") || "previews";
+        applyView(mode);
+        try { localStorage.setItem(VIEW_KEY, mode); } catch {}
+      });
+    }
+
+    // Inline "+ New List" toggle button next to Your Lists heading
+    const newListBtn = document.querySelector(".js-new-list-toggle");
+    const newListForm = document.getElementById("roche-new-list-form");
+    if (newListBtn && newListForm && newListBtn.dataset.bound !== "1") {
+      newListBtn.dataset.bound = "1";
+      newListBtn.addEventListener("click", () => {
+        const opening = newListForm.hidden;
+        newListForm.hidden = !opening;
+        newListBtn.setAttribute("aria-expanded", opening ? "true" : "false");
+        if (opening) newListForm.querySelector("input")?.focus();
+      });
+    }
+
+    // Close open Draw popovers on outside click or Escape
+    if (document.body && document.body.dataset.drawPopoverBound !== "1") {
+      document.body.dataset.drawPopoverBound = "1";
+      document.addEventListener("click", (ev) => {
+        for (const d of document.querySelectorAll(".draw-badge-details[open]")) {
+          if (!d.contains(ev.target)) d.open = false;
+        }
+      });
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape") return;
+        for (const d of document.querySelectorAll(".draw-badge-details[open]")) {
+          d.open = false;
+        }
+      });
+    }
+  };
+
   const initPageWidgets = () => {
     initReaderProgress();
     initReaderExtras();
@@ -1526,6 +1637,8 @@
     initSleeveDrawers();
     initSidebarFeedFilter();
     initFeedsFilter();
+    initListFilter();
+    initListsViewToggle();
     initFaviconFallbacks();
     initOptimisticStars();
   };

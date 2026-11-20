@@ -1767,7 +1767,33 @@ async fn test_web_csp_a11y_and_reader_link_existence() {
         read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
     assert!(articles_list_html.contains("Quick Logged Article"));
     assert!(!articles_list_html.contains(&format!("/reader/{}", quick_logged_art.id)));
-    assert!(articles_list_html.contains("<span class=\"sr-only\">Score "));
+    // Unranked lists omit empty Tier/Score columns until comparisons exist
+    assert!(!articles_list_html.contains("<span class=\"sr-only\">Score "));
+
+    let second_art = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Article),
+            title: "Second Logged Article".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog()
+        .log_consumption(&second_art.id, ConsumptionStatus::Consumed, None, None)
+        .await
+        .unwrap();
+    db.catalog()
+        .append_comparison(
+            None,
+            &[vec![quick_logged_art.id.clone()], vec![second_art.id.clone()]],
+            None,
+        )
+        .await
+        .unwrap();
+    let ranked_articles_html =
+        read_body_html(get_authed(&app, "/lists/articles", &cookie).await).await;
+    assert!(ranked_articles_html.contains("<span class=\"sr-only\">Score "));
 
     let manual_list = db
         .catalog()

@@ -433,11 +433,11 @@ test.describe('Roche Web Accessibility (WCAG 2.1/2.2 AA + Best Practices + Contr
 
     // 2. Real form flow: create a manual list and add a work via the actual template controls
     await gotoAndAssertOk(page, baseUrl, '/lists', '/lists');
-    const createSummary = page.locator('details.editorial-panel > summary', {
-      hasText: 'New Manual List',
+    const createToggle = page.locator('button.js-new-list-toggle', {
+      hasText: 'New List',
     });
-    await expect(createSummary).toBeVisible();
-    await createSummary.click();
+    await expect(createToggle).toBeVisible();
+    await createToggle.click();
     const listTitleInput = page.locator('#list-title');
     await expect(listTitleInput).toBeVisible();
     await listTitleInput.fill('Accessibility Audit List');
