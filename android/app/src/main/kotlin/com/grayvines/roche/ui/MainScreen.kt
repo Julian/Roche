@@ -52,6 +52,8 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.generatorFor
@@ -269,11 +271,17 @@ private data class MainChromeFlags(
 private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
     val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
     val topTab = (topKey as? RocheNavKey.Tab)?.tab
-    val isHomeTop = topTab == AppTab.HOME
     val isInboxTop = topKey is RocheNavKey.ScopedInbox || topTab == AppTab.INBOX
-    val isFeedsTop = topTab == AppTab.FEEDS
+    val hasHeaderSearch =
+        isInboxTop ||
+            topTab == AppTab.HOME ||
+            topTab == AppTab.FEEDS ||
+            topTab == AppTab.LISTS ||
+            topTab == AppTab.DIARY ||
+            topTab == AppTab.QUEUE ||
+            topTab == AppTab.STARRED
     val hasFab = showChrome && topKey !is RocheNavKey.Search && topTab != AppTab.SETTINGS
-    val showSearchFab = hasFab && !isHomeTop && !isInboxTop && !isFeedsTop
+    val showSearchFab = hasFab && !hasHeaderSearch
     val showAddFab = hasFab && !isInboxTop
     return MainChromeFlags(
         showChrome = showChrome,
@@ -337,7 +345,7 @@ internal fun MainDestinationScaffold(
                     showSearchFab = showSearchFab,
                     showAddFab = showAddFab,
                     onOpenSearch = { onAction(MainAction.OpenSearch) },
-                    onOpenAddSheet = { onAction(MainAction.OpenAddSheet()) },
+                    onOpenAddSheet = { onAction(resolveAddFabAction(state)) },
                 )
             }
         },
@@ -873,8 +881,10 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 upNextListState = scrollStates.lazyListState("queue:up_next"),
+                wantListState = scrollStates.lazyListState("queue:want"),
                 historyListState = scrollStates.lazyListState("queue:history"),
                 activeAudioEntryId = activeAudioEntryId,
+                onOpenExternalUrl = onOpenExternalUrl,
             )
         AppTab.STARRED ->
             StarredTabContent(
@@ -904,6 +914,13 @@ internal fun MainTabDestinationContent(
                 onOpenCollectionDraw = onOpenCollectionDraw,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
+        AppTab.DIARY ->
+            DiaryScreen(
+                state = state,
+                onAction = onAction,
+                listState = scrollStates.lazyListState("diary"),
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
         AppTab.SETTINGS ->
             SettingsTabContent(
                 state = state,
@@ -911,6 +928,45 @@ internal fun MainTabDestinationContent(
                 onImportOpml = onImportOpml,
                 onExportOpml = onExportOpml,
             )
+    }
+}
+
+private fun resolveAddFabAction(state: MainUiState): MainAction =
+    when (state.activeTab) {
+        AppTab.LISTS -> resolveListsFabAction(state)
+        AppTab.DIARY -> MainAction.OpenQuickLogSheet(defaultToWant = false)
+        AppTab.STARRED ->
+            MainAction.OpenQuickLogSheet(
+                defaultToWant = false,
+                targetCollectionId = STARRED_COLLECTION_ID,
+                targetCollectionTitle = "Starred",
+            )
+        AppTab.QUEUE -> resolveQueueFabAction(state)
+        else -> MainAction.OpenAddSheet()
+    }
+
+private fun resolveListsFabAction(state: MainUiState): MainAction {
+    val activeList =
+        state.selectedCatalogCollectionId?.let { id ->
+            state.catalog.lists.firstOrNull { it.collectionId == id }
+        }
+    val editable = isEditableManualUserList(activeList)
+    return MainAction.OpenQuickLogSheet(
+        defaultToWant = false,
+        targetCollectionId = activeList?.collectionId?.takeIf { editable },
+        targetCollectionTitle = activeList?.title?.takeIf { editable },
+    )
+}
+
+private fun resolveQueueFabAction(state: MainUiState): MainAction {
+    val isWantToRead =
+        state.queueSubTab == QueueSubTab.WANT &&
+            (state.selectedWantCollectionId == null ||
+                state.selectedWantCollectionId == WANT_TO_READ_COLLECTION_ID)
+    return if (state.queueSubTab == QueueSubTab.WANT && !isWantToRead) {
+        MainAction.OpenQuickLogSheet(defaultToWant = true)
+    } else {
+        MainAction.OpenAddSheet()
     }
 }
 
@@ -965,9 +1021,10 @@ internal fun readerBackLabel(state: MainUiState): String =
         state.isSearchOpen -> "← Search"
         state.activeTab == AppTab.HOME -> "← Home"
         state.activeTab == AppTab.QUEUE -> "← Queue"
-        state.activeTab == AppTab.STARRED -> "← Starred"
+        state.activeTab == AppTab.STARRED -> "← Stars"
         state.activeTab == AppTab.OFFLINE -> "← Offline"
         state.activeTab == AppTab.LISTS -> "← Lists"
+        state.activeTab == AppTab.DIARY -> "← Diary"
         state.selectedFeedId != null -> "← ${state.selectedFeedTitle ?: "Feed"}"
         state.selectedTag != null -> "← #${state.selectedTag}"
         else -> "← Inbox"

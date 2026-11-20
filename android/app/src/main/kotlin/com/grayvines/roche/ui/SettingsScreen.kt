@@ -358,14 +358,15 @@ internal fun NavigationSummaryCardSection(
                     when (unpinnedTab) {
                         AppTab.HOME -> "Quick access to your unpinned Home widgets"
                         AppTab.INBOX -> "Read-only chronological stream from subscribed feeds"
+                        AppTab.DIARY ->
+                            "Chronological consumption log (${state.catalog.consumedCount} logged)"
                         AppTab.QUEUE ->
-                            "Quick access to your unpinned tab (${state.queueEntries.size} queued)"
+                            "${state.queueEntries.size} up next · ${state.catalog.wantItemCount} want"
                         AppTab.OFFLINE ->
                             "Quick access to your unpinned tab (${state.offlineEntries.size} cached)"
                         AppTab.STARRED ->
                             "Quick access to your unpinned tab ($totalStarred starred)"
-                        AppTab.LISTS ->
-                            "Lists, Diary, Want Queues & rankings (${state.catalog.consumedCount} logged)"
+                        AppTab.LISTS -> "Ranked collections & custom lists"
                         else -> "Quick access to your unpinned tab"
                     }
                 HorizontalDivider(color = colors.border, thickness = 1.dp)

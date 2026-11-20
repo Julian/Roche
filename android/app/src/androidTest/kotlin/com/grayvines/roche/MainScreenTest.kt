@@ -162,6 +162,7 @@ class MainScreenTest {
             .onNodeWithText("Home · Inbox · Lists · Feeds · Stars")
             .performScrollTo()
             .assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_diary").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_settings").assertDoesNotExist()

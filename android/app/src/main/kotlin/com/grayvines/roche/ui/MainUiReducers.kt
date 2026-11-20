@@ -23,6 +23,12 @@ private fun reduceNavigationUiAction(
                 .clearSearch()
                 .copy(
                     activeTab = action.tab,
+                    selectedCatalogCollectionId =
+                        if (action.tab == AppTab.LISTS && state.activeTab == AppTab.LISTS) {
+                            null
+                        } else {
+                            state.selectedCatalogCollectionId
+                        },
                     selectedReaderEntryId = null,
                     readerContent = null,
                     selectedFeedId = null,
@@ -161,6 +167,7 @@ private fun reduceCatalogUiAction(
     when (action) {
         is MainAction.OpenCompanionSection -> reduceOpenCompanionSection(state, action)
         is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
+        is MainAction.SelectQueueSubTab -> state.copy(queueSubTab = action.subTab)
         is MainAction.SelectCatalogCollection ->
             state.copy(selectedCatalogCollectionId = action.collectionId)
         is MainAction.SelectWantCollection ->
@@ -187,14 +194,26 @@ private fun reduceCatalogUiAction(
 private fun reduceOpenCompanionSection(
     state: TransientUiState,
     action: MainAction.OpenCompanionSection,
-): TransientUiState =
-    state
+): TransientUiState {
+    val targetTab =
+        when (action.subTab) {
+            CompanionSubTab.LISTS -> AppTab.LISTS
+            CompanionSubTab.DIARY -> AppTab.DIARY
+            CompanionSubTab.WANT -> AppTab.QUEUE
+        }
+    return state
         .clearSearch()
         .copy(
-            activeTab = AppTab.LISTS,
+            activeTab = targetTab,
             companionSubTab = action.subTab,
+            queueSubTab =
+                if (action.subTab == CompanionSubTab.WANT) {
+                    QueueSubTab.WANT
+                } else {
+                    state.queueSubTab
+                },
             selectedCatalogCollectionId =
-                if (action.subTab == CompanionSubTab.LISTS && action.collectionId != null) {
+                if (action.subTab == CompanionSubTab.LISTS) {
                     action.collectionId
                 } else {
                     state.selectedCatalogCollectionId
@@ -211,6 +230,7 @@ private fun reduceOpenCompanionSection(
             selectedTag = null,
             scopeOriginTab = null,
         )
+}
 
 private fun reduceUpdateSearchQuery(state: TransientUiState, query: String): TransientUiState {
     val clean = query.trim()

@@ -66,6 +66,9 @@ fun BottomTabIcon(
             AppTab.LISTS -> {
                 drawListsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
             }
+            AppTab.DIARY -> {
+                drawDiaryTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+            }
             AppTab.OFFLINE -> {
                 drawArrowTray(
                     trayPath = pathA,
@@ -204,6 +207,53 @@ private fun DrawScope.drawListsTabIcon(tint: Color, stroke: Stroke, strokeWidth:
             cap = StrokeCap.Round,
         )
     }
+}
+
+private fun DrawScope.drawDiaryTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
+    val w = size.width
+    val h = size.height
+    drawRoundRect(
+        color = tint,
+        topLeft = Offset(w * 0.16f, h * 0.22f),
+        size = Size(w * 0.68f, h * 0.62f),
+        cornerRadius = CornerRadius(w * CORNER_FRACTION, w * CORNER_FRACTION),
+        style = stroke,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.34f, h * 0.14f),
+        end = Offset(w * 0.34f, h * 0.28f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.66f, h * 0.14f),
+        end = Offset(w * 0.66f, h * 0.28f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.16f, h * 0.42f),
+        end = Offset(w * 0.84f, h * 0.42f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.30f, h * 0.58f),
+        end = Offset(w * 0.70f, h * 0.58f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
+    drawLine(
+        color = tint,
+        start = Offset(w * 0.30f, h * 0.72f),
+        end = Offset(w * 0.56f, h * 0.72f),
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round,
+    )
 }
 
 /** Crisp magnifying glass icon for the floating Search overlay button and search bar. */

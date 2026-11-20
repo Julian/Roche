@@ -157,6 +157,15 @@ class AccessibilityTest {
     }
 
     @Test
+    fun diaryPassesAccessibilityChecksInDarkTheme() {
+        renderAndAudit(
+            state = populatedState(activeTab = AppTab.DIARY, themeMode = ThemeMode.DARK),
+            expectedVisibleText = "Diary",
+            themeMode = ThemeMode.DARK,
+        )
+    }
+
+    @Test
     fun settingsPassesAccessibilityChecksInDarkTheme() {
         renderAndAudit(
             state = populatedState(activeTab = AppTab.SETTINGS, themeMode = ThemeMode.DARK),

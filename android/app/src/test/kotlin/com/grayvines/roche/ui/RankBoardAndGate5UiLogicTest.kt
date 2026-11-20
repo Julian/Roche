@@ -491,13 +491,13 @@ class RankBoardAndGate5UiLogicTest {
             )
 
             viewModel.dispatch(MainAction.OpenCompanionSection(CompanionSubTab.DIARY))
-            val companionState = viewModel.uiState.first { it.activeTab == AppTab.LISTS }
+            val companionState = viewModel.uiState.first { it.activeTab == AppTab.DIARY }
             assertEquals(CompanionSubTab.DIARY, companionState.companionSubTab)
             assertNull(companionState.selectedFeedId)
             assertNull(companionState.selectedTag)
             assertNull(companionState.scopeOriginTab)
             assertEquals(
-                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Tab(AppTab.LISTS)),
+                listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Tab(AppTab.DIARY)),
                 deriveRocheBackStack(companionState),
             )
 
@@ -509,7 +509,7 @@ class RankBoardAndGate5UiLogicTest {
             )
             val customListState =
                 viewModel.uiState.first {
-                    it.companionSubTab == CompanionSubTab.LISTS &&
+                    it.activeTab == AppTab.LISTS &&
                         it.selectedCatalogCollectionId == "col-essential-cinema"
                 }
             assertEquals(

@@ -34,6 +34,13 @@ enum class CompanionSubTab(val label: String) {
     WANT("Want"),
 }
 
+@Serializable
+enum class QueueSubTab(val label: String) {
+    UP_NEXT("Up Next"),
+    WANT("Want"),
+    HISTORY("History"),
+}
+
 enum class AddSheetMode {
     WANT_TO_READ,
     SUBSCRIBE_FEED,
@@ -103,6 +110,7 @@ data class MainUiState(
     val offlineEntries: List<InboxEntry> = computeOfflineEntries(allEntries),
     val catalog: CatalogSnapshot = CatalogSnapshot(),
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
+    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
@@ -388,7 +396,9 @@ sealed interface MainAction {
 
     data class SelectCompanionSubTab(val subTab: CompanionSubTab) : CatalogUi
 
-    data class SelectCatalogCollection(val collectionId: String) : CatalogUi
+    data class SelectQueueSubTab(val subTab: QueueSubTab) : CatalogUi
+
+    data class SelectCatalogCollection(val collectionId: String?) : CatalogUi
 
     data class SelectWantCollection(val collectionId: String) : CatalogUi
 
@@ -500,6 +510,7 @@ internal data class TransientUiState(
     val prefilledShareTitle: String = "",
     val isSyncing: Boolean = false,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
+    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
@@ -528,6 +539,7 @@ internal data class SavedNavigationUiState(
     val scopeOriginTab: AppTab? = null,
     val selectedReaderEntryId: String? = null,
     val companionSubTab: CompanionSubTab = CompanionSubTab.LISTS,
+    val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
 )
@@ -543,6 +555,7 @@ internal fun TransientUiState.toSavedNavigationUiState(): SavedNavigationUiState
         scopeOriginTab = scopeOriginTab,
         selectedReaderEntryId = selectedReaderEntryId,
         companionSubTab = companionSubTab,
+        queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
     )
@@ -561,6 +574,7 @@ internal fun SavedNavigationUiState.toInitialTransientUiState(
         selectedReaderEntryId = selectedReaderEntryId,
         hydratingEntryIds = setOfNotNull(selectedReaderEntryId),
         companionSubTab = companionSubTab,
+        queueSubTab = queueSubTab,
         selectedCatalogCollectionId = selectedCatalogCollectionId,
         selectedWantCollectionId = selectedWantCollectionId,
         localNetworkTier = localNetworkTier,
@@ -743,6 +757,7 @@ internal class MainUiStateMemoizer {
             offlineEntries = lastOfflineEntries,
             catalog = snapshot.catalog,
             companionSubTab = local.companionSubTab,
+            queueSubTab = local.queueSubTab,
             selectedCatalogCollectionId = local.selectedCatalogCollectionId,
             selectedWantCollectionId = local.selectedWantCollectionId,
             isQuickLogSheetOpen = local.isQuickLogSheetOpen,
