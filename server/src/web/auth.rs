@@ -14,7 +14,7 @@ use super::{
     MAX_WEB_FORM_BODY_BYTES, MAX_WEB_OPML_BODY_BYTES, OPML_UPLOAD_PATH,
     html::{redirect_see_other, render_error_page, render_login_page},
 };
-use crate::{error::ApiError, scheduler::FeedFetcher, service::RocheService};
+use crate::service::{AppError, RocheService};
 
 pub(super) const SESSION_COOKIE_NAME: &str = "roche_session";
 pub(super) const LOGGED_OUT_COOKIE_NAME: &str = "roche_logged_out";
@@ -162,8 +162,8 @@ pub(super) fn is_same_origin_post(headers: &HeaderMap, expected_https: bool) -> 
 /// strictly requires a loopback TCP peer (`127.0.0.1` / `::1`, i.e. local `tailscale serve` reverse proxy),
 /// `tailscale.enabled == true`, and membership in `tailscale.auto_auth_users`.
 #[must_use]
-fn verified_tailscale_login<F: FeedFetcher>(
-    service: &RocheService<F>,
+fn verified_tailscale_login(
+    service: &RocheService,
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
 ) -> Option<String> {
@@ -183,8 +183,8 @@ fn verified_tailscale_login<F: FeedFetcher>(
     cfg.auto_auth_users.iter().any(|allowed| allowed == &normalized).then_some(normalized)
 }
 
-pub(super) async fn login_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn login_get(
+    State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
 ) -> Response {
@@ -209,8 +209,8 @@ pub(super) async fn login_get<F: FeedFetcher>(
     render_login_page(None, service.config().tailscale.enabled, ts_login.as_deref()).into_response()
 }
 
-pub(super) async fn login_post<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn login_post(
+    State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
@@ -228,8 +228,20 @@ pub(super) async fn login_post<F: FeedFetcher>(
     let ts_login = verified_tailscale_login(&service, peer_addr, &headers);
     let label =
         form.device_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Roche Web");
+    let raw_ts_login_hdr = headers.get(TAILSCALE_LOGIN_HEADER).and_then(|v| v.to_str().ok());
+    let x_forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
 
-    match service.pair_device_for_request(label, &form.pairing_code, peer_addr, &headers).await {
+    match service
+        .auth()
+        .pair_device_for_request(
+            label,
+            &form.pairing_code,
+            peer_addr,
+            raw_ts_login_hdr,
+            x_forwarded_for,
+        )
+        .await
+    {
         Ok(raw_token) => {
             let mut resp = redirect_see_other("/");
             append_set_cookie(&mut resp, &build_session_set_cookie(&raw_token, secure));
@@ -237,13 +249,21 @@ pub(super) async fn login_post<F: FeedFetcher>(
             resp
         }
         Err(err) => {
-            let (status, msg) = match &err {
-                ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.as_str()),
-                ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.as_str()),
-                ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.as_str()),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "Unable to complete browser pairing."),
+            let (status, msg, retry_after) = match &err {
+                AppError::PairingRateLimited { detail, retry_after_seconds } => {
+                    (StatusCode::TOO_MANY_REQUESTS, detail.as_str(), Some(*retry_after_seconds))
+                }
+                AppError::Unauthorized(m)
+                | AppError::TokenInvalid(m)
+                | AppError::PairingCodeInvalid(m) => (StatusCode::UNAUTHORIZED, m.as_str(), None),
+                AppError::BadRequest(m) | AppError::SsrfBlocked(m) => {
+                    (StatusCode::BAD_REQUEST, m.as_str(), None)
+                }
+                _ => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Unable to complete browser pairing.", None)
+                }
             };
-            (
+            let mut resp = (
                 status,
                 render_login_page(
                     Some(msg),
@@ -251,13 +271,19 @@ pub(super) async fn login_post<F: FeedFetcher>(
                     ts_login.as_deref(),
                 ),
             )
-                .into_response()
+                .into_response();
+            if let Some(secs) = retry_after
+                && let Ok(val) = HeaderValue::from_str(&secs.to_string())
+            {
+                resp.headers_mut().insert(header::RETRY_AFTER, val);
+            }
+            resp
         }
     }
 }
 
-pub(super) async fn login_tailscale_post<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn login_tailscale_post(
+    State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
 ) -> Response {
@@ -299,8 +325,8 @@ pub(super) async fn login_tailscale_post<F: FeedFetcher>(
     resp
 }
 
-pub(super) async fn logout_post<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn logout_post(
+    State(service): State<Arc<RocheService>>,
     connect_info: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     Extension(session): Extension<WebSession>,
     headers: HeaderMap,
@@ -318,8 +344,8 @@ pub(super) async fn logout_post<F: FeedFetcher>(
 /// - Authenticates `roche_session` cookie (or loopback `Tailscale-User-Login` on safe `GET`/`HEAD` requests
 ///   when the user has not explicitly logged out).
 /// - Enforces per-session CSRF token validation on all state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`).
-pub(super) async fn require_web_auth_and_csrf<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn require_web_auth_and_csrf(
+    State(service): State<Arc<RocheService>>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -383,8 +409,8 @@ pub(super) async fn require_web_auth_and_csrf<F: FeedFetcher>(
     resp
 }
 
-async fn verify_and_rebuild_mutating_request<F: FeedFetcher>(
-    service: &RocheService<F>,
+async fn verify_and_rebuild_mutating_request(
+    service: &RocheService,
     raw_token: &str,
     session: WebSession,
     req: Request,

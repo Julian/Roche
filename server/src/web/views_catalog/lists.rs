@@ -16,21 +16,17 @@ use super::{
     render_search_kind_options,
 };
 use crate::{
-    db::{
-        CatalogEntry, CollectionGeneratorState, CollectionMode, CollectionRole, EntryKind,
-        RankedCollectionView, UpsertEntryInput,
-    },
-    error::ApiError,
-    scheduler::FeedFetcher,
+    db::{CatalogEntry, CollectionGeneratorState, RankedCollectionView, UpsertEntryInput},
+    domain::{CollectionMode, CollectionRole, EntryKind},
     service::RocheService,
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, parse_csv_list, rank_collection_href,
-            redirect_with_flash, render_inline_csrf_form, render_page, urlencode,
-            web_api_error_response,
+            CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
+            parse_csv_list, rank_collection_href, redirect_with_flash, render_creator_year_meta,
+            render_inline_csrf_form, render_page, urlencode,
         },
-        links::{load_artist_id_by_lower_name, render_creator_links},
+        links::load_artist_id_by_lower_name,
         views_home::render_collection_draw_section,
     },
 };
@@ -38,17 +34,12 @@ use crate::{
 const LIST_PAGE_SIZE: usize = 200;
 const CATALOG_SEARCH_LIMIT: usize = 80;
 
-pub(in crate::web) async fn lists_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn lists_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(query): Query<ListsOverviewQuery>,
-) -> Response {
-    let collections = match service.catalog().list_collections(false, false).await {
-        Ok(cols) => cols,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+) -> Result<Response, WebError> {
+    let collections = service.catalog().list_collections(false, false).await.web_err(&session)?;
 
     let clean_q = query.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let raw_kind = query.kind.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -63,17 +54,15 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
         Some((Vec::new(), HashMap::new(), false))
     } else if is_searching {
         let fetch_limit = if parsed_kind.is_none() { 500 } else { CATALOG_SEARCH_LIMIT + 1 };
-        let non_collections =
-            match service.catalog().search_entries(clean_q, parsed_kind, fetch_limit).await {
-                Ok(rows) => rows
-                    .into_iter()
-                    .filter(|e| e.kind != EntryKind::Collection)
-                    .take(CATALOG_SEARCH_LIMIT + 1)
-                    .collect::<Vec<_>>(),
-                Err(err) => {
-                    return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-                }
-            };
+        let non_collections = service
+            .catalog()
+            .search_entries(clean_q, parsed_kind, fetch_limit)
+            .await
+            .web_err(&session)?
+            .into_iter()
+            .filter(|e| e.kind != EntryKind::Collection)
+            .take(CATALOG_SEARCH_LIMIT + 1)
+            .collect::<Vec<_>>();
         let truncated = non_collections.len() > CATALOG_SEARCH_LIMIT;
         let matched: Vec<CatalogEntry> =
             non_collections.into_iter().take(CATALOG_SEARCH_LIMIT).collect();
@@ -100,10 +89,12 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
     }
     render_lists_overview_table(&mut body, &collections);
 
-    let err =
-        query.err.or_else(|| invalid_kind.map(|bad| format!("Unknown entry kind filter '{bad}'")));
-    let flash = FlashQuery { notice: query.notice, err };
-    render_page(&PageShell {
+    let err = query
+        .flash
+        .err
+        .or_else(|| invalid_kind.map(|bad| format!("Unknown entry kind filter '{bad}'")));
+    let flash = FlashQuery { notice: query.flash.notice, err };
+    Ok(render_page(&PageShell {
         title: "Lists",
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
@@ -111,7 +102,7 @@ pub(in crate::web) async fn lists_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn render_catalog_search_form(
@@ -160,14 +151,13 @@ fn render_catalog_search_results(
             esc(&urlencode(&entry.id)),
             esc(&entry.title),
         );
-        if !entry.creators.is_empty() {
-            out.push_str(" <span class=\"text-soft\">&mdash; ");
-            render_creator_links(out, &entry.creators, artist_links, false);
-            out.push_str("</span>");
-        }
-        if let Some(yr) = entry.release_year {
-            let _ = write!(out, " <span class=\"text-faint\">({yr})</span>");
-        }
+        render_creator_year_meta(
+            out,
+            &entry.creators,
+            entry.release_year,
+            artist_links,
+            CreatorYearStyle::InlineSoft { open_new_tab: false },
+        );
         let _ =
             writeln!(out, " <span class=\"badge\">{}</span></li>", esc(entry.kind.display_label()));
     }
@@ -235,12 +225,12 @@ fn render_lists_overview_table(out: &mut String, collections: &[crate::db::Colle
     out.push_str("</tbody>\n</table>\n");
 }
 
-pub(in crate::web) async fn post_list_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_list_create(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<CreateListForm>,
-) -> Response {
-    let created = service
+) -> Result<Response, WebError> {
+    let col = service
         .catalog()
         .create_manual_collection(
             &form.title,
@@ -249,32 +239,19 @@ pub(in crate::web) async fn post_list_create<F: FeedFetcher>(
             form.summary.as_deref(),
             None,
         )
-        .await;
-    match created {
-        Ok(col) => {
-            let slug = col.slug.as_deref().unwrap_or(&col.id);
-            redirect_with_flash(
-                &format!("/lists/{}", urlencode(slug)),
-                "notice",
-                "Created manual list",
-            )
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+        .await
+        .web_err(&session)?;
+    let slug = col.slug.as_deref().unwrap_or(&col.id);
+    Ok(redirect_with_flash(&format!("/lists/{}", urlencode(slug)), "notice", "Created manual list"))
 }
 
-pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn list_detail_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Query(q): Query<ListPageQuery>,
-) -> Response {
-    let view = match service.catalog().get_ranked_collection(&slug, false).await {
-        Ok(v) => v,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+) -> Result<Response, WebError> {
+    let view = service.catalog().get_ranked_collection(&slug, false).await.web_err(&session)?;
     let total_rows = view.rows.len();
     let total_pages = total_rows.max(1).div_ceil(LIST_PAGE_SIZE);
     let page_num = q.page.unwrap_or(1).clamp(1, total_pages);
@@ -315,21 +292,20 @@ pub(in crate::web) async fn list_detail_get<F: FeedFetcher>(
         &session.csrf_token,
     );
 
-    let flash = FlashQuery { notice: q.notice, err: q.err };
     let active_nav = if view.collection.slug.as_deref() == Some("starred") {
         NavSection::Starred
     } else {
         NavSection::Lists
     };
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: &view.collection.title,
         active: active_nav,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -477,10 +453,13 @@ fn render_ranked_table_row(
         id = esc(&urlencode(&row.entry.id)),
         title = esc(&row.entry.title),
     );
-    render_creators_span(out, &row.entry.creators, artist_links);
-    if let Some(yr) = row.entry.release_year {
-        let _ = write!(out, "<span class=\"year\">({yr})</span>");
-    }
+    render_creator_year_meta(
+        out,
+        &row.entry.creators,
+        row.entry.release_year,
+        artist_links,
+        CreatorYearStyle::TableByYear,
+    );
     if reader_item_ids.contains(&row.entry.id) {
         let _ = write!(
             out,
@@ -576,32 +555,19 @@ fn render_list_pager(
     out.push_str("</nav>\n");
 }
 
-fn render_creators_span(
-    out: &mut String,
-    creators: &[String],
-    artist_links: &HashMap<String, String>,
-) {
-    if creators.is_empty() {
-        return;
-    }
-    out.push_str("<span class=\"by\">");
-    render_creator_links(out, creators, artist_links, false);
-    out.push_str("</span>");
-}
-
-pub(in crate::web) async fn post_list_add_entry<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_list_add_entry(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Form(form): Form<AddListEntryForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let query = form.title_or_id.trim();
     if query.is_empty() {
-        return redirect_with_flash(
+        return Ok(redirect_with_flash(
             &format!("/lists/{}", urlencode(&slug)),
             "err",
             "Title cannot be empty",
-        );
+        ));
     }
 
     let parsed_kind = form
@@ -631,35 +597,22 @@ pub(in crate::web) async fn post_list_add_entry<F: FeedFetcher>(
             release_year: year,
             ..UpsertEntryInput::default()
         };
-        match service.catalog().upsert_entry(&input).await {
-            Ok(created) => created.id,
-            Err(err) => {
-                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-            }
-        }
+        service.catalog().upsert_entry(&input).await.web_err(&session)?.id
     };
 
-    match service.catalog().add_collection_entry(&slug, &entry_id, None).await {
-        Ok(()) => redirect_with_flash(
-            &format!("/lists/{}", urlencode(&slug)),
-            "notice",
-            "Added work to list",
-        ),
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+    service.catalog().add_collection_entry(&slug, &entry_id, None).await.web_err(&session)?;
+    Ok(redirect_with_flash(&format!("/lists/{}", urlencode(&slug)), "notice", "Added work to list"))
 }
 
-pub(in crate::web) async fn post_list_remove_entry<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_list_remove_entry(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((slug, entry_id)): Path<(String, String)>,
-) -> Response {
-    match service.catalog().remove_collection_entry(&slug, &entry_id).await {
-        Ok(_) => redirect_with_flash(
-            &format!("/lists/{}", urlencode(&slug)),
-            "notice",
-            "Removed work from list",
-        ),
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let _ = service.catalog().remove_collection_entry(&slug, &entry_id).await.web_err(&session)?;
+    Ok(redirect_with_flash(
+        &format!("/lists/{}", urlencode(&slug)),
+        "notice",
+        "Removed work from list",
+    ))
 }

@@ -8,19 +8,14 @@ use axum::{
 
 use super::{EntryAddToListForm, EntryLogForm, EntryMergeForm, parse_consumption_status};
 use crate::{
-    db::{
-        CatalogEntry, CollectionMode, CollectionRole, CollectionSummary, ConsumptionStatus,
-        EntryDetailView, EntryKind,
-    },
-    error::ApiError,
-    scheduler::FeedFetcher,
-    service::RocheService,
+    db::{CatalogEntry, CollectionSummary, EntryDetailView},
+    domain::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
+    service::{AppError, EntryListAppearance, RocheService},
     web::{
-        artist_enrich::spawn_artist_enrichment_if_needed,
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, redirect_with_flash, render_page,
-            safe_local_redirect, urlencode, web_api_error_response,
+            FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc, parse_form_bool,
+            redirect_with_flash, render_page, safe_local_redirect, urlencode,
         },
         links::{
             collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
@@ -29,44 +24,40 @@ use crate::{
     },
 };
 
-pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn entry_detail_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    let detail = match service.catalog().get_entry_detail(&id).await {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return web_api_error_response(
-                &ApiError::not_found(format!("Entry '{id}' not found")),
+) -> Result<Response, WebError> {
+    let detail =
+        service.catalog().get_entry_detail(&id).await.web_err(&session)?.ok_or_else(|| {
+            WebError::from_app(
+                AppError::not_found(format!("Entry '{id}' not found")),
                 Some(&session.csrf_token),
-            );
-        }
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
-    spawn_artist_enrichment_if_needed(&service, &detail);
+            )
+        })?;
+    service.enrich().spawn_artist_enrichment_if_needed(&detail);
 
     let mut relevant_creators: Vec<String> = detail.entry.creators.clone();
     relevant_creators.extend(detail.children.iter().flat_map(|c| c.creators.iter().cloned()));
     relevant_creators.extend(detail.parents.iter().flat_map(|p| p.creators.iter().cloned()));
-    let artist_links = load_artist_id_by_lower_name(&service, &relevant_creators).await;
-    let appearances = load_entry_ranked_appearances(&service, &detail).await;
-    let manual_lists = service
-        .catalog()
-        .list_collections(false, false)
-        .await
+    let catalog = service.catalog();
+    let items = service.items();
+    let (artist_links, appearances, collections_res, reader_ids_res) = tokio::join!(
+        load_artist_id_by_lower_name(&service, &relevant_creators),
+        catalog.load_entry_ranked_appearances(&detail),
+        catalog.list_collections(false, false),
+        items.existing_ids(std::slice::from_ref(&detail.entry.id)),
+    );
+    let manual_lists = collections_res
         .unwrap_or_default()
         .into_iter()
         .filter(|c| {
             c.mode == CollectionMode::Manual && !c.has_generator && c.role == CollectionRole::List
         })
         .collect::<Vec<_>>();
-
-    // Check if entry also has an inbox reader view
-    let has_reader_item = service.items().get(&detail.entry.id).await.is_ok();
+    let has_reader_item = reader_ids_res.is_ok_and(|ids| ids.contains(&detail.entry.id));
 
     let mut body = String::with_capacity(8_192);
     render_entry_detail_body(
@@ -79,7 +70,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
         &session.csrf_token,
     );
 
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: &detail.entry.title,
         active: NavSection::Lists,
         csrf_token: &session.csrf_token,
@@ -87,50 +78,7 @@ pub(in crate::web) async fn entry_detail_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
-}
-
-struct EntryListAppearance {
-    slug: String,
-    title: String,
-    rank: usize,
-    total: usize,
-    tier: Option<char>,
-}
-
-async fn load_entry_ranked_appearances<F: FeedFetcher>(
-    service: &RocheService<F>,
-    detail: &EntryDetailView,
-) -> Vec<EntryListAppearance> {
-    let mut candidate_slugs: Vec<String> = Vec::new();
-    if let Some(default_slug) = detail.entry.kind.default_list_slug() {
-        candidate_slugs.push(default_slug.to_owned());
-    }
-    for parent in &detail.parents {
-        if parent.kind == EntryKind::Collection {
-            candidate_slugs.push(parent.id.clone());
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut seen_col_ids = std::collections::HashSet::new();
-    for key in candidate_slugs {
-        // Only show genuine global Lists (`List` / `System`), never `Want`, `Tag`, or `Feed` collections.
-        if let Ok(ranked) = service.catalog().get_ranked_collection(&key, false).await
-            && matches!(ranked.collection.role, CollectionRole::List | CollectionRole::System)
-            && seen_col_ids.insert(ranked.collection.id.clone())
-            && let Some(found) = ranked.rows.iter().find(|r| r.entry.id == detail.entry.id)
-        {
-            out.push(EntryListAppearance {
-                slug: ranked.collection.slug.unwrap_or(ranked.collection.id),
-                title: ranked.collection.title,
-                rank: found.rank,
-                total: ranked.rows.len(),
-                tier: found.tier,
-            });
-        }
-    }
-    out
+    .into_response())
 }
 
 fn render_entry_detail_body(
@@ -373,76 +321,72 @@ fn render_entry_diary_and_actions(
     );
 }
 
-pub(in crate::web) async fn post_entry_log<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_entry_log(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<EntryLogForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let status = parse_consumption_status(&form.status);
-    match service.catalog().log_consumption(&id, status, form.notes.as_deref(), None).await {
-        Ok(logged) => {
-            if status == ConsumptionStatus::Consumed
-                && form.rank_after.as_deref() == Some("1")
-                && let Ok(Some(slug)) =
-                    service.catalog().rank_target_after_consumption(&logged.entry).await
-            {
-                redirect_with_flash(
-                    &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
-                    "notice",
-                    "Logged to Diary",
-                )
-            } else {
-                redirect_with_flash(
-                    &format!("/entries/{}", urlencode(&logged.entry.id)),
-                    "notice",
-                    "Logged to Diary",
-                )
-            }
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+    let logged = service
+        .catalog()
+        .log_consumption(&id, status, form.notes.as_deref(), None)
+        .await
+        .web_err(&session)?;
+    if status == ConsumptionStatus::Consumed
+        && parse_form_bool(form.rank_after.as_deref())
+        && let Ok(Some(slug)) = service.catalog().rank_target_after_consumption(&logged.entry).await
+    {
+        Ok(redirect_with_flash(
+            &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
+            "notice",
+            "Logged to Diary",
+        ))
+    } else {
+        Ok(redirect_with_flash(
+            &format!("/entries/{}", urlencode(&logged.entry.id)),
+            "notice",
+            "Logged to Diary",
+        ))
     }
 }
 
-pub(in crate::web) async fn post_entry_list_add<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_entry_list_add(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<EntryAddToListForm>,
-) -> Response {
-    match service.catalog().add_collection_entry(&form.list_slug_or_id, &id, None).await {
-        Ok(()) => {
-            let fallback = format!("/entries/{}", urlencode(&id));
-            let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
-            let msg = if form.list_slug_or_id == crate::db::WANT_TO_READ_COLLECTION_ID {
-                "Added to Want to Read"
-            } else {
-                "Added to list"
-            };
-            redirect_with_flash(&dest, "notice", msg)
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    service
+        .catalog()
+        .add_collection_entry(&form.list_slug_or_id, &id, None)
+        .await
+        .web_err(&session)?;
+    let fallback = format!("/entries/{}", urlencode(&id));
+    let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
+    let msg = if form.list_slug_or_id == crate::db::WANT_TO_READ_COLLECTION_ID {
+        "Added to Want to Read"
+    } else {
+        "Added to list"
+    };
+    Ok(redirect_with_flash(&dest, "notice", msg))
 }
 
-pub(in crate::web) async fn post_entry_merge<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_entry_merge(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<EntryMergeForm>,
-) -> Response {
-    let target = match service.catalog().resolve_entry(&form.canonical_query, None, None).await {
-        Ok(e) => e,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
-    match service.catalog().merge_entries(&id, &target.id).await {
-        Ok(canon) => redirect_with_flash(
-            &format!("/entries/{}", urlencode(&canon.id)),
-            "notice",
-            "Merged duplicate into canonical entry",
-        ),
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let target = service
+        .catalog()
+        .resolve_entry(&form.canonical_query, None, None)
+        .await
+        .web_err(&session)?;
+    let canon = service.catalog().merge_entries(&id, &target.id).await.web_err(&session)?;
+    Ok(redirect_with_flash(
+        &format!("/entries/{}", urlencode(&canon.id)),
+        "notice",
+        "Merged duplicate into canonical entry",
+    ))
 }

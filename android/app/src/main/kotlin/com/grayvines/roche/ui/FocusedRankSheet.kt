@@ -45,137 +45,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.RankClusterCandidate
-import com.grayvines.roche.data.RankSettlementSummary
+import com.grayvines.roche.data.catalog.RankClusterCandidate
+import com.grayvines.roche.data.catalog.RankSettlementSummary
+import com.grayvines.roche.ranking.RankBoardRowState
+import com.grayvines.roche.ranking.RankBoardState
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
-
-@Suppress("DataClassContainsFunctions")
-internal data class RankBoardState(val buckets: List<List<RankClusterCandidate>>) {
-    val isEmpty: Boolean
-        get() = buckets.isEmpty()
-
-    val size: Int
-        get() = buckets.sumOf { it.size }
-
-    val isAllTied: Boolean
-        get() = buckets.size == 1 && size >= 2
-
-    fun rows(): List<RankBoardRowState> {
-        val result = ArrayList<RankBoardRowState>(size)
-        var flatIdx = 0
-        val totalBuckets = buckets.size
-        buckets.forEachIndexed { bIdx, bucket ->
-            val displayRank = flatIdx + 1
-            val bSize = bucket.size
-            bucket.forEachIndexed { iIdx, candidate ->
-                result.add(
-                    RankBoardRowState(
-                        candidate = candidate,
-                        flatIndex = flatIdx,
-                        displayRank = displayRank,
-                        isTiedWithAbove = iIdx > 0,
-                        canMoveUp = bSize > 1 || bIdx > 0,
-                        canMoveDown = bSize > 1 || bIdx + 1 < totalBuckets,
-                    )
-                )
-                flatIdx++
-            }
-        }
-        return result
-    }
-
-    fun displayRanks(): List<Int> = rows().map { it.displayRank }
-
-    fun toOrderingGroups(): List<List<String>> =
-        buckets.filter { it.isNotEmpty() }.map { bucket -> bucket.map { it.entryId } }
-
-    fun moveUp(entryId: String): RankBoardState {
-        val (bIdx, iIdx) = findCoords(entryId) ?: return this
-        val next = buckets.map { it.toMutableList() }.toMutableList()
-        if (next[bIdx].size > 1) {
-            val item = next[bIdx].removeAt(iIdx)
-            next.add(bIdx, mutableListOf(item))
-        } else if (bIdx > 0) {
-            val prev = next[bIdx - 1]
-            next[bIdx - 1] = next[bIdx]
-            next[bIdx] = prev
-        }
-        return RankBoardState(next)
-    }
-
-    fun moveDown(entryId: String): RankBoardState {
-        val (bIdx, iIdx) = findCoords(entryId) ?: return this
-        val next = buckets.map { it.toMutableList() }.toMutableList()
-        if (next[bIdx].size > 1) {
-            val item = next[bIdx].removeAt(iIdx)
-            next.add(bIdx + 1, mutableListOf(item))
-        } else if (bIdx + 1 < next.size) {
-            val below = next[bIdx + 1]
-            next[bIdx + 1] = next[bIdx]
-            next[bIdx] = below
-        }
-        return RankBoardState(next)
-    }
-
-    fun toggleTieWithAbove(entryId: String): RankBoardState {
-        val (bIdx, iIdx) = findCoords(entryId) ?: return this
-        val next = buckets.map { it.toMutableList() }.toMutableList()
-        if (iIdx > 0) {
-            val head = next[bIdx].subList(0, iIdx).toMutableList()
-            val tail = next[bIdx].subList(iIdx, next[bIdx].size).toMutableList()
-            next[bIdx] = head
-            next.add(bIdx + 1, tail)
-        } else if (bIdx > 0) {
-            val merged = next.removeAt(bIdx)
-            next[bIdx - 1].addAll(merged)
-        }
-        return RankBoardState(next)
-    }
-
-    fun tieAll(): RankBoardState {
-        val flat = buckets.flatten()
-        return if (flat.isEmpty()) RankBoardState(emptyList()) else RankBoardState(listOf(flat))
-    }
-
-    private fun findCoords(entryId: String): Pair<Int, Int>? {
-        buckets.forEachIndexed { bIdx, bucket ->
-            val iIdx = bucket.indexOfFirst { it.entryId == entryId }
-            if (iIdx >= 0) return bIdx to iIdx
-        }
-        return null
-    }
-
-    internal companion object {
-        fun fromCandidates(
-            items: List<RankClusterCandidate>,
-            tiedWithAboveIds: Set<String> = emptySet(),
-        ): RankBoardState {
-            if (items.isEmpty()) return RankBoardState(emptyList())
-            val buckets = mutableListOf<MutableList<RankClusterCandidate>>()
-            items.forEachIndexed { idx, item ->
-                if (idx == 0 || item.entryId !in tiedWithAboveIds) {
-                    buckets.add(mutableListOf(item))
-                } else {
-                    buckets.last().add(item)
-                }
-            }
-            return RankBoardState(buckets)
-        }
-    }
-}
-
-internal data class RankBoardRowState(
-    val candidate: RankClusterCandidate,
-    val flatIndex: Int,
-    val displayRank: Int,
-    val isTiedWithAbove: Boolean,
-    val canMoveUp: Boolean,
-    val canMoveDown: Boolean,
-)
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
 @Composable
 internal fun TierBadgePill(
@@ -262,7 +141,7 @@ private fun RankSettlementSheetBody(
         Text(
             text = settlement.title,
             color = colors.textPrimary,
-            fontFamily = FontFamily.Serif,
+            fontFamily = currentHeadlineFontFamily(),
             fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
         )
@@ -401,7 +280,7 @@ private fun ClusterRankHeader(
             Text(
                 text = "Order best to worst (tap = to tie)",
                 color = colors.textPrimary,
-                fontFamily = FontFamily.Serif,
+                fontFamily = currentHeadlineFontFamily(),
                 fontSize = 18.sp,
                 fontWeight = FontWeight.SemiBold,
             )

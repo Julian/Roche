@@ -1,4 +1,6 @@
 mod activity;
+#[cfg(test)]
+mod cross_stack_tests;
 mod hlc;
 mod hrw;
 mod identity;
@@ -10,7 +12,7 @@ mod tests;
 
 #[allow(unused_imports)]
 pub use activity::{ActivityEntry, SyncTombstone};
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, Utc};
 #[allow(unused_imports)]
 pub use hlc::{
     HlcClock, HlcTimestamp, MAX_CLOCK_DRIFT_MS, MAX_HLC_WALL_MS, resolve_or_synthesize_hlc,
@@ -40,9 +42,10 @@ pub use identity::{
 #[allow(unused_imports)]
 pub use models::{
     InsertedItemCandidate, MAX_PEER_SYNC_PAGE_BYTES, MAX_PEER_SYNC_PAGE_CHANGES,
-    MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, SyncCollectionEntryRecord,
-    SyncCollectionGeneratorRecord, SyncCollectionSpec, SyncComparisonRecord,
-    SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord, SyncEntryState, SyncFeedSource,
+    MAX_SYNC_INLINE_HTML_BYTES, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry,
+    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
+    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
+    SyncEntryState, SyncFeedSource,
 };
 use sqlx::SqlitePool;
 
@@ -59,6 +62,6 @@ impl<'a> SyncRepo<'a> {
     /// Returns the current UTC timestamp truncated to milliseconds (`YYYY-MM-DDTHH:MM:SS.sss+00:00`).
     #[must_use]
     pub fn now_utc() -> DateTime<Utc> {
-        Utc::now().trunc_subsecs(3)
+        crate::util::clock::now_utc()
     }
 }

@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use super::SyncRepo;
+use crate::util::{clock::now_utc, hash::sha256_hex};
 
 const MAX_PAIRING_ATTEMPTS: i64 = 25;
 
@@ -26,9 +26,9 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn save_pairing_code(&self, code: &str, expires_at: DateTime<Utc>) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let normalized = code.trim().to_ascii_lowercase();
-        let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
+        let code_hash = sha256_hex(&normalized);
         let mut tx = crate::db::begin_write(self.pool).await?;
         sqlx::query!("DELETE FROM pairing_codes").execute(&mut *tx).await?;
 
@@ -45,7 +45,7 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn active_pairing_code_hash(&self) -> Result<Option<String>> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         Ok(sqlx::query_scalar!(
             "SELECT code FROM pairing_codes
              WHERE datetime(expires_at) > datetime(?) AND failed_attempts < ?
@@ -58,9 +58,9 @@ impl<'a> AuthRepo<'a> {
     }
 
     pub async fn consume_valid_pairing_code(&self, code: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let normalized = code.trim().to_ascii_lowercase();
-        let code_hash = crate::auth::tokens::TokenManager::hash_token(&normalized);
+        let code_hash = sha256_hex(&normalized);
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         sqlx::query!(
@@ -102,7 +102,7 @@ impl<'a> AuthRepo<'a> {
         device_name: &str,
         token_hash: &str,
     ) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         sqlx::query!(
             "INSERT INTO device_tokens (id, device_name, token, created_at) VALUES (?, ?, ?, ?)",
             id,
@@ -130,7 +130,7 @@ impl<'a> AuthRepo<'a> {
         };
 
         if should_update {
-            let now = SyncRepo::now_utc();
+            let now = now_utc();
             sqlx::query!(
                 "UPDATE device_tokens SET last_used_at = ? WHERE token = ?",
                 now as _,

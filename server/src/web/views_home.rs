@@ -10,25 +10,23 @@ use serde::Deserialize;
 use super::{
     auth::WebSession,
     html::{
-        ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, content_type_badge_class,
-        content_type_label, esc, redirect_with_flash, render_diary_row_with_tier,
+        ARCHIVE_BOX_SVG, CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError,
+        WithWebCsrf as _, content_type_badge_class, content_type_label, esc, parse_form_bool,
+        redirect_with_flash, render_creator_year_meta, render_diary_row_with_tier,
         render_feed_favicon, render_inline_csrf_form, render_page, urlencode,
-        web_api_error_response,
     },
     links::{
         WebLinkIcon, collect_web_external_links, extract_entry_tags, load_artist_id_by_lower_name,
-        render_creator_links, sanitize_non_local_href,
+        sanitize_non_local_href,
     },
     views_reader::render_audio_play_button,
 };
 use crate::{
     db::{
-        CollectionGeneratorState, ConsumptionLogView, ContentType, Item, ItemFilter,
-        ItemStatusFilter, WANT_TO_READ_COLLECTION_ID,
+        CollectionGeneratorState, ConsumptionLogView, Item, ItemFilter, WANT_TO_READ_COLLECTION_ID,
     },
-    error::ApiError,
-    scheduler::FeedFetcher,
-    service::RocheService,
+    domain::{CollectionRole, ConsumptionStatus, ContentType, ItemStatusFilter},
+    service::{AppError, RocheService},
 };
 
 const WIKI_MARK_SVG: &str = "<svg viewBox=\"0 0 24 24\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M12.09 13.119c-.936 1.932-2.217 4.548-2.853 5.728-.616 1.074-1.127.931-1.532.029-1.406-3.321-4.293-9.144-5.651-12.409-.251-.601-.441-.987-.619-1.139-.181-.15-.554-.24-1.122-.271C.103 5.033 0 4.982 0 4.898v-.455l.052-.045c.924-.005 5.401 0 5.401 0l.051.045v.434c0 .119-.075.176-.225.176l-.564.031c-.485.029-.727.164-.727.436 0 .135.053.33.166.601 1.082 2.646 4.818 10.521 4.818 10.521l.136.046 2.411-4.81-.482-1.067-1.658-3.264s-.318-.654-.428-.872c-.728-1.443-.712-1.518-1.447-1.617-.207-.023-.313-.05-.313-.149v-.468l.06-.045h4.292l.113.037v.451c0 .105-.076.15-.227.15l-.308.047c-.792.061-.661.381-.136 1.422l1.582 3.252 1.758-3.504c.293-.64.233-.801.111-.947-.07-.084-.305-.22-.812-.24l-.201-.021c-.052 0-.098-.015-.145-.051-.045-.031-.067-.076-.067-.129v-.427l.061-.045c1.247-.008 4.043 0 4.043 0l.059.045v.436c0 .121-.059.178-.193.178-.646.03-.782.095-1.023.439-.12.186-.375.589-.646 1.039l-2.301 4.273-.065.135 2.792 5.712.17.048 4.396-10.438c.154-.422.129-.722-.064-.895-.197-.172-.346-.273-.857-.295l-.42-.016c-.061 0-.105-.014-.152-.045-.043-.029-.072-.075-.072-.119v-.436l.059-.045h4.961l.041.045v.437c0 .119-.074.18-.209.18-.648.03-1.127.18-1.443.421-.314.255-.557.616-.736 1.067 0 0-4.043 9.258-5.426 12.339-.525 1.007-1.053.917-1.503-.031-.571-1.171-1.773-3.786-2.646-5.711l.053-.036z\"/></svg>";
@@ -48,22 +46,19 @@ pub(super) struct GeneratorNotesForm {
     pub notes: Option<String>,
 }
 
-pub(super) async fn home_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn home_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    match render_home_inner(&service, &session, &flash).await {
-        Ok(resp) => resp,
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    render_home_inner(&service, &session, &flash).await.web_err(&session)
 }
 
-async fn render_home_inner<F: FeedFetcher>(
-    service: &RocheService<F>,
+async fn render_home_inner(
+    service: &RocheService,
     session: &WebSession,
     flash: &FlashQuery,
-) -> Result<Response, ApiError> {
+) -> Result<Response, AppError> {
     let unread_filter = ItemFilter {
         status: Some(ItemStatusFilter::Unread),
         inbox_only: Some(true),
@@ -84,6 +79,7 @@ async fn render_home_inner<F: FeedFetcher>(
         ..ItemFilter::default()
     };
     let catalog = service.catalog();
+    let sync = service.sync();
     let (
         active_generators_res,
         unread_page_res,
@@ -97,7 +93,7 @@ async fn render_home_inner<F: FeedFetcher>(
         service.items().query().with_filter(unread_filter).list_page(),
         service.items().query().with_filter(readable_filter).list_page(),
         service.items().query().with_filter(wtr_filter).list_page(),
-        service.sync_status(),
+        sync.status(),
         catalog.list_diary(None, None, 8),
         catalog.list_collections(true, false),
     );
@@ -139,7 +135,7 @@ async fn render_home_inner<F: FeedFetcher>(
         .map_or(want_to_read_page.items.len(), |c| c.member_count);
     let other_want_total: usize = collections
         .iter()
-        .filter(|c| c.role == crate::db::CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
+        .filter(|c| c.role == CollectionRole::Want && c.id != WANT_TO_READ_COLLECTION_ID)
         .map(|c| c.member_count)
         .sum();
     render_want_to_read_section(
@@ -246,18 +242,13 @@ pub(in crate::web) fn render_collection_draw_section(
         csrf = esc(csrf),
     );
 
-    if !entry.creators.is_empty() || entry.release_year.is_some() {
-        out.push_str("<div class=\"album-artist\">");
-        render_creator_links(out, &entry.creators, artist_links, false);
-        if let Some(yr) = entry.release_year {
-            if entry.creators.is_empty() {
-                let _ = write!(out, "{yr}");
-            } else {
-                let _ = write!(out, " <span class=\"album-year\">({yr})</span>");
-            }
-        }
-        out.push_str("</div>\n");
-    }
+    render_creator_year_meta(
+        out,
+        &entry.creators,
+        entry.release_year,
+        artist_links,
+        CreatorYearStyle::DrawArtistBlock,
+    );
 
     let genres = extract_entry_tags(entry);
     if !genres.is_empty() {
@@ -606,13 +597,13 @@ fn render_home_inbox_row(out: &mut String, item: &Item, csrf: &str) {
     out.push_str("</div></li>\n");
 }
 
-async fn load_diary_tiers<F: FeedFetcher>(
-    service: &RocheService<F>,
+async fn load_diary_tiers(
+    service: &RocheService,
     diary: &[ConsumptionLogView],
 ) -> HashMap<String, char> {
     let mut slugs: Vec<&'static str> = diary
         .iter()
-        .filter(|d| d.status == crate::db::ConsumptionStatus::Consumed)
+        .filter(|d| d.status == ConsumptionStatus::Consumed)
         .filter_map(|d| d.entry.kind.default_list_slug())
         .collect();
     slugs.sort_unstable();
@@ -648,7 +639,7 @@ fn render_recent_diary_section(
         );
     } else {
         for row in diary {
-            let tier = if row.status == crate::db::ConsumptionStatus::Consumed {
+            let tier = if row.status == ConsumptionStatus::Consumed {
                 diary_tiers.get(&row.entry.id).copied()
             } else {
                 None
@@ -659,90 +650,83 @@ fn render_recent_diary_section(
     out.push_str("</section>\n");
 }
 
-pub(super) async fn post_generator_toggle<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn post_generator_toggle(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Form(form): Form<GeneratorToggleForm>,
-) -> Response {
-    let enabled = matches!(form.enabled.trim(), "true" | "1" | "on");
-    match service.catalog().set_collection_generator_enabled(&slug, enabled).await {
-        Ok(state) => {
-            let msg = if enabled {
-                format!("Enabled active draw for '{}'", state.collection_title)
-            } else {
-                format!("Paused active draw for '{}'", state.collection_title)
-            };
-            let to_list = form.redirect_list.as_deref().is_some_and(|v| v == "true" || v == "1");
-            if to_list {
-                let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
-                redirect_with_flash(&format!("/lists/{}", urlencode(list_key)), "notice", &msg)
-            } else {
-                redirect_with_flash("/", "notice", &msg)
-            }
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+) -> Result<Response, WebError> {
+    let enabled = parse_form_bool(Some(&form.enabled));
+    let state = service
+        .catalog()
+        .set_collection_generator_enabled(&slug, enabled)
+        .await
+        .web_err(&session)?;
+    let msg = if enabled {
+        format!("Enabled active draw for '{}'", state.collection_title)
+    } else {
+        format!("Paused active draw for '{}'", state.collection_title)
+    };
+    let to_list = parse_form_bool(form.redirect_list.as_deref());
+    if to_list {
+        let list_key = state.collection_slug.as_deref().unwrap_or(&state.collection_id);
+        Ok(redirect_with_flash(&format!("/lists/{}", urlencode(list_key)), "notice", &msg))
+    } else {
+        Ok(redirect_with_flash("/", "notice", &msg))
     }
 }
 
-pub(super) async fn post_generator_finish<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn post_generator_finish(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Form(form): Form<GeneratorNotesForm>,
-) -> Response {
-    match service.catalog().finish_active_generator_entry(&slug, form.notes.as_deref()).await {
-        Ok((completed, next_state)) => {
-            let list_key =
-                next_state.collection_slug.as_deref().unwrap_or(&next_state.collection_id);
-            let rank_slug =
-                if service.catalog().can_rank_collection(list_key, false).await.unwrap_or(false) {
-                    Some(list_key.to_owned())
-                } else {
-                    service.catalog().rank_target_after_consumption(&completed).await.ok().flatten()
-                };
-            if let Some(target_slug) = rank_slug {
-                let notice = format!(
-                    "Finished '{}' — rank it in {}",
-                    completed.title, next_state.collection_title
-                );
-                redirect_with_flash(
-                    &format!(
-                        "/rank/{}?focus={}",
-                        urlencode(&target_slug),
-                        urlencode(&completed.id),
-                    ),
-                    "notice",
-                    &notice,
-                )
-            } else {
-                let next_part = next_state
-                    .current_entry
-                    .as_ref()
-                    .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
-                let notice = format!("Logged '{}' to Diary{next_part}", completed.title);
-                redirect_with_flash("/", "notice", &notice)
-            }
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+) -> Result<Response, WebError> {
+    let (completed, next_state) = service
+        .catalog()
+        .finish_active_generator_entry(&slug, form.notes.as_deref())
+        .await
+        .web_err(&session)?;
+    let list_key = next_state.collection_slug.as_deref().unwrap_or(&next_state.collection_id);
+    let rank_slug = service
+        .catalog()
+        .rank_target_after_generator_finish(list_key, &completed)
+        .await
+        .ok()
+        .flatten();
+    if let Some(target_slug) = rank_slug {
+        let notice =
+            format!("Finished '{}' — rank it in {}", completed.title, next_state.collection_title);
+        Ok(redirect_with_flash(
+            &format!("/rank/{}?focus={}", urlencode(&target_slug), urlencode(&completed.id)),
+            "notice",
+            &notice,
+        ))
+    } else {
+        let next_part = next_state
+            .current_entry
+            .as_ref()
+            .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
+        let notice = format!("Logged '{}' to Diary{next_part}", completed.title);
+        Ok(redirect_with_flash("/", "notice", &notice))
     }
 }
 
-pub(super) async fn post_generator_abandon<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn post_generator_abandon(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(slug): Path<String>,
     Form(form): Form<GeneratorNotesForm>,
-) -> Response {
-    match service.catalog().abandon_active_generator_entry(&slug, form.notes.as_deref()).await {
-        Ok((abandoned, next_state)) => {
-            let next_part = next_state
-                .current_entry
-                .as_ref()
-                .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
-            let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
-            redirect_with_flash("/", "notice", &notice)
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let (abandoned, next_state) = service
+        .catalog()
+        .abandon_active_generator_entry(&slug, form.notes.as_deref())
+        .await
+        .web_err(&session)?;
+    let next_part = next_state
+        .current_entry
+        .as_ref()
+        .map_or_else(String::new, |n| format!(" · Next draw: {}", n.title));
+    let notice = format!("Abandoned '{}'{next_part}", abandoned.title);
+    Ok(redirect_with_flash("/", "notice", &notice))
 }

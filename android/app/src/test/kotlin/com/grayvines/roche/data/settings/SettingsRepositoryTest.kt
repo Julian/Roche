@@ -7,9 +7,9 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.edit
 import com.grayvines.roche.MusicUrlCandidate
 import com.grayvines.roche.MusicUrlResolution
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.buildYoutubeMusicAlbumUrl
-import com.grayvines.roche.data.candidateStreamingUrls
+import com.grayvines.roche.core.buildYoutubeMusicAlbumUrl
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.candidateStreamingUrls
 import com.grayvines.roche.isHostDomainSelected
 import com.grayvines.roche.isNonMusicVideoPackage
 import com.grayvines.roche.model.AppTab

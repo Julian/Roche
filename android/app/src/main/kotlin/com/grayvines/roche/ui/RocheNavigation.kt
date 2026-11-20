@@ -35,11 +35,14 @@ sealed interface SettingsNavKey : NavKey {
 
 internal fun deriveRocheBackStack(
     state: MainUiState,
+    activeAudioEntryId: String? = null,
     activeReaderEntryId: String? =
         state.activeReaderEntry?.id
             ?: state.selectedReaderEntryId?.takeIf { state.isInitialLoading },
     activeFullscreenPlayerEntryId: String? =
-        state.activePlayerEntry?.id?.takeIf { state.playerState.isFullscreenOpen },
+        state.resolveActivePlayerEntry(activeAudioEntryId)?.id?.takeIf {
+            state.isPlayerFullscreenOpen
+        },
 ): List<RocheNavKey> = buildList {
     add(RocheNavKey.Tab(AppTab.HOME))
     val isScopedInbox =

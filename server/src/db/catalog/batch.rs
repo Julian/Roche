@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    collections::slugify_title,
+    collections::derive_manual_collection_slug_and_id,
     identity_norm::{normalize_identifier_scheme, normalize_identifier_value},
     models::{
         BatchCollectionInput, BatchComparisonInput, BatchGeneratorInput, CatalogBatchInput,
@@ -14,8 +14,11 @@ use super::{
 };
 use crate::{
     db::{
-        sync::{SyncRepo, collection_entry_natural_key, deterministic_system_collection_id},
-        types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+        entries_core,
+        sync::SyncRepo,
+        types::{
+            ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
+        },
     },
     ranking::validate_ordering,
 };
@@ -30,7 +33,7 @@ impl CatalogRepo<'_> {
         &self,
         batch: &CatalogBatchInput,
     ) -> CatalogResult<CatalogBatchResult> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut ref_map: HashMap<String, String> =
             HashMap::with_capacity(batch.entries.len() + batch.collections.len());
@@ -111,12 +114,13 @@ impl CatalogRepo<'_> {
             for member in &col.members {
                 let member_id =
                     Self::resolve_batch_ref_in_tx(tx, ref_map, &member.entry_ref).await?;
-                Self::attach_batch_collection_member_in_tx(
+                Self::attach_collection_member_in_tx(
                     tx,
                     &col_id,
                     &member_id,
                     member.position,
                     now,
+                    false,
                 )
                 .await?;
             }
@@ -163,7 +167,9 @@ impl CatalogRepo<'_> {
 
         let show_in_lists = col.role == CollectionRole::List;
         let clean_summary = col.summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let clean_color = col.color.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let validated_color = HexColor::parse_optional(col.color.as_deref())
+            .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
+        let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
         sqlx::query(
             "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
@@ -174,7 +180,7 @@ impl CatalogRepo<'_> {
                 updated_at = excluded.updated_at",
         )
         .bind(&target_id)
-        .bind(clean_title)
+        .bind(&clean_title)
         .bind(clean_summary)
         .bind(now)
         .bind(now)
@@ -198,14 +204,7 @@ impl CatalogRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-        )
-        .bind(&derived_slug)
-        .bind(&target_id)
-        .execute(&mut *tx)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &derived_slug).await?;
 
         SyncRepo::record_activity(
             tx,
@@ -217,48 +216,6 @@ impl CatalogRepo<'_> {
         .await?;
 
         Ok(target_id)
-    }
-
-    async fn attach_batch_collection_member_in_tx(
-        tx: &mut SqliteConnection,
-        col_id: &str,
-        member_id: &str,
-        position: Option<f64>,
-        now: DateTime<Utc>,
-    ) -> CatalogResult<()> {
-        if col_id == member_id {
-            return Err(CatalogError::InvalidInput(
-                "A collection cannot contain itself".to_owned(),
-            ));
-        }
-        if Self::would_introduce_collection_cycle_in_tx(tx, col_id, member_id).await? {
-            return Err(CatalogError::InvalidInput(
-                "Adding entry to collection would create a cycle".to_owned(),
-            ));
-        }
-        let nat_key = collection_entry_natural_key(col_id, member_id);
-        SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
-        sqlx::query(
-            "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(collection_id, entry_id) DO UPDATE SET
-                position = COALESCE(excluded.position, collection_entries.position)",
-        )
-        .bind(col_id)
-        .bind(member_id)
-        .bind(position)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        SyncRepo::record_activity(
-            tx,
-            ActivityEntityType::CollectionEntry,
-            &nat_key,
-            ActivityAction::Create,
-            now,
-        )
-        .await?;
-        Ok(())
     }
 
     async fn apply_batch_comparisons_in_tx(
@@ -312,14 +269,7 @@ impl CatalogRepo<'_> {
             let (col_id, col_title, mode, role) =
                 Self::resolve_batch_collection_ref_in_tx(tx, ref_map, &gen_input.collection_ref)
                     .await?;
-            if col_id == crate::db::STARRED_COLLECTION_ID
-                || mode != CollectionMode::Manual
-                || role != CollectionRole::List
-            {
-                return Err(CatalogError::InvalidInput(format!(
-                    "Collection '{col_title}' cannot use a generator (must be a custom manual list)"
-                )));
-            }
+            Self::ensure_generator_eligible(&col_id, &col_title, mode, role)?;
             let explicit_entry_id = match gen_input
                 .current_entry_ref
                 .as_deref()
@@ -390,17 +340,23 @@ impl CatalogRepo<'_> {
         if let Some((raw_scheme, raw_val)) = trimmed.split_once(':') {
             let scheme = normalize_identifier_scheme(raw_scheme);
             if !scheme.is_empty() && !raw_val.trim().is_empty() {
-                for candidate_kind in [EntryKind::Album, EntryKind::Book, EntryKind::Movie] {
+                let mut tried_vals = HashSet::new();
+                for candidate_kind in [
+                    EntryKind::Album,
+                    EntryKind::Song,
+                    EntryKind::Artist,
+                    EntryKind::Podcast,
+                    EntryKind::PodcastEpisode,
+                    EntryKind::Book,
+                    EntryKind::Movie,
+                ] {
                     let norm_val = normalize_identifier_value(candidate_kind, &scheme, raw_val);
-                    if let Some(found) = sqlx::query_scalar::<_, String>(
-                        "SELECT entry_id FROM entry_identifiers
-                         WHERE scheme = ? AND value = ?
-                         LIMIT 1",
-                    )
-                    .bind(&scheme)
-                    .bind(&norm_val)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                    if !tried_vals.insert(norm_val.clone()) {
+                        continue;
+                    }
+                    if let Some(found) =
+                        entries_core::find_entry_id_by_identifier_in_tx(tx, &scheme, &norm_val)
+                            .await?
                         && let Some(canon) = Self::follow_merged_id_in_tx(tx, &found).await?
                     {
                         return Ok(canon);
@@ -414,35 +370,15 @@ impl CatalogRepo<'_> {
 
 fn derive_batch_collection_slug_and_id(
     col: &BatchCollectionInput,
-) -> CatalogResult<(&str, String, String)> {
-    let clean_title = col.title.trim();
-    if clean_title.is_empty() {
-        return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
-    }
-    if !matches!(col.role, CollectionRole::List | CollectionRole::Want) {
-        return Err(CatalogError::InvalidInput(
-            "Batch collections must have role 'list' or 'want'".to_owned(),
-        ));
-    }
-    let derived_slug = col
-        .slug
+) -> CatalogResult<(String, String, String)> {
+    let (clean_title, derived_slug, default_id) =
+        derive_manual_collection_slug_and_id(&col.title, col.slug.as_deref(), col.role)?;
+    let requested_id = col
+        .id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map_or_else(|| slugify_title(clean_title), slugify_title);
-    if derived_slug.is_empty() {
-        return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
-    }
-    let requested_id = col.id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or_else(
-        || {
-            if derived_slug.starts_with("want:") {
-                deterministic_system_collection_id(&derived_slug)
-            } else {
-                deterministic_system_collection_id(&format!("custom:{derived_slug}"))
-            }
-        },
-        str::to_owned,
-    );
+        .map_or(default_id, str::to_owned);
     Ok((clean_title, derived_slug, requested_id))
 }
 
@@ -573,9 +509,101 @@ mod tests {
         assert_eq!(gen_state.remaining_count, 1);
         assert_eq!(gen_state.current_entry.as_ref().unwrap().title, "Elvis Presley");
 
-        let ranked = db.catalog().get_ranked_collection("album_canon", false).await.unwrap();
+        let ranked = crate::service::CatalogService::new(&db)
+            .get_ranked_collection("album_canon", false)
+            .await
+            .unwrap();
         assert_eq!(ranked.rows.len(), 2);
         assert_eq!(ranked.rows[0].entry.title, "In The Wee Small Hours");
         assert_eq!(ranked.rows[1].entry.title, "Ellington at Newport");
+    }
+
+    #[tokio::test]
+    async fn test_custom_want_collection_slug_and_id_converge_across_manual_want_and_batch() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let catalog = db.catalog();
+        let expected_id = crate::db::deterministic_system_collection_id("want:weekend_watch");
+
+        let manual = catalog
+            .create_manual_collection("Weekend Watch", None, CollectionRole::Want, None, None)
+            .await
+            .unwrap();
+        assert_eq!(manual.slug.as_deref(), Some("want:weekend_watch"));
+        assert_eq!(manual.id, expected_id);
+
+        // `get_or_create_want_collection("weekend_watch")` resolves to the exact same collection
+        let resolved = catalog.get_or_create_want_collection("weekend_watch").await.unwrap();
+        assert_eq!(resolved.id, expected_id);
+        assert_eq!(resolved.slug.as_deref(), Some("want:weekend_watch"));
+
+        // Case-insensitive "WANT:" prefix on an explicit slug is stripped before slugifying
+        let prefixed = catalog
+            .create_manual_collection(
+                "Autumn Queue",
+                Some("WANT:Autumn Queue"),
+                CollectionRole::Want,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefixed.slug.as_deref(), Some("want:autumn_queue"));
+        assert_eq!(prefixed.id, crate::db::deterministic_system_collection_id("want:autumn_queue"));
+
+        // Empty base slug after stripping "want:" is rejected
+        let empty_err = catalog
+            .create_manual_collection("Empty Want", Some("WANT:"), CollectionRole::Want, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(empty_err, crate::db::CatalogError::InvalidInput(_)));
+
+        // `apply_batch` with `slug: Some("want:weekend_watch")` converges to the same ID and slug
+        let batch_db = Db::connect("sqlite::memory:").await.unwrap();
+        let batch = CatalogBatchInput {
+            collections: vec![BatchCollectionInput {
+                ref_key: Some("col:ww".to_owned()),
+                id: None,
+                title: "Weekend Watch".to_owned(),
+                slug: Some("want:weekend_watch".to_owned()),
+                role: CollectionRole::Want,
+                summary: None,
+                color: None,
+                members: Vec::new(),
+            }],
+            entries: Vec::new(),
+            logs: Vec::new(),
+            comparisons: Vec::new(),
+            generators: Vec::new(),
+            dry_run: false,
+        };
+        batch_db.catalog().apply_batch(&batch).await.unwrap();
+        let batched =
+            batch_db.catalog().get_collection_summary("want:weekend_watch").await.unwrap();
+        assert_eq!(batched.id, expected_id);
+        assert_eq!(batched.slug.as_deref(), Some("want:weekend_watch"));
+
+        // Explicit `col.id` override in batch is still honored
+        let custom_id_batch = CatalogBatchInput {
+            collections: vec![BatchCollectionInput {
+                ref_key: None,
+                id: Some("explicit-want-id".to_owned()),
+                title: "Explicit Queue".to_owned(),
+                slug: Some("want:explicit_queue".to_owned()),
+                role: CollectionRole::Want,
+                summary: None,
+                color: None,
+                members: Vec::new(),
+            }],
+            entries: Vec::new(),
+            logs: Vec::new(),
+            comparisons: Vec::new(),
+            generators: Vec::new(),
+            dry_run: false,
+        };
+        batch_db.catalog().apply_batch(&custom_id_batch).await.unwrap();
+        let explicit =
+            batch_db.catalog().get_collection_summary("want:explicit_queue").await.unwrap();
+        assert_eq!(explicit.id, "explicit-want-id");
+        assert_eq!(explicit.slug.as_deref(), Some("want:explicit_queue"));
     }
 }

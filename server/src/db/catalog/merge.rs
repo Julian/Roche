@@ -5,15 +5,16 @@ use sqlx::SqliteConnection;
 
 use super::{
     CatalogRepo,
-    models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow},
+    models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow, raw_entry_columns},
 };
 use crate::db::{
     MediaRepo,
+    entries_core::{self, EntryStateUpsert},
     sync::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
         deterministic_comparison_id,
     },
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, InboxState},
 };
 
 impl CatalogRepo<'_> {
@@ -24,7 +25,7 @@ impl CatalogRepo<'_> {
         duplicate_id: &str,
         canonical_id: &str,
     ) -> CatalogResult<CatalogEntry> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let dup_resolved = Self::follow_merged_id_in_tx(&mut tx, duplicate_id)
             .await?
@@ -160,21 +161,11 @@ impl CatalogRepo<'_> {
         .await?;
 
         // Backfill missing metadata onto canonical from duplicate
-        let dup_row = sqlx::query_as!(
-            RawEntryRow,
-            r#"SELECT id as "id!", kind as "kind!: EntryKind", title as "title!",
-                      creators_json as "creators_json!", url as "url?",
-                      published_at as "published_at?: DateTime<Utc>",
-                      release_year as "release_year?: i32", summary as "summary?",
-                      thumbnail_url as "thumbnail_url?", metadata_json as "metadata_json!",
-                      merged_into_id as "merged_into_id?",
-                      created_at as "created_at!: DateTime<Utc>",
-                      updated_at as "updated_at!: DateTime<Utc>"
-               FROM entries WHERE id = ?"#,
-            dup_resolved,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let dup_row: RawEntryRow =
+            sqlx::query_as(concat!("SELECT ", raw_entry_columns!(), " FROM entries WHERE id = ?"))
+                .bind(dup_resolved)
+                .fetch_one(&mut *tx)
+                .await?;
 
         let dup_url = dup_row.url.as_deref();
         let dup_summary = dup_row.summary.as_deref();
@@ -312,45 +303,45 @@ impl CatalogRepo<'_> {
             .fetch_optional(&mut *tx)
             .await?;
 
-            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) =
-                if let Some(cs) = canon_state {
-                    let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
-                        "dismissed".to_owned()
-                    } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
-                        "unread".to_owned()
-                    } else {
-                        "none".to_owned()
-                    };
-                    let read_at = match (cs.read_at, ds.read_at) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    };
-                    let progress = cs.progress.max(ds.progress);
-                    let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
-                    (inbox, read_at, progress, inter_ts)
+            let parse_inbox = |raw: &str| match raw {
+                "dismissed" => InboxState::Dismissed,
+                "unread" => InboxState::Unread,
+                _ => InboxState::None,
+            };
+            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) = if let Some(cs) =
+                canon_state
+            {
+                let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
+                    InboxState::Dismissed
+                } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
+                    InboxState::Unread
                 } else {
-                    (ds.inbox_state, ds.read_at, ds.progress, ds.interaction_updated_at)
+                    InboxState::None
                 };
+                let read_at = match (cs.read_at, ds.read_at) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let progress = cs.progress.max(ds.progress);
+                let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
+                (inbox, read_at, progress, inter_ts)
+            } else {
+                (parse_inbox(&ds.inbox_state), ds.read_at, ds.progress, ds.interaction_updated_at)
+            };
 
-            sqlx::query!(
-                "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(entry_id) DO UPDATE SET
-                    inbox_state = excluded.inbox_state,
-                    read_at = excluded.read_at,
-                    progress = excluded.progress,
-                    interaction_updated_at = excluded.interaction_updated_at,
-                    updated_at = excluded.updated_at",
-                canon_resolved,
-                &merged_inbox,
-                merged_read_at as _,
-                merged_progress,
-                merged_inter_ts as _,
-                now as _,
+            entries_core::upsert_entry_state_in_tx(
+                tx,
+                &EntryStateUpsert {
+                    entry_id: canon_resolved,
+                    inbox_state: merged_inbox,
+                    read_at: merged_read_at,
+                    progress: merged_progress,
+                    interaction_updated_at: merged_inter_ts,
+                    updated_at: now,
+                },
             )
-            .execute(&mut *tx)
             .await?;
             sqlx::query!("DELETE FROM entry_state WHERE entry_id = ?", dup_resolved)
                 .execute(&mut *tx)
@@ -505,15 +496,15 @@ impl CatalogRepo<'_> {
         .await?;
 
         if let Some((dup_enabled, mut dup_cur_entry, mut dup_drawn_at)) = dup_gen {
-            let canon_eligible = canon_resolved != crate::db::STARRED_COLLECTION_ID
-                && sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM collection_specs
-                     WHERE collection_id = ? AND mode = 'manual' AND collection_role = 'list'",
-                )
-                .bind(canon_resolved)
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
+            let canon_spec: Option<(CollectionMode, CollectionRole)> = sqlx::query_as(
+                "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
+            )
+            .bind(canon_resolved)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let canon_eligible = canon_spec.is_some_and(|(mode, role)| {
+                Self::is_generator_eligible(canon_resolved, mode, role)
+            });
             let canon_gen_updated: Option<DateTime<Utc>> = sqlx::query_scalar(
                 "SELECT updated_at FROM collection_generators WHERE collection_id = ?",
             )

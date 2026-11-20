@@ -367,7 +367,10 @@ async fn test_web_collection_generator_finish_rank_and_abandon_flows() {
     .await;
     assert_eq!(rank_post_resp.status(), StatusCode::SEE_OTHER);
 
-    let ranked_albums = db.catalog().get_ranked_collection("album-queue", false).await.unwrap();
+    let ranked_albums = crate::service::CatalogService::new(&db)
+        .get_ranked_collection("album-queue", false)
+        .await
+        .unwrap();
     assert_eq!(ranked_albums.rows.len(), 2);
     assert_eq!(ranked_albums.rows[0].entry.id, second_id);
 
@@ -582,7 +585,10 @@ async fn test_web_want_queue_local_priority_noscript_and_entry_merge() {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     }
 
-    let want_detail = db.catalog().get_ranked_collection("movies", true).await.unwrap();
+    let want_detail = crate::service::CatalogService::new(&db)
+        .get_ranked_collection("movies", true)
+        .await
+        .unwrap();
     assert_eq!(want_detail.rows.len(), 2);
     let m1 = want_detail.rows[0].entry.id.clone();
     let m2 = want_detail.rows[1].entry.id.clone();
@@ -607,7 +613,10 @@ async fn test_web_want_queue_local_priority_noscript_and_entry_merge() {
     .await;
     assert_eq!(prio_resp.status(), StatusCode::SEE_OTHER);
 
-    let want_ranked = db.catalog().get_ranked_collection("movies", true).await.unwrap();
+    let want_ranked = crate::service::CatalogService::new(&db)
+        .get_ranked_collection("movies", true)
+        .await
+        .unwrap();
     assert_eq!(want_ranked.rows[0].entry.id, m2);
     assert!(want_ranked.rows[0].tier.is_none(), "want queues never assign S-D tiers");
 
@@ -1203,11 +1212,11 @@ async fn test_lists_overview_catalog_search_and_kind_filter() {
 
 #[test]
 fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
-    use super::artist_enrich::{
+    use super::links::sanitize_non_local_href;
+    use crate::service::enrich::{
         WikipediaSearchHit, encode_wiki_path_segment, extract_spotify_artist_uri_from_album_html,
         parse_wikipedia_artist_summary_json, select_best_artist_wikipedia_slug,
     };
-    use super::links::sanitize_non_local_href;
 
     assert_eq!(sanitize_non_local_href("HTTPS://ROCHE.LOCAL/entry/123"), None);
     assert_eq!(sanitize_non_local_href("http://127.0.0.1:8080/thumb.jpg"), None);
@@ -1276,7 +1285,7 @@ fn test_artist_enrichment_wikipedia_and_spotify_parsers() {
 
 #[tokio::test]
 async fn test_artist_detail_enrichment_persists_links_portrait_and_bio() {
-    use super::artist_enrich::enrich_artist_detail_with_fetcher;
+    use crate::service::enrich::enrich_artist_detail_with_fetcher;
 
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, _csrf) = login_browser(&db, &app).await;
@@ -1503,7 +1512,7 @@ async fn test_want_to_read_readonly_inbox_starred_list_and_homepage_feed_discove
 
 #[test]
 fn test_decode_html_entities_multibyte_utf8_no_panic() {
-    use super::artist_enrich::decode_html_entities;
+    use crate::service::enrich::decode_html_entities;
 
     // '&' followed by 10 ASCII bytes + a 3-byte UTF-8 char straddling byte 12 (bytes 10..13)
     let input = "A &0123456789\u{2014}end &amp; &quot;Bj\u{00f6}rk&quot; &#x27;ok&#x27;";
@@ -1527,6 +1536,10 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "http://169.254.169.254/latest/meta-data",
         "http://100.64.0.1/tailscale",
         "http://100.127.255.254/cgnat",
+        "http://192.0.2.1/doc",
+        "http://198.18.0.1/benchmark",
+        "http://198.51.100.1/doc",
+        "http://203.0.113.1/doc",
         "http://240.0.0.1/reserved",
         "http://255.255.255.255/broadcast",
         "http://[::1]/a",
@@ -1536,7 +1549,10 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "http://[::ffff:0:127.0.0.1]/siit",
         "http://[64:ff9b::127.0.0.1]/nat64-wkp",
         "http://[64:ff9b:1::1]/nat64-local",
+        "http://[100::1]/discard",
         "http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/teredo",
+        "http://[2001:20::1]/orchidv2",
+        "http://[2001:db8::1]/doc",
         "http://[fc00::1]/ula",
         "http://[fd12:3456::1]/ula",
         "http://[fe80::1]/link-local",
@@ -1554,6 +1570,9 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
         "https://metadata.google.internal/computeMetadata/v1/",
         "http://home.arpa/admin",
         "http://router.home.arpa/status",
+        "http://nas.lan/status",
+        "http://router.home/status",
+        "https://my-box.tail1234.ts.net/status",
         "https://user:pass@example.com/secret",
     ] {
         assert!(sanitize_non_local_href(blocked).is_none(), "expected {blocked} to be blocked");
@@ -1561,6 +1580,7 @@ fn test_sanitize_non_local_href_blocks_ipv6_ula_link_local_mapped_6to4_and_cgnat
 
     for allowed in [
         "https://example.com/audio.mp3",
+        "https://example.com:8444/audio.mp3",
         "https://8.8.8.8/file.mp3",
         "https://[2606:4700:4700::1111]/file.mp3",
         "https://[::ffff:8.8.8.8]/file.mp3",
@@ -1643,7 +1663,7 @@ fn test_is_same_origin_post_origin_and_referer_fallback() {
 fn test_enrich_attempt_cache_ttl() {
     use std::time::{Duration, Instant};
 
-    use super::artist_enrich::EnrichAttemptCache;
+    use crate::service::enrich::EnrichAttemptCache;
 
     let mut cache = EnrichAttemptCache::default();
     let t0 = Instant::now();
@@ -2084,7 +2104,7 @@ async fn seed_a11y_landmark_fixtures(db: &Db) -> (String, String, String) {
         .apply_background_enrichment(
             &item.id,
             None,
-            None,
+            &[],
             None,
             None,
             None,
@@ -2263,52 +2283,40 @@ fn test_safe_local_redirect_ascii_fallback_and_fragment_preserving_flash() {
 
 #[test]
 fn test_try_reserve_enrichment_slot_bounds_concurrency_before_marking_cache() {
-    use std::{
-        sync::{Arc, Mutex},
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
-    use super::artist_enrich::{
-        EnrichAttemptCache, MAX_CONCURRENT_ENRICH_TASKS, try_reserve_enrichment_slot,
-    };
+    use crate::service::enrich::{ArtistEnricher, MAX_CONCURRENT_ENRICH_TASKS};
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ENRICH_TASKS));
-    let cache = Mutex::new(EnrichAttemptCache::default());
+    let enricher = ArtistEnricher::new(false);
     let now = Instant::now();
     let ttl = Duration::from_secs(60);
 
     let mut held = Vec::new();
     for idx in 0..MAX_CONCURRENT_ENRICH_TASKS {
-        let permit =
-            try_reserve_enrichment_slot(&sem, &cache, format!("artist-{idx}|sp=false"), now, ttl)
-                .unwrap_or_else(|| panic!("expected slot {idx} to be reserved"));
+        let permit = enricher
+            .try_reserve_slot(format!("artist-{idx}|sp=false"), now, ttl)
+            .unwrap_or_else(|| panic!("expected slot {idx} to be reserved"));
         held.push(permit);
     }
-    assert_eq!(sem.available_permits(), 0);
+    assert_eq!(enricher.available_permits(), 0);
 
     // Exhausted semaphore rejects new artist WITHOUT marking it in the attempt cache
-    assert!(
-        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl)
-            .is_none()
-    );
+    assert!(enricher.try_reserve_slot("artist-overflow|sp=false".to_owned(), now, ttl).is_none());
 
     // Releasing one permit lets the previously-throttled artist run immediately
     drop(held.pop());
-    assert_eq!(sem.available_permits(), 1);
+    assert_eq!(enricher.available_permits(), 1);
     let overflow_permit =
-        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl);
+        enricher.try_reserve_slot("artist-overflow|sp=false".to_owned(), now, ttl);
     assert!(overflow_permit.is_some());
     drop(overflow_permit);
 
     // Duplicate key within TTL returns None and does NOT leak a semaphore permit
-    assert_eq!(sem.available_permits(), 1);
-    assert!(
-        try_reserve_enrichment_slot(&sem, &cache, "artist-overflow|sp=false".to_owned(), now, ttl)
-            .is_none()
-    );
-    assert_eq!(sem.available_permits(), 1);
+    assert_eq!(enricher.available_permits(), 1);
+    assert!(enricher.try_reserve_slot("artist-overflow|sp=false".to_owned(), now, ttl).is_none());
+    assert_eq!(enricher.available_permits(), 1);
     drop(held);
-    assert_eq!(sem.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
+    assert_eq!(enricher.available_permits(), MAX_CONCURRENT_ENRICH_TASKS);
 }
 
 #[tokio::test]
@@ -2316,7 +2324,7 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
     let (db, app) = setup_web_app(Config::default()).await;
     let (cookie, csrf) = login_browser(&db, &app).await;
 
-    // 1. Standard form POST > 128 KiB with known body length is rejected with 413
+    // 1. Standard form POST > 128 KiB with known body length is rejected with HTML 413 + security headers
     let big_summary = "a".repeat(140 * 1024);
     let oversized_regular = post_form(
         &app,
@@ -2326,8 +2334,17 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
     )
     .await;
     assert_eq!(oversized_regular.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        oversized_regular.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(oversized_regular.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(oversized_regular.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
+    let oversized_html = read_body_html(oversized_regular).await;
+    assert!(oversized_html.contains("<!doctype html>"));
+    assert!(oversized_html.contains("Payload Too Large"));
 
-    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB
+    // 2. Streamed/chunked standard form POST > 128 KiB (unknown size_hint) is capped at 128 KiB with HTML 413
     let raw_form =
         encode_form(&[("_csrf", &csrf), ("title", "Streamed"), ("summary", &big_summary)]);
     let stream_body =
@@ -2346,6 +2363,12 @@ async fn test_web_body_limits_standard_128kib_vs_opml_4mib() {
         .await
         .unwrap();
     assert_eq!(streamed_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        streamed_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let streamed_html = read_body_html(streamed_resp).await;
+    assert!(streamed_html.contains("Payload Too Large"));
 
     // 3. Authenticated OPML upload > 128 KiB (within 4 MiB) is accepted
     let padding = " ".repeat(160 * 1024);
@@ -2620,4 +2643,68 @@ async fn test_load_existing_reader_item_ids_batched_lookup_and_catalog_links() {
     let queue_html = read_body_html(get_authed(&app, "/queue", &cookie).await).await;
     assert!(queue_html.contains(&format!("/reader/{}", want_with_url.id)));
     assert!(!queue_html.contains(&format!("/reader/{}", want_no_url.id)));
+}
+
+#[test]
+fn test_flattened_flash_query_deserialization() {
+    use axum::{extract::Query, http::Uri};
+
+    let Query(lists) = Query::<super::views_catalog::ListsOverviewQuery>::try_from_uri(
+        &Uri::from_static("/lists?q=bjork&kind=album&notice=Saved&err=Oops"),
+    )
+    .unwrap();
+    assert_eq!(lists.q.as_deref(), Some("bjork"));
+    assert_eq!(lists.kind.as_deref(), Some("album"));
+    assert_eq!(lists.flash.notice.as_deref(), Some("Saved"));
+    assert_eq!(lists.flash.err.as_deref(), Some("Oops"));
+
+    let Query(list_page) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
+        &Uri::from_static("/lists/movies?page=3&notice=Added"),
+    )
+    .unwrap();
+    assert_eq!(list_page.page, Some(3));
+    assert_eq!(list_page.flash.notice.as_deref(), Some("Added"));
+
+    let Query(list_page_empty) = Query::<super::views_catalog::ListPageQuery>::try_from_uri(
+        &Uri::from_static("/lists/movies?page="),
+    )
+    .unwrap();
+    assert_eq!(list_page_empty.page, None);
+
+    let Query(diary) = Query::<super::views_catalog::DiaryFilterQuery>::try_from_uri(
+        &Uri::from_static("/diary?year=2025&status=consumed&err=Bad"),
+    )
+    .unwrap();
+    assert_eq!(diary.year, Some(2025));
+    assert_eq!(diary.status.as_deref(), Some("consumed"));
+    assert_eq!(diary.flash.err.as_deref(), Some("Bad"));
+
+    let Query(inbox) = Query::<super::views_reader::InboxQuery>::try_from_uri(&Uri::from_static(
+        "/inbox?status=all&page=2&notice=Done",
+    ))
+    .unwrap();
+    assert_eq!(inbox.status.as_deref(), Some("all"));
+    assert_eq!(inbox.page, Some(2));
+    assert_eq!(inbox.flash.notice.as_deref(), Some("Done"));
+
+    let Query(rank) =
+        Query::<super::views_rank::RankSessionQuery>::try_from_uri(&Uri::from_static(
+            "/rank/movies?want=true&focus=abc&round=2&random=4&covered=x&notice=Saved",
+        ))
+        .unwrap();
+    assert!(rank.want);
+    assert_eq!(rank.focus.as_deref(), Some("abc"));
+    assert_eq!(rank.round, Some(2));
+    assert_eq!(rank.random, Some(4));
+    assert_eq!(rank.covered.as_deref(), Some("x"));
+    assert_eq!(rank.flash.notice.as_deref(), Some("Saved"));
+
+    let Query(rank_defaults) = Query::<super::views_rank::RankSessionQuery>::try_from_uri(
+        &Uri::from_static("/rank/movies"),
+    )
+    .unwrap();
+    assert!(!rank_defaults.want);
+    assert_eq!(rank_defaults.round, None);
+    assert_eq!(rank_defaults.random, None);
+    assert_eq!(rank_defaults.flash.notice, None);
 }

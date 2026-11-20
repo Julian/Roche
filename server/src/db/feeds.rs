@@ -7,13 +7,19 @@ use url::Url;
 use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
     ItemRepo, MediaRepo, SyncRepo,
+    entries_core::{self, EntryInsertParams},
     sync::{
         MAX_CONSECUTIVE_FAILURES, SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id,
         deterministic_item_id, feed_natural_key, item_natural_key, normalize_consecutive_failures,
     },
 };
-use crate::feeds::{OpmlOutline, arxiv::ArxivParser};
+use crate::{
+    domain::OpmlOutline,
+    util::{clock::now_utc, media_urls::extract_arxiv_id},
+};
 
+/// Read-only feed subscription projection over the unified `entries` + `collection_specs`
+/// (`mode = 'feed'`, `collection_role = 'feed'`) + `feed_sources` tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Feed {
@@ -142,7 +148,7 @@ impl TryFrom<RawFeedRow> for Feed {
 pub struct PollItemCandidate {
     pub title: String,
     pub url: Url,
-    pub author: Option<String>,
+    pub creators: Vec<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub summary: String,
     pub content_html: Option<String>,
@@ -197,35 +203,21 @@ pub(super) async fn resolve_dedup_entry_id(
         return Ok(Some(found));
     }
 
-    let by_ident: Option<String> = if let Some(aid) = arxiv_id {
-        sqlx::query_scalar!(
-            "SELECT COALESCE(e.merged_into_id, e.id) AS \"id!: String\"
-             FROM entry_identifiers ei
-             JOIN entries e ON e.id = ei.entry_id
-             WHERE (ei.scheme = 'arxiv' AND ei.value = ?)
-                OR (ei.scheme = 'url' AND ei.value = ?)
-             LIMIT 1",
-            aid,
-            canon_url,
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-    } else {
-        sqlx::query_scalar!(
-            "SELECT COALESCE(e.merged_into_id, e.id) AS \"id!: String\"
-             FROM entry_identifiers ei
-             JOIN entries e ON e.id = ei.entry_id
-             WHERE ei.scheme = 'url' AND ei.value = ?
-             LIMIT 1",
-            canon_url,
-        )
-        .fetch_optional(&mut *conn)
-        .await?
-    };
-
-    if let Some(found) = by_ident {
-        return CatalogRepo::follow_merged_id_in_tx(&mut *conn, &found).await;
+    if let Some(aid) = arxiv_id
+        && let Some(raw_id) =
+            entries_core::find_entry_id_by_identifier_in_tx(&mut *conn, "arxiv", aid).await?
+        && let Some(canon) = CatalogRepo::follow_merged_id_in_tx(&mut *conn, &raw_id).await?
+    {
+        return Ok(Some(canon));
     }
+
+    if let Some(raw_id) =
+        entries_core::find_entry_id_by_identifier_in_tx(&mut *conn, "url", canon_url).await?
+        && let Some(canon) = CatalogRepo::follow_merged_id_in_tx(&mut *conn, &raw_id).await?
+    {
+        return Ok(Some(canon));
+    }
+
     Ok(None)
 }
 
@@ -250,7 +242,88 @@ impl<'a> FeedRepo<'a> {
         self.create_with_interval(feed_type, url, title, description, 30).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    async fn reactivate_archived_feed_in_tx(
+        tx: &mut SqliteConnection,
+        url_str: &str,
+        det_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        prefer_incoming_title: bool,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let existing_archived_id: Option<String> = sqlx::query_scalar(
+            "SELECT collection_id FROM feed_sources
+             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
+             LIMIT 1",
+        )
+        .bind(url_str)
+        .bind(det_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(existing_id) = existing_archived_id else {
+            return Ok(None);
+        };
+
+        let feed_sql = if prefer_incoming_title {
+            "UPDATE feed_sources
+             SET is_active = 1,
+                 feed_title = COALESCE(?, feed_title),
+                 consecutive_failures = 0,
+                 last_error = NULL,
+                 last_error_by = NULL
+             WHERE collection_id = ?"
+        } else {
+            "UPDATE feed_sources
+             SET is_active = 1,
+                 feed_title = COALESCE(feed_title, ?),
+                 consecutive_failures = 0,
+                 last_error = NULL,
+                 last_error_by = NULL
+             WHERE collection_id = ?"
+        };
+        sqlx::query(feed_sql).bind(title).bind(&existing_id).execute(&mut *tx).await?;
+
+        if prefer_incoming_title {
+            sqlx::query(
+                "UPDATE entries
+                 SET title = COALESCE(?, title),
+                     summary = COALESCE(?, summary),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(title)
+            .bind(description)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE entries
+                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&existing_id)
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        SyncRepo::record_activity(
+            &mut *tx,
+            ActivityEntityType::Feed,
+            &existing_id,
+            ActivityAction::Unarchive,
+            now,
+        )
+        .await?;
+
+        Ok(Some(existing_id))
+    }
+
     pub async fn create_with_interval(
         &self,
         feed_type: FeedType,
@@ -262,59 +335,22 @@ impl<'a> FeedRepo<'a> {
         let url_str = url.as_str();
         let id = deterministic_feed_id(url_str);
         let nat_key = feed_natural_key(url_str);
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Feed, &nat_key).await?;
 
-        let existing_archived_id: Option<String> = sqlx::query_scalar!(
-            "SELECT collection_id FROM feed_sources
-             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
-             LIMIT 1",
+        if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
+            &mut tx,
             url_str,
-            id,
+            &id,
+            title,
+            description,
+            true,
+            now,
         )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(existing_id) = existing_archived_id {
-            sqlx::query(
-                "UPDATE feed_sources
-                 SET is_active = 1,
-                     feed_title = COALESCE(?, feed_title),
-                     consecutive_failures = 0,
-                     last_error = NULL,
-                     last_error_by = NULL
-                 WHERE collection_id = ?",
-            )
-            .bind(title)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query!(
-                "UPDATE entries
-                 SET title = COALESCE(?, title),
-                     summary = COALESCE(?, summary),
-                     updated_at = ?
-                 WHERE id = ?",
-                title,
-                description,
-                now as _,
-                existing_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Feed,
-                &existing_id,
-                ActivityAction::Unarchive,
-                now,
-            )
-            .await?;
-
+        .await?
+        {
             tx.commit().await?;
             return self
                 .get(&existing_id)
@@ -440,14 +476,8 @@ impl<'a> FeedRepo<'a> {
         .execute(&mut *conn)
         .await?;
 
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('feed_url', ?, ?)",
-            nat_key,
-            row.id,
-        )
-        .execute(&mut *conn)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(&mut *conn, row.id, "feed_url", &nat_key)
+            .await?;
 
         SyncRepo::record_activity(
             &mut *conn,
@@ -464,7 +494,7 @@ impl<'a> FeedRepo<'a> {
         outlines: Vec<OpmlOutline>,
         default_interval: i64,
     ) -> Result<Vec<Feed>> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut imported = Vec::new();
 
@@ -480,7 +510,6 @@ impl<'a> FeedRepo<'a> {
         Ok(imported)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn import_single_outline_in_tx(
         tx: &mut SqliteConnection,
         outline: OpmlOutline,
@@ -493,52 +522,17 @@ impl<'a> FeedRepo<'a> {
         let clean_title = outline.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
         SyncRepo::clear_tombstone(&mut *tx, ActivityEntityType::Feed, &nat_key).await?;
 
-        let existing_archived_id: Option<String> = sqlx::query_scalar!(
-            "SELECT collection_id FROM feed_sources
-             WHERE (feed_url = ? OR collection_id = ?) AND is_active = 0
-             LIMIT 1",
+        if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
+            &mut *tx,
             xml_url_str,
-            id,
+            &id,
+            clean_title,
+            None,
+            false,
+            now,
         )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some(existing_id) = existing_archived_id {
-            sqlx::query(
-                "UPDATE feed_sources
-                 SET is_active = 1,
-                     feed_title = COALESCE(feed_title, ?),
-                     consecutive_failures = 0,
-                     last_error = NULL,
-                     last_error_by = NULL
-                 WHERE collection_id = ?",
-            )
-            .bind(clean_title)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query!(
-                "UPDATE entries
-                 SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
-                     updated_at = ?
-                 WHERE id = ?",
-                existing_id,
-                now as _,
-                existing_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut *tx,
-                ActivityEntityType::Feed,
-                &existing_id,
-                ActivityAction::Unarchive,
-                now,
-            )
-            .await?;
-
+        .await?
+        {
             let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
                 .bind(&existing_id)
                 .fetch_optional(&mut *tx)
@@ -627,7 +621,7 @@ impl<'a> FeedRepo<'a> {
             return Ok(self.get(id).await?.is_some());
         }
 
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let existing_url: Option<String> =
@@ -770,7 +764,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let deleted_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
@@ -823,7 +817,7 @@ impl<'a> FeedRepo<'a> {
         batch: &PollBatch,
         peer_id: &str,
     ) -> std::result::Result<Vec<(String, PollItemCandidate)>, sqlx::Error> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
 
         let new_title = batch.title.as_deref().filter(|s| !s.is_empty());
         let new_desc = batch.description.as_deref().filter(|s| !s.is_empty());
@@ -919,7 +913,7 @@ impl<'a> FeedRepo<'a> {
 
             let det_id = deterministic_item_id(feed_url.as_deref(), item_url_str);
             let canon_url = canonicalize_sync_url(item_url_str);
-            let arxiv_id = ArxivParser::extract_arxiv_id(item_url_str);
+            let arxiv_id = extract_arxiv_id(item_url_str);
             let clean_duration = item.duration.filter(|&d| d > 0);
 
             if let Some(existing_id) =
@@ -976,34 +970,21 @@ impl<'a> FeedRepo<'a> {
                     .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                         VALUES (?, 'unread', 0.0, ?)",
-                        existing_id,
-                        now as _,
+                    entries_core::ensure_entry_state_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        InboxState::Unread,
+                        now,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                         VALUES ('url', ?, ?)",
-                        canon_url,
-                        existing_id,
+                    entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+                        &mut tx,
+                        &existing_id,
+                        &canon_url,
+                        arxiv_id.as_deref(),
                     )
-                    .execute(&mut *tx)
                     .await?;
-
-                    if let Some(ref aid) = arxiv_id {
-                        sqlx::query!(
-                            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                             VALUES ('arxiv', ?, ?)",
-                            aid,
-                            existing_id,
-                        )
-                        .execute(&mut *tx)
-                        .await?;
-                    }
 
                     MediaRepo::upsert_audio_enclosure_in_tx(
                         &mut tx,
@@ -1044,71 +1025,46 @@ impl<'a> FeedRepo<'a> {
                 }
             } else {
                 let entry_kind = EntryKind::from_content_type(item.content_type);
-                let creators_json = item
-                    .author
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|a| serde_json::to_string(&[a]).ok())
+                let creators_json = crate::db::serialize_creators_json(&item.creators)
                     .unwrap_or_else(|| "[]".to_owned());
 
-                let res = sqlx::query!(
-                    "INSERT OR IGNORE INTO entries
-                     (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    det_id,
-                    entry_kind as _,
-                    item.title,
-                    creators_json,
-                    item_url_str,
-                    item.published_at as _,
-                    item.summary,
-                    item_thumb,
-                    now as _,
-                    now as _,
+                let inserted_entry = entries_core::insert_entry_row_or_ignore_in_tx(
+                    &mut tx,
+                    &EntryInsertParams {
+                        creators_json: &creators_json,
+                        url: Some(item_url_str),
+                        published_at: item.published_at,
+                        summary: Some(item.summary.as_str()),
+                        thumbnail_url: item_thumb,
+                        ..EntryInsertParams::minimal(&det_id, entry_kind, &item.title, now, now)
+                    },
                 )
-                .execute(&mut *tx)
                 .await?;
 
-                if res.rows_affected() > 0 {
-                    sqlx::query!(
-                        "INSERT INTO entry_content (entry_id, content_html, content_type)
-                         VALUES (?, ?, ?)",
-                        det_id,
+                if inserted_entry {
+                    entries_core::insert_entry_content_in_tx(
+                        &mut tx,
+                        &det_id,
                         item_content_html,
-                        item.content_type as _,
+                        item.content_type,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                         VALUES (?, 'unread', 0.0, ?)",
-                        det_id,
-                        now as _,
+                    entries_core::ensure_entry_state_in_tx(
+                        &mut tx,
+                        &det_id,
+                        InboxState::Unread,
+                        now,
                     )
-                    .execute(&mut *tx)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                         VALUES ('url', ?, ?)",
-                        canon_url,
-                        det_id,
+                    entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+                        &mut tx,
+                        &det_id,
+                        &canon_url,
+                        arxiv_id.as_deref(),
                     )
-                    .execute(&mut *tx)
                     .await?;
-
-                    if let Some(ref aid) = arxiv_id {
-                        sqlx::query!(
-                            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                             VALUES ('arxiv', ?, ?)",
-                            aid,
-                            det_id,
-                        )
-                        .execute(&mut *tx)
-                        .await?;
-                    }
 
                     sqlx::query!(
                         "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
@@ -1156,17 +1112,12 @@ impl<'a> FeedRepo<'a> {
         if item.audio_url.is_none()
             && clean_duration.is_none()
             && item.thumbnail_url.is_none()
-            && item.author.is_none()
+            && item.creators.is_empty()
         {
             return Ok(());
         }
 
-        let new_creators_json = item
-            .author
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|a| serde_json::to_string(&[a]).ok());
+        let new_creators_json = crate::db::serialize_creators_json(&item.creators);
         let thumb_ref = item.thumbnail_url.as_deref();
         let creators_ref = new_creators_json.as_deref();
         let audio_ref = item.audio_url.as_deref();
@@ -1283,7 +1234,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub async fn mark_error_by_peer(&self, id: &str, error: &str, peer_id: &str) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         sqlx::query(
             "UPDATE feed_sources
@@ -1315,7 +1266,7 @@ mod tests {
 
     use crate::{
         db::{ActivityAction, ActivityEntityType, ContentType, Db, FeedType, NewItem},
-        feeds::OpmlOutline,
+        domain::OpmlOutline,
     };
 
     #[tokio::test]

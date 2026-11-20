@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::{
-    ActivityAction, ActivityEntityType, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
+    ActivityAction, ActivityEntityType, EntryKind, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
+    entries_core::{self, EntryInsertParams},
     sync::{deterministic_tag_id, tag_natural_key},
 };
 
@@ -18,18 +19,34 @@ macro_rules! tag_select_sql {
        (SELECT COUNT(*)
         FROM collection_entries ce
         LEFT JOIN entry_state es ON es.entry_id = ce.entry_id
+        LEFT JOIN entry_content ec ON ec.entry_id = ce.entry_id
         JOIN entries ie ON ie.id = ce.entry_id
         WHERE ce.collection_id = e.id
           AND ie.merged_into_id IS NULL
           AND (
+              es.inbox_state IN ('unread', 'dismissed')
+              OR ec.entry_id IS NOT NULL
+              OR (
+                  ie.kind IN ('article', 'paper', 'video', 'podcast_episode')
+                  AND EXISTS (
+                      SELECT 1 FROM collection_entries ce_li
+                      JOIN collection_specs cs_li ON cs_li.collection_id = ce_li.collection_id
+                      WHERE ce_li.entry_id = ie.id
+                        AND cs_li.collection_role IN ('want', 'list')
+                  )
+              )
+          )
+          AND (
               es.inbox_state = 'unread'
               OR (
                   COALESCE(es.inbox_state, 'none') = 'none'
-                  AND es.read_at IS NULL
-                  AND EXISTS (
-                      SELECT 1 FROM collection_entries ce_wtr
-                      WHERE ce_wtr.collection_id = ?
-                        AND ce_wtr.entry_id = ie.id
+                  AND (
+                      es.read_at IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM collection_entries ce_wtr
+                          WHERE ce_wtr.collection_id = ?
+                            AND ce_wtr.entry_id = ie.id
+                      )
                   )
               )
           )) AS unread_count
@@ -83,7 +100,7 @@ impl<'a> TagRepo<'a> {
     pub async fn create(&self, name: &str, color: Option<&HexColor>) -> Result<Tag> {
         let id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Tag, &nat_key).await?;
@@ -146,7 +163,7 @@ impl<'a> TagRepo<'a> {
             return Ok(self.get(id).await?.is_some());
         }
 
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let exists = sqlx::query_scalar!(
@@ -190,17 +207,7 @@ impl<'a> TagRepo<'a> {
             sqlx::query!("UPDATE collection_specs SET slug = ? WHERE collection_id = ?", slug, id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query!("DELETE FROM entry_identifiers WHERE scheme = 'tag' AND entry_id = ?", id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query!(
-                "INSERT OR REPLACE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('tag', ?, ?)",
-                nat_key,
-                id,
-            )
-            .execute(&mut *tx)
-            .await?;
+            entries_core::replace_entry_identifier_in_tx(&mut tx, id, "tag", &nat_key).await?;
             sqlx::query!(
                 "UPDATE entries SET updated_at = ?
                  WHERE id IN (SELECT entry_id FROM collection_entries WHERE collection_id = ?)",
@@ -237,7 +244,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let exists = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
@@ -317,18 +324,13 @@ impl<'a> TagRepo<'a> {
             return Ok(id);
         }
 
-        let tag_insert = sqlx::query!(
-            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?)",
-            new_tag_id,
-            name,
-            created_at as _,
-            now as _,
+        let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
+            &mut *conn,
+            &EntryInsertParams::minimal(&new_tag_id, EntryKind::Collection, name, created_at, now),
         )
-        .execute(&mut *conn)
         .await?;
 
-        if tag_insert.rows_affected() > 0 {
+        if inserted {
             sqlx::query!(
                 "INSERT OR IGNORE INTO collection_specs (collection_id, slug, mode, collection_role, show_in_lists, color)
                  VALUES (?, ?, 'manual', 'tag', 0, ?)",
@@ -338,14 +340,8 @@ impl<'a> TagRepo<'a> {
             )
             .execute(&mut *conn)
             .await?;
-            sqlx::query!(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('tag', ?, ?)",
-                nat_key,
-                new_tag_id,
-            )
-            .execute(&mut *conn)
-            .await?;
+            entries_core::upsert_entry_identifier_in_tx(&mut *conn, &new_tag_id, "tag", &nat_key)
+                .await?;
             SyncRepo::record_activity(
                 &mut *conn,
                 ActivityEntityType::Tag,
@@ -432,7 +428,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn add_to_item(&self, item_id: &str, tag_id: &str) -> Result<()> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         Self::attach_in_tx(&mut tx, item_id, tag_id, now).await?;
         tx.commit().await?;
@@ -440,7 +436,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn add_named_to_item(&self, item_id: &str, name: &str) -> Result<Tag> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let tag = Self::get_or_create_and_attach_in_tx(&mut tx, item_id, name, now).await?;
         tx.commit().await?;
@@ -448,7 +444,7 @@ impl<'a> TagRepo<'a> {
     }
 
     pub async fn remove_from_item(&self, item_id: &str, tag_id: &str) -> Result<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query!(
             "DELETE FROM collection_entries
@@ -501,19 +497,6 @@ impl<'a> TagRepo<'a> {
             .await?)
     }
 
-    pub async fn list_all_item_tags(&self) -> Result<Vec<ItemTag>> {
-        Ok(sqlx::query_as!(
-            ItemTag,
-            "SELECT ce.entry_id AS item_id, ce.collection_id AS tag_id
-             FROM collection_entries ce
-             JOIN collection_specs cs ON cs.collection_id = ce.collection_id
-             WHERE cs.collection_role = 'tag'
-             ORDER BY ce.entry_id, ce.collection_id",
-        )
-        .fetch_all(self.pool)
-        .await?)
-    }
-
     pub(crate) async fn list_item_tags_for_items_in_tx(
         conn: &mut SqliteConnection,
         item_ids: &[String],
@@ -539,5 +522,95 @@ impl<'a> TagRepo<'a> {
         }
         out.sort_by(|a, b| a.item_id.cmp(&b.item_id).then_with(|| a.tag_id.cmp(&b.tag_id)));
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use chrono::Utc;
+    use url::Url;
+
+    use crate::db::{
+        ContentType, Db, EntryKind, ItemFilter, ItemStatus, ItemStatusFilter, ManualItemInput,
+        ReadAtPatch, UpsertEntryInput,
+    };
+
+    #[tokio::test]
+    async fn test_tag_unread_count_matches_unread_filter_for_read_wtr_item_and_excludes_non_reader()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let url = Url::parse("https://example.com/wtr-reread").unwrap();
+        let (item, tags) = db
+            .items()
+            .save_manual_input_with_tags(&ManualItemInput {
+                url: &url,
+                title: "Re-read Essay",
+                summary: None,
+                content_html: Some("<p>Body</p>"),
+                thumbnail_url: None,
+                audio_url: None,
+                duration: None,
+                content_type: ContentType::Article,
+                tags: &["essays".to_owned()],
+            })
+            .await
+            .unwrap();
+        let tag_id = &tags[0].id;
+        assert_eq!(tags[0].unread_count, 1);
+
+        // Tag a non-reader catalog entry (Movie with no entry_content / entry_state) — must NOT count
+        let movie = db
+            .catalog()
+            .upsert_entry(&UpsertEntryInput {
+                kind: Some(EntryKind::Movie),
+                title: "Stalker".to_owned(),
+                ..UpsertEntryInput::default()
+            })
+            .await
+            .unwrap();
+        db.tags().add_to_item(&movie.id, tag_id).await.unwrap();
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 1);
+
+        // Mark item read and archive (removes from Want-to-Read) -> unread_count drops to 0
+        db.items()
+            .update(
+                &item.id,
+                Some(ItemStatus::Archived),
+                None,
+                Some(1.0),
+                ReadAtPatch::MarkRead(Utc::now()),
+            )
+            .await
+            .unwrap();
+        let unread_page_archived = db
+            .items()
+            .list_filtered_page(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                tag_id: Some(tag_id.clone()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(unread_page_archived.items.len(), 0);
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 0);
+
+        // Re-add read item to Want-to-Read (read_at IS NOT NULL, in WTR) -> unread_count == 1
+        db.catalog().add_collection_entry("want:read", &item.id, None).await.unwrap();
+        let unread_page_reread = db
+            .items()
+            .list_filtered_page(&ItemFilter {
+                status: Some(ItemStatusFilter::Unread),
+                tag_id: Some(tag_id.clone()),
+                ..ItemFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(unread_page_reread.items.len(), 1);
+        assert_eq!(unread_page_reread.items[0].id, item.id);
+        assert!(unread_page_reread.items[0].read_at.is_some());
+        assert_eq!(db.tags().get(tag_id).await.unwrap().unwrap().unread_count, 1);
+        assert_eq!(db.tags().list().await.unwrap()[0].unread_count, 1);
+        assert_eq!(db.tags().list_for_item(&item.id).await.unwrap()[0].unread_count, 1);
     }
 }

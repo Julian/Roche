@@ -11,6 +11,27 @@ package com.grayvines.roche.data
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.MAX_CLOCK_DRIFT_MS
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_CONSUMPTION_LOG
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.deterministicFeedId
+import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.data.catalog.CatalogStore
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
+import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
+import com.grayvines.roche.data.catalog.SyncEntryContentDto
+import com.grayvines.roche.data.catalog.SyncEntryRecordDto
+import com.grayvines.roche.data.catalog.SyncEntryStateDto
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.feeds.ParsedFeedBatch
+import com.grayvines.roche.data.feeds.ParsedFeedCandidateItem
+import com.grayvines.roche.data.feeds.enrichWantToReadItemOnDevice
 import com.grayvines.roche.data.local.CollectionEntryEntity
 import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
@@ -20,17 +41,34 @@ import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.TombstoneEntity
+import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.PeerSyncResponseDto
+import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.ResponseTooLargeException
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.data.remote.RocheProblemTypes
 import com.grayvines.roche.data.remote.rocheJson
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.MAX_PEER_SYNC_PAYLOAD_BYTES
+import com.grayvines.roche.data.sync.MIN_SERVER_PAYLOAD_BYTES
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerSyncCoordinator
+import com.grayvines.roche.data.sync.PeerSyncJobTracker
+import com.grayvines.roche.data.sync.PeerSyncScheduler
+import com.grayvines.roche.data.sync.SyncTombstoneDto
+import com.grayvines.roche.data.sync.compute413RetryPayloadBudget
+import com.grayvines.roche.data.sync.isOversizedResponseError
+import com.grayvines.roche.data.sync.isPayloadTooLargeProblem
+import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
+import com.grayvines.roche.data.sync.resolveOrSynthesizeHlc
 import com.grayvines.roche.isAllowedSharedContentUri
 import com.grayvines.roche.model.ContentType
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
@@ -972,4 +1010,138 @@ class DataSyncRound2FixesTest {
             dataStoreScope.coroutineContext[Job]?.cancelAndJoin()
         }
     }
+
+    @Test
+    fun `PeerSyncCoordinator caps 413 retry budget from maxBytes and handles ResponseTooLargeException`() =
+        runTest {
+            assertTrue(
+                isPayloadTooLargeProblem(
+                    ProblemDetailsException(
+                        statusCode = 400,
+                        title = "Too Big",
+                        detail = "Payload exceeds limit",
+                        problemType = RocheProblemTypes.PAYLOAD_TOO_LARGE,
+                    )
+                )
+            )
+            assertTrue(
+                isPayloadTooLargeProblem(
+                    ProblemDetailsException(statusCode = 413, title = "Too Big", detail = "Legacy")
+                )
+            )
+            assertEquals(
+                60_000,
+                compute413RetryPayloadBudget(MAX_PEER_SYNC_PAYLOAD_BYTES, 60_000L),
+            )
+            assertEquals(
+                MIN_SERVER_PAYLOAD_BYTES,
+                compute413RetryPayloadBudget(MAX_PEER_SYNC_PAYLOAD_BYTES, 128L),
+            )
+            assertEquals(30_000, compute413RetryPayloadBudget(60_000, 60_000L))
+            assertEquals(
+                MAX_PEER_SYNC_PAYLOAD_BYTES / 2,
+                compute413RetryPayloadBudget(MAX_PEER_SYNC_PAYLOAD_BYTES, null),
+            )
+            assertTrue(isOversizedResponseError(ResponseTooLargeException(maxBytes = 1024L)))
+            assertFalse(isOversizedResponseError(IOException("exceeds maximum allowed size")))
+
+            val dao = database.dao()
+            val nowIso = "2026-11-19T12:00:00Z"
+            val entryIds = (0 until 8).map { "entry-maxbytes-$it" }
+            for ((idx, id) in entryIds.withIndex()) {
+                val hlc = nextLocalHlc(dao, "android-test")
+                dao.upsertEntry(
+                    EntryEntity(
+                        id = id,
+                        kind = EntryKind.ARTICLE.wireValue,
+                        title = "Entry $idx",
+                        url = "https://example.com/maxbytes/$idx",
+                        summary = "a".repeat(25_000),
+                        createdAt = nowIso,
+                        updatedAt = nowIso,
+                        hlc = hlc,
+                        isLocalDirty = true,
+                    )
+                )
+            }
+
+            var server413Count = 0
+            var seq = 30L
+            val uploadedIds = LinkedHashSet<String>()
+            val serverLimitBytes = 60_000L
+            val cappedClient = RocheApiClient { req ->
+                val rawBody = req.body.orEmpty()
+                if (rawBody.toByteArray().size > serverLimitBytes) {
+                    server413Count++
+                    HttpResponse(
+                        statusCode = 413,
+                        body =
+                            """{"type":"urn:roche:problem:payload-too-large","title":"Payload Too Large","status":413,"detail":"Body exceeds 60000 bytes","max_bytes":$serverLimitBytes}""",
+                    )
+                } else {
+                    val parsed = rocheJson.parseToJsonElement(rawBody).jsonObject
+                    parsed["entries"]?.jsonArray.orEmpty().forEach { el ->
+                        uploadedIds.add(el.jsonObject["id"]!!.jsonPrimitive.content)
+                    }
+                    seq += 1L
+                    HttpResponse(
+                        statusCode = 200,
+                        body =
+                            """{"server_peer_id":"server","sync_timestamp":"$nowIso","sync_seq":$seq,"has_more":false,"reset_required":false}""",
+                    )
+                }
+            }
+
+            val coordinator =
+                PeerSyncCoordinator(
+                    dao = dao,
+                    apiClient = cappedClient,
+                    networkTier = NetworkTier.WIFI,
+                )
+            val baseSettings =
+                Settings(
+                    serverUrl = "http://127.0.0.1:8080",
+                    bearerToken = "tok",
+                    peerId = "android-test",
+                    deviceName = "Pixel",
+                    lastPeerSyncCursor = "20",
+                )
+            coordinator.syncAndCooperativePoll(currentSettings = baseSettings)
+            assertEquals(1, server413Count)
+            assertTrue(uploadedIds.containsAll(entryIds))
+            for (id in entryIds) {
+                assertFalse(dao.getEntryById(id)!!.isLocalDirty)
+            }
+
+            val oversizedCoordinator =
+                PeerSyncCoordinator(
+                    dao = dao,
+                    apiClient =
+                        RocheApiClient { throw ResponseTooLargeException(maxBytes = 1024L) },
+                    networkTier = NetworkTier.WIFI,
+                )
+            assertNull(
+                oversizedCoordinator.syncAndCooperativePoll(
+                    currentSettings = baseSettings.copy(lastPeerSyncCursor = "0"),
+                    sinceSeqOverride = 0L,
+                )
+            )
+            val genericIoCoordinator =
+                PeerSyncCoordinator(
+                    dao = dao,
+                    apiClient =
+                        RocheApiClient {
+                            throw IOException("Response exceeds maximum allowed size")
+                        },
+                    networkTier = NetworkTier.WIFI,
+                )
+            val genericIoErr = runCatching {
+                genericIoCoordinator.syncAndCooperativePoll(
+                    currentSettings = baseSettings.copy(lastPeerSyncCursor = "0"),
+                    sinceSeqOverride = 0L,
+                )
+            }
+                .exceptionOrNull()
+            assertTrue(genericIoErr is IOException)
+        }
 }

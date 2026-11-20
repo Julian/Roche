@@ -45,16 +45,18 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
-import com.grayvines.roche.data.CollectionDrawSnapshot
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.generatorFor
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.playback.PodcastPlayerState
 import com.grayvines.roche.ui.components.PlusIcon
 import com.grayvines.roche.ui.components.RocheBottomBar
 import com.grayvines.roche.ui.components.SearchIcon
@@ -62,7 +64,19 @@ import com.grayvines.roche.ui.components.UndoOrStatusSnackbar
 import com.grayvines.roche.ui.theme.LocalReaderFontScale
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
+
+private val IdlePlayerStateFlow: StateFlow<PodcastPlayerState> =
+    MutableStateFlow(PodcastPlayerState())
+
+private fun observeActiveAudioEntryId(
+    playerStateFlow: StateFlow<PodcastPlayerState>
+): Flow<String?> = playerStateFlow.map { it.currentEntryId }.distinctUntilChanged()
 
 @Composable
 fun MainScreen(
@@ -71,6 +85,7 @@ fun MainScreen(
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     modifier: Modifier = Modifier,
+    playerStateFlow: StateFlow<PodcastPlayerState> = IdlePlayerStateFlow,
     onImportOpml: () -> Unit = {},
     onExportOpml: () -> Unit = {},
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
@@ -79,7 +94,9 @@ fun MainScreen(
 ) {
     val colors = LocalRocheColors.current
     val scrollStates = rememberMainScrollStates()
-    val activePlayerEntry = state.activePlayerEntry
+    val activeAudioIdFlow = remember(playerStateFlow) { observeActiveAudioEntryId(playerStateFlow) }
+    val activeAudioEntryId by activeAudioIdFlow.collectAsStateWithLifecycle(initialValue = null)
+    val activePlayerEntry = state.resolveActivePlayerEntry(activeAudioEntryId)
     val activeReaderEntry = state.activeReaderEntry
     val retainedSearchStateRef = remember { RetentionRef(state.takeIf { it.isSearchOpen }) }
     val retainedScopedStates = remember { LinkedHashMap<RocheNavKey.ScopedInbox, MainUiState>() }
@@ -90,7 +107,9 @@ fun MainScreen(
         cacheActiveScopedState(state, retainedScopedStates)
     }
     val currentState by rememberUpdatedState(state)
+    val currentActiveAudioEntryId by rememberUpdatedState(activeAudioEntryId)
     val currentPlayerEntry by rememberUpdatedState(activePlayerEntry)
+    val currentPlayerStateFlow by rememberUpdatedState(playerStateFlow)
     val currentReaderEntry by rememberUpdatedState(activeReaderEntry)
     val currentOnAction by rememberUpdatedState(onAction)
     val currentOnShareEntry by rememberUpdatedState(onShareEntry)
@@ -99,11 +118,12 @@ fun MainScreen(
     val currentOnExportOpml by rememberUpdatedState(onExportOpml)
     val currentOnOpenCollectionDraw by rememberUpdatedState(onOpenCollectionDraw)
     val activeFullscreenPlayerEntryId =
-        activePlayerEntry?.id?.takeIf { state.playerState.isFullscreenOpen }
+        activePlayerEntry?.id?.takeIf { state.isPlayerFullscreenOpen }
     val desiredBackStack =
         remember(state, activeReaderEntry?.id, activeFullscreenPlayerEntryId) {
             deriveRocheBackStack(
                 state = state,
+                activeAudioEntryId = activeAudioEntryId,
                 activeFullscreenPlayerEntryId = activeFullscreenPlayerEntryId,
             )
         }
@@ -129,6 +149,7 @@ fun MainScreen(
         MainDestinationScaffold(
             state = state,
             activePlayerEntry = activePlayerEntry,
+            playerStateFlow = playerStateFlow,
             showBottomBar = chromeFlags.showChrome,
             hasFab = chromeFlags.hasFab,
             showAddFab = chromeFlags.showAddFab,
@@ -150,6 +171,7 @@ fun MainScreen(
                             MainTabDestinationContent(
                                 tab = tabKey.tab,
                                 state = currentState,
+                                activeAudioEntryId = currentActiveAudioEntryId,
                                 scrollStates = scrollStates,
                                 onAction = currentOnAction,
                                 onOpenExternalUrl = currentOnOpenExternalUrl,
@@ -163,6 +185,7 @@ fun MainScreen(
                             MainScopedInboxDestination(
                                 scopedKey = scopedKey,
                                 state = currentState,
+                                activeAudioEntryId = currentActiveAudioEntryId,
                                 retainedFromParent = retainedScopedStates[scopedKey],
                                 scrollStates = scrollStates,
                                 onAction = currentOnAction,
@@ -172,6 +195,7 @@ fun MainScreen(
                         entry<RocheNavKey.Search> {
                             MainSearchDestination(
                                 state = currentState,
+                                activeAudioEntryId = currentActiveAudioEntryId,
                                 retainedFromParent =
                                     if (currentState.isSearchOpen) {
                                         currentState
@@ -199,6 +223,7 @@ fun MainScreen(
                                 playerKey = playerKey,
                                 state = currentState,
                                 activePlayerEntry = currentPlayerEntry,
+                                playerStateFlow = currentPlayerStateFlow,
                                 onAction = currentOnAction,
                                 onShareEntry = currentOnShareEntry,
                                 onOpenExternalUrl = currentOnOpenExternalUrl,
@@ -287,6 +312,7 @@ internal fun rememberMainScrollStates(): MainScrollStateHolder =
 internal fun MainDestinationScaffold(
     state: MainUiState,
     activePlayerEntry: InboxEntry?,
+    playerStateFlow: StateFlow<PodcastPlayerState>,
     showBottomBar: Boolean,
     hasFab: Boolean,
     showAddFab: Boolean = hasFab,
@@ -314,6 +340,7 @@ internal fun MainDestinationScaffold(
                     state = state,
                     activeTab = activeTabForBar,
                     activePlayerEntry = activePlayerEntry,
+                    playerStateFlow = playerStateFlow,
                     onAction = onAction,
                     modifier = Modifier.onSizeChanged { onChromeBottomHeightChange(it.height) },
                 )
@@ -350,14 +377,15 @@ internal fun MainBottomBarChrome(
     state: MainUiState,
     activeTab: AppTab,
     activePlayerEntry: InboxEntry?,
+    playerStateFlow: StateFlow<PodcastPlayerState>,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier) {
         if (activePlayerEntry != null) {
-            DockedMiniPlayer(
+            DockedMiniPlayerSlot(
                 entry = activePlayerEntry,
-                playerState = state.playerState,
+                playerStateFlow = playerStateFlow,
                 onAction = onAction,
             )
         }
@@ -367,6 +395,20 @@ internal fun MainBottomBarChrome(
             onSelectTab = { onAction(MainAction.SelectTab(it)) },
         )
     }
+}
+
+@Composable
+private fun DockedMiniPlayerSlot(
+    entry: InboxEntry,
+    playerStateFlow: StateFlow<PodcastPlayerState>,
+    onAction: (MainAction) -> Unit,
+) {
+    val playerState by playerStateFlow.collectAsStateWithLifecycle()
+    DockedMiniPlayer(
+        entry = entry,
+        playerState = playerState,
+        onAction = onAction,
+    )
 }
 
 @Composable
@@ -542,6 +584,7 @@ internal fun MainOverlaySheets(
 private fun MainScopedInboxDestination(
     scopedKey: RocheNavKey.ScopedInbox,
     state: MainUiState,
+    activeAudioEntryId: String?,
     retainedFromParent: MainUiState?,
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
@@ -561,12 +604,14 @@ private fun MainScopedInboxDestination(
         state = displayState,
         onAction = onAction,
         listState = scrollStates.lazyListState(scopedInboxScrollKey(scopedKey)),
+        activeAudioEntryId = activeAudioEntryId,
     )
 }
 
 @Composable
 private fun MainSearchDestination(
     state: MainUiState,
+    activeAudioEntryId: String?,
     retainedFromParent: MainUiState?,
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
@@ -595,6 +640,7 @@ private fun MainSearchDestination(
         onAction = onAction,
         listState = searchListState,
         isSearchActive = state.isSearchOpen,
+        activeAudioEntryId = activeAudioEntryId,
     )
 }
 
@@ -647,10 +693,12 @@ private fun MainPlayerDestination(
     playerKey: RocheNavKey.FullscreenPlayer,
     state: MainUiState,
     activePlayerEntry: InboxEntry?,
+    playerStateFlow: StateFlow<PodcastPlayerState>,
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
 ) {
+    val playerState by playerStateFlow.collectAsStateWithLifecycle()
     val liveEntry =
         activePlayerEntry?.takeIf { it.id == playerKey.entryId }
             ?: state.allEntries.firstOrNull { it.id == playerKey.entryId }
@@ -663,16 +711,18 @@ private fun MainPlayerDestination(
     }
     if (targetEntry != null) {
         val resolvedFeed =
-            state.activePlayerFeed
+            state.resolveActivePlayerFeed(playerState.currentEntryId)
                 ?: targetEntry.feedId?.let { fid -> state.feeds.firstOrNull { it.id == fid } }
         FullscreenPodcastPlayer(
             entry = targetEntry,
             feed = resolvedFeed,
-            playerState = state.playerState,
-            nextQueuedAudioEntry = state.nextQueuedAudioEntry,
+            playerState = playerState,
+            nextQueuedAudioEntry = state.resolveNextQueuedAudioEntry(playerState.currentEntryId),
             onAction = onAction,
             onShareEntry = onShareEntry,
             onOpenExternalUrl = onOpenExternalUrl,
+            isSpeedSheetOpen = state.isPlayerSpeedSheetOpen,
+            activeDrawerTab = state.activePlayerDrawerTab,
         )
     }
 }
@@ -680,6 +730,7 @@ private fun MainPlayerDestination(
 @Composable
 private fun UnscopedInboxTabDestination(
     state: MainUiState,
+    activeAudioEntryId: String?,
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
 ) {
@@ -703,6 +754,7 @@ private fun UnscopedInboxTabDestination(
         state = unscopedState,
         onAction = onAction,
         listState = scrollStates.lazyListState("inbox:filter:${state.activeFilter.name}"),
+        activeAudioEntryId = activeAudioEntryId,
     )
 }
 
@@ -776,6 +828,7 @@ internal fun resolveSearchOverlayState(
 internal fun MainTabDestinationContent(
     tab: AppTab,
     state: MainUiState,
+    activeAudioEntryId: String?,
     scrollStates: MainScrollStateHolder,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
@@ -789,12 +842,14 @@ internal fun MainTabDestinationContent(
                 state = state,
                 onAction = onAction,
                 scrollState = scrollStates.scrollState("home"),
+                activeAudioEntryId = activeAudioEntryId,
                 onOpenExternalUrl = onOpenExternalUrl,
                 onOpenCollectionDraw = onOpenCollectionDraw,
             )
         AppTab.INBOX ->
             UnscopedInboxTabDestination(
                 state = state,
+                activeAudioEntryId = activeAudioEntryId,
                 scrollStates = scrollStates,
                 onAction = onAction,
             )
@@ -804,12 +859,14 @@ internal fun MainTabDestinationContent(
                 onAction = onAction,
                 upNextListState = scrollStates.lazyListState("queue:up_next"),
                 historyListState = scrollStates.lazyListState("queue:history"),
+                activeAudioEntryId = activeAudioEntryId,
             )
         AppTab.STARRED ->
             StarredTabContent(
                 state = state,
                 onAction = onAction,
                 listState = scrollStates.lazyListState("starred"),
+                activeAudioEntryId = activeAudioEntryId,
                 onOpenExternalUrl = onOpenExternalUrl,
             )
         AppTab.FEEDS ->

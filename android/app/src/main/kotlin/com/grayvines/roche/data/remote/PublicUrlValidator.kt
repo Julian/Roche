@@ -1,12 +1,13 @@
 package com.grayvines.roche.data.remote
 
 import android.security.NetworkSecurityPolicy
-import com.grayvines.roche.data.isLoopbackHost
-import com.grayvines.roche.data.isPublicHost
-import com.grayvines.roche.data.isPublicInetAddress
-import com.grayvines.roche.data.isTailnetOnlyHost
-import com.grayvines.roche.data.isTailscaleHostOrIp
-import com.grayvines.roche.data.isTailscaleInetAddress
+import com.grayvines.roche.core.isAllowedPublicPort
+import com.grayvines.roche.core.isLoopbackHost
+import com.grayvines.roche.core.isPublicHost
+import com.grayvines.roche.core.isPublicInetAddress
+import com.grayvines.roche.core.isTailnetOnlyHost
+import com.grayvines.roche.core.isTailscaleHostOrIp
+import com.grayvines.roche.core.isTailscaleInetAddress
 import java.io.IOException
 import java.net.IDN
 import java.net.InetAddress
@@ -22,6 +23,10 @@ internal object PublicUrlValidator {
         val asciiHost = extractAsciiHostOrThrow(uri)
         if (!isPublicHost(asciiHost)) {
             throw IOException("Blocked non-public upstream host: $asciiHost")
+        }
+        val port = extractPortOrThrow(uri)
+        if (!isAllowedPublicPort(port)) {
+            throw IOException("Blocked disallowed upstream port: $port")
         }
         return asciiHost
     }
@@ -216,4 +221,18 @@ internal fun extractAsciiHostOrThrow(uri: URI): String {
         .getOrNull()
         ?.takeIf { it.isNotBlank() }
     return ascii ?: throw IOException("URL has invalid host")
+}
+
+internal fun extractPortOrThrow(uri: URI): Int {
+    if (uri.host != null) return uri.port
+    val authority = uri.rawAuthority?.trim().orEmpty()
+    val hostAndPort = authority.substringAfterLast('@')
+    val portPart =
+        when {
+            hostAndPort.startsWith("[") -> hostAndPort.substringAfter(']', "").removePrefix(":")
+            ':' in hostAndPort -> hostAndPort.substringAfterLast(':')
+            else -> ""
+        }
+    if (portPart.isEmpty()) return -1
+    return portPart.toIntOrNull()?.takeIf { it > 0 } ?: throw IOException("URL has invalid port")
 }

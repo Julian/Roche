@@ -117,6 +117,7 @@ fun SearchOverlay(
     onAction: (MainAction) -> Unit,
     listState: LazyListState = rememberLazyListState(),
     isSearchActive: Boolean = state.isSearchOpen,
+    activeAudioEntryId: String? = null,
 ) {
     val colors = LocalRocheColors.current
     val focusRequester = remember { FocusRequester() }
@@ -170,8 +171,9 @@ fun SearchOverlay(
             selectedScope = scopeFilter,
             ultraDense = displayState.settings.ultraDenseRows,
             swipeToArchive = displayState.settings.swipeToArchive,
-            playingEntryId = displayState.playerState.currentEntryId,
-            nextQueuedAudioEntryId = displayState.nextQueuedAudioEntryId,
+            playingEntryId = activeAudioEntryId,
+            nextQueuedAudioEntryId =
+                displayState.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id,
             onAction = onAction,
             listState = listState,
         )

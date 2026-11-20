@@ -2,15 +2,12 @@
 
 package com.grayvines.roche.ui
 
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.NetworkTierProvider
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.data.collectInBackground
-import com.grayvines.roche.data.generatorFor
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.RocheDatabase
@@ -23,6 +20,15 @@ import com.grayvines.roche.data.local.upsertTags
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.media.BitmapLoader
+import com.grayvines.roche.media.ImageDecoders
+import com.grayvines.roche.media.MAX_BITMAP_DIMENSION_PX
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.ThumbnailLoader
+import com.grayvines.roche.media.computeProportionalTargetSize
+import com.grayvines.roche.media.pruneThumbnailDiskCache
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedSortOrder
@@ -30,12 +36,20 @@ import com.grayvines.roche.model.extractCleanDomain
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.model.resolveFallbackFaviconUrl
 import com.grayvines.roche.model.resolveOriginFaviconUrl
-import com.grayvines.roche.ui.components.MAX_BITMAP_DIMENSION_PX
-import com.grayvines.roche.ui.components.ThumbnailLoader
-import com.grayvines.roche.ui.components.computeProportionalTargetSize
-import com.grayvines.roche.ui.components.pruneThumbnailDiskCache
+import com.grayvines.roche.playback.AudioPlayerBackend
+import com.grayvines.roche.playback.MediaSessionCommand
+import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastMediaSessionCallbacks
+import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
+import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.extractPlainTextHeadings
+import com.grayvines.roche.reader.mapBlockHeadingIndices
+import com.grayvines.roche.reader.parseHtmlArticleBlocks
+import com.grayvines.roche.reader.resolveSafeAnchorHref
 import java.io.File
-import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlinx.coroutines.CompletableDeferred
@@ -48,10 +62,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -668,7 +680,7 @@ class MainViewModelTest {
             assertNull(closedState.readerContent)
 
             val mathPlainText = "if x < 5 " + "word ".repeat(540) + "then y > 10"
-            assertEquals("3m", com.grayvines.roche.model.formatArticleMinutes(mathPlainText))
+            assertEquals("3m", com.grayvines.roche.core.formatArticleMinutes(mathPlainText))
 
             collectJob.cancel()
         }
@@ -718,19 +730,17 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.AddToQueue("ep-2"))
             val queuedState = viewModel.uiState.first { it.queueEntries.size == 3 }
             assertEquals(listOf("ep-1", "art-mid", "ep-2"), queuedState.queueEntries.map { it.id })
-            assertEquals("ep-1", queuedState.nextQueuedAudioEntryId)
+            assertEquals("ep-1", queuedState.resolveNextQueuedAudioEntry(null)?.id)
 
             // Play ep-1: applies podcast customPlaybackSpeed (2.65x), parses chapters, sets
-            // nextQueuedAudioEntryId to ep-2 (skipping art-mid)
+            // next queued audio to ep-2 (skipping art-mid)
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-1", openFullscreen = true))
-            val playingEp1 =
-                viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-1" && it.playerState.isFullscreenOpen
-                }
-            assertEquals(2.65f, playingEp1.playerState.playbackSpeed, 1e-3f)
-            assertEquals(3, playingEp1.playerState.chapters.size)
-            assertEquals("Tokio Internals", playingEp1.playerState.chapters[1].title)
-            assertEquals("ep-2", playingEp1.nextQueuedAudioEntryId)
+            val playingEp1Player = viewModel.playerState.first { it.currentEntryId == "ep-1" }
+            val playingEp1 = viewModel.uiState.first { it.isPlayerFullscreenOpen }
+            assertEquals(2.65f, playingEp1Player.playbackSpeed, 1e-3f)
+            assertEquals(3, playingEp1Player.chapters.size)
+            assertEquals("Tokio Internals", playingEp1Player.chapters[1].title)
+            assertEquals("ep-2", playingEp1.resolveNextQueuedAudioEntry("ep-1")?.id)
 
             // Seek ep-1 to 25%, then SkipToNextQueuedAudio: must NOT archive ep-1 or mark its
             // progress 1.0; rotates ep-1 behind ep-2 and starts ep-2
@@ -739,10 +749,10 @@ class MainViewModelTest {
                 abs(it.allEntries.first { e -> e.id == "ep-1" }.readProgress - 0.25) < 1e-2
             }
             viewModel.dispatch(MainAction.SkipToNextQueuedAudio)
+            viewModel.playerState.first { it.currentEntryId == "ep-2" }
             val playingEp2 =
                 viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-2" &&
-                        it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2", "ep-1") &&
+                    it.queueEntries.map { e -> e.id } == listOf("art-mid", "ep-2", "ep-1") &&
                         it.listeningHistoryEntries.size == 2
                 }
             val skippedEp1 = playingEp2.allEntries.first { it.id == "ep-1" }
@@ -756,10 +766,10 @@ class MainViewModelTest {
 
             // Actual episode completion DOES mark ep-2 100% read & archived and autoplays ep-1
             viewModel.playerController.completeActiveEpisodeNow()
+            viewModel.playerState.first { it.currentEntryId == "ep-1" }
             val afterEp2Completed =
                 viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-1" &&
-                        it.allEntries.first { e -> e.id == "ep-2" }.isArchived
+                    it.allEntries.first { e -> e.id == "ep-2" }.isArchived
                 }
             val ep2History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-2" }
             val ep1History = afterEp2Completed.listeningHistoryEntries.first { it.id == "ep-1" }
@@ -788,19 +798,18 @@ class MainViewModelTest {
             viewModel.dispatch(
                 MainAction.SetPlaybackSpeed(speed = 2.75f, applyToCurrentPodcast = true)
             )
-            val updatedFeedSpeed =
-                viewModel.uiState.first {
-                    abs((it.activePlayerFeed?.customPlaybackSpeed ?: 0f) - 2.75f) < 1e-3f
-                }
-            assertEquals(2.75f, updatedFeedSpeed.playerState.playbackSpeed, 1e-3f)
+            viewModel.uiState.first {
+                abs((it.resolveActivePlayerFeed("ep-1")?.customPlaybackSpeed ?: 0f) - 2.75f) < 1e-3f
+            }
+            assertEquals(2.75f, viewModel.playerState.value.playbackSpeed, 1e-3f)
 
             // Explicitly marking active episode finished clears active player and removes from
             // queue
             viewModel.dispatch(MainAction.MarkFeedEntryFinished("ep-1"))
+            viewModel.playerState.first { it.currentEntryId == null }
             val afterExplicitFinish =
                 viewModel.uiState.first {
-                    it.playerState.currentEntryId == null &&
-                        it.queueEntries.map { e -> e.id } == listOf("art-mid")
+                    it.queueEntries.map { e -> e.id } == listOf("art-mid")
                 }
             assertTrue(afterExplicitFinish.allEntries.first { it.id == "ep-1" }.isArchived)
 
@@ -808,106 +817,86 @@ class MainViewModelTest {
         }
 
     @Test
-    fun `mediaSessionBridge handles lock screen transport audio focus and bluetooth headset keys`() =
-        runTest {
-            val podcastFeed = testFeed("f-pod", "Systems Cast").copy(feedType = "podcast")
-            val ep1 =
-                testItem("ep-a", "Episode A", "f-pod")
-                    .copy(
-                        feedTitle = "Systems Cast",
-                        contentType = "audio",
-                        audioUrl = "https://example.com/a.mp3",
-                        duration = "30:00",
-                    )
-            val ep2 =
-                testItem("ep-b", "Episode B", "f-pod")
-                    .copy(
-                        feedTitle = "Systems Cast",
-                        contentType = "audio",
-                        audioUrl = "https://example.com/b.mp3",
-                        duration = "40:00",
-                    )
-            database.dao().upsertFeeds(listOf(podcastFeed))
-            database.dao().upsertItems(listOf(ep1, ep2))
+    fun `mediaSessionBridge handles lock screen transport and playback speed commands`() = runTest {
+        val podcastFeed = testFeed("f-pod", "Systems Cast").copy(feedType = "podcast")
+        val ep1 =
+            testItem("ep-a", "Episode A", "f-pod")
+                .copy(
+                    feedTitle = "Systems Cast",
+                    contentType = "audio",
+                    audioUrl = "https://example.com/a.mp3",
+                    duration = "30:00",
+                )
+        val ep2 =
+            testItem("ep-b", "Episode B", "f-pod")
+                .copy(
+                    feedTitle = "Systems Cast",
+                    contentType = "audio",
+                    audioUrl = "https://example.com/b.mp3",
+                    duration = "40:00",
+                )
+        database.dao().upsertFeeds(listOf(podcastFeed))
+        database.dao().upsertItems(listOf(ep1, ep2))
 
-            val collectJob = collectInBackground(viewModel.uiState)
-            viewModel.uiState.first { it.allEntries.size == 2 }
-            viewModel.dispatch(MainAction.AddToQueue("ep-a"))
-            viewModel.dispatch(MainAction.AddToQueue("ep-b"))
-            viewModel.uiState.first { it.queueEntries.size == 2 }
-            viewModel.dispatch(MainAction.PlayAudioEntry("ep-a"))
+        val collectJob = collectInBackground(viewModel.uiState)
+        viewModel.uiState.first { it.allEntries.size == 2 }
+        viewModel.dispatch(MainAction.AddToQueue("ep-a"))
+        viewModel.dispatch(MainAction.AddToQueue("ep-b"))
+        viewModel.uiState.first { it.queueEntries.size == 2 }
+        viewModel.dispatch(MainAction.PlayAudioEntry("ep-a"))
 
-            viewModel.uiState.first {
-                it.playerState.currentEntryId == "ep-a" && it.playerState.hasNextQueuedAudio
+        viewModel.playerState.first { it.currentEntryId == "ep-a" && it.hasNextQueuedAudio }
+        val epASnapshot =
+            mediaSessionBridge.snapshots.first {
+                it?.entryId == "ep-a" && it.hasNextQueuedAudio
             }
-            val epASnapshot =
-                mediaSessionBridge.snapshots.first {
-                    it?.entryId == "ep-a" && it.hasNextQueuedAudio
-                }
-            assertTrue(mediaSessionBridge.focusRequestedCount > 0)
-            assertEquals("Episode A", epASnapshot?.episodeTitle)
-            assertTrue(epASnapshot?.hasNextQueuedAudio == true)
+        assertEquals("Episode A", epASnapshot?.episodeTitle)
+        assertTrue(epASnapshot?.hasNextQueuedAudio == true)
 
-            // Seek, Fast-forward 30s & Rewind 15s via MediaSession commands
-            mediaSessionBridge.callbacks?.onSeekToMs(60_000L)
-            assertEquals(60_000L, viewModel.playerController.state.value.positionMs)
-            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
-            assertEquals(90_000L, viewModel.playerController.state.value.positionMs)
-            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.REWIND_15S)
-            assertEquals(75_000L, viewModel.playerController.state.value.positionMs)
+        // Seek, Fast-forward 30s, Rewind 15s, Pause & Play via MediaSession commands
+        mediaSessionBridge.callbacks?.onSeekToMs(60_000L)
+        assertEquals(60_000L, viewModel.playerController.state.value.positionMs)
+        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.FAST_FORWARD_30S)
+        assertEquals(90_000L, viewModel.playerController.state.value.positionMs)
+        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.REWIND_15S)
+        assertEquals(75_000L, viewModel.playerController.state.value.positionMs)
+        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.PAUSE)
+        assertFalse(viewModel.playerController.state.value.isPlaying)
+        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.PLAY)
+        assertTrue(viewModel.playerController.state.value.isPlaying)
 
-            // Transient audio focus loss pauses playback; regaining focus auto-resumes
-            mediaSessionBridge.callbacks?.onAudioFocusLost(transient = true)
-            assertFalse(viewModel.playerController.state.value.isPlaying)
-            mediaSessionBridge.callbacks?.onAudioFocusGained()
-            assertTrue(viewModel.playerController.state.value.isPlaying)
-
-            // Unplugging headphones (AUDIO_BECOMING_NOISY) pauses and does not auto-resume
-            mediaSessionBridge.callbacks?.onAudioBecomingNoisy()
-            assertFalse(viewModel.playerController.state.value.isPlaying)
-            mediaSessionBridge.callbacks?.onAudioFocusGained()
-            assertFalse(viewModel.playerController.state.value.isPlaying)
-
-            // Hardware keycode mapping & lock-screen Skip to Next advances to ep-b even when
-            // uiState has zero active UI subscribers (app in background).
-            collectJob.cancel()
-            assertEquals(
-                MediaSessionCommand.TOGGLE_PLAY_PAUSE,
-                mapMediaKeyCodeToCommand(android.view.KeyEvent.KEYCODE_HEADSETHOOK),
-            )
-            assertEquals(
-                MediaSessionCommand.SKIP_TO_NEXT,
-                mapMediaKeyCodeToCommand(android.view.KeyEvent.KEYCODE_MEDIA_NEXT),
-            )
-            mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
-            viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
-            val epBSnapshot =
-                mediaSessionBridge.snapshots.first {
-                    it?.entryId == "ep-b" && it.hasNextQueuedAudio
-                }
-            assertEquals("Episode B", epBSnapshot?.episodeTitle)
-            assertTrue(epBSnapshot?.hasNextQueuedAudio == true)
-            assertFalse(repository.snapshot.first().entries.first { it.id == "ep-a" }.isArchived)
-
-            // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
-            viewModel.dispatch(MainAction.SetRememberPodcastSpeed("f-pod", true))
-            repository.snapshot.first { snap ->
-                snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed != null
+        // Lock-screen Skip to Next advances to ep-b even when uiState has zero active UI
+        // subscribers (app in background).
+        collectJob.cancel()
+        mediaSessionBridge.callbacks?.onMediaCommand(MediaSessionCommand.SKIP_TO_NEXT)
+        viewModel.playerController.state.first { it.currentEntryId == "ep-b" }
+        val epBSnapshot =
+            mediaSessionBridge.snapshots.first {
+                it?.entryId == "ep-b" && it.hasNextQueuedAudio
             }
-            mediaSessionBridge.callbacks?.onSetPlaybackSpeed(1.75f)
-            val updatedSnap =
-                repository.snapshot.first { snap ->
-                    val spd = snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed ?: 0f
-                    abs(spd - 1.75f) < 1e-3f
-                }
-            assertEquals(1.75f, viewModel.playerController.state.value.playbackSpeed, 1e-3f)
-            assertEquals(
-                1.75f,
-                updatedSnap.feeds.first { it.id == "f-pod" }.customPlaybackSpeed ?: 0f,
-                1e-3f,
-            )
-            viewModel.playerController.stopAndClear()
+        assertEquals("Episode B", epBSnapshot?.episodeTitle)
+        assertTrue(epBSnapshot?.hasNextQueuedAudio == true)
+        assertFalse(repository.snapshot.first().entries.first { it.id == "ep-a" }.isArchived)
+
+        // Changing playback speed from MediaSession respects podcast customPlaybackSpeed
+        viewModel.dispatch(MainAction.SetRememberPodcastSpeed("f-pod", true))
+        repository.snapshot.first { snap ->
+            snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed != null
         }
+        mediaSessionBridge.callbacks?.onSetPlaybackSpeed(1.75f)
+        val updatedSnap =
+            repository.snapshot.first { snap ->
+                val spd = snap.feeds.firstOrNull { it.id == "f-pod" }?.customPlaybackSpeed ?: 0f
+                abs(spd - 1.75f) < 1e-3f
+            }
+        assertEquals(1.75f, viewModel.playerController.state.value.playbackSpeed, 1e-3f)
+        assertEquals(
+            1.75f,
+            updatedSnap.feeds.first { it.id == "f-pod" }.customPlaybackSpeed ?: 0f,
+            1e-3f,
+        )
+        viewModel.playerController.stopAndClear()
+    }
 
     @Test
     internal fun `playback backend failure stops playback without silent ticking and SetSmartRewind persists`() =
@@ -933,8 +922,8 @@ class MainViewModelTest {
                 viewModel.uiState.first {
                     it.statusBanner == PodcastPlayerController.DEFAULT_PLAYBACK_ERROR_MESSAGE
                 }
-            assertFalse(failedState.playerState.isPlaying)
-            assertFalse(failedState.playerState.isBuffering)
+            assertFalse(viewModel.playerState.value.isPlaying)
+            assertFalse(viewModel.playerState.value.isBuffering)
             assertFalse(failedState.allEntries.first { it.id == "ep-fail" }.isArchived)
             assertEquals(
                 0.0,
@@ -945,16 +934,16 @@ class MainViewModelTest {
             // Recovering when connection returns reloads and plays cleanly
             playerBackend.failNextLoad = false
             viewModel.dispatch(MainAction.TogglePlayPause)
-            val resumedState = viewModel.uiState.first { it.playerState.isPlaying }
-            assertTrue(resumedState.playerState.isPlaying)
+            val resumedState = viewModel.playerState.first { it.isPlaying }
+            assertTrue(resumedState.isPlaying)
 
             // Toggle Smart Rewind off and back on
             viewModel.dispatch(MainAction.SetSmartRewind(false))
-            val rewindOff = viewModel.uiState.first { !it.settings.smartRewindEnabled }
-            assertFalse(rewindOff.playerState.smartRewindEnabled)
+            viewModel.uiState.first { !it.settings.smartRewindEnabled }
+            assertFalse(viewModel.playerState.first { !it.smartRewindEnabled }.smartRewindEnabled)
             viewModel.dispatch(MainAction.SetSmartRewind(true))
-            val rewindOn = viewModel.uiState.first { it.settings.smartRewindEnabled }
-            assertTrue(rewindOn.playerState.smartRewindEnabled)
+            viewModel.uiState.first { it.settings.smartRewindEnabled }
+            assertTrue(viewModel.playerState.first { it.smartRewindEnabled }.smartRewindEnabled)
 
             viewModel.playerController.stopAndClear()
             collectJob.cancel()
@@ -1012,10 +1001,14 @@ class MainViewModelTest {
                 }
             }
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = flakyClient,
                     settings = settings,
-                    decoder = { fakeImageBitmap(width = 64, height = 64) },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = { FakeImage(width = 64, height = 64) },
+                            sizeOfKiB = { 16 },
+                        ),
                     clockMs = { nowMs },
                 )
             assertNull(loader.loadThumbnail("https://example.com/thumb.jpg"))
@@ -1083,12 +1076,11 @@ class MainViewModelTest {
             localVm.awaitBackgroundUiWorkForTest()
             localVm.uiState.first { it.searchQuery == "Episode" }
             localVm.dispatch(MainAction.PlayAudioEntry("ep-tier-1"))
-            localVm.uiState.first {
-                it.playerState.currentEntryId == "ep-tier-1" && it.activePlayerNotesContent != null
-            }
+            localVm.playerState.first { it.currentEntryId == "ep-tier-1" }
+            localVm.uiState.first { it.activePlayerNotesContent != null }
             localVm.playerController.cancelAutoTickerForTest()
             localVm.dispatch(MainAction.SeekPlayerToMs(10_100L))
-            localVm.uiState.first { it.playerState.positionMs == 10_100L }
+            localVm.playerState.first { it.positionMs == 10_100L }
             assertEquals(1, tierQueryCount)
 
             var playerEmissions = 0
@@ -1111,10 +1103,7 @@ class MainViewModelTest {
             assertEquals(2, playerEmissions)
             assertEquals(
                 11_200L,
-                localVm.uiState
-                    .first { it.playerState.positionMs == 11_200L }
-                    .playerState
-                    .positionMs,
+                localVm.playerState.first { it.positionMs == 11_200L }.positionMs,
             )
             assertEquals(1, tierQueryCount)
 
@@ -1169,7 +1158,7 @@ class MainViewModelTest {
     }
 
     @Test
-    internal fun `two-stage uiState keeps visibleEntries and searchResults reference-identical on player ticks`() =
+    internal fun `decoupled playerState ticks emit zero root uiState updates and keep memoized lists identical`() =
         runTest {
             val activeFeed = testFeed("f-pod-stage", "Systems Podcast").copy(feedType = "podcast")
             val archivedFeed = testFeed("f-arch-stage", "Archived Blog").copy(isActive = false)
@@ -1197,11 +1186,10 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-stage-1"))
             viewModel.awaitBackgroundUiWorkForTest()
 
+            viewModel.playerState.first { it.currentEntryId == "ep-stage-1" && !it.isBuffering }
             val beforeState =
                 viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-stage-1" &&
-                        !it.playerState.isBuffering &&
-                        it.queueEntries.size == 2 &&
+                    it.queueEntries.size == 2 &&
                         it.searchQuery == "Systems" &&
                         it.searchResults.size == 2 &&
                         it.listeningHistoryEntries.size == 1 &&
@@ -1215,7 +1203,7 @@ class MainViewModelTest {
             assertEquals(1, beforeState.starredEntries.size)
             assertEquals(1, beforeState.offlineEntries.size)
 
-            // Non-list transient UI updates (e.g. context sheet / snackbar) also keep derived lists
+            // Non-list transient UI updates (e.g. context sheet / snackbar) keep derived lists
             // reference-identical via MainUiStateMemoizer
             viewModel.dispatch(MainAction.OpenContextSheet("art-stage-2"))
             val afterSheetOpen = viewModel.uiState.first { it.contextSheetEntryId == "art-stage-2" }
@@ -1225,37 +1213,34 @@ class MainViewModelTest {
             viewModel.dispatch(MainAction.CloseContextSheet)
             viewModel.uiState.first { it.contextSheetEntryId == null }
 
-            // 1-second playback tick updates playerState without recomputing list filters
+            // 1-second playback ticks and sleep-timer updates emit on playerState ONLY with zero
+            // root uiState emissions
+            var uiStateEmissionCount = 0
+            val uiCountJob =
+                backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                    viewModel.uiState.collect { uiStateEmissionCount++ }
+                }
+            assertEquals(1, uiStateEmissionCount)
+
             playerBackend.setSimulatedPositionMs(5_200L)
             assertTrue(viewModel.playerController.advanceSingleTick(tickCount = 1))
-            val afterTick = viewModel.uiState.first { it.playerState.positionMs == 5_200L }
-            assertEquals(5_200L, afterTick.playerState.positionMs)
-            assertSame(beforeState.visibleEntries, afterTick.visibleEntries)
-            assertSame(beforeState.searchResults, afterTick.searchResults)
-            assertSame(beforeState.queueEntries, afterTick.queueEntries)
-            assertSame(beforeState.listeningHistoryEntries, afterTick.listeningHistoryEntries)
-            assertSame(beforeState.activeFeeds, afterTick.activeFeeds)
-            assertSame(beforeState.archivedFeeds, afterTick.archivedFeeds)
-            assertSame(beforeState.starredEntries, afterTick.starredEntries)
-            assertSame(beforeState.offlineEntries, afterTick.offlineEntries)
+            val afterTick = viewModel.playerState.first { it.positionMs == 5_200L }
+            assertEquals(5_200L, afterTick.positionMs)
+            assertEquals(1, uiStateEmissionCount)
 
-            // Seek updates playerState positionMs while keeping base lists reference-identical
-            // prior to DB progress snapshot emission; test sub-progress seek on in-memory state
             viewModel.playerController.setSleepTimerMinutes(15)
-            val afterSleepUpdate =
-                viewModel.uiState.first { it.playerState.sleepTimerRemainingSec == 900 }
-            assertSame(beforeState.visibleEntries, afterSleepUpdate.visibleEntries)
-            assertSame(beforeState.searchResults, afterSleepUpdate.searchResults)
+            viewModel.playerState.first { it.sleepTimerRemainingSec == 900 }
+            assertEquals(1, uiStateEmissionCount)
 
             playerBackend.setSimulatedPositionMs(8_400L)
             assertTrue(viewModel.playerController.advanceSingleTick(tickCount = 2))
-            val afterSecondTick = viewModel.uiState.first { it.playerState.positionMs == 8_400L }
-            assertEquals(899, afterSecondTick.playerState.sleepTimerRemainingSec)
-            assertSame(beforeState.visibleEntries, afterSecondTick.visibleEntries)
-            assertSame(beforeState.searchResults, afterSecondTick.searchResults)
+            val afterSecondTick = viewModel.playerState.first { it.positionMs == 8_400L }
+            assertEquals(899, afterSecondTick.sleepTimerRemainingSec)
+            assertEquals(1, uiStateEmissionCount)
+            uiCountJob.cancel()
 
             // Seeking on a shared controller without DB mutation updates playerState.positionMs
-            // while keeping visibleEntries and searchResults reference-identical (assertSame)
+            // with zero root uiState emissions
             val seekBackend = FakeAudioPlayerBackend()
             val seekScope =
                 CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
@@ -1279,17 +1264,20 @@ class MainViewModelTest {
                     skipSilenceEnabled = false,
                 )
                 seekController.cancelAutoTickerForTest()
-                val seekBefore =
-                    seekVm.uiState.first {
-                        it.playerState.currentEntryId == "ep-stage-1" &&
-                            !it.playerState.isBuffering &&
-                            it.activePlayerNotesContent != null
+                seekVm.playerState.first { it.currentEntryId == "ep-stage-1" && !it.isBuffering }
+                val seekBefore = seekVm.uiState.first { it.activePlayerNotesContent != null }
+                var seekUiEmissions = 0
+                val seekCountJob =
+                    backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                        seekVm.uiState.collect { seekUiEmissions++ }
                     }
                 seekVm.dispatch(MainAction.SeekPlayerToMs(42_000L))
-                val afterSeek = seekVm.uiState.first { it.playerState.positionMs == 42_000L }
-                assertEquals(42_000L, afterSeek.playerState.positionMs)
-                assertSame(seekBefore.visibleEntries, afterSeek.visibleEntries)
-                assertSame(seekBefore.searchResults, afterSeek.searchResults)
+                val afterSeek = seekVm.playerState.first { it.positionMs == 42_000L }
+                assertEquals(42_000L, afterSeek.positionMs)
+                assertEquals(1, seekUiEmissions)
+                assertSame(seekBefore.visibleEntries, seekVm.uiState.value.visibleEntries)
+                assertSame(seekBefore.searchResults, seekVm.uiState.value.searchResults)
+                seekCountJob.cancel()
             } finally {
                 seekController.releaseController()
                 seekCollectJob.cancel()
@@ -1301,71 +1289,65 @@ class MainViewModelTest {
         }
 
     @Test
-    internal fun `mergeBaseWithPlayerState preserves re-entrant onBuilt updates and concurrent emissions`() =
+    internal fun `observePlayerControllerSync propagates queue and settings changes with shared orchestrator`() =
         runTest {
-            val queuedEpisode =
-                com.grayvines.roche.data.toInboxEntry(
-                    testItem("ep-next", "Next Episode").copy(contentType = "audio"),
-                    emptyList(),
+            val sharedOrchestrator =
+                PodcastPlaybackOrchestrator(
+                    repository = repository,
+                    settingsRepository = settings,
                 )
-            val baseFlow = MutableStateFlow(MainUiState())
-            val playerFlow = MutableStateFlow(PodcastPlayerState(currentEntryId = "ep-now"))
-            val mergeScope =
-                CoroutineScope(SupervisorJob() + UnconfinedTestDispatcher(testScheduler))
-            try {
-                val mergedState =
-                    mergeBaseWithPlayerState(baseFlow, playerFlow) { built ->
-                            val hasNext = built.nextQueuedAudioEntryId != null
-                            if (playerFlow.value.hasNextQueuedAudio != hasNext) {
-                                playerFlow.value =
-                                    playerFlow.value.copy(hasNextQueuedAudio = hasNext)
-                            }
-                            Thread.yield()
-                        }
-                        .stateIn(
-                            scope = mergeScope,
-                            started = kotlinx.coroutines.flow.SharingStarted.Eagerly,
-                            initialValue = MainUiState(),
-                        )
-
-                baseFlow.value =
-                    MainUiState(
-                        allEntries = listOf(queuedEpisode),
-                        settings =
-                            com.grayvines.roche.data.settings.Settings(
-                                queueItemIds = listOf("ep-next")
-                            ),
+            val podcastFeed = testFeed("f-sync-pod", "Sync Cast").copy(feedType = "podcast")
+            val epNow =
+                testItem("ep-sync-1", "Now Playing", "f-sync-pod")
+                    .copy(
+                        feedTitle = "Sync Cast",
+                        contentType = "audio",
+                        audioUrl = "https://example.com/sync-1.mp3",
+                        duration = "20:00",
                     )
-                assertTrue(mergedState.value.playerState.hasNextQueuedAudio)
+            val epNext =
+                testItem("ep-sync-2", "Up Next", "f-sync-pod")
+                    .copy(
+                        feedTitle = "Sync Cast",
+                        contentType = "audio",
+                        audioUrl = "https://example.com/sync-2.mp3",
+                        duration = "25:00",
+                    )
+            database.dao().upsertFeeds(listOf(podcastFeed))
+            database.dao().upsertItems(listOf(epNow, epNext))
 
-                val rounds = 200L
-                for (round in 1L..rounds) {
-                    val barrier = java.util.concurrent.CyclicBarrier(2)
-                    val writerA =
-                        async(Dispatchers.Default) {
-                            barrier.await()
-                            baseFlow.value = baseFlow.value.copy(messageSequence = round)
-                        }
-                    val writerB =
-                        async(Dispatchers.IO) {
-                            barrier.await()
-                            playerFlow.value = playerFlow.value.copy(positionMs = round * 1_000L)
-                        }
-                    awaitAll(writerA, writerB)
-                    val current =
-                        kotlinx.coroutines.withContext(Dispatchers.Default) {
-                            kotlinx.coroutines.withTimeout(1_000L) {
-                                mergedState.first {
-                                    it.messageSequence == round &&
-                                        it.playerState.positionMs == round * 1_000L
-                                }
-                            }
-                        }
-                    assertEquals(round, current.messageSequence)
-                    assertEquals(round * 1_000L, current.playerState.positionMs)
-                }
+            val localBackend = FakeAudioPlayerBackend()
+            val localVm =
+                MainViewModel(
+                    repository = repository,
+                    settingsRepository = settings,
+                    playerBackend = localBackend,
+                    sharedPlaybackOrchestrator = sharedOrchestrator,
+                )
+            assertSame(sharedOrchestrator, localVm.playbackOrchestrator)
+            val collectJob = collectInBackground(localVm.uiState)
+            try {
+                localVm.uiState.first { it.allEntries.size == 2 }
+                localVm.dispatch(MainAction.PlayAudioEntry("ep-sync-1", openFullscreen = false))
+                localVm.playerState.first { it.currentEntryId == "ep-sync-1" }
+                localVm.playerController.cancelAutoTickerForTest()
+                assertFalse(localVm.playerState.value.hasNextQueuedAudio)
+
+                localVm.dispatch(MainAction.AddToQueue("ep-sync-2"))
+                localVm.playerState.first { it.hasNextQueuedAudio }
+                assertTrue(localVm.playerState.value.hasNextQueuedAudio)
+
+                localVm.dispatch(MainAction.RemoveFromQueue("ep-sync-2"))
+                localVm.playerState.first { !it.hasNextQueuedAudio }
+                assertFalse(localVm.playerState.value.hasNextQueuedAudio)
+
+                localVm.dispatch(MainAction.SetSkipSilence(false))
+                localVm.playerState.first { !it.skipSilenceEnabled }
+                assertFalse(localBackend.lastSkipSilence)
             } finally {
-                mergeScope.coroutineContext[Job]?.cancelAndJoin()
+                localVm.playerController.stopAndClear()
+                collectJob.cancel()
+                localVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 
@@ -1425,11 +1407,13 @@ class MainViewModelTest {
                 firstVm.dispatch(MainAction.AddToQueue("ep-shared-2"))
                 firstVm.uiState.first { it.queueEntries.size == 2 }
                 firstVm.dispatch(MainAction.PlayAudioEntry("ep-shared-1"))
-                firstVm.uiState.first {
-                    it.playerState.currentEntryId == "ep-shared-1" &&
-                        it.playerState.isPlaying &&
-                        it.nextQueuedAudioEntryId == "ep-shared-2"
+                firstVm.playerState.first {
+                    it.currentEntryId == "ep-shared-1" && it.isPlaying && it.hasNextQueuedAudio
                 }
+                assertEquals(
+                    "ep-shared-2",
+                    firstVm.uiState.value.resolveNextQueuedAudioEntry("ep-shared-1")?.id,
+                )
                 sharedController.cancelAutoTickerForTest()
 
                 // Finish Activity 1: cancels vm1.viewModelScope and invokes vm1.onCleared()
@@ -1449,17 +1433,21 @@ class MainViewModelTest {
                 // Recreate MainViewModel: immediately observes live playing episode
                 val secondVm = ViewModelProvider(store2, factory)[MainViewModel::class.java]
                 vm2 = secondVm
-                assertEquals("ep-shared-1", secondVm.uiState.value.playerState.currentEntryId)
-                assertTrue(secondVm.uiState.value.playerState.isPlaying)
+                assertEquals("ep-shared-1", secondVm.playerState.value.currentEntryId)
+                assertTrue(secondVm.playerState.value.isPlaying)
 
                 val collect2 = collectInBackground(secondVm.uiState)
                 val liveState =
                     secondVm.uiState.first {
-                        !it.isInitialLoading && it.activePlayerEntry?.id == "ep-shared-1"
+                        !it.isInitialLoading &&
+                            it.resolveActivePlayerEntry("ep-shared-1")?.id == "ep-shared-1"
                     }
-                assertTrue(liveState.playerState.isPlaying)
-                assertEquals(18_000L, liveState.playerState.positionMs)
-                assertEquals("ep-shared-2", liveState.nextQueuedAudioEntryId)
+                assertTrue(secondVm.playerState.value.isPlaying)
+                assertEquals(18_000L, secondVm.playerState.value.positionMs)
+                assertEquals(
+                    "ep-shared-2",
+                    liveState.resolveNextQueuedAudioEntry("ep-shared-1")?.id,
+                )
 
                 collect2.cancel()
             } finally {
@@ -1497,15 +1485,19 @@ class MainViewModelTest {
             }
             var nowMs = 1_000_000L
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = coalescingClient,
                     settings = settings,
-                    cacheDir = coalescingCacheDir,
-                    decoder = {
-                        decodeCount.incrementAndGet()
-                        fakeImageBitmap(width = 128, height = 128)
-                    },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = {
+                                decodeCount.incrementAndGet()
+                                FakeImage(width = 128, height = 128)
+                            },
+                            sizeOfKiB = { 64 },
+                        ),
                     clockMs = { nowMs },
+                    diskCache = ThumbnailDiskCache(coalescingCacheDir, clockMs = { nowMs }),
                 )
 
             val jobs =
@@ -1538,7 +1530,7 @@ class MainViewModelTest {
                 )
             }
             val pruneLoader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient =
                         RocheApiClient {
                             HttpResponse(
@@ -1548,9 +1540,13 @@ class MainViewModelTest {
                             )
                         },
                     settings = settings,
-                    cacheDir = pruneCacheDir,
-                    decoder = { fakeImageBitmap(width = 32, height = 32) },
+                    decoders =
+                        ImageDecoders(
+                            decodeBytes = { FakeImage(width = 32, height = 32) },
+                            sizeOfKiB = { 4 },
+                        ),
                     clockMs = { nowMs },
+                    diskCache = ThumbnailDiskCache(pruneCacheDir, clockMs = { nowMs }),
                 )
             val totalWritten = ThumbnailLoader.MAX_DISK_CACHED_FILES + 4
             for (idx in 1..totalWritten) {
@@ -1674,32 +1670,47 @@ class MainViewModelTest {
         runTest {
             val listId = repository.catalog.createCustomList("Essential Albums")
             listOf(
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "11111111-1111-4111-8111-111111111111",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "First Canon Album",
                         creators = listOf("Artist One"),
                         releaseYear = 1971,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp1")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp1",
+                                )
+                            ),
                     ),
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "22222222-2222-4222-8222-222222222222",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "Second Canon Album",
                         creators = listOf("Artist Two"),
                         releaseYear = 1975,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp2")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp2",
+                                )
+                            ),
                     ),
-                    com.grayvines.roche.data.UpsertCatalogEntryInput(
+                    com.grayvines.roche.data.catalog.UpsertCatalogEntryInput(
                         id = "33333333-3333-4333-8333-333333333333",
-                        kind = com.grayvines.roche.data.EntryKind.ALBUM,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.ALBUM,
                         title = "Third Canon Album",
                         creators = listOf("Artist Three"),
                         releaseYear = 1980,
                         identifiers =
-                            listOf(com.grayvines.roche.data.EntryIdentifierDto("spotify", "sp3")),
+                            listOf(
+                                com.grayvines.roche.data.catalog.EntryIdentifierDto(
+                                    "spotify",
+                                    "sp3",
+                                )
+                            ),
                     ),
                 )
                 .forEachIndexed { idx, input ->
@@ -1781,11 +1792,11 @@ class MainViewModelTest {
                 // Seed one consumed movie so completing a Want movie has >= 2 items to rank
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Arrival",
                         creatorsCsv = "Denis Villeneuve",
                         releaseYear = 2016,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "Great",
                         addToWant = false,
                         rankAfterLog = false,
@@ -1794,11 +1805,11 @@ class MainViewModelTest {
                 // Add two movies to Want Queue and immediately start ranking on Want Queue
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Stalker",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1979,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "",
                         addToWant = true,
                         rankAfterLog = false,
@@ -1806,11 +1817,11 @@ class MainViewModelTest {
                 )
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Solaris",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1972,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "",
                         addToWant = true,
                         rankAfterLog = false,
@@ -1865,11 +1876,11 @@ class MainViewModelTest {
                         .collectionId
                 viewModel.dispatch(
                     MainAction.SubmitQuickLog(
-                        kind = com.grayvines.roche.data.EntryKind.MOVIE,
+                        kind = com.grayvines.roche.data.catalog.EntryKind.MOVIE,
                         title = "Mirror",
                         creatorsCsv = "Andrei Tarkovsky",
                         releaseYear = 1975,
-                        status = com.grayvines.roche.data.ConsumptionStatus.CONSUMED,
+                        status = com.grayvines.roche.data.catalog.ConsumptionStatus.CONSUMED,
                         notes = "Poetic",
                         addToWant = false,
                         rankAfterLog = false,
@@ -1975,10 +1986,10 @@ class MainViewModelTest {
 
                 // Skip immediately to ep-fast while ep-slow is still blocked on network.
                 localVm.dispatch(MainAction.PlayAudioEntry("ep-fast"))
+                localVm.playerState.first { it.currentEntryId == "ep-fast" }
                 val hydratedFast =
                     localVm.uiState.first {
-                        it.playerState.currentEntryId == "ep-fast" &&
-                            it.activePlayerNotesContent?.itemId == "ep-fast" &&
+                        it.activePlayerNotesContent?.itemId == "ep-fast" &&
                             it.activePlayerNotesContent.contentHtml == "<p>Fast notes</p>"
                     }
                 assertEquals(
@@ -2062,42 +2073,14 @@ class MainViewModelTest {
         }
     }
 
-    private fun fakeImageBitmap(width: Int, height: Int): ImageBitmap =
-        Proxy.newProxyInstance(
-            ImageBitmap::class.java.classLoader,
-            arrayOf(ImageBitmap::class.java),
-        ) { proxy, method, args ->
-            when (method.name) {
-                "getWidth" -> width
-                "getHeight" -> height
-                "getHasAlpha" -> true
-                "equals" -> proxy === args?.firstOrNull()
-                "hashCode" -> System.identityHashCode(proxy)
-                "toString" -> "FakeImageBitmap(${width}x$height)"
-                else -> null
-            }
-        } as ImageBitmap
+    private class FakeImage(val width: Int, val height: Int)
 
     private class RecordingMediaSessionBridge : PodcastMediaSessionBridge {
         @Volatile var callbacks: PodcastMediaSessionCallbacks? = null
-        private val focusRequested = AtomicInteger(0)
-        private val focusAbandoned = AtomicInteger(0)
         val snapshots = MutableStateFlow<MediaSessionMetadataSnapshot?>(null)
-
-        val focusRequestedCount: Int
-            get() = focusRequested.get()
 
         override fun bindCallbacks(callbacks: PodcastMediaSessionCallbacks) {
             this.callbacks = callbacks
-        }
-
-        override fun requestAudioFocus(): Boolean {
-            focusRequested.incrementAndGet()
-            return true
-        }
-
-        override fun abandonAudioFocus() {
-            focusAbandoned.incrementAndGet()
         }
 
         override fun updatePlaybackSession(snapshot: MediaSessionMetadataSnapshot?) {
@@ -2222,6 +2205,110 @@ class MainViewModelTest {
             } finally {
                 slowVm.playerController.releaseController()
                 slowVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
+            }
+        }
+
+    @Test
+    fun `PairWithServer and SyncNow surface RFC 9457 rate-limit invalid-code and token-invalid banners`() =
+        runTest {
+            var pairAttempt = 0
+            val problemClient = RocheApiClient { request ->
+                when (request.url) {
+                    "https://100.64.0.12:8080/auth/pair" -> {
+                        pairAttempt++
+                        if (pairAttempt == 1) {
+                            HttpResponse(
+                                statusCode = 429,
+                                body =
+                                    """{"type":"urn:roche:problem:pairing-rate-limited","title":"Too Many Requests","status":429,"detail":"Rate limited"}""",
+                                headers = mapOf("Retry-After" to "42"),
+                            )
+                        } else {
+                            HttpResponse(
+                                statusCode = 401,
+                                body =
+                                    """{"type":"urn:roche:problem:pairing-code-invalid","title":"Unauthorized","status":401,"detail":"Code expired"}""",
+                            )
+                        }
+                    }
+                    "https://100.64.0.12:8080/api/v1/sync/peer" -> {
+                        HttpResponse(
+                            statusCode = 401,
+                            body =
+                                """{"type":"urn:roche:problem:token-invalid","title":"Unauthorized","status":401,"detail":"Token revoked"}""",
+                        )
+                    }
+                    else -> {
+                        HttpResponse(statusCode = 404, body = "{}")
+                    }
+                }
+            }
+            val problemRepo =
+                RocheRepository(
+                    database = database,
+                    apiClient = problemClient,
+                    settings = settings,
+                )
+            val problemVm =
+                MainViewModel(
+                    repository = problemRepo,
+                    settingsRepository = settings,
+                    playerBackend = playerBackend,
+                    mediaSessionBridge = mediaSessionBridge,
+                )
+            try {
+                val collectJob = collectInBackground(problemVm.uiState)
+                problemVm.uiState.first { !it.isInitialLoading }
+
+                problemVm.dispatch(
+                    MainAction.PairWithServer(
+                        serverUrl = "https://100.64.0.12:8080",
+                        pairingCode = "123456",
+                    )
+                )
+                val rateLimitedBanner =
+                    problemVm.uiState
+                        .first { it.statusBanner?.contains("Try again in 42s") == true }
+                        .statusBanner
+                assertTrue(rateLimitedBanner?.startsWith("Pairing failed") == true)
+
+                problemVm.dispatch(MainAction.DismissMessages)
+                problemVm.uiState.first { it.statusBanner == null }
+
+                problemVm.dispatch(
+                    MainAction.PairWithServer(
+                        serverUrl = "https://100.64.0.12:8080",
+                        pairingCode = "654321",
+                    )
+                )
+                val invalidCodeBanner =
+                    problemVm.uiState
+                        .first {
+                            it.statusBanner?.contains("invalid or expired", ignoreCase = true) ==
+                                true
+                        }
+                        .statusBanner
+                assertTrue(invalidCodeBanner?.startsWith("Pairing failed") == true)
+
+                problemVm.dispatch(MainAction.DismissMessages)
+                problemVm.uiState.first { it.statusBanner == null }
+                settings.update {
+                    it.copy(serverUrl = "https://100.64.0.12:8080", bearerToken = "revoked-tok")
+                }
+                problemVm.dispatch(MainAction.SyncNow)
+                val tokenRevokedBanner =
+                    problemVm.uiState
+                        .first {
+                            !it.isSyncing &&
+                                it.statusBanner?.contains("re-pair", ignoreCase = true) == true
+                        }
+                        .statusBanner
+                assertTrue(tokenRevokedBanner?.contains("Settings") == true)
+
+                collectJob.cancel()
+            } finally {
+                problemVm.playerController.releaseController()
+                problemVm.viewModelScope.coroutineContext[Job]?.cancelAndJoin()
             }
         }
 

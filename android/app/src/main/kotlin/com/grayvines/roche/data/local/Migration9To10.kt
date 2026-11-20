@@ -5,28 +5,35 @@ package com.grayvines.roche.data.local
 import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.SQLiteStatement
 import androidx.sqlite.execSQL
-import com.grayvines.roche.data.DEFAULT_LOCAL_HLC_NODE
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.HlcTimestamp
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
-import com.grayvines.roche.data.canonicalizeSyncUrl
-import com.grayvines.roche.data.collectionEntryNaturalKey
-import com.grayvines.roche.data.deterministicTagId
-import com.grayvines.roche.data.encodeCreatorsJson
-import com.grayvines.roche.data.extractArxivIdentifier
-import com.grayvines.roche.data.extractYearPrefix
-import com.grayvines.roche.data.isLocalTagId
-import com.grayvines.roche.data.itemNaturalKey
-import com.grayvines.roche.data.normalizeTagName
-import com.grayvines.roche.data.parseTagCsv
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.ENTRY_KIND_ARTICLE
+import com.grayvines.roche.core.ENTRY_KIND_CHANNEL
+import com.grayvines.roche.core.ENTRY_KIND_COLLECTION
+import com.grayvines.roche.core.ENTRY_KIND_PAPER
+import com.grayvines.roche.core.ENTRY_KIND_PODCAST
+import com.grayvines.roche.core.ENTRY_KIND_PODCAST_EPISODE
+import com.grayvines.roche.core.ENTRY_KIND_PUBLICATION
+import com.grayvines.roche.core.ENTRY_KIND_VIDEO
+import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.SEED_EPOCH_ISO
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.encodeCreatorsJson
+import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractYearPrefix
+import com.grayvines.roche.core.isLocalTagId
+import com.grayvines.roche.core.itemNaturalKey
+import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.core.parseTagCsv
 
 private const val MIGRATED_DELETED_STATUS = "__deleted__"
 private const val MIGRATED_UNREAD_READ_AT = "__unread__"
 private const val MIGRATED_FEED_ACTIVE = "__feed_active__"
 private const val MIGRATED_FEED_ARCHIVED = "__feed_archived__"
 private const val MIGRATED_FEED_RENAME = "rename_feed"
-private const val SEED_EPOCH_ISO = "1970-01-01T00:00:00Z"
 
 private const val COL_0 = 0
 private const val COL_1 = 1
@@ -348,7 +355,7 @@ private fun ensureCollectionParentEntry(
             row =
                 EntryEntity(
                     id = colId,
-                    kind = EntryKind.COLLECTION.wireValue,
+                    kind = ENTRY_KIND_COLLECTION,
                     title = title,
                     summary = summary,
                     createdAt = createdAt,
@@ -378,7 +385,7 @@ private fun seedV10SystemManualSpecs(connection: SQLiteConnection) {
                 row =
                     EntryEntity(
                         id = id,
-                        kind = EntryKind.COLLECTION.wireValue,
+                        kind = ENTRY_KIND_COLLECTION,
                         title = title,
                         createdAt = SEED_EPOCH_ISO,
                         updatedAt = SEED_EPOCH_ISO,
@@ -592,7 +599,7 @@ private fun upsertMigratedTagGraph(
         row =
             EntryEntity(
                 id = id,
-                kind = EntryKind.COLLECTION.wireValue,
+                kind = ENTRY_KIND_COLLECTION,
                 title = normName,
                 createdAt = SEED_EPOCH_ISO,
                 updatedAt = SEED_EPOCH_ISO,
@@ -1266,21 +1273,21 @@ internal fun createUnifiedV10FtsObjects(connection: SQLiteConnection) {
 
 internal fun entryKindForFeedTypeWire(feedType: String): String =
     when {
-        feedType.equals("arxiv", ignoreCase = true) -> EntryKind.COLLECTION.wireValue
-        feedType.equals("youtube", ignoreCase = true) -> EntryKind.CHANNEL.wireValue
-        feedType.equals("podcast", ignoreCase = true) -> EntryKind.PODCAST.wireValue
-        else -> EntryKind.PUBLICATION.wireValue
+        feedType.equals("arxiv", ignoreCase = true) -> ENTRY_KIND_COLLECTION
+        feedType.equals("youtube", ignoreCase = true) -> ENTRY_KIND_CHANNEL
+        feedType.equals("podcast", ignoreCase = true) -> ENTRY_KIND_PODCAST
+        else -> ENTRY_KIND_PUBLICATION
     }
 
 internal fun entryKindForItemWire(contentType: String, audioUrl: String?): String =
     when {
         !audioUrl.isNullOrBlank() ||
             contentType.equals("audio", ignoreCase = true) ||
-            contentType.equals("podcast", ignoreCase = true) -> EntryKind.PODCAST_EPISODE.wireValue
+            contentType.equals("podcast", ignoreCase = true) -> ENTRY_KIND_PODCAST_EPISODE
         contentType.equals("pdf", ignoreCase = true) ||
-            contentType.equals("paper", ignoreCase = true) -> EntryKind.PAPER.wireValue
-        contentType.equals("video", ignoreCase = true) -> EntryKind.VIDEO.wireValue
-        else -> EntryKind.ARTICLE.wireValue
+            contentType.equals("paper", ignoreCase = true) -> ENTRY_KIND_PAPER
+        contentType.equals("video", ignoreCase = true) -> ENTRY_KIND_VIDEO
+        else -> ENTRY_KIND_ARTICLE
     }
 
 private fun migratedHlc(rawIso: String?): String =

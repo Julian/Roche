@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rand::{RngExt, seq::IndexedRandom};
 
-use crate::db::{AuthRepo, SyncRepo};
+use crate::{db::AuthRepo, util::clock::now_utc};
 
 pub struct PairingManager<'a> {
     repo: AuthRepo<'a>,
@@ -16,7 +16,7 @@ impl<'a> PairingManager<'a> {
     pub async fn create_code(&self, ttl_seconds: u64) -> Result<String> {
         let code = Self::generate_human_readable_code();
         let ttl = i64::try_from(ttl_seconds).unwrap_or(300).max(1);
-        let expires_at = SyncRepo::now_utc() + chrono::Duration::seconds(ttl);
+        let expires_at = now_utc() + chrono::Duration::seconds(ttl);
         self.repo.save_pairing_code(&code, expires_at).await?;
         Ok(code)
     }

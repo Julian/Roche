@@ -19,9 +19,20 @@ import com.grayvines.roche.data.remote.HttpRequest
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.playback.AudioPlayerBackend
+import com.grayvines.roche.playback.ExoPlayerAudioBackend
+import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.SafeRedirectHttpDataSource
+import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.playback.isSafeAudioPlaybackSource
+import com.grayvines.roche.playback.resolveSafeHttpPlaybackUrl
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
+import java.io.OutputStream
 import java.lang.reflect.Proxy
 import java.net.HttpURLConnection
 import java.net.URL
@@ -159,6 +170,12 @@ class PodcastMedia3PlaybackTest {
     }
 
     @Test
+    internal fun `SafeRedirectHttpDataSource strips cross-origin auth headers rewrites 303 to GET and sanitizes spaces`() {
+        verifyCrossOriginRedirectStripsSensitiveHeaders()
+        verifySeeOtherRewriteAndSpaceSanitization()
+    }
+
+    @Test
     fun `skipSilence propagates to backend and periodic ticks debounce HTTP PATCH`() = runTest {
         val syncRequests = CopyOnWriteArrayList<HttpRequest>()
         var fakeClockMs = 100_000L
@@ -169,10 +186,10 @@ class PodcastMedia3PlaybackTest {
             drainJobs ->
             assertTrue(backend.skipSilenceEnabled)
             vm.dispatch(MainAction.SetSkipSilence(false))
-            vm.uiState.first { !it.playerState.skipSilenceEnabled }
+            vm.playerState.first { !it.skipSilenceEnabled }
             assertFalse(backend.skipSilenceEnabled)
             vm.dispatch(MainAction.SetSkipSilence(true))
-            vm.uiState.first { it.playerState.skipSilenceEnabled }
+            vm.playerState.first { it.skipSilenceEnabled }
             assertTrue(backend.skipSilenceEnabled)
 
             val initialReadAt =
@@ -241,12 +258,13 @@ class PodcastMedia3PlaybackTest {
             val vm = MainViewModel(repo, settings, sharedPlayerController = controller)
             val collectJob = collectInBackground(vm.uiState)
             try {
-                assertFalse(vm.uiState.value.playerState.skipSilenceEnabled)
-                vm.uiState.first { !it.isInitialLoading && !it.playerState.skipSilenceEnabled }
+                assertFalse(vm.playerState.value.skipSilenceEnabled)
+                vm.uiState.first { !it.isInitialLoading }
+                vm.playerState.first { !it.skipSilenceEnabled }
                 assertFalse(backend.skipSilenceEnabled)
 
                 settings.update { it.copy(skipSilenceEnabled = true) }
-                vm.uiState.first { it.playerState.skipSilenceEnabled }
+                vm.playerState.first { it.skipSilenceEnabled }
                 assertTrue(backend.skipSilenceEnabled)
             } finally {
                 controller.releaseController()
@@ -469,12 +487,10 @@ class PodcastMedia3PlaybackTest {
         try {
             vm.uiState.first { it.allEntries.size == 1 }
             vm.dispatch(MainAction.PlayAudioEntry("ep-1"))
-            vm.uiState.first {
-                it.playerState.currentEntryId == "ep-1" &&
-                    it.playerState.isPlaying &&
-                    !it.playerState.isBuffering &&
-                    !it.allEntries.first().readAt.isNullOrBlank()
+            vm.playerState.first {
+                it.currentEntryId == "ep-1" && it.isPlaying && !it.isBuffering
             }
+            vm.uiState.first { !it.allEntries.first().readAt.isNullOrBlank() }
             controller.cancelAutoTickerForTest()
             drainJobs()
             syncRequests.clear()
@@ -757,6 +773,15 @@ private class TestAudioHttpURLConnection(
     private val code: Int,
     private val headers: Map<String, List<String>> = emptyMap(),
 ) : HttpURLConnection(url) {
+    val capturedRequestHeaders = LinkedHashMap<String, String>()
+
+    override fun setRequestProperty(key: String?, value: String?) {
+        if (key != null && value != null) {
+            capturedRequestHeaders[key] = value
+        }
+        super.setRequestProperty(key, value)
+    }
+
     override fun connect() {
         connected = true
     }
@@ -776,6 +801,8 @@ private class TestAudioHttpURLConnection(
         headers.mapValues { it.value.toMutableList() }.toMutableMap()
 
     override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+
+    override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
 }
 
 @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
@@ -878,4 +905,115 @@ private fun verifyBlockedPrivateRedirectHop() {
         .exceptionOrNull()
     assertTrue(ssrfErr is java.io.IOException)
     assertEquals(listOf("https://pod.example.com/evil.mp3"), connectedUrls)
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal fun verifyCrossOriginRedirectStripsSensitiveHeaders() {
+    val connections = mutableListOf<TestAudioHttpURLConnection>()
+    val dataSource =
+        SafeRedirectHttpDataSource(
+            openConnection = { url ->
+                val conn =
+                    when (url.toString()) {
+                        "https://pod.example.com/start.mp3" ->
+                            TestAudioHttpURLConnection(
+                                url = url,
+                                code = 302,
+                                headers = mapOf("Location" to listOf("/same-origin.mp3")),
+                            )
+                        "https://pod.example.com/same-origin.mp3" ->
+                            TestAudioHttpURLConnection(
+                                url = url,
+                                code = 302,
+                                headers =
+                                    mapOf("Location" to listOf("https://cdn.other.example/ep.mp3")),
+                            )
+                        else -> TestAudioHttpURLConnection(url = url, code = 200)
+                    }
+                connections += conn
+                conn
+            },
+            validateUrl = { it },
+        )
+
+    val (_, finalUrl) =
+        dataSource.openValidatedUrl(
+            rawUrl = "https://pod.example.com/start.mp3",
+            requestHeaders =
+                mapOf(
+                    "Authorization" to "Bearer secret-tok",
+                    "Cookie" to "sid=abc",
+                    "Proxy-Authorization" to "Basic xyz",
+                    "X-Trace" to "trace-1",
+                ),
+        )
+    assertEquals("https://cdn.other.example/ep.mp3", finalUrl)
+    assertEquals(3, connections.size)
+
+    val sameOriginHeaders = connections[1].capturedRequestHeaders
+    assertEquals("Bearer secret-tok", sameOriginHeaders["Authorization"])
+    assertEquals("sid=abc", sameOriginHeaders["Cookie"])
+    assertEquals("Basic xyz", sameOriginHeaders["Proxy-Authorization"])
+    assertEquals("trace-1", sameOriginHeaders["X-Trace"])
+
+    val crossOriginHeaders = connections[2].capturedRequestHeaders
+    assertFalse(crossOriginHeaders.containsKey("Authorization"))
+    assertFalse(crossOriginHeaders.containsKey("Cookie"))
+    assertFalse(crossOriginHeaders.containsKey("Proxy-Authorization"))
+    assertEquals("trace-1", crossOriginHeaders["X-Trace"])
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal fun verifySeeOtherRewriteAndSpaceSanitization() {
+    val connections = mutableListOf<TestAudioHttpURLConnection>()
+    val dataSource =
+        SafeRedirectHttpDataSource(
+            openConnection = { url ->
+                val conn =
+                    if (url.toString() == "https://pod.example.com/upload") {
+                        TestAudioHttpURLConnection(
+                            url = url,
+                            code = 303,
+                            headers = mapOf("Location" to listOf("/my podcast ep 1.mp3")),
+                        )
+                    } else {
+                        TestAudioHttpURLConnection(url = url, code = 200)
+                    }
+                connections += conn
+                conn
+            },
+            validateUrl = { it },
+        )
+
+    val (_, resolved) =
+        dataSource.openValidatedUrl(
+            rawUrl = "https://pod.example.com/upload",
+            httpMethod = "PUT",
+            httpBody = "payload".toByteArray(),
+            requestHeaders =
+                mapOf(
+                    "Content-Type" to "audio/mpeg",
+                    "Content-Length" to "7",
+                    "Authorization" to "Bearer same-origin",
+                ),
+        )
+    assertEquals("https://pod.example.com/my%20podcast%20ep%201.mp3", resolved)
+    assertEquals(2, connections.size)
+    assertEquals("PUT", connections[0].requestMethod)
+    assertEquals("GET", connections[1].requestMethod)
+    assertFalse(connections[1].capturedRequestHeaders.containsKey("Content-Type"))
+    assertFalse(connections[1].capturedRequestHeaders.containsKey("Content-Length"))
+    assertEquals("Bearer same-origin", connections[1].capturedRequestHeaders["Authorization"])
+
+    val directUrls = mutableListOf<String>()
+    val spaceSource =
+        SafeRedirectHttpDataSource(
+            openConnection = { url ->
+                directUrls += url.toString()
+                TestAudioHttpURLConnection(url = url, code = 200)
+            },
+            validateUrl = { it },
+        )
+    spaceSource.openValidatedUrl("https://cdn.example.com/episode 42 final.mp3")
+    assertEquals(listOf("https://cdn.example.com/episode%2042%20final.mp3"), directUrls)
 }

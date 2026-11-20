@@ -8,9 +8,9 @@ import androidx.room3.OnConflictStrategy
 import androidx.room3.Query
 import androidx.room3.Transaction
 import androidx.room3.Update
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
-import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import kotlinx.coroutines.flow.Flow
 
 private const val FEED_ID_SUBQUERY =
@@ -57,18 +57,34 @@ private const val IS_FAVORITE_EXPR =
 
 private const val STATUS_EXPR =
     "CASE WHEN es.inboxState = 'dismissed' " +
-        "OR (es.inboxState = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
+        "OR (COALESCE(es.inboxState, 'none') = 'none' AND es.readAt IS NOT NULL AND NOT EXISTS (" +
         "SELECT 1 FROM collection_entries ce_wtr " +
         "WHERE ce_wtr.collectionId = '$WANT_TO_READ_COLLECTION_ID' " +
         "AND ce_wtr.entryId = e.id)) " +
         "THEN 'archived' ELSE 'unread' END"
 
+private const val CONTENT_TYPE_EXPR =
+    "COALESCE(ec.contentType, CASE e.kind " +
+        "WHEN 'video' THEN 'video' " +
+        "WHEN 'paper' THEN 'paper' " +
+        "WHEN 'podcast_episode' THEN 'audio' " +
+        "ELSE 'article' END)"
+
+private const val IS_LIVE_ITEM_WHERE =
+    "e.mergedIntoId IS NULL " +
+        "AND COALESCE(es.inboxState, 'none') != 'deleted' " +
+        "AND (es.inboxState IN ('unread', 'dismissed') " +
+        "OR ec.entryId IS NOT NULL " +
+        "OR (e.kind IN ('article', 'paper', 'video', 'podcast_episode') " +
+        "AND EXISTS (SELECT 1 FROM collection_entries ce_li " +
+        "INNER JOIN collection_specs cs_li ON cs_li.collectionId = ce_li.collectionId " +
+        "WHERE ce_li.entryId = e.id AND cs_li.role IN ('want', 'list'))))"
+
 private const val INBOX_FROM_WHERE =
     "FROM entries e " +
-        "INNER JOIN entry_state es ON es.entryId = e.id " +
+        "LEFT JOIN entry_state es ON es.entryId = e.id " +
         "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
-        "WHERE e.mergedIntoId IS NULL " +
-        "AND (es.inboxState IN ('unread', 'dismissed') OR ec.entryId IS NOT NULL)"
+        "WHERE $IS_LIVE_ITEM_WHERE"
 
 private const val INBOX_SELECT_LIST_PREFIX =
     "SELECT e.id AS id, " +
@@ -80,13 +96,13 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "SUBSTR(e.summary, 1, 1024) AS summary, " +
         "SUBSTR(ec.contentText, 1, 2048) AS contentText, " +
         "SUBSTR(ec.contentHtml, 1, 2048) AS contentHtml, " +
-        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$CONTENT_TYPE_EXPR AS contentType, " +
         "$STATUS_EXPR AS status, " +
         "$IS_FAVORITE_EXPR AS isFavorite, " +
-        "es.isCachedOffline AS isCachedOffline, " +
+        "COALESCE(es.isCachedOffline, 0) AS isCachedOffline, " +
         "e.publishedAt AS publishedAt, " +
         "e.createdAt AS createdAt, " +
-        "es.progress AS readProgress, " +
+        "COALESCE(es.progress, 0.0) AS readProgress, " +
         "ec.thumbnailMediaId AS thumbnailMediaId, " +
         "ec.duration AS duration, " +
         "es.readAt AS readAt, " +
@@ -94,7 +110,7 @@ private const val INBOX_SELECT_LIST_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "es.inboxState AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_FULL_PREFIX =
@@ -107,13 +123,13 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "SUBSTR(e.summary, 1, 16384) AS summary, " +
         "SUBSTR(ec.contentText, 1, 262144) AS contentText, " +
         "SUBSTR(ec.contentHtml, 1, 512000) AS contentHtml, " +
-        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$CONTENT_TYPE_EXPR AS contentType, " +
         "$STATUS_EXPR AS status, " +
         "$IS_FAVORITE_EXPR AS isFavorite, " +
-        "es.isCachedOffline AS isCachedOffline, " +
+        "COALESCE(es.isCachedOffline, 0) AS isCachedOffline, " +
         "e.publishedAt AS publishedAt, " +
         "e.createdAt AS createdAt, " +
-        "es.progress AS readProgress, " +
+        "COALESCE(es.progress, 0.0) AS readProgress, " +
         "ec.thumbnailMediaId AS thumbnailMediaId, " +
         "ec.duration AS duration, " +
         "es.readAt AS readAt, " +
@@ -121,7 +137,7 @@ private const val INBOX_SELECT_FULL_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "es.inboxState AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState " +
         INBOX_FROM_WHERE
 
 private const val INBOX_SELECT_SEARCH_PREFIX =
@@ -134,13 +150,13 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "SUBSTR(e.summary, 1, 16384) AS summary, " +
         "SUBSTR(ec.contentText, 1, 65536) AS contentText, " +
         "SUBSTR(ec.contentHtml, 1, 65536) AS contentHtml, " +
-        "COALESCE(ec.contentType, 'article') AS contentType, " +
+        "$CONTENT_TYPE_EXPR AS contentType, " +
         "$STATUS_EXPR AS status, " +
         "$IS_FAVORITE_EXPR AS isFavorite, " +
-        "es.isCachedOffline AS isCachedOffline, " +
+        "COALESCE(es.isCachedOffline, 0) AS isCachedOffline, " +
         "e.publishedAt AS publishedAt, " +
         "e.createdAt AS createdAt, " +
-        "es.progress AS readProgress, " +
+        "COALESCE(es.progress, 0.0) AS readProgress, " +
         "ec.thumbnailMediaId AS thumbnailMediaId, " +
         "ec.duration AS duration, " +
         "es.readAt AS readAt, " +
@@ -148,8 +164,146 @@ private const val INBOX_SELECT_SEARCH_PREFIX =
         "$FEED_URL_SUBQUERY AS feedUrl, " +
         "es.interactionUpdatedAt AS interactionUpdatedAt, " +
         "ec.audioUrl AS audioUrl, " +
-        "es.inboxState AS inboxState " +
+        "COALESCE(es.inboxState, 'none') AS inboxState " +
         INBOX_FROM_WHERE
+
+private const val ENTRIES_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(MAX(updatedAt), '') || ':' || " +
+        "COALESCE(SUM(CASE WHEN mergedIntoId IS NOT NULL AND mergedIntoId != '' " +
+        "THEN 1 ELSE 0 END), 0) || ':' || " +
+        "COALESCE(SUM(LENGTH(title) * 31 + LENGTH(COALESCE(url, '')) * 7 + " +
+        "LENGTH(COALESCE(summary, '')) * 13 + LENGTH(creatorsJson) * 17 + " +
+        "LENGTH(COALESCE(mergedIntoId, '')) * 23 + LENGTH(COALESCE(thumbnailUrl, '')) * 29 + " +
+        "LENGTH(metadataJson) * 37 + COALESCE(releaseYear, 0) * 41 + " +
+        "LENGTH(COALESCE(publishedAt, '')) * 43 + isLocalDirty * 47 + " +
+        "COALESCE(UNICODE(title), 0) * 3 + " +
+        "COALESCE(UNICODE(SUBSTR(title, -1, 1)), 0) * 5), 0) " +
+        "FROM entries"
+
+private const val IDENTS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || " +
+        "COALESCE(SUM(LENGTH(entryId) * 31 + LENGTH(scheme) * 7 + LENGTH(value)), 0) || ':' || " +
+        "COALESCE(SUM(COALESCE(UNICODE(entryId), 0) * 17 + " +
+        "COALESCE(UNICODE(SUBSTR(entryId, -1, 1)), 0) * 31 + " +
+        "COALESCE(UNICODE(SUBSTR(entryId, LENGTH(entryId) / 2 + 1, 1)), 0) * 13 + " +
+        "COALESCE(UNICODE(value), 0) * 7 + " +
+        "COALESCE(UNICODE(SUBSTR(value, -1, 1)), 0)), 0) || ':' || " +
+        "COALESCE(MIN(entryId), '') || ':' || COALESCE(MAX(entryId), '') || ':' || " +
+        "COALESCE(MIN(value), '') || ':' || COALESCE(MAX(value), '') " +
+        "FROM entry_identifiers"
+
+private const val SPECS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) || ':' || " +
+        "COALESCE(SUM(LENGTH(COALESCE(slug, '')) * 31 + LENGTH(role) * 7 + " +
+        "LENGTH(mode) * 13 + LENGTH(COALESCE(ruleJson, '')) * 17 + " +
+        "LENGTH(COALESCE(color, '')) * 23 + " +
+        "COALESCE(UNICODE(COALESCE(slug, '')), 0) * 3 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(slug, ''), -1, 1)), 0) * 5 + " +
+        "COALESCE(UNICODE(role), 0) * 11 + COALESCE(UNICODE(mode), 0) * 19 + " +
+        "COALESCE(UNICODE(COALESCE(ruleJson, '')), 0) * 29 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(ruleJson, ''), -1, 1)), 0) * 37 + " +
+        "COALESCE(UNICODE(COALESCE(color, '')), 0) * 41 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), 2, 1)), 0) * 47 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(color, ''), -1, 1)), 0) * 43), 0) || ':' || " +
+        "COALESCE(MIN(COALESCE(slug, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(slug, '')), '') || ':' || " +
+        "COALESCE(MIN(COALESCE(color, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(color, '')), '') " +
+        "FROM collection_specs"
+
+private const val MEMBERS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(MAX(addedAt), '') || ':' || COALESCE(SUM(COALESCE(position, 0.0)), 0.0) || ':' || " +
+        "COALESCE(SUM(LENGTH(collectionId) * 7 + LENGTH(entryId) * 13 + " +
+        "COALESCE(UNICODE(collectionId), 0) * 3 + COALESCE(UNICODE(entryId), 0) * 5 + " +
+        "COALESCE(UNICODE(SUBSTR(entryId, -1, 1)), 0) * 11), 0) || ':' || " +
+        "COALESCE(MIN(entryId), '') || ':' || COALESCE(MAX(entryId), '') " +
+        "FROM collection_entries"
+
+private const val GENERATORS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(SUM(enabled), 0) || ':' || " +
+        "COALESCE(MAX(hlc), '') || ':' || COALESCE(MAX(updatedAt), '') || ':' || " +
+        "COALESCE(MIN(COALESCE(currentEntryId, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(currentEntryId, '')), '') || ':' || " +
+        "COALESCE(SUM(LENGTH(COALESCE(currentEntryId, '')) * 7 + " +
+        "COALESCE(UNICODE(COALESCE(currentEntryId, '')), 0) * 13 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(currentEntryId, ''), -1, 1)), 0) * 17), 0) " +
+        "FROM collection_generators"
+
+private const val LOGS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(MAX(ts), '') || ':' || COALESCE(MIN(entryId), '') || ':' || " +
+        "COALESCE(MAX(entryId), '') || ':' || " +
+        "COALESCE(SUM(LENGTH(status) * 7 + LENGTH(COALESCE(notes, '')) * 13 + " +
+        "COALESCE(UNICODE(status), 0) * 3 + " +
+        "COALESCE(UNICODE(COALESCE(notes, '')), 0) * 5), 0) " +
+        "FROM consumption_log"
+
+private const val COMPARISONS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(MIN(id), '') || ':' || COALESCE(MAX(id), '') || ':' || " +
+        "COALESCE(SUM(LENGTH(orderingJson) * 7 + " +
+        "LENGTH(COALESCE(scopeCollectionId, '')) * 13 + " +
+        "COALESCE(UNICODE(orderingJson), 0) * 3 + " +
+        "COALESCE(UNICODE(SUBSTR(orderingJson, -2, 1)), 0) * 5), 0) " +
+        "FROM comparisons"
+
+private const val STATES_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(MAX(updatedAt), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(interactionUpdatedAt, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(readAt, '')), '') || ':' || " +
+        "COALESCE(SUM(CASE WHEN readAt IS NOT NULL THEN 1 ELSE 0 END), 0) || ':' || " +
+        "COALESCE(SUM(isCachedOffline), 0) || ':' || " +
+        "COALESCE(SUM(CASE WHEN inboxState = 'unread' THEN 1 " +
+        "WHEN inboxState = 'dismissed' THEN 2 " +
+        "WHEN inboxState = 'deleted' THEN 4 ELSE 0 END), 0) || ':' || " +
+        "COALESCE(SUM(progress), 0.0) " +
+        "FROM entry_state"
+
+private const val CONTENTS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || " +
+        "COALESCE(SUM(LENGTH(COALESCE(contentHtml, '')) * 31 + " +
+        "LENGTH(COALESCE(contentText, '')) * 17 + " +
+        "LENGTH(COALESCE(audioUrl, '')) * 7 + LENGTH(COALESCE(duration, '')) * 13 + " +
+        "LENGTH(COALESCE(thumbnailMediaId, '')) * 19 + " +
+        "LENGTH(COALESCE(fallbackFeedTitle, '')) * 23 + LENGTH(contentType) * 3 + " +
+        "COALESCE(UNICODE(contentType), 0) * 5 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(contentHtml, ''), 1, 1)), 0) * 11 + " +
+        "COALESCE(UNICODE(SUBSTR(COALESCE(contentText, ''), 1, 1)), 0) * 29), 0) || ':' || " +
+        "COALESCE(MIN(COALESCE(fallbackFeedTitle, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(fallbackFeedTitle, '')), '') || ':' || " +
+        "COALESCE(MIN(COALESCE(duration, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(duration, '')), '') " +
+        "FROM entry_content"
+
+private const val FEEDS_STAMP_SQL =
+    "SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') || ':' || " +
+        "COALESCE(SUM(isActive), 0) || ':' || COALESCE(SUM(autoDownloadEpisodes), 0) || ':' || " +
+        "COALESCE(SUM(consecutiveFailures), 0) || ':' || " +
+        "COALESCE(SUM(COALESCE(customPlaybackSpeed, 0.0)), 0.0) || ':' || " +
+        "COALESCE(MAX(COALESCE(lastPolledAt, '')), '') || ':' || " +
+        "COALESCE(MAX(COALESCE(lastError, '')), '') || ':' || " +
+        "COALESCE(SUM(LENGTH(COALESCE(feedTitle, '')) * 7 + LENGTH(sourceType) * 13 + " +
+        "LENGTH(COALESCE(lastError, '')) * 17 + " +
+        "COALESCE(UNICODE(COALESCE(feedTitle, '')), 0) * 3 + isLocalDirty * 19), 0) " +
+        "FROM feed_sources"
+
+private const val CATALOG_STAMP_SELECT =
+    "SELECT ($ENTRIES_STAMP_SQL) AS entriesStamp, " +
+        "($IDENTS_STAMP_SQL) AS identsStamp, " +
+        "($SPECS_STAMP_SQL) AS specsStamp, " +
+        "($MEMBERS_STAMP_SQL) AS membersStamp, " +
+        "($GENERATORS_STAMP_SQL) AS generatorsStamp, " +
+        "($LOGS_STAMP_SQL) AS logsStamp, " +
+        "($COMPARISONS_STAMP_SQL) AS comparisonsStamp"
+
+private const val REPOSITORY_STAMP_SELECT =
+    "$CATALOG_STAMP_SELECT, " +
+        "($STATES_STAMP_SQL) AS statesStamp, " +
+        "($CONTENTS_STAMP_SQL) AS contentsStamp, " +
+        "($FEEDS_STAMP_SQL) AS feedsStamp"
 
 private const val FEED_ROW_SELECT =
     "SELECT fs.collectionId AS id, " +
@@ -202,51 +356,37 @@ interface RocheDao {
     )
     fun observeItemTags(): Flow<List<ItemTagRow>>
 
-    @Query("SELECT * FROM entries") fun observeEntries(): Flow<List<EntryEntity>>
+    @Query(ENTRIES_STAMP_SQL) fun observeEntriesStamp(): Flow<String>
 
-    @Query("SELECT * FROM entry_identifiers")
-    fun observeEntryIdentifiers(): Flow<List<EntryIdentifierEntity>>
+    @Query(IDENTS_STAMP_SQL) fun observeIdentsStamp(): Flow<String>
 
-    @Query("SELECT * FROM collection_specs")
-    fun observeCollectionSpecs(): Flow<List<CollectionSpecEntity>>
+    @Query(SPECS_STAMP_SQL) fun observeSpecsStamp(): Flow<String>
 
-    @Query("SELECT * FROM collection_entries")
-    fun observeCollectionEntries(): Flow<List<CollectionEntryEntity>>
+    @Query(MEMBERS_STAMP_SQL) fun observeMembersStamp(): Flow<String>
 
-    @Query("SELECT * FROM collection_generators")
-    fun observeCollectionGenerators(): Flow<List<CollectionGeneratorEntity>>
+    @Query(GENERATORS_STAMP_SQL) fun observeGeneratorsStamp(): Flow<String>
 
-    @Query("SELECT * FROM consumption_log ORDER BY ts DESC")
-    fun observeConsumptionLogs(): Flow<List<ConsumptionLogEntity>>
+    @Query(LOGS_STAMP_SQL) fun observeLogsStamp(): Flow<String>
 
-    @Query("SELECT * FROM comparisons ORDER BY ts ASC")
-    fun observeComparisons(): Flow<List<ComparisonEntity>>
+    @Query(COMPARISONS_STAMP_SQL) fun observeComparisonsStamp(): Flow<String>
 
-    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM entries")
-    fun observeEntriesStamp(): Flow<String>
+    @Query(CATALOG_STAMP_SELECT) fun observeCatalogStamp(): Flow<CatalogStampRow>
 
-    @Query("SELECT COUNT(*) FROM entry_identifiers") fun observeIdentsStamp(): Flow<Int>
+    @Query(CATALOG_STAMP_SELECT) suspend fun getCatalogStamp(): CatalogStampRow
 
-    @Query("SELECT COUNT(*) || ':' || COALESCE(SUM(showInLists), 0) FROM collection_specs")
-    fun observeSpecsStamp(): Flow<String>
+    @Query(REPOSITORY_STAMP_SELECT) fun observeRepositoryStamp(): Flow<RepositoryStampRow>
 
-    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM collection_entries")
-    fun observeMembersStamp(): Flow<String>
-
-    @Query(
-        "SELECT COUNT(*) || ':' || COALESCE(SUM(enabled), 0) || ':' || COALESCE(MAX(hlc), '') FROM collection_generators"
-    )
-    fun observeGeneratorsStamp(): Flow<String>
-
-    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM consumption_log")
-    fun observeLogsStamp(): Flow<String>
-
-    @Query("SELECT COUNT(*) || ':' || COALESCE(MAX(hlc), '') FROM comparisons")
-    fun observeComparisonsStamp(): Flow<String>
+    @Query(REPOSITORY_STAMP_SELECT) suspend fun getRepositoryStamp(): RepositoryStampRow
 
     // --- Core Entries (`entries` + FTS-safe upserts) ---
 
     @Query("SELECT * FROM entries") suspend fun getAllEntries(): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE id IN (:ids)")
+    suspend fun getEntriesByIds(ids: List<String>): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE mergedIntoId IS NOT NULL AND mergedIntoId != ''")
+    suspend fun getMergedEntries(): List<EntryEntity>
 
     @Query("SELECT * FROM entries WHERE id = :id LIMIT 1")
     suspend fun getEntryById(id: String): EntryEntity?
@@ -284,9 +424,6 @@ interface RocheDao {
 
     @Query("DELETE FROM entries WHERE id = :id") suspend fun deleteRawEntryById(id: String)
 
-    @Query("DELETE FROM entries WHERE id IN (:ids)")
-    suspend fun deleteRawEntriesByIds(ids: List<String>)
-
     @Query("UPDATE entries SET isLocalDirty = 0 WHERE id = :id AND hlc = :expectedHlc")
     suspend fun clearEntryDirtyIfSameHlc(id: String, expectedHlc: String)
 
@@ -301,8 +438,14 @@ interface RocheDao {
 
     // --- Satellite `entry_content` (FTS-safe upserts) ---
 
-    @Query("SELECT * FROM entry_content")
-    suspend fun getAllEntryContents(): List<EntryContentEntity>
+    @Query(
+        "SELECT entryId, contentType, " +
+            "SUBSTR(contentText, 1, 2048) AS contentText, " +
+            "SUBSTR(contentHtml, 1, 2048) AS contentHtml, " +
+            "audioUrl, duration, thumbnailMediaId, fallbackFeedTitle " +
+            "FROM entry_content"
+    )
+    suspend fun getAllEntryContentPreviews(): List<EntryContentPreviewRow>
 
     @Query("SELECT * FROM entry_content WHERE entryId IN (:ids)")
     suspend fun getEntryContentsByIds(ids: List<String>): List<EntryContentEntity>
@@ -351,6 +494,9 @@ interface RocheDao {
 
     @Query("SELECT * FROM entry_state") suspend fun getAllEntryStates(): List<EntryStateEntity>
 
+    @Query("SELECT * FROM entry_state WHERE entryId IN (:ids)")
+    suspend fun getEntryStatesByIds(ids: List<String>): List<EntryStateEntity>
+
     @Query("SELECT * FROM entry_state WHERE isLocalDirty = 1")
     suspend fun getDirtyEntryStates(): List<EntryStateEntity>
 
@@ -374,14 +520,7 @@ interface RocheDao {
 
     // --- Inbox Projections & Search ---
 
-    @Query(
-        "SELECT COUNT(*) FROM entries e " +
-            "INNER JOIN entry_state es ON es.entryId = e.id " +
-            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
-            "WHERE e.mergedIntoId IS NULL " +
-            "AND (es.inboxState IN ('unread', 'dismissed') OR ec.entryId IS NOT NULL)"
-    )
-    suspend fun countItems(): Int
+    @Query("SELECT COUNT(*) $INBOX_FROM_WHERE") suspend fun countItems(): Int
 
     @Query("$INBOX_SELECT_FULL_PREFIX AND e.id = :id LIMIT 1")
     suspend fun getItemById(id: String): InboxItemRow?
@@ -405,12 +544,12 @@ interface RocheDao {
         "SELECT e.id AS id, " +
             "$STATUS_EXPR AS status, " +
             "$IS_FAVORITE_EXPR AS isFavorite, " +
-            "es.isCachedOffline AS isCachedOffline, " +
-            "COALESCE(ec.contentType, 'article') AS contentType, " +
+            "COALESCE(es.isCachedOffline, 0) AS isCachedOffline, " +
+            "$CONTENT_TYPE_EXPR AS contentType, " +
             "es.readAt AS readAt, " +
-            "es.progress AS readProgress, " +
+            "COALESCE(es.progress, 0.0) AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
-            "es.inboxState AS inboxState " +
+            "COALESCE(es.inboxState, 'none') AS inboxState " +
             "$INBOX_FROM_WHERE AND e.id = :id LIMIT 1"
     )
     suspend fun getItemStateById(id: String): ItemStateRow?
@@ -420,7 +559,7 @@ interface RocheDao {
             "$STATUS_EXPR AS status, " +
             "$IS_FAVORITE_EXPR AS isFavorite, " +
             "es.isCachedOffline AS isCachedOffline, " +
-            "COALESCE(ec.contentType, 'article') AS contentType, " +
+            "$CONTENT_TYPE_EXPR AS contentType, " +
             "es.readAt AS readAt, " +
             "es.progress AS readProgress, " +
             "ec.audioUrl AS audioUrl, " +
@@ -482,18 +621,19 @@ interface RocheDao {
 
     @Query(
         "SELECT e.id FROM entries e " +
-            "INNER JOIN entry_state es ON es.entryId = e.id " +
-            "LEFT JOIN entry_content ec_f1 ON ec_f1.entryId = e.id " +
+            "LEFT JOIN entry_state es ON es.entryId = e.id " +
+            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
             "INNER JOIN entries_fts ON e.rowid = entries_fts.rowid " +
-            "WHERE e.mergedIntoId IS NULL " +
-            "AND (es.inboxState IN ('unread', 'dismissed') OR ec_f1.entryId IS NOT NULL) " +
+            "WHERE $IS_LIVE_ITEM_WHERE " +
             "AND entries_fts MATCH :tokenMatchQuery " +
             "UNION " +
             "SELECT ec.entryId FROM entry_content ec " +
-            "INNER JOIN entry_state es2 ON es2.entryId = ec.entryId " +
+            "LEFT JOIN entry_state es2 ON es2.entryId = ec.entryId " +
             "INNER JOIN entries e2 ON e2.id = ec.entryId " +
             "INNER JOIN entry_content_fts ON ec.rowid = entry_content_fts.rowid " +
-            "WHERE e2.mergedIntoId IS NULL AND entry_content_fts MATCH :tokenMatchQuery " +
+            "WHERE e2.mergedIntoId IS NULL " +
+            "AND COALESCE(es2.inboxState, 'none') != 'deleted' " +
+            "AND entry_content_fts MATCH :tokenMatchQuery " +
             "UNION " +
             "SELECT ce.entryId FROM collection_entries ce " +
             "INNER JOIN entry_state es3 ON es3.entryId = ce.entryId " +
@@ -510,11 +650,11 @@ interface RocheDao {
         "SELECT DISTINCT ce.entryId FROM collection_entries ce " +
             "INNER JOIN collection_specs cs ON cs.collectionId = ce.collectionId " +
             "INNER JOIN entries te ON te.id = cs.collectionId " +
-            "INNER JOIN entry_state es ON es.entryId = ce.entryId " +
-            "LEFT JOIN entry_content ec_t ON ec_t.entryId = ce.entryId " +
-            "INNER JOIN entries ie ON ie.id = ce.entryId " +
-            "WHERE cs.role = 'tag' AND te.mergedIntoId IS NULL AND ie.mergedIntoId IS NULL " +
-            "AND (es.inboxState IN ('unread', 'dismissed') OR ec_t.entryId IS NOT NULL) " +
+            "INNER JOIN entries e ON e.id = ce.entryId " +
+            "LEFT JOIN entry_state es ON es.entryId = e.id " +
+            "LEFT JOIN entry_content ec ON ec.entryId = e.id " +
+            "WHERE cs.role = 'tag' AND te.mergedIntoId IS NULL " +
+            "AND $IS_LIVE_ITEM_WHERE " +
             "AND te.title LIKE :likePattern ESCAPE '\\'"
     )
     suspend fun matchItemIdsByTagLike(likePattern: String): List<String>
@@ -636,6 +776,9 @@ interface RocheDao {
     @Query("SELECT * FROM entry_identifiers")
     suspend fun getAllEntryIdentifiers(): List<EntryIdentifierEntity>
 
+    @Query("SELECT * FROM entry_identifiers WHERE entryId IN (:entryIds)")
+    suspend fun getEntryIdentsByEntryIds(entryIds: List<String>): List<EntryIdentifierEntity>
+
     @Query(
         "SELECT entryId FROM entry_identifiers " +
             "WHERE scheme = :scheme AND value = :value LIMIT 1"
@@ -685,6 +828,9 @@ interface RocheDao {
     @Query("SELECT * FROM collection_entries WHERE isLocalDirty = 1")
     suspend fun getDirtyCollectionEntries(): List<CollectionEntryEntity>
 
+    @Query("SELECT * FROM collection_entries WHERE collectionId IN (:collectionIds)")
+    suspend fun getMembershipsByColIds(collectionIds: List<String>): List<CollectionEntryEntity>
+
     @Query(
         "SELECT * FROM collection_entries WHERE collectionId = :collectionId " +
             "ORDER BY COALESCE(position, 1e12) ASC, addedAt ASC"
@@ -727,12 +873,6 @@ interface RocheDao {
         entryId: String,
         expectedHlc: String,
     )
-
-    @Query(
-        "UPDATE collection_entries SET isLocalDirty = 1 " +
-            "WHERE collectionId = :collectionId AND entryId = :entryId"
-    )
-    suspend fun markCollectionEntryDirty(collectionId: String, entryId: String)
 
     @Query("SELECT * FROM collection_generators")
     suspend fun getAllCollectionGenerators(): List<CollectionGeneratorEntity>
@@ -787,9 +927,6 @@ interface RocheDao {
     @Query("UPDATE consumption_log SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearConsumptionLogsDirty(ids: List<String>)
 
-    @Query("UPDATE consumption_log SET isLocalDirty = 1 WHERE id IN (:ids)")
-    suspend fun markConsumptionLogsDirty(ids: List<String>)
-
     @Query("DELETE FROM consumption_log WHERE id = :id")
     suspend fun deleteConsumptionLogById(id: String)
 
@@ -810,9 +947,6 @@ interface RocheDao {
 
     @Query("UPDATE comparisons SET isLocalDirty = 0 WHERE id IN (:ids)")
     suspend fun clearComparisonsDirty(ids: List<String>)
-
-    @Query("UPDATE comparisons SET isLocalDirty = 1 WHERE id IN (:ids)")
-    suspend fun markComparisonsDirty(ids: List<String>)
 
     @Query("DELETE FROM comparisons WHERE id = :id") suspend fun deleteComparisonById(id: String)
 
@@ -850,8 +984,6 @@ interface RocheDao {
         expectedHlc: String,
     )
 
-    @Query("DELETE FROM sync_tombstones") suspend fun clearAllTombstones()
-
     @Query("SELECT flagValue FROM local_sync_flags WHERE flagKey = :key LIMIT 1")
     suspend fun getLocalSyncFlag(key: String): String?
 
@@ -866,9 +998,6 @@ interface RocheDao {
     )
     suspend fun upsertLocalSyncFlagIfGreater(key: String, value: String)
 
-    @Query("DELETE FROM local_sync_flags WHERE flagKey = :key")
-    suspend fun deleteLocalSyncFlag(key: String)
-
     // --- Catalog History Check ---
 
     @Query(
@@ -882,6 +1011,13 @@ interface RocheDao {
             "THEN 1 ELSE 0 END"
     )
     suspend fun hasCatalogHistoryRaw(entryId: String, quotedPattern: String): Int
+
+    @Query(
+        "SELECT CASE WHEN EXISTS (" +
+            "SELECT 1 FROM comparisons WHERE scopeCollectionId = :entryId" +
+            ") THEN 1 ELSE 0 END"
+    )
+    suspend fun hasComparisonScopeRaw(entryId: String): Int
 
     @Transaction
     suspend fun executeInTransaction(block: suspend () -> Unit) {

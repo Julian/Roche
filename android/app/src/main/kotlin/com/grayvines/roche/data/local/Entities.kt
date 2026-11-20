@@ -328,4 +328,52 @@ data class ItemTagRow(
     val tagId: String,
 )
 
+@Suppress("LongParameterList")
+data class EntryContentPreviewRow(
+    val entryId: String,
+    val contentType: String,
+    val contentText: String?,
+    val contentHtml: String?,
+    val audioUrl: String?,
+    val duration: String?,
+    val thumbnailMediaId: String?,
+    val fallbackFeedTitle: String?,
+)
+
+@Suppress("LongParameterList")
+data class CatalogStampRow(
+    val entriesStamp: String,
+    val identsStamp: String,
+    val specsStamp: String,
+    val membersStamp: String,
+    val generatorsStamp: String,
+    val logsStamp: String,
+    val comparisonsStamp: String,
+)
+
+@Suppress("LongParameterList")
+data class RepositoryStampRow(
+    val entriesStamp: String,
+    val identsStamp: String,
+    val specsStamp: String,
+    val membersStamp: String,
+    val generatorsStamp: String,
+    val logsStamp: String,
+    val comparisonsStamp: String,
+    val statesStamp: String,
+    val contentsStamp: String,
+    val feedsStamp: String,
+)
+
+internal fun RepositoryStampRow.toCatalogStamp(): CatalogStampRow =
+    CatalogStampRow(
+        entriesStamp = entriesStamp,
+        identsStamp = identsStamp,
+        specsStamp = specsStamp,
+        membersStamp = membersStamp,
+        generatorsStamp = generatorsStamp,
+        logsStamp = logsStamp,
+        comparisonsStamp = comparisonsStamp,
+    )
+
 internal const val DEFAULT_INBOX_STATE = "unread"

@@ -1,5 +1,10 @@
 package com.grayvines.roche.data.settings
 
+import com.grayvines.roche.core.HTTPS_URL_PREFIX
+import com.grayvines.roche.core.HTTP_URL_PREFIX
+import com.grayvines.roche.core.isHttpOrHttpsUrl
+import com.grayvines.roche.core.isLoopbackHost
+import com.grayvines.roche.core.isTailscaleCgnatIpv4
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.HeadlineFont
 import com.grayvines.roche.model.ThemeMode
@@ -79,7 +84,7 @@ internal fun normalizeServerUrl(rawUrl: String): String {
 
 private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     val lower = trimmedUrl.lowercase()
-    if (lower.startsWith(SCHEME_HTTP_PREFIX) || lower.startsWith(SCHEME_HTTPS_PREFIX)) {
+    if (isHttpOrHttpsUrl(trimmedUrl)) {
         return trimmedUrl
     }
     if ("://" in lower || lower.startsWith("javascript:") || lower.startsWith("file:")) {
@@ -87,24 +92,12 @@ private fun resolveCandidateWithScheme(trimmedUrl: String): String? {
     }
     val hostPart = extractHostWithoutPort(trimmedUrl).lowercase()
     val prefix =
-        if (shouldUseCleartextHttp(hostPart)) {
-            SCHEME_HTTP_PREFIX
+        if (isLoopbackHost(hostPart)) {
+            HTTP_URL_PREFIX
         } else {
-            SCHEME_HTTPS_PREFIX
+            HTTPS_URL_PREFIX
         }
     return "$prefix$trimmedUrl"
-}
-
-private fun shouldUseCleartextHttp(hostPart: String): Boolean =
-    hostPart in CLEARTEXT_LOOPBACK_HOSTS ||
-        hostPart == HOST_LOOPBACK_V6 ||
-        hostPart.startsWith("127.") && isValidLoopbackIpv4(hostPart)
-
-private fun isValidLoopbackIpv4(host: String): Boolean {
-    val parts = host.split('.')
-    if (parts.size != IPV4_OCTET_COUNT) return false
-    val octets = parts.map { it.toIntOrNull() ?: return false }
-    return octets[0] == LOOPBACK_FIRST_OCTET && octets.all { it in 0..MAX_IPV4_OCTET }
 }
 
 private fun extractHostWithoutPort(authority: String): String =
@@ -248,16 +241,6 @@ private fun extractTsNetSuffix(host: String): String? {
     return withoutTs.substringAfterLast('.').takeIf { it.isNotBlank() }
 }
 
-private fun isTailscaleCgnatIpv4(host: String): Boolean {
-    val parts = host.split('.')
-    if (parts.size != IPV4_OCTET_COUNT) return false
-    val octets = parts.map { it.toIntOrNull() ?: return false }
-    return octets[0] == CGNAT_FIRST_OCTET &&
-        octets[1] in CGNAT_SECOND_OCTET_MIN..CGNAT_SECOND_OCTET_MAX &&
-        octets[SECOND_SUBNET_OCTET_INDEX] in 0..MAX_IPV4_OCTET &&
-        octets[LAST_IPV4_OCTET_INDEX] in 0..MAX_IPV4_OCTET
-}
-
 internal fun isValidDnsName(name: String): Boolean =
     name.isNotEmpty() &&
         name.length <= MAX_DNS_NAME_LEN &&
@@ -277,21 +260,12 @@ private const val HOST_LOCALHOST = "localhost"
 private const val HOST_LOOPBACK_V4 = "127.0.0.1"
 private const val HOST_LOOPBACK_V6 = "[::1]"
 private const val HOST_EMULATOR = "10.0.2.2"
-private const val SCHEME_HTTP_PREFIX = "http://"
-private const val SCHEME_HTTPS_PREFIX = "https://"
+private const val SCHEME_HTTP_PREFIX = HTTP_URL_PREFIX
+private const val SCHEME_HTTPS_PREFIX = HTTPS_URL_PREFIX
 private const val TS_NET_SUFFIX = ".ts.net"
-private const val LOOPBACK_FIRST_OCTET = 127
-private val CLEARTEXT_LOOPBACK_HOSTS = setOf(HOST_LOCALHOST, HOST_EMULATOR)
 private val LOCAL_HTTP_PROBE_HOSTS =
     setOf(HOST_LOOPBACK_V4, HOST_LOCALHOST, HOST_EMULATOR, HOST_LOOPBACK_V6)
 private val TRUSTED_LOCAL_PROBE_HOSTS = setOf(HOST_ROCHE, HOST_LOOPBACK_V4, HOST_LOCALHOST)
 private const val MAX_TCP_PORT = 65_535
 private const val MAX_DNS_NAME_LEN = 253
 private const val MAX_DNS_LABEL_LEN = 63
-private const val IPV4_OCTET_COUNT = 4
-private const val SECOND_SUBNET_OCTET_INDEX = 2
-private const val LAST_IPV4_OCTET_INDEX = 3
-private const val CGNAT_FIRST_OCTET = 100
-private const val CGNAT_SECOND_OCTET_MIN = 64
-private const val CGNAT_SECOND_OCTET_MAX = 127
-private const val MAX_IPV4_OCTET = 255

@@ -2,41 +2,57 @@
 
 package com.grayvines.roche.data.local
 
-import com.grayvines.roche.data.COLLECTION_ENTRY_ENTITY
-import com.grayvines.roche.data.DEFAULT_LOCAL_HLC_NODE
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.HlcTimestamp
-import com.grayvines.roche.data.MAX_SQLITE_HTML_CHARS
-import com.grayvines.roche.data.MAX_SQLITE_SUMMARY_CHARS
-import com.grayvines.roche.data.MAX_SQLITE_TEXT_CHARS
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.UP_NEXT_COLLECTION_ID
-import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
-import com.grayvines.roche.data.WANT_TO_READ_SLUG
-import com.grayvines.roche.data.WANT_TO_READ_TITLE
-import com.grayvines.roche.data.canonicalizeSyncUrl
-import com.grayvines.roche.data.collectionEntryNaturalKey
-import com.grayvines.roche.data.encodeCreatorsJson
-import com.grayvines.roche.data.extractArxivIdentifier
-import com.grayvines.roche.data.extractYearPrefix
-import com.grayvines.roche.data.isSyncableItemUrl
-import com.grayvines.roche.data.nextLocalHlc
-import com.grayvines.roche.data.normalizeConsecutiveFailures
-import com.grayvines.roche.data.normalizeTagName
-import com.grayvines.roche.data.nowUtcIso
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.ENTRY_KIND_COLLECTION
+import com.grayvines.roche.core.FLAG_LOCAL_HLC
+import com.grayvines.roche.core.HlcClock
+import com.grayvines.roche.core.HlcTimestamp
+import com.grayvines.roche.core.SEED_EPOCH_ISO
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.STARRED_SLUG
+import com.grayvines.roche.core.STARRED_TITLE
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_ENTRY
+import com.grayvines.roche.core.TOMBSTONE_ENTITY_COLLECTION_GENERATOR
+import com.grayvines.roche.core.UP_NEXT_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_SLUG
+import com.grayvines.roche.core.WANT_TO_READ_TITLE
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.collectionEntryNaturalKey
+import com.grayvines.roche.core.encodeCreatorsJson
+import com.grayvines.roche.core.extractArxivIdentifier
+import com.grayvines.roche.core.extractYearPrefix
+import com.grayvines.roche.core.formatArticleMinutes
+import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.isSyncableItemUrl
+import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.core.nowUtcIso
+import com.grayvines.roche.core.resolveArticleDuration
 import com.grayvines.roche.model.ContentType
-import com.grayvines.roche.model.formatArticleMinutes
 
 internal const val SQLITE_DELETE_CHUNK_SIZE = 500
+internal const val MAX_SQLITE_SUMMARY_CHARS = 16_384
+internal const val MAX_SQLITE_TEXT_CHARS = 262_144
+internal const val MAX_SQLITE_HTML_CHARS = 512_000
 internal const val LIST_PREVIEW_SUMMARY_CHARS = 1_024
 internal const val LIST_PREVIEW_TEXT_CHARS = 2_048
 internal const val LIST_PREVIEW_HTML_CHARS = 2_048
 internal const val MAX_FTS_QUERY_TOKENS = 16
 
-private const val SEED_EPOCH_ISO = "1970-01-01T00:00:00Z"
-private const val FTS_SEARCHABLE_COLUMNS_PREFIX =
-    "{title creatorsJson url summary contentText contentHtml fallbackFeedTitle} : "
-private val SYNTHETIC_ARTICLE_DURATION_REGEX = Regex("""^\d+m$""")
+internal suspend fun nextLocalHlc(
+    dao: RocheDao,
+    nodeId: String = DEFAULT_LOCAL_HLC_NODE,
+    nowMs: Long = System.currentTimeMillis(),
+): String {
+    var next = ""
+    dao.executeInTransaction {
+        val dbPrev = dao.getLocalSyncFlag(FLAG_LOCAL_HLC)
+        next = HlcClock(nodeId, dbPrev).tick(nowMs).encode()
+        dao.upsertLocalSyncFlagIfGreater(FLAG_LOCAL_HLC, next)
+    }
+    return next
+}
 
 internal fun truncateInboxItemForStorage(item: InboxItemRow): InboxItemRow {
     val boundedSummary = item.summary?.take(MAX_SQLITE_SUMMARY_CHARS)
@@ -66,22 +82,13 @@ private fun resolveStoredArticleDuration(
     boundedSummary: String?,
     boundedText: String?,
     boundedHtml: String?,
-): String? {
-    if (ContentType.fromWireValue(item.contentType) != ContentType.ARTICLE) {
-        return item.duration
-    }
-    val existing = item.duration?.trim()?.takeIf { it.isNotEmpty() }
-    val hasExplicitUpstreamDuration =
-        existing != null && !SYNTHETIC_ARTICLE_DURATION_REGEX.matches(existing)
-    if (hasExplicitUpstreamDuration) {
-        return item.duration
-    }
-    if (!hasExtendedItemContent(item)) {
-        return null
-    }
-    val textSource = boundedText ?: boundedHtml ?: boundedSummary.orEmpty()
-    return if (textSource.isNotBlank()) formatArticleMinutes(textSource) else null
-}
+): String? =
+    resolveArticleDuration(
+        existingDuration = item.duration,
+        isArticle = ContentType.fromWireValue(item.contentType) == ContentType.ARTICLE,
+        hasExtendedContent = hasExtendedItemContent(item),
+        fallbackTextSource = boundedText ?: boundedHtml ?: boundedSummary.orEmpty(),
+    )
 
 internal fun hasExtendedItemContent(item: InboxItemRow): Boolean =
     item.summary.orEmpty().length > LIST_PREVIEW_SUMMARY_CHARS ||
@@ -110,15 +117,6 @@ internal fun extractFtsTokenQueries(rawQuery: String): List<String> {
     return tokens.take(MAX_FTS_QUERY_TOKENS).map { token ->
         val escaped = token.replace("\"", "\"\"")
         "\"$escaped\"*"
-    }
-}
-
-internal fun buildFts5MatchQuery(rawQuery: String): String? {
-    val tokenQueries = extractFtsTokenQueries(rawQuery)
-    return if (tokenQueries.isEmpty()) {
-        null
-    } else {
-        "$FTS_SEARCHABLE_COLUMNS_PREFIX(${tokenQueries.joinToString(separator = " ")})"
     }
 }
 
@@ -188,35 +186,54 @@ internal suspend fun RocheDao.executeMultiTokenSearch(
     }
 }
 
+internal fun buildSeededCollectionEntry(
+    id: String,
+    title: String,
+    seedHlc: String,
+    timestampIso: String = SEED_EPOCH_ISO,
+    isLocalDirty: Boolean = false,
+): EntryEntity =
+    EntryEntity(
+        id = id,
+        kind = ENTRY_KIND_COLLECTION,
+        title = title,
+        createdAt = timestampIso,
+        updatedAt = timestampIso,
+        hlc = seedHlc,
+        isLocalDirty = isLocalDirty,
+    )
+
+internal fun buildStarredCollectionSpec(existingColor: String? = null): CollectionSpecEntity =
+    CollectionSpecEntity(
+        collectionId = STARRED_COLLECTION_ID,
+        slug = STARRED_SLUG,
+        mode = MODE_MANUAL,
+        role = "list",
+        ruleJson = null,
+        showInLists = true,
+        color = existingColor,
+    )
+
+internal fun buildWantToReadCollectionSpec(): CollectionSpecEntity =
+    CollectionSpecEntity(
+        collectionId = WANT_TO_READ_COLLECTION_ID,
+        slug = WANT_TO_READ_SLUG,
+        mode = MODE_MANUAL,
+        role = "want",
+        ruleJson = null,
+        showInLists = false,
+        color = null,
+    )
+
 internal suspend fun RocheDao.ensureStarredSpecExists() {
     val existingSpec = getCollectionSpecById(STARRED_COLLECTION_ID)
     if (existingSpec != null && existingSpec.showInLists && existingSpec.role == "list") return
     val seedHlc = HlcTimestamp.fromIsoOrEpoch(SEED_EPOCH_ISO, DEFAULT_LOCAL_HLC_NODE).encode()
     if (getEntryById(STARRED_COLLECTION_ID) == null) {
-        upsertEntry(
-            EntryEntity(
-                id = STARRED_COLLECTION_ID,
-                kind = EntryKind.COLLECTION.wireValue,
-                title = "Starred",
-                createdAt = SEED_EPOCH_ISO,
-                updatedAt = SEED_EPOCH_ISO,
-                hlc = seedHlc,
-                isLocalDirty = false,
-            )
-        )
+        upsertEntry(buildSeededCollectionEntry(STARRED_COLLECTION_ID, STARRED_TITLE, seedHlc))
     }
-    upsertCollectionSpec(
-        CollectionSpecEntity(
-            collectionId = STARRED_COLLECTION_ID,
-            slug = "starred",
-            mode = MODE_MANUAL,
-            role = "list",
-            ruleJson = null,
-            showInLists = true,
-            color = existingSpec?.color,
-        )
-    )
-    insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", "starred", STARRED_COLLECTION_ID))
+    upsertCollectionSpec(buildStarredCollectionSpec(existingSpec?.color))
+    insertEntryIdentifierIgnore(EntryIdentifierEntity("slug", STARRED_SLUG, STARRED_COLLECTION_ID))
 }
 
 internal suspend fun RocheDao.ensureWantToReadSpecExists(
@@ -238,28 +255,16 @@ internal suspend fun RocheDao.ensureWantToReadSpecExists(
         }
     if (getEntryById(WANT_TO_READ_COLLECTION_ID) == null) {
         upsertEntry(
-            EntryEntity(
+            buildSeededCollectionEntry(
                 id = WANT_TO_READ_COLLECTION_ID,
-                kind = EntryKind.COLLECTION.wireValue,
                 title = WANT_TO_READ_TITLE,
-                createdAt = nowIso,
-                updatedAt = nowIso,
-                hlc = hlc,
+                seedHlc = hlc,
+                timestampIso = nowIso,
                 isLocalDirty = markDirty,
             )
         )
     }
-    upsertCollectionSpec(
-        CollectionSpecEntity(
-            collectionId = WANT_TO_READ_COLLECTION_ID,
-            slug = WANT_TO_READ_SLUG,
-            mode = MODE_MANUAL,
-            role = "want",
-            ruleJson = null,
-            showInLists = false,
-            color = null,
-        )
-    )
+    upsertCollectionSpec(buildWantToReadCollectionSpec())
     insertEntryIdentifierIgnore(
         EntryIdentifierEntity("slug", WANT_TO_READ_SLUG, WANT_TO_READ_COLLECTION_ID)
     )
@@ -588,7 +593,7 @@ internal suspend fun RocheDao.upsertTag(
         upsertEntry(
             EntryEntity(
                 id = tag.id,
-                kind = EntryKind.COLLECTION.wireValue,
+                kind = ENTRY_KIND_COLLECTION,
                 title = displayTitle,
                 createdAt = existingEntry?.createdAt ?: nowIso,
                 updatedAt = if (markDirty) nowIso else existingEntry?.updatedAt ?: nowIso,
@@ -640,7 +645,7 @@ internal suspend fun RocheDao.insertItemTag(
             }
     if (markDirty) {
         deleteTombstone(
-            COLLECTION_ENTRY_ENTITY,
+            TOMBSTONE_ENTITY_COLLECTION_ENTRY,
             collectionEntryNaturalKey(itemTag.tagId, itemTag.itemId),
         )
     }
@@ -682,7 +687,7 @@ internal suspend fun RocheDao.removeItemTag(
         if (markDirty) {
             upsertTombstone(
                 TombstoneEntity(
-                    entityType = COLLECTION_ENTRY_ENTITY,
+                    entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                     naturalKey = collectionEntryNaturalKey(tagId, itemId),
                     deletedAt = nowIso,
                     hlc = hlc,
@@ -800,6 +805,19 @@ private fun resolveEnrichedDuration(
     return src.takeIf { it.isNotBlank() }?.let(::formatArticleMinutes)
 }
 
+private suspend fun RocheDao.resolveOrInitEntryState(
+    itemId: String,
+    nowIso: String,
+): EntryStateEntity? =
+    getEntryStateById(itemId)
+        ?: getEntryById(itemId)?.let {
+            EntryStateEntity(
+                entryId = itemId,
+                inboxState = "none",
+                updatedAt = nowIso,
+            )
+        }
+
 internal suspend fun RocheDao.setItemStatusAndReadAt(
     itemId: String,
     status: String,
@@ -807,9 +825,9 @@ internal suspend fun RocheDao.setItemStatusAndReadAt(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             val isNonFeed = existing.inboxState.equals("none", ignoreCase = true)
             val isArchived = status.equals("archived", ignoreCase = true)
@@ -855,7 +873,7 @@ private suspend fun RocheDao.syncNonFeedWantArchive(
             if (isSyncable) {
                 upsertTombstone(
                     TombstoneEntity(
-                        entityType = COLLECTION_ENTRY_ENTITY,
+                        entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                         naturalKey = natKey,
                         deletedAt = nowIso,
                         hlc = hlc,
@@ -866,7 +884,7 @@ private suspend fun RocheDao.syncNonFeedWantArchive(
         }
     } else {
         ensureWantToReadSpecExists(markDirty = isSyncable, nodeId = nodeId)
-        deleteTombstone(COLLECTION_ENTRY_ENTITY, natKey)
+        deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_ENTRY, natKey)
         upsertCollectionEntry(
             CollectionEntryEntity(
                 collectionId = WANT_TO_READ_COLLECTION_ID,
@@ -886,9 +904,9 @@ internal suspend fun RocheDao.setItemReadAt(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             upsertEntryState(
                 existing.copy(
@@ -910,9 +928,9 @@ internal suspend fun RocheDao.setItemReadProgress(
     nodeId: String = DEFAULT_LOCAL_HLC_NODE,
 ) {
     executeInTransaction {
-        val existing = getEntryStateById(itemId)
+        val nowIso = nowUtcIso()
+        val existing = resolveOrInitEntryState(itemId, nowIso)
         if (existing != null) {
-            val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             upsertEntryState(
                 existing.copy(
@@ -937,12 +955,12 @@ internal suspend fun RocheDao.setItemFavorite(
         ensureStarredSpecExists()
         val entry = getEntryById(itemId)
         if (entry != null) {
-            val isSyncable = entry.url?.startsWith("localpdf://", ignoreCase = true) != true
+            val isSyncable = !isLocalPdfUrl(entry.url)
             val nowIso = nowUtcIso()
             val hlc = nextLocalHlc(this, nodeId)
             val natKey = collectionEntryNaturalKey(STARRED_COLLECTION_ID, itemId)
             if (isFavorite) {
-                deleteTombstone(COLLECTION_ENTRY_ENTITY, natKey)
+                deleteTombstone(TOMBSTONE_ENTITY_COLLECTION_ENTRY, natKey)
                 upsertCollectionEntry(
                     CollectionEntryEntity(
                         collectionId = STARRED_COLLECTION_ID,
@@ -958,7 +976,7 @@ internal suspend fun RocheDao.setItemFavorite(
                 if (isSyncable) {
                     upsertTombstone(
                         TombstoneEntity(
-                            entityType = COLLECTION_ENTRY_ENTITY,
+                            entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                             naturalKey = natKey,
                             deletedAt = nowIso,
                             hlc = hlc,
@@ -1062,7 +1080,7 @@ internal suspend fun RocheDao.deleteCollectionGeneratorWithTombstone(
             val hlc = nextLocalHlc(this, nodeId)
             upsertTombstone(
                 TombstoneEntity(
-                    entityType = com.grayvines.roche.data.TOMBSTONE_ENTITY_COLLECTION_GENERATOR,
+                    entityType = TOMBSTONE_ENTITY_COLLECTION_GENERATOR,
                     naturalKey = cleanId,
                     deletedAt = nowIso,
                     hlc = hlc,
@@ -1092,7 +1110,7 @@ internal suspend fun RocheDao.deleteItemPreservingHistory(
     hlcOverride: String? = null,
 ): Boolean {
     val entry = getEntryById(itemId) ?: return false
-    val isSyncable = entry.url?.startsWith("localpdf://", ignoreCase = true) != true
+    val isSyncable = !isLocalPdfUrl(entry.url)
     val emitTombstones = recordTombstones && isSyncable
     val nowIso = nowUtcIso()
     val hlc = hlcOverride ?: nextLocalHlc(this, nodeId)
@@ -1143,7 +1161,7 @@ private suspend fun RocheDao.detachWantMembershipsForItem(
             if (recordTombstones) {
                 upsertTombstone(
                     TombstoneEntity(
-                        entityType = COLLECTION_ENTRY_ENTITY,
+                        entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                         naturalKey = collectionEntryNaturalKey(mem.collectionId, itemId),
                         deletedAt = nowIso,
                         hlc = hlc,
@@ -1179,7 +1197,7 @@ private suspend fun RocheDao.detachInboxOnlyMemberships(
             if (recordTombstones) {
                 upsertTombstone(
                     TombstoneEntity(
-                        entityType = COLLECTION_ENTRY_ENTITY,
+                        entityType = TOMBSTONE_ENTITY_COLLECTION_ENTRY,
                         naturalKey = collectionEntryNaturalKey(mem.collectionId, itemId),
                         deletedAt = nowIso,
                         hlc = hlc,

@@ -1,12 +1,19 @@
 package com.grayvines.roche.model
 
+import com.grayvines.roche.core.formatArticleMinutes
+import com.grayvines.roche.core.formatAudioDurationEstimate
+import com.grayvines.roche.core.inferContentTypeWireValue
+import com.grayvines.roche.core.isHttpOrHttpsUrl
+import com.grayvines.roche.core.parseIsoInstant
 import java.net.URI
 import java.time.Duration
 import java.time.Instant
-import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+
+internal fun inferContentType(url: String): ContentType =
+    ContentType.fromWireValue(inferContentTypeWireValue(url))
 
 enum class ContentType(val wireValue: String) {
     ARTICLE("article"),
@@ -268,29 +275,6 @@ data class InboxEntry(
         }
 }
 
-internal fun formatAudioDurationEstimate(raw: String?): String? {
-    val clean = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
-    val totalSeconds =
-        clean.toLongOrNull()
-            ?: run {
-                val parts = clean.split(':').map { it.trim().toLongOrNull() ?: return clean }
-                when (parts.size) {
-                    2 -> parts[0] * 60L + parts[1]
-                    3 -> parts[0] * 3_600L + parts[1] * 60L + parts[2]
-                    else -> return clean
-                }
-            }
-    if (totalSeconds <= 0L) return clean
-    val hours = totalSeconds / SECONDS_PER_HOUR
-    val minutes = totalSeconds % SECONDS_PER_HOUR / SECONDS_PER_MIN
-    return when {
-        hours > 0L && minutes > 0L -> "${hours}h ${minutes}m"
-        hours > 0L -> "${hours}h"
-        minutes > 0L -> "${minutes}m"
-        else -> "${totalSeconds}s"
-    }
-}
-
 internal fun extractCleanDomain(rawUrl: String): String {
     val trimmed = rawUrl.trim()
     if (trimmed.isBlank()) return ""
@@ -354,18 +338,15 @@ internal fun resolveArticleImageUrl(rawUrl: String, baseUrl: String? = null): St
     val candidate = rawUrl.trim().replace("&amp;", "&")
     if (candidate.isBlank() || hasDisallowedImageScheme(candidate)) return null
     val resolved =
-        if (isHttpImageScheme(candidate)) {
+        if (isHttpOrHttpsUrl(candidate)) {
             candidate
         } else if (!baseUrl.isNullOrBlank()) {
             runCatching { URI.create(baseUrl.trim()).resolve(candidate).toString() }.getOrNull()
         } else {
             null
         }
-    return resolved?.takeIf { isHttpImageScheme(it) && !isNonThumbnailUrl(it) }
+    return resolved?.takeIf { isHttpOrHttpsUrl(it) && !isNonThumbnailUrl(it) }
 }
-
-private fun isHttpImageScheme(url: String): Boolean =
-    url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true)
 
 private fun hasDisallowedImageScheme(url: String): Boolean =
     url.startsWith("data:", ignoreCase = true) ||
@@ -394,10 +375,7 @@ internal fun extractAllImageUrlsFromHtml(html: String?, baseUrl: String? = null)
 internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now()): String {
     val trimmed = raw?.trim().orEmpty()
     if (trimmed.isBlank()) return "recent"
-    val instant =
-        runCatching { Instant.parse(trimmed) }.getOrNull()
-            ?: runCatching { OffsetDateTime.parse(trimmed).toInstant() }.getOrNull()
-            ?: return trimmed
+    val instant = parseIsoInstant(trimmed) ?: return trimmed
     val seconds = Duration.between(instant, now).seconds.coerceAtLeast(0L)
     return when {
         seconds < SECONDS_PER_MIN -> "now"
@@ -408,53 +386,10 @@ internal fun formatRelativeTimestamp(raw: String?, now: Instant = Instant.now())
     }
 }
 
-internal fun formatArticleMinutes(text: String): String {
-    val wordCount = countPlainTextWords(text)
-    val minutes = (wordCount / ARTICLE_WORDS_PER_MINUTE).coerceAtLeast(1)
-    return "${minutes}m"
-}
-
-private fun countPlainTextWords(text: String): Int {
-    var wordCount = 0
-    var inWord = false
-    var i = 0
-    val len = text.length
-    while (i < len) {
-        val ch = text[i]
-        val tagEnd = findClosingHtmlTagIndex(text, i, len)
-        if (tagEnd != -1) {
-            inWord = false
-            i = tagEnd + 1
-        } else {
-            if (ch.isWhitespace()) {
-                inWord = false
-            } else if (!inWord) {
-                inWord = true
-                wordCount++
-            }
-            i++
-        }
-    }
-    return wordCount
-}
-
-private fun findClosingHtmlTagIndex(text: String, start: Int, len: Int): Int {
-    if (text[start] != '<' || start + 1 >= len) return -1
-    val next = text[start + 1]
-    val isTagStart = next.isLetter() || next == '/' || next == '!' || next == '?'
-    if (!isTagStart) return -1
-    val minCloseIdx = start + 2
-    val maxCloseIdx = start + MAX_HTML_TAG_SCAN_CHARS
-    val closeIdx = text.indexOf('>', minCloseIdx)
-    return if (closeIdx in minCloseIdx..maxCloseIdx) closeIdx else -1
-}
-
-private const val MAX_HTML_TAG_SCAN_CHARS = 2_048
 private const val SECONDS_PER_MIN = 60L
 private const val SECONDS_PER_HOUR = 3_600L
 private const val SECONDS_PER_DAY = 86_400L
 private const val SECONDS_PER_MONTH = 2_592_000L
-private const val ARTICLE_WORDS_PER_MINUTE = 180
 private const val COMPLETED_PROGRESS_THRESHOLD = 0.98
 private const val PERCENT_SCALE = 100
 private const val MAX_PARTIAL_PCT = 99

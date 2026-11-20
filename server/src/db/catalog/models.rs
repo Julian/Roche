@@ -6,7 +6,7 @@ use super::identity_norm::{
     EXTERNAL_ID_DISPLAY_ORDER, external_identifier_label, external_identifier_url,
 };
 use crate::{
-    db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind},
+    db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, HexColor},
     ranking::Score,
 };
 
@@ -18,8 +18,8 @@ pub enum CatalogError {
     #[error("{0} not found")]
     NotFound(String),
 
-    #[error("Ambiguous lookup for '{query}': matches {matches}")]
-    AmbiguousLookup { query: String, matches: String },
+    #[error("Ambiguous lookup for '{query}': matches {}", .candidates.join(", "))]
+    AmbiguousLookup { query: String, candidates: Vec<String> },
 
     #[error("Cannot manually modify entries of {mode:?} collection '{title}'")]
     ImmutableCollection { title: String, mode: CollectionMode },
@@ -29,6 +29,9 @@ pub enum CatalogError {
 
     #[error("Conflict: {0}")]
     Conflict(String),
+
+    #[error("Internal catalog error: {0}")]
+    Internal(String),
 }
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
@@ -115,6 +118,31 @@ impl CatalogEntry {
         list
     }
 }
+
+macro_rules! raw_entry_columns {
+    () => {
+        "id, kind, title, creators_json, url, published_at, release_year, summary, \
+         thumbnail_url, metadata_json, merged_into_id, created_at, updated_at"
+    };
+    (e) => {
+        "e.id, e.kind, e.title, e.creators_json, e.url, e.published_at, e.release_year, \
+         e.summary, e.thumbnail_url, e.metadata_json, e.merged_into_id, e.created_at, \
+         e.updated_at"
+    };
+}
+
+pub(super) use raw_entry_columns;
+
+macro_rules! raw_collection_columns {
+    () => {
+        "e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role, \
+         cs.rule_json, cs.show_in_lists, cs.color, \
+         EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator, \
+         e.created_at, e.updated_at"
+    };
+}
+
+pub(super) use raw_collection_columns;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(super) struct RawEntryRow {
@@ -212,7 +240,7 @@ pub struct CollectionSummary {
     pub role: CollectionRole,
     pub rule_json: Option<String>,
     pub show_in_lists: bool,
-    pub color: Option<String>,
+    pub color: Option<HexColor>,
     pub member_count: usize,
     pub comparison_count: usize,
     pub has_generator: bool,
@@ -316,6 +344,29 @@ pub(super) struct RawCollectionRow {
     pub updated_at: DateTime<Utc>,
 }
 
+impl RawCollectionRow {
+    #[must_use]
+    pub fn into_summary(self, member_count: usize, comparison_count: usize) -> CollectionSummary {
+        CollectionSummary {
+            id: self.id,
+            slug: self.slug,
+            title: self.title,
+            summary: self.summary,
+            kind: self.kind,
+            mode: self.mode,
+            role: self.collection_role,
+            rule_json: self.rule_json,
+            show_in_lists: self.show_in_lists,
+            color: HexColor::from_stored_tolerant(self.color.as_deref()),
+            member_count,
+            comparison_count,
+            has_generator: self.has_generator,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BatchEntryInput {
     #[serde(default)]
@@ -408,4 +459,52 @@ pub struct CatalogBatchResult {
     pub comparisons_recorded: usize,
     pub generators_updated: usize,
     pub dry_run: bool,
+}
+
+/// Pure database snapshot of a collection and its rankable members, consumed by
+/// `CatalogService` to run EP inference and cluster selection outside the DB layer.
+#[derive(Debug, Clone)]
+pub struct CollectionRankingInputs {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub members: Vec<CatalogEntry>,
+}
+
+/// Exported catalog entry record (alias for [`CatalogEntry`]).
+pub type ExportCatalogEntry = CatalogEntry;
+
+/// Exported consumption log record (alias for [`ConsumptionLogRow`]).
+pub type ExportConsumptionLog = ConsumptionLogRow;
+
+/// Exported comparison ordering record (alias for [`ComparisonRecord`]).
+pub type ExportComparison = ComparisonRecord;
+
+/// Exported `collection_entries` membership row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExportCollectionEntry {
+    pub collection_id: String,
+    pub entry_id: String,
+    pub position: Option<f64>,
+    pub added_at: DateTime<Utc>,
+}
+
+/// Exported `collection_generators` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ExportCollectionGenerator {
+    pub collection_id: String,
+    pub enabled: bool,
+    pub current_entry_id: Option<String>,
+    pub drawn_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Complete, point-in-time snapshot of unified catalog tables for full data export.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogExportSnapshot {
+    pub entries: Vec<CatalogEntry>,
+    pub collections: Vec<CollectionSummary>,
+    pub collection_entries: Vec<ExportCollectionEntry>,
+    pub consumption_log: Vec<ConsumptionLogRow>,
+    pub comparisons: Vec<ComparisonRecord>,
+    pub collection_generators: Vec<ExportCollectionGenerator>,
 }

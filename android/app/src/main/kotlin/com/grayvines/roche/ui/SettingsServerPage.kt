@@ -38,10 +38,10 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerNodeDto
-import com.grayvines.roche.data.isLoopbackHost
+import com.grayvines.roche.core.isLoopbackHost
 import com.grayvines.roche.data.settings.normalizeServerUrl
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.isCrossPeerRescueError
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle

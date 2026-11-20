@@ -1,13 +1,11 @@
 package com.grayvines.roche.ui
 
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.lifecycle.viewModelScope
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.RankClusterCandidate
 import com.grayvines.roche.data.RocheRepository
-import com.grayvines.roche.data.THUMBNAILS_SUBDIR
 import com.grayvines.roche.data.TestRocheEnv
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankClusterCandidate
 import com.grayvines.roche.data.collectInBackground
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
@@ -18,14 +16,20 @@ import com.grayvines.roche.data.local.upsertItems
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.media.BitmapLoader
+import com.grayvines.roche.media.ImageDecoders
+import com.grayvines.roche.media.THUMBNAILS_SUBDIR
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.ThumbnailLoader
+import com.grayvines.roche.media.computeProportionalTargetSize
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
-import com.grayvines.roche.ui.components.ThumbnailLoader
-import com.grayvines.roche.ui.components.computeProportionalTargetSize
+import com.grayvines.roche.ranking.RankBoardState
+import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.extractPlainTextHeadings
 import java.io.File
-import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -165,11 +169,11 @@ class RankBoardAndGate5UiLogicTest {
 
             val cacheRoot = File(tempDir, "thumb_cache").apply { mkdirs() }
             val loader =
-                ThumbnailLoader(
+                BitmapLoader(
                     apiClient = streamingClient,
                     settings = settings,
-                    cacheDir = cacheRoot,
-                    decoder = { fakeBitmap() },
+                    decoders = ImageDecoders(decodeBytes = { FakeImage() }, sizeOfKiB = { 16 }),
+                    diskCache = ThumbnailDiskCache(cacheRoot),
                 )
 
             val jobs =
@@ -361,7 +365,7 @@ class RankBoardAndGate5UiLogicTest {
                 selectedFeedId = "f-1",
                 scopeOriginTab = AppTab.FEEDS,
                 isSearchOpen = true,
-                playerState = PodcastPlayerState(currentEntryId = "ep-1", isFullscreenOpen = true),
+                isPlayerFullscreenOpen = true,
             )
         val fullStack =
             deriveRocheBackStack(
@@ -534,48 +538,47 @@ class RankBoardAndGate5UiLogicTest {
             viewModel.uiState.first { it.allEntries.size == 1 }
 
             viewModel.dispatch(MainAction.OpenReader("ep-nav-1"))
-            val inPlayer =
-                viewModel.uiState.first {
-                    it.playerState.currentEntryId == "ep-nav-1" &&
-                        !it.playerState.isBuffering &&
-                        it.playerState.isFullscreenOpen
-                }
+            viewModel.playerState.first { it.currentEntryId == "ep-nav-1" && !it.isBuffering }
+            val inPlayer = viewModel.uiState.first { it.isPlayerFullscreenOpen }
             viewModel.playerController.cancelAutoTickerForTest()
             assertNull(inPlayer.selectedReaderEntryId)
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
-                deriveRocheBackStack(inPlayer),
+                deriveRocheBackStack(inPlayer, activeAudioEntryId = "ep-nav-1"),
             )
 
             viewModel.dispatch(MainAction.SeekPlayerToMs(45_000L))
-            viewModel.uiState.first { it.playerState.positionMs == 45_000L }
+            viewModel.playerState.first { it.positionMs == 45_000L }
 
             viewModel.dispatch(MainAction.OpenReader("ep-nav-1", forceArticleView = true))
             val inReader =
                 viewModel.uiState.first {
-                    !it.playerState.isFullscreenOpen && it.selectedReaderEntryId == "ep-nav-1"
+                    !it.isPlayerFullscreenOpen && it.selectedReaderEntryId == "ep-nav-1"
                 }
-            assertTrue(inReader.playerState.isPlaying)
-            assertEquals(45_000L, inReader.playerState.positionMs)
+            assertTrue(viewModel.playerState.value.isPlaying)
+            assertEquals(45_000L, viewModel.playerState.value.positionMs)
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.Reader("ep-nav-1")),
-                deriveRocheBackStack(inReader),
+                deriveRocheBackStack(inReader, activeAudioEntryId = "ep-nav-1"),
             )
 
             viewModel.dispatch(MainAction.PlayAudioEntry("ep-nav-1", openFullscreen = true))
             val backInPlayer =
                 viewModel.uiState.first {
-                    it.playerState.isFullscreenOpen && it.selectedReaderEntryId == null
+                    it.isPlayerFullscreenOpen && it.selectedReaderEntryId == null
                 }
-            val playerStack = deriveRocheBackStack(backInPlayer)
+            val playerStack = deriveRocheBackStack(backInPlayer, activeAudioEntryId = "ep-nav-1")
             assertEquals(
                 listOf(RocheNavKey.Tab(AppTab.HOME), RocheNavKey.FullscreenPlayer("ep-nav-1")),
                 playerStack,
             )
 
             viewModel.dispatch(popActionForTopKey(playerStack.last())!!)
-            val collapsed = viewModel.uiState.first { !it.playerState.isFullscreenOpen }
-            assertEquals(listOf(RocheNavKey.Tab(AppTab.HOME)), deriveRocheBackStack(collapsed))
+            val collapsed = viewModel.uiState.first { !it.isPlayerFullscreenOpen }
+            assertEquals(
+                listOf(RocheNavKey.Tab(AppTab.HOME)),
+                deriveRocheBackStack(collapsed, activeAudioEntryId = "ep-nav-1"),
+            )
             collectJob.cancel()
         }
 
@@ -792,20 +795,7 @@ class RankBoardAndGate5UiLogicTest {
             )
     }
 
-    private fun fakeBitmap(): ImageBitmap =
-        Proxy.newProxyInstance(
-            ImageBitmap::class.java.classLoader,
-            arrayOf(ImageBitmap::class.java),
-        ) { proxy, method, args ->
-            when (method.name) {
-                "getWidth" -> 64
-                "getHeight" -> 64
-                "getHasAlpha" -> true
-                "equals" -> proxy === args?.firstOrNull()
-                "hashCode" -> System.identityHashCode(proxy)
-                else -> null
-            }
-        } as ImageBitmap
+    private class FakeImage
 
     private fun sampleItem(id: String, title: String, feedId: String = "f-1") =
         InboxItemRow(

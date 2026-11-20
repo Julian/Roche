@@ -11,11 +11,17 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 @Serializable
+internal data class EpExpectedScore(
+    val mean: Double = 0.0,
+    val variance: Double = EpRankingEngine.COLD_START_VARIANCE,
+)
+
+@Serializable
 internal data class EpVectorCase(
     val name: String,
     val items: List<String>,
     val orderings: List<List<List<String>>>,
-    @SerialName("expected_scores") val expectedScores: Map<String, EpRankingEngine.Score>,
+    @SerialName("expected_scores") val expectedScores: Map<String, EpExpectedScore>,
     @SerialName("expected_quantiles") val expectedQuantiles: Map<String, Int>,
     @SerialName("expected_first_pair_confusability") val expectedFirstPairConfusability: Double,
 )

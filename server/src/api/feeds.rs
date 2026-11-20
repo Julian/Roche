@@ -9,16 +9,15 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    db::{Feed, FeedType, ItemFilter, ItemPage},
+    db::{Feed, ItemFilter, ItemPage},
+    domain::FeedType,
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery, ProblemString},
-    feeds::FeedSource,
-    scheduler::FeedFetcher,
-    service::{ExportBundle, RocheService},
+    service::{ExportBundle, FeedService, RocheService},
 };
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateFeedRequest {
-    url: FeedSource,
+    url: String,
     #[serde(default)]
     feed_type: FeedType,
     title: Option<String>,
@@ -37,34 +36,35 @@ struct OpmlImportRequest {
     opml: String,
 }
 
-pub(super) async fn feeds_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_list(
+    State(service): State<Arc<RocheService>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let feeds = service.feeds().list().await?;
     Ok(Json(serde_json::json!({ "feeds": feeds })))
 }
 
-pub(super) async fn feeds_create<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_create(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<CreateFeedRequest>,
 ) -> Result<(StatusCode, Json<Feed>), ApiError> {
+    let source = FeedService::parse_source(&req.url)?;
     let feed = service
         .feeds()
-        .create(req.feed_type, req.url, req.title.as_deref(), req.description.as_deref())
+        .create(req.feed_type, source, req.title.as_deref(), req.description.as_deref())
         .await?;
     Ok((StatusCode::CREATED, Json(feed)))
 }
 
-pub(super) async fn feeds_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<Feed>, ApiError> {
     let feed = service.feeds().get(&id).await?;
     Ok(Json(feed))
 }
 
-pub(super) async fn feeds_update<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_update(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<UpdateFeedRequest>,
 ) -> Result<Json<Feed>, ApiError> {
@@ -73,40 +73,40 @@ pub(super) async fn feeds_update<F: FeedFetcher>(
     Ok(Json(updated))
 }
 
-pub(super) async fn feeds_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_delete(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<StatusCode, ApiError> {
     service.feeds().delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn feeds_archive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_archive(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<Feed>, ApiError> {
     let archived = service.feeds().archive(&id).await?;
     Ok(Json(archived))
 }
 
-pub(super) async fn feeds_unarchive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_unarchive(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<Feed>, ApiError> {
     let unarchived = service.feeds().unarchive(&id).await?;
     Ok(Json(unarchived))
 }
 
-pub(super) async fn feeds_refresh<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_refresh(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<Feed>, ApiError> {
     let refreshed = service.feeds().refresh(&id).await?;
     Ok(Json(refreshed))
 }
 
-pub(super) async fn feeds_items<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn feeds_items(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     ProblemQuery(filter): ProblemQuery<ItemFilter>,
 ) -> Result<Json<ItemPage>, ApiError> {
@@ -116,8 +116,8 @@ pub(super) async fn feeds_items<F: FeedFetcher>(
     Ok(Json(page))
 }
 
-pub(super) async fn import_opml<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn import_opml(
+    State(service): State<Arc<RocheService>>,
     ProblemString(body): ProblemString,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let opml_str = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
@@ -139,15 +139,15 @@ pub(super) async fn import_opml<F: FeedFetcher>(
     })))
 }
 
-pub(super) async fn export_feeds_opml<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn export_feeds_opml(
+    State(service): State<Arc<RocheService>>,
 ) -> Result<Response, ApiError> {
     let xml = service.feeds().export_opml().await?;
     Ok(([(header::CONTENT_TYPE, "text/x-opml; charset=utf-8")], xml).into_response())
 }
 
-pub(super) async fn export_data<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn export_data(
+    State(service): State<Arc<RocheService>>,
 ) -> Result<Json<ExportBundle>, ApiError> {
     let bundle = service.export_data().await?;
     Ok(Json(bundle))

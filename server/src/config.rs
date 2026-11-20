@@ -30,12 +30,32 @@ impl ServerConfig {
     #[must_use]
     pub fn listen_addr(&self) -> String {
         let host = self.host.trim();
-        if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]:{}", self.port)
-        } else {
-            format!("{host}:{}", self.port)
-        }
+        format!("{}:{}", crate::util::url_guard::bracket_ipv6_host(host), self.port)
     }
+}
+
+#[must_use]
+pub fn normalize_service_name(raw: &str) -> String {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("svc:") { trimmed } else { format!("svc:{trimmed}") }
+}
+
+#[must_use]
+pub fn is_valid_service_name(svc: &str) -> bool {
+    svc.strip_prefix("svc:").is_some_and(is_valid_dns_label)
+}
+
+#[must_use]
+pub fn is_valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.starts_with('.')
+        && !label.ends_with('-')
+        && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 impl Default for ServerConfig {
@@ -285,7 +305,7 @@ impl Config {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(crate::tailscale::normalize_service_name);
+            .map(normalize_service_name);
 
         let mut normalized_users: Vec<String> = Vec::new();
         for raw_user in &cfg.tailscale.auto_auth_users {
@@ -323,8 +343,8 @@ impl Config {
         if self.media.max_video_size_mb == 0 {
             anyhow::bail!("media.max_video_size_mb must be greater than 0");
         }
-        let norm_media = crate::media::MediaStore::normalize_lexical(&self.storage.media_dir);
-        let norm_downloads = crate::media::MediaStore::normalize_lexical(&self.media.download_dir);
+        let norm_media = crate::util::fs_perms::normalize_lexical(&self.storage.media_dir);
+        let norm_downloads = crate::util::fs_perms::normalize_lexical(&self.media.download_dir);
         if !norm_downloads.starts_with(&norm_media) {
             anyhow::bail!("media.download_dir must be inside storage.media_dir");
         }
@@ -338,7 +358,7 @@ impl Config {
             anyhow::bail!("auth.token_length must be at least {}", crate::auth::MIN_TOKEN_BYTES);
         }
         if let Some(svc) = &self.tailscale.advertise_service
-            && !crate::tailscale::is_valid_service_name(svc)
+            && !is_valid_service_name(svc)
         {
             anyhow::bail!(
                 "tailscale.advertise_service must be a valid service name (e.g. 'svc:roche')"

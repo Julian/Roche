@@ -4,6 +4,18 @@ package com.grayvines.roche.data
 
 import androidx.lifecycle.viewModelScope
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_SLUG
+import com.grayvines.roche.core.canonicalizeSyncUrl
+import com.grayvines.roche.core.deterministicFeedId
+import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.isSyncableItemUrl
+import com.grayvines.roche.core.isSyncablePublicUrl
+import com.grayvines.roche.core.systemCollectionUuid
+import com.grayvines.roche.data.catalog.CollectionMode
+import com.grayvines.roche.data.catalog.CollectionRole
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.local.SeedData
@@ -12,12 +24,22 @@ import com.grayvines.roche.data.local.upsertItem
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.FLAG_LOCAL_THROUGHPUT_WEIGHT
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.data.sync.PeerNodeDto
+import com.grayvines.roche.data.sync.PeerSyncRequestConfig
+import com.grayvines.roche.data.sync.buildTrackedPeerSyncRequest
+import com.grayvines.roche.data.sync.computeThroughputWeight
+import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
+import com.grayvines.roche.data.sync.selectFeedPoller
+import com.grayvines.roche.data.sync.shouldPeerPollFeed
 import com.grayvines.roche.model.ContentType
-import com.grayvines.roche.ui.ArticleBlock
+import com.grayvines.roche.reader.ArticleBlock
+import com.grayvines.roche.reader.extractInboxSnippet
+import com.grayvines.roche.reader.parseHtmlArticleBlocks
+import com.grayvines.roche.reader.prepareInlineHtmlForCompose
 import com.grayvines.roche.ui.MainViewModel
-import com.grayvines.roche.ui.extractInboxSnippet
-import com.grayvines.roche.ui.parseHtmlArticleBlocks
-import com.grayvines.roche.ui.prepareInlineHtmlForCompose
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -458,65 +480,6 @@ class RocheRssWorkflowTest {
         }
 
     @Test
-    fun `classifyNetworkCapabilities maps ethernet wifi cellular and unvalidated states`() {
-        assertEquals(
-            NetworkTier.WIRED,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = true,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.WIFI,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.CELLULAR,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = true,
-            ),
-        )
-        assertEquals(
-            NetworkTier.WIFI,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = true,
-                hasEthernet = false,
-                hasWifi = false,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-        assertEquals(
-            NetworkTier.OFFLINE,
-            classifyNetworkCapabilities(
-                hasInternet = true,
-                isValidated = false,
-                hasEthernet = false,
-                hasWifi = true,
-                hasCellular = false,
-                isMetered = false,
-            ),
-        )
-    }
-
-    @Test
     fun `live network tier provider and background sync adapt weight and offline fallback`() =
         runTest {
             val peerSyncBodies = mutableListOf<String>()
@@ -694,7 +657,7 @@ class RocheRssWorkflowTest {
             listOf(
                 "http://intranet/rss.xml",
                 "https://user:pass@example.com/rss.xml",
-                "https://example.com:8443/rss.xml",
+                "https://example.com:9000/rss.xml",
                 "http://127.0.0.1/rss.xml",
                 "http://[::1]/rss.xml",
                 "http://10.0.0.1/rss.xml",
@@ -715,6 +678,8 @@ class RocheRssWorkflowTest {
         blockedFeedUrls.forEach { url -> assertFalse(isSyncablePublicUrl(url), url) }
 
         assertTrue(isSyncablePublicUrl("https://blog.example.com/rss.xml"))
+        assertTrue(isSyncablePublicUrl("http://blog.example.com:8080/rss.xml"))
+        assertTrue(isSyncablePublicUrl("https://blog.example.com:8443/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://172.15.0.1/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://172.32.0.1/rss.xml"))
         assertTrue(isSyncablePublicUrl("http://100.63.255.1/rss.xml"))

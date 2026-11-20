@@ -6,10 +6,11 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    db::{ItemFilter, ItemPage, ItemStatus, ReadAtPatch, SyncRepo},
+    db::{ItemFilter, ItemPage},
+    domain::{ItemStatus, READER_AUTO_READ_THRESHOLD, ReadAtPatch},
     error::{ApiError, ProblemJson, ProblemPath, ProblemQuery},
-    scheduler::FeedFetcher,
     service::{ItemDetail, RocheService},
+    util::clock::now_utc,
 };
 
 #[derive(Debug, Deserialize)]
@@ -56,32 +57,32 @@ pub(super) struct AddItemTagRequest {
     name: Option<String>,
 }
 
-pub(super) async fn items_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_list(
+    State(service): State<Arc<RocheService>>,
     ProblemQuery(filter): ProblemQuery<ItemFilter>,
 ) -> Result<Json<ItemPage>, ApiError> {
     let page = service.items().query().with_filter(filter).list_page().await?;
     Ok(Json(page))
 }
 
-pub(super) async fn items_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_get(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<ItemDetail>, ApiError> {
     let detail = service.items().get(&id).await?;
     Ok(Json(detail))
 }
 
-pub(super) async fn items_save<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_save(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<SaveItemRequest>,
 ) -> Result<(StatusCode, Json<ItemDetail>), ApiError> {
     let detail = service.items().save(&req.url, req.title.as_deref(), &req.tags).await?;
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
-pub(super) async fn items_update<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_update(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<UpdateItemRequest>,
 ) -> Result<Json<ItemDetail>, ApiError> {
@@ -89,8 +90,11 @@ pub(super) async fn items_update<F: FeedFetcher>(
         Some(Some(ts)) => ReadAtPatch::MarkRead(ts),
         Some(None) => ReadAtPatch::MarkUnread,
         None => match req.is_read {
-            Some(true) => ReadAtPatch::MarkRead(SyncRepo::now_utc()),
+            Some(true) => ReadAtPatch::MarkRead(now_utc()),
             Some(false) => ReadAtPatch::MarkUnread,
+            None if req.read_progress.is_some_and(|p| p >= READER_AUTO_READ_THRESHOLD) => {
+                ReadAtPatch::MarkRead(now_utc())
+            }
             None => ReadAtPatch::Unchanged,
         },
     };
@@ -101,24 +105,24 @@ pub(super) async fn items_update<F: FeedFetcher>(
     Ok(Json(detail))
 }
 
-pub(super) async fn items_delete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_delete(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<StatusCode, ApiError> {
     service.items().delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn items_archive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_archive(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<ItemDetail>, ApiError> {
     let detail = service.items().archive(&id).await?;
     Ok(Json(detail))
 }
 
-pub(super) async fn items_archive_batch<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_archive_batch(
+    State(service): State<Arc<RocheService>>,
     ProblemJson(req): ProblemJson<ArchiveBatchRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let archived_count = service
@@ -128,16 +132,16 @@ pub(super) async fn items_archive_batch<F: FeedFetcher>(
     Ok(Json(serde_json::json!({ "archived_count": archived_count })))
 }
 
-pub(super) async fn items_unarchive<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_unarchive(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
 ) -> Result<Json<ItemDetail>, ApiError> {
     let detail = service.items().unarchive(&id).await?;
     Ok(Json(detail))
 }
 
-pub(super) async fn items_add_tag<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_add_tag(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(item_id): ProblemPath<String>,
     ProblemJson(req): ProblemJson<AddItemTagRequest>,
 ) -> Result<Json<ItemDetail>, ApiError> {
@@ -146,16 +150,16 @@ pub(super) async fn items_add_tag<F: FeedFetcher>(
     Ok(Json(detail))
 }
 
-pub(super) async fn items_remove_tag<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_remove_tag(
+    State(service): State<Arc<RocheService>>,
     ProblemPath((item_id, tag_id)): ProblemPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     service.items().remove_tag(&item_id, &tag_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(super) async fn items_media_list<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(super) async fn items_media_list(
+    State(service): State<Arc<RocheService>>,
     ProblemPath(item_id): ProblemPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let media = service.items().list_media(&item_id).await?;

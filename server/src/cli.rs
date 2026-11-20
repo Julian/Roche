@@ -9,9 +9,10 @@ use figment::{
 use crate::{
     config::Config,
     db::{
-        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, CollectionGeneratorState,
-        ConsumptionStatus, Db, EntryIdentifier, EntryKind, UpsertEntryInput,
+        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, CollectionGeneratorState, Db,
+        EntryIdentifier, UpsertEntryInput,
     },
+    domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::RANDOM_SEED_EVERY,
     service::CatalogService,
     tui_rank::{ClusterRankOutcome, open_system_browser, prompt_cluster_tty},
@@ -196,12 +197,7 @@ impl Cli {
                 let catalog = CatalogService::new(&db);
                 let input = args.to_upsert_input()?;
                 let (want_col, entry) = catalog
-                    .want_resolved_or_upsert(
-                        &input,
-                        args.has_explicit_metadata(),
-                        args.notes.as_deref(),
-                        queue.as_deref(),
-                    )
+                    .want_resolved_or_upsert(&input, args.notes.as_deref(), queue.as_deref())
                     .await?;
                 println!(
                     "Added '{}' ({}) to {}",
@@ -213,7 +209,7 @@ impl Cli {
             }
             Some(Command::Unwant { target, query }) => {
                 let db = crate::RocheServer::connect_db(&cfg).await?;
-                let entry = db.catalog().unwant_entry(&target, &query).await?;
+                let entry = CatalogService::new(&db).unwant_entry(&target, &query).await?;
                 println!(
                     "Removed '{}' ({}) from want queue '{}'",
                     sanitize_terminal_text(&entry.title),
@@ -258,7 +254,7 @@ async fn run_catalog_apply_cmd(
     if dry_run_flag {
         batch.dry_run = true;
     }
-    let result = db.catalog().apply_batch(&batch).await?;
+    let result = CatalogService::new(db).apply_batch(&batch).await?;
     if json {
         println!("{}", serde_json::to_string(&result)?);
     } else {
@@ -427,14 +423,6 @@ pub struct MediaEntryArgs {
 }
 
 impl MediaEntryArgs {
-    #[must_use]
-    const fn has_explicit_metadata(&self) -> bool {
-        !self.creators.is_empty()
-            || self.year.is_some()
-            || self.url.is_some()
-            || !self.identifiers.is_empty()
-    }
-
     fn to_upsert_input(&self) -> anyhow::Result<UpsertEntryInput> {
         let parsed_kind = EntryKind::parse_flexible(&self.kind)?;
         let mut idents = Vec::with_capacity(self.identifiers.len());
@@ -530,7 +518,8 @@ pub enum DrawCommand {
 }
 
 async fn run_lists_cmd(db: &Db, include_want: bool, include_system: bool) -> anyhow::Result<()> {
-    let collections = db.catalog().list_collections(include_want, include_system).await?;
+    let collections =
+        CatalogService::new(db).list_collections(include_want, include_system).await?;
     if collections.is_empty() {
         println!("No collections found.");
         return Ok(());
@@ -550,7 +539,7 @@ async fn run_lists_cmd(db: &Db, include_want: bool, include_system: bool) -> any
 }
 
 async fn run_show_cmd(db: &Db, target: &str, want: bool) -> anyhow::Result<()> {
-    let view = db.catalog().get_ranked_collection(target, want).await?;
+    let view = CatalogService::new(db).get_ranked_collection(target, want).await?;
     if view.rows.is_empty() {
         println!("{} is empty.", sanitize_terminal_text(&view.collection.title));
         return Ok(());
@@ -589,7 +578,7 @@ async fn run_diary_cmd(
         }
         None => None,
     };
-    let entries = db.catalog().list_diary(year, status, limit).await?;
+    let entries = CatalogService::new(db).list_diary(year, status, limit).await?;
     if entries.is_empty() {
         println!("No diary entries found.");
         return Ok(());
@@ -630,18 +619,11 @@ async fn run_log_entry_cmd(
     status: ConsumptionStatus,
     rank_after: bool,
 ) -> anyhow::Result<()> {
-    let parsed_kind = EntryKind::parse_flexible(&args.kind)?;
     let catalog = CatalogService::new(db);
-    let entry = if !args.has_explicit_metadata()
-        && let Ok(existing) = catalog.resolve_entry(&args.title, Some(parsed_kind), None).await
-    {
-        existing
-    } else {
-        let input = args.to_upsert_input()?;
-        catalog.upsert_entry(&input).await?
-    };
-
-    let logged = catalog.log_consumption(&entry.id, status, args.notes.as_deref(), None).await?;
+    let input = args.to_upsert_input()?;
+    let logged = catalog
+        .log_entry_resolved_or_upsert(None, Some(&input), status, args.notes.as_deref(), None)
+        .await?;
     println!(
         "Logged {} '{}' ({})",
         logged.status.as_str(),
@@ -710,7 +692,7 @@ async fn run_rank_cmd(db: &Db, args: &RankArgs) -> anyhow::Result<()> {
                     && judged_clusters.iter().any(|s| cand.iter().all(|c| s.contains(&c.id)))
             })
             .await?;
-        if summary.role == crate::db::CollectionRole::Want {
+        if summary.role == CollectionRole::Want {
             effective_want = true;
         }
         if cluster.len() < 2 {
@@ -866,13 +848,9 @@ async fn run_draw_finish_cmd(
         sanitize_terminal_text(&finished.creators.join(", "))
     );
     if !no_rank {
-        let rank_target =
-            if catalog.can_rank_collection(&next_state.collection_id, false).await.unwrap_or(false)
-            {
-                Some(next_state.collection_id.clone())
-            } else {
-                catalog.rank_target_after_consumption(&finished).await?
-            };
+        let rank_target = catalog
+            .rank_target_after_generator_finish(&next_state.collection_id, &finished)
+            .await?;
         if let Some(list_slug) = rank_target {
             let rank_args = RankArgs {
                 target: list_slug,

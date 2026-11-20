@@ -18,21 +18,53 @@ pub struct ItemDeleteOutcome {
     pub deleted: bool,
     pub readable_content_removed: bool,
 }
+
+#[derive(sqlx::FromRow)]
+struct ExistingItemStateRow {
+    kind: EntryKind,
+    inbox_state: InboxState,
+    is_favorite: bool,
+    in_want_to_read: bool,
+    progress: f64,
+    read_at: Option<DateTime<Utc>>,
+}
+
+struct EntryMetadataBackfill<'a> {
+    title: Option<&'a str>,
+    creators_json: Option<String>,
+    published_at: Option<DateTime<Utc>>,
+    summary: Option<&'a str>,
+    thumbnail_url: Option<&'a str>,
+}
+
+impl EntryMetadataBackfill<'_> {
+    const fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.creators_json.is_none()
+            && self.published_at.is_none()
+            && self.summary.is_none()
+            && self.thumbnail_url.is_none()
+    }
+}
 use crate::{
     db::{
-        ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, EntryKind, InboxState,
-        ItemStatus, MediaRepo, ReadAtPatch, SyncRepo, Tag, TagRepo,
+        ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
+        ConsumptionLogView, ConsumptionStatus, EntryKind, InboxState, ItemStatus, MediaRepo,
+        ReadAtPatch, SyncRepo, Tag, TagRepo,
+        entries_core::{self, EntryInsertParams, EntryStateUpsert},
         feeds::resolve_dedup_entry_id,
         sync::{
             STARRED_COLLECTION_ID, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID,
             canonicalize_sync_url, deterministic_item_id, item_natural_key,
         },
     },
-    feeds::arxiv::ArxivParser,
+    domain::READER_AUTO_READ_THRESHOLD,
+    util::{clock::now_utc, media_urls::extract_arxiv_id},
 };
 
 /// Auto-logs feed / reader completion (`consumed`) when:
-/// - a `podcast_episode` reaches audio playback completion (`progress >= 0.98`, or archived/finished with `>= 0.9`), or
+/// - a `podcast_episode` reaches audio playback completion (`progress >= READER_AUTO_READ_THRESHOLD`,
+///   or archived/finished with `>= 0.9`), or
 /// - an `article` or `paper` is archived/finished with `progress >= 0.9`.
 ///
 /// Delegates to `CatalogRepo::ensure_auto_consumed_with_parents_in_tx` so auto-completion uses
@@ -48,7 +80,9 @@ pub(super) async fn maybe_auto_log_feed_completion_in_tx(
 ) -> std::result::Result<(), sqlx::Error> {
     let is_dismissed_or_done = matches!(inbox_state, InboxState::Dismissed | InboxState::None);
     let should_log = match entry_kind {
-        EntryKind::PodcastEpisode => progress >= 0.98 || (is_dismissed_or_done && progress >= 0.9),
+        EntryKind::PodcastEpisode => {
+            progress >= READER_AUTO_READ_THRESHOLD || (is_dismissed_or_done && progress >= 0.9)
+        }
         EntryKind::Article | EntryKind::Paper => is_dismissed_or_done && progress >= 0.9,
         _ => false,
     };
@@ -130,7 +164,7 @@ impl ItemRepo<'_> {
         let url_str = new_item.url.as_str();
         let id = deterministic_item_id(feed_url.as_deref(), url_str);
         let canon_url = canonicalize_sync_url(url_str);
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let entry_kind = EntryKind::from_content_type(new_item.content_type);
         let creators_json = new_item
             .author
@@ -190,50 +224,21 @@ impl ItemRepo<'_> {
         canon_url: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let url_str = new_item.url.as_str();
-        sqlx::query!(
-            "INSERT INTO entries
-             (id, kind, title, creators_json, url, published_at, summary, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            id,
-            entry_kind as _,
-            new_item.title,
-            creators_json,
-            url_str,
-            new_item.published_at as _,
-            new_item.summary,
-            now as _,
-            now as _,
+        entries_core::insert_entry_row_in_tx(
+            tx,
+            &EntryInsertParams {
+                creators_json,
+                url: Some(new_item.url.as_str()),
+                published_at: new_item.published_at,
+                summary: new_item.summary,
+                ..EntryInsertParams::minimal(id, entry_kind, new_item.title, now, now)
+            },
         )
-        .execute(&mut *tx)
         .await?;
 
-        sqlx::query!(
-            "INSERT INTO entry_content (entry_id, content_html, content_type)
-             VALUES (?, NULL, ?)",
-            id,
-            new_item.content_type as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!(
-            "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-             VALUES (?, 'unread', 0.0, ?)",
-            id,
-            now as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('url', ?, ?)",
-            canon_url,
-            id,
-        )
-        .execute(&mut *tx)
-        .await?;
+        entries_core::insert_entry_content_in_tx(tx, id, None, new_item.content_type).await?;
+        entries_core::ensure_entry_state_in_tx(tx, id, InboxState::Unread, now).await?;
+        entries_core::upsert_entry_identifier_in_tx(tx, id, "url", canon_url).await?;
 
         if let Some(fid) = new_item.feed_id {
             sqlx::query!(
@@ -270,7 +275,6 @@ impl ItemRepo<'_> {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn save_manual_input_with_tags(
         &self,
         input: &ManualItemInput<'_>,
@@ -279,8 +283,8 @@ impl ItemRepo<'_> {
         let trimmed_title = input.title.trim();
         let det_item_id = deterministic_item_id(None, url_str);
         let canon_url = canonicalize_sync_url(url_str);
-        let arxiv_id = ArxivParser::extract_arxiv_id(url_str);
-        let now = SyncRepo::now_utc();
+        let arxiv_id = extract_arxiv_id(url_str);
+        let now = now_utc();
         let clean_duration = input.duration.filter(|&d| d > 0);
         let entry_kind = EntryKind::from_content_type(input.content_type);
         let mut tx = crate::db::begin_write(self.pool).await?;
@@ -298,216 +302,57 @@ impl ItemRepo<'_> {
         let existing_dedup =
             resolve_dedup_entry_id(&mut tx, &det_item_id, &canon_url, arxiv_id.as_deref()).await?;
 
-        let final_item_id = if let Some(existing_id) = existing_dedup {
-            let has_feed_source: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM collection_entries ce
-                 JOIN feed_sources fs ON fs.collection_id = ce.collection_id
-                 WHERE ce.entry_id = ? LIMIT 1",
-            )
-            .bind(&existing_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
-            sqlx::query(
-                "UPDATE entries
-                 SET title = CASE
-                         WHEN ? = ? AND ? THEN ?
-                         WHEN title = url AND ? != '' THEN ?
-                         ELSE title
-                     END,
-                     summary = COALESCE(summary, ?),
-                     thumbnail_url = COALESCE(thumbnail_url, ?),
-                     updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(&existing_id)
-            .bind(&det_item_id)
-            .bind(has_explicit_non_url_title)
-            .bind(input.title)
-            .bind(trimmed_title)
-            .bind(input.title)
-            .bind(input.summary)
-            .bind(input.thumbnail_url)
-            .bind(now)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO entry_content (entry_id, content_html, content_type)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(entry_id) DO UPDATE SET
-                     content_html = COALESCE(NULLIF(excluded.content_html, ''), entry_content.content_html)",
-            )
-            .bind(&existing_id)
-            .bind(input.content_html)
-            .bind(input.content_type)
-            .execute(&mut *tx)
-            .await?;
-
-            if has_feed_source.is_some() {
-                sqlx::query(
-                    "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-                     VALUES (?, 'unread', 0.0, ?, ?)
-                     ON CONFLICT(entry_id) DO UPDATE SET
-                         read_at = NULL,
-                         interaction_updated_at = excluded.interaction_updated_at,
-                         updated_at = excluded.updated_at",
-                )
-                .bind(&existing_id)
-                .bind(now)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                sqlx::query(
-                    "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-                     VALUES (?, 'none', 0.0, ?, ?)
-                     ON CONFLICT(entry_id) DO UPDATE SET
-                         inbox_state = 'none',
-                         read_at = NULL,
-                         interaction_updated_at = excluded.interaction_updated_at,
-                         updated_at = excluded.updated_at",
-                )
-                .bind(&existing_id)
-                .bind(now)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            set_collection_flag_membership_in_tx(
+        let (final_item_id, activity_action) = if let Some(existing_id) = existing_dedup {
+            Self::update_existing_manual_item_in_tx(
                 &mut tx,
-                WANT_TO_READ_COLLECTION_ID,
                 &existing_id,
-                true,
+                &det_item_id,
+                trimmed_title,
+                input,
                 now,
             )
             .await?;
-
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('url', ?, ?)",
-            )
-            .bind(&canon_url)
-            .bind(&existing_id)
-            .execute(&mut *tx)
-            .await?;
-
-            if let Some(ref aid) = arxiv_id {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('arxiv', ?, ?)",
-                )
-                .bind(aid)
-                .bind(&existing_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            MediaRepo::upsert_audio_enclosure_in_tx(
-                &mut tx,
-                &existing_id,
-                input.audio_url,
-                clean_duration,
-                now,
-            )
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Item,
-                &existing_id,
-                ActivityAction::Update,
-                now,
-            )
-            .await?;
-            existing_id
+            (existing_id, ActivityAction::Update)
         } else {
-            sqlx::query(
-                "INSERT INTO entries
-                 (id, kind, title, creators_json, url, published_at, summary, thumbnail_url, created_at, updated_at)
-                 VALUES (?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(entry_kind)
-            .bind(input.title)
-            .bind(url_str)
-            .bind(input.summary)
-            .bind(input.thumbnail_url)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO entry_content (entry_id, content_html, content_type)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(input.content_html)
-            .bind(input.content_type)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO entry_state (entry_id, inbox_state, progress, updated_at)
-                 VALUES (?, 'none', 0.0, ?)",
-            )
-            .bind(&det_item_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            set_collection_flag_membership_in_tx(
-                &mut tx,
-                WANT_TO_READ_COLLECTION_ID,
-                &det_item_id,
-                true,
-                now,
-            )
-            .await?;
-
-            sqlx::query(
-                "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                 VALUES ('url', ?, ?)",
-            )
-            .bind(&canon_url)
-            .bind(&det_item_id)
-            .execute(&mut *tx)
-            .await?;
-
-            if let Some(ref aid) = arxiv_id {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-                     VALUES ('arxiv', ?, ?)",
-                )
-                .bind(aid)
-                .bind(&det_item_id)
-                .execute(&mut *tx)
+            Self::insert_new_manual_item_in_tx(&mut tx, &det_item_id, entry_kind, input, now)
                 .await?;
-            }
-
-            MediaRepo::upsert_audio_enclosure_in_tx(
-                &mut tx,
-                &det_item_id,
-                input.audio_url,
-                clean_duration,
-                now,
-            )
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Item,
-                &det_item_id,
-                ActivityAction::Create,
-                now,
-            )
-            .await?;
-            det_item_id
+            (det_item_id, ActivityAction::Create)
         };
+
+        set_collection_flag_membership_in_tx(
+            &mut tx,
+            WANT_TO_READ_COLLECTION_ID,
+            &final_item_id,
+            true,
+            now,
+        )
+        .await?;
+
+        entries_core::upsert_url_and_arxiv_identifiers_in_tx(
+            &mut tx,
+            &final_item_id,
+            &canon_url,
+            arxiv_id.as_deref(),
+        )
+        .await?;
+
+        MediaRepo::upsert_audio_enclosure_in_tx(
+            &mut tx,
+            &final_item_id,
+            input.audio_url,
+            clean_duration,
+            now,
+        )
+        .await?;
+
+        SyncRepo::record_activity(
+            &mut tx,
+            ActivityEntityType::Item,
+            &final_item_id,
+            activity_action,
+            now,
+        )
+        .await?;
 
         let mut seen_names = HashSet::new();
         let mut attached_tags = Vec::new();
@@ -530,7 +375,109 @@ impl ItemRepo<'_> {
         Ok((item, attached_tags))
     }
 
-    #[allow(clippy::too_many_lines)]
+    async fn insert_new_manual_item_in_tx(
+        tx: &mut SqliteConnection,
+        det_item_id: &str,
+        entry_kind: EntryKind,
+        input: &ManualItemInput<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        entries_core::insert_entry_row_in_tx(
+            tx,
+            &EntryInsertParams {
+                url: Some(input.url.as_str()),
+                summary: input.summary,
+                thumbnail_url: input.thumbnail_url,
+                ..EntryInsertParams::minimal(det_item_id, entry_kind, input.title, now, now)
+            },
+        )
+        .await?;
+        entries_core::insert_entry_content_in_tx(
+            tx,
+            det_item_id,
+            input.content_html,
+            input.content_type,
+        )
+        .await?;
+        entries_core::ensure_entry_state_in_tx(tx, det_item_id, InboxState::None, now).await
+    }
+
+    async fn update_existing_manual_item_in_tx(
+        tx: &mut SqliteConnection,
+        existing_id: &str,
+        det_item_id: &str,
+        trimmed_title: &str,
+        input: &ManualItemInput<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        let has_feed_source: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM collection_entries ce
+             JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+             WHERE ce.entry_id = ? LIMIT 1",
+        )
+        .bind(existing_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let url_str = input.url.as_str();
+        let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
+        sqlx::query(
+            "UPDATE entries
+             SET title = CASE
+                     WHEN ? = ? AND ? THEN ?
+                     WHEN title = url AND ? != '' THEN ?
+                     ELSE title
+                 END,
+                 summary = COALESCE(summary, ?),
+                 thumbnail_url = COALESCE(thumbnail_url, ?),
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(existing_id)
+        .bind(det_item_id)
+        .bind(has_explicit_non_url_title)
+        .bind(input.title)
+        .bind(trimmed_title)
+        .bind(input.title)
+        .bind(input.summary)
+        .bind(input.thumbnail_url)
+        .bind(now)
+        .bind(existing_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO entry_content (entry_id, content_html, content_type)
+             VALUES (?, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 content_html = COALESCE(NULLIF(excluded.content_html, ''), entry_content.content_html)",
+        )
+        .bind(existing_id)
+        .bind(input.content_html)
+        .bind(input.content_type)
+        .execute(&mut *tx)
+        .await?;
+
+        let state_sql = if has_feed_source.is_some() {
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
+             VALUES (?, 'unread', 0.0, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 read_at = NULL,
+                 interaction_updated_at = excluded.interaction_updated_at,
+                 updated_at = excluded.updated_at"
+        } else {
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
+             VALUES (?, 'none', 0.0, ?, ?)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 inbox_state = 'none',
+                 read_at = NULL,
+                 interaction_updated_at = excluded.interaction_updated_at,
+                 updated_at = excluded.updated_at"
+        };
+        sqlx::query(state_sql).bind(existing_id).bind(now).bind(now).execute(&mut *tx).await?;
+        Ok(())
+    }
+
     pub async fn update(
         &self,
         id: &str,
@@ -539,11 +486,81 @@ impl ItemRepo<'_> {
         read_progress: Option<f64>,
         read_at: ReadAtPatch,
     ) -> Result<bool> {
-        type ExistingItemStateTuple =
-            (EntryKind, InboxState, bool, bool, f64, Option<DateTime<Utc>>);
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let found =
+            Self::update_in_tx(&mut tx, id, status, is_favorite, read_progress, read_at, now, true)
+                .await?;
+        if found {
+            tx.commit().await?;
+        }
+        Ok(found)
+    }
+
+    /// Atomically marks a live reader item finished (`Archived`, `read_progress = 1.0`, `read_at = now`)
+    /// and logs a `'consumed'` diary entry inside a single SQLite write transaction.
+    ///
+    /// Returns `Ok(None)` if `id` is not a live reader item, or `Ok(Some((has_feed, logged)))`.
+    pub async fn finish_reader_item(
+        &self,
+        id: &str,
+        notes: Option<&str>,
+    ) -> CatalogResult<Option<(bool, ConsumptionLogView)>> {
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
+        let has_feed = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM collection_entries ce
+             JOIN feed_sources fs ON fs.collection_id = ce.collection_id
+             WHERE ce.entry_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        let found = Self::update_in_tx(
+            &mut tx,
+            id,
+            Some(ItemStatus::Archived),
+            None,
+            Some(1.0),
+            ReadAtPatch::MarkRead(now),
+            now,
+            false,
+        )
+        .await?;
+        if !found {
+            return Ok(None);
+        }
+
+        let (log_id, canon_id) = CatalogRepo::log_consumption_in_tx(
+            &mut tx,
+            id,
+            ConsumptionStatus::Consumed,
+            notes,
+            now,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let logged =
+            CatalogRepo::new(self.pool).load_consumption_log_view(&log_id, &canon_id).await?;
+        Ok(Some((has_feed, logged)))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn update_in_tx(
+        tx: &mut SqliteConnection,
+        id: &str,
+        status: Option<ItemStatus>,
+        is_favorite: Option<bool>,
+        read_progress: Option<f64>,
+        read_at: ReadAtPatch,
+        now: DateTime<Utc>,
+        allow_auto_log: bool,
+    ) -> std::result::Result<bool, sqlx::Error> {
         let mut check_qb = QueryBuilder::<Sqlite>::new(
             "SELECT i.kind,
                     COALESCE(es.inbox_state, 'none') AS inbox_state,
@@ -575,17 +592,17 @@ impl ItemRepo<'_> {
             .push(" AND i.merged_into_id IS NULL AND ")
             .push(IS_LIVE_ITEM_SQL);
 
-        let existing: Option<ExistingItemStateTuple> =
+        let existing: Option<ExistingItemStateRow> =
             check_qb.build_query_as().fetch_optional(&mut *tx).await?;
 
-        let Some((
-            entry_kind,
-            cur_inbox,
-            current_favorite,
-            current_in_wtr,
-            current_progress,
-            current_read_at,
-        )) = existing
+        let Some(ExistingItemStateRow {
+            kind: entry_kind,
+            inbox_state: cur_inbox,
+            is_favorite: current_favorite,
+            in_want_to_read: current_in_wtr,
+            progress: current_progress,
+            read_at: current_read_at,
+        }) = existing
         else {
             return Ok(false);
         };
@@ -623,6 +640,8 @@ impl ItemRepo<'_> {
                 ReadAtPatch::Unchanged => {
                     if current_status == ItemStatus::Archived {
                         None
+                    } else if read_progress.is_some_and(|p| p >= READER_AUTO_READ_THRESHOLD) {
+                        current_read_at.or(Some(now))
                     } else {
                         current_read_at
                     }
@@ -643,23 +662,17 @@ impl ItemRepo<'_> {
             return Ok(true);
         }
 
-        sqlx::query(
-            "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(entry_id) DO UPDATE SET
-                 inbox_state = excluded.inbox_state,
-                 read_at = excluded.read_at,
-                 progress = excluded.progress,
-                 interaction_updated_at = excluded.interaction_updated_at,
-                 updated_at = excluded.updated_at",
+        entries_core::upsert_entry_state_in_tx(
+            tx,
+            &EntryStateUpsert {
+                entry_id: id,
+                inbox_state: target_inbox,
+                read_at: target_read_at,
+                progress: target_progress,
+                interaction_updated_at: Some(now),
+                updated_at: now,
+            },
         )
-        .bind(id)
-        .bind(target_inbox)
-        .bind(target_read_at)
-        .bind(target_progress)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
         .await?;
 
         sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
@@ -669,11 +682,11 @@ impl ItemRepo<'_> {
             .await?;
 
         if fav_changed {
-            set_favorite_membership_in_tx(&mut tx, id, target_favorite, now).await?;
+            set_favorite_membership_in_tx(tx, id, target_favorite, now).await?;
         }
         if wtr_changed {
             set_collection_flag_membership_in_tx(
-                &mut tx,
+                tx,
                 WANT_TO_READ_COLLECTION_ID,
                 id,
                 target_in_wtr,
@@ -682,38 +695,40 @@ impl ItemRepo<'_> {
             .await?;
         }
 
-        let completion_signal = if target_status == ItemStatus::Archived {
-            InboxState::Dismissed
-        } else {
-            InboxState::Unread
-        };
-        maybe_auto_log_feed_completion_in_tx(
-            &mut tx,
-            id,
-            entry_kind,
-            completion_signal,
-            target_progress,
-            target_read_at.unwrap_or(now),
-        )
-        .await?;
+        if allow_auto_log {
+            let completion_signal = if target_status == ItemStatus::Archived {
+                InboxState::Dismissed
+            } else {
+                InboxState::Unread
+            };
+            maybe_auto_log_feed_completion_in_tx(
+                tx,
+                id,
+                entry_kind,
+                completion_signal,
+                target_progress,
+                target_read_at.unwrap_or(now),
+            )
+            .await?;
+        }
 
         if status_changed {
             let action = match target_status {
                 ItemStatus::Archived => ActivityAction::Archive,
                 ItemStatus::Unread => ActivityAction::Unarchive,
             };
-            SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
         if fav_changed {
             let action =
                 if target_favorite { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
-            SyncRepo::record_activity(&mut tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
         }
 
         if (read_at_changed && !status_changed) || progress_changed {
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::Item,
                 id,
                 ActivityAction::Update,
@@ -722,7 +737,6 @@ impl ItemRepo<'_> {
             .await?;
         }
 
-        tx.commit().await?;
         Ok(true)
     }
 
@@ -934,7 +948,7 @@ impl ItemRepo<'_> {
     }
 
     pub(crate) async fn delete_returning_outcome(&self, id: &str) -> Result<ItemDeleteOutcome> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         let mut key_qb = QueryBuilder::<Sqlite>::new(
@@ -985,49 +999,16 @@ impl ItemRepo<'_> {
         Ok(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn apply_background_enrichment(
-        &self,
+    async fn backfill_entry_fields_in_tx(
+        tx: &mut SqliteConnection,
         id: &str,
-        title: Option<&str>,
-        author: Option<&str>,
-        published_at: Option<DateTime<Utc>>,
-        summary: Option<&str>,
-        thumbnail_url: Option<&str>,
-        content_html: Option<&str>,
-    ) -> Result<()> {
-        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
-        let clean_author = author.map(str::trim).filter(|s| !s.is_empty());
-        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        let clean_thumb = thumbnail_url.map(str::trim).filter(|s| !s.is_empty());
-        let clean_html = content_html.filter(|s| !s.trim().is_empty());
-        if clean_title.is_none()
-            && clean_author.is_none()
-            && published_at.is_none()
-            && clean_summary.is_none()
-            && clean_thumb.is_none()
-            && clean_html.is_none()
-        {
-            return Ok(());
+        backfill: &EntryMetadataBackfill<'_>,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        if backfill.is_empty() {
+            return Ok(false);
         }
-
-        let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
-        let creators_ref = new_creators_json.as_deref();
-        let now = SyncRepo::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
-
-        let live: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM entries e
-             JOIN entry_content ec ON ec.entry_id = e.id
-             WHERE e.id = ? AND e.merged_into_id IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if live.is_none() {
-            return Ok(());
-        }
-
+        let creators_ref = backfill.creators_json.as_deref();
         let entry_res = sqlx::query(
             "UPDATE entries
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
@@ -1043,22 +1024,64 @@ impl ItemRepo<'_> {
                     OR (summary IS NULL AND ? IS NOT NULL)
                     OR (thumbnail_url IS NULL AND ? IS NOT NULL))",
         )
-        .bind(clean_title)
-        .bind(clean_title)
+        .bind(backfill.title)
+        .bind(backfill.title)
         .bind(creators_ref)
         .bind(creators_ref)
-        .bind(published_at)
-        .bind(clean_summary)
-        .bind(clean_thumb)
+        .bind(backfill.published_at)
+        .bind(backfill.summary)
+        .bind(backfill.thumbnail_url)
         .bind(now)
         .bind(id)
-        .bind(clean_title)
+        .bind(backfill.title)
         .bind(creators_ref)
-        .bind(published_at)
-        .bind(clean_summary)
-        .bind(clean_thumb)
+        .bind(backfill.published_at)
+        .bind(backfill.summary)
+        .bind(backfill.thumbnail_url)
         .execute(&mut *tx)
         .await?;
+        Ok(entry_res.rows_affected() > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_background_enrichment(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        authors: &[String],
+        published_at: Option<DateTime<Utc>>,
+        summary: Option<&str>,
+        thumbnail_url: Option<&str>,
+        content_html: Option<&str>,
+    ) -> Result<()> {
+        let backfill = EntryMetadataBackfill {
+            title: title.map(str::trim).filter(|s| !s.is_empty()),
+            creators_json: crate::db::serialize_creators_json(authors),
+            published_at,
+            summary: summary.map(str::trim).filter(|s| !s.is_empty()),
+            thumbnail_url: thumbnail_url.map(str::trim).filter(|s| !s.is_empty()),
+        };
+        let clean_html = content_html.filter(|s| !s.trim().is_empty());
+        if backfill.is_empty() && clean_html.is_none() {
+            return Ok(());
+        }
+
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM entries e
+             JOIN entry_content ec ON ec.entry_id = e.id
+             WHERE e.id = ? AND e.merged_into_id IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Ok(());
+        }
+
+        let entry_updated = Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await?;
 
         let mut content_updated = false;
         if let Some(html) = clean_html {
@@ -1081,7 +1104,7 @@ impl ItemRepo<'_> {
             }
         }
 
-        if entry_res.rows_affected() > 0 || content_updated {
+        if entry_updated || content_updated {
             SyncRepo::record_activity(
                 &mut tx,
                 ActivityEntityType::Item,
@@ -1102,42 +1125,23 @@ impl ItemRepo<'_> {
         author: Option<&str>,
         summary: Option<&str>,
     ) -> Result<()> {
-        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
-        let clean_author = author.map(str::trim).filter(|s| !s.is_empty());
-        let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        if clean_title.is_none() && clean_author.is_none() && clean_summary.is_none() {
+        let backfill = EntryMetadataBackfill {
+            title: title.map(str::trim).filter(|s| !s.is_empty()),
+            creators_json: author
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|a| serde_json::to_string(&[a]).ok()),
+            published_at: None,
+            summary: summary.map(str::trim).filter(|s| !s.is_empty()),
+            thumbnail_url: None,
+        };
+        if backfill.is_empty() {
             return Ok(());
         }
 
-        let new_creators_json = clean_author.and_then(|a| serde_json::to_string(&[a]).ok());
-        let creators_ref = new_creators_json.as_deref();
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        let result = sqlx::query!(
-            "UPDATE entries
-             SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
-                 creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
-                 summary = COALESCE(summary, ?),
-                 updated_at = ?
-             WHERE id = ?
-               AND ((title = url AND ? IS NOT NULL)
-                    OR (creators_json = '[]' AND ? IS NOT NULL)
-                    OR (summary IS NULL AND ? IS NOT NULL))",
-            clean_title as _,
-            clean_title as _,
-            creators_ref as _,
-            creators_ref as _,
-            clean_summary as _,
-            now as _,
-            id,
-            clean_title as _,
-            creators_ref as _,
-            clean_summary as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() > 0 {
+        if Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await? {
             SyncRepo::record_activity(
                 &mut tx,
                 ActivityEntityType::Item,

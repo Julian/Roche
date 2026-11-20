@@ -5,14 +5,19 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
 
 use super::{
     CatalogRepo,
-    models::{CatalogError, CatalogResult, ConsumptionLogRow, ConsumptionLogView},
-};
-use crate::db::{
-    sync::{
-        SyncRepo, collection_entry_natural_key, deterministic_auto_consumption_log_id,
-        deterministic_consumption_log_id,
+    models::{
+        CatalogError, CatalogResult, ConsumptionLogRow, ConsumptionLogView, UpsertEntryInput,
     },
-    types::{ActivityAction, ActivityEntityType, ConsumptionStatus, EntryKind},
+};
+use crate::{
+    db::{
+        sync::{
+            SyncRepo, collection_entry_natural_key, deterministic_auto_consumption_log_id,
+            deterministic_consumption_log_id,
+        },
+        types::{ActivityAction, ActivityEntityType, ConsumptionStatus, EntryKind},
+    },
+    util::clock::now_utc,
 };
 
 /// Removes `entry_id` from all `Want` queues inside `conn` and records `collection_entry`
@@ -65,15 +70,51 @@ impl CatalogRepo<'_> {
         notes: Option<&str>,
         ts: Option<DateTime<Utc>>,
     ) -> CatalogResult<ConsumptionLogView> {
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let event_ts = ts.unwrap_or(now);
         let mut tx = crate::db::begin_write(self.pool).await?;
         let (log_id, canon_id) =
             Self::log_consumption_in_tx(&mut tx, entry_id, status, notes, event_ts, now).await?;
         tx.commit().await?;
 
+        self.load_consumption_log_view(&log_id, &canon_id).await
+    }
+
+    /// Atomically upserts a catalog entry and records a consumption log event in a single
+    /// SQLite write transaction.
+    pub async fn upsert_and_log_consumption(
+        &self,
+        input: &UpsertEntryInput,
+        status: ConsumptionStatus,
+        notes: Option<&str>,
+        ts: Option<DateTime<Utc>>,
+    ) -> CatalogResult<ConsumptionLogView> {
+        let kind = input
+            .kind
+            .ok_or_else(|| CatalogError::InvalidInput("Entry kind is required".to_owned()))?;
+        let title = input.title.trim();
+        if title.is_empty() {
+            return Err(CatalogError::InvalidInput("Entry title cannot be empty".to_owned()));
+        }
+
+        let now = now_utc();
+        let event_ts = ts.unwrap_or(now);
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let entry_id = Self::upsert_entry_in_tx(&mut tx, input, kind, title, now).await?;
+        let (log_id, canon_id) =
+            Self::log_consumption_in_tx(&mut tx, &entry_id, status, notes, event_ts, now).await?;
+        tx.commit().await?;
+
+        self.load_consumption_log_view(&log_id, &canon_id).await
+    }
+
+    pub(crate) async fn load_consumption_log_view(
+        &self,
+        log_id: &str,
+        canon_id: &str,
+    ) -> CatalogResult<ConsumptionLogView> {
         let entry = self
-            .get_entry(&canon_id)
+            .get_entry(canon_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{canon_id}'")))?;
         let row = sqlx::query_as!(
@@ -83,7 +124,7 @@ impl CatalogRepo<'_> {
                       created_at as "created_at!: DateTime<Utc>"
                FROM consumption_log
                WHERE id = ?"#,
-            &log_id,
+            log_id,
         )
         .fetch_one(self.pool)
         .await?;
@@ -459,7 +500,7 @@ impl CatalogRepo<'_> {
         let Some(canon_id) = self.follow_merged_id(entry_id).await? else {
             return Ok(0);
         };
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let log_ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM consumption_log WHERE entry_id = ? AND status = 'consumed'",

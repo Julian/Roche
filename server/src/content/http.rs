@@ -1,18 +1,14 @@
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use ip_network::IpNetwork;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use url::{Host, Url};
+use url::Url;
 
 use super::classify::UrlClassifier;
+use crate::util::url_guard::{is_global_ip, validate_public_url};
 
 /// Custom DNS resolver for `reqwest` that validates every resolved IP address against
-/// [`SafeHttpClient::is_global_ip`] at socket connection time.
+/// [`is_global_ip`] at socket connection time.
 ///
 /// This eliminates both DNS-rebinding TOCTOU windows and redirect-target DNS-rebinding bypasses.
 #[derive(Debug, Default, Clone, Copy)]
@@ -31,7 +27,7 @@ impl Resolve for SafeDnsResolver {
                 )) as Box<dyn std::error::Error + Send + Sync>);
             }
             for addr in &addrs {
-                if !SafeHttpClient::is_global_ip(addr.ip()) {
+                if !is_global_ip(addr.ip()) {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         format!("Host '{host}' resolved to disallowed IP address {}", addr.ip()),
@@ -87,83 +83,6 @@ impl SafeHttpClient {
             .user_agent("Mozilla/5.0 (compatible; Roche/0.1)")
             .build()?;
         Ok(Self { client })
-    }
-
-    /// Parses and validates an external HTTP(S) [`Url`], rejecting SSRF targets.
-    pub fn parse_url(raw_url: &str) -> Result<Url> {
-        let parsed = Url::parse(raw_url.trim())?;
-        Self::validate_url(&parsed)?;
-        Ok(parsed)
-    }
-
-    /// Validates that a [`Url`] uses HTTP(S) on an allowed port and points to a public/global host.
-    pub fn validate_url(parsed: &Url) -> Result<()> {
-        if !matches!(parsed.scheme(), "http" | "https") {
-            anyhow::bail!("URL scheme must be http or https");
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            anyhow::bail!("URL must not contain embedded credentials");
-        }
-        if let Some(port) = parsed.port()
-            && !matches!(port, 80 | 443 | 8080 | 8443)
-        {
-            anyhow::bail!("Disallowed URL port: {port}");
-        }
-
-        let Some(host) = parsed.host() else {
-            anyhow::bail!("URL must include a valid host");
-        };
-
-        match host {
-            Host::Domain(domain) => {
-                let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
-                if normalized.is_empty() || !normalized.contains('.') {
-                    anyhow::bail!("Single-label or empty domain names are not allowed");
-                }
-                if normalized.rsplit('.').next().is_some_and(|tld| {
-                    matches!(tld, "localhost" | "local" | "internal" | "home" | "lan")
-                }) || normalized.ends_with(".ts.net")
-                {
-                    anyhow::bail!("Local or Tailnet domain names are not allowed");
-                }
-            }
-            Host::Ipv4(ipv4) => {
-                if !Self::is_global_ip(IpAddr::V4(ipv4)) {
-                    anyhow::bail!("Private, loopback, or reserved IPv4 addresses are not allowed");
-                }
-            }
-            Host::Ipv6(ipv6) => {
-                if !Self::is_global_ip(IpAddr::V6(ipv6)) {
-                    anyhow::bail!("Private, loopback, or reserved IPv6 addresses are not allowed");
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn is_global_ip(ip: IpAddr) -> bool {
-        if let IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4() {
-                return IpNetwork::from(IpAddr::V4(v4)).is_global();
-            }
-            let s = v6.segments();
-            // NAT64 Well-Known Prefix (64:ff9b::/96) and Local-Use NAT64 (64:ff9b:1::/48)
-            // SIIT IPv4-translated (::ffff:0:0/96)
-            // Discard-Only (100::/64)
-            // ORCHIDv2 (2001:20::/28)
-            // 6to4 (2002::/16) — can embed private/loopback IPv4 addresses
-            if (s[0] == 0x0064 && s[1] == 0xff9b)
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
-                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020)
-                || s[0] == 0x2002
-            {
-                return false;
-            }
-        }
-        IpNetwork::from(ip).is_global()
     }
 
     pub async fn fetch_bytes(&self, url: &Url, max_bytes: usize) -> Result<Vec<u8>> {
@@ -244,7 +163,7 @@ impl SafeHttpClient {
         max_bytes: usize,
         validation: FetchValidation,
     ) -> Result<Vec<u8>> {
-        Self::validate_url(url)?;
+        validate_public_url(url)?;
         let mut response = self.client.get(url.clone()).send().await?;
         let response_status = response.status();
         if !response_status.is_success() {
@@ -297,10 +216,28 @@ impl SafeHttpClient {
             if attempt.previous().len() >= 5 {
                 return attempt.error("Too many redirects");
             }
-            if let Err(err) = Self::validate_url(attempt.url()) {
+            if let Err(err) = validate_public_url(attempt.url()) {
                 return attempt.error(err);
             }
             attempt.follow()
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_xml_or_text_bytes_handles_utf16_bom_and_encoding_prolog() {
+        let raw_xml = r#"<?xml version="1.0" encoding="utf-16"?><rss version="2.0"><channel><title>Petzold</title></channel></rss>"#;
+        let mut utf16le = vec![0xFF, 0xFE];
+        for unit in raw_xml.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = SafeHttpClient::decode_xml_or_text_bytes(&utf16le);
+        assert!(decoded.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(decoded.contains("<title>Petzold</title>"));
     }
 }

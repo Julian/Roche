@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
@@ -10,17 +12,19 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::{
-    content::fetcher::{
+    content::{
         HtmlSanitizer, MAX_SUMMARY_CHARS, SafeHttpClient, classify_url, is_valid_pdf_bytes,
         resolve_pdf_url,
     },
     db::{
-        ContentType, DEFAULT_ONLINE_PEER_WEIGHT, Db, Feed, FeedRepo, FeedType, MAX_PEER_WEIGHT,
-        MIN_PEER_WEIGHT, MediaType, NetworkTier, PollBatch, PollItemCandidate, SERVER_PEER_ID,
-        SyncRepo, compute_throughput_weight, should_peer_poll_feed, update_throughput_ewma,
+        DEFAULT_ONLINE_PEER_WEIGHT, Db, Feed, FeedRepo, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT,
+        NetworkTier, PollBatch, PollItemCandidate, SERVER_PEER_ID, compute_throughput_weight,
+        should_peer_poll_feed, update_throughput_ewma,
     },
+    domain::{ContentType, FeedType, MediaType},
     feeds::{ArxivParser, RssParser, YouTubeParser},
     media::{MediaStore, ytdlp::YtDlpWorker},
+    util::{clock::now_utc, media_urls::youtube_thumbnail_url, url_guard::validate_public_url},
 };
 
 const MAX_FEED_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
@@ -39,20 +43,67 @@ pub enum PollError {
 }
 
 pub trait FeedFetcher: Send + Sync + 'static {
-    fn fetch_feed(&self, url: &Url) -> impl std::future::Future<Output = Result<String>> + Send;
+    fn fetch_feed(&self, url: &Url) -> impl Future<Output = Result<String>> + Send;
 
-    fn fetch_html(
-        &self,
-        _url: &Url,
-    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+    fn fetch_html(&self, _url: &Url) -> impl Future<Output = Result<Option<String>>> + Send {
         std::future::ready(Ok(None))
     }
 
-    fn fetch_pdf(
-        &self,
-        _url: &Url,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
+    fn fetch_pdf(&self, _url: &Url) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send {
         std::future::ready(Ok(None))
+    }
+}
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+trait BoxedFeedFetcher: Send + Sync + 'static {
+    fn fetch_feed<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<String>>;
+    fn fetch_html<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<String>>>;
+    fn fetch_pdf<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<Vec<u8>>>>;
+}
+
+impl<T: FeedFetcher> BoxedFeedFetcher for T {
+    fn fetch_feed<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<String>> {
+        Box::pin(FeedFetcher::fetch_feed(self, url))
+    }
+
+    fn fetch_html<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(FeedFetcher::fetch_html(self, url))
+    }
+
+    fn fetch_pdf<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(FeedFetcher::fetch_pdf(self, url))
+    }
+}
+
+/// Type-erased, cheaply cloneable [`FeedFetcher`] handle used by `RocheService`.
+#[derive(Clone)]
+pub struct DynFeedFetcher(Arc<dyn BoxedFeedFetcher>);
+
+impl std::fmt::Debug for DynFeedFetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DynFeedFetcher").field(&"<dyn FeedFetcher>").finish()
+    }
+}
+
+impl DynFeedFetcher {
+    #[must_use]
+    pub fn new(fetcher: impl FeedFetcher) -> Self {
+        Self(Arc::new(fetcher))
+    }
+}
+
+impl FeedFetcher for DynFeedFetcher {
+    async fn fetch_feed(&self, url: &Url) -> Result<String> {
+        self.0.fetch_feed(url).await
+    }
+
+    async fn fetch_html(&self, url: &Url) -> Result<Option<String>> {
+        self.0.fetch_html(url).await
+    }
+
+    async fn fetch_pdf(&self, url: &Url) -> Result<Option<Vec<u8>>> {
+        self.0.fetch_pdf(url).await
     }
 }
 
@@ -305,7 +356,7 @@ impl<F: FeedFetcher> PollScheduler<F> {
 
     pub async fn check_and_poll(&self) -> Result<()> {
         self.reap_finished_tasks().await;
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         if !self.throughput_ewma.is_seeded()
             && let Ok(persisted) = self.db.sync().get_peer_weight(SERVER_PEER_ID).await
         {
@@ -534,7 +585,7 @@ impl FeedIngester {
         let Some(pdf_url) = resolve_pdf_url(url) else {
             return;
         };
-        if SafeHttpClient::validate_url(&pdf_url).is_err() {
+        if validate_public_url(&pdf_url).is_err() {
             return;
         }
         let fetched = {
@@ -592,7 +643,7 @@ impl FeedIngester {
         let Some(worker) = ctx.ytdlp_worker else {
             return;
         };
-        if SafeHttpClient::validate_url(url).is_err() {
+        if validate_public_url(url).is_err() {
             return;
         }
         let download_res = {
@@ -689,11 +740,7 @@ impl FeedIngester {
                                         )
                                     })
                             })
-                            .or_else(|| {
-                                YouTubeParser::extract_video_id(&url).map(|vid| {
-                                    format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
-                                })
-                            });
+                            .or_else(|| youtube_thumbnail_url(&url));
                         let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
                             &clean_desc,
                             MAX_SUMMARY_CHARS,
@@ -701,7 +748,7 @@ impl FeedIngester {
                         Some(PollItemCandidate {
                             title: item.title,
                             url,
-                            author: item.author,
+                            creators: item.authors,
                             published_at: item.pub_date,
                             summary,
                             content_html,
@@ -734,12 +781,11 @@ impl FeedIngester {
                             &clean_desc,
                             MAX_SUMMARY_CHARS,
                         );
-                        let thumbnail_url = YouTubeParser::extract_video_id(&video.watch_url)
-                            .map(|vid| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+                        let thumbnail_url = youtube_thumbnail_url(&video.watch_url);
                         PollItemCandidate {
                             title: video.title,
                             url: video.watch_url,
-                            author: author.clone(),
+                            creators: author.clone().into_iter().collect(),
                             published_at: video.published_at,
                             content_html: Some(clean_desc),
                             thumbnail_url,
@@ -764,8 +810,6 @@ impl FeedIngester {
                     .into_iter()
                     .filter_map(|paper| {
                         let url = paper.abstract_url?;
-                        let authors = paper.authors.join(", ");
-                        let author = (!authors.is_empty()).then_some(authors);
                         let clean_summary = HtmlSanitizer::clean(&paper.summary);
                         let summary = HtmlSanitizer::plain_text_excerpt_from_clean(
                             &clean_summary,
@@ -774,7 +818,7 @@ impl FeedIngester {
                         Some(PollItemCandidate {
                             title: paper.title,
                             url,
-                            author,
+                            creators: paper.authors,
                             published_at: paper.published_at,
                             content_html: Some(clean_summary),
                             thumbnail_url: None,
@@ -991,7 +1035,7 @@ mod tests {
             .map(|idx| PollItemCandidate {
                 title: format!("Paper {idx}"),
                 url: Url::parse(&format!("https://example.com/paper-{idx}.pdf")).unwrap(),
-                author: None,
+                creators: Vec::new(),
                 published_at: None,
                 summary: format!("Summary {idx}"),
                 content_html: None,
@@ -1348,7 +1392,7 @@ mod tests {
         let backed_off = db.feeds().get(&feed.id).await.unwrap().unwrap();
         assert_eq!(backed_off.consecutive_failures, 2);
         assert!(
-            !should_peer_poll_feed(SERVER_PEER_ID, &[], &backed_off, SyncRepo::now_utc()),
+            !should_peer_poll_feed(SERVER_PEER_ID, &[], &backed_off, now_utc()),
             "Scheduled poller must keep feed in backoff before due_at"
         );
 
@@ -1362,7 +1406,7 @@ mod tests {
 
         // 1. Manual refresh bypasses backoff and increments consecutive_failures (2 -> 3) on failure
         let err = service.feeds().refresh(&feed.id).await.unwrap_err();
-        assert!(matches!(err, crate::error::ApiError::BadGateway(_)));
+        assert!(matches!(err, crate::service::AppError::BadGateway(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let after_manual_fail = db.feeds().get(&feed.id).await.unwrap().unwrap();
         assert_eq!(after_manual_fail.consecutive_failures, 3);
@@ -1458,5 +1502,41 @@ mod tests {
         assert!(res.unwrap().is_ok());
         drop(tx);
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_arxiv_poll_preserves_separate_authors_in_creators_json() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>arXiv cs.LG</title>
+          <entry>
+            <id>http://arxiv.org/abs/2401.12345v1</id>
+            <title>Distributed Consensus Revisited</title>
+            <summary>We study multi-author consensus.</summary>
+            <author><name>Alice Smith</name></author>
+            <author><name>Bob Jones</name></author>
+            <link rel="alternate" type="text/html" href="https://arxiv.org/abs/2401.12345"/>
+          </entry>
+        </feed>"#;
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let feed_url =
+            Url::parse("https://export.arxiv.org/api/query?search_query=cat:cs.LG").unwrap();
+        let feed = db.feeds().create(FeedType::Arxiv, &feed_url, None, None).await.unwrap();
+        let batch = FeedIngester::parse_feed_content(FeedType::Arxiv, xml).unwrap();
+        let inserted = db.feeds().record_poll_batch(&feed.id, &batch).await.unwrap();
+        assert_eq!(inserted.len(), 1);
+        let item_id = &inserted[0].0;
+
+        let creators_json: String =
+            sqlx::query_scalar("SELECT creators_json FROM entries WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(creators_json, r#"["Alice Smith","Bob Jones"]"#);
+
+        let item = db.items().get(item_id).await.unwrap().unwrap();
+        assert_eq!(item.author.as_deref(), Some("Alice Smith, Bob Jones"));
     }
 }

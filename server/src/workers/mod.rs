@@ -80,7 +80,16 @@ impl WorkerManager {
         let _ = self.media_store.cleanup_stale_temp_files(Duration::from_secs(600)).await;
         let media_repo = self.db.media();
         let orphans = media_repo.find_orphaned().await?;
-        media_repo.delete_with_files(&self.media_store, orphans).await?;
+        let to_unlink = media_repo.delete_rows_returning(orphans).await?;
+        for media in to_unlink {
+            if let Err(e) = self.media_store.remove(&media.path).await {
+                tracing::warn!(
+                    path = %media.path,
+                    error = %e,
+                    "Skipped removing media outside media_dir or failed I/O"
+                );
+            }
+        }
         if let Ok(registered) = media_repo.list_registered_item_ids().await {
             let _ = self
                 .media_store
@@ -101,7 +110,10 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::db::{ContentType, Db, MediaType, NewItem};
+    use crate::{
+        db::{Db, NewItem},
+        domain::{ContentType, MediaType},
+    };
 
     #[tokio::test]
     async fn test_worker_manager_prunes_old_activity_logs_and_orphaned_media() {

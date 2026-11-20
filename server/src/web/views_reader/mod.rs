@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 
 use serde::Deserialize;
 
-use super::html::{esc, urlencode};
-use crate::db::{ContentType, Item};
+use super::html::{FlashQuery, de_opt_from_str, esc, urlencode};
+use crate::{db::Item, domain::ContentType};
 
 pub(super) use feeds::{
     export_opml_get, feeds_get, post_feed_create, post_feed_delete, post_feed_opml,
@@ -29,9 +29,10 @@ pub(super) struct InboxQuery {
     pub feed: Option<String>,
     pub tag: Option<String>,
     pub q: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_from_str")]
     pub page: Option<usize>,
-    pub notice: Option<String>,
-    pub err: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
 }
 
 #[derive(Debug, Deserialize)]

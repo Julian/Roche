@@ -8,8 +8,11 @@ import android.provider.OpenableColumns
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.net.toUri
-import com.grayvines.roche.data.PeerSyncScheduler
-import com.grayvines.roche.data.runSuspendCatching
+import com.grayvines.roche.core.PDF_MAGIC_BYTES
+import com.grayvines.roche.core.hasPdfMagicHeader
+import com.grayvines.roche.core.isLocalPdfUrl
+import com.grayvines.roche.core.runSuspendCatching
+import com.grayvines.roche.data.sync.PeerSyncScheduler
 import java.io.InputStream
 import java.io.PushbackInputStream
 import kotlinx.coroutines.Dispatchers
@@ -68,11 +71,7 @@ class ShareReceiveActivity : Activity() {
         payload: SharedContentPayload,
     ) {
         val pdfStream = openPdfStreamIfPresent(payload.pdfStreamUri)
-        if (
-            payload.pdfStreamUri != null &&
-                pdfStream == null &&
-                payload.url.startsWith("localpdf://", ignoreCase = true)
-        ) {
+        if (payload.pdfStreamUri != null && pdfStream == null && isLocalPdfUrl(payload.url)) {
             showShareToast(appContext, "Could not open shared PDF")
             return
         }
@@ -193,8 +192,6 @@ class ShareReceiveActivity : Activity() {
     }
 }
 
-private val PDF_MAGIC_HEADER = byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D) // %PDF-
-
 internal fun isAllowedSharedContentUri(
     scheme: String?,
     authority: String?,
@@ -217,15 +214,15 @@ internal fun isAllowedSharedContentUri(
 }
 
 internal fun openValidatedPdfStream(stream: InputStream): InputStream? {
-    val pushback = PushbackInputStream(stream, PDF_MAGIC_HEADER.size)
-    val header = ByteArray(PDF_MAGIC_HEADER.size)
+    val pushback = PushbackInputStream(stream, PDF_MAGIC_BYTES.size)
+    val header = ByteArray(PDF_MAGIC_BYTES.size)
     var totalRead = 0
-    while (totalRead < PDF_MAGIC_HEADER.size) {
-        val read = pushback.read(header, totalRead, PDF_MAGIC_HEADER.size - totalRead)
+    while (totalRead < PDF_MAGIC_BYTES.size) {
+        val read = pushback.read(header, totalRead, PDF_MAGIC_BYTES.size - totalRead)
         if (read == -1) break
         totalRead += read
     }
-    if (totalRead != PDF_MAGIC_HEADER.size || !header.contentEquals(PDF_MAGIC_HEADER)) {
+    if (!hasPdfMagicHeader(header, totalRead)) {
         runCatching { pushback.close() }
         return null
     }

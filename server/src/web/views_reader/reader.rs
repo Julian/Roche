@@ -9,21 +9,21 @@ use axum::{
 
 use super::{AddTagForm, FinishItemForm, ItemReturnForm, ProgressForm, render_audio_play_button};
 use crate::{
-    content::fetcher::HtmlSanitizer,
-    db::{
-        ConsumptionStatus, EntryKind, ItemStatus, MediaType, ReadAtPatch, SyncRepo,
-        WANT_TO_READ_COLLECTION_ID,
+    content::HtmlSanitizer,
+    db::WANT_TO_READ_COLLECTION_ID,
+    domain::{
+        ConsumptionStatus, EntryKind, ItemStatus, MediaType, READER_AUTO_READ_THRESHOLD,
+        ReadAtPatch,
     },
-    error::ApiError,
-    scheduler::FeedFetcher,
-    service::{ItemDetail, RocheService},
+    service::{AppError, ItemDetail, RocheService},
+    util::clock::now_utc,
     web::{
         auth::WebSession,
         html::{
-            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, esc, redirect_see_other,
-            redirect_with_flash, render_feed_favicon, render_inline_csrf_form,
-            render_inline_csrf_form_with_class, render_page, safe_local_redirect, urlencode,
-            web_api_error_response,
+            ARCHIVE_BOX_SVG, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
+            parse_form_bool, redirect_see_other, redirect_with_flash, render_feed_favicon,
+            render_inline_csrf_form, render_inline_csrf_form_with_class, render_page,
+            safe_local_redirect, urlencode,
         },
         links::sanitize_non_local_href,
     },
@@ -33,16 +33,13 @@ const QUEUE_ADD_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"no
 const QUEUE_CHECK_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.45\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 2.5h9v11l-4.5-3-4.5 3v-11Z\"/><path d=\"m6 6.8 1.5 1.5 2.6-2.6\"/></svg>";
 const TOP_ARROW_SVG: &str = "<svg class=\"icon\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M8 13V3.5\"/><path d=\"M4 7.5 8 3.5l4 4\"/></svg>";
 
-pub(in crate::web) async fn reader_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn reader_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    let detail = match service.items().get(&id).await {
-        Ok(d) => d,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
+) -> Result<Response, WebError> {
+    let detail = service.items().get(&id).await.web_err(&session)?;
 
     let (is_consumed, rank_slug) = match service.catalog().get_entry_detail(&id).await {
         Ok(Some(ed)) => {
@@ -64,8 +61,9 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
     } else {
         NavSection::Inbox
     };
-    let is_finished =
-        is_consumed || detail.item.read_at.is_some() || detail.item.read_progress >= 0.98;
+    let is_finished = is_consumed
+        || detail.item.read_at.is_some()
+        || detail.item.read_progress >= READER_AUTO_READ_THRESHOLD;
     let suppress_auto_finish =
         flash.notice.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Marked unfinished"));
 
@@ -79,7 +77,7 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
         &session.csrf_token,
     );
 
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: &detail.item.title,
         active: active_nav,
         csrf_token: &session.csrf_token,
@@ -87,7 +85,7 @@ pub(in crate::web) async fn reader_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn estimate_reading_minutes(detail: &ItemDetail) -> Option<usize> {
@@ -516,20 +514,17 @@ fn render_reader_rail_archive(
     );
 }
 
-pub(in crate::web) async fn item_audio_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn item_audio_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Response {
-    let detail = match service.items().get(&id).await {
-        Ok(d) => d,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
+) -> Result<Response, WebError> {
+    let detail = service.items().get(&id).await.web_err(&session)?;
     if let Some(local_audio) = detail.media.iter().find(|m| m.media_type == MediaType::Audio)
         && let Ok(resp) = crate::api::serve_media_stream(&service, &local_audio.id, &headers).await
     {
-        return resp;
+        return Ok(resp);
     }
     if let Some(ext_audio) = detail.item.audio_url.as_deref().and_then(sanitize_non_local_href) {
         let mut resp = StatusCode::SEE_OTHER.into_response();
@@ -537,136 +532,175 @@ pub(in crate::web) async fn item_audio_get<F: FeedFetcher>(
             resp.headers_mut().insert(header::LOCATION, val);
             resp.headers_mut()
                 .insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
-            return resp;
+            return Ok(resp);
         }
     }
-    web_api_error_response(
-        &ApiError::not_found("Audio stream not found for this item"),
+    Err(WebError::from_app(
+        AppError::not_found("Audio stream not found for this item"),
         Some(&session.csrf_token),
-    )
+    ))
 }
 
-pub(in crate::web) async fn web_media_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn web_media_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Response {
-    match crate::api::serve_media_stream(&service, &id, &headers).await {
-        Ok(resp) => resp,
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    crate::api::serve_media_stream(&service, &id, &headers).await.web_err(&session)
 }
 
-pub(in crate::web) async fn post_item_progress<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_progress(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<ProgressForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let p = if form.progress.is_finite() { form.progress.clamp(0.0, 1.0) } else { 0.0 };
-    let patch =
-        if p >= 0.98 { ReadAtPatch::MarkRead(SyncRepo::now_utc()) } else { ReadAtPatch::Unchanged };
-    match service.items().update(&id, None, None, Some(p), patch).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+    let patch = if p >= READER_AUTO_READ_THRESHOLD {
+        ReadAtPatch::MarkRead(now_utc())
+    } else {
+        ReadAtPatch::Unchanged
+    };
+    let _ = service.items().update(&id, None, None, Some(p), patch).await.web_err(&session)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-pub(in crate::web) async fn post_item_finish<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_finish(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<FinishItemForm>,
-) -> Response {
-    let existing = match service.items().get(&id).await {
-        Ok(d) => d,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
-    let default_return = if existing.item.feed_id.is_some() { "/inbox" } else { "/queue" };
-    let logged = match service
-        .catalog()
-        .log_consumption(&id, ConsumptionStatus::Consumed, form.notes.as_deref(), None)
-        .await
-    {
-        Ok(l) => l,
-        Err(err) => return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    };
-    let _ = service
-        .items()
-        .update(
-            &id,
-            Some(ItemStatus::Archived),
-            None,
-            Some(1.0),
-            ReadAtPatch::MarkRead(SyncRepo::now_utc()),
-        )
-        .await;
+) -> Result<Response, WebError> {
+    let finished =
+        service.items().finish_reader_item(&id, form.notes.as_deref()).await.web_err(&session)?;
+    let default_return = if finished.has_feed { "/inbox" } else { "/queue" };
 
-    if form.rank_after.as_deref() == Some("1")
+    if parse_form_bool(form.rank_after.as_deref())
         && let Ok(Some(list_slug)) =
-            service.catalog().rank_target_after_consumption(&logged.entry).await
+            service.catalog().rank_target_after_consumption(&finished.logged.entry).await
     {
-        redirect_with_flash(
-            &format!("/rank/{}?focus={}", urlencode(&list_slug), urlencode(&logged.entry.id)),
+        Ok(redirect_with_flash(
+            &format!(
+                "/rank/{}?focus={}",
+                urlencode(&list_slug),
+                urlencode(&finished.logged.entry.id)
+            ),
             "notice",
             "Marked finished & logged to Diary",
-        )
+        ))
     } else {
         let base = safe_local_redirect(form.return_to.as_deref(), default_return);
-        redirect_with_flash(&base, "notice", "Marked finished & logged to Diary")
+        Ok(redirect_with_flash(&base, "notice", "Marked finished & logged to Diary"))
     }
 }
 
-pub(in crate::web) async fn post_item_unfinish<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_unfinish(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<ItemReturnForm>,
-) -> Response {
-    let existing = match service.items().get(&id).await {
-        Ok(d) => d,
-        Err(err) => return web_api_error_response(&err, Some(&session.csrf_token)),
-    };
-    if let Err(err) = service.catalog().delete_consumed_logs_for_entry(&id).await {
-        return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-    }
-    if let Err(err) = service
+) -> Result<Response, WebError> {
+    let existing = service.items().get(&id).await.web_err(&session)?;
+    let _ = service.catalog().delete_consumed_logs_for_entry(&id).await.web_err(&session)?;
+    let _ = service
         .items()
         .update(&id, Some(ItemStatus::Unread), None, Some(0.0), ReadAtPatch::MarkUnread)
         .await
-    {
-        return web_api_error_response(&err, Some(&session.csrf_token));
-    }
+        .web_err(&session)?;
     if existing.item.feed_id.is_none() {
         let _ = service.catalog().add_collection_entry(WANT_TO_READ_COLLECTION_ID, &id, None).await;
     }
     let fallback = format!("/reader/{}", urlencode(&id));
     let dest = safe_local_redirect(form.return_to.as_deref(), &fallback);
-    redirect_with_flash(&dest, "notice", "Marked unfinished")
+    Ok(redirect_with_flash(&dest, "notice", "Marked unfinished"))
 }
 
-pub(in crate::web) async fn post_item_tag_add<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_tag_add(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path(id): Path<String>,
     Form(form): Form<AddTagForm>,
-) -> Response {
-    match service.items().add_tag(&id, None, Some(&form.name)).await {
-        Ok(_) => redirect_see_other(&format!("/reader/{}", urlencode(&id))),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let _ = service.items().add_tag(&id, None, Some(&form.name)).await.web_err(&session)?;
+    Ok(redirect_see_other(&format!("/reader/{}", urlencode(&id))))
 }
 
-pub(in crate::web) async fn post_item_tag_remove<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_item_tag_remove(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((id, tag_id)): Path<(String, String)>,
-) -> Response {
-    match service.items().remove_tag(&id, &tag_id).await {
-        Ok(()) => redirect_see_other(&format!("/reader/{}", urlencode(&id))),
-        Err(err) => web_api_error_response(&err, Some(&session.csrf_token)),
+) -> Result<Response, WebError> {
+    service.items().remove_tag(&id, &tag_id).await.web_err(&session)?;
+    Ok(redirect_see_other(&format!("/reader/{}", urlencode(&id))))
+}
+
+/// Finds the byte index of the closing `>` of an HTML tag starting immediately after `<`,
+/// ignoring any `>` characters inside single- or double-quoted attribute values.
+fn find_html_tag_end(after_lt: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (idx, b) in after_lt.bytes().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(idx),
+            Some(_) | None => {}
+        }
     }
+    None
+}
+
+/// Checks whether an HTML tag's attribute string defines an attribute named `target`
+/// (ASCII case-insensitive), skipping quoted attribute values so text inside another
+/// attribute value (e.g. `title="alt=foo"`) is never mistaken for an attribute name.
+fn has_html_attr(attrs: &str, target: &str) -> bool {
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let matched = attrs[name_start..i].eq_ignore_ascii_case(target);
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+        }
+        if matched {
+            return true;
+        }
+    }
+    false
 }
 
 /// Normalizes already-sanitized article HTML for embedding under the Reader's `<h2>` title:
@@ -680,7 +714,7 @@ fn harden_reader_prose_html(clean_html: &str) -> String {
     while let Some(lt) = rest.find('<') {
         out.push_str(&rest[..lt]);
         let after_lt = &rest[lt + 1..];
-        let Some(gt) = after_lt.find('>') else {
+        let Some(gt) = find_html_tag_end(after_lt) else {
             out.push('<');
             out.push_str(after_lt);
             return out;
@@ -714,13 +748,12 @@ fn harden_reader_prose_html(clean_html: &str) -> String {
         } else if tag_name.eq_ignore_ascii_case("pre") {
             out.push_str(tag_name);
             out.push_str(attrs);
-            if !attrs.to_ascii_lowercase().contains("tabindex=") {
+            if !has_html_attr(attrs, "tabindex") {
                 out.push_str(" tabindex=\"0\"");
             }
         } else if tag_name.eq_ignore_ascii_case("img") {
             out.push_str(tag_name);
-            let has_alt = attrs.to_ascii_lowercase().contains(" alt=")
-                || attrs.to_ascii_lowercase().starts_with("alt=");
+            let has_alt = has_html_attr(attrs, "alt");
             if let Some(before_slash) = attrs.strip_suffix('/') {
                 out.push_str(before_slash);
                 if !has_alt {
@@ -740,4 +773,33 @@ fn harden_reader_prose_html(clean_html: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_harden_reader_prose_html_preserves_gt_inside_quoted_attributes() {
+        let img = r#"<img src="https://example.com/a.png" alt="1 > 0">"#;
+        assert_eq!(harden_reader_prose_html(img), img);
+
+        let img_single_quote = "<img src='https://example.com/a.png' alt='a > b'>";
+        assert_eq!(harden_reader_prose_html(img_single_quote), img_single_quote);
+
+        let img_missing_alt = r#"<img src="https://example.com/a.png" title="1 > 0">"#;
+        assert_eq!(
+            harden_reader_prose_html(img_missing_alt),
+            r#"<img src="https://example.com/a.png" title="1 > 0" alt="">"#
+        );
+
+        let img_fake_alt_in_title = r#"<img src="https://example.com/a.png" title="alt=fake">"#;
+        assert_eq!(
+            harden_reader_prose_html(img_fake_alt_in_title),
+            r#"<img src="https://example.com/a.png" title="alt=fake" alt="">"#
+        );
+
+        let heading_with_gt = r#"<h1 title="a > b">Title</h1>"#;
+        assert_eq!(harden_reader_prose_html(heading_with_gt), r#"<h3 title="a > b">Title</h3>"#);
+    }
 }

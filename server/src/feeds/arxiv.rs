@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::fetcher::SafeHttpClient;
+use crate::util::{media_urls, url_guard::parse_public_url};
 
 #[derive(Debug, Clone)]
 pub struct ArxivFeed {
@@ -23,9 +23,10 @@ pub struct ArxivPaper {
 pub struct ArxivParser;
 
 impl ArxivParser {
+    #[allow(dead_code)]
     #[must_use]
     pub fn is_arxiv_host(host: Option<&str>) -> bool {
-        matches!(host, Some("arxiv.org" | "rss.arxiv.org" | "export.arxiv.org"))
+        media_urls::is_arxiv_host(host)
     }
 
     pub fn parse(content: &str) -> Result<ArxivFeed> {
@@ -40,13 +41,19 @@ impl ArxivParser {
                 let published_at = extract_entry_timestamp(&entry);
                 let abstract_url = select_entry_link(&entry.links).or_else(|| {
                     Self::extract_arxiv_id(&entry.id).and_then(|id| {
-                        SafeHttpClient::parse_url(&format!("https://arxiv.org/abs/{id}")).ok()
+                        parse_public_url(&format!("https://arxiv.org/abs/{id}")).ok()
                     })
                 });
                 let title = entry.title.map_or_default(|t| t.content);
 
-                let authors: Vec<String> =
-                    entry.authors.into_iter().filter_map(|a| a.name).collect();
+                let authors: Vec<String> = entry
+                    .authors
+                    .into_iter()
+                    .filter_map(|a| {
+                        let trimmed = a.name.as_deref()?.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                    })
+                    .collect();
 
                 let summary = entry.summary.map_or_default(|s| s.content);
 
@@ -59,56 +66,13 @@ impl ArxivParser {
 
     #[must_use]
     pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
-        let trimmed = url_or_id.trim();
-        let is_http = trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-            || trimmed.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-        if is_http {
-            let parsed = Url::parse(trimmed).ok()?;
-            if !Self::is_arxiv_host(parsed.host_str()) {
-                return None;
-            }
-            let path = parsed.path();
-            if !path.starts_with("/abs/") && !path.starts_with("/pdf/") {
-                return None;
-            }
-        }
-        let stripped_oai = trimmed
-            .strip_prefix("oai:arXiv.org:")
-            .or_else(|| trimmed.strip_prefix("arXiv:"))
-            .or_else(|| trimmed.strip_prefix("arxiv:"))
-            .unwrap_or(trimmed);
-
-        let id_part = stripped_oai
-            .find("/abs/")
-            .map(|idx| &stripped_oai[idx + "/abs/".len()..])
-            .or_else(|| stripped_oai.find("/pdf/").map(|idx| &stripped_oai[idx + "/pdf/".len()..]))
-            .unwrap_or(stripped_oai);
-
-        let cleaned = id_part.split(&['?', '#'][..]).next().unwrap_or(id_part);
-        let cleaned = cleaned.strip_suffix(".pdf").unwrap_or(cleaned).trim_matches('/');
-
-        if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+        media_urls::extract_arxiv_id(url_or_id)
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn pdf_url_for_paper(paper_url: &Url) -> Option<Url> {
-        if !Self::is_arxiv_host(paper_url.host_str()) {
-            return None;
-        }
-        let path = paper_url.path();
-        if !path.starts_with("/abs/") && !path.starts_with("/pdf/") {
-            return None;
-        }
-        let arxiv_id = Self::extract_arxiv_id(paper_url.as_str())?;
-        if arxiv_id.contains("..")
-            || arxiv_id.matches('/').count() > 1
-            || !arxiv_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
-        {
-            return None;
-        }
-        Url::parse(&format!("https://arxiv.org/pdf/{arxiv_id}.pdf")).ok()
+        media_urls::arxiv_pdf_url(paper_url)
     }
 }
 

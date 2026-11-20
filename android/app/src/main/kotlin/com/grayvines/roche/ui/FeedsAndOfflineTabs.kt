@@ -2,7 +2,6 @@
 
 package com.grayvines.roche.ui
 
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
@@ -31,11 +30,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -58,13 +54,15 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.PredictiveBackDrawerContainer
 import com.grayvines.roche.ui.components.RefreshIcon
 import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
 import com.grayvines.roche.ui.components.SiteFaviconBadge
+import com.grayvines.roche.ui.components.SyncHeaderActionButton
 import com.grayvines.roche.ui.theme.LocalRocheColors
-import kotlinx.coroutines.CancellationException
 
 @Composable
 fun FeedsAndTagsTabContent(
@@ -72,7 +70,6 @@ fun FeedsAndTagsTabContent(
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
 ) {
-    val colors = LocalRocheColors.current
     var showFilterDrawer by rememberSaveable { mutableStateOf(false) }
     var sortOrder by rememberSaveable { mutableStateOf(FeedSortOrder.ALPHABETICAL) }
     var unreadOnly by rememberSaveable { mutableStateOf(false) }
@@ -92,43 +89,42 @@ fun FeedsAndTagsTabContent(
         }
     val hasActiveFilter = showFilterDrawer || unreadOnly || sortOrder != FeedSortOrder.ALPHABETICAL
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        FeedsTopHeaderBar(
-            subtitle = if (state.isSyncing) "$subtitle · Refreshing…" else subtitle,
-            hasActiveFilter = hasActiveFilter,
-            isSyncing = state.isSyncing,
-            onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
-            onSync = { onAction(MainAction.SyncNow) },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        FeedsFilterDrawerSection(
-            visible = showFilterDrawer,
-            state = state,
-            sortOrder = sortOrder,
-            unreadOnly = unreadOnly,
-            onDismiss = { showFilterDrawer = false },
-            onSelectSortOrder = { sortOrder = it },
-            onToggleUnreadOnly = { unreadOnly = !unreadOnly },
-            onSelectTag = { tagName ->
-                showFilterDrawer = false
-                onAction(MainAction.FilterByTag(tagName))
-            },
-        )
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("feeds_pull_to_refresh"),
-        ) {
-            SubscribedFeedsCardList(
-                feeds = visibleFeeds,
-                archivedFeeds = archivedFeeds,
-                hasFeedsAtAll = activeFeeds.isNotEmpty(),
-                onAction = onAction,
-                scrollState = scrollState,
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "feeds_pull_to_refresh",
+        header = {
+            FeedsTopHeaderBar(
+                subtitle = if (state.isSyncing) "$subtitle · Refreshing…" else subtitle,
+                hasActiveFilter = hasActiveFilter,
+                isSyncing = state.isSyncing,
+                onToggleFilterDrawer = { showFilterDrawer = !showFilterDrawer },
+                onSync = { onAction(MainAction.SyncNow) },
             )
-        }
+        },
+        drawer = {
+            FeedsFilterDrawerSection(
+                visible = showFilterDrawer,
+                state = state,
+                sortOrder = sortOrder,
+                unreadOnly = unreadOnly,
+                onDismiss = { showFilterDrawer = false },
+                onSelectSortOrder = { sortOrder = it },
+                onToggleUnreadOnly = { unreadOnly = !unreadOnly },
+                onSelectTag = { tagName ->
+                    showFilterDrawer = false
+                    onAction(MainAction.FilterByTag(tagName))
+                },
+            )
+        },
+    ) {
+        SubscribedFeedsCardList(
+            feeds = visibleFeeds,
+            archivedFeeds = archivedFeeds,
+            hasFeedsAtAll = activeFeeds.isNotEmpty(),
+            onAction = onAction,
+            scrollState = scrollState,
+        )
     }
 }
 
@@ -143,35 +139,17 @@ internal fun FeedsFilterDrawerSection(
     onToggleUnreadOnly: () -> Unit,
     onSelectTag: (String?) -> Unit,
 ) {
-    var drawerBackProgress by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(visible) {
-        if (!visible) {
-            drawerBackProgress = 0f
-        }
+    PredictiveBackDrawerContainer(visible = visible, onDismiss = onDismiss) { drawerModifier ->
+        FeedsFilterDrawer(
+            state = state,
+            sortOrder = sortOrder,
+            unreadOnly = unreadOnly,
+            onSelectSortOrder = onSelectSortOrder,
+            onToggleUnreadOnly = onToggleUnreadOnly,
+            modifier = drawerModifier,
+            onSelectTag = onSelectTag,
+        )
     }
-    PredictiveBackHandler(enabled = visible) { progress ->
-        try {
-            progress.collect { backEvent -> drawerBackProgress = backEvent.progress }
-            drawerBackProgress = 0f
-            onDismiss()
-        } catch (cancelled: CancellationException) {
-            drawerBackProgress = 0f
-            throw cancelled
-        }
-    }
-    if (!visible) return
-    FeedsFilterDrawer(
-        state = state,
-        sortOrder = sortOrder,
-        unreadOnly = unreadOnly,
-        onSelectSortOrder = onSelectSortOrder,
-        onToggleUnreadOnly = onToggleUnreadOnly,
-        modifier = Modifier.predictiveBackDrawerGraphics(drawerBackProgress),
-        onSelectTag = { tagName ->
-            drawerBackProgress = 0f
-            onSelectTag(tagName)
-        },
-    )
 }
 
 @Composable
@@ -197,17 +175,12 @@ internal fun FeedsTopHeaderBar(
                 size = 17.dp,
             )
         }
-        RocheIconActionButton(
-            contentDescription = "Sync Feeds",
+        SyncHeaderActionButton(
+            isSyncing = isSyncing,
             onClick = onSync,
+            contentDescription = "Sync Feeds",
             modifier = Modifier.testTag("feeds_sync_btn"),
-        ) {
-            RefreshIcon(
-                tint = if (isSyncing) colors.accentBlue else colors.textSecondary,
-                size = 17.dp,
-                isSpinning = isSyncing,
-            )
-        }
+        )
     }
 }
 
@@ -603,52 +576,44 @@ fun OfflineTabContent(
             "${offlineEntries.size} cached"
         }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        RocheTopHeader(title = "Offline Vault", subtitle = subtitle) {
-            RocheIconActionButton(
-                contentDescription = "Sync",
-                onClick = { onAction(MainAction.SyncNow) },
-            ) {
-                RefreshIcon(
-                    tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
-                    size = 17.dp,
-                    isSpinning = state.isSyncing,
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "offline_pull_to_refresh",
+        header = {
+            RocheTopHeader(title = "Offline Vault", subtitle = subtitle) {
+                SyncHeaderActionButton(
+                    isSyncing = state.isSyncing,
+                    onClick = { onAction(MainAction.SyncNow) },
                 )
             }
-        }
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("offline_pull_to_refresh"),
-        ) {
-            if (offlineEntries.isEmpty()) {
-                Box(
-                    modifier =
-                        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        "No offline entries cached on this device.",
-                        color = colors.textMuted,
-                        fontSize = 13.sp,
+        },
+    ) {
+        if (offlineEntries.isEmpty()) {
+            Box(
+                modifier =
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "No offline entries cached on this device.",
+                    color = colors.textMuted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
+            ) {
+                items(items = offlineEntries, key = { it.id }) { entry ->
+                    OfflineVaultEntryRow(
+                        entry = entry,
+                        onOpen = { onAction(MainAction.OpenReader(entry.id)) },
+                        onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
                     )
-                }
-            } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                    contentPadding = PaddingValues(top = 4.dp, bottom = 96.dp),
-                ) {
-                    items(items = offlineEntries, key = { it.id }) { entry ->
-                        OfflineVaultEntryRow(
-                            entry = entry,
-                            onOpen = { onAction(MainAction.OpenReader(entry.id)) },
-                            onEvict = { onAction(MainAction.ToggleOfflineCache(entry.id)) },
-                        )
-                        HorizontalDivider(color = colors.border, thickness = 1.dp)
-                    }
+                    HorizontalDivider(color = colors.border, thickness = 1.dp)
                 }
             }
         }

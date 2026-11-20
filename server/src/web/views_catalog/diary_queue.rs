@@ -15,41 +15,34 @@ use super::{
     parse_consumption_status, parse_optional_year, render_kind_options,
 };
 use crate::{
-    db::{
-        CollectionRole, CollectionSummary, ConsumptionLogView, ConsumptionStatus, EntryKind,
-        RankedCollectionView, UpsertEntryInput,
-    },
-    error::ApiError,
-    scheduler::FeedFetcher,
+    db::{CollectionSummary, ConsumptionLogView, RankedCollectionView, UpsertEntryInput},
+    domain::{CollectionRole, ConsumptionStatus, EntryKind},
     service::{CatalogService, RocheService},
     web::{
         auth::WebSession,
         html::{
-            FlashQuery, NavSection, PageShell, esc, parse_csv_list, rank_collection_href,
-            redirect_with_flash, render_diary_row, render_inline_csrf_form, render_page, urlencode,
-            web_api_error_response,
+            CreatorYearStyle, FlashQuery, NavSection, PageShell, WebError, WithWebCsrf as _, esc,
+            parse_csv_list, parse_form_bool, rank_collection_href, redirect_with_flash,
+            render_creator_year_meta, render_diary_row, render_inline_csrf_form, render_page,
+            urlencode,
         },
-        links::{load_artist_id_by_lower_name, render_creator_links},
+        links::load_artist_id_by_lower_name,
     },
 };
 
-pub(in crate::web) async fn diary_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn diary_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(q): Query<DiaryFilterQuery>,
-) -> Response {
+) -> Result<Response, WebError> {
     let status_filter = match q.status.as_deref() {
         Some("consumed") => Some(ConsumptionStatus::Consumed),
         Some("started") => Some(ConsumptionStatus::Started),
         Some("abandoned") => Some(ConsumptionStatus::Abandoned),
         _ => None,
     };
-    let entries = match service.catalog().list_diary(q.year, status_filter, 500).await {
-        Ok(list) => list,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+    let entries =
+        service.catalog().list_diary(q.year, status_filter, 500).await.web_err(&session)?;
 
     let diary_creators: Vec<String> =
         entries.iter().flat_map(|e| e.entry.creators.iter().cloned()).collect();
@@ -108,16 +101,15 @@ pub(in crate::web) async fn diary_get<F: FeedFetcher>(
 
     render_diary_months(&mut body, &months, &artist_links);
 
-    let flash = FlashQuery { notice: q.notice, err: q.err };
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: "Diary",
         active: NavSection::Diary,
         csrf_token: &session.csrf_token,
-        flash: &flash,
+        flash: &q.flash,
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn render_diary_months(
@@ -138,17 +130,12 @@ fn render_diary_months(
     }
 }
 
-pub(in crate::web) async fn queue_get<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn queue_get(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Query(flash): Query<FlashQuery>,
-) -> Response {
-    let all_cols = match service.catalog().list_collections(true, false).await {
-        Ok(cols) => cols,
-        Err(err) => {
-            return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-        }
-    };
+) -> Result<Response, WebError> {
+    let all_cols = service.catalog().list_collections(true, false).await.web_err(&session)?;
 
     let want_cols: Vec<CollectionSummary> = all_cols
         .into_iter()
@@ -195,7 +182,7 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         }
     }
 
-    render_page(&PageShell {
+    Ok(render_page(&PageShell {
         title: "Queue",
         active: NavSection::Queue,
         csrf_token: &session.csrf_token,
@@ -203,7 +190,7 @@ pub(in crate::web) async fn queue_get<F: FeedFetcher>(
         is_refreshing: service.is_refreshing(),
         body_html: &body,
     })
-    .into_response()
+    .into_response())
 }
 
 fn render_quick_log_panel(out: &mut String, csrf: &str) {
@@ -272,11 +259,13 @@ fn render_want_queue_section(
 
     for row in &qview.rows {
         let mut by = String::new();
-        if !row.entry.creators.is_empty() {
-            by.push_str(" <span class=\"by\">&mdash; ");
-            render_creator_links(&mut by, &row.entry.creators, artist_links, false);
-            by.push_str("</span>");
-        }
+        render_creator_year_meta(
+            &mut by,
+            &row.entry.creators,
+            None,
+            artist_links,
+            CreatorYearStyle::QueueDash,
+        );
         let read_btn = if reader_item_ids.contains(&row.entry.id) {
             format!(
                 "<a class=\"btn btn-small\" href=\"/reader/{}\">Read</a>",
@@ -323,20 +312,18 @@ fn render_want_queue_section(
     out.push_str("</ol>\n");
 }
 
-pub(in crate::web) async fn post_quick_log<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_quick_log(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Form(form): Form<QuickLogForm>,
-) -> Response {
+) -> Result<Response, WebError> {
     let kind = match EntryKind::parse_flexible(&form.kind) {
         Ok(k) => k,
-        Err(e) => return redirect_with_flash("/queue", "err", &e.to_string()),
+        Err(e) => return Ok(redirect_with_flash("/queue", "err", &e.to_string())),
     };
     let creators = parse_csv_list(form.creators.as_deref());
     let release_year = parse_optional_year(form.release_year.as_deref());
     let (url, identifiers) = CatalogService::parse_smart_identifier(form.identifier.as_deref());
-    let has_explicit_meta =
-        !creators.is_empty() || release_year.is_some() || url.is_some() || !identifiers.is_empty();
 
     let input = UpsertEntryInput {
         kind: Some(kind),
@@ -349,119 +336,86 @@ pub(in crate::web) async fn post_quick_log<F: FeedFetcher>(
     };
 
     if form.action == "want" {
-        match service
+        let (queue, entry) = service
             .catalog()
-            .want_resolved_or_upsert(&input, has_explicit_meta, form.notes.as_deref(), None)
+            .want_resolved_or_upsert(&input, form.notes.as_deref(), None)
             .await
-        {
-            Ok((queue, entry)) => {
-                if form.rank_after.as_deref() == Some("1") && queue.member_count >= 2 {
-                    let q_slug = queue.slug.as_deref().unwrap_or(&queue.id);
-                    let base = q_slug.strip_prefix("want:").unwrap_or(q_slug);
-                    redirect_with_flash(
-                        &format!(
-                            "/rank/{}?want=true&focus={}",
-                            urlencode(base),
-                            urlencode(&entry.id)
-                        ),
-                        "notice",
-                        "Added to Want queue",
-                    )
-                } else {
-                    redirect_with_flash(
-                        "/queue",
-                        "notice",
-                        &format!("Added '{}' to {}", entry.title, queue.title),
-                    )
-                }
-            }
-            Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+            .web_err(&session)?;
+        if parse_form_bool(form.rank_after.as_deref()) && queue.member_count >= 2 {
+            let q_slug = queue.slug.as_deref().unwrap_or(&queue.id);
+            let base = q_slug.strip_prefix("want:").unwrap_or(q_slug);
+            Ok(redirect_with_flash(
+                &format!("/rank/{}?want=true&focus={}", urlencode(base), urlencode(&entry.id)),
+                "notice",
+                "Added to Want queue",
+            ))
+        } else {
+            Ok(redirect_with_flash(
+                "/queue",
+                "notice",
+                &format!("Added '{}' to {}", entry.title, queue.title),
+            ))
         }
     } else {
-        let entry = match service.catalog().upsert_entry(&input).await {
-            Ok(e) => e,
-            Err(err) => {
-                return web_api_error_response(&ApiError::from(err), Some(&session.csrf_token));
-            }
-        };
         let status = parse_consumption_status(&form.action);
-        match service
+        let logged = service
             .catalog()
-            .log_consumption(&entry.id, status, form.notes.as_deref(), None)
+            .log_entry_resolved_or_upsert(None, Some(&input), status, form.notes.as_deref(), None)
             .await
+            .web_err(&session)?;
+        if status == ConsumptionStatus::Consumed
+            && parse_form_bool(form.rank_after.as_deref())
+            && let Ok(Some(slug)) =
+                service.catalog().rank_target_after_consumption(&logged.entry).await
         {
-            Ok(logged) => {
-                if status == ConsumptionStatus::Consumed
-                    && form.rank_after.as_deref() == Some("1")
-                    && let Ok(Some(slug)) =
-                        service.catalog().rank_target_after_consumption(&logged.entry).await
-                {
-                    redirect_with_flash(
-                        &format!(
-                            "/rank/{}?focus={}",
-                            urlencode(&slug),
-                            urlencode(&logged.entry.id)
-                        ),
-                        "notice",
-                        "Logged to Diary",
-                    )
-                } else {
-                    redirect_with_flash(
-                        "/diary",
-                        "notice",
-                        &format!("Logged '{}' to Diary", logged.entry.title),
-                    )
-                }
-            }
-            Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+            Ok(redirect_with_flash(
+                &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
+                "notice",
+                "Logged to Diary",
+            ))
+        } else {
+            Ok(redirect_with_flash(
+                "/diary",
+                "notice",
+                &format!("Logged '{}' to Diary", logged.entry.title),
+            ))
         }
     }
 }
 
-pub(in crate::web) async fn post_want_complete<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_want_complete(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((_queue, entry_id)): Path<(String, String)>,
     Form(form): Form<WantCompleteForm>,
-) -> Response {
-    match service
+) -> Result<Response, WebError> {
+    let logged = service
         .catalog()
         .log_consumption(&entry_id, ConsumptionStatus::Consumed, None, None)
         .await
+        .web_err(&session)?;
+    if parse_form_bool(form.rank_after.as_deref())
+        && let Ok(Some(slug)) = service.catalog().rank_target_after_consumption(&logged.entry).await
     {
-        Ok(logged) => {
-            if form.rank_after.as_deref() == Some("1")
-                && let Ok(Some(slug)) =
-                    service.catalog().rank_target_after_consumption(&logged.entry).await
-            {
-                redirect_with_flash(
-                    &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
-                    "notice",
-                    "Completed from queue — rank globally",
-                )
-            } else {
-                redirect_with_flash(
-                    "/queue",
-                    "notice",
-                    &format!("Completed '{}' & logged to Diary", logged.entry.title),
-                )
-            }
-        }
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
+        Ok(redirect_with_flash(
+            &format!("/rank/{}?focus={}", urlencode(&slug), urlencode(&logged.entry.id)),
+            "notice",
+            "Completed from queue — rank globally",
+        ))
+    } else {
+        Ok(redirect_with_flash(
+            "/queue",
+            "notice",
+            &format!("Completed '{}' & logged to Diary", logged.entry.title),
+        ))
     }
 }
 
-pub(in crate::web) async fn post_want_remove<F: FeedFetcher>(
-    State(service): State<Arc<RocheService<F>>>,
+pub(in crate::web) async fn post_want_remove(
+    State(service): State<Arc<RocheService>>,
     Extension(session): Extension<WebSession>,
     Path((queue, entry_id)): Path<(String, String)>,
-) -> Response {
-    match service.catalog().unwant_entry(&queue, &entry_id).await {
-        Ok(removed) => redirect_with_flash(
-            "/queue",
-            "notice",
-            &format!("Removed '{}' from queue", removed.title),
-        ),
-        Err(err) => web_api_error_response(&ApiError::from(err), Some(&session.csrf_token)),
-    }
+) -> Result<Response, WebError> {
+    let removed = service.catalog().unwant_entry(&queue, &entry_id).await.web_err(&session)?;
+    Ok(redirect_with_flash("/queue", "notice", &format!("Removed '{}' from queue", removed.title)))
 }

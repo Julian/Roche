@@ -2,15 +2,25 @@
 
 package com.grayvines.roche.data
 
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
+import com.grayvines.roche.core.deterministicItemId
+import com.grayvines.roche.core.deterministicTagId
+import com.grayvines.roche.core.isLocalPollNewer
+import com.grayvines.roche.core.normalizeConsecutiveFailures
+import com.grayvines.roche.core.normalizeTagName
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.ItemTagRow
+import com.grayvines.roche.data.local.MAX_SQLITE_HTML_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_SUMMARY_CHARS
+import com.grayvines.roche.data.local.MAX_SQLITE_TEXT_CHARS
 import com.grayvines.roche.data.local.RocheDao
 import com.grayvines.roche.data.local.TagRow
 import com.grayvines.roche.data.local.insertItemTag
 import com.grayvines.roche.data.local.upsertTag
 import com.grayvines.roche.data.remote.RemoteFeedDto
 import com.grayvines.roche.data.remote.RemoteItemDto
+import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
@@ -18,6 +28,25 @@ import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import java.time.Instant
+
+internal fun groupSortedTagNamesByItemId(
+    tags: List<TagRow>,
+    itemTags: List<ItemTagRow>,
+): Map<String, List<String>> {
+    val tagsById = tags.associateBy { it.id }
+    return itemTags
+        .groupBy(
+            keySelector = { it.itemId },
+            valueTransform = { tagsById[it.tagId]?.name },
+        )
+        .mapValues { (_, names) ->
+            names
+                .filterNotNull()
+                .sortedWith(
+                    compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) { it }.thenBy { it }
+                )
+        }
+}
 
 internal class InboxEntryCache {
     private data class CachedEntry(
@@ -62,21 +91,7 @@ internal fun buildSnapshot(
     activePeers: List<PeerNodeDto> = emptyList(),
     entryCache: InboxEntryCache? = null,
 ): RepositorySnapshot {
-    val tagsById = tags.associateBy { it.id }
-    val tagNamesByItemId =
-        itemTags
-            .groupBy(
-                keySelector = { it.itemId },
-                valueTransform = { tagsById[it.tagId]?.name },
-            )
-            .mapValues { (_, names) ->
-                names
-                    .filterNotNull()
-                    .sortedWith(
-                        compareBy<String, String>(String.CASE_INSENSITIVE_ORDER) { it }
-                            .thenBy { it }
-                    )
-            }
+    val tagNamesByItemId = groupSortedTagNamesByItemId(tags, itemTags)
 
     val domainEntries =
         if (entryCache != null) {
@@ -240,75 +255,26 @@ internal fun toRemoteFeedEntity(
     )
 }
 
-internal fun newerIsoTimestamp(first: String?, second: String?): String? {
-    val a = first?.trim()?.takeIf { it.isNotEmpty() }
-    val b = second?.trim()?.takeIf { it.isNotEmpty() }
-    if (a == null) return b
-    if (b == null) return a
-    val instA = runCatching { Instant.parse(a) }.getOrNull()
-    val instB = runCatching { Instant.parse(b) }.getOrNull()
-    return if (instA != null && instB != null) {
-        if (instB.isAfter(instA)) b else a
-    } else {
-        if (b > a) b else a
-    }
-}
-
 private fun String?.nonBlankOr(fallback: String?): String? =
     this?.takeIf { it.isNotBlank() } ?: fallback
 
 internal fun mergeRemoteItemIntoLocal(
     local: InboxItemRow,
     remote: RemoteItemDto,
-    adoptRemoteIdentity: Boolean,
 ): InboxItemRow =
     local.copy(
-        id = if (adoptRemoteIdentity) remote.id else local.id,
         title = remote.title.ifBlank { local.title },
         author = remote.author.nonBlankOr(local.author),
-        summary =
-            (if (adoptRemoteIdentity) {
-                    remote.summary ?: local.summary
-                } else {
-                    remote.summary.nonBlankOr(local.summary)
-                })
-                ?.take(MAX_SQLITE_SUMMARY_CHARS),
+        summary = remote.summary.nonBlankOr(local.summary)?.take(MAX_SQLITE_SUMMARY_CHARS),
         contentText =
-            (if (adoptRemoteIdentity) {
-                    remote.contentText ?: local.contentText
-                } else {
-                    remote.contentText.nonBlankOr(
-                        local.contentText?.takeIf { it.isNotBlank() && it != local.summary }
-                    )
-                })
+            remote.contentText
+                .nonBlankOr(local.contentText?.takeIf { it.isNotBlank() && it != local.summary })
                 ?.take(MAX_SQLITE_TEXT_CHARS),
         contentHtml = remote.contentHtml.nonBlankOr(local.contentHtml)?.take(MAX_SQLITE_HTML_CHARS),
-        contentType =
-            if (adoptRemoteIdentity) {
-                remote.contentType.ifBlank { local.contentType }
-            } else {
-                local.contentType
-            },
-        createdAt =
-            if (adoptRemoteIdentity) {
-                remote.createdAt.ifBlank { local.createdAt }
-            } else {
-                local.createdAt
-            },
         thumbnailMediaId = remote.thumbnailMediaId.nonBlankOr(local.thumbnailMediaId),
         duration = remote.duration.nonBlankOr(local.duration),
         thumbnailUrl = remote.thumbnailUrl.nonBlankOr(local.thumbnailUrl),
         audioUrl = remote.audioUrl.nonBlankOr(local.audioUrl),
-    )
-
-internal fun reconcileSavedItemEntity(
-    localEntity: InboxItemRow,
-    remoteSaved: RemoteItemDto,
-): InboxItemRow =
-    mergeRemoteItemIntoLocal(
-        local = localEntity,
-        remote = remoteSaved,
-        adoptRemoteIdentity = true,
     )
 
 internal fun createSavedItemEntity(
@@ -373,7 +339,3 @@ internal suspend fun attachTagsLocally(
         }
     }
 }
-
-internal const val MAX_SQLITE_SUMMARY_CHARS = 16_384
-internal const val MAX_SQLITE_TEXT_CHARS = 262_144
-internal const val MAX_SQLITE_HTML_CHARS = 512_000

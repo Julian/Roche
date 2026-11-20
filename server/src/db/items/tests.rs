@@ -312,7 +312,16 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
     assert_eq!(list_sorted[0].id, item_new.id);
     assert_eq!(list_sorted[1].id, item_old.id);
 
-    let normalized_count = items.normalize_legacy_html_summaries().await.unwrap();
+    let normalized_count = items
+        .normalize_legacy_html_summaries(|raw, _| {
+            if raw.contains("Clean &amp; fast") {
+                ("Clean & fast summary".to_owned(), Some("https://example.com/a.png".to_owned()))
+            } else {
+                (raw.to_owned(), None)
+            }
+        })
+        .await
+        .unwrap();
     assert_eq!(normalized_count, 1);
     let refreshed_new = items.get(&item_new.id).await.unwrap().unwrap();
     assert_eq!(refreshed_new.summary.as_deref(), Some("Clean & fast summary"));
@@ -332,10 +341,23 @@ async fn test_default_published_sort_summary_normalization_and_archive_batch() {
         })
         .await
         .unwrap();
-    assert_eq!(items.normalize_legacy_html_summaries().await.unwrap(), 1);
+    let decode_angle = |raw: &str, _: Option<&Url>| {
+        if raw.starts_with("<p>") && raw.ends_with("</p>") {
+            (
+                raw.trim_start_matches("<p>")
+                    .trim_end_matches("</p>")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">"),
+                None,
+            )
+        } else {
+            (raw.to_owned(), None)
+        }
+    };
+    assert_eq!(items.normalize_legacy_html_summaries(decode_angle).await.unwrap(), 1);
     let after_first = items.get(&item_angle.id).await.unwrap().unwrap();
     assert_eq!(after_first.summary.as_deref(), Some("Use <div> or x < y > z"));
-    assert_eq!(items.normalize_legacy_html_summaries().await.unwrap(), 0);
+    assert_eq!(items.normalize_legacy_html_summaries(decode_angle).await.unwrap(), 0);
     let after_second = items.get(&item_angle.id).await.unwrap().unwrap();
     assert_eq!(after_second.summary.as_deref(), Some("Use <div> or x < y > z"));
 

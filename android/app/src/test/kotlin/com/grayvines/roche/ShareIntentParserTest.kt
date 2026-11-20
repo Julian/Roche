@@ -10,9 +10,9 @@ import org.junit.jupiter.api.Test
 class ShareIntentParserTest {
 
     @Test
-    fun `extractSharedLink parses plain url and prefers subject or title extras`() {
+    fun `extractSharedContent parses plain url and prefers subject or title extras`() {
         val withSubject =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain; charset=utf-8",
                 extraText = "https://example.com/articles/42",
@@ -20,7 +20,7 @@ class ShareIntentParserTest {
                 extraTitle = "Fallback Title",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/articles/42",
                 title = "Systems Programming in 2026",
             ),
@@ -28,7 +28,7 @@ class ShareIntentParserTest {
         )
 
         val withTitleExtra =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "TEXT/PLAIN",
                 extraText = "https://example.com/articles/42",
@@ -36,7 +36,7 @@ class ShareIntentParserTest {
                 extraTitle = "  Fallback Title  ",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/articles/42",
                 title = "Fallback Title",
             ),
@@ -45,15 +45,15 @@ class ShareIntentParserTest {
     }
 
     @Test
-    fun `extractSharedLink extracts inline title prefix and markdown links`() {
+    fun `extractSharedContent extracts inline title prefix and markdown links`() {
         val newlineSeparated =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "Designing a Local-First Reader\nhttps://example.com/local-first",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/local-first",
                 title = "Designing a Local-First Reader",
             ),
@@ -61,13 +61,13 @@ class ShareIntentParserTest {
         )
 
         val dashSeparated =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "Memory Bandwidth Deep Dive — https://example.com/memory",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/memory",
                 title = "Memory Bandwidth Deep Dive",
             ),
@@ -75,13 +75,13 @@ class ShareIntentParserTest {
         )
 
         val markdownLink =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "[Designing a Reader](https://example.com/reader)",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/reader",
                 title = "Designing a Reader",
             ),
@@ -90,15 +90,15 @@ class ShareIntentParserTest {
     }
 
     @Test
-    fun `extractSharedLink unwraps surrounding quotes while preserving inner quotes and brackets`() {
+    fun `extractSharedContent unwraps surrounding quotes while preserving inner quotes and brackets`() {
         val fullyQuotedTitle =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "\"Designing a Reader\" — https://example.com/quoted",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/quoted",
                 title = "Designing a Reader",
             ),
@@ -106,13 +106,13 @@ class ShareIntentParserTest {
         )
 
         val titleEndingInQuotedWord =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "Why We Built \"Roche\" - https://example.com/roche",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/roche",
                 title = "Why We Built \"Roche\"",
             ),
@@ -120,13 +120,13 @@ class ShareIntentParserTest {
         )
 
         val multipleBracketedSegments =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "[2026] Systems Programming [Part 1] — https://example.com/sys",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/sys",
                 title = "[2026] Systems Programming [Part 1]",
             ),
@@ -135,15 +135,15 @@ class ShareIntentParserTest {
     }
 
     @Test
-    fun `extractSharedLink strips wrappers curly quotes and trailing punctuation`() {
+    fun `extractSharedContent strips wrappers curly quotes and trailing punctuation`() {
         val wrappedInParens =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "Check this out (https://example.com/a).",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/a",
                 title = "Check this out",
             ),
@@ -151,13 +151,13 @@ class ShareIntentParserTest {
         )
 
         val wrappedInAngleBrackets =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "<https://example.com/b>,",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/b",
                 title = null,
             ),
@@ -165,13 +165,13 @@ class ShareIntentParserTest {
         )
 
         val curlyQuotesAndEllipsis =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "“https://example.com/local-first…”",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://example.com/local-first",
                 title = null,
             ),
@@ -180,15 +180,15 @@ class ShareIntentParserTest {
     }
 
     @Test
-    fun `extractSharedLink preserves balanced parentheses inside wikipedia style urls`() {
+    fun `extractSharedContent preserves balanced parentheses inside wikipedia style urls`() {
         val wikipediaBalanced =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "https://en.wikipedia.org/wiki/Rust_(programming_language)",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://en.wikipedia.org/wiki/Rust_(programming_language)",
                 title = null,
             ),
@@ -196,13 +196,13 @@ class ShareIntentParserTest {
         )
 
         val wikipediaWrappedInOuterParens =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "(https://en.wikipedia.org/wiki/Rust_(programming_language)).",
             )
         assertEquals(
-            SharedLinkPayload(
+            SharedContentPayload(
                 url = "https://en.wikipedia.org/wiki/Rust_(programming_language)",
                 title = null,
             ),
@@ -211,57 +211,57 @@ class ShareIntentParserTest {
     }
 
     @Test
-    fun `extractSharedLink deduplicates title when subject matches url or is another raw url`() {
+    fun `extractSharedContent deduplicates title when subject matches url or is another raw url`() {
         val duplicateSubject =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "https://example.com/post",
                 extraSubject = "HTTPS://EXAMPLE.COM/POST",
             )
         assertEquals(
-            SharedLinkPayload(url = "https://example.com/post", title = null),
+            SharedContentPayload(url = "https://example.com/post", title = null),
             duplicateSubject,
         )
 
         val rawUrlSubject =
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "https://example.com/post",
                 extraSubject = "https://example.com/other",
             )
         assertEquals(
-            SharedLinkPayload(url = "https://example.com/post", title = null),
+            SharedContentPayload(url = "https://example.com/post", title = null),
             rawUrlSubject,
         )
     }
 
     @Test
-    fun `extractSharedLink rejects non-http schemes wrong intent metadata and blank text`() {
+    fun `extractSharedContent rejects non-http schemes wrong intent metadata and blank text`() {
         assertNull(
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "javascript:alert(1) file:///etc/passwd mailto:user@example.com",
             )
         )
         assertNull(
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_VIEW,
                 mimeType = "text/plain",
                 extraText = "https://example.com",
             )
         )
         assertNull(
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "image/png",
                 extraText = "https://example.com",
             )
         )
         assertNull(
-            extractSharedLink(
+            extractSharedContent(
                 action = Intent.ACTION_SEND,
                 mimeType = "text/plain",
                 extraText = "   ",

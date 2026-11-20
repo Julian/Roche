@@ -4,7 +4,13 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::{extract_entry_timestamp, select_entry_link};
-use crate::content::fetcher::{HtmlSanitizer, SafeHttpClient, is_direct_audio_url};
+use crate::{
+    content::HtmlSanitizer,
+    util::{
+        media_urls::is_direct_audio_url,
+        url_guard::{parse_public_url, validate_public_url},
+    },
+};
 
 #[derive(Debug, Clone)]
 pub struct RssFeed {
@@ -22,7 +28,7 @@ pub struct RssItem {
     pub thumbnail_url: Option<String>,
     pub audio_url: Option<Url>,
     pub duration: Option<i64>,
-    pub author: Option<String>,
+    pub authors: Vec<String>,
     pub pub_date: Option<DateTime<Utc>>,
 }
 
@@ -41,6 +47,210 @@ struct SupplementalFeedMeta {
     feed_image_url: Option<String>,
     feed_author: Option<String>,
     entries: Vec<SupplementalEntryMeta>,
+}
+
+#[derive(Debug, Default)]
+struct SupplementalXmlState {
+    meta: SupplementalFeedMeta,
+    current_entry: Option<SupplementalEntryMeta>,
+    source_depth: usize,
+    entry_child_depth: usize,
+    current_entry_has_alt_link: bool,
+    in_channel_image: bool,
+    active_text_tag: Option<&'static str>,
+    text_buf: String,
+}
+
+impl SupplementalXmlState {
+    fn handle_open_tag(&mut self, tag: &quick_xml::events::BytesStart<'_>, is_empty: bool) {
+        let qname = tag.name();
+        let raw_name = qname.as_ref();
+        if RssParser::is_source_tag(raw_name) {
+            if !is_empty {
+                self.source_depth += 1;
+                self.active_text_tag = None;
+            }
+            return;
+        }
+        if self.source_depth > 0 {
+            return;
+        }
+
+        if RssParser::is_entry_tag(raw_name) {
+            if let Some(unfinished) = self.current_entry.take() {
+                self.meta.entries.push(unfinished);
+            }
+            if is_empty {
+                self.meta.entries.push(SupplementalEntryMeta::default());
+            } else {
+                let mut next_entry = SupplementalEntryMeta::default();
+                if (raw_name.eq_ignore_ascii_case("item")
+                    || raw_name.eq_ignore_ascii_case("rdf:item"))
+                    && let Some(about) = RssParser::extract_attr(tag, "rdf:about")
+                {
+                    next_entry.entry_id = RssParser::normalize_entry_id(&about);
+                }
+                self.current_entry = Some(next_entry);
+            }
+            self.entry_child_depth = 0;
+            self.current_entry_has_alt_link = false;
+            self.active_text_tag = None;
+            return;
+        }
+
+        let is_direct_entry_child = self.current_entry.is_some() && self.entry_child_depth == 0;
+        if !is_empty && self.current_entry.is_some() {
+            self.entry_child_depth += 1;
+        }
+
+        let local = RssParser::local_tag_name(raw_name);
+        if local.eq_ignore_ascii_case("enclosure")
+            || (local.eq_ignore_ascii_case("link") && RssParser::is_enclosure_link(tag))
+        {
+            if let Some(ref mut entry) = self.current_entry
+                && entry.enclosure_url.is_none()
+            {
+                entry.enclosure_url = RssParser::inspect_enclosure_tag(tag);
+            }
+        } else if is_direct_entry_child
+            && RssParser::is_link_tag(raw_name)
+            && let Some(ref mut entry) = self.current_entry
+        {
+            if let Some(href) = RssParser::extract_attr(tag, "href") {
+                RssParser::record_atom_entry_link(
+                    entry,
+                    &mut self.current_entry_has_alt_link,
+                    tag,
+                    &href,
+                );
+            } else if !is_empty && entry.entry_link.is_none() {
+                self.begin_text_tag("entry_link");
+            }
+        } else if !is_empty
+            && is_direct_entry_child
+            && RssParser::is_entry_id_tag(raw_name)
+            && self.current_entry.as_ref().is_some_and(|e| e.entry_id.is_none())
+        {
+            self.begin_text_tag("entry_id");
+        } else if RssParser::is_itunes_image(raw_name) {
+            if let Some(href) = RssParser::extract_attr(tag, "href") {
+                if let Some(ref mut entry) = self.current_entry {
+                    if entry.itunes_image_url.is_none() {
+                        entry.itunes_image_url = Some(href);
+                    }
+                } else if self.meta.feed_image_url.is_none() {
+                    self.meta.feed_image_url = Some(href);
+                }
+            }
+        } else if !is_empty {
+            self.handle_non_empty_text_or_container_tag(raw_name);
+        }
+    }
+
+    fn begin_text_tag(&mut self, kind: &'static str) {
+        self.active_text_tag = Some(kind);
+        self.text_buf.clear();
+    }
+
+    fn handle_non_empty_text_or_container_tag(&mut self, raw_name: &str) {
+        if self.current_entry.is_none() && raw_name.eq_ignore_ascii_case("image") {
+            self.in_channel_image = true;
+        } else if self.in_channel_image
+            && self.current_entry.is_none()
+            && raw_name.eq_ignore_ascii_case("url")
+        {
+            self.begin_text_tag("channel_image_url");
+        } else if RssParser::is_itunes_duration(raw_name) && self.current_entry.is_some() {
+            self.begin_text_tag("duration");
+        } else if RssParser::is_itunes_author(raw_name) {
+            self.begin_text_tag("itunes_author");
+        }
+    }
+
+    fn handle_end_tag(&mut self, raw_name: &str) {
+        if RssParser::is_source_tag(raw_name) {
+            self.source_depth = self.source_depth.saturating_sub(1);
+            return;
+        }
+        if self.source_depth > 0 {
+            return;
+        }
+        if RssParser::is_entry_tag(raw_name) {
+            if let Some(finished) = self.current_entry.take() {
+                self.meta.entries.push(finished);
+            }
+            self.entry_child_depth = 0;
+            self.current_entry_has_alt_link = false;
+            self.active_text_tag = None;
+            return;
+        }
+
+        if self.current_entry.is_some() {
+            self.entry_child_depth = self.entry_child_depth.saturating_sub(1);
+        }
+        if raw_name.eq_ignore_ascii_case("image") && self.current_entry.is_none() {
+            self.in_channel_image = false;
+            if self.active_text_tag == Some("channel_image_url") {
+                self.active_text_tag = None;
+            }
+        } else if self
+            .active_text_tag
+            .is_some_and(|kind| RssParser::matches_active_text_end_tag(kind, raw_name))
+            && let Some(kind) = self.active_text_tag.take()
+        {
+            self.commit_active_text(kind);
+        }
+    }
+
+    fn commit_active_text(&mut self, kind: &str) {
+        let val = self.text_buf.trim();
+        if val.is_empty() {
+            return;
+        }
+        match kind {
+            "entry_id" => {
+                if let Some(ref mut entry) = self.current_entry
+                    && entry.entry_id.is_none()
+                {
+                    entry.entry_id = RssParser::normalize_entry_id(val);
+                }
+            }
+            "entry_link" => {
+                if let Some(ref mut entry) = self.current_entry
+                    && entry.entry_link.is_none()
+                {
+                    entry.entry_link = Some(val.to_owned());
+                }
+            }
+            "duration" => {
+                if let Some(ref mut entry) = self.current_entry
+                    && entry.duration_secs.is_none()
+                {
+                    entry.duration_secs = RssParser::parse_duration_seconds(val);
+                }
+            }
+            "itunes_author" => {
+                if let Some(ref mut entry) = self.current_entry {
+                    if entry.itunes_author.is_none() {
+                        entry.itunes_author = Some(val.to_owned());
+                    }
+                } else if self.meta.feed_author.is_none() {
+                    self.meta.feed_author = Some(val.to_owned());
+                }
+            }
+            "channel_image_url" if self.meta.feed_image_url.is_none() => {
+                self.meta.feed_image_url = Some(val.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> SupplementalFeedMeta {
+        if let Some(unfinished) = self.current_entry.take() {
+            self.meta.entries.push(unfinished);
+        }
+        self.meta
+    }
 }
 
 pub struct RssParser;
@@ -106,7 +316,7 @@ impl RssParser {
                     media_audio_url.or_else(|| supp.and_then(|s| s.enclosure_url.clone()));
                 let duration = media_duration.or_else(|| supp.and_then(|s| s.duration_secs));
                 let link = primary_link
-                    .or_else(|| SafeHttpClient::parse_url(&entry.id).ok())
+                    .or_else(|| parse_public_url(&entry.id).ok())
                     .or_else(|| audio_url.clone());
                 let base_for_thumb = link.as_ref().or(feed_base_url.as_ref());
                 let thumbnail_url = Self::extract_entry_thumbnail_url(&entry, base_for_thumb)
@@ -122,20 +332,12 @@ impl RssParser {
                 let description = summary.clone().or_else(|| body.clone()).unwrap_or_default();
                 let content_html = body.or(summary);
 
-                let authors: Vec<String> = entry
-                    .authors
-                    .into_iter()
-                    .filter_map(|a| {
-                        let trimmed = a.name.as_deref()?.trim();
-                        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-                    })
-                    .collect();
-                let author = (!authors.is_empty())
-                    .then(|| authors.join(", "))
-                    .or_else(|| supp.and_then(|s| s.itunes_author.clone()))
-                    .or_else(|| {
-                        audio_url.is_some().then(|| supplemental.feed_author.clone()).flatten()
-                    });
+                let authors = Self::extract_entry_authors(
+                    entry.authors,
+                    supp,
+                    audio_url.is_some(),
+                    supplemental.feed_author.as_deref(),
+                );
 
                 RssItem {
                     title,
@@ -145,13 +347,38 @@ impl RssParser {
                     thumbnail_url,
                     audio_url,
                     duration,
-                    author,
+                    authors,
                     pub_date,
                 }
             })
             .collect();
 
         Ok((parsed_feed, items))
+    }
+
+    fn extract_entry_authors(
+        entry_authors: Vec<feed_rs::model::Person>,
+        supp: Option<&SupplementalEntryMeta>,
+        has_audio: bool,
+        feed_author: Option<&str>,
+    ) -> Vec<String> {
+        let mut authors: Vec<String> = entry_authors
+            .into_iter()
+            .filter_map(|a| {
+                let trimmed = a.name.as_deref()?.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            })
+            .collect();
+        if authors.is_empty()
+            && let Some(fallback) = supp
+                .and_then(|s| s.itunes_author.as_deref())
+                .or_else(|| has_audio.then_some(feed_author).flatten())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            authors.push(fallback.to_owned());
+        }
+        authors
     }
 
     fn match_supplemental_entry<'a>(
@@ -207,11 +434,11 @@ impl RssParser {
         if trimmed.is_empty() {
             return None;
         }
-        if let Ok(url) = SafeHttpClient::parse_url(trimmed) {
+        if let Ok(url) = parse_public_url(trimmed) {
             return Some(url.into());
         }
         let joined = base_url?.join(trimmed).ok()?;
-        SafeHttpClient::validate_url(&joined).ok()?;
+        validate_public_url(&joined).ok()?;
         Some(joined.into())
     }
 
@@ -232,7 +459,7 @@ impl RssParser {
                 if found_url.is_none()
                     && let Some(ref url) = content.url
                     && (is_audio_mime || is_direct_audio_url(url))
-                    && SafeHttpClient::validate_url(url).is_ok()
+                    && validate_public_url(url).is_ok()
                 {
                     found_url = Some(url.clone());
                     found_duration = content
@@ -253,7 +480,7 @@ impl RssParser {
                     .as_deref()
                     .is_some_and(|mt| mt.trim().to_ascii_lowercase().starts_with("audio/"));
                 if is_enclosure
-                    && let Ok(parsed) = SafeHttpClient::parse_url(&link.href)
+                    && let Ok(parsed) = parse_public_url(&link.href)
                     && (is_audio_mime || is_direct_audio_url(&parsed))
                 {
                     found_url = Some(parsed);
@@ -288,247 +515,34 @@ impl RssParser {
         (total > 0).then_some(total)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn extract_supplemental_xml_metadata(content: &str) -> SupplementalFeedMeta {
         let mut reader = Reader::from_str(content);
         reader.config_mut().check_end_names = false;
-
-        let mut meta = SupplementalFeedMeta::default();
-        let mut current_entry: Option<SupplementalEntryMeta> = None;
-        let mut source_depth: usize = 0;
-        let mut entry_child_depth: usize = 0;
-        let mut current_entry_has_alt_link = false;
-        let mut in_channel_image = false;
-        let mut active_text_tag: Option<&'static str> = None;
-        let mut text_buf = String::new();
+        let mut state = SupplementalXmlState::default();
 
         loop {
             match reader.read_event() {
-                Ok(Event::Start(tag)) => {
-                    let qname = tag.name();
-                    let raw_name = qname.as_ref();
-                    if Self::is_source_tag(raw_name) {
-                        source_depth += 1;
-                        active_text_tag = None;
-                        continue;
-                    }
-                    if source_depth > 0 {
-                        continue;
-                    }
-                    let local = Self::local_tag_name(raw_name);
-                    if Self::is_entry_tag(raw_name) {
-                        if let Some(unfinished) = current_entry.take() {
-                            meta.entries.push(unfinished);
-                        }
-                        let mut next_entry = SupplementalEntryMeta::default();
-                        if (raw_name.eq_ignore_ascii_case("item")
-                            || raw_name.eq_ignore_ascii_case("rdf:item"))
-                            && let Some(about) = Self::extract_attr(&tag, "rdf:about")
-                        {
-                            next_entry.entry_id = Self::normalize_entry_id(&about);
-                        }
-                        current_entry = Some(next_entry);
-                        entry_child_depth = 0;
-                        current_entry_has_alt_link = false;
-                        active_text_tag = None;
-                    } else {
-                        if current_entry.is_some() {
-                            entry_child_depth += 1;
-                        }
-                        if local.eq_ignore_ascii_case("enclosure")
-                            || (local.eq_ignore_ascii_case("link") && Self::is_enclosure_link(&tag))
-                        {
-                            if let Some(ref mut entry) = current_entry
-                                && entry.enclosure_url.is_none()
-                            {
-                                entry.enclosure_url = Self::inspect_enclosure_tag(&tag);
-                            }
-                        } else if entry_child_depth == 1
-                            && Self::is_link_tag(raw_name)
-                            && let Some(ref mut entry) = current_entry
-                        {
-                            if let Some(href) = Self::extract_attr(&tag, "href") {
-                                Self::record_atom_entry_link(
-                                    entry,
-                                    &mut current_entry_has_alt_link,
-                                    &tag,
-                                    &href,
-                                );
-                            } else if entry.entry_link.is_none() {
-                                active_text_tag = Some("entry_link");
-                                text_buf.clear();
-                            }
-                        } else if entry_child_depth == 1
-                            && Self::is_entry_id_tag(raw_name)
-                            && current_entry.as_ref().is_some_and(|e| e.entry_id.is_none())
-                        {
-                            active_text_tag = Some("entry_id");
-                            text_buf.clear();
-                        } else if Self::is_itunes_image(raw_name) {
-                            if let Some(href) = Self::extract_attr(&tag, "href") {
-                                if let Some(ref mut entry) = current_entry {
-                                    if entry.itunes_image_url.is_none() {
-                                        entry.itunes_image_url = Some(href);
-                                    }
-                                } else if meta.feed_image_url.is_none() {
-                                    meta.feed_image_url = Some(href);
-                                }
-                            }
-                        } else if current_entry.is_none() && raw_name.eq_ignore_ascii_case("image")
-                        {
-                            in_channel_image = true;
-                        } else if in_channel_image
-                            && current_entry.is_none()
-                            && raw_name.eq_ignore_ascii_case("url")
-                        {
-                            active_text_tag = Some("channel_image_url");
-                            text_buf.clear();
-                        } else if Self::is_itunes_duration(raw_name) && current_entry.is_some() {
-                            active_text_tag = Some("duration");
-                            text_buf.clear();
-                        } else if Self::is_itunes_author(raw_name) {
-                            active_text_tag = Some("itunes_author");
-                            text_buf.clear();
-                        }
-                    }
+                Ok(Event::Start(tag)) => state.handle_open_tag(&tag, false),
+                Ok(Event::Empty(tag)) => state.handle_open_tag(&tag, true),
+                Ok(Event::Text(text)) if state.active_text_tag.is_some() => {
+                    state.text_buf.push_str(&crate::content::xml_util::decode_text(&text));
                 }
-                Ok(Event::Empty(tag)) => {
-                    let qname = tag.name();
-                    let raw_name = qname.as_ref();
-                    if source_depth > 0 || Self::is_source_tag(raw_name) {
-                        continue;
-                    }
-                    let local = Self::local_tag_name(raw_name);
-                    if Self::is_entry_tag(raw_name) {
-                        if let Some(unfinished) = current_entry.take() {
-                            meta.entries.push(unfinished);
-                        }
-                        meta.entries.push(SupplementalEntryMeta::default());
-                        entry_child_depth = 0;
-                        current_entry_has_alt_link = false;
-                        active_text_tag = None;
-                    } else if local.eq_ignore_ascii_case("enclosure")
-                        || (local.eq_ignore_ascii_case("link") && Self::is_enclosure_link(&tag))
-                    {
-                        if let Some(ref mut entry) = current_entry
-                            && entry.enclosure_url.is_none()
-                        {
-                            entry.enclosure_url = Self::inspect_enclosure_tag(&tag);
-                        }
-                    } else if entry_child_depth == 0
-                        && Self::is_link_tag(raw_name)
-                        && let Some(ref mut entry) = current_entry
-                        && let Some(href) = Self::extract_attr(&tag, "href")
-                    {
-                        Self::record_atom_entry_link(
-                            entry,
-                            &mut current_entry_has_alt_link,
-                            &tag,
-                            &href,
-                        );
-                    } else if Self::is_itunes_image(raw_name)
-                        && let Some(href) = Self::extract_attr(&tag, "href")
-                    {
-                        if let Some(ref mut entry) = current_entry {
-                            if entry.itunes_image_url.is_none() {
-                                entry.itunes_image_url = Some(href);
-                            }
-                        } else if meta.feed_image_url.is_none() {
-                            meta.feed_image_url = Some(href);
-                        }
-                    }
+                Ok(Event::GeneralRef(entity)) if state.active_text_tag.is_some() => {
+                    state.text_buf.push_str(&crate::content::xml_util::decode_entity(&entity));
                 }
-                Ok(Event::Text(text)) if active_text_tag.is_some() => {
-                    text_buf.push_str(&crate::content::xml_util::decode_text(&text));
-                }
-                Ok(Event::GeneralRef(entity)) if active_text_tag.is_some() => {
-                    text_buf.push_str(&crate::content::xml_util::decode_entity(&entity));
-                }
-                Ok(Event::CData(cdata)) if active_text_tag.is_some() => {
-                    text_buf.push_str(cdata.as_ref());
+                Ok(Event::CData(cdata)) if state.active_text_tag.is_some() => {
+                    state.text_buf.push_str(cdata.as_ref());
                 }
                 Ok(Event::End(tag)) => {
                     let qname = tag.name();
-                    let raw_name = qname.as_ref();
-                    if Self::is_source_tag(raw_name) {
-                        source_depth = source_depth.saturating_sub(1);
-                        continue;
-                    }
-                    if source_depth > 0 {
-                        continue;
-                    }
-                    if Self::is_entry_tag(raw_name) {
-                        if let Some(finished) = current_entry.take() {
-                            meta.entries.push(finished);
-                        }
-                        entry_child_depth = 0;
-                        current_entry_has_alt_link = false;
-                        active_text_tag = None;
-                    } else {
-                        if current_entry.is_some() {
-                            entry_child_depth = entry_child_depth.saturating_sub(1);
-                        }
-                        if raw_name.eq_ignore_ascii_case("image") && current_entry.is_none() {
-                            in_channel_image = false;
-                            if active_text_tag == Some("channel_image_url") {
-                                active_text_tag = None;
-                            }
-                        } else if active_text_tag
-                            .is_some_and(|kind| Self::matches_active_text_end_tag(kind, raw_name))
-                            && let Some(kind) = active_text_tag.take()
-                        {
-                            let val = text_buf.trim();
-                            if !val.is_empty() {
-                                match kind {
-                                    "entry_id" => {
-                                        if let Some(ref mut entry) = current_entry
-                                            && entry.entry_id.is_none()
-                                        {
-                                            entry.entry_id = Self::normalize_entry_id(val);
-                                        }
-                                    }
-                                    "entry_link" => {
-                                        if let Some(ref mut entry) = current_entry
-                                            && entry.entry_link.is_none()
-                                        {
-                                            entry.entry_link = Some(val.to_owned());
-                                        }
-                                    }
-                                    "duration" => {
-                                        if let Some(ref mut entry) = current_entry
-                                            && entry.duration_secs.is_none()
-                                        {
-                                            entry.duration_secs = Self::parse_duration_seconds(val);
-                                        }
-                                    }
-                                    "itunes_author" => {
-                                        if let Some(ref mut entry) = current_entry {
-                                            if entry.itunes_author.is_none() {
-                                                entry.itunes_author = Some(val.to_owned());
-                                            }
-                                        } else if meta.feed_author.is_none() {
-                                            meta.feed_author = Some(val.to_owned());
-                                        }
-                                    }
-                                    "channel_image_url" if meta.feed_image_url.is_none() => {
-                                        meta.feed_image_url = Some(val.to_owned());
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
+                    state.handle_end_tag(qname.as_ref());
                 }
                 Ok(Event::Eof) | Err(_) => break,
                 _ => {}
             }
         }
 
-        if let Some(unfinished) = current_entry.take() {
-            meta.entries.push(unfinished);
-        }
-
-        meta
+        state.finish()
     }
 
     fn record_atom_entry_link(
@@ -613,7 +627,7 @@ impl RssParser {
 
     fn inspect_enclosure_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<Url> {
         let url_str = Self::extract_attr(tag, "url").or_else(|| Self::extract_attr(tag, "href"))?;
-        let parsed = SafeHttpClient::parse_url(&url_str).ok()?;
+        let parsed = parse_public_url(&url_str).ok()?;
         let mime = Self::extract_attr(tag, "type").unwrap_or_default().to_ascii_lowercase();
         if mime.starts_with("audio/") || is_direct_audio_url(&parsed) { Some(parsed) } else { None }
     }
@@ -639,7 +653,7 @@ impl RssParser {
                     let has_img_ext = Self::has_image_extension(url.path());
                     if (is_image_mime || has_img_ext)
                         && !HtmlSanitizer::is_non_thumbnail_url(url)
-                        && SafeHttpClient::validate_url(url).is_ok()
+                        && validate_public_url(url).is_ok()
                     {
                         return Some(url.as_str().to_owned());
                     }
@@ -774,7 +788,7 @@ mod tests {
             items[0].thumbnail_url.as_deref(),
             Some("https://cdn.example.com/acquired-cover.jpg")
         );
-        assert_eq!(items[0].author.as_deref(), Some("Ben Gilbert & David Rosenthal"));
+        assert_eq!(items[0].authors, vec!["Ben Gilbert & David Rosenthal"]);
 
         // Second item has no <link> and non-URL <guid>, so link falls back to audio_url
         assert_eq!(
@@ -790,7 +804,7 @@ mod tests {
             items[1].thumbnail_url.as_deref(),
             Some("https://cdn.example.com/ep-custom-art.png")
         );
-        assert_eq!(items[1].author.as_deref(), Some("Guest Host"));
+        assert_eq!(items[1].authors, vec!["Guest Host"]);
     }
 
     #[test]
@@ -859,7 +873,7 @@ mod tests {
         );
         assert_eq!(items[0].duration, Some(15 * 60 + 30));
         assert_eq!(items[0].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-1.jpg"));
-        assert_eq!(items[0].author.as_deref(), Some("Host One"));
+        assert_eq!(items[0].authors, vec!["Host One"]);
 
         assert_eq!(items[1].title, "Episode 2 Missing ID Matched By Link");
         assert_eq!(
@@ -872,7 +886,7 @@ mod tests {
         );
         assert_eq!(items[1].duration, Some(42 * 60 + 10));
         assert_eq!(items[1].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-2.jpg"));
-        assert_eq!(items[1].author.as_deref(), Some("Host Two"));
+        assert_eq!(items[1].authors, vec!["Host Two"]);
 
         assert_eq!(items[2].title, "Episode 3 Missing ID And Link");
         assert_eq!(
@@ -881,7 +895,7 @@ mod tests {
         );
         assert_eq!(items[2].duration, Some(8 * 60 + 5));
         assert_eq!(items[2].thumbnail_url.as_deref(), Some("https://cdn.example.com/art/ep-3.jpg"));
-        assert_eq!(items[2].author.as_deref(), Some("Host Three"));
+        assert_eq!(items[2].authors, vec!["Host Three"]);
     }
 
     #[test]

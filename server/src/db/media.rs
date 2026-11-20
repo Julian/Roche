@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{
     ActivityAction, ActivityEntityType, MediaType, SyncRepo, sync::deterministic_enclosure_media_id,
 };
-use crate::media::MediaStore;
+use crate::util::clock::now_utc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
@@ -37,6 +37,40 @@ impl<'a> MediaRepo<'a> {
         Self { pool }
     }
 
+    async fn insert_media_row_in_tx(
+        tx: &mut SqliteConnection,
+        item_id: &str,
+        spec: &NewMediaSpec<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Media> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query!(
+            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
+             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+            id,
+            item_id,
+            spec.media_type as _,
+            spec.path,
+            spec.file_size,
+            spec.duration,
+            now as _,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        SyncRepo::record_activity(tx, ActivityEntityType::Media, &id, ActivityAction::Create, now)
+            .await?;
+
+        Ok(Media {
+            id,
+            item_id: item_id.to_owned(),
+            media_type: spec.media_type,
+            path: spec.path.to_owned(),
+            file_size: spec.file_size,
+            duration: spec.duration,
+        })
+    }
+
     pub async fn create_batch(
         &self,
         item_id: &str,
@@ -45,43 +79,12 @@ impl<'a> MediaRepo<'a> {
         if specs.is_empty() {
             return Ok(Vec::new());
         }
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let mut out = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            let id = Uuid::new_v4().to_string();
-            sqlx::query!(
-                "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
-                 VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-                id,
-                item_id,
-                spec.media_type as _,
-                spec.path,
-                spec.file_size,
-                spec.duration,
-                now as _,
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            SyncRepo::record_activity(
-                &mut tx,
-                ActivityEntityType::Media,
-                &id,
-                ActivityAction::Create,
-                now,
-            )
-            .await?;
-
-            out.push(Media {
-                id,
-                item_id: item_id.to_owned(),
-                media_type: spec.media_type,
-                path: spec.path.to_owned(),
-                file_size: spec.file_size,
-                duration: spec.duration,
-            });
+            out.push(Self::insert_media_row_in_tx(&mut tx, item_id, spec, now).await?);
         }
 
         tx.commit().await?;
@@ -126,43 +129,17 @@ impl<'a> MediaRepo<'a> {
         file_size: Option<i64>,
         duration: Option<i64>,
     ) -> Result<Media> {
-        let id = Uuid::new_v4().to_string();
-        let now = SyncRepo::now_utc();
+        let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-
-        sqlx::query!(
-            "INSERT INTO entry_media (id, entry_id, media_type, remote_url, local_path, file_size, duration, created_at)
-             VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
-            id,
-            item_id,
-            media_type as _,
-            path,
-            file_size,
-            duration,
-            now as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        SyncRepo::record_activity(
+        let media = Self::insert_media_row_in_tx(
             &mut tx,
-            ActivityEntityType::Media,
-            &id,
-            ActivityAction::Create,
+            item_id,
+            &NewMediaSpec { media_type, path, file_size, duration },
             now,
         )
         .await?;
-
         tx.commit().await?;
-
-        Ok(Media {
-            id,
-            item_id: item_id.to_string(),
-            media_type,
-            path: path.to_string(),
-            file_size,
-            duration,
-        })
+        Ok(media)
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Media>> {
@@ -194,27 +171,6 @@ impl<'a> MediaRepo<'a> {
              FROM entry_media m
              WHERE m.local_path IS NOT NULL AND m.entry_id = ?",
             item_id,
-        )
-        .fetch_all(self.pool)
-        .await?)
-    }
-
-    pub async fn list_for_feed(&self, feed_id: &str) -> Result<Vec<Media>> {
-        Ok(sqlx::query_as!(
-            Media,
-            "SELECT m.id,
-                    m.entry_id AS item_id,
-                    m.media_type AS \"media_type: MediaType\",
-                    m.local_path AS \"path!: String\",
-                    m.file_size,
-                    m.duration
-             FROM entry_media m
-             WHERE m.local_path IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM collection_entries ce
-                   WHERE ce.entry_id = m.entry_id AND ce.collection_id = ?
-               )",
-            feed_id,
         )
         .fetch_all(self.pool)
         .await?)
@@ -257,16 +213,18 @@ impl<'a> MediaRepo<'a> {
         .await?)
     }
 
-    pub async fn delete(&self, id: &str) -> Result<()> {
-        let now = SyncRepo::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
+    async fn delete_local_in_tx(
+        tx: &mut SqliteConnection,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(), sqlx::Error> {
         let res =
             sqlx::query!("DELETE FROM entry_media WHERE id = ? AND local_path IS NOT NULL", id,)
                 .execute(&mut *tx)
                 .await?;
         if res.rows_affected() > 0 {
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::Media,
                 id,
                 ActivityAction::Delete,
@@ -274,22 +232,31 @@ impl<'a> MediaRepo<'a> {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        Self::delete_local_in_tx(&mut tx, id, now).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    pub async fn delete_with_files(
-        &self,
-        store: &MediaStore,
-        media_list: Vec<Media>,
-    ) -> Result<()> {
-        for media in media_list {
-            if let Err(e) = store.remove(&media.path).await {
-                tracing::warn!(path = %media.path, error = %e, "Skipped removing media outside media_dir or failed I/O");
-            }
-            self.delete(&media.id).await?;
+    /// Deletes any remaining local media rows for `media_list` in a single write transaction
+    /// (recording delete activity for each deleted row) and returns `media_list` so callers
+    /// can unlink the corresponding files on disk.
+    pub async fn delete_rows_returning(&self, media_list: Vec<Media>) -> Result<Vec<Media>> {
+        if media_list.is_empty() {
+            return Ok(media_list);
         }
-        Ok(())
+        let now = now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        for media in &media_list {
+            Self::delete_local_in_tx(&mut tx, &media.id, now).await?;
+        }
+        tx.commit().await?;
+        Ok(media_list)
     }
 
     pub async fn find_orphaned(&self) -> Result<Vec<Media>> {

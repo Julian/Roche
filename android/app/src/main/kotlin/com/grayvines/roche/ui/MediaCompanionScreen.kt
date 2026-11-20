@@ -3,7 +3,6 @@
 package com.grayvines.roche.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -24,12 +23,10 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,24 +42,26 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.CatalogListSummary
-import com.grayvines.roche.data.CollectionDrawSnapshot
-import com.grayvines.roche.data.CollectionMode
-import com.grayvines.roche.data.CollectionRole
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.DiaryEntryItem
-import com.grayvines.roche.data.RankedCatalogEntry
-import com.grayvines.roche.data.STARRED_COLLECTION_ID
-import com.grayvines.roche.data.WANT_TO_READ_COLLECTION_ID
-import com.grayvines.roche.data.generatorFor
+import com.grayvines.roche.core.STARRED_COLLECTION_ID
+import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
+import com.grayvines.roche.data.catalog.CatalogListSummary
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.CollectionMode
+import com.grayvines.roche.data.catalog.CollectionRole
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.RankedCatalogEntry
+import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
-import com.grayvines.roche.ui.components.RefreshIcon
+import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheButtonStyle
-import com.grayvines.roche.ui.components.RocheIconActionButton
+import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SyncHeaderActionButton
+import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 import java.util.Locale
@@ -78,49 +77,47 @@ fun MediaCompanionScreen(
     val colors = LocalRocheColors.current
     var showCreateListDialog by rememberSaveable { mutableStateOf(false) }
 
-    Column(modifier = Modifier.fillMaxSize().testTag("lists_companion_screen")) {
-        CompanionTopBar(state = state, onAction = onAction)
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        CompanionSubTabBar(
-            activeSubTab = state.companionSubTab,
-            wantCount = state.catalog.wantItemCount,
-            onSelect = { onAction(MainAction.SelectCompanionSubTab(it)) },
-        )
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-
-        PullToRefreshBox(
-            isRefreshing = state.isSyncing,
-            onRefresh = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.fillMaxSize().testTag("lists_pull_to_refresh"),
-        ) {
-            when (state.companionSubTab) {
-                CompanionSubTab.LISTS ->
-                    RankedListsPane(
-                        state = state,
-                        listState = listState,
-                        onAction = onAction,
-                        onOpenCreateList = { showCreateListDialog = true },
-                        onOpenCollectionDraw = onOpenCollectionDraw,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                    )
-                CompanionSubTab.DIARY ->
-                    DiaryHistoryPane(
-                        state = state,
-                        diaryEntries = state.catalog.diaryEntries,
-                        listState = listState,
-                        onAction = onAction,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                        onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
-                    )
-                CompanionSubTab.WANT ->
-                    WantQueuesPane(
-                        state = state,
-                        listState = listState,
-                        onAction = onAction,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                    )
-            }
+    RocheRefreshableTabScaffold(
+        isRefreshing = state.isSyncing,
+        onRefresh = { onAction(MainAction.SyncNow) },
+        pullToRefreshTestTag = "lists_pull_to_refresh",
+        modifier = Modifier.testTag("lists_companion_screen"),
+        header = { CompanionTopBar(state = state, onAction = onAction) },
+        subHeader = {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+            CompanionSubTabBar(
+                activeSubTab = state.companionSubTab,
+                wantCount = state.catalog.wantItemCount,
+                onSelect = { onAction(MainAction.SelectCompanionSubTab(it)) },
+            )
+        },
+    ) {
+        when (state.companionSubTab) {
+            CompanionSubTab.LISTS ->
+                RankedListsPane(
+                    state = state,
+                    listState = listState,
+                    onAction = onAction,
+                    onOpenCreateList = { showCreateListDialog = true },
+                    onOpenCollectionDraw = onOpenCollectionDraw,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
+            CompanionSubTab.DIARY ->
+                DiaryHistoryPane(
+                    state = state,
+                    diaryEntries = state.catalog.diaryEntries,
+                    listState = listState,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                    onOpenQuickLog = { onAction(MainAction.OpenQuickLogSheet(false)) },
+                )
+            CompanionSubTab.WANT ->
+                WantQueuesPane(
+                    state = state,
+                    listState = listState,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
         }
     }
 
@@ -140,24 +137,17 @@ private fun CompanionTopBar(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
 ) {
-    val colors = LocalRocheColors.current
     val baseSubtitle =
         "${state.catalog.consumedCount} logged · ${state.catalog.comparisonCount} ranked"
     RocheTopHeader(
         title = "Lists & Diary",
         subtitle = if (state.isSyncing) "$baseSubtitle · Refreshing…" else baseSubtitle,
     ) {
-        RocheIconActionButton(
-            contentDescription = "Sync",
+        SyncHeaderActionButton(
+            isSyncing = state.isSyncing,
             onClick = { onAction(MainAction.SyncNow) },
             modifier = Modifier.testTag("companion_sync_btn"),
-        ) {
-            RefreshIcon(
-                tint = if (state.isSyncing) colors.accentBlue else colors.textSecondary,
-                size = 17.dp,
-                isSpinning = state.isSyncing,
-            )
-        }
+        )
         HeaderActionButton(
             label = "+ Log / Want",
             style = RocheButtonStyle.PRIMARY,
@@ -378,7 +368,13 @@ private fun RankedListLazyColumn(
         }
         items(rankedEntries, key = { it.entry.id }) { item ->
             val onOpen =
-                resolveCatalogEntryOpenAction(item, readableIds, onAction, onOpenExternalUrl)
+                resolveCatalogEntryOpenAction(
+                    entryId = item.entry.id,
+                    externalUrl = item.entry.url,
+                    readableIds = readableIds,
+                    onOpenReader = { onAction(MainAction.OpenReader(it)) },
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
             RankedEntryCardRow(
                 item = item,
                 showQualityMeta = activeList?.isPriorityScoped != true,
@@ -393,24 +389,6 @@ private fun RankedListLazyColumn(
             )
         }
         item { Spacer(modifier = Modifier.height(72.dp)) }
-    }
-}
-
-private fun resolveCatalogEntryOpenAction(
-    item: RankedCatalogEntry,
-    readableIds: Set<String>,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-): (() -> Unit)? {
-    val extUrl = item.entry.url?.takeIf { it.isNotBlank() }
-    return when {
-        item.entry.id in readableIds -> {
-            { onAction(MainAction.OpenReader(item.entry.id)) }
-        }
-        extUrl != null -> {
-            { onOpenExternalUrl(extUrl) }
-        }
-        else -> null
     }
 }
 
@@ -763,17 +741,14 @@ private fun DiaryHistoryPane(
                 RocheSectionHeader(label = monthKey)
             }
             items(itemsInMonth, key = { it.id }) { diary ->
-                val extUrl = catalogUrlsById[diary.entryId]
-                val onOpen: (() -> Unit)? =
-                    when {
-                        diary.entryId in readableIds -> {
-                            { onAction(MainAction.OpenReader(diary.entryId)) }
-                        }
-                        extUrl != null -> {
-                            { onOpenExternalUrl(extUrl) }
-                        }
-                        else -> null
-                    }
+                val onOpen =
+                    resolveCatalogEntryOpenAction(
+                        entryId = diary.entryId,
+                        externalUrl = catalogUrlsById[diary.entryId],
+                        readableIds = readableIds,
+                        onOpenReader = { onAction(MainAction.OpenReader(it)) },
+                        onOpenExternalUrl = onOpenExternalUrl,
+                    )
                 DiaryLogCard(diary = diary, onOpen = onOpen)
             }
         }
@@ -1004,18 +979,14 @@ private fun WantQueueEntriesList(
         modifier = Modifier.fillMaxSize(),
     ) {
         items(entries, key = { it.entry.id }) { item ->
-            val canOpenReader = item.entry.id in readableIds
-            val extUrl = item.entry.url?.takeIf { it.isNotBlank() }
-            val onOpen: (() -> Unit)? =
-                when {
-                    canOpenReader -> {
-                        { onAction(MainAction.OpenReader(item.entry.id)) }
-                    }
-                    extUrl != null -> {
-                        { onOpenExternalUrl(extUrl) }
-                    }
-                    else -> null
-                }
+            val onOpen =
+                resolveCatalogEntryOpenAction(
+                    entryId = item.entry.id,
+                    externalUrl = item.entry.url,
+                    readableIds = readableIds,
+                    onOpenReader = { onAction(MainAction.OpenReader(it)) },
+                    onOpenExternalUrl = onOpenExternalUrl,
+                )
             WantQueueRowCard(
                 item = item,
                 onOpen = onOpen,
@@ -1113,7 +1084,7 @@ private fun CompanionEmptyCard(
                 Text(
                     text = title,
                     color = colors.textPrimary,
-                    fontFamily = FontFamily.Serif,
+                    fontFamily = currentHeadlineFontFamily(),
                     fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -1140,9 +1111,9 @@ private fun CreateCustomListDialog(
     onCreate: (String) -> Unit,
 ) {
     var title by rememberSaveable { mutableStateOf("") }
-    AlertDialog(
+    RocheAlertDialog(
+        title = "Create Custom List",
         onDismissRequest = onDismiss,
-        title = { Text("Create Custom List") },
         text = {
             OutlinedTextField(
                 value = title,

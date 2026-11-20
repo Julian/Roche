@@ -9,14 +9,23 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.savedstate.serialization.decodeFromSavedState
 import androidx.savedstate.serialization.encodeToSavedState
-import com.grayvines.roche.data.EntryKind
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.SettingsRepository
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
+import com.grayvines.roche.playback.AudioPlayerBackend
+import com.grayvines.roche.playback.NoOpAudioPlayerBackend
+import com.grayvines.roche.playback.NoOpPodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
+import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.PodcastPlayerState
+import com.grayvines.roche.playback.createManagedPlayerController
+import com.grayvines.roche.playback.hasNextQueuedAudio
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +37,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -41,17 +51,19 @@ class MainViewModel(
     private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
     sharedPlayerController: PodcastPlayerController? = null,
     private val savedStateHandle: SavedStateHandle? = null,
+    sharedPlaybackOrchestrator: PodcastPlaybackOrchestrator? = null,
 ) : ViewModel() {
 
     private val ownsPlayerController: Boolean = sharedPlayerController == null
     private val restoredNavState: SavedNavigationUiState? =
-        savedStateHandle?.let(::restoreNavigationState)
+        savedStateHandle?.let(::restoreSavedNavigationState)
 
-    internal val playbackOrchestrator =
-        PodcastPlaybackOrchestrator(
-            repository = repository,
-            settingsRepository = settingsRepository,
-        )
+    internal val playbackOrchestrator: PodcastPlaybackOrchestrator =
+        sharedPlaybackOrchestrator
+            ?: PodcastPlaybackOrchestrator(
+                repository = repository,
+                settingsRepository = settingsRepository,
+            )
 
     internal val transientState =
         MutableStateFlow(
@@ -61,10 +73,6 @@ class MainViewModel(
 
     private var deepSearchJob: Job? = null
     private val uiStateMemoizer = MainUiStateMemoizer()
-
-    private val inboxReaderDelegate = MainInboxReaderDelegate(this)
-    private val syncFeedDelegate = MainSyncFeedDelegate(this)
-    private val catalogActionsDelegate = MainCatalogActionsDelegate(this)
 
     private val settingsForUi =
         settingsRepository.settings
@@ -79,13 +87,23 @@ class MainViewModel(
                 scope = viewModelScope,
                 repository = repository,
                 settingsRepository = settingsRepository,
+                orchestrator = playbackOrchestrator,
                 playerBackend = playerBackend,
                 mediaSessionBridge = mediaSessionBridge,
             )
 
+    val playerState: StateFlow<PodcastPlayerState> = playerController.state
+
+    private val sharedSnapshotFlow =
+        repository.snapshot.shareIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(),
+            replay = 1,
+        )
+
     private val baseUiStateFlow =
         combine(
-            repository.snapshot,
+            sharedSnapshotFlow,
             settingsForUi,
             transientState,
             repository.isSyncActive,
@@ -105,19 +123,16 @@ class MainViewModel(
         }
 
     val uiState: StateFlow<MainUiState> =
-        mergeBaseWithPlayerState(
-                baseFlow = baseUiStateFlow,
-                playerFlow = playerController.state,
-            ) { built ->
-                playerController.updateHasNextQueuedAudio(built.nextQueuedAudioEntryId != null)
-                playerController.updateSmartRewindEnabled(built.settings.smartRewindEnabled)
-                playerController.syncSkipSilenceFromSettings(built.settings.skipSilenceEnabled)
-            }
-            .stateIn(
-                scope = viewModelScope,
-                started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
-                initialValue = buildInitialUiState(),
-            )
+        baseUiStateFlow.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS),
+            initialValue = buildInitialUiState(),
+        )
+
+    private val delegateHost = MainViewModelHost(this)
+    private val inboxReaderDelegate = MainInboxReaderDelegate(delegateHost)
+    private val syncFeedDelegate = MainSyncFeedDelegate(delegateHost)
+    private val catalogActionsDelegate = MainCatalogActionsDelegate(delegateHost)
 
     init {
         savedStateHandle?.setSavedStateProvider(SAVED_NAV_STATE_KEY) {
@@ -127,15 +142,51 @@ class MainViewModel(
             )
         }
         playerController.setUiErrorListener(uiErrorListener)
+        settingsRepository.latestSettings?.let { cached ->
+            playerController.updateSmartRewindEnabled(cached.smartRewindEnabled)
+            playerController.syncSkipSilenceFromSettings(cached.skipSilenceEnabled)
+        }
+        observePlayerControllerSync()
         observeActiveEpisodeNotes()
         observeActiveCollectionDraws()
         observeSettledStars()
         restoredNavState?.let(::restoreNavigationSideEffects)
     }
 
+    private fun observePlayerControllerSync() {
+        viewModelScope.launch {
+            combine(
+                    sharedSnapshotFlow.map { it.entries }.distinctUntilChanged(),
+                    settingsForUi
+                        .map { settings ->
+                            PlayerSettingsSlice(
+                                queueItemIds = settings.queueItemIds,
+                                smartRewindEnabled = settings.smartRewindEnabled,
+                                skipSilenceEnabled = settings.skipSilenceEnabled,
+                            )
+                        }
+                        .distinctUntilChanged(),
+                    playerController.state.map { it.currentEntryId }.distinctUntilChanged(),
+                ) { entries, slice, activeAudioId ->
+                    PlayerControllerSyncTarget(
+                        hasNextQueuedAudio =
+                            hasNextQueuedAudio(entries, slice.queueItemIds, activeAudioId),
+                        smartRewindEnabled = slice.smartRewindEnabled,
+                        skipSilenceEnabled = slice.skipSilenceEnabled,
+                    )
+                }
+                .distinctUntilChanged()
+                .collect { target ->
+                    playerController.updateHasNextQueuedAudio(target.hasNextQueuedAudio)
+                    playerController.updateSmartRewindEnabled(target.smartRewindEnabled)
+                    playerController.syncSkipSilenceFromSettings(target.skipSilenceEnabled)
+                }
+        }
+    }
+
     private fun observeSettledStars() {
         viewModelScope.launch {
-            repository.snapshot
+            sharedSnapshotFlow
                 .map { snap -> snap.entries.associate { it.id to it.isFavorite } }
                 .distinctUntilChanged()
                 .collect { persistedById ->
@@ -146,7 +197,7 @@ class MainViewModel(
 
     private fun observeActiveCollectionDraws() {
         viewModelScope.launch {
-            repository.snapshot
+            sharedSnapshotFlow
                 .map { snap ->
                     snap.catalog.generators
                         .filter { it.enabled }
@@ -163,15 +214,6 @@ class MainViewModel(
     private fun buildInitialUiState(): MainUiState {
         val local = transientState.value
         val cachedSettings = settingsRepository.latestSettings
-        val basePlayerState =
-            if (cachedSettings != null) {
-                playerController.state.value.copy(
-                    smartRewindEnabled = cachedSettings.smartRewindEnabled,
-                    skipSilenceEnabled = cachedSettings.skipSilenceEnabled,
-                )
-            } else {
-                playerController.state.value
-            }
         val cachedSnapshot =
             repository.latestSnapshot
                 ?: return MainUiState(
@@ -187,22 +229,18 @@ class MainViewModel(
                     companionSubTab = local.companionSubTab,
                     selectedCatalogCollectionId = local.selectedCatalogCollectionId,
                     selectedWantCollectionId = local.selectedWantCollectionId,
+                    isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
+                    isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
+                    activePlayerDrawerTab = local.activePlayerDrawerTab,
                     localNetworkTier = local.localNetworkTier,
                     settings = cachedSettings ?: Settings(),
                     isInitialLoading = true,
-                    playerState = basePlayerState,
                 )
-        val resolvedSettings = cachedSettings ?: Settings()
         return uiStateMemoizer.build(
             snapshot = cachedSnapshot,
-            settings = resolvedSettings,
+            settings = cachedSettings ?: Settings(),
             local = local,
             localNetworkTier = local.localNetworkTier,
-            playerState =
-                playerController.state.value.copy(
-                    smartRewindEnabled = resolvedSettings.smartRewindEnabled,
-                    skipSilenceEnabled = resolvedSettings.skipSilenceEnabled,
-                ),
         )
     }
 
@@ -230,8 +268,18 @@ class MainViewModel(
     private suspend fun refreshActiveEpisodeNotes(entryId: String?) {
         if (entryId == null) {
             transientState.update { current ->
-                if (current.activePlayerNotesContent != null) {
-                    current.copy(activePlayerNotesContent = null)
+                val hasActivePlayerUi =
+                    current.activePlayerNotesContent != null ||
+                        current.isPlayerFullscreenOpen ||
+                        current.isPlayerSpeedSheetOpen ||
+                        current.activePlayerDrawerTab != null
+                if (hasActivePlayerUi) {
+                    current.copy(
+                        activePlayerNotesContent = null,
+                        isPlayerFullscreenOpen = false,
+                        isPlayerSpeedSheetOpen = false,
+                        activePlayerDrawerTab = null,
+                    )
                 } else {
                     current
                 }
@@ -263,24 +311,29 @@ class MainViewModel(
     }
 
     private fun handleUiAction(action: MainAction.Ui) {
-        if (handlePlayerUiAction(action)) return
-        if (action is MainAction.OpenReader) {
-            if (action.forceArticleView) {
-                playerController.closeFullscreen()
-            } else {
-                val existing = peekLatestEntries().firstOrNull { it.id == action.entryId }
-                if (existing?.contentType == ContentType.AUDIO) {
-                    viewModelScope.launch {
-                        inboxReaderDelegate.performPlayAudioEntry(
-                            entryId = action.entryId,
-                            openFullscreen = true,
-                        )
-                    }
-                    return
+        if (
+            action is MainAction.OpenFullscreenPlayer &&
+                !playerController.state.value.hasActiveEpisode
+        ) {
+            return
+        }
+        if (action is MainAction.OpenReader && !action.forceArticleView) {
+            val existing = peekLatestEntries().firstOrNull { it.id == action.entryId }
+            if (existing?.contentType == ContentType.AUDIO) {
+                viewModelScope.launch {
+                    inboxReaderDelegate.performPlayAudioEntry(
+                        entryId = action.entryId,
+                        openFullscreen = true,
+                    )
                 }
+                return
             }
         }
         transientState.update { reduceUiAction(it, action) }
+        handleUiSideEffects(action)
+    }
+
+    private fun handleUiSideEffects(action: MainAction.Ui) {
         when (action) {
             is MainAction.OpenReader -> launchReaderOpenSideEffects(action.entryId)
             is MainAction.UpdateSearchQuery -> scheduleDeepSearch(action.query)
@@ -331,7 +384,7 @@ class MainViewModel(
     }
 
     private suspend fun reconcileRestoredSelection(restored: SavedNavigationUiState) {
-        val snapshot = repository.snapshot.first()
+        val snapshot = sharedSnapshotFlow.first()
         val missingReaderId =
             restored.selectedReaderEntryId?.takeIf { targetId ->
                 snapshot.entries.none { it.id == targetId }
@@ -346,28 +399,6 @@ class MainViewModel(
                 pruneMissingRestoredState(current, missingReaderId, missingFeedId)
             }
         }
-    }
-
-    private fun pruneMissingRestoredState(
-        current: TransientUiState,
-        missingReaderId: String?,
-        missingFeedId: String?,
-    ): TransientUiState {
-        val clearReader =
-            missingReaderId != null && current.selectedReaderEntryId == missingReaderId
-        val clearFeed = missingFeedId != null && current.selectedFeedId == missingFeedId
-        val nextOriginTab =
-            if (clearFeed && current.selectedTag == null) {
-                null
-            } else {
-                current.scopeOriginTab
-            }
-        return current.copy(
-            selectedReaderEntryId = if (clearReader) null else current.selectedReaderEntryId,
-            readerContent = if (clearReader) null else current.readerContent,
-            selectedFeedId = if (clearFeed) null else current.selectedFeedId,
-            scopeOriginTab = nextOriginTab,
-        )
     }
 
     internal fun exportSavedNavigationJson(): String =
@@ -413,9 +444,11 @@ class MainViewModel(
     }
 
     private suspend fun executeMutation(action: MainAction.Mutation) {
-        if (inboxReaderDelegate.tryExecute(action)) return
-        if (syncFeedDelegate.tryExecute(action)) return
-        catalogActionsDelegate.execute(action)
+        when (action) {
+            is MainAction.InboxReaderMutation -> inboxReaderDelegate.execute(action)
+            is MainAction.SyncFeedMutation -> syncFeedDelegate.execute(action)
+            is MainAction.CatalogMutation -> catalogActionsDelegate.execute(action)
+        }
     }
 
     private fun resolveCurrentFavoriteState(entryId: String): Boolean? =
@@ -445,33 +478,6 @@ class MainViewModel(
         }
     }
 
-    private fun handlePlayerUiAction(action: MainAction.Ui): Boolean =
-        when (action) {
-            MainAction.OpenFullscreenPlayer -> {
-                playerController.openFullscreen()
-                true
-            }
-            MainAction.CloseFullscreenPlayer -> {
-                playerController.closeFullscreen()
-                true
-            }
-            is MainAction.SetPlayerSpeedSheetOpen -> {
-                playerController.setSpeedSheetOpen(action.open)
-                true
-            }
-            is MainAction.SelectPlayerDrawerTab -> {
-                playerController.selectDrawerTab(action.tab)
-                true
-            }
-            MainAction.RequestAudioOutputCast -> {
-                showStatusMessage("Use system output switcher for Cast / Bluetooth audio")
-                true
-            }
-            else -> {
-                false
-            }
-        }
-
     internal suspend fun latestEntries(): List<InboxEntry> =
         repository.latestSnapshot?.entries ?: repository.snapshot.first().entries
 
@@ -488,13 +494,17 @@ class MainViewModel(
             }
             playbackOrchestrator.syncActivePlayerQueueState(playerController)
         }
-        if (playerController.state.value.currentEntryId in removedIds) {
+        val clearingActivePlayer = playerController.state.value.currentEntryId in removedIds
+        if (clearingActivePlayer) {
             playerController.stopAndClear()
         }
-        clearRemovedTransientSelection(removedIds)
+        clearRemovedTransientSelection(removedIds, clearingActivePlayer)
     }
 
-    private fun clearRemovedTransientSelection(removedIds: Set<String>) {
+    private fun clearRemovedTransientSelection(
+        removedIds: Set<String>,
+        clearingActivePlayer: Boolean,
+    ) {
         transientState.update { current ->
             val nextReaderId = current.selectedReaderEntryId?.takeUnless { it in removedIds }
             val nextContent = nextReaderId?.let { current.readerContent }
@@ -506,12 +516,14 @@ class MainViewModel(
                 readerContent = nextContent,
                 activePlayerNotesContent = nextPlayerNotes,
                 contextSheetEntryId = nextSheetId,
+                isPlayerFullscreenOpen =
+                    if (clearingActivePlayer) false else current.isPlayerFullscreenOpen,
+                isPlayerSpeedSheetOpen =
+                    if (clearingActivePlayer) false else current.isPlayerSpeedSheetOpen,
+                activePlayerDrawerTab =
+                    if (clearingActivePlayer) null else current.activePlayerDrawerTab,
             )
         }
-    }
-
-    internal suspend fun handleAudioEpisodeCompleted(completedEntryId: String) {
-        playbackOrchestrator.handleAudioEpisodeCompleted(playerController, completedEntryId)
     }
 
     internal suspend fun exportOpmlXml(): Result<String> = repository.exportOpml()
@@ -588,6 +600,7 @@ class MainViewModel(
         private val settings: SettingsRepository,
         private val mediaSessionBridge: PodcastMediaSessionBridge = NoOpPodcastMediaSessionBridge,
         private val sharedPlayerController: PodcastPlayerController? = null,
+        private val sharedPlaybackOrchestrator: PodcastPlaybackOrchestrator? = null,
     ) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
             create(modelClass, CreationExtras.Empty)
@@ -604,6 +617,7 @@ class MainViewModel(
                 mediaSessionBridge = mediaSessionBridge,
                 sharedPlayerController = sharedPlayerController,
                 savedStateHandle = savedStateHandle,
+                sharedPlaybackOrchestrator = sharedPlaybackOrchestrator,
             )
                 as T
         }
@@ -614,25 +628,99 @@ class MainViewModel(
         private const val DEEP_SEARCH_DEBOUNCE_MS = 200L
         internal const val SAVED_NAV_STATE_KEY = "roche_saved_navigation_state"
         internal const val SAVED_NAV_JSON_KEY = "roche_saved_navigation_json"
-
-        internal fun restoreNavigationState(
-            savedStateHandle: SavedStateHandle
-        ): SavedNavigationUiState? {
-            val savedBundle = savedStateHandle.remove<Bundle>(SAVED_NAV_STATE_KEY)
-            if (savedBundle != null) {
-                runCatching {
-                    decodeFromSavedState(SavedNavigationUiState.serializer(), savedBundle)
-                }
-                    .getOrNull()
-                    ?.let {
-                        return it
-                    }
-            }
-            val savedJson = savedStateHandle.remove<String>(SAVED_NAV_JSON_KEY)
-            return savedJson?.let { raw ->
-                runCatching { Json.decodeFromString(SavedNavigationUiState.serializer(), raw) }
-                    .getOrNull()
-            }
-        }
     }
 }
+
+internal fun restoreSavedNavigationState(
+    savedStateHandle: SavedStateHandle
+): SavedNavigationUiState? {
+    val savedBundle = savedStateHandle.remove<Bundle>(MainViewModel.SAVED_NAV_STATE_KEY)
+    if (savedBundle != null) {
+        runCatching { decodeFromSavedState(SavedNavigationUiState.serializer(), savedBundle) }
+            .getOrNull()
+            ?.let {
+                return it
+            }
+    }
+    val savedJson = savedStateHandle.remove<String>(MainViewModel.SAVED_NAV_JSON_KEY)
+    return savedJson?.let { raw ->
+        runCatching { Json.decodeFromString(SavedNavigationUiState.serializer(), raw) }.getOrNull()
+    }
+}
+
+internal fun pruneMissingRestoredState(
+    current: TransientUiState,
+    missingReaderId: String?,
+    missingFeedId: String?,
+): TransientUiState {
+    val clearReader = missingReaderId != null && current.selectedReaderEntryId == missingReaderId
+    val clearFeed = missingFeedId != null && current.selectedFeedId == missingFeedId
+    val nextOriginTab =
+        if (clearFeed && current.selectedTag == null) null else current.scopeOriginTab
+    return current.copy(
+        selectedReaderEntryId = if (clearReader) null else current.selectedReaderEntryId,
+        readerContent = if (clearReader) null else current.readerContent,
+        selectedFeedId = if (clearFeed) null else current.selectedFeedId,
+        scopeOriginTab = nextOriginTab,
+    )
+}
+
+private class MainViewModelHost(private val vm: MainViewModel) : InboxReaderHost, SyncFeedHost {
+    override val repository: RocheRepository
+        get() = vm.repository
+
+    override val settingsRepository: SettingsRepository
+        get() = vm.settingsRepository
+
+    override val playerController: PodcastPlayerController
+        get() = vm.playerController
+
+    override val playbackOrchestrator: PodcastPlaybackOrchestrator
+        get() = vm.playbackOrchestrator
+
+    override fun currentTransientState(): TransientUiState = vm.transientState.value
+
+    override fun updateTransient(transform: (TransientUiState) -> TransientUiState) {
+        vm.transientState.update(transform)
+    }
+
+    override fun showStatusMessage(message: String) {
+        vm.showStatusMessage(message)
+    }
+
+    override suspend fun latestEntries(): List<InboxEntry> = vm.latestEntries()
+
+    override suspend fun cleanupRemovedEntries(removedIds: Set<String>) {
+        vm.cleanupRemovedEntries(removedIds)
+    }
+
+    override fun cancelDeepSearch() {
+        vm.cancelDeepSearch()
+    }
+
+    override fun applyReaderContentIfActive(entryId: String, content: ReaderItemContent) {
+        vm.applyReaderContentIfActive(entryId, content)
+    }
+
+    override fun tryAcquireSyncLock(): Boolean = vm.tryAcquireSyncLock()
+
+    override fun refreshLocalNetworkTier() {
+        vm.refreshLocalNetworkTier()
+    }
+
+    override suspend fun awaitInitialLoad() {
+        vm.uiState.first { !it.isInitialLoading }
+    }
+}
+
+private data class PlayerSettingsSlice(
+    val queueItemIds: List<String>,
+    val smartRewindEnabled: Boolean,
+    val skipSilenceEnabled: Boolean,
+)
+
+private data class PlayerControllerSyncTarget(
+    val hasNextQueuedAudio: Boolean,
+    val smartRewindEnabled: Boolean,
+    val skipSilenceEnabled: Boolean,
+)

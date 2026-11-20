@@ -247,7 +247,7 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
                     PollItemCandidate {
                         title: "Post 1".to_string(),
                         url: item1_url.clone(),
-                        author: None,
+                        creators: Vec::new(),
                         published_at: None,
                         summary: "Short".to_string(),
                         content_html: Some("<p>Short</p>".to_string()),
@@ -259,7 +259,7 @@ async fn test_peer_sync_merges_without_duplication_and_respects_tombstones() {
                     PollItemCandidate {
                         title: "Post 2".to_string(),
                         url: item2_url.clone(),
-                        author: None,
+                        creators: Vec::new(),
                         published_at: None,
                         summary: "To be deleted".to_string(),
                         content_html: None,
@@ -603,7 +603,7 @@ async fn test_sync_seq_delta_and_multipage_content_html() {
         .map(|idx| PollItemCandidate {
             title: format!("Article {idx}"),
             url: Url::parse(&format!("https://example.com/article-{idx}")).unwrap(),
-            author: None,
+            creators: Vec::new(),
             published_at: None,
             summary: format!("Summary {idx}"),
             content_html: Some(format!("<p>Body content {idx}</p>")),
@@ -807,7 +807,7 @@ async fn test_sync_seq_pagination_and_pruned_cursor_reset() {
         .map(|idx| PollItemCandidate {
             title: format!("Cap Item {idx}"),
             url: Url::parse(&format!("https://example.com/cap-item-{idx}")).unwrap(),
-            author: None,
+            creators: Vec::new(),
             published_at: None,
             summary: format!("Summary {idx}"),
             content_html: Some(format!("<p>Body {idx}</p>")),
@@ -1162,35 +1162,14 @@ fn test_cross_stack_golden_vectors() {
             std::collections::HashMap::new()
         };
         let mut sorted: Vec<&RankedEntryInput> = case.entries.iter().collect();
-        sorted.sort_by(|a, b| {
-            let sa = scores.get(&a.id).copied().unwrap_or_default().mean;
-            let sb = scores.get(&b.id).copied().unwrap_or_default().mean;
-            sb.total_cmp(&sa)
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let mut i = 0usize;
-        while i < sorted.len() {
-            let base = scores.get(&sorted[i].id).copied().unwrap_or_default().mean;
-            let mut j = i + 1;
-            while j < sorted.len() {
-                let cur = scores.get(&sorted[j].id).copied().unwrap_or_default().mean;
-                if (cur - base).abs() <= crate::ranking::MEAN_TIE_EPSILON {
-                    j += 1;
-                } else {
-                    break;
-                }
-            }
-            if j - i > 1 {
-                sorted[i..j].sort_by(|a, b| {
-                    a.title
-                        .to_lowercase()
-                        .cmp(&b.title.to_lowercase())
-                        .then_with(|| a.id.cmp(&b.id))
-                });
-            }
-            i = j;
-        }
+        crate::ranking::sort_by_score_with_ties(
+            &mut sorted,
+            &scores,
+            |entry| entry.id.as_str(),
+            |a, b| {
+                a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.id.cmp(&b.id))
+            },
+        );
         assert_eq!(
             sorted.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
             case.expected_ids,

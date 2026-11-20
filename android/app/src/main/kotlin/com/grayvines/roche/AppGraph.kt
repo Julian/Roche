@@ -1,23 +1,26 @@
 package com.grayvines.roche
 
 import android.content.Context
-import androidx.compose.ui.graphics.asAndroidBitmap
-import com.grayvines.roche.data.AlbumStreamingResolver
-import com.grayvines.roche.data.AndroidNetworkTierProvider
-import com.grayvines.roche.data.NetworkTierProvider
-import com.grayvines.roche.data.PeerSyncScheduler
+import com.grayvines.roche.core.DEFAULT_LOCAL_HLC_NODE
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.CatalogStore
+import com.grayvines.roche.data.enrichment.AlbumStreamingResolver
 import com.grayvines.roche.data.local.RocheDatabase
 import com.grayvines.roche.data.remote.HttpEngineTransport
 import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.VpnTransportCheck
 import com.grayvines.roche.data.settings.SettingsRepository
-import com.grayvines.roche.ui.AndroidPodcastMediaSessionBridge
-import com.grayvines.roche.ui.ExoPlayerAudioBackend
-import com.grayvines.roche.ui.PodcastMediaSessionBridge
-import com.grayvines.roche.ui.PodcastPlayerController
-import com.grayvines.roche.ui.components.ThumbnailLoader
-import com.grayvines.roche.ui.createManagedPlayerController
+import com.grayvines.roche.data.sync.AndroidNetworkTierProvider
+import com.grayvines.roche.data.sync.NetworkTierProvider
+import com.grayvines.roche.data.sync.PeerSyncScheduler
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.ThumbnailLoader
+import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.playback.ExoPlayerAudioBackend
+import com.grayvines.roche.playback.PodcastMediaSessionBridge
+import com.grayvines.roche.playback.PodcastPlaybackOrchestrator
+import com.grayvines.roche.playback.PodcastPlayerController
+import com.grayvines.roche.playback.createManagedPlayerController
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -31,7 +34,9 @@ class AppGraph(context: Context) : AutoCloseable {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    val database: RocheDatabase by lazy { RocheDatabase.create(appContext) }
+    private val databaseDelegate = lazy { RocheDatabase.create(appContext) }
+
+    val database: RocheDatabase by databaseDelegate
 
     val settings: SettingsRepository by lazy { SettingsRepository.create(appContext) }
 
@@ -56,25 +61,35 @@ class AppGraph(context: Context) : AutoCloseable {
 
     val offlineCacheDir: File by lazy { File(appContext.filesDir, "offline_media") }
 
+    val thumbnailDiskCache: ThumbnailDiskCache by lazy {
+        ThumbnailDiskCache(cacheDir = offlineCacheDir)
+    }
+
     val repository: RocheRepository by lazy {
-        lateinit var repo: RocheRepository
+        val catalogStore =
+            CatalogStore(
+                dao = database.dao(),
+                localPeerIdProvider = {
+                    settings.settings.first().peerId.ifBlank { DEFAULT_LOCAL_HLC_NODE }
+                },
+            )
         val resolver =
             AlbumStreamingResolver(
                 transport = httpTransport,
                 backgroundScope = appScope,
-                catalogStoreProvider = { repo.catalog },
+                catalogStore = catalogStore,
             )
-        repo =
-            RocheRepository(
-                database = database,
-                apiClient = apiClient,
-                settings = settings,
-                cacheDir = offlineCacheDir,
-                networkTierProvider = networkTierProvider,
-                backgroundScope = appScope,
-                albumStreamingResolver = resolver,
-            )
-        repo
+        RocheRepository(
+            database = database,
+            apiClient = apiClient,
+            settings = settings,
+            cacheDir = offlineCacheDir,
+            networkTierProvider = networkTierProvider,
+            backgroundScope = appScope,
+            albumStreamingResolver = resolver,
+            thumbnailDiskCache = thumbnailDiskCache,
+            catalogStore = catalogStore,
+        )
     }
 
     val thumbnailLoader: ThumbnailLoader by lazy {
@@ -82,6 +97,7 @@ class AppGraph(context: Context) : AutoCloseable {
             apiClient = apiClient,
             settings = settings,
             cacheDir = offlineCacheDir,
+            diskCache = thumbnailDiskCache,
         )
     }
 
@@ -91,7 +107,6 @@ class AppGraph(context: Context) : AutoCloseable {
             allowedLocalDirs = listOf(offlineCacheDir, appContext.cacheDir),
             parentScope = appScope,
             httpEngineProvider = { httpTransport.sharedHttpEngine },
-            httpEngineExecutorProvider = { httpTransport.sharedCallbackExecutor },
         )
     }
 
@@ -102,7 +117,14 @@ class AppGraph(context: Context) : AutoCloseable {
             context = appContext,
             backend = audioPlayerBackend,
             scope = appScope,
-            artworkBitmapLoader = { url -> thumbnailLoader.loadThumbnail(url)?.asAndroidBitmap() },
+            artworkBitmapLoader = thumbnailLoader::loadBitmap,
+        )
+    }
+
+    val playbackOrchestrator: PodcastPlaybackOrchestrator by lazy {
+        PodcastPlaybackOrchestrator(
+            repository = repository,
+            settingsRepository = settings,
         )
     }
 
@@ -111,6 +133,7 @@ class AppGraph(context: Context) : AutoCloseable {
             scope = appScope,
             repository = repository,
             settingsRepository = settings,
+            orchestrator = playbackOrchestrator,
             playerBackend = audioPlayerBackend,
             mediaSessionBridge = mediaSessionBridge,
         )
@@ -136,6 +159,9 @@ class AppGraph(context: Context) : AutoCloseable {
         }
         if (networkTierProviderDelegate.isInitialized()) {
             runCatching { networkTierProviderDelegate.value.close() }
+        }
+        if (databaseDelegate.isInitialized()) {
+            runCatching { database.close() }
         }
     }
 }

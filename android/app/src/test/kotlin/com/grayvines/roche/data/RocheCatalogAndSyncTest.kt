@@ -5,10 +5,36 @@ package com.grayvines.roche.data
 import androidx.room3.Room
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
+import com.grayvines.roche.core.MAX_CONSECUTIVE_FAILURES
+import com.grayvines.roche.core.deterministicAutoLogId
+import com.grayvines.roche.core.deterministicComparisonId
+import com.grayvines.roche.core.deterministicFeedId
+import com.grayvines.roche.core.isLocalPollNewer
+import com.grayvines.roche.core.systemCollectionUuid
+import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CatalogStore
+import com.grayvines.roche.data.catalog.CollectionRole
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryIdentifierDto
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.SyncCollectionEntryDto
+import com.grayvines.roche.data.catalog.SyncCollectionSpecDto
+import com.grayvines.roche.data.catalog.SyncComparisonDto
+import com.grayvines.roche.data.catalog.SyncConsumptionLogDto
+import com.grayvines.roche.data.catalog.SyncEntryContentDto
+import com.grayvines.roche.data.catalog.SyncEntryRecordDto
+import com.grayvines.roche.data.catalog.SyncEntryStateDto
+import com.grayvines.roche.data.catalog.SyncFeedSourceDto
+import com.grayvines.roche.data.catalog.UpsertCatalogEntryInput
+import com.grayvines.roche.data.feeds.LocalFeedPoller
+import com.grayvines.roche.data.feeds.decodeHtmlText
+import com.grayvines.roche.data.feeds.resolveRelativeUrl
+import com.grayvines.roche.data.local.EntryIdentifierEntity
 import com.grayvines.roche.data.local.FeedRow
 import com.grayvines.roche.data.local.InboxItemRow
 import com.grayvines.roche.data.local.LocalSyncFlagEntity
 import com.grayvines.roche.data.local.RocheDatabase
+import com.grayvines.roche.data.local.nextLocalHlc
 import com.grayvines.roche.data.local.updateFeedActiveGraph
 import com.grayvines.roche.data.local.upsertFeed
 import com.grayvines.roche.data.local.upsertFeeds
@@ -20,18 +46,35 @@ import com.grayvines.roche.data.remote.RocheApiClient
 import com.grayvines.roche.data.remote.buildPeerSyncRequestPayload
 import com.grayvines.roche.data.remote.parsePeerSyncResponseJson
 import com.grayvines.roche.data.settings.SettingsRepository
+import com.grayvines.roche.data.sync.FLAG_LOCAL_THROUGHPUT_WEIGHT
+import com.grayvines.roche.data.sync.PeerNodeDto
+import com.grayvines.roche.data.sync.PeerSyncRequestConfig
+import com.grayvines.roche.data.sync.buildTrackedPeerSyncRequest
+import com.grayvines.roche.data.sync.feedPhaseOffsetSecs
+import com.grayvines.roche.data.sync.nextScheduledPollEpochSecs
+import com.grayvines.roche.data.sync.pollCooperativeFeedsOnDevice
+import com.grayvines.roche.data.sync.reconcilePeerSyncResponse
+import com.grayvines.roche.data.sync.selectFeedPoller
+import com.grayvines.roche.data.sync.shouldPeerPollFeed
+import com.grayvines.roche.data.sync.targetPollIntervalSecs
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.isCrossPeerRescueError
 import java.io.File
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
@@ -2141,6 +2184,122 @@ class RocheCatalogAndSyncTest {
             assertEquals(null, afterLocalUnarchiveSync.lastError)
             assertEquals(null, afterLocalUnarchiveSync.lastErrorBy)
             assertEquals(0, afterLocalUnarchiveSync.consecutiveFailures)
+        }
+
+    @Test
+    fun `createCustomList normalizes want prefix and rejects empty symbol-only slugs`() = runTest {
+        val catalog = repository.catalog
+        val wantId = catalog.createCustomList("Weekend Watch", role = CollectionRole.WANT)
+        assertEquals(systemCollectionUuid("want:weekend_watch"), wantId)
+        assertEquals("want:weekend_watch", database.dao().getCollectionSpecById(wantId)?.slug)
+
+        val prefixedLower =
+            catalog.createCustomList("want:Weekend Watch", role = CollectionRole.WANT)
+        val prefixedUpper =
+            catalog.createCustomList("WANT:Weekend Watch", role = CollectionRole.WANT)
+        assertEquals(wantId, prefixedLower)
+        assertEquals(wantId, prefixedUpper)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { catalog.createCustomList("!!!") }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { catalog.createCustomList("!!!", role = CollectionRole.WANT) }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { catalog.createCustomList("want:!!!", role = CollectionRole.WANT) }
+        }
+    }
+
+    @Test
+    fun `repointIdentifiersToEntry and collection_specs metadata edits emit fresh CatalogStore snapshots`() =
+        runTest {
+            val dao = database.dao()
+            val catalog = repository.catalog
+            val listId = catalog.createCustomList("Stamp Watch")
+            val entryA =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(
+                        kind = EntryKind.MOVIE,
+                        title = "Solaris",
+                        identifiers = listOf(EntryIdentifierDto("imdb", "tt0069293")),
+                    )
+                )
+            val entryB =
+                catalog.upsertEntry(
+                    UpsertCatalogEntryInput(
+                        kind = EntryKind.MOVIE,
+                        title = "Stalker",
+                    )
+                )
+            catalog.addCollectionEntry(listId, entryA)
+            catalog.addCollectionEntry(listId, entryB)
+            val initialSpec = dao.getCollectionSpecById(listId)!!
+            dao.upsertCollectionSpec(initialSpec.copy(color = "#112233"))
+            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("custom", "keep-min", "00000000"))
+            dao.insertEntryIdentifierIgnore(EntryIdentifierEntity("custom", "keep-max", "zzzzzzzz"))
+
+            val emissions = Channel<CatalogSnapshot>(Channel.UNLIMITED)
+            val collectJob =
+                launch(Dispatchers.Default) {
+                    catalog.snapshot.collect { emissions.send(it) }
+                }
+            try {
+                awaitCatalogSnapshot(emissions) { snap ->
+                    snap.entriesByCollectionId[listId].orEmpty().any {
+                        it.entry.id == entryA && it.entry.identifiers.isNotEmpty()
+                    }
+                }
+
+                // 1. Repoint identifier in-place (same row count, same min/max entryId!)
+                val identsBefore = dao.observeIdentsStamp().first()
+                dao.repointIdentifiersToEntry(entryA, entryB)
+                assertNotEquals(identsBefore, dao.observeIdentsStamp().first())
+                awaitCatalogSnapshot(emissions) { snap ->
+                    snap.entriesByCollectionId[listId]
+                        .orEmpty()
+                        .firstOrNull { it.entry.id == entryB }
+                        ?.entry
+                        ?.identifiers
+                        ?.any { it.value == "tt0069293" } == true
+                }
+
+                // 2. Update collection_specs.color (same row count, same length!)
+                val specsBeforeColor = dao.observeSpecsStamp().first()
+                val updatedColorSpec = dao.getCollectionSpecById(listId)!!.copy(color = "#112234")
+                dao.upsertCollectionSpec(updatedColorSpec)
+                assertNotEquals(specsBeforeColor, dao.observeSpecsStamp().first())
+                val afterColorSnap =
+                    withContext(Dispatchers.Default) { withTimeout(5_000L) { emissions.receive() } }
+                assertTrue(afterColorSnap.lists.any { it.collectionId == listId })
+
+                // 3. Update collection_specs.slug
+                val specsBeforeSlug = dao.observeSpecsStamp().first()
+                dao.upsertCollectionSpec(updatedColorSpec.copy(slug = "stamp_watch_v2"))
+                assertNotEquals(specsBeforeSlug, dao.observeSpecsStamp().first())
+                awaitCatalogSnapshot(emissions) { snap ->
+                    snap.lists.any { it.collectionId == listId && it.slug == "stamp_watch_v2" }
+                }
+            } finally {
+                collectJob.cancel()
+            }
+        }
+
+    private suspend fun awaitCatalogSnapshot(
+        emissions: Channel<CatalogSnapshot>,
+        predicate: (CatalogSnapshot) -> Boolean,
+    ): CatalogSnapshot =
+        withContext(Dispatchers.Default) {
+            withTimeout(5_000L) {
+                var matched: CatalogSnapshot? = null
+                while (matched == null) {
+                    val snap = emissions.receive()
+                    if (predicate(snap)) {
+                        matched = snap
+                    }
+                }
+                matched
+            }
         }
 }
 

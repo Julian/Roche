@@ -4,7 +4,10 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::db::MediaType;
+use crate::{
+    domain::MediaType,
+    util::fs_perms::{ensure_private_dir, normalize_lexical},
+};
 
 /// Manages media files on disk while strictly enforcing path containment within `media_dir`
 /// to prevent path traversal (`../`), symlink escapes, or arbitrary host file deletion.
@@ -17,23 +20,7 @@ impl MediaStore {
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         let raw = base_dir.into();
-        Self { base_dir: Self::normalize_lexical(&raw) }
-    }
-
-    #[must_use]
-    pub fn normalize_lexical(path: &Path) -> PathBuf {
-        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut normalized = PathBuf::new();
-        for comp in abs.components() {
-            match comp {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    let _ = normalized.pop();
-                }
-                other => normalized.push(other.as_os_str()),
-            }
-        }
-        normalized
+        Self { base_dir: normalize_lexical(&raw) }
     }
 
     #[must_use]
@@ -45,7 +32,7 @@ impl MediaStore {
     /// if the configured path escapes `base_dir`.
     #[must_use]
     pub fn resolve_download_dir(&self, download_dir: &Path) -> PathBuf {
-        let normalized = Self::normalize_lexical(download_dir);
+        let normalized = normalize_lexical(download_dir);
         if normalized.starts_with(&self.base_dir) {
             normalized
         } else {
@@ -81,13 +68,13 @@ impl MediaStore {
         }
 
         let norm_cand = if candidate.is_absolute() {
-            let normalized = Self::normalize_lexical(candidate);
+            let normalized = normalize_lexical(candidate);
             if !normalized.starts_with(&self.base_dir) {
                 anyhow::bail!("Media path is outside configured media_dir");
             }
             normalized
         } else {
-            Self::normalize_lexical(&self.base_dir.join(candidate))
+            normalize_lexical(&self.base_dir.join(candidate))
         };
 
         let rel = norm_cand
@@ -123,93 +110,6 @@ impl MediaStore {
             .map_err(|e| anyhow::anyhow!("Media path validation task failed: {e}"))?
     }
 
-    /// Creates `dir` recursively with `0700` permissions on Unix and tightens existing dedicated
-    /// directories to `0700` (skipping shared system/home/temp/cwd roots).
-    pub async fn ensure_private_dir(dir: &Path) -> Result<()> {
-        #[cfg(unix)]
-        {
-            let mut builder = tokio::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(dir).await?;
-            if Self::is_safe_to_chmod_dir(dir) {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-        Ok(())
-    }
-
-    /// Creates `file` if missing with `0600` permissions on Unix and tightens existing file mode to `0600`.
-    pub async fn precreate_or_tighten_private_file(file: &Path) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut opts = tokio::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(false).mode(0o600);
-            let handle = opts.open(file).await?;
-            drop(handle);
-            let _ = tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
-        }
-        #[cfg(not(unix))]
-        {
-            let handle = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(file)
-                .await?;
-            drop(handle);
-        }
-        Ok(())
-    }
-
-    /// Tightens `file` permissions to `0600` on Unix if the file exists.
-    pub async fn tighten_private_file_if_exists(file: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if tokio::fs::try_exists(file).await.unwrap_or(false) {
-                let _ =
-                    tokio::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).await;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = file;
-        }
-    }
-
-    #[cfg(unix)]
-    fn is_safe_to_chmod_dir(dir: &Path) -> bool {
-        let abs = Self::normalize_lexical(dir);
-        if abs == Path::new("/")
-            || abs == Path::new("/tmp")
-            || abs == Path::new("/private/tmp")
-            || abs == Path::new("/var/tmp")
-        {
-            return false;
-        }
-        if std::env::current_dir().is_ok_and(|cwd| Self::normalize_lexical(&cwd) == abs) {
-            return false;
-        }
-        let temp_norm = Self::normalize_lexical(&std::env::temp_dir());
-        if abs == temp_norm {
-            return false;
-        }
-        if std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .is_some_and(|home| Self::normalize_lexical(&home) == abs)
-        {
-            return false;
-        }
-        true
-    }
-
     pub async fn open_file(&self, stored_path: &str) -> Result<tokio::fs::File> {
         let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
         Ok(tokio::fs::File::open(&safe_path).await?)
@@ -217,9 +117,9 @@ impl MediaStore {
 
     pub async fn write_bytes(&self, stored_path: &str, bytes: &[u8]) -> Result<i64> {
         let safe_path = self.validate_path_async(Path::new(stored_path)).await?;
-        Self::ensure_private_dir(&self.base_dir).await?;
+        ensure_private_dir(&self.base_dir).await?;
         if let Some(parent) = safe_path.parent() {
-            Self::ensure_private_dir(parent).await?;
+            ensure_private_dir(parent).await?;
         }
         // Re-validate after creating parent directories to guard against TOCTOU symlink swaps
         let verified_path = self.validate_path_async(&safe_path).await?;

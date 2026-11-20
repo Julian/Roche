@@ -6,13 +6,16 @@ pub mod youtube;
 use anyhow::Result;
 pub use arxiv::ArxivParser;
 use chrono::{DateTime, SubsecRound, Utc};
-pub use opml::{OpmlDocument, OpmlOutline};
+pub use opml::OpmlDocument;
 pub use rss::RssParser;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 pub use youtube::YouTubeParser;
 
-use crate::{content::fetcher::SafeHttpClient, db::FeedType};
+use crate::{
+    domain::FeedType,
+    util::{media_urls::is_direct_pdf_url, url_guard::parse_public_url},
+};
 
 /// Validated feed creation source: either a full [`Url`] or a 24-character `YouTube` channel ID (`UC...`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,7 +44,7 @@ impl FeedSource {
         } else {
             std::borrow::Cow::Borrowed(trimmed)
         };
-        let url = SafeHttpClient::parse_url(&normalized_url_str)?;
+        let url = parse_public_url(&normalized_url_str)?;
         Ok(Self::Url(url))
     }
 
@@ -56,8 +59,7 @@ impl FeedSource {
                 ),
             },
             Self::Url(url) => {
-                let is_youtube_feed_url = YouTubeParser::is_youtube_host(url.host_str())
-                    && url.path() == "/feeds/videos.xml";
+                let is_youtube_feed_url = YouTubeParser::is_youtube_feed_url(&url);
                 match requested_type {
                     FeedType::Youtube => {
                         if !is_youtube_feed_url
@@ -107,10 +109,7 @@ impl FeedSource {
 
     fn validate_arxiv_feed_url(url: &Url) -> Result<()> {
         let path = url.path();
-        if path.starts_with("/abs/")
-            || path.starts_with("/pdf/")
-            || crate::content::fetcher::is_direct_pdf_url(url)
-        {
+        if path.starts_with("/abs/") || path.starts_with("/pdf/") || is_direct_pdf_url(url) {
             anyhow::bail!("URL points to a single arXiv paper, not an arXiv feed");
         }
         Ok(())
@@ -135,12 +134,12 @@ pub fn select_entry_link(links: &[feed_rs::model::Link]) -> Option<Url> {
     links
         .iter()
         .filter(|l| l.rel.as_deref().is_none_or(|r| r.eq_ignore_ascii_case("alternate")))
-        .find_map(|l| SafeHttpClient::parse_url(&l.href).ok())
+        .find_map(|l| parse_public_url(&l.href).ok())
         .or_else(|| {
             links
                 .iter()
                 .filter(|l| l.rel.as_deref().is_none_or(|r| !r.eq_ignore_ascii_case("enclosure")))
-                .find_map(|l| SafeHttpClient::parse_url(&l.href).ok())
+                .find_map(|l| parse_public_url(&l.href).ok())
         })
 }
 

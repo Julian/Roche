@@ -1,29 +1,38 @@
 package com.grayvines.roche.ui
 
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.media3.common.C
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSourceException
 import com.grayvines.roche.data.ReaderItemContent
-import com.grayvines.roche.data.THUMBNAILS_SUBDIR
 import com.grayvines.roche.data.TestRocheEnv
-import com.grayvines.roche.data.diskCacheKey
 import com.grayvines.roche.data.remote.HttpResponse
 import com.grayvines.roche.data.remote.RocheApiClient
+import com.grayvines.roche.media.BitmapLoader
+import com.grayvines.roche.media.ImageDecoders
+import com.grayvines.roche.media.THUMBNAILS_SUBDIR
+import com.grayvines.roche.media.ThumbnailDiskCache
+import com.grayvines.roche.media.ThumbnailLoader
+import com.grayvines.roche.media.diskCacheKey
+import com.grayvines.roche.media.openSessionCancellably
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
-import com.grayvines.roche.ui.components.ThumbnailLoader
+import com.grayvines.roche.playback.AndroidPodcastMediaSessionBridge
+import com.grayvines.roche.playback.MediaSessionMetadataSnapshot
+import com.grayvines.roche.playback.SafeRedirectHttpDataSource
+import com.grayvines.roche.playback.parseChaptersFromEpisodeNotes
+import com.grayvines.roche.playback.resolveSafeHttpPlaybackUrl
+import com.grayvines.roche.reader.formatLatexAltToHtml
+import com.grayvines.roche.reader.parsePreprocessedHtmlBody
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.lang.reflect.Proxy
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
@@ -253,13 +262,12 @@ class UiReviewFixesTest {
                 readerContent = articleFull,
                 activePlayerNotesContent = podcastFull,
                 allEntries = listOf(article, podcast),
-                playerState = PodcastPlayerState(currentEntryId = "pod-1"),
             )
 
         assertEquals(articleFull.contentHtml, state.activeReaderEntry?.contentHtml)
-        assertEquals(podcastFull.contentHtml, state.activePlayerEntry?.contentHtml)
+        assertEquals(podcastFull.contentHtml, state.resolveActivePlayerEntry("pod-1")?.contentHtml)
 
-        val closedReaderTransient =
+        val closed =
             reduceUiAction(
                 TransientUiState(
                     selectedReaderEntryId = "article-1",
@@ -268,8 +276,8 @@ class UiReviewFixesTest {
                 ),
                 MainAction.CloseReader,
             )
-        assertNull(closedReaderTransient.readerContent)
-        assertEquals(podcastFull, closedReaderTransient.activePlayerNotesContent)
+        assertNull(closed.readerContent)
+        assertEquals(podcastFull, closed.activePlayerNotesContent)
     }
 
     @Suppress("LongParameterList")
@@ -455,15 +463,19 @@ class UiReviewFixesTest {
                     HttpResponse(statusCode = 200, body = "", bodyBytes = payload)
                 }
                 val loader =
-                    ThumbnailLoader(
+                    BitmapLoader(
                         apiClient = apiClient,
                         settings = env.settings,
-                        cacheDir = cacheRoot,
-                        decoder = { bytes ->
-                            decodeCalls++
-                            if (bytes.decodeToString() == "VALID_IMG") fakeImageBitmap() else null
-                        },
+                        decoders =
+                            ImageDecoders(
+                                decodeBytes = { bytes ->
+                                    decodeCalls++
+                                    if (bytes.decodeToString() == "VALID_IMG") FakeImage() else null
+                                },
+                                sizeOfKiB = { 16 },
+                            ),
                         clockMs = { nowMs },
+                        diskCache = ThumbnailDiskCache(cacheRoot, clockMs = { nowMs }),
                     )
                 val expectedCacheFile =
                     File(File(cacheRoot, THUMBNAILS_SUBDIR), diskCacheKey(imageUrl))
@@ -632,18 +644,7 @@ class UiReviewFixesTest {
         assertEquals("HOST#NEXT-789", clearedToken.pairingCode)
     }
 
-    private fun fakeImageBitmap(): ImageBitmap =
-        Proxy.newProxyInstance(
-            ImageBitmap::class.java.classLoader,
-            arrayOf(ImageBitmap::class.java),
-        ) { _, method, _ ->
-            when (method.name) {
-                "getWidth",
-                "getHeight" -> 16
-                "toString" -> "FakeImageBitmap(16x16)"
-                else -> 0
-            }
-        } as ImageBitmap
+    private class FakeImage
 
     private class QueuedTestDispatcher : CoroutineDispatcher() {
         private val queue = ConcurrentLinkedQueue<Runnable>()

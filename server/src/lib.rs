@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 mod content;
 pub mod db;
+pub mod domain;
 mod error;
 mod feeds;
 mod media;
@@ -12,6 +13,7 @@ mod scheduler;
 mod service;
 pub mod tailscale;
 mod tui_rank;
+mod util;
 mod web;
 mod workers;
 
@@ -20,6 +22,7 @@ pub struct RocheServer;
 impl RocheServer {
     pub async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let db = db::Db::connect(&cfg.storage.database_path).await?;
+        service::run_content_startup_maintenance(&db).await;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         let (listen_cfg, ts_identity) = Self::prepare_tailscale(&cfg).await?;
         let bootstrap_canonical_url =
@@ -146,8 +149,8 @@ impl RocheServer {
         }
     }
 
-    async fn maybe_issue_bootstrap_code<F: scheduler::FeedFetcher>(
-        roche_service: &service::RocheService<F>,
+    async fn maybe_issue_bootstrap_code(
+        roche_service: &service::RocheService,
         canonical_url: Option<&str>,
         pairing_code_ttl: u64,
     ) {
@@ -161,8 +164,8 @@ impl RocheServer {
         .await;
     }
 
-    async fn maybe_issue_bootstrap_code_with_tty<F: scheduler::FeedFetcher>(
-        roche_service: &service::RocheService<F>,
+    async fn maybe_issue_bootstrap_code_with_tty(
+        roche_service: &service::RocheService,
         canonical_url: Option<&str>,
         pairing_code_ttl: u64,
         stderr_is_tty: bool,
@@ -236,11 +239,13 @@ impl RocheServer {
     }
 
     pub(crate) async fn connect_db(cfg: &config::Config) -> anyhow::Result<db::Db> {
-        db::Db::connect(&cfg.storage.database_path).await
+        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        service::run_content_startup_maintenance(&db).await;
+        Ok(db)
     }
 
     async fn connect_service(cfg: &config::Config) -> anyhow::Result<service::RocheService> {
-        let db = db::Db::connect(&cfg.storage.database_path).await?;
+        let db = Self::connect_db(cfg).await?;
         let fetcher = scheduler::HttpFeedFetcher::new()?;
         Ok(service::RocheService::new(db, fetcher, cfg.clone()))
     }
@@ -259,7 +264,7 @@ impl RocheServer {
         let service = Self::connect_service(cfg).await?;
         match service.auth().revoke_device(device_id).await {
             Ok(()) => Ok(true),
-            Err(error::ApiError::NotFound(_)) => Ok(false),
+            Err(service::AppError::NotFound(_)) => Ok(false),
             Err(other) => Err(other.into()),
         }
     }
@@ -270,7 +275,7 @@ impl RocheServer {
         poll: bool,
     ) -> anyhow::Result<usize> {
         let bytes = tokio::fs::read(path).await?;
-        let opml_str = content::fetcher::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
+        let opml_str = content::SafeHttpClient::decode_xml_or_text_bytes(&bytes);
         let service = Self::connect_service(cfg).await?;
         let imported = service.feeds().import_opml(opml_str).await?;
         let count = imported.len();

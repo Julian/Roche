@@ -7,6 +7,7 @@ use sqlx::sqlite::{
 
 mod auth;
 mod catalog;
+pub(crate) mod entries_core;
 mod feeds;
 mod items;
 mod media;
@@ -18,13 +19,15 @@ pub use auth::{AuthRepo, DeviceToken};
 pub use catalog::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
-    CatalogError, CatalogRepo, CatalogResult, ClusterSelectFilter, CollectionGeneratorState,
-    CollectionSummary, ComparisonRecord, ConsumptionLogRow, ConsumptionLogView,
-    DynamicCollectionRule, EntryDetailView, EntryIdentifier, PREFERRED_IDENTIFIER_SCHEMES,
-    RankedCollectionView, RankedEntryRow, UpsertEntryInput, choose_deterministic_entry_id,
-    external_identifier_label, external_identifier_url, matches_dynamic_collection_rule,
-    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
-    strip_album_edition_suffix,
+    CatalogError, CatalogExportSnapshot, CatalogRepo, CatalogResult, ClusterSelectFilter,
+    CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
+    ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
+    ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
+    ExportConsumptionLog, PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow,
+    UpsertEntryInput, choose_deterministic_entry_id, derive_manual_collection_slug_and_id,
+    external_identifier_label, external_identifier_url, external_identifier_url_for_kind,
+    matches_dynamic_collection_rule, normalize_identifier_scheme, normalize_identifier_value,
+    parse_dynamic_collection_rule, strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
@@ -34,17 +37,17 @@ pub use media::{Media, MediaRepo, NewMediaSpec};
 pub use sync::{
     ABSOLUTE_MAX_BACKOFF_SECS, ActivityEntry, DEFAULT_MAX_BACKOFF_SECS, DEFAULT_ONLINE_PEER_WEIGHT,
     HlcClock, HlcTimestamp, MAX_CONSECUTIVE_FAILURES, MAX_PEER_WEIGHT, MIN_PEER_WEIGHT,
-    NetworkTier, PeerSyncRequest, PeerSyncResponse, SERVER_PEER_ID, STARRED_COLLECTION_ID,
-    SyncCollectionEntryRecord, SyncCollectionGeneratorRecord, SyncCollectionSpec,
-    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent, SyncEntryRecord,
-    SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone, THROUGHPUT_EWMA_ALPHA,
-    UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG, WANT_TO_READ_TITLE,
-    canonical_ordering_json, canonicalize_sync_url, collection_entry_natural_key,
-    compute_throughput_weight, deterministic_comparison_id, deterministic_consumption_log_id,
-    deterministic_feed_id, deterministic_system_collection_id, deterministic_title_entry_id,
-    feed_phase_offset_secs, is_protected_system_collection_id, next_phase_slot_at_or_after,
-    next_scheduled_poll_epoch_secs, should_peer_poll_feed, target_poll_interval_secs,
-    update_throughput_ewma,
+    NetworkTier, PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry, SERVER_PEER_ID,
+    STARRED_COLLECTION_ID, SyncCollectionEntryRecord, SyncCollectionGeneratorRecord,
+    SyncCollectionSpec, SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryContent,
+    SyncEntryRecord, SyncEntryState, SyncFeedSource, SyncRepo, SyncTombstone,
+    THROUGHPUT_EWMA_ALPHA, UP_NEXT_COLLECTION_ID, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG,
+    WANT_TO_READ_TITLE, canonical_ordering_json, canonicalize_sync_url,
+    collection_entry_natural_key, compute_throughput_weight, deterministic_comparison_id,
+    deterministic_consumption_log_id, deterministic_feed_id, deterministic_system_collection_id,
+    deterministic_title_entry_id, feed_phase_offset_secs, is_protected_system_collection_id,
+    next_phase_slot_at_or_after, next_scheduled_poll_epoch_secs, should_peer_poll_feed,
+    target_poll_interval_secs, update_throughput_ewma,
 };
 pub use tags::{ItemTag, Tag, TagRepo};
 pub use types::{
@@ -74,6 +77,17 @@ pub(crate) fn escape_like_literal(value: &str) -> String {
 pub(crate) fn json_string_like_pattern(value: &str) -> String {
     let json_quoted = serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""));
     format!("%{}%", escape_like_literal(&json_quoted))
+}
+
+/// Trims, removes empty names, and JSON-encodes a slice of creator names for `entries.creators_json`.
+/// Returns `None` if no non-empty creator names remain.
+pub(crate) fn serialize_creators_json(creators: &[String]) -> Option<String> {
+    let cleaned: Vec<&str> =
+        creators.iter().map(String::as_str).map(str::trim).filter(|s| !s.is_empty()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&cleaned).ok()
 }
 
 /// Begins a SQLite write transaction using `BEGIN IMMEDIATE` so WAL-mode writers
@@ -120,9 +134,9 @@ impl Db {
                     if let Some(parent) = file_path.parent()
                         && !parent.as_os_str().is_empty()
                     {
-                        crate::media::MediaStore::ensure_private_dir(parent).await?;
+                        crate::util::fs_perms::ensure_private_dir(parent).await?;
                     }
-                    crate::media::MediaStore::precreate_or_tighten_private_file(file_path).await?;
+                    crate::util::fs_perms::precreate_or_tighten_private_file(file_path).await?;
                 }
                 SqliteConnectOptions::new().filename(path)
             }
@@ -153,18 +167,8 @@ impl Db {
     }
 
     async fn run_startup_maintenance(&self) {
-        const NORMALIZE_SUMMARIES_TASK: &str = "normalize_legacy_html_summaries";
-        const BACKFILL_THUMBNAILS_TASK: &str = "backfill_missing_thumbnails";
         const CANONICALIZE_URL_IDENTIFIERS_TASK: &str = "canonicalize_entry_url_identifiers";
 
-        self.run_maintenance_task_once(NORMALIZE_SUMMARIES_TASK, async {
-            self.items().normalize_legacy_html_summaries().await.map(|_| ())
-        })
-        .await;
-        self.run_maintenance_task_once(BACKFILL_THUMBNAILS_TASK, async {
-            self.items().backfill_missing_thumbnails().await.map(|_| ())
-        })
-        .await;
         self.run_maintenance_task_once(CANONICALIZE_URL_IDENTIFIERS_TASK, async {
             self.canonicalize_entry_url_identifiers().await
         })
@@ -246,7 +250,7 @@ impl Db {
         Ok(())
     }
 
-    async fn run_maintenance_task_once<Fut>(&self, task_name: &str, task: Fut)
+    pub(crate) async fn run_maintenance_task_once<Fut>(&self, task_name: &str, task: Fut)
     where
         Fut: std::future::Future<Output = Result<()>>,
     {
@@ -289,7 +293,7 @@ impl Db {
     }
 
     async fn record_maintenance_completed(&self, task_name: &str) -> Result<()> {
-        let completed_at = SyncRepo::now_utc().to_rfc3339();
+        let completed_at = crate::util::clock::now_utc().to_rfc3339();
         sqlx::query!(
             "INSERT OR REPLACE INTO maintenance_runs (task_name, completed_at) VALUES (?, ?)",
             task_name,
@@ -467,11 +471,11 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
 }
 
 pub(crate) async fn tighten_sqlite_sidecar_permissions(db_path: &Path) {
-    crate::media::MediaStore::tighten_private_file_if_exists(db_path).await;
+    crate::util::fs_perms::tighten_private_file_if_exists(db_path).await;
     for suffix in ["-wal", "-shm"] {
         let mut os = db_path.as_os_str().to_os_string();
         os.push(suffix);
-        crate::media::MediaStore::tighten_private_file_if_exists(Path::new(&os)).await;
+        crate::util::fs_perms::tighten_private_file_if_exists(Path::new(&os)).await;
     }
 }
 
@@ -489,16 +493,16 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         let db_path = temp_dir.join("roche.db");
 
-        // 1. Initial connect creates maintenance_runs records for all startup tasks
+        // 1. Initial connect creates maintenance_runs records for DB startup tasks
         let db1 = Db::connect(&db_path).await.unwrap();
         let recorded_count =
             sqlx::query_scalar!("SELECT COUNT(*) AS \"count!: i64\" FROM maintenance_runs")
                 .fetch_one(db1.pool())
                 .await
                 .unwrap();
-        assert_eq!(recorded_count, 3);
+        assert_eq!(recorded_count, 1);
 
-        // Simulate a pre-009 database with unnormalized HTML summary and missing thumbnail
+        // Simulate a legacy database needing one-shot task execution
         let url1 = Url::parse("https://example.com/legacy-post").unwrap();
         let item1 = db1
             .items()
@@ -519,24 +523,28 @@ mod tests {
         db1.pool().close().await;
         drop(db1);
 
-        // 2. Reconnecting runs all tasks once and records completion timestamps
+        // 2. Reconnecting runs DB maintenance once and custom one-shot maintenance tasks record completion
         let db2 = Db::connect(&db_path).await.unwrap();
+        db2.run_maintenance_task_once("normalize_legacy_html_summaries", async {
+            db2.items()
+                .normalize_legacy_html_summaries(|_, _| {
+                    (
+                        "Legacy & HTML summary".to_owned(),
+                        Some("https://example.com/hero.jpg".to_owned()),
+                    )
+                })
+                .await
+                .map(|_| ())
+        })
+        .await;
         let normalized_item = db2.items().get(&item1.id).await.unwrap().unwrap();
         assert_eq!(normalized_item.summary.as_deref(), Some("Legacy & HTML summary"));
         assert_eq!(normalized_item.thumbnail_url.as_deref(), Some("https://example.com/hero.jpg"));
 
-        let first_runs: Vec<(String, String)> = sqlx::query!(
-            "SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC",
-        )
-        .fetch_all(db2.pool())
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.task_name, r.completed_at))
-        .collect();
-        assert_eq!(first_runs.len(), 3);
+        let first_runs = list_maintenance_runs(&db2).await;
+        assert_eq!(first_runs.len(), 2);
 
-        // Inject raw unnormalized state while maintenance_runs already marks both tasks completed
+        // Inject raw unnormalized state while maintenance_runs already marks tasks completed
         let url2 = Url::parse("https://example.com/post-after-maint").unwrap();
         let item2 = db2
             .items()
@@ -551,43 +559,39 @@ mod tests {
             })
             .await
             .unwrap();
-        sqlx::query!(
-            "UPDATE entry_content SET content_html = '<img src=\"https://example.com/skip.jpg\"/>' WHERE entry_id = ?",
-            item2.id,
-        )
-        .execute(db2.pool())
-        .await
-        .unwrap();
-        sqlx::query!("UPDATE entries SET thumbnail_url = NULL WHERE id = ?", item2.id)
-            .execute(db2.pool())
-            .await
-            .unwrap();
         db2.pool().close().await;
         drop(db2);
 
-        // 3. Subsequent Db::connect skips both full-table scans and preserves completed_at
+        // 3. Subsequent Db::connect + run_maintenance_task_once skips completed tasks and preserves completed_at
         let db3 = Db::connect(&db_path).await.unwrap();
+        db3.run_maintenance_task_once("normalize_legacy_html_summaries", async {
+            db3.items()
+                .normalize_legacy_html_summaries(|_, _| ("OVERWRITTEN".to_owned(), None))
+                .await
+                .map(|_| ())
+        })
+        .await;
         let untouched = db3.items().get(&item2.id).await.unwrap().unwrap();
         assert_eq!(
             untouched.summary.as_deref(),
             Some("<p>Should NOT be rescanned on reconnect</p>")
         );
         assert!(untouched.thumbnail_url.is_none());
-
-        let second_runs: Vec<(String, String)> = sqlx::query!(
-            "SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC",
-        )
-        .fetch_all(db3.pool())
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.task_name, r.completed_at))
-        .collect();
-        assert_eq!(second_runs, first_runs);
+        assert_eq!(list_maintenance_runs(&db3).await, first_runs);
 
         db3.pool().close().await;
         drop(db3);
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    async fn list_maintenance_runs(db: &Db) -> Vec<(String, String)> {
+        sqlx::query!("SELECT task_name, completed_at FROM maintenance_runs ORDER BY task_name ASC")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.task_name, r.completed_at))
+            .collect()
     }
 
     #[tokio::test]

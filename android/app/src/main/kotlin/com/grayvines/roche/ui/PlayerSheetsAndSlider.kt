@@ -7,7 +7,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -52,16 +51,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.data.settings.PLAYBACK_SPEED_PRESETS
 import com.grayvines.roche.data.settings.Settings
 import com.grayvines.roche.data.settings.clampPlaybackSpeed
 import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.ui.components.FilterChipPill
+import com.grayvines.roche.playback.PlayerDrawerTab
+import com.grayvines.roche.playback.PodcastPlayerState
+import com.grayvines.roche.playback.formatPlaybackClock
+import com.grayvines.roche.playback.formatPlaybackSpeedLabel
 import com.grayvines.roche.ui.components.HeaderActionButton
+import com.grayvines.roche.ui.components.PodcastSpeedStrip
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.theme.LocalRocheColors
-import kotlin.math.abs
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -173,20 +174,11 @@ fun PlaybackSpeedAndPodcastSheet(
                 modifier = Modifier.fillMaxWidth().testTag("speed_slider"),
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                PLAYBACK_SPEED_PRESETS.forEach { preset ->
-                    val label = formatPlaybackSpeedLabel(preset)
-                    FilterChipPill(
-                        label = label,
-                        selected = abs(currentSpeed - preset) < 0.02f,
-                        onClick = { onAction(MainAction.SetPlaybackSpeed(preset)) },
-                        modifier = Modifier.testTag("speed_preset_$label"),
-                    )
-                }
-            }
+            PodcastSpeedStrip(
+                selectedSpeed = currentSpeed,
+                onSelectSpeed = { preset -> onAction(MainAction.SetPlaybackSpeed(preset)) },
+                chipTestTagPrefix = "speed_preset_",
+            )
 
             HorizontalDivider(color = colors.border, thickness = 1.dp)
 
@@ -253,7 +245,11 @@ internal fun PlayerContentDrawerSheet(
                     .testTag("player_content_drawer_sheet"),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            FullscreenPlayerDrawerBar(playerState = playerState, onAction = onAction)
+            FullscreenPlayerDrawerBar(
+                playerState = playerState,
+                activeDrawerTab = activeTab,
+                onAction = onAction,
+            )
             HorizontalDivider(color = colors.border, thickness = 1.dp)
 
             when (activeTab) {

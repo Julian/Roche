@@ -2,6 +2,7 @@
 
 package com.grayvines.roche.ui.components
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -16,6 +17,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -26,6 +28,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
@@ -35,11 +38,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.media.ThumbnailLoader
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
+
+val LocalThumbnailLoader = staticCompositionLocalOf<ThumbnailLoader?> { null }
 
 /**
  * Renders a rounded site favicon badge (`28.dp` on Feeds rows, `14.dp` inline in Inbox meta).
@@ -255,30 +261,12 @@ fun EntryThumbnailPreview(entry: InboxEntry, modifier: Modifier = Modifier) {
 @Composable
 private fun PodcastEpisodeThumbnail(entry: InboxEntry, modifier: Modifier = Modifier) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(10.dp)
-    val bitmap =
-        rememberEntryThumbnailBitmap(
-            primaryKey = entry.thumbnailMediaId,
-            fallbackKey = entry.effectiveThumbnailUrl ?: entry.faviconUrl,
-        )
-    Box(
-        modifier =
-            modifier
-                .size(56.dp)
-                .clip(shape)
-                .background(Color(0xFF1A242D))
-                .border(width = 1.dp, color = colors.border, shape = shape)
+    PodcastArtworkBox(
+        entry = entry,
+        size = 56.dp,
+        cornerRadius = 10.dp,
+        modifier = modifier,
     ) {
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            Canvas(modifier = Modifier.matchParentSize()) { drawPodcastArtworkCanvas(colors) }
-        }
         Box(
             contentAlignment = Alignment.Center,
             modifier =
@@ -591,8 +579,8 @@ internal fun rememberHighResImageBitmap(
 private fun rememberCachedOrLoadedBitmap(
     primaryKey: String?,
     fallbackKey: String?,
-    getCached: ThumbnailLoader.(String) -> ImageBitmap?,
-    loadRemote: suspend ThumbnailLoader.(String) -> ImageBitmap?,
+    getCached: ThumbnailLoader.(String) -> Bitmap?,
+    loadRemote: suspend ThumbnailLoader.(String) -> Bitmap?,
 ): ImageBitmap? {
     val cleanPrimary = primaryKey?.trim()?.takeIf { it.isNotBlank() }
     val cleanFallback = fallbackKey?.trim()?.takeIf { it.isNotBlank() && it != cleanPrimary }
@@ -601,7 +589,7 @@ private fun rememberCachedOrLoadedBitmap(
     val initialCached =
         loader.getCached(effectivePrimary) ?: cleanFallback?.let { loader.getCached(it) }
     val bitmap by
-        produceState<ImageBitmap?>(
+        produceState<Bitmap?>(
             initialValue = initialCached,
             key1 = effectivePrimary,
             key2 = cleanFallback,
@@ -619,7 +607,7 @@ private fun rememberCachedOrLoadedBitmap(
                         }
             }
         }
-    return bitmap
+    return remember(bitmap) { bitmap?.asImageBitmap() }
 }
 
 private fun DrawScope.drawVideoCanvas(

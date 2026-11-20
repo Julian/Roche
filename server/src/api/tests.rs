@@ -81,6 +81,7 @@ async fn setup_app() -> (Router, String) {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
     let db = Db::connect("sqlite::memory:").await.unwrap();
     let code = PairingManager::new(db.auth()).create_code(300).await.unwrap();
@@ -94,11 +95,12 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
     assert_eq!(res.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
     let problem: serde_json::Value =
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(problem["type"], "urn:roche:problem:unauthorized");
+    assert_eq!(problem["type"], "about:blank");
     assert_eq!(problem["title"], "Unauthorized");
     assert_eq!(problem["status"], 401);
+    assert!(problem.get("instance").is_none());
 
-    // Unknown route returns 404 with application/problem+json
+    // Unknown route returns 404 with application/problem+json (about:blank)
     let not_found_request = Request::builder().uri("/does-not-exist").body(Body::empty()).unwrap();
     let not_found_response = app.clone().oneshot(not_found_request).await.unwrap();
     assert_eq!(not_found_response.status(), StatusCode::NOT_FOUND);
@@ -106,8 +108,14 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         not_found_response.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/problem+json"
     );
+    let nf_problem: serde_json::Value = serde_json::from_slice(
+        &to_bytes(not_found_response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(nf_problem["type"], "about:blank");
+    assert_eq!(nf_problem["status"], 404);
 
-    // Wrong HTTP method returns 405 with application/problem+json
+    // Wrong HTTP method returns 405 with application/problem+json (about:blank)
     let method_request =
         Request::builder().method("DELETE").uri("/health").body(Body::empty()).unwrap();
     let method_response = app.clone().oneshot(method_request).await.unwrap();
@@ -116,8 +124,13 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         method_response.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/problem+json"
     );
+    let method_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(method_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(method_problem["type"], "about:blank");
+    assert_eq!(method_problem["status"], 405);
 
-    // Missing Content-Type on JSON endpoint returns 415 with application/problem+json
+    // Missing Content-Type on JSON endpoint returns 415 with application/problem+json (about:blank)
     let bad_ct_request = Request::builder()
         .method("POST")
         .uri("/auth/pair")
@@ -129,6 +142,11 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         bad_ct_response.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/problem+json"
     );
+    let bad_ct_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(bad_ct_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(bad_ct_problem["type"], "about:blank");
+    assert_eq!(bad_ct_problem["status"], 415);
 
     // Pair with valid pairing code
     let req = Request::builder()
@@ -143,7 +161,7 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
     let token = pair_body["token"].as_str().unwrap();
 
-    // Reusing the single-use pairing code fails with 401
+    // Reusing the single-use pairing code fails with 401 + pairing-code-invalid URN
     let req = Request::builder()
         .method("POST")
         .uri("/auth/pair")
@@ -152,6 +170,10 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         .unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(res.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+    let reuse_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(reuse_problem["type"], "urn:roche:problem:pairing-code-invalid");
 
     // Valid Bearer token is accepted
     let req = Request::builder()
@@ -186,7 +208,7 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
     let revoke_response = app.clone().oneshot(revoke_request).await.unwrap();
     assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
 
-    // Revoked token is now rejected with 401
+    // Revoked token is now rejected with 401 + token-invalid URN
     let post_revoke_request = Request::builder()
         .uri("/api/v1/feeds")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -194,9 +216,16 @@ async fn test_auth_required_and_rfc9457_problem_details_on_all_errors() {
         .unwrap();
     let post_revoke_response = app.oneshot(post_revoke_request).await.unwrap();
     assert_eq!(post_revoke_response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(post_revoke_response.headers().get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+    let revoked_problem: serde_json::Value = serde_json::from_slice(
+        &to_bytes(post_revoke_response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoked_problem["type"], "urn:roche:problem:token-invalid");
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_feeds_crud_refresh_and_conflict() {
     let (app, auth) = setup_app().await;
 
@@ -231,8 +260,13 @@ async fn test_feeds_crud_refresh_and_conflict() {
         duplicate_response.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/problem+json"
     );
+    let dup_problem: serde_json::Value = serde_json::from_slice(
+        &to_bytes(duplicate_response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dup_problem["type"], "urn:roche:problem:conflict");
 
-    // SSRF URL is rejected with 400 Bad Request
+    // SSRF URL is rejected with 400 Bad Request + ssrf-blocked URN
     let ssrf_request = Request::builder()
         .method("POST")
         .uri("/api/v1/feeds")
@@ -242,6 +276,14 @@ async fn test_feeds_crud_refresh_and_conflict() {
         .unwrap();
     let ssrf_response = app.clone().oneshot(ssrf_request).await.unwrap();
     assert_eq!(ssrf_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        ssrf_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let ssrf_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ssrf_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(ssrf_problem["type"], "urn:roche:problem:ssrf-blocked");
 
     // Trigger refresh via injected FakeFeedFetcher
     let req = Request::builder()
@@ -1037,7 +1079,7 @@ async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
 
     let valid_code = service.auth().issue_pairing_code().await.unwrap();
 
-    // 4 rapid wrong attempts return 401 Unauthorized
+    // 4 rapid wrong attempts return 401 Unauthorized (pairing-code-invalid)
     for i in 0..4 {
         let req = Request::builder()
             .method("POST")
@@ -1049,9 +1091,12 @@ async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let p: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(p["type"], "urn:roche:problem:pairing-code-invalid");
     }
 
-    // 5th rapid attempt is throttled with 429 Too Many Requests before touching the DB
+    // 5th rapid attempt is throttled with 429 Too Many Requests + Retry-After before touching the DB
     let throttled_request = Request::builder()
         .method("POST")
         .uri("/auth/pair")
@@ -1060,11 +1105,25 @@ async fn test_pairing_rate_limit_protects_active_code_from_rapid_burst() {
         .unwrap();
     let throttled_response = app.clone().oneshot(throttled_request).await.unwrap();
     assert_eq!(throttled_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        throttled_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let retry_after_hdr: u64 = throttled_response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry_after_hdr));
     let problem: serde_json::Value = serde_json::from_slice(
         &to_bytes(throttled_response.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(problem["type"], "urn:roche:problem:too-many-requests");
+    assert_eq!(problem["type"], "urn:roche:problem:pairing-rate-limited");
+    assert_eq!(problem["retry_after_seconds"], retry_after_hdr);
 
     // Simulating `roche pair` in a separate CLI process (writing directly to SQLite)
     // automatically resets the server's rate-limiter state because the active code hash changed!
@@ -1672,6 +1731,10 @@ async fn test_catalog_api_collection_generator_and_peer_sync_roundtrip() {
         .unwrap();
     let dyn_res = app.clone().oneshot(dyn_mutate).await.unwrap();
     assert_eq!(dyn_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(dyn_res.headers().get(header::CONTENT_TYPE).unwrap(), "application/problem+json");
+    let dyn_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(dyn_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(dyn_problem["type"], "urn:roche:problem:immutable-collection");
 
     // 3. Peer sync round-trip: offline peer logs a second album, compares it against `first_album_id`,
     //    and finishes `second_album_id` while offline -> server advances generator automatically!
@@ -1757,11 +1820,417 @@ async fn test_oversized_payload_returns_rfc9457_problem_details_413() {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    let res = app.oneshot(req).await.unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "application/problem+json");
     let problem: serde_json::Value =
         serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(problem["type"], "urn:roche:problem:payload-too-large");
     assert_eq!(problem["status"], 413);
+    assert_eq!(problem["max_bytes"], 65_536);
+
+    // Public pairing route body limit is 16 KiB; send 20 KiB JSON payload
+    let big_name = "x".repeat(20 * 1024);
+    let pair_body = serde_json::json!({
+        "device_name": big_name,
+        "pairing_code": "1234-5678",
+    });
+    let pair_request = Request::builder()
+        .method("POST")
+        .uri("/auth/pair")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(pair_body.to_string()))
+        .unwrap();
+    let pair_response = app.oneshot(pair_request).await.unwrap();
+    assert_eq!(pair_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        pair_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let pair_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(pair_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(pair_problem["type"], "urn:roche:problem:payload-too-large");
+    assert_eq!(pair_problem["max_bytes"], 16_384);
+}
+
+#[tokio::test]
+async fn test_ambiguous_lookup_and_item_ssrf_problem_details() {
+    let (app, auth) = setup_app().await;
+
+    // SSRF on POST /api/v1/items/save returns 400 + ssrf-blocked URN
+    let ssrf_item_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/items/save")
+        .header(header::AUTHORIZATION, &auth)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"url":"http://169.254.169.254/latest/meta-data"}"#))
+        .unwrap();
+    let ssrf_item_response = app.clone().oneshot(ssrf_item_request).await.unwrap();
+    assert_eq!(ssrf_item_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        ssrf_item_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let ssrf_problem: serde_json::Value = serde_json::from_slice(
+        &to_bytes(ssrf_item_response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ssrf_problem["type"], "urn:roche:problem:ssrf-blocked");
+
+    // Seed two distinct movies with identical title "Solaris" into the want-to-watch queue
+    for (director, year, tmdb_id) in
+        [("Andrei Tarkovsky", 1972, "593"), ("Steven Soderbergh", 2002, "2103")]
+    {
+        let want_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalog/want")
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "queue": "movies",
+                    "entry": {
+                        "kind": "movie",
+                        "title": "Solaris",
+                        "creators": [director],
+                        "release_year": year,
+                        "identifiers": [{"scheme": "tmdb", "value": tmdb_id}],
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let want_response = app.clone().oneshot(want_request).await.unwrap();
+        assert_eq!(want_response.status(), StatusCode::CREATED);
+    }
+
+    // Resolving "Solaris" in the movies queue fails with 409 + ambiguous-lookup + candidates array
+    let ambig_request = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/catalog/want/movies/Solaris")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    let ambig_response = app.oneshot(ambig_request).await.unwrap();
+    assert_eq!(ambig_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        ambig_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let ambig_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ambig_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(ambig_problem["type"], "urn:roche:problem:ambiguous-lookup");
+    assert_eq!(ambig_problem["status"], 409);
+    let candidates = ambig_problem["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates.iter().all(|c| c.as_str().unwrap().contains("Solaris")));
+}
+
+#[tokio::test]
+async fn test_not_found_html_vs_api_problem_details_boundary() {
+    let (app, _auth) = setup_app().await;
+
+    // Browser Accept: text/html on non-API unknown route returns HTML 404 with web security headers
+    let browser_request = Request::builder()
+        .uri("/does-not-exist")
+        .header(header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .body(Body::empty())
+        .unwrap();
+    let browser_response = app.clone().oneshot(browser_request).await.unwrap();
+    assert_eq!(browser_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        browser_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(browser_response.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(browser_response.headers().get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
+    let browser_body = String::from_utf8(
+        to_bytes(browser_response.into_body(), usize::MAX).await.unwrap().to_vec(),
+    )
+    .unwrap();
+    assert!(browser_body.contains("<!doctype html>"));
+    assert!(browser_body.contains("Not Found"));
+
+    // /api/* unknown route ALWAYS returns application/problem+json even with Accept: text/html
+    let api_html_request = Request::builder()
+        .uri("/api/v1/does-not-exist")
+        .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+        .body(Body::empty())
+        .unwrap();
+    let api_html_response = app.clone().oneshot(api_html_request).await.unwrap();
+    assert_eq!(api_html_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        api_html_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let api_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(api_html_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(api_problem["type"], "about:blank");
+
+    // Non-API unknown route without Accept: text/html (headless/curl) returns application/problem+json
+    let headless_request = Request::builder().uri("/does-not-exist").body(Body::empty()).unwrap();
+    let headless_response = app.oneshot(headless_request).await.unwrap();
+    assert_eq!(headless_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        headless_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    let headless_problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(headless_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(headless_problem["type"], "about:blank");
+}
+
+#[tokio::test]
+async fn test_api_collection_hex_color_validation() {
+    let (app, auth) = setup_app().await;
+
+    // POST /api/v1/catalog/lists normalizes valid uppercase hex color to lowercase
+    let create_ok = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/lists")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"title":"Accent List","color":" #3B82F6 "}"#))
+        .unwrap();
+    let ok_res = app.clone().oneshot(create_ok).await.unwrap();
+    assert_eq!(ok_res.status(), StatusCode::CREATED);
+    let ok_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ok_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(ok_body["color"], "#3b82f6");
+
+    // Whitespace-only color normalizes to null
+    let create_blank = Request::builder()
+        .method("POST")
+        .uri("/api/v1/catalog/lists")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"title":"Blank Color","color":"   "}"#))
+        .unwrap();
+    let blank_res = app.clone().oneshot(create_blank).await.unwrap();
+    assert_eq!(blank_res.status(), StatusCode::CREATED);
+    let blank_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(blank_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(blank_body["color"].is_null());
+
+    // Invalid colors return 400 Bad Request Problem Details
+    for invalid in ["not-a-color", "javascript:alert(1)", "#12345"] {
+        let create_bad = Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalog/lists")
+            .header(header::AUTHORIZATION, &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "title": "Bad Color", "color": invalid }).to_string(),
+            ))
+            .unwrap();
+        let bad_res = app.clone().oneshot(create_bad).await.unwrap();
+        assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_api_item_patch_respects_reader_auto_read_threshold() {
+    let (app, auth) = setup_app().await;
+
+    let save_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/items/save")
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"url":"https://example.com/threshold-test","title":"Threshold"}"#))
+        .unwrap();
+    let save_response = app.clone().oneshot(save_request).await.unwrap();
+    assert_eq!(save_response.status(), StatusCode::CREATED);
+    let save_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(save_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let item_id = save_body["id"].as_str().unwrap();
+    assert!(save_body["read_at"].is_null());
+
+    let patch_done = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/items/{item_id}"))
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "read_progress": crate::domain::READER_AUTO_READ_THRESHOLD })
+                .to_string(),
+        ))
+        .unwrap();
+    let done_res = app.clone().oneshot(patch_done).await.unwrap();
+    assert_eq!(done_res.status(), StatusCode::OK);
+    let done_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(done_res.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(done_body["read_at"].is_string());
+
+    // Explicit read_at: null still overrides auto-read threshold
+    let patch_unread = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/items/{item_id}"))
+        .header(header::AUTHORIZATION, &auth)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"read_progress":1.0,"read_at":null}"#))
+        .unwrap();
+    let unread_res = app.oneshot(patch_unread).await.unwrap();
+    assert_eq!(unread_res.status(), StatusCode::OK);
+    let unread_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(unread_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(unread_body["read_at"].is_null());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_export_data_includes_legacy_and_unified_catalog_fields_backward_compatibly() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let token = TokenManager::new(db.auth()).create("export-test", 32).await.unwrap();
+    let auth = format!("Bearer {token}");
+    let service = RocheService::new(db.clone(), FakeFeedFetcher, crate::config::Config::default());
+    let app = ApiRoutes::router_with_service(service.clone());
+
+    // Seed legacy feed + saved item + tag
+    let feed_url = Url::parse("https://example.com/export-feed.xml").unwrap();
+    let feed = db
+        .feeds()
+        .create(crate::db::FeedType::Rss, &feed_url, Some("Export Feed"), None)
+        .await
+        .unwrap();
+    let item_url = Url::parse("https://example.com/export-article").unwrap();
+    let (saved_item, _) = db
+        .items()
+        .save_manual_with_tags(&item_url, "Exported Post", &["rust".to_owned()])
+        .await
+        .unwrap();
+
+    // Seed unified catalog entities: manual list, two entries, consumption log, comparison, generator
+    let catalog = db.catalog();
+    let canon = catalog
+        .create_manual_collection(
+            "Film Canon",
+            Some("film_canon"),
+            crate::db::CollectionRole::List,
+            Some("Great films"),
+            Some("#10B981"),
+        )
+        .await
+        .unwrap();
+    let m1 = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Movie),
+            title: "Stalker".to_owned(),
+            creators: vec!["Andrei Tarkovsky".to_owned()],
+            release_year: Some(1979),
+            parent_collection_id: Some(canon.id.clone()),
+            parent_position: Some(1.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let m2 = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(crate::db::EntryKind::Movie),
+            title: "Mirror".to_owned(),
+            creators: vec!["Andrei Tarkovsky".to_owned()],
+            release_year: Some(1975),
+            parent_collection_id: Some(canon.id.clone()),
+            parent_position: Some(2.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    catalog
+        .log_consumption(&m1.id, crate::db::ConsumptionStatus::Consumed, Some("Masterpiece"), None)
+        .await
+        .unwrap();
+    catalog
+        .append_comparison(None, &[vec![m1.id.clone()], vec![m2.id.clone()]], None)
+        .await
+        .unwrap();
+    catalog.update_collection_generator(&canon.id, Some(true), Some(&m2.id), None).await.unwrap();
+
+    // 1. Verify RocheService::export_data directly
+    let direct_bundle = service.export_data().await.unwrap();
+    assert_eq!(direct_bundle.version, "1.0");
+    assert_eq!(direct_bundle.feeds.len(), 1);
+    assert_eq!(direct_bundle.feeds[0].id, feed.id);
+    assert!(direct_bundle.items.iter().any(|i| i.id == saved_item.id));
+    assert!(direct_bundle.tags.iter().any(|t| t.name == "rust"));
+    assert!(direct_bundle.entries.iter().any(|e| e.id == m1.id && e.release_year == Some(1979)));
+    assert!(direct_bundle.collections.iter().any(|c| {
+        c.id == canon.id && c.color.as_ref().map(crate::domain::HexColor::as_str) == Some("#10b981")
+    }));
+    assert!(
+        direct_bundle
+            .collection_entries
+            .iter()
+            .any(|ce| { ce.collection_id == canon.id && ce.entry_id == m1.id })
+    );
+    assert!(
+        direct_bundle
+            .consumption_log
+            .iter()
+            .any(|cl| { cl.entry_id == m1.id && cl.notes.as_deref() == Some("Masterpiece") })
+    );
+    assert_eq!(direct_bundle.comparisons.len(), 1);
+    assert_eq!(direct_bundle.collection_generators.len(), 1);
+    assert_eq!(direct_bundle.collection_generators[0].collection_id, canon.id);
+
+    // 2. Verify GET /api/v1/export/data emits all legacy + unified catalog JSON keys and roundtrips
+    let export_request = Request::builder()
+        .uri("/api/v1/export/data")
+        .header(header::AUTHORIZATION, &auth)
+        .body(Body::empty())
+        .unwrap();
+    let export_response = app.oneshot(export_request).await.unwrap();
+    assert_eq!(export_response.status(), StatusCode::OK);
+    let bytes = to_bytes(export_response.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for key in [
+        "version",
+        "exported_at",
+        "feeds",
+        "items",
+        "tags",
+        "item_tags",
+        "activity",
+        "entries",
+        "collections",
+        "collection_entries",
+        "consumption_log",
+        "comparisons",
+        "collection_generators",
+    ] {
+        assert!(json.get(key).is_some(), "export JSON missing expected key '{key}'");
+    }
+    let roundtripped: crate::service::ExportBundle = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(roundtripped.comparisons.len(), 1);
+    assert_eq!(roundtripped.collection_generators.len(), 1);
+
+    // 3. Verify backward compatibility: legacy export JSON without catalog keys still deserializes
+    let legacy_json = serde_json::json!({
+        "version": "1.0",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "feeds": [],
+        "items": [],
+        "tags": [],
+        "item_tags": [],
+        "activity": []
+    });
+    let legacy_bundle: crate::service::ExportBundle = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy_bundle.version, "1.0");
+    assert_eq!(legacy_bundle.entries.len(), 0);
+    assert_eq!(legacy_bundle.collections.len(), 0);
+    assert_eq!(legacy_bundle.collection_entries.len(), 0);
+    assert_eq!(legacy_bundle.consumption_log.len(), 0);
+    assert_eq!(legacy_bundle.comparisons.len(), 0);
+    assert_eq!(legacy_bundle.collection_generators.len(), 0);
 }

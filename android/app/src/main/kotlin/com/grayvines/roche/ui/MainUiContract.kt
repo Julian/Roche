@@ -1,19 +1,19 @@
 package com.grayvines.roche.ui
 
 import com.grayvines.roche.data.ArchiveStateSnapshot
-import com.grayvines.roche.data.CatalogSnapshot
-import com.grayvines.roche.data.CollectionGeneratorState
-import com.grayvines.roche.data.ConsumptionStatus
-import com.grayvines.roche.data.EntryKind
-import com.grayvines.roche.data.NetworkTier
-import com.grayvines.roche.data.PeerNodeDto
-import com.grayvines.roche.data.RankClusterCandidate
-import com.grayvines.roche.data.RankSettlementSummary
 import com.grayvines.roche.data.ReaderItemContent
 import com.grayvines.roche.data.RepositorySnapshot
 import com.grayvines.roche.data.RocheRepository
+import com.grayvines.roche.data.catalog.CatalogSnapshot
+import com.grayvines.roche.data.catalog.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.RankClusterCandidate
+import com.grayvines.roche.data.catalog.RankSettlementSummary
 import com.grayvines.roche.data.matchesSearchQuery
 import com.grayvines.roche.data.settings.Settings
+import com.grayvines.roche.data.sync.NetworkTier
+import com.grayvines.roche.data.sync.PeerNodeDto
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.FeedItem
@@ -23,13 +23,8 @@ import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.model.ItemStatus
 import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.model.ThemeMode
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.buffer
-import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.launch
+import com.grayvines.roche.playback.PlayerDrawerTab
+import com.grayvines.roche.playback.findNextQueuedAudioEntry
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -116,7 +111,9 @@ data class MainUiState(
     val quickLogTargetCollectionTitle: String? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
-    val playerState: PodcastPlayerState = PodcastPlayerState(),
+    val isPlayerFullscreenOpen: Boolean = false,
+    val isPlayerSpeedSheetOpen: Boolean = false,
+    val activePlayerDrawerTab: PlayerDrawerTab? = null,
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
     val messageSequence: Long = 0L,
@@ -126,33 +123,6 @@ data class MainUiState(
 
     val activeCollectionDraws: List<CollectionGeneratorState>
         get() = if (settings.showCollectionDrawsOnHome) enabledGenerators else emptyList()
-
-    val activePlayerEntry: InboxEntry?
-        get() {
-            val activeId = playerState.currentEntryId ?: return null
-            val base = allEntries.firstOrNull { it.id == activeId } ?: return null
-            val full =
-                activePlayerNotesContent?.takeIf { it.itemId == base.id }
-                    ?: readerContent?.takeIf { it.itemId == base.id }
-            return base.mergeReaderContent(full)
-        }
-
-    val activePlayerFeed: FeedItem?
-        get() =
-            activePlayerEntry?.feedId?.let { fid ->
-                feeds.firstOrNull { it.id == fid }
-            }
-
-    val nextQueuedAudioEntry: InboxEntry?
-        get() {
-            val activeAudioId = playerState.currentEntryId
-            return queueEntries.firstOrNull { entry ->
-                entry.contentType == ContentType.AUDIO && entry.id != activeAudioId
-            }
-        }
-
-    val nextQueuedAudioEntryId: String?
-        get() = nextQueuedAudioEntry?.id
 
     val activeReaderEntry: InboxEntry?
         get() {
@@ -176,6 +146,27 @@ data class MainUiState(
         get() = selectedReaderEntryId != null && selectedReaderEntryId in hydratingEntryIds
 }
 
+fun MainUiState.resolveActivePlayerEntry(activeAudioEntryId: String?): InboxEntry? {
+    val activeId = activeAudioEntryId ?: return null
+    val base = allEntries.firstOrNull { it.id == activeId } ?: return null
+    val full =
+        activePlayerNotesContent?.takeIf { it.itemId == base.id }
+            ?: readerContent?.takeIf { it.itemId == base.id }
+    return base.mergeReaderContent(full)
+}
+
+fun MainUiState.resolveActivePlayerFeed(activeAudioEntryId: String?): FeedItem? =
+    resolveActivePlayerEntry(activeAudioEntryId)?.feedId?.let { fid ->
+        feeds.firstOrNull { it.id == fid }
+    }
+
+fun MainUiState.resolveNextQueuedAudioEntry(activeAudioEntryId: String?): InboxEntry? =
+    findNextQueuedAudioEntry(
+        entries = allEntries,
+        queueItemIds = settings.queueItemIds,
+        excludeEntryId = activeAudioEntryId,
+    )
+
 fun MainUiState.isEntryInQueue(entryId: String): Boolean = entryId in settings.queueItemIds
 
 enum class ConfigSaveFeedback {
@@ -191,237 +182,261 @@ internal enum class SyncErrorPolicy {
 sealed interface MainAction {
     sealed interface Ui : MainAction
 
+    sealed interface NavigationUi : Ui
+
+    sealed interface OverlayUi : Ui
+
+    sealed interface PlayerChromeUi : Ui
+
+    sealed interface CatalogUi : Ui
+
     sealed interface Mutation : MainAction
 
-    data class SelectTab(val tab: AppTab) : Ui
+    sealed interface InboxReaderMutation : Mutation
 
-    data class SelectFilter(val filter: InboxFilter) : Ui
+    sealed interface EntryMutation : InboxReaderMutation
 
-    data class FilterByTag(val tagName: String?) : Ui
+    sealed interface PlaybackMutation : InboxReaderMutation
 
-    data class FilterByFeed(val feedId: String?) : Ui
+    sealed interface QueueFeedAudioMutation : InboxReaderMutation
 
-    data object NavigateBackFromScope : Ui
+    sealed interface SyncFeedMutation : Mutation
 
-    data object OpenSearch : Ui
+    sealed interface FeedSyncAction : SyncFeedMutation
 
-    data object CloseSearch : Ui
+    sealed interface SettingsServerAction : SyncFeedMutation
 
-    data class UpdateSearchQuery(val query: String) : Ui
+    sealed interface CatalogMutation : Mutation
+
+    data class SelectTab(val tab: AppTab) : NavigationUi
+
+    data class SelectFilter(val filter: InboxFilter) : NavigationUi
+
+    data class FilterByTag(val tagName: String?) : NavigationUi
+
+    data class FilterByFeed(val feedId: String?) : NavigationUi
+
+    data object NavigateBackFromScope : NavigationUi
+
+    data object OpenSearch : OverlayUi
+
+    data object CloseSearch : OverlayUi
+
+    data class UpdateSearchQuery(val query: String) : OverlayUi
 
     data class OpenReader(
         val entryId: String,
         val forceArticleView: Boolean = false,
-    ) : Ui
+    ) : OverlayUi
 
-    data object CloseReader : Ui
+    data object CloseReader : OverlayUi
 
-    data class OpenContextSheet(val entryId: String) : Ui
+    data class OpenContextSheet(val entryId: String) : OverlayUi
 
-    data object CloseContextSheet : Ui
+    data object CloseContextSheet : OverlayUi
 
-    data class OpenFeedContextSheet(val feedId: String) : Ui
+    data class OpenFeedContextSheet(val feedId: String) : OverlayUi
 
-    data object CloseFeedContextSheet : Ui
+    data object CloseFeedContextSheet : OverlayUi
 
     data class OpenAddSheet(
         val prefilledUrl: String = "",
         val prefilledTitle: String = "",
-    ) : Ui
+    ) : OverlayUi
 
-    data object CloseAddSheet : Ui
+    data object CloseAddSheet : OverlayUi
 
-    data object DismissMessages : Ui
+    data object DismissMessages : OverlayUi
 
-    data object OpenFullscreenPlayer : Ui
+    data object OpenFullscreenPlayer : PlayerChromeUi
 
-    data object CloseFullscreenPlayer : Ui
+    data object CloseFullscreenPlayer : PlayerChromeUi
 
-    data class SetPlayerSpeedSheetOpen(val open: Boolean) : Ui
+    data class SetPlayerSpeedSheetOpen(val open: Boolean) : PlayerChromeUi
 
-    data class SelectPlayerDrawerTab(val tab: PlayerDrawerTab?) : Ui
+    data class SelectPlayerDrawerTab(val tab: PlayerDrawerTab?) : PlayerChromeUi
 
-    data object RequestAudioOutputCast : Ui
+    data object RequestAudioOutputCast : PlayerChromeUi
 
     data class PlayAudioEntry(
         val entryId: String,
         val openFullscreen: Boolean = true,
-    ) : Mutation
+    ) : PlaybackMutation
 
-    data object TogglePlayPause : Mutation
+    data object TogglePlayPause : PlaybackMutation
 
-    data class SeekPlayerToFraction(val fraction: Float) : Mutation
+    data class SeekPlayerToFraction(val fraction: Float) : PlaybackMutation
 
-    data class SeekPlayerToMs(val positionMs: Long) : Mutation
+    data class SeekPlayerToMs(val positionMs: Long) : PlaybackMutation
 
-    data class SkipPlayerBySeconds(val deltaSeconds: Int) : Mutation
+    data class SkipPlayerBySeconds(val deltaSeconds: Int) : PlaybackMutation
 
-    data object SkipToNextQueuedAudio : Mutation
+    data object SkipToNextQueuedAudio : PlaybackMutation
 
     data class SetPlaybackSpeed(
         val speed: Float,
         val applyToCurrentPodcast: Boolean? = null,
-    ) : Mutation
+    ) : PlaybackMutation
 
     data class SetRememberPodcastSpeed(
         val feedId: String,
         val enabled: Boolean,
-    ) : Mutation
+    ) : PlaybackMutation
 
-    data class SetSkipSilence(val enabled: Boolean) : Mutation
+    data class SetSkipSilence(val enabled: Boolean) : PlaybackMutation
 
-    data class SetSmartRewind(val enabled: Boolean) : Mutation
+    data class SetSmartRewind(val enabled: Boolean) : PlaybackMutation
 
-    data class SetSleepTimerMinutes(val minutes: Int?) : Mutation
+    data class SetSleepTimerMinutes(val minutes: Int?) : PlaybackMutation
 
     data class SetFeedAutoDownload(
         val feedId: String,
         val enabled: Boolean,
-    ) : Mutation
+    ) : QueueFeedAudioMutation
 
     data class SetFeedPlaybackSpeed(
         val feedId: String,
         val speed: Float?,
-    ) : Mutation
+    ) : QueueFeedAudioMutation
 
-    data class ToggleQueueMembership(val entryId: String) : Mutation
+    data class ToggleQueueMembership(val entryId: String) : QueueFeedAudioMutation
 
     data class AddToQueue(
         val entryId: String,
         val playNext: Boolean = false,
-    ) : Mutation
+    ) : QueueFeedAudioMutation
 
-    data class RemoveFromQueue(val entryId: String) : Mutation
+    data class RemoveFromQueue(val entryId: String) : QueueFeedAudioMutation
 
-    data class MoveQueueItemUp(val entryId: String) : Mutation
+    data class MoveQueueItemUp(val entryId: String) : QueueFeedAudioMutation
 
-    data class MoveQueueItemToTop(val entryId: String) : Mutation
+    data class MoveQueueItemToTop(val entryId: String) : QueueFeedAudioMutation
 
     data class ToggleArchive(
         val entry: InboxEntry,
         val liveReadProgress: Double? = null,
-    ) : Mutation
+    ) : EntryMutation
 
-    data object UndoLastArchive : Mutation
+    data object UndoLastArchive : EntryMutation
 
-    data object ArchiveVisibleEntries : Mutation
+    data object ArchiveVisibleEntries : EntryMutation
 
-    data class ImportOpml(val opmlXml: String) : Mutation
+    data class ImportOpml(val opmlXml: String) : FeedSyncAction
 
-    data class ToggleStar(val entryId: String) : Mutation
+    data class ToggleStar(val entryId: String) : EntryMutation
 
-    data class ToggleReadState(val entryId: String) : Mutation
+    data class ToggleReadState(val entryId: String) : EntryMutation
 
-    data class ToggleOfflineCache(val entryId: String) : Mutation
+    data class ToggleOfflineCache(val entryId: String) : EntryMutation
 
-    data class ToggleTagOnEntry(val entryId: String, val tagName: String) : Mutation
+    data class ToggleTagOnEntry(val entryId: String, val tagName: String) : EntryMutation
 
-    data class UpdateReadProgress(val entryId: String, val progress: Double) : Mutation
+    data class UpdateReadProgress(val entryId: String, val progress: Double) : EntryMutation
 
     data class SaveUrlOrFeed(
         val url: String,
         val titleOverride: String?,
         val tagCsv: String,
         val mode: AddSheetMode? = null,
-    ) : Mutation
+    ) : EntryMutation
 
-    data class RefreshFeed(val feedId: String) : Mutation
+    data class RefreshFeed(val feedId: String) : FeedSyncAction
 
-    data class RenameFeed(val feedId: String, val newTitle: String) : Mutation
+    data class RenameFeed(val feedId: String, val newTitle: String) : FeedSyncAction
 
-    data class ApplyTagToFeed(val feedId: String, val tagName: String) : Mutation
+    data class ApplyTagToFeed(val feedId: String, val tagName: String) : FeedSyncAction
 
-    data class ArchiveFeedUnread(val feedId: String) : Mutation
+    data class ArchiveFeedUnread(val feedId: String) : FeedSyncAction
 
-    data class ToggleFeedArchive(val feedId: String) : Mutation
+    data class ToggleFeedArchive(val feedId: String) : FeedSyncAction
 
-    data class DeleteFeed(val feedId: String) : Mutation
+    data class DeleteFeed(val feedId: String) : FeedSyncAction
 
-    data class DeleteEntry(val entryId: String) : Mutation
+    data class DeleteEntry(val entryId: String) : EntryMutation
 
-    data object SyncNow : Mutation
+    data object SyncNow : FeedSyncAction
 
-    data object PollFeedsOnDeviceNow : Mutation
+    data object PollFeedsOnDeviceNow : FeedSyncAction
 
     data class SyncWithServerConfig(
         val serverUrl: String,
         val bearerToken: String,
-    ) : Mutation
+    ) : FeedSyncAction
 
-    data object StartupSyncIfConfigured : Mutation
+    data object StartupSyncIfConfigured : FeedSyncAction
 
-    data class SetThemeMode(val mode: ThemeMode) : Mutation
+    data class SetThemeMode(val mode: ThemeMode) : SettingsServerAction
 
-    data class SetHeadlineFont(val font: HeadlineFont) : Mutation
+    data class SetHeadlineFont(val font: HeadlineFont) : SettingsServerAction
 
-    data class SetUltraDenseRows(val enabled: Boolean) : Mutation
+    data class SetUltraDenseRows(val enabled: Boolean) : SettingsServerAction
 
-    data class SetReaderFontScale(val scale: Float) : Mutation
+    data class SetReaderFontScale(val scale: Float) : SettingsServerAction
 
-    data class SetSwipeToArchive(val enabled: Boolean) : Mutation
+    data class SetSwipeToArchive(val enabled: Boolean) : SettingsServerAction
 
-    data class SetShowCollectionDrawsOnHome(val enabled: Boolean) : Mutation
+    data class SetShowCollectionDrawsOnHome(val enabled: Boolean) : SettingsServerAction
 
-    data class SetBottomNavSlot(val slotIndex: Int, val tab: AppTab) : Mutation
+    data class SetBottomNavSlot(val slotIndex: Int, val tab: AppTab) : SettingsServerAction
 
-    data object ResetBottomNavTabs : Mutation
+    data object ResetBottomNavTabs : SettingsServerAction
 
     data class OpenCompanionSection(
         val subTab: CompanionSubTab,
         val collectionId: String? = null,
-    ) : Ui
+    ) : CatalogUi
 
-    data class SelectCompanionSubTab(val subTab: CompanionSubTab) : Ui
+    data class SelectCompanionSubTab(val subTab: CompanionSubTab) : CatalogUi
 
-    data class SelectCatalogCollection(val collectionId: String) : Ui
+    data class SelectCatalogCollection(val collectionId: String) : CatalogUi
 
-    data class SelectWantCollection(val collectionId: String) : Ui
+    data class SelectWantCollection(val collectionId: String) : CatalogUi
 
     data class OpenQuickLogSheet(
         val defaultToWant: Boolean = false,
         val targetCollectionId: String? = null,
         val targetCollectionTitle: String? = null,
-    ) : Ui
+    ) : CatalogUi
 
-    data object CloseQuickLogSheet : Ui
+    data object CloseQuickLogSheet : CatalogUi
 
     data class OpenDrawNoteDialog(
         val collectionId: String,
         val mode: DrawNoteDialogMode,
-    ) : Ui
+    ) : CatalogUi
 
-    data object CloseDrawNoteDialog : Ui
+    data object CloseDrawNoteDialog : CatalogUi
 
-    data object CloseRankSession : Ui
+    data object CloseRankSession : CatalogUi
 
     data class SetCollectionGeneratorEnabled(
         val collectionIdOrSlug: String,
         val enabled: Boolean,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class ConfirmFinishDraw(
         val collectionId: String,
         val notes: String,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class ConfirmAbandonDraw(
         val collectionId: String,
         val notes: String,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class StartRankingSession(
         val collectionIdOrSlug: String,
         val focusEntryId: String? = null,
-    ) : Mutation
+    ) : CatalogMutation
 
-    data class SubmitRankCluster(val ordering: List<List<String>>) : Mutation
+    data class SubmitRankCluster(val ordering: List<List<String>>) : CatalogMutation
 
-    data object SkipRankCluster : Mutation
+    data object SkipRankCluster : CatalogMutation
 
     data class MarkFeedEntryFinished(
         val entryId: String,
         val rankImmediately: Boolean = false,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class SubmitQuickLog(
         val kind: EntryKind,
@@ -434,33 +449,33 @@ sealed interface MainAction {
         val rankAfterLog: Boolean,
         val targetCollectionId: String? = null,
         val addToListOnly: Boolean = false,
-    ) : Mutation
+    ) : CatalogMutation
 
-    data class CreateCustomCatalogList(val title: String) : Mutation
+    data class CreateCustomCatalogList(val title: String) : CatalogMutation
 
     data class CompleteWantEntry(
         val entryId: String,
         val rankImmediately: Boolean = true,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class RemoveWantEntry(
         val collectionId: String,
         val entryId: String,
-    ) : Mutation
+    ) : CatalogMutation
 
     data class UpdateServerConfig(
         val serverUrl: String,
         val bearerToken: String,
         val feedback: ConfigSaveFeedback = ConfigSaveFeedback.SHOW_BANNER,
-    ) : Mutation
+    ) : SettingsServerAction
 
     data class PairWithServer(
         val serverUrl: String,
         val pairingCode: String,
         val deviceName: String = "Roche Android",
-    ) : Mutation
+    ) : SettingsServerAction
 
-    data object DiscoverServer : Mutation
+    data object DiscoverServer : SettingsServerAction
 }
 
 internal data class TransientUiState(
@@ -493,6 +508,9 @@ internal data class TransientUiState(
     val quickLogTargetCollectionTitle: String? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
+    val isPlayerFullscreenOpen: Boolean = false,
+    val isPlayerSpeedSheetOpen: Boolean = false,
+    val activePlayerDrawerTab: PlayerDrawerTab? = null,
     val localNetworkTier: NetworkTier = NetworkTier.WIFI,
     val undoEvent: UndoArchiveEvent? = null,
     val statusBanner: String? = null,
@@ -556,62 +574,6 @@ internal fun TransientUiState.clearSearch(): TransientUiState =
         deepSearchResults = emptyList(),
     )
 
-internal fun reduceUiAction(
-    state: TransientUiState,
-    action: MainAction.Ui,
-): TransientUiState =
-    when (action) {
-        is MainAction.SelectTab ->
-            state
-                .clearSearch()
-                .copy(
-                    activeTab = action.tab,
-                    selectedReaderEntryId = null,
-                    readerContent = null,
-                    selectedFeedId = null,
-                    selectedTag = null,
-                    scopeOriginTab = null,
-                )
-        is MainAction.SelectFilter -> state.copy(activeFilter = action.filter)
-        is MainAction.FilterByTag ->
-            state
-                .clearSearch()
-                .copy(
-                    activeTab = AppTab.INBOX,
-                    selectedTag = action.tagName,
-                    selectedFeedId = null,
-                    scopeOriginTab = resolveNextScopeOriginTab(state, action.tagName != null),
-                    selectedReaderEntryId = null,
-                    readerContent = null,
-                    contextSheetEntryId = null,
-                )
-        is MainAction.FilterByFeed ->
-            state
-                .clearSearch()
-                .copy(
-                    activeTab = AppTab.INBOX,
-                    selectedFeedId = action.feedId,
-                    selectedTag = null,
-                    scopeOriginTab = resolveNextScopeOriginTab(state, action.feedId != null),
-                    selectedReaderEntryId = null,
-                    readerContent = null,
-                    contextSheetEntryId = null,
-                    feedContextSheetId = null,
-                )
-        MainAction.NavigateBackFromScope ->
-            state.copy(
-                activeTab = state.scopeOriginTab ?: AppTab.HOME,
-                selectedFeedId = null,
-                selectedTag = null,
-                scopeOriginTab = null,
-                selectedReaderEntryId = null,
-                readerContent = null,
-                contextSheetEntryId = null,
-                feedContextSheetId = null,
-            )
-        else -> reduceOverlayUiAction(state, action)
-    }
-
 internal fun InboxEntry.mergeReaderContent(full: ReaderItemContent?): InboxEntry {
     if (full == null) return this
     val mergedHtml = pickLongerReaderText(full.contentHtml, contentHtml)
@@ -635,125 +597,6 @@ internal fun pickLongerReaderText(first: String?, second: String?): String? {
         a.length >= b.length -> a
         else -> b
     }
-}
-
-private fun resolveNextScopeOriginTab(state: TransientUiState, hasNewScope: Boolean): AppTab? =
-    when {
-        !hasNewScope -> null
-        state.activeTab != AppTab.INBOX -> state.activeTab
-        else -> state.scopeOriginTab
-    }
-
-private fun reduceOverlayUiAction(
-    state: TransientUiState,
-    action: MainAction.Ui,
-): TransientUiState =
-    when (action) {
-        is MainAction.UpdateSearchQuery -> reduceUpdateSearchQuery(state, action.query)
-        MainAction.OpenSearch ->
-            state.copy(
-                isSearchOpen = true,
-                contextSheetEntryId = null,
-                feedContextSheetId = null,
-                isAddSheetOpen = false,
-            )
-        MainAction.CloseSearch -> state.clearSearch()
-        is MainAction.OpenReader ->
-            state.copy(
-                selectedReaderEntryId = action.entryId,
-                readerContent = state.readerContent?.takeIf { it.itemId == action.entryId },
-                hydratingEntryIds = state.hydratingEntryIds + action.entryId,
-                contextSheetEntryId = null,
-            )
-        MainAction.CloseReader -> state.copy(selectedReaderEntryId = null, readerContent = null)
-        is MainAction.OpenContextSheet -> state.copy(contextSheetEntryId = action.entryId)
-        MainAction.CloseContextSheet -> state.copy(contextSheetEntryId = null)
-        is MainAction.OpenFeedContextSheet -> state.copy(feedContextSheetId = action.feedId)
-        MainAction.CloseFeedContextSheet -> state.copy(feedContextSheetId = null)
-        is MainAction.OpenAddSheet ->
-            state.copy(
-                isAddSheetOpen = true,
-                prefilledShareUrl = action.prefilledUrl,
-                prefilledShareTitle = action.prefilledTitle,
-                contextSheetEntryId = null,
-                feedContextSheetId = null,
-            )
-        MainAction.CloseAddSheet ->
-            state.copy(
-                isAddSheetOpen = false,
-                prefilledShareUrl = "",
-                prefilledShareTitle = "",
-            )
-        MainAction.DismissMessages -> state.copy(undoEvent = null, statusBanner = null)
-        else -> reduceCatalogUiAction(state, action)
-    }
-
-private fun reduceCatalogUiAction(
-    state: TransientUiState,
-    action: MainAction.Ui,
-): TransientUiState =
-    when (action) {
-        is MainAction.OpenCompanionSection -> reduceOpenCompanionSection(state, action)
-        is MainAction.SelectCompanionSubTab -> state.copy(companionSubTab = action.subTab)
-        is MainAction.SelectCatalogCollection ->
-            state.copy(selectedCatalogCollectionId = action.collectionId)
-        is MainAction.SelectWantCollection ->
-            state.copy(selectedWantCollectionId = action.collectionId)
-        is MainAction.OpenQuickLogSheet ->
-            state.copy(
-                isQuickLogSheetOpen = true,
-                quickLogDefaultWant = action.defaultToWant,
-                quickLogTargetCollectionId = action.targetCollectionId,
-                quickLogTargetCollectionTitle = action.targetCollectionTitle,
-            )
-        MainAction.CloseQuickLogSheet ->
-            state.copy(
-                isQuickLogSheetOpen = false,
-                quickLogTargetCollectionId = null,
-                quickLogTargetCollectionTitle = null,
-            )
-        is MainAction.OpenDrawNoteDialog ->
-            state.copy(drawNoteDialog = DrawNoteDialogState(action.collectionId, action.mode))
-        MainAction.CloseDrawNoteDialog -> state.copy(drawNoteDialog = null)
-        MainAction.CloseRankSession -> state.copy(rankSession = null)
-        else -> state
-    }
-
-private fun reduceOpenCompanionSection(
-    state: TransientUiState,
-    action: MainAction.OpenCompanionSection,
-): TransientUiState =
-    state
-        .clearSearch()
-        .copy(
-            activeTab = AppTab.LISTS,
-            companionSubTab = action.subTab,
-            selectedCatalogCollectionId =
-                if (action.subTab == CompanionSubTab.LISTS && action.collectionId != null) {
-                    action.collectionId
-                } else {
-                    state.selectedCatalogCollectionId
-                },
-            selectedWantCollectionId =
-                if (action.subTab == CompanionSubTab.WANT && action.collectionId != null) {
-                    action.collectionId
-                } else {
-                    state.selectedWantCollectionId
-                },
-            selectedReaderEntryId = null,
-            readerContent = null,
-            selectedFeedId = null,
-            selectedTag = null,
-            scopeOriginTab = null,
-        )
-
-private fun reduceUpdateSearchQuery(state: TransientUiState, query: String): TransientUiState {
-    val clean = query.trim()
-    return state.copy(
-        searchQuery = query,
-        deepSearchQuery = if (clean.isEmpty()) "" else state.deepSearchQuery,
-        deepSearchResults = if (clean.isEmpty()) emptyList() else state.deepSearchResults,
-    )
 }
 
 internal fun updateBottomNavSlot(
@@ -780,7 +623,6 @@ internal fun buildMainUiState(
     settings: Settings,
     local: TransientUiState,
     localNetworkTier: NetworkTier = local.localNetworkTier,
-    playerState: PodcastPlayerState = PodcastPlayerState(),
 ): MainUiState =
     MainUiStateMemoizer()
         .build(
@@ -788,7 +630,6 @@ internal fun buildMainUiState(
             settings = settings,
             local = local,
             localNetworkTier = localNetworkTier,
-            playerState = playerState,
         )
 
 internal class MainUiStateMemoizer {
@@ -826,7 +667,6 @@ internal class MainUiStateMemoizer {
         settings: Settings,
         local: TransientUiState,
         localNetworkTier: NetworkTier = local.localNetworkTier,
-        playerState: PodcastPlayerState = PodcastPlayerState(),
     ): MainUiState =
         synchronized(this) {
             val effectiveEntries =
@@ -852,7 +692,6 @@ internal class MainUiStateMemoizer {
                 settings = settings,
                 local = local,
                 localNetworkTier = localNetworkTier,
-                playerState = playerState,
                 effectiveEntries = effectiveEntries,
                 filtered = filtered,
                 searchResults = searchResults,
@@ -865,7 +704,6 @@ internal class MainUiStateMemoizer {
         settings: Settings,
         local: TransientUiState,
         localNetworkTier: NetworkTier,
-        playerState: PodcastPlayerState,
         effectiveEntries: List<InboxEntry>,
         filtered: List<InboxEntry>,
         searchResults: List<InboxEntry>,
@@ -913,7 +751,9 @@ internal class MainUiStateMemoizer {
             quickLogTargetCollectionTitle = local.quickLogTargetCollectionTitle,
             drawNoteDialog = local.drawNoteDialog,
             rankSession = local.rankSession,
-            playerState = playerState,
+            isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,
+            isPlayerSpeedSheetOpen = local.isPlayerSpeedSheetOpen,
+            activePlayerDrawerTab = local.activePlayerDrawerTab,
             undoEvent = local.undoEvent,
             statusBanner = local.statusBanner,
             messageSequence = local.messageSequence,
@@ -1104,43 +944,5 @@ internal fun computeOfflineEntries(allEntries: List<InboxEntry>): List<InboxEntr
     if (allEntries.isEmpty()) emptyList() else allEntries.filter { it.isCachedOffline }
 
 internal fun entryCountNoun(count: Int): String = if (count == 1) "entry" else "entries"
-
-internal fun mergeBaseWithPlayerState(
-    baseFlow: Flow<MainUiState>,
-    playerFlow: StateFlow<PodcastPlayerState>,
-    onBuilt: (MainUiState) -> Unit,
-): Flow<MainUiState> = channelFlow {
-    val lock = Any()
-    var latestBase: MainUiState? = null
-    var latestPlayer: PodcastPlayerState = playerFlow.value
-
-    fun sendMerged(updateBase: MainUiState?, updatePlayer: PodcastPlayerState?) {
-        synchronized(lock) {
-            if (updateBase != null) latestBase = updateBase
-            if (updatePlayer != null) latestPlayer = updatePlayer
-            val base = latestBase ?: return
-            val player = latestPlayer
-            val hasNextQueuedAudio =
-                base.queueEntries.any { entry ->
-                    entry.contentType == ContentType.AUDIO && entry.id != player.currentEntryId
-                }
-            trySend(
-                base.copy(
-                    playerState =
-                        player.copy(
-                            hasNextQueuedAudio = hasNextQueuedAudio,
-                            smartRewindEnabled = base.settings.smartRewindEnabled,
-                            skipSilenceEnabled = base.settings.skipSilenceEnabled,
-                        )
-                )
-            )
-        }
-    }
-
-    launch { baseFlow.collect { base -> sendMerged(updateBase = base, updatePlayer = null) } }
-    playerFlow.collect { player -> sendMerged(updateBase = null, updatePlayer = player) }
-}
-    .buffer(Channel.CONFLATED)
-    .onEach { merged -> onBuilt(merged) }
 
 internal const val SNACKBAR_TITLE_LIMIT = 36

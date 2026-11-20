@@ -1,163 +1,114 @@
 package com.grayvines.roche.ui
 
-import com.grayvines.roche.data.normalizeTagName
+import com.grayvines.roche.core.normalizeTagName
+import com.grayvines.roche.data.remote.ProblemDetailsException
+import com.grayvines.roche.data.remote.RocheProblemTypes
+import com.grayvines.roche.data.remote.formatProblemDetailsMessage
 import com.grayvines.roche.data.settings.normalizeServerUrl
 import com.grayvines.roche.model.AppTab
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.update
 
 @Suppress("TooManyFunctions")
-internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
-    internal suspend fun tryExecute(action: MainAction.Mutation): Boolean =
+internal class MainSyncFeedDelegate(private val host: SyncFeedHost) {
+    internal suspend fun execute(action: MainAction.SyncFeedMutation) {
         when (action) {
-            is MainAction.ImportOpml -> {
-                performImportOpml(action.opmlXml)
-                true
-            }
-            is MainAction.RefreshFeed -> {
-                performRefreshFeed(action.feedId)
-                true
-            }
-            is MainAction.RenameFeed -> {
-                performRenameFeed(action.feedId, action.newTitle)
-                true
-            }
-            is MainAction.ApplyTagToFeed -> {
-                performApplyTagToFeed(action.feedId, action.tagName)
-                true
-            }
-            is MainAction.ArchiveFeedUnread -> {
-                performArchiveFeedUnread(action.feedId)
-                true
-            }
-            is MainAction.ToggleFeedArchive -> {
-                performToggleFeedArchive(action.feedId)
-                true
-            }
-            is MainAction.DeleteFeed -> {
-                performDeleteFeed(action.feedId)
-                true
-            }
-            MainAction.SyncNow -> {
-                performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
-                true
-            }
-            MainAction.PollFeedsOnDeviceNow -> {
-                performPollFeedsOnDevice()
-                true
-            }
-            is MainAction.SyncWithServerConfig -> {
-                performSyncWithServerConfig(action)
-                true
-            }
-            MainAction.StartupSyncIfConfigured -> {
-                performStartupSync()
-                true
-            }
-            else -> {
-                tryExecuteSettings(action)
-            }
+            is MainAction.FeedSyncAction -> executeFeedSyncAction(action)
+            is MainAction.SettingsServerAction -> executeSettingsServerAction(action)
         }
+    }
 
-    private suspend fun tryExecuteSettings(action: MainAction.Mutation): Boolean =
+    private suspend fun executeFeedSyncAction(action: MainAction.FeedSyncAction) {
         when (action) {
-            is MainAction.SetThemeMode -> {
-                vm.settingsRepository.update { it.copy(themeMode = action.mode) }
-                true
-            }
-            is MainAction.SetHeadlineFont -> {
-                vm.settingsRepository.update { it.copy(headlineFont = action.font) }
-                true
-            }
-            is MainAction.SetUltraDenseRows -> {
-                vm.settingsRepository.update { it.copy(ultraDenseRows = action.enabled) }
-                true
-            }
-            is MainAction.SetReaderFontScale -> {
-                vm.settingsRepository.update { it.copy(readerFontScale = action.scale) }
-                true
-            }
-            is MainAction.SetSwipeToArchive -> {
-                vm.settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
-                true
-            }
-            is MainAction.SetShowCollectionDrawsOnHome -> {
-                vm.settingsRepository.update {
+            is MainAction.ImportOpml -> performImportOpml(action.opmlXml)
+            is MainAction.RefreshFeed -> performRefreshFeed(action.feedId)
+            is MainAction.RenameFeed -> performRenameFeed(action.feedId, action.newTitle)
+            is MainAction.ApplyTagToFeed -> performApplyTagToFeed(action.feedId, action.tagName)
+            is MainAction.ArchiveFeedUnread -> performArchiveFeedUnread(action.feedId)
+            is MainAction.ToggleFeedArchive -> performToggleFeedArchive(action.feedId)
+            is MainAction.DeleteFeed -> performDeleteFeed(action.feedId)
+            MainAction.SyncNow -> performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
+            MainAction.PollFeedsOnDeviceNow -> performPollFeedsOnDevice()
+            is MainAction.SyncWithServerConfig -> performSyncWithServerConfig(action)
+            MainAction.StartupSyncIfConfigured -> performStartupSync()
+        }
+    }
+
+    private suspend fun executeSettingsServerAction(action: MainAction.SettingsServerAction) {
+        when (action) {
+            is MainAction.SetThemeMode ->
+                host.settingsRepository.update { it.copy(themeMode = action.mode) }
+            is MainAction.SetHeadlineFont ->
+                host.settingsRepository.update { it.copy(headlineFont = action.font) }
+            is MainAction.SetUltraDenseRows ->
+                host.settingsRepository.update { it.copy(ultraDenseRows = action.enabled) }
+            is MainAction.SetReaderFontScale ->
+                host.settingsRepository.update { it.copy(readerFontScale = action.scale) }
+            is MainAction.SetSwipeToArchive ->
+                host.settingsRepository.update { it.copy(swipeToArchive = action.enabled) }
+            is MainAction.SetShowCollectionDrawsOnHome ->
+                host.settingsRepository.update {
                     it.copy(showCollectionDrawsOnHome = action.enabled)
                 }
-                true
-            }
-            is MainAction.SetBottomNavSlot -> {
-                vm.settingsRepository.update { current ->
+            is MainAction.SetBottomNavSlot ->
+                host.settingsRepository.update { current ->
                     val updatedTabs =
                         updateBottomNavSlot(current.bottomNavTabs, action.slotIndex, action.tab)
                     current.copy(bottomNavTabs = updatedTabs)
                 }
-                true
-            }
-            MainAction.ResetBottomNavTabs -> {
-                vm.settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
-                true
-            }
-            is MainAction.UpdateServerConfig -> {
-                performUpdateServerConfig(action)
-                true
-            }
-            is MainAction.PairWithServer -> {
-                performPairWithServer(action)
-                true
-            }
-            MainAction.DiscoverServer -> {
-                performDiscoverServer()
-                true
-            }
-            else -> {
-                false
-            }
+            MainAction.ResetBottomNavTabs ->
+                host.settingsRepository.update { it.copy(bottomNavTabs = AppTab.defaultSideTabs) }
+            is MainAction.UpdateServerConfig -> performUpdateServerConfig(action)
+            is MainAction.PairWithServer -> performPairWithServer(action)
+            MainAction.DiscoverServer -> performDiscoverServer()
         }
+    }
 
     internal suspend fun performImportOpml(opmlXml: String) {
-        if (!vm.tryAcquireSyncLock()) return
+        if (!host.tryAcquireSyncLock()) return
         try {
-            vm.repository
+            host.repository
                 .importOpml(opmlXml)
                 .onSuccess { importedCount ->
                     val noun = if (importedCount == 1) "feed" else "feeds"
-                    vm.showStatusMessage("Imported $importedCount $noun from OPML")
+                    host.showStatusMessage("Imported $importedCount $noun from OPML")
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("OPML import failed (${error.message ?: "error"})")
+                    host.showStatusMessage(
+                        "OPML import failed (${formatErrorDetail(error, "error")})"
+                    )
                 }
         } finally {
-            vm.transientState.update { it.copy(isSyncing = false) }
+            host.updateTransient { it.copy(isSyncing = false) }
         }
     }
 
     private suspend fun performRefreshFeed(feedId: String) {
-        if (!vm.tryAcquireSyncLock()) return
+        if (!host.tryAcquireSyncLock()) return
         try {
-            vm.repository
+            host.repository
                 .refreshFeed(feedId)
                 .onSuccess { title ->
-                    vm.showStatusMessage("Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
+                    host.showStatusMessage("Refreshed \"${title.take(SNACKBAR_TITLE_LIMIT)}\"")
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("Refresh failed (${error.message ?: "unreachable"})")
+                    host.showStatusMessage(
+                        "Refresh failed (${formatErrorDetail(error, "unreachable")})"
+                    )
                 }
         } finally {
-            vm.transientState.update { it.copy(isSyncing = false) }
+            host.updateTransient { it.copy(isSyncing = false) }
         }
     }
 
     private suspend fun performRenameFeed(feedId: String, newTitle: String) {
-        val updatedTitle = vm.repository.renameFeed(feedId = feedId, newTitle = newTitle)
+        val updatedTitle = host.repository.renameFeed(feedId = feedId, newTitle = newTitle)
         if (updatedTitle != null) {
-            vm.showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
+            host.showStatusMessage("Renamed feed to \"${updatedTitle.take(SNACKBAR_TITLE_LIMIT)}\"")
         }
     }
 
     private suspend fun performApplyTagToFeed(feedId: String, tagName: String) {
-        val count = vm.repository.applyTagToFeedItems(feedId = feedId, tagName = tagName)
+        val count = host.repository.applyTagToFeedItems(feedId = feedId, tagName = tagName)
         val cleanTag = normalizeTagName(tagName)
         if (cleanTag.isNotBlank()) {
             val msg =
@@ -166,27 +117,27 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 } else {
                     "All active feed entries already have #$cleanTag"
                 }
-            vm.showStatusMessage(msg)
+            host.showStatusMessage(msg)
         }
     }
 
     private suspend fun performArchiveFeedUnread(feedId: String) {
         val unreadIds =
-            vm.latestEntries().filter { it.feedId == feedId && !it.isArchived }.map { it.id }
+            host.latestEntries().filter { it.feedId == feedId && !it.isArchived }.map { it.id }
         if (unreadIds.isEmpty()) return
         val snapshots =
-            vm.repository.archiveBatchWithSnapshots(
+            host.repository.archiveBatchWithSnapshots(
                 entryIds = unreadIds,
                 feedId = feedId,
                 allUnread = false,
             )
         if (snapshots.isEmpty()) return
         val archivedIds = snapshots.map { it.itemId }.toSet()
-        vm.cleanupRemovedEntries(archivedIds)
+        host.cleanupRemovedEntries(archivedIds)
         val count = snapshots.size
         val noun = entryCountNoun(count)
         val first = snapshots.first()
-        vm.transientState.update {
+        host.updateTransient {
             it.copy(
                 feedContextSheetId = null,
                 statusBanner = null,
@@ -204,11 +155,11 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performToggleFeedArchive(feedId: String) {
-        vm.repository
+        host.repository
             .toggleFeedArchive(feedId)
             .onSuccess { (title, isArchived) ->
                 val verb = if (isArchived) "Archived feed" else "Unarchived feed"
-                vm.transientState.update { current ->
+                host.updateTransient { current ->
                     current.copy(
                         feedContextSheetId =
                             if (current.feedContextSheetId == feedId) {
@@ -223,24 +174,24 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                 }
             }
             .onFailure { error ->
-                vm.showStatusMessage("Feed update failed (${error.message ?: "error"})")
+                host.showStatusMessage("Feed update failed (${formatErrorDetail(error, "error")})")
             }
     }
 
     private suspend fun performDeleteFeed(feedId: String) {
-        val feedEntryIds = vm.latestEntries().filter { it.feedId == feedId }.map { it.id }.toSet()
-        vm.repository
+        val feedEntryIds = host.latestEntries().filter { it.feedId == feedId }.map { it.id }.toSet()
+        host.repository
             .deleteFeed(feedId)
             .onSuccess { title ->
                 if (feedEntryIds.isNotEmpty()) {
-                    vm.cleanupRemovedEntries(feedEntryIds)
+                    host.cleanupRemovedEntries(feedEntryIds)
                 }
-                vm.transientState.update { current ->
+                host.updateTransient { current ->
                     applyDeletedFeedState(current = current, feedId = feedId, title = title)
                 }
             }
             .onFailure { error ->
-                vm.showStatusMessage("Unsubscribe failed (${error.message ?: "error"})")
+                host.showStatusMessage("Unsubscribe failed (${formatErrorDetail(error, "error")})")
             }
     }
 
@@ -268,7 +219,7 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
     }
 
     private suspend fun performSyncWithServerConfig(action: MainAction.SyncWithServerConfig) {
-        vm.refreshLocalNetworkTier()
+        host.refreshLocalNetworkTier()
         performUpdateServerConfig(
             MainAction.UpdateServerConfig(
                 serverUrl = action.serverUrl,
@@ -277,16 +228,16 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
             )
         )
         if (normalizeServerUrl(action.serverUrl).isBlank()) {
-            vm.showStatusMessage("Configure Server URL in Settings")
+            host.showStatusMessage("Configure Server URL in Settings")
             return
         }
         performSync(errorPolicy = SyncErrorPolicy.SHOW_BANNER)
-        vm.refreshLocalNetworkTier()
+        host.refreshLocalNetworkTier()
     }
 
     private suspend fun performUpdateServerConfig(action: MainAction.UpdateServerConfig) {
         val normalizedTargetUrl = normalizeServerUrl(action.serverUrl)
-        vm.settingsRepository.update { current ->
+        host.settingsRepository.update { current ->
             val preserveToken =
                 current.hasUndecryptableToken &&
                     action.bearerToken.trim().isEmpty() &&
@@ -297,61 +248,63 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
             )
         }
         if (action.feedback == ConfigSaveFeedback.SHOW_BANNER) {
-            vm.showStatusMessage("Saved server settings")
+            host.showStatusMessage("Saved server settings")
         }
     }
 
     private suspend fun performDiscoverServer() {
         val message =
-            vm.repository
+            host.repository
                 .discoverServer()
                 .fold(
                     onSuccess = { url -> "Discovered Roche server at $url" },
-                    onFailure = { err -> "Discovery failed (${err.message ?: "not found"})" },
+                    onFailure = { err ->
+                        "Discovery failed (${formatErrorDetail(err, "not found")})"
+                    },
                 )
-        vm.showStatusMessage(message)
+        host.showStatusMessage(message)
     }
 
     private suspend fun performPairWithServer(action: MainAction.PairWithServer) {
         if (action.pairingCode.isBlank()) {
-            vm.showStatusMessage("Enter a pairing code")
+            host.showStatusMessage("Enter a pairing code")
             return
         }
-        vm.refreshLocalNetworkTier()
-        vm.repository
+        host.refreshLocalNetworkTier()
+        host.repository
             .pairWithCode(
                 serverUrl = action.serverUrl,
                 pairingCode = action.pairingCode,
                 deviceName = action.deviceName,
             )
             .onSuccess {
-                val syncCount = vm.repository.syncWithServer().getOrNull()
-                vm.refreshLocalNetworkTier()
+                val syncCount = host.repository.syncWithServer().getOrNull()
+                host.refreshLocalNetworkTier()
                 val suffix = syncCount?.let { " · Synced $it entries" }.orEmpty()
-                vm.showStatusMessage("Paired with server$suffix")
+                host.showStatusMessage("Paired with server$suffix")
             }
             .onFailure { error ->
-                vm.refreshLocalNetworkTier()
-                vm.showStatusMessage("Pairing failed (${error.message ?: "error"})")
+                host.refreshLocalNetworkTier()
+                host.showStatusMessage("Pairing failed (${formatErrorDetail(error, "error")})")
             }
     }
 
     private suspend fun performStartupSync() {
-        vm.refreshLocalNetworkTier()
-        vm.uiState.first { !it.isInitialLoading }
-        val currentSettings = vm.settingsRepository.settings.first()
+        host.refreshLocalNetworkTier()
+        host.awaitInitialLoad()
+        val currentSettings = host.settingsRepository.settings.first()
         if (currentSettings.serverUrl.isNotBlank() && currentSettings.bearerToken.isNotBlank()) {
             performSync(errorPolicy = SyncErrorPolicy.SILENT)
         }
-        vm.refreshLocalNetworkTier()
+        host.refreshLocalNetworkTier()
     }
 
     private suspend fun performPollFeedsOnDevice() {
-        vm.refreshLocalNetworkTier()
-        if (!vm.tryAcquireSyncLock()) return
+        host.refreshLocalNetworkTier()
+        if (!host.tryAcquireSyncLock()) return
         try {
-            val pollResult = vm.repository.pollDueFeedsOnDeviceNow()
-            vm.refreshLocalNetworkTier()
+            val pollResult = host.repository.pollDueFeedsOnDeviceNow()
+            host.refreshLocalNetworkTier()
             pollResult
                 .onSuccess { count ->
                     val msg =
@@ -361,24 +314,26 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                             val noun = if (count == 1) "feed" else "feeds"
                             "Polled $count due $noun on-device"
                         }
-                    vm.showStatusMessage(msg)
+                    host.showStatusMessage(msg)
                 }
                 .onFailure { error ->
-                    vm.showStatusMessage("On-device poll skipped (${error.message ?: "offline"})")
+                    host.showStatusMessage(
+                        "On-device poll skipped (${formatErrorDetail(error, "offline")})"
+                    )
                 }
         } finally {
-            vm.refreshLocalNetworkTier()
-            vm.transientState.update { it.copy(isSyncing = false) }
+            host.refreshLocalNetworkTier()
+            host.updateTransient { it.copy(isSyncing = false) }
         }
     }
 
     private suspend fun performSync(errorPolicy: SyncErrorPolicy) {
-        vm.refreshLocalNetworkTier()
-        if (!vm.tryAcquireSyncLock()) return
+        host.refreshLocalNetworkTier()
+        if (!host.tryAcquireSyncLock()) return
         try {
-            val hasServer = vm.settingsRepository.settings.first().serverUrl.isNotBlank()
-            val syncResult = vm.repository.syncWithServer()
-            vm.refreshLocalNetworkTier()
+            val hasServer = host.settingsRepository.settings.first().serverUrl.isNotBlank()
+            val syncResult = host.repository.syncWithServer()
+            host.refreshLocalNetworkTier()
             syncResult
                 .onSuccess { count ->
                     val message =
@@ -387,16 +342,33 @@ internal class MainSyncFeedDelegate(private val vm: MainViewModel) {
                             count == 0 -> "Feeds are up to date"
                             else -> "Refreshed $count ${if (count == 1) "feed" else "feeds"}"
                         }
-                    vm.showStatusMessage(message)
+                    host.showStatusMessage(message)
                 }
                 .onFailure { error ->
                     if (errorPolicy == SyncErrorPolicy.SHOW_BANNER) {
-                        vm.showStatusMessage("Sync offline (${error.message ?: "unreachable"})")
+                        val detail = formatErrorDetail(error, "unreachable")
+                        val banner =
+                            if (
+                                error is ProblemDetailsException &&
+                                    error.problemType == RocheProblemTypes.TOKEN_INVALID
+                            ) {
+                                detail
+                            } else {
+                                "Sync offline ($detail)"
+                            }
+                        host.showStatusMessage(banner)
                     }
                 }
         } finally {
-            vm.refreshLocalNetworkTier()
-            vm.transientState.update { it.copy(isSyncing = false) }
+            host.refreshLocalNetworkTier()
+            host.updateTransient { it.copy(isSyncing = false) }
         }
     }
+
+    private fun formatErrorDetail(error: Throwable, fallback: String): String =
+        if (error is ProblemDetailsException) {
+            formatProblemDetailsMessage(error)
+        } else {
+            error.message?.takeIf { it.isNotBlank() } ?: fallback
+        }
 }

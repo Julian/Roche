@@ -19,6 +19,20 @@ use super::{
     SortOrder, WANT_TO_READ_COLLECTION_ID,
 };
 
+/// Canonical SQL predicate defining the read-only `Item` projection boundary over unified `entries`.
+///
+/// `Item` (along with [`crate::db::Feed`]) is a read-only projection over `entries` plus its
+/// satellite tables (`entry_state`, `entry_content`, `entry_media`, `collection_entries`, and
+/// `feed_sources`), rather than a separate backing table. An `entries` row (aliased as `i`, joined
+/// to `entry_state es` and `entry_content ec`) is projected as a live reader `Item` when
+/// `i.merged_into_id IS NULL` and at least one of the following holds:
+/// - `es.inbox_state IN ('unread', 'dismissed')` (Feed Inbox emission),
+/// - `ec.entry_id IS NOT NULL` (saved/enriched reader body or media content), or
+/// - `i.kind` is reader-openable (`article`, `paper`, `video`, `podcast_episode`) and the entry
+///   belongs to a `want` or `list` collection.
+///
+/// Non-reader catalog works (such as `movie`, `book`, `album`, `game`, `artist`, or `collection`)
+/// without reader state/content are excluded from this projection.
 pub const IS_LIVE_ITEM_SQL: &str = "(
     es.inbox_state IN ('unread', 'dismissed')
     OR ec.entry_id IS NOT NULL
@@ -33,6 +47,9 @@ pub const IS_LIVE_ITEM_SQL: &str = "(
     )
 )";
 
+/// Stricter SQL predicate narrowing [`IS_LIVE_ITEM_SQL`] strictly to Feed Inbox emissions:
+/// entries with `es.inbox_state IN ('unread', 'dismissed')` that belong to at least one subscribed
+/// `feed_sources` collection.
 pub const IS_FEED_INBOX_ITEM_SQL: &str = "(
     es.inbox_state IN ('unread', 'dismissed')
     AND EXISTS (
@@ -151,6 +168,10 @@ impl TryFrom<&str> for TagNames {
     }
 }
 
+/// Read-only reader/inbox item projection over unified `entries` and satellite tables
+/// (`entry_state`, `entry_content`, `entry_media`, `collection_entries`, `feed_sources`).
+///
+/// Only rows matching `merged_into_id IS NULL` and [`IS_LIVE_ITEM_SQL`] are exposed as `Item`s.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Item {
     pub id: String,

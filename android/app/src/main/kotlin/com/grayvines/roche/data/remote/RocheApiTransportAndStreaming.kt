@@ -9,12 +9,12 @@ import android.net.http.UploadDataProvider
 import android.net.http.UploadDataSink
 import android.net.http.UrlRequest
 import android.net.http.UrlResponseInfo
-import java.io.BufferedReader
+import com.grayvines.roche.core.isHttpOrHttpsUrl
+import com.grayvines.roche.core.moveFileAtomically
+import com.grayvines.roche.core.writeBytesAtomicallyToFile
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
-import java.io.InputStream
-import java.io.InputStreamReader
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.URLEncoder
@@ -22,10 +22,8 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -98,9 +96,6 @@ class HttpEngineTransport(
 
     internal val sharedHttpEngine: HttpEngine
         get() = httpEngine
-
-    internal val sharedCallbackExecutor: Executor
-        get() = executor
 
     override suspend fun execute(request: HttpRequest): HttpResponse =
         withContext(Dispatchers.IO) { executeFollowingRedirects(request) }
@@ -387,48 +382,92 @@ internal class ByteArrayUploadDataProvider(private val bytes: ByteArray) : Uploa
     }
 }
 
-internal class BufferedUrlRequestCallback(
-    private val httpRequest: HttpRequest,
-    private val watchdog: HopWatchdog,
-    private val continuation: CancellableContinuation<BufferedHopOutcome>,
+internal abstract class BaseUrlRequestCallback<T>(
+    protected val watchdog: HopWatchdog,
+    protected val continuation: CancellableContinuation<T>,
 ) : UrlRequest.Callback {
-    private val readBuffer: ByteBuffer = ByteBuffer.allocateDirect(DIRECT_READ_BUFFER_BYTES)
-    private val scratch = ByteArray(READ_BUFFER_CHARS)
-    private val output = ByteArrayOutputStream()
-    private val settled = AtomicBoolean(false)
-    private val abortError = AtomicReference<IOException?>(null)
+    protected val readBuffer: ByteBuffer = ByteBuffer.allocateDirect(DIRECT_READ_BUFFER_BYTES)
+    protected val settled = AtomicBoolean(false)
+    protected val abortError = AtomicReference<IOException?>(null)
     private val startedRequestRef = AtomicReference<UrlRequest?>(null)
-    @Volatile private var maxAllowedBytes: Int = MAX_RESPONSE_CHARS
-    @Volatile private var redirectStatus: Int = 0
-    @Volatile private var redirectLocation: String? = null
-    @Volatile private var redirectHeaders: Map<String, String> = emptyMap()
+    @Volatile protected var redirectStatus: Int = 0
+    @Volatile protected var redirectLocation: String? = null
+    @Volatile protected var redirectHeaders: Map<String, String> = emptyMap()
+
+    protected open fun shouldCancelOnStart(): Boolean =
+        settled.get() || abortError.get() != null || !continuation.isActive
 
     fun markRequestStarted(urlRequest: UrlRequest) {
         startedRequestRef.set(urlRequest)
-        if (settled.get() || abortError.get() != null || !continuation.isActive) {
+        if (shouldCancelOnStart()) {
             runCatching { urlRequest.cancel() }
         }
     }
 
-    fun cancelFromCoroutine() {
+    open fun cancelFromCoroutine() {
         settled.set(true)
         watchdog.cancel()
+        cancelStartedRequest()
+    }
+
+    protected fun cancelStartedRequest() {
         runCatching { startedRequestRef.get()?.cancel() }
     }
+
+    protected fun trySettle(): Boolean = continuation.isActive && settled.compareAndSet(false, true)
+
+    protected fun recordRedirectTarget(
+        statusCode: Int,
+        headers: Map<String, String>,
+        newLocationUrl: String,
+    ): Boolean {
+        watchdog.cancel()
+        val cleanLocation = newLocationUrl.trim().takeIf { it.isNotBlank() }
+        return if (cleanLocation == null) {
+            abortError.compareAndSet(null, IOException(REDIRECT_MISSING_LOCATION_MESSAGE))
+            false
+        } else {
+            redirectStatus = statusCode
+            redirectHeaders = headers
+            redirectLocation = cleanLocation
+            true
+        }
+    }
+
+    protected fun armReadAndContinue(
+        request: UrlRequest,
+        buffer: ByteBuffer,
+        timeoutMs: Long,
+    ) {
+        watchdog.arm(timeoutMs)
+        buffer.clear()
+        request.read(buffer)
+    }
+}
+
+internal class BufferedUrlRequestCallback(
+    private val httpRequest: HttpRequest,
+    watchdog: HopWatchdog,
+    continuation: CancellableContinuation<BufferedHopOutcome>,
+    initialMaxAllowedBytes: Int = MAX_RESPONSE_CHARS,
+) : BaseUrlRequestCallback<BufferedHopOutcome>(watchdog, continuation) {
+    private val scratch = ByteArray(READ_BUFFER_CHARS)
+    private val output = ByteArrayOutputStream()
+    @Volatile private var maxAllowedBytes: Int = initialMaxAllowedBytes
 
     fun abortWithTimeout() {
         val timeout = SocketTimeoutException("HTTP request timed out")
         abortError.compareAndSet(null, timeout)
         watchdog.cancel()
-        runCatching { startedRequestRef.get()?.cancel() }
-        if (settled.compareAndSet(false, true) && continuation.isActive) {
+        cancelStartedRequest()
+        if (trySettle()) {
             continuation.resumeWithException(abortError.get() ?: timeout)
         }
     }
 
     fun failStart(error: Throwable) {
         watchdog.cancel()
-        if (settled.compareAndSet(false, true) && continuation.isActive) {
+        if (trySettle()) {
             val ioError =
                 error as? IOException ?: IOException("Failed to start HTTP request", error)
             continuation.resumeWithException(ioError)
@@ -453,15 +492,7 @@ internal class BufferedUrlRequestCallback(
         headers: Map<String, String>,
         newLocationUrl: String,
     ) {
-        watchdog.cancel()
-        val cleanLocation = newLocationUrl.trim().takeIf { it.isNotBlank() }
-        if (cleanLocation == null) {
-            abortError.compareAndSet(null, IOException(REDIRECT_MISSING_LOCATION_MESSAGE))
-        } else {
-            redirectStatus = statusCode
-            redirectHeaders = headers
-            redirectLocation = cleanLocation
-        }
+        recordRedirectTarget(statusCode, headers, newLocationUrl)
     }
 
     override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
@@ -472,16 +503,11 @@ internal class BufferedUrlRequestCallback(
         maxAllowedBytes = bound
         val declaredLength = parseResponseContentLength(info)
         if (declaredLength != null && declaredLength > bound.toLong()) {
-            abortError.compareAndSet(
-                null,
-                IOException("Response exceeds maximum allowed size of $bound bytes"),
-            )
+            abortError.compareAndSet(null, ResponseTooLargeException(maxBytes = bound.toLong()))
             watchdog.cancel()
             request.cancel()
         } else {
-            watchdog.arm(READ_TIMEOUT_MS)
-            readBuffer.clear()
-            request.read(readBuffer)
+            armReadAndContinue(request, readBuffer, READ_TIMEOUT_MS)
         }
     }
 
@@ -494,9 +520,7 @@ internal class BufferedUrlRequestCallback(
             watchdog.cancel()
             request.cancel()
         } else {
-            watchdog.arm(READ_TIMEOUT_MS)
-            byteBuffer.clear()
-            request.read(byteBuffer)
+            armReadAndContinue(request, byteBuffer, READ_TIMEOUT_MS)
         }
     }
 
@@ -505,10 +529,7 @@ internal class BufferedUrlRequestCallback(
         val incoming = byteBuffer.remaining()
         val bound = maxAllowedBytes
         return if (incoming > bound - output.size()) {
-            abortError.compareAndSet(
-                null,
-                IOException("Response exceeds maximum allowed size of $bound bytes"),
-            )
+            abortError.compareAndSet(null, ResponseTooLargeException(maxBytes = bound.toLong()))
             false
         } else {
             while (byteBuffer.hasRemaining()) {
@@ -526,9 +547,7 @@ internal class BufferedUrlRequestCallback(
 
     internal fun handleSucceeded(statusCode: Int, headers: Map<String, String>) {
         watchdog.cancel()
-        if (!continuation.isActive || !settled.compareAndSet(false, true)) {
-            return
-        }
+        if (!trySettle()) return
         val isSuccess = statusCode in HTTP_OK_START..HTTP_OK_END
         val bytes = output.toByteArray()
         val text =
@@ -553,7 +572,7 @@ internal class BufferedUrlRequestCallback(
 
     override fun onFailed(request: UrlRequest, info: UrlResponseInfo?, error: HttpException) {
         watchdog.cancel()
-        if (continuation.isActive && settled.compareAndSet(false, true)) {
+        if (trySettle()) {
             continuation.resumeWithException(abortError.get() ?: error)
         }
     }
@@ -564,9 +583,7 @@ internal class BufferedUrlRequestCallback(
 
     internal fun handleCanceled() {
         watchdog.cancel()
-        if (!continuation.isActive || !settled.compareAndSet(false, true)) {
-            return
-        }
+        if (!trySettle()) return
         val recordedRedirect = redirectLocation
         val recordedError = abortError.get()
         when {
@@ -590,39 +607,26 @@ internal class BufferedUrlRequestCallback(
 
 internal class StreamingUrlRequestCallback(
     private val sink: StreamFileSink,
-    private val watchdog: HopWatchdog,
-    private val continuation: CancellableContinuation<StreamHopResult>,
-) : UrlRequest.Callback {
-    private val readBuffer: ByteBuffer = ByteBuffer.allocateDirect(DIRECT_READ_BUFFER_BYTES)
-    private val settled = AtomicBoolean(false)
-    private val startedRequestRef = AtomicReference<UrlRequest?>(null)
-    private val abortError = AtomicReference<IOException?>(null)
+    watchdog: HopWatchdog,
+    continuation: CancellableContinuation<StreamHopResult>,
+) : BaseUrlRequestCallback<StreamHopResult>(watchdog, continuation) {
     @Volatile private var aborted: Boolean = false
     @Volatile private var bytesWritten: Long = 0L
-    @Volatile private var redirectStatus: Int = 0
-    @Volatile private var redirectLocation: String? = null
 
-    fun markRequestStarted(urlRequest: UrlRequest) {
-        startedRequestRef.set(urlRequest)
-        if (settled.get() || aborted || !continuation.isActive) {
-            runCatching { urlRequest.cancel() }
-        }
-    }
+    override fun shouldCancelOnStart(): Boolean = settled.get() || aborted || !continuation.isActive
 
-    fun cancelFromCoroutine() {
+    override fun cancelFromCoroutine() {
         aborted = true
-        settled.set(true)
-        watchdog.cancel()
         closeAndDeletePartFile()
-        runCatching { startedRequestRef.get()?.cancel() }
+        super.cancelFromCoroutine()
     }
 
     fun abortRequest() {
         aborted = true
         watchdog.cancel()
         closeAndDeletePartFile()
-        runCatching { startedRequestRef.get()?.cancel() }
-        if (settled.compareAndSet(false, true) && continuation.isActive) {
+        cancelStartedRequest()
+        if (trySettle()) {
             continuation.resume(StreamHopResult.Failed)
         }
     }
@@ -631,7 +635,7 @@ internal class StreamingUrlRequestCallback(
         aborted = true
         watchdog.cancel()
         closeAndDeletePartFile()
-        if (settled.compareAndSet(false, true) && continuation.isActive) {
+        if (trySettle()) {
             continuation.resume(StreamHopResult.Failed)
         }
     }
@@ -646,14 +650,8 @@ internal class StreamingUrlRequestCallback(
     }
 
     internal fun recordRedirectReceived(statusCode: Int, newLocationUrl: String) {
-        watchdog.cancel()
-        val cleanLocation = newLocationUrl.trim().takeIf { it.isNotBlank() }
-        if (cleanLocation == null) {
+        if (!recordRedirectTarget(statusCode, emptyMap(), newLocationUrl)) {
             aborted = true
-            abortError.compareAndSet(null, IOException(REDIRECT_MISSING_LOCATION_MESSAGE))
-        } else {
-            redirectStatus = statusCode
-            redirectLocation = cleanLocation
         }
     }
 
@@ -670,9 +668,7 @@ internal class StreamingUrlRequestCallback(
             watchdog.cancel()
             request.cancel()
         } else {
-            watchdog.arm(AUDIO_READ_TIMEOUT_MS)
-            readBuffer.clear()
-            request.read(readBuffer)
+            armReadAndContinue(request, readBuffer, AUDIO_READ_TIMEOUT_MS)
         }
     }
 
@@ -686,9 +682,7 @@ internal class StreamingUrlRequestCallback(
             watchdog.cancel()
             request.cancel()
         } else {
-            watchdog.arm(AUDIO_READ_TIMEOUT_MS)
-            byteBuffer.clear()
-            request.read(byteBuffer)
+            armReadAndContinue(request, byteBuffer, AUDIO_READ_TIMEOUT_MS)
         }
     }
 
@@ -719,7 +713,7 @@ internal class StreamingUrlRequestCallback(
     internal fun handleSucceeded(statusCode: Int) {
         watchdog.cancel()
         val closedCleanly = runCatching { sink.channel.close() }.isSuccess
-        if (!continuation.isActive || !settled.compareAndSet(false, true)) {
+        if (!trySettle()) {
             closeAndDeletePartFile()
             return
         }
@@ -754,9 +748,7 @@ internal class StreamingUrlRequestCallback(
     internal fun handleCanceled() {
         watchdog.cancel()
         closeAndDeletePartFile()
-        if (!continuation.isActive || !settled.compareAndSet(false, true)) {
-            return
-        }
+        if (!trySettle()) return
         val next = redirectLocation
         continuation.resume(
             if (!aborted && next != null) {
@@ -860,6 +852,7 @@ private const val HEADER_COOKIE = "Cookie"
 private const val HEADER_PROXY_AUTHORIZATION = "Proxy-Authorization"
 private const val HEADER_CONTENT_TYPE = "Content-Type"
 private const val HEADER_CONTENT_LENGTH = "Content-Length"
+internal const val HEADER_RETRY_AFTER = "Retry-After"
 private const val CONTENT_TYPE_JSON = "application/json"
 private val CROSS_ORIGIN_SENSITIVE_HEADERS =
     listOf(HEADER_AUTHORIZATION, HEADER_COOKIE, HEADER_PROXY_AUTHORIZATION)
@@ -946,7 +939,7 @@ internal fun buildRedirectedRequest(
     )
 }
 
-private fun filterRedirectHeaders(
+internal fun filterRedirectHeaders(
     headers: Map<String, String>,
     sameOrigin: Boolean,
     dropPayloadHeaders: Boolean,
@@ -966,16 +959,13 @@ internal fun resolveRedirectUrl(baseUrl: String, location: String): String? = ru
         URI.create(baseUrl.trim().replace(" ", "%20"))
             .resolve(location.trim().replace(" ", "%20"))
             .toString()
-    resolved.takeIf {
-        it.startsWith(HTTP_SCHEME_HTTPS, ignoreCase = true) ||
-            it.startsWith(HTTP_SCHEME_HTTP, ignoreCase = true)
-    }
+    resolved.takeIf(::isHttpOrHttpsUrl)
 }
     .getOrNull()
 
 internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = runCatching {
-    val origin = URI.create(firstUrl.trim()).toURL()
-    val target = URI.create(secondUrl.trim()).toURL()
+    val origin = URI.create(firstUrl.trim().replace(" ", "%20")).toURL()
+    val target = URI.create(secondUrl.trim().replace(" ", "%20")).toURL()
     val originHost = origin.host
     val targetHost = target.host
     val sameProtocol = origin.protocol.equals(target.protocol, ignoreCase = true)
@@ -988,72 +978,6 @@ internal fun isSameOriginHost(firstUrl: String, secondUrl: String): Boolean = ru
         originPort == targetPort
 }
     .getOrDefault(false)
-
-internal fun readBoundedBytes(
-    input: InputStream,
-    maxBytes: Int = MAX_MEDIA_BYTES,
-): ByteArray = input.use { stream ->
-    require(maxBytes >= 0) { "maxBytes must be non-negative" }
-    val out = ByteArrayOutputStream()
-    val buffer = ByteArray(READ_BUFFER_CHARS)
-    var total = 0
-    while (true) {
-        val remainingToLimit = maxBytes - total
-        val maxReadLen = if (remainingToLimit >= buffer.size) buffer.size else remainingToLimit + 1
-        val read = stream.read(buffer, 0, maxReadLen)
-        if (read == -1) break
-        if (read > maxBytes - total) {
-            throw IOException("Response exceeds maximum allowed size of $maxBytes bytes")
-        }
-        total += read
-        out.write(buffer, 0, read)
-    }
-    out.toByteArray()
-}
-
-internal fun readBoundedText(input: InputStream): String =
-    BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
-        val builder = StringBuilder()
-        val buffer = CharArray(READ_BUFFER_CHARS)
-        var total = 0
-        while (total < MAX_RESPONSE_CHARS) {
-            val read = reader.read(buffer, 0, minOf(buffer.size, MAX_RESPONSE_CHARS - total))
-            if (read == -1) break
-            builder.append(buffer, 0, read)
-            total += read
-        }
-        builder.toString()
-    }
-
-internal fun moveFileAtomically(tempFile: File, targetFile: File) {
-    runCatching {
-        Files.move(
-            tempFile.toPath(),
-            targetFile.toPath(),
-            StandardCopyOption.ATOMIC_MOVE,
-            StandardCopyOption.REPLACE_EXISTING,
-        )
-    }
-        .getOrElse {
-            Files.move(
-                tempFile.toPath(),
-                targetFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        }
-}
-
-internal fun writeBytesAtomicallyToFile(bytes: ByteArray, targetFile: File): Boolean {
-    targetFile.parentFile?.mkdirs()
-    val temp = File(targetFile.parentFile, "${targetFile.name}.${System.nanoTime()}.tmp")
-    return try {
-        temp.writeBytes(bytes)
-        moveFileAtomically(temp, targetFile)
-        true
-    } finally {
-        if (temp.exists()) temp.delete()
-    }
-}
 
 internal suspend fun streamTransportResponseToFile(
     transport: HttpTransport,
@@ -1087,9 +1011,6 @@ internal suspend fun streamTransportResponseToFile(
     }
 }
 
-internal fun itemEndpointUrl(serverUrl: String, itemId: String): String =
-    "${serverUrl.trimEnd('/')}/api/v1/items/${encodePathSegment(itemId)}"
-
 internal fun encodePathSegment(raw: String): String =
     URLEncoder.encode(raw, StandardCharsets.UTF_8.name()).replace("+", "%20")
 
@@ -1102,6 +1023,20 @@ internal fun authHeaders(token: String): Map<String, String> =
 
 internal fun ensureSuccess(response: HttpResponse) {
     if (response.statusCode in HTTP_OK_START..HTTP_OK_END) return
-    val (title, detail) = parseProblemDetails(response.body, response.statusCode)
-    throw ProblemDetailsException(statusCode = response.statusCode, title = title, detail = detail)
+    val problem = parseProblemDetails(response.body, response.statusCode, response.headers)
+    throw ProblemDetailsException(
+        statusCode = response.statusCode,
+        title = problem.title,
+        detail = problem.detail,
+        problemType = problem.problemType,
+        retryAfterSeconds = problem.retryAfterSeconds,
+        maxBytes = problem.maxBytes,
+        candidates = problem.candidates,
+    )
+}
+
+internal fun ensureExternalSuccess(response: HttpResponse) {
+    if (response.statusCode !in HTTP_OK_START..HTTP_OK_END) {
+        throw HttpStatusException(response.statusCode)
+    }
 }

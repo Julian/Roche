@@ -2,16 +2,12 @@ package com.grayvines.roche
 
 import android.content.Intent
 import android.net.Uri
+import com.grayvines.roche.core.LOCAL_PDF_SCHEME
 import com.grayvines.roche.model.ContentType
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.UUID
-
-data class SharedLinkPayload(
-    val url: String,
-    val title: String? = null,
-)
 
 data class SharedContentPayload(
     val url: String,
@@ -24,27 +20,6 @@ internal data class MatchedHttpUrl(
     val url: String,
     val startIndex: Int,
 )
-
-fun extractSharedLink(
-    action: String?,
-    mimeType: String?,
-    extraText: String?,
-    extraSubject: String? = null,
-    extraTitle: String? = null,
-): SharedLinkPayload? {
-    if (!isSupportedShareMime(action, mimeType) || extraText.isNullOrBlank()) {
-        return null
-    }
-    val match = findFirstHttpUrl(extraText) ?: return null
-    val rawTitle =
-        extraSubject?.trim()?.takeIf { it.isNotBlank() }
-            ?: extraTitle?.trim()?.takeIf { it.isNotBlank() }
-            ?: extractPrefixTitle(extraText, match.startIndex)
-    return SharedLinkPayload(
-        url = match.url,
-        title = sanitizeCandidateTitle(rawTitle, match.url),
-    )
-}
 
 @Suppress("LongParameterList")
 fun extractSharedContent(
@@ -203,7 +178,7 @@ private fun buildPdfStreamPayload(
             .take(MAX_PDF_SLUG_LEN)
             .ifEmpty { "document" }
     return SharedContentPayload(
-        url = "localpdf://$streamKey/$slug.pdf",
+        url = "$LOCAL_PDF_SCHEME$streamKey/$slug.pdf",
         title = rawLabel ?: "Shared PDF",
         forcedContentType = ContentType.PDF,
         pdfStreamUri = streamUri,

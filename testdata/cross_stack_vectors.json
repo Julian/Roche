@@ -301,38 +301,67 @@
     {
       "kind": "album",
       "title": "The Dark Side of the Moon (2011 Remastered Version)",
-      "creators": ["Pink Floyd"],
+      "creators": [
+        "Pink Floyd"
+      ],
       "identifiers": [
-        { "scheme": "url", "value": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv" },
-        { "scheme": "musicbrainz_release", "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a" },
-        { "scheme": "spotify", "value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv" }
+        {
+          "scheme": "url",
+          "value": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"
+        },
+        {
+          "scheme": "musicbrainz_release",
+          "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a"
+        },
+        {
+          "scheme": "spotify",
+          "value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv"
+        }
       ],
       "expected_id": "3c5218f9-675c-55e6-819b-2673630566a4"
     },
     {
       "kind": "album",
       "title": "The Dark Side of the Moon",
-      "creators": ["Pink Floyd"],
+      "creators": [
+        "Pink Floyd"
+      ],
       "identifiers": [
-        { "scheme": "musicbrainz_release", "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a" },
-        { "scheme": "url", "value": "https://example.com/dsotm" }
+        {
+          "scheme": "musicbrainz_release",
+          "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a"
+        },
+        {
+          "scheme": "url",
+          "value": "https://example.com/dsotm"
+        }
       ],
       "expected_id": "d0cd4a24-3ba4-5df0-b394-5dfb22dfd8c8"
     },
     {
       "kind": "movie",
       "title": "Stalker",
-      "creators": ["Andrei Tarkovsky"],
+      "creators": [
+        "Andrei Tarkovsky"
+      ],
       "identifiers": [
-        { "scheme": "wikipedia", "value": "Stalker_(1979_film)" },
-        { "scheme": "imdb", "value": "tt0079944" }
+        {
+          "scheme": "wikipedia",
+          "value": "Stalker_(1979_film)"
+        },
+        {
+          "scheme": "imdb",
+          "value": "tt0079944"
+        }
       ],
       "expected_id": "397f3c1d-69b3-50a1-a003-2dce793de263"
     },
     {
       "kind": "album",
       "title": "OK Computer (Deluxe Edition)",
-      "creators": ["  Radiohead  "],
+      "creators": [
+        "  Radiohead  "
+      ],
       "identifiers": [],
       "expected_id": "ac172f8d-60f5-590a-be4b-4234e4a41668"
     },
@@ -359,9 +388,13 @@
       "rule_json": "{\"kinds\":[\"movie\",\"tv\"],\"consumed\":true,\"release_year\":1979}",
       "entry": {
         "kind": "movie",
-        "creators": ["Andrei Tarkovsky"],
+        "creators": [
+          "Andrei Tarkovsky"
+        ],
         "release_year": 1979,
-        "statuses": ["consumed"]
+        "statuses": [
+          "consumed"
+        ]
       },
       "expected_match": true
     },
@@ -369,9 +402,13 @@
       "rule_json": "{\"kinds\":[\"movie\",\"tv\"],\"consumed\":true,\"release_year\":1979}",
       "entry": {
         "kind": "movie",
-        "creators": ["Andrei Tarkovsky"],
+        "creators": [
+          "Andrei Tarkovsky"
+        ],
         "release_year": 1972,
-        "statuses": ["consumed"]
+        "statuses": [
+          "consumed"
+        ]
       },
       "expected_match": false
     },
@@ -379,9 +416,13 @@
       "rule_json": "{\"kind\":\"album\",\"status\":\"abandoned\",\"creator_contains\":\"björk\"}",
       "entry": {
         "kind": "album",
-        "creators": ["Björk Guðmundsdóttir"],
+        "creators": [
+          "Björk Guðmundsdóttir"
+        ],
         "release_year": 1997,
-        "statuses": ["abandoned"]
+        "statuses": [
+          "abandoned"
+        ]
       },
       "expected_match": true
     },
@@ -389,9 +430,13 @@
       "rule_json": "{\"kind\":\"album\",\"consumed\":false}",
       "entry": {
         "kind": "album",
-        "creators": ["Radiohead"],
+        "creators": [
+          "Radiohead"
+        ],
         "release_year": 1997,
-        "statuses": ["abandoned"]
+        "statuses": [
+          "abandoned"
+        ]
       },
       "expected_match": true
     }
@@ -401,27 +446,69 @@
       "name": "cold_start_no_comparisons_has_null_tiers_and_title_order",
       "is_priority_scope": false,
       "entries": [
-        { "id": "id-z", "title": "Solaris" },
-        { "id": "id-b", "title": "alpha" },
-        { "id": "id-a", "title": "Alpha" }
+        {
+          "id": "id-z",
+          "title": "Solaris"
+        },
+        {
+          "id": "id-b",
+          "title": "alpha"
+        },
+        {
+          "id": "id-a",
+          "title": "Alpha"
+        }
       ],
       "orderings": [],
-      "expected_ids": ["id-a", "id-b", "id-z"],
-      "expected_tiers": [null, null, null]
+      "expected_ids": [
+        "id-a",
+        "id-b",
+        "id-z"
+      ],
+      "expected_tiers": [
+        null,
+        null,
+        null
+      ]
     },
     {
       "name": "explicit_tie_breaks_by_lowercase_title_then_id_with_quantiles",
       "is_priority_scope": false,
       "entries": [
-        { "id": "id-9", "title": "Zodiac" },
-        { "id": "id-2", "title": "Arrival" },
-        { "id": "id-5", "title": "Metropolis" }
+        {
+          "id": "id-9",
+          "title": "Zodiac"
+        },
+        {
+          "id": "id-2",
+          "title": "Arrival"
+        },
+        {
+          "id": "id-5",
+          "title": "Metropolis"
+        }
       ],
       "orderings": [
-        [["id-9", "id-2"], ["id-5"]]
+        [
+          [
+            "id-9",
+            "id-2"
+          ],
+          [
+            "id-5"
+          ]
+        ]
       ],
-      "expected_ids": ["id-2", "id-9", "id-5"],
-      "expected_tiers": ["A", "A", "D"]
+      "expected_ids": [
+        "id-2",
+        "id-9",
+        "id-5"
+      ],
+      "expected_tiers": [
+        "A",
+        "A",
+        "D"
+      ]
     }
   ],
   "hlc_vectors": {
@@ -775,6 +862,1972 @@
       "current_weight": 0.05,
       "sample_weight": 0.01,
       "expected_weight": 0.2
+    }
+  ],
+  "custom_collection_ids": [
+    {
+      "title": "Favorites 2026",
+      "role": "list",
+      "expected_slug": "favorites_2026",
+      "expected_collection_id": "a4c3776a-fa5b-5946-944f-6d0cda118d63"
+    },
+    {
+      "title": "Sci-Fi & Fantasy",
+      "role": "list",
+      "expected_slug": "sci_fi_fantasy",
+      "expected_collection_id": "ec54fc60-2ac3-56e9-81ee-a555bebc88b3"
+    },
+    {
+      "title": "  Top   10  ",
+      "role": "list",
+      "expected_slug": "top_10",
+      "expected_collection_id": "ef6e401d-aadc-550a-98e9-287983fce7cd"
+    },
+    {
+      "title": "Articles",
+      "role": "list",
+      "expected_slug": "articles",
+      "expected_collection_id": "0cae2b53-6c64-5e09-85b4-4ce23a627f49"
+    },
+    {
+      "title": "Albums",
+      "role": "want",
+      "expected_slug": "want:albums",
+      "expected_collection_id": "4eb48576-6bc6-5d08-851b-bac8e5412207"
+    },
+    {
+      "title": "Want: Movies",
+      "role": "want",
+      "expected_slug": "want:movies",
+      "expected_collection_id": "63fafe9a-0c79-575c-b40a-b87d0887c6e1"
+    },
+    {
+      "title": "want:sci-fi",
+      "role": "want",
+      "expected_slug": "want:sci_fi",
+      "expected_collection_id": "cb58064d-61f3-5749-84b4-dc769dad9900"
+    },
+    {
+      "title": "Books",
+      "role": "want",
+      "expected_slug": "want:books",
+      "expected_collection_id": "b2b3c205-47e7-55ce-9029-b15223a3764b"
+    },
+    {
+      "title": "Read",
+      "role": "want",
+      "expected_slug": "want:read",
+      "expected_collection_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+    },
+    {
+      "title": "Articles",
+      "role": "want",
+      "expected_slug": "want:read",
+      "expected_collection_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+    },
+    {
+      "title": "Papers",
+      "role": "want",
+      "expected_slug": "want:read",
+      "expected_collection_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+    },
+    {
+      "title": "Want: Articles",
+      "role": "want",
+      "expected_slug": "want:read",
+      "expected_collection_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+    },
+    {
+      "title": "WANT:Papers",
+      "role": "want",
+      "expected_slug": "want:read",
+      "expected_collection_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3"
+    },
+    {
+      "title": "Weekend Watch",
+      "role": "want",
+      "expected_slug": "want:weekend_watch",
+      "expected_collection_id": "f74e02ff-d940-5e0a-860d-04c2435f3541"
+    },
+    {
+      "title": "",
+      "role": "list",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "   ",
+      "role": "list",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "!!!",
+      "role": "list",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "日本語",
+      "role": "list",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "日本語",
+      "role": "want",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "want:   ",
+      "role": "want",
+      "expected_slug": null,
+      "expected_collection_id": null
+    },
+    {
+      "title": "WANT:!!!",
+      "role": "want",
+      "expected_slug": null,
+      "expected_collection_id": null
+    }
+  ],
+  "url_classification": [
+    {
+      "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "expected_content_type": "video",
+      "expected_reader_class": "video",
+      "expected_feed_type": "youtube",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": "dQw4w9WgXcQ",
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://youtu.be/dQw4w9WgXcQ",
+      "expected_content_type": "video",
+      "expected_reader_class": "video",
+      "expected_feed_type": "youtube",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": "dQw4w9WgXcQ",
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://m.youtube.com/shorts/dQw4w9WgXcQ",
+      "expected_content_type": "video",
+      "expected_reader_class": "video",
+      "expected_feed_type": "youtube",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": "dQw4w9WgXcQ",
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=10",
+      "expected_content_type": "video",
+      "expected_reader_class": "video",
+      "expected_feed_type": "youtube",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": "dQw4w9WgXcQ",
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "youtube",
+      "expected_is_youtube_feed": true,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://arxiv.org/abs/2301.07041",
+      "expected_content_type": "paper",
+      "expected_reader_class": "pdf",
+      "expected_feed_type": "arxiv",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": true
+    },
+    {
+      "url": "https://arxiv.org/pdf/2301.07041.pdf",
+      "expected_content_type": "paper",
+      "expected_reader_class": "pdf",
+      "expected_feed_type": "arxiv",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": true
+    },
+    {
+      "url": "https://export.arxiv.org/abs/2301.07041v2",
+      "expected_content_type": "paper",
+      "expected_reader_class": "pdf",
+      "expected_feed_type": "arxiv",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": true
+    },
+    {
+      "url": "https://rss.arxiv.org/rss/cs.LG",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "arxiv",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": true
+    },
+    {
+      "url": "https://example.org/paper.pdf",
+      "expected_content_type": "pdf",
+      "expected_reader_class": "pdf",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://cdn.example.org/ep42.mp3?token=abc",
+      "expected_content_type": "audio",
+      "expected_reader_class": "audio",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://cdn.example.org/show.m4a",
+      "expected_content_type": "audio",
+      "expected_reader_class": "audio",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://blog.rust-lang.org/2026/05/01/rust.html",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://evil.example/?q=youtube.com/watch?v=dQw4w9WgXcQ",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://evil.example/youtube.com/feeds/videos.xml?channel_id=UC123",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://evil.example/?next=arxiv.org/abs/2301.07041",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    },
+    {
+      "url": "https://fake-arxiv.org/abs/2301.07041",
+      "expected_content_type": "article",
+      "expected_reader_class": "article",
+      "expected_feed_type": "rss",
+      "expected_is_youtube_feed": false,
+      "expected_youtube_video_id": null,
+      "expected_is_arxiv": false
+    }
+  ],
+  "ssrf_url_validation": {
+    "ips": [
+      {
+        "ip": "93.184.216.34",
+        "expected_allowed": true
+      },
+      {
+        "ip": "1.1.1.1",
+        "expected_allowed": true
+      },
+      {
+        "ip": "127.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "10.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "172.16.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "192.168.1.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "169.254.169.254",
+        "expected_allowed": false
+      },
+      {
+        "ip": "100.64.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "192.0.2.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "198.18.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "224.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "0.0.0.0",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2606:2800:220:1:248:1893:25c8:1946",
+        "expected_allowed": true
+      },
+      {
+        "ip": "2001:4860:4860::8888",
+        "expected_allowed": true
+      },
+      {
+        "ip": "::ffff:93.184.216.34",
+        "expected_allowed": true
+      },
+      {
+        "ip": "::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "::",
+        "expected_allowed": false
+      },
+      {
+        "ip": "fc00::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "fd12::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "fe80::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "fec0::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "::8.8.8.8",
+        "expected_allowed": false
+      },
+      {
+        "ip": "::ffff:127.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "::ffff:10.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "64:ff9b::127.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "64:ff9b::93.184.216.34",
+        "expected_allowed": false
+      },
+      {
+        "ip": "64:ff9b:1::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "::ffff:0:127.0.0.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2002:7f00:0001::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2002:5db8:d822::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2001:db8::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2001:20::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "100::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2001:0::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2001:2::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "ff02::1",
+        "expected_allowed": false
+      }
+    ],
+    "urls": [
+      {
+        "url": "https://example.com/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "http://example.com:80/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "https://example.com:443/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "http://example.com:8080/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "https://example.com:8443/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "https://93.184.216.34/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "https://[2606:2800:220:1:248:1893:25c8:1946]/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "http://example.com./rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "http://localhost/feed",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://printer.local/feed",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://home.arpa/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://nas.home.arpa/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://box.ts.net/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://router.lan/",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://server.home/",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://api.internal/",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://singlelabel/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://example.com:22/",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://example.com:3000/",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://example.com:8081/",
+        "expected_allowed": false
+      },
+      {
+        "url": "ftp://example.com/file",
+        "expected_allowed": false
+      },
+      {
+        "url": "file:///etc/passwd",
+        "expected_allowed": false
+      },
+      {
+        "url": "javascript:alert(1)",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://user:pass@example.com/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://127.0.0.1/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://169.254.169.254/latest/meta-data",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[::1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[::8.8.8.8]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[::ffff:0:127.0.0.1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[64:ff9b::93.184.216.34]/rss",
+        "expected_allowed": false
+      }
+    ]
+  },
+  "external_identifier_urls": [
+    {
+      "scheme": "spotify",
+      "value": "spotify:album:4LH4d3cOWNNsVw41Gqt2kv",
+      "kind": "album",
+      "expected_url": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "scheme": "spotify",
+      "value": "spotify:track:6rqhFgbbKwnb9MLmUQDhG6",
+      "kind": "song",
+      "expected_url": "https://open.spotify.com/track/6rqhFgbbKwnb9MLmUQDhG6"
+    },
+    {
+      "scheme": "spotify",
+      "value": "spotify:artist:4dpARuHxo51G3z768sgnrY",
+      "kind": "artist",
+      "expected_url": "https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"
+    },
+    {
+      "scheme": "spotify",
+      "value": "spotify:user:spotifycharts:playlist:37i9dQZEVXbMDoHDwVN2tF",
+      "kind": "collection",
+      "expected_url": "https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF"
+    },
+    {
+      "scheme": "spotify",
+      "value": "https://open.spotify.com/intl-de/album/4LH4d3cOWNNsVw41Gqt2kv?si=abc",
+      "kind": "album",
+      "expected_url": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "scheme": "Spotify",
+      "value": "4LH4d3cOWNNsVw41Gqt2kv",
+      "kind": "album",
+      "expected_url": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "scheme": "spotify",
+      "value": "6rqhFgbbKwnb9MLmUQDhG6",
+      "kind": "song",
+      "expected_url": "https://open.spotify.com/track/6rqhFgbbKwnb9MLmUQDhG6"
+    },
+    {
+      "scheme": "spotify",
+      "value": "4dpARuHxo51G3z768sgnrY",
+      "kind": "artist",
+      "expected_url": "https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY"
+    },
+    {
+      "scheme": "spotify",
+      "value": "2MAi0BvDc6GTFvKFPXnkCL",
+      "kind": "podcast",
+      "expected_url": "https://open.spotify.com/show/2MAi0BvDc6GTFvKFPXnkCL"
+    },
+    {
+      "scheme": "spotify",
+      "value": "512ojhOuo1ktJprKbVcKyQ",
+      "kind": "podcast_episode",
+      "expected_url": "https://open.spotify.com/episode/512ojhOuo1ktJprKbVcKyQ"
+    },
+    {
+      "scheme": "spotify",
+      "value": "4LH4d3cOWNNsVw41Gqt2kv",
+      "kind": null,
+      "expected_url": "https://open.spotify.com/album/4LH4d3cOWNNsVw41Gqt2kv"
+    },
+    {
+      "scheme": "apple-music",
+      "value": "1440833098",
+      "kind": "album",
+      "expected_url": "https://music.apple.com/album/1440833098"
+    },
+    {
+      "scheme": "apple_music",
+      "value": "https://music.apple.com/us/album/foo/123",
+      "kind": "album",
+      "expected_url": "https://music.apple.com/us/album/foo/123"
+    },
+    {
+      "scheme": "bandcamp",
+      "value": "https://radiohead.bandcamp.com/album/in-rainbows",
+      "kind": "album",
+      "expected_url": "https://radiohead.bandcamp.com/album/in-rainbows"
+    },
+    {
+      "scheme": "bandcamp",
+      "value": "bare-bandcamp-id",
+      "kind": "album",
+      "expected_url": null
+    },
+    {
+      "scheme": "youtube_music",
+      "value": "MPREb_xyz789",
+      "kind": "album",
+      "expected_url": "https://music.youtube.com/browse/MPREb_xyz789"
+    },
+    {
+      "scheme": "youtube_music",
+      "value": "VLOLAK5uy_abc123&feature=share",
+      "kind": "album",
+      "expected_url": "https://music.youtube.com/playlist?list=OLAK5uy_abc123"
+    },
+    {
+      "scheme": "youtube_music",
+      "value": "https://music.youtube.com/browse/MPREb_xyz789?si=99",
+      "kind": "album",
+      "expected_url": "https://music.youtube.com/browse/MPREb_xyz789"
+    },
+    {
+      "scheme": "youtube",
+      "value": "dQw4w9WgXcQ",
+      "kind": "video",
+      "expected_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    },
+    {
+      "scheme": "youtube",
+      "value": "UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "kind": "channel",
+      "expected_url": "https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA"
+    },
+    {
+      "scheme": "musicbrainz_release",
+      "value": "f5093c06-23e3-404f-aeaa-40f72885ee3a",
+      "kind": "album",
+      "expected_url": "https://musicbrainz.org/release/f5093c06-23e3-404f-aeaa-40f72885ee3a"
+    },
+    {
+      "scheme": "musicbrainz",
+      "value": "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+      "kind": "artist",
+      "expected_url": "https://musicbrainz.org/artist/a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    },
+    {
+      "scheme": "musicbrainz",
+      "value": "12345678-1234-1234-1234-1234567890ab",
+      "kind": "song",
+      "expected_url": "https://musicbrainz.org/recording/12345678-1234-1234-1234-1234567890ab"
+    },
+    {
+      "scheme": "discogs",
+      "value": "249504",
+      "kind": "album",
+      "expected_url": "https://www.discogs.com/release/249504"
+    },
+    {
+      "scheme": "rym",
+      "value": "https://rateyourmusic.com/release/album/radiohead/ok-computer/",
+      "kind": "album",
+      "expected_url": "https://rateyourmusic.com/release/album/radiohead/ok-computer/"
+    },
+    {
+      "scheme": "isbn",
+      "value": "9780140449136",
+      "kind": "book",
+      "expected_url": "https://openlibrary.org/isbn/9780140449136"
+    },
+    {
+      "scheme": "openlibrary",
+      "value": "OL12345W",
+      "kind": "book",
+      "expected_url": "https://openlibrary.org/works/OL12345W"
+    },
+    {
+      "scheme": "goodreads",
+      "value": "18144590",
+      "kind": "book",
+      "expected_url": "https://www.goodreads.com/book/show/18144590"
+    },
+    {
+      "scheme": "imdb",
+      "value": "tt0079944",
+      "kind": "movie",
+      "expected_url": "https://www.imdb.com/title/tt0079944/"
+    },
+    {
+      "scheme": "tmdb",
+      "value": "1396",
+      "kind": "tv",
+      "expected_url": "https://www.themoviedb.org/tv/1396"
+    },
+    {
+      "scheme": "tmdb",
+      "value": "620",
+      "kind": "movie",
+      "expected_url": "https://www.themoviedb.org/movie/620"
+    },
+    {
+      "scheme": "letterboxd",
+      "value": "stalker",
+      "kind": "movie",
+      "expected_url": "https://letterboxd.com/film/stalker"
+    },
+    {
+      "scheme": "steam",
+      "value": "620",
+      "kind": "game",
+      "expected_url": "https://store.steampowered.com/app/620"
+    },
+    {
+      "scheme": "igdb",
+      "value": "portal-2",
+      "kind": "game",
+      "expected_url": "https://www.igdb.com/games/portal-2"
+    },
+    {
+      "scheme": "doi",
+      "value": "doi:10.1000/182",
+      "kind": "paper",
+      "expected_url": "https://doi.org/10.1000/182"
+    },
+    {
+      "scheme": "arxiv",
+      "value": "2301.07041",
+      "kind": "paper",
+      "expected_url": "https://arxiv.org/abs/2301.07041"
+    },
+    {
+      "scheme": "wikipedia",
+      "value": "#1_Record",
+      "kind": "album",
+      "expected_url": "https://en.wikipedia.org/wiki/%231_Record"
+    },
+    {
+      "scheme": "wikidata",
+      "value": "Q42",
+      "kind": "artist",
+      "expected_url": "https://www.wikidata.org/wiki/Q42"
+    },
+    {
+      "scheme": "url",
+      "value": "https://example.com/essay",
+      "kind": "article",
+      "expected_url": "https://example.com/essay"
+    },
+    {
+      "scheme": "url",
+      "value": "not-a-url",
+      "kind": "article",
+      "expected_url": null
+    },
+    {
+      "scheme": "spotify",
+      "value": "spotify:",
+      "kind": "album",
+      "expected_url": null
+    },
+    {
+      "scheme": "spotify",
+      "value": "spotify:album",
+      "kind": "album",
+      "expected_url": null
+    },
+    {
+      "scheme": "imdb",
+      "value": "javascript:alert(1)",
+      "kind": "movie",
+      "expected_url": null
+    },
+    {
+      "scheme": "unknown_scheme",
+      "value": "https://example.com/foo",
+      "kind": "article",
+      "expected_url": null
+    },
+    {
+      "scheme": "tmdb",
+      "value": "123",
+      "kind": "book",
+      "expected_url": null
+    },
+    {
+      "scheme": "isbn",
+      "value": "   ",
+      "kind": "book",
+      "expected_url": null
+    }
+  ],
+  "rank_board_operations": [
+    {
+      "name": "tie_three_extract_middle_swap_solo_across_tie",
+      "initial_items": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e"
+      ],
+      "ops": [
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "c"
+        },
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "d"
+        },
+        {
+          "op": "move_up",
+          "entry_id": "c"
+        },
+        {
+          "op": "move_up",
+          "entry_id": "e"
+        }
+      ],
+      "expected_ordering": [
+        [
+          "a"
+        ],
+        [
+          "c"
+        ],
+        [
+          "e"
+        ],
+        [
+          "b",
+          "d"
+        ]
+      ],
+      "expected_display_ranks": [
+        1,
+        2,
+        3,
+        4,
+        4
+      ],
+      "expected_tied_with_above": [
+        false,
+        false,
+        false,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "extract_from_tie_downward_and_split",
+      "initial_items": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "ops": [
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "b"
+        },
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "c"
+        },
+        {
+          "op": "move_down",
+          "entry_id": "a"
+        },
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "c"
+        },
+        {
+          "op": "move_down",
+          "entry_id": "d"
+        }
+      ],
+      "expected_ordering": [
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "a"
+        ],
+        [
+          "d"
+        ]
+      ],
+      "expected_display_ranks": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "expected_tied_with_above": [
+        false,
+        false,
+        false,
+        false
+      ]
+    },
+    {
+      "name": "move_to_rank_slot_preserves_ties_both_directions",
+      "initial_items": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "e"
+      ],
+      "ops": [
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "c"
+        },
+        {
+          "op": "move_to_rank_slot",
+          "entry_id": "e",
+          "target_slot": 1
+        },
+        {
+          "op": "move_to_rank_slot",
+          "entry_id": "a",
+          "target_slot": 3
+        }
+      ],
+      "expected_ordering": [
+        [
+          "e"
+        ],
+        [
+          "b",
+          "c"
+        ],
+        [
+          "a"
+        ],
+        [
+          "d"
+        ]
+      ],
+      "expected_display_ranks": [
+        1,
+        2,
+        2,
+        4,
+        5
+      ],
+      "expected_tied_with_above": [
+        false,
+        false,
+        true,
+        false,
+        false
+      ]
+    },
+    {
+      "name": "move_to_rank_slot_into_tie_bucket_up_and_down",
+      "initial_items": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "ops": [
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "c"
+        },
+        {
+          "op": "move_to_rank_slot",
+          "entry_id": "a",
+          "target_slot": 1
+        },
+        {
+          "op": "move_to_rank_slot",
+          "entry_id": "d",
+          "target_slot": 1
+        }
+      ],
+      "expected_ordering": [
+        [
+          "d"
+        ],
+        [
+          "b",
+          "c"
+        ],
+        [
+          "a"
+        ]
+      ],
+      "expected_display_ranks": [
+        1,
+        2,
+        2,
+        4
+      ],
+      "expected_tied_with_above": [
+        false,
+        false,
+        true,
+        false
+      ]
+    },
+    {
+      "name": "toggle_tie_all_roundtrip_and_boundary_noops",
+      "initial_items": [
+        "x",
+        "y",
+        "z"
+      ],
+      "ops": [
+        {
+          "op": "move_up",
+          "entry_id": "x"
+        },
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "x"
+        },
+        {
+          "op": "toggle_tie_all"
+        },
+        {
+          "op": "toggle_tie_all"
+        },
+        {
+          "op": "move_down",
+          "entry_id": "z"
+        },
+        {
+          "op": "toggle_tie_with_above",
+          "entry_id": "z"
+        }
+      ],
+      "expected_ordering": [
+        [
+          "x"
+        ],
+        [
+          "y",
+          "z"
+        ]
+      ],
+      "expected_display_ranks": [
+        1,
+        2,
+        2
+      ],
+      "expected_tied_with_above": [
+        false,
+        false,
+        true
+      ]
+    }
+  ],
+  "artist_wikipedia_scoring": {
+    "wikipedia_scoring": [
+      {
+        "name": "nirvana_band_with_album_boost_beats_uk_band_and_philosophy",
+        "artist_name": "Nirvana",
+        "child_titles": [
+          "Nevermind"
+        ],
+        "hits": [
+          {
+            "title": "Nirvana",
+            "snippet": "In Indian religions, nirvana is the liberation from samsara."
+          },
+          {
+            "title": "Nirvana (UK band)",
+            "snippet": "British progressive rock band formed in London in 1967."
+          },
+          {
+            "title": "Nirvana (band)",
+            "snippet": "American rock band formed in Aberdeen. Released <span>Nevermind</span>."
+          }
+        ],
+        "expected_scores": [
+          0,
+          50,
+          58
+        ],
+        "expected_winner": "Nirvana_(band)"
+      },
+      {
+        "name": "rejects_non_music_disambiguators_footballer_politician_film_municipality",
+        "artist_name": "Jordan",
+        "child_titles": [],
+        "hits": [
+          {
+            "title": "Jordan (footballer)",
+            "snippet": "English professional footballer who played in a local band."
+          },
+          {
+            "title": "Jordan (politician)",
+            "snippet": "Politician and jazz enthusiast born in 1960."
+          },
+          {
+            "title": "Jordan (film)",
+            "snippet": "2018 drama film featuring classical music."
+          },
+          {
+            "title": "Jordan (municipality)",
+            "snippet": "Municipality known for its annual rock festival."
+          },
+          {
+            "title": "Jordan (musician)",
+            "snippet": "British electronic musician and record producer."
+          }
+        ],
+        "expected_scores": [
+          0,
+          0,
+          0,
+          0,
+          50
+        ],
+        "expected_winner": "Jordan_(musician)"
+      },
+      {
+        "name": "rejects_discography_and_self_titled_album_selects_singer",
+        "artist_name": "Elvis Presley",
+        "child_titles": [
+          "Elvis Presley"
+        ],
+        "hits": [
+          {
+            "title": "Elvis Presley discography",
+            "snippet": "The discography of American singer Elvis Presley."
+          },
+          {
+            "title": "Elvis Presley (album)",
+            "snippet": "Debut studio album by American singer Elvis Presley."
+          },
+          {
+            "title": "Elvis Presley",
+            "snippet": "American singer and actor (1935-1977)."
+          }
+        ],
+        "expected_scores": [
+          0,
+          0,
+          32
+        ],
+        "expected_winner": "Elvis_Presley"
+      },
+      {
+        "name": "leading_the_equivalence_matches_band",
+        "artist_name": "Beatles",
+        "child_titles": [
+          "Abbey Road"
+        ],
+        "hits": [
+          {
+            "title": "The Beatles",
+            "snippet": "English rock band formed in Liverpool, creators of Abbey Road."
+          },
+          {
+            "title": "List of Beatles songs",
+            "snippet": "Songs recorded by the rock band."
+          }
+        ],
+        "expected_scores": [
+          36,
+          0
+        ],
+        "expected_winner": "The_Beatles"
+      },
+      {
+        "name": "rejects_all_non_music_candidates_returns_null",
+        "artist_name": "Mercury",
+        "child_titles": [],
+        "hits": [
+          {
+            "title": "Mercury (planet)",
+            "snippet": "The smallest planet in the Solar System."
+          },
+          {
+            "title": "Mercury (mythology)",
+            "snippet": "A major Roman god of commerce."
+          },
+          {
+            "title": "Mercury",
+            "snippet": "Chemical element with symbol Hg and atomic number 80."
+          }
+        ],
+        "expected_scores": [
+          0,
+          0,
+          0
+        ],
+        "expected_winner": null
+      },
+      {
+        "name": "rejects_various_artists_compilation_guard",
+        "artist_name": "Various Artists",
+        "child_titles": [],
+        "hits": [
+          {
+            "title": "Various Artists",
+            "snippet": "Various Artists is a term for a music compilation band."
+          }
+        ],
+        "expected_scores": [
+          0
+        ],
+        "expected_winner": null
+      }
+    ],
+    "spotify_html_extraction": [
+      {
+        "name": "anchor_match_with_numeric_apostrophe_entity_and_script_noise",
+        "artist_name": "Guns N' Roses",
+        "allow_single_fallback": false,
+        "html": "<script>if (x<a && y>z) { var fake = \"https://open.spotify.com/artist/9999999999999999999999\"; }</script><a href=\"/artist/1111111111111111111111\">Guns N&#8217; Roses</a><a href=\"/artist/2222222222222222222222\">Brian Eno</a>",
+        "expected_uri": "spotify:artist:1111111111111111111111"
+      },
+      {
+        "name": "anchor_match_with_full_url_and_nested_span",
+        "artist_name": "Adele",
+        "allow_single_fallback": false,
+        "html": "<a data-testid=\"creator\" href=\"https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY?si=abc\"><span>Adele</span></a>",
+        "expected_uri": "spotify:artist:4dpARuHxo51G3z768sgnrY"
+      },
+      {
+        "name": "single_fallback_ignores_script_artist_id",
+        "artist_name": "Unknown Alias",
+        "allow_single_fallback": true,
+        "html": "<script>var unrelated = \"https://open.spotify.com/artist/9999999999999999999999\";</script><meta name=\"music:musician\" content=\"https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY\"/>",
+        "expected_uri": "spotify:artist:4dpARuHxo51G3z768sgnrY"
+      },
+      {
+        "name": "single_fallback_disabled_returns_null_without_anchor_match",
+        "artist_name": "Unknown Alias",
+        "allow_single_fallback": false,
+        "html": "<meta name=\"music:musician\" content=\"https://open.spotify.com/artist/4dpARuHxo51G3z768sgnrY\"/>",
+        "expected_uri": null
+      },
+      {
+        "name": "multi_artist_fallback_guard_rejects_ambiguous_ids",
+        "artist_name": "Unknown Collaborator",
+        "allow_single_fallback": true,
+        "html": "<meta name=\"music:musician\" content=\"https://open.spotify.com/artist/1111111111111111111111\"/><meta name=\"music:musician\" content=\"https://open.spotify.com/artist/2222222222222222222222\"/>",
+        "expected_uri": null
+      },
+      {
+        "name": "rejects_short_invalid_spotify_id",
+        "artist_name": "Adele",
+        "allow_single_fallback": true,
+        "html": "<a href=\"/artist/short123\">Adele</a>",
+        "expected_uri": null
+      },
+      {
+        "name": "rejects_various_artists",
+        "artist_name": "Various Artists",
+        "allow_single_fallback": true,
+        "html": "<a href=\"/artist/4dpARuHxo51G3z768sgnrY\">Various Artists</a>",
+        "expected_uri": null
+      },
+      {
+        "name": "empty_html_returns_null",
+        "artist_name": "Radiohead",
+        "allow_single_fallback": true,
+        "html": "<html><body>No artist links</body></html>",
+        "expected_uri": null
+      }
+    ]
+  },
+  "peer_sync_merge_scenarios": [
+    {
+      "name": "hlc_lww_state_wins",
+      "initial": {
+        "entries": [
+          {
+            "id": "6539789d-f580-594e-a606-b204cdcada06",
+            "kind": "article",
+            "title": "Article A",
+            "url": "https://example.com/hlc-a",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "state": {
+              "inbox_state": "unread",
+              "read_at": null,
+              "progress": 0.25,
+              "interaction_updated_at": "2025-06-01T10:00:00Z",
+              "hlc": "001748772000000-0000-local-peer"
+            }
+          },
+          {
+            "id": "8676cf75-bd8a-581c-be5e-57d3e4769041",
+            "kind": "article",
+            "title": "Article B",
+            "url": "https://example.com/hlc-b",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-local-peer",
+            "state": {
+              "inbox_state": "dismissed",
+              "read_at": "2025-06-01T10:10:00Z",
+              "progress": 1.0,
+              "interaction_updated_at": "2025-06-01T10:10:00Z",
+              "hlc": "001748772600000-0000-local-peer"
+            }
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:10:00Z",
+        "entries": [
+          {
+            "id": "6539789d-f580-594e-a606-b204cdcada06",
+            "kind": "article",
+            "title": "Article A",
+            "url": "https://example.com/hlc-a",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer",
+            "state": {
+              "inbox_state": "dismissed",
+              "read_at": "2025-06-01T10:05:00Z",
+              "progress": 1.0,
+              "interaction_updated_at": "2025-06-01T10:05:00Z",
+              "hlc": "001748772300000-0000-remote-peer"
+            }
+          },
+          {
+            "id": "8676cf75-bd8a-581c-be5e-57d3e4769041",
+            "kind": "article",
+            "title": "Article B",
+            "url": "https://example.com/hlc-b",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer",
+            "state": {
+              "inbox_state": "unread",
+              "read_at": null,
+              "progress": 0.1,
+              "interaction_updated_at": "2025-06-01T10:05:00Z",
+              "hlc": "001748772300000-0000-remote-peer"
+            }
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "expected": {
+        "entry_states": [
+          {
+            "entry_id": "6539789d-f580-594e-a606-b204cdcada06",
+            "inbox_state": "dismissed",
+            "read_at_present": true,
+            "progress": 1.0,
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entry_id": "8676cf75-bd8a-581c-be5e-57d3e4769041",
+            "inbox_state": "dismissed",
+            "read_at_present": true,
+            "progress": 1.0,
+            "hlc": "001748772600000-0000-local-peer"
+          }
+        ],
+        "entry_presence": [],
+        "collection_members": [],
+        "consumption_log_counts": [],
+        "comparison_orderings": [],
+        "generators": [],
+        "tombstone_presence": []
+      }
+    },
+    {
+      "name": "tombstone_vs_revival",
+      "initial": {
+        "entries": [
+          {
+            "id": "col-tomb",
+            "kind": "collection",
+            "title": "Tombstone Test List",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "collection_spec": {
+              "slug": "tomb_list",
+              "mode": "manual",
+              "role": "list",
+              "show_in_lists": true
+            }
+          },
+          {
+            "id": "book-del",
+            "kind": "book",
+            "title": "Deleted Book",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "book-keep",
+            "kind": "book",
+            "title": "Kept Book",
+            "created_at": "2025-06-01T10:10:00Z",
+            "updated_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [
+          {
+            "collection_id": "col-tomb",
+            "entry_id": "book-del",
+            "added_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "collection_id": "col-tomb",
+            "entry_id": "book-keep",
+            "added_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-local-peer"
+          }
+        ],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "entry",
+            "natural_key": "book-revive",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-local-peer"
+          },
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-revive",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-local-peer"
+          }
+        ]
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:10:00Z",
+        "entries": [
+          {
+            "id": "book-revive",
+            "kind": "book",
+            "title": "Revived Book",
+            "created_at": "2025-06-01T10:10:00Z",
+            "updated_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-remote-peer"
+          }
+        ],
+        "collection_entries": [
+          {
+            "collection_id": "col-tomb",
+            "entry_id": "book-revive",
+            "added_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-remote-peer"
+          }
+        ],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-del",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "book-del",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-keep",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "book-keep",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ]
+      },
+      "expected": {
+        "entry_states": [],
+        "entry_presence": [
+          {
+            "entry_id": "book-del",
+            "exists": false,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "book-keep",
+            "exists": true,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "book-revive",
+            "exists": true,
+            "merged_into_id": null
+          }
+        ],
+        "collection_members": [
+          {
+            "collection_id": "col-tomb",
+            "entry_ids": [
+              "book-keep",
+              "book-revive"
+            ]
+          }
+        ],
+        "consumption_log_counts": [],
+        "comparison_orderings": [],
+        "generators": [],
+        "tombstone_presence": [
+          {
+            "entity_type": "entry",
+            "natural_key": "book-del",
+            "exists": true
+          },
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-del",
+            "exists": true
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "book-keep",
+            "exists": false
+          },
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-keep",
+            "exists": false
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "book-revive",
+            "exists": false
+          },
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-tomb\u0000book-revive",
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "merged_into_id_folding",
+      "initial": {
+        "entries": [
+          {
+            "id": "col-fold",
+            "kind": "collection",
+            "title": "Fold List",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "collection_spec": {
+              "slug": "fold_list",
+              "mode": "manual",
+              "role": "list",
+              "show_in_lists": true
+            }
+          },
+          {
+            "id": "movie-canon",
+            "kind": "movie",
+            "title": "Solaris",
+            "release_year": 1972,
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "movie-dup",
+            "kind": "movie",
+            "title": "Solaris (Dup)",
+            "release_year": 1972,
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "movie-other",
+            "kind": "movie",
+            "title": "Stalker",
+            "release_year": 1979,
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [
+          {
+            "collection_id": "col-fold",
+            "entry_id": "movie-dup",
+            "added_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "consumption_log": [
+          {
+            "id": "log-dup-1",
+            "entry_id": "movie-dup",
+            "ts": "2025-06-01T10:00:00Z",
+            "status": "consumed",
+            "created_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "comparisons": [
+          {
+            "id": "comp-dup-1",
+            "ts": "2025-06-01T10:00:00Z",
+            "scope_collection_id": null,
+            "ordering": [
+              [
+                "movie-dup"
+              ],
+              [
+                "movie-other"
+              ]
+            ],
+            "created_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:05:00Z",
+        "entries": [
+          {
+            "id": "movie-dup",
+            "kind": "movie",
+            "title": "Solaris (Dup)",
+            "merged_into_id": "movie-canon",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "expected": {
+        "entry_states": [],
+        "entry_presence": [
+          {
+            "entry_id": "movie-canon",
+            "exists": true,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "movie-dup",
+            "exists": true,
+            "merged_into_id": "movie-canon"
+          }
+        ],
+        "collection_members": [
+          {
+            "collection_id": "col-fold",
+            "entry_ids": [
+              "movie-canon"
+            ]
+          }
+        ],
+        "consumption_log_counts": [
+          {
+            "entry_id": "movie-canon",
+            "count": 1
+          },
+          {
+            "entry_id": "movie-dup",
+            "count": 0
+          }
+        ],
+        "comparison_orderings": [
+          [
+            [
+              "movie-canon"
+            ],
+            [
+              "movie-other"
+            ]
+          ]
+        ],
+        "generators": [],
+        "tombstone_presence": []
+      }
+    },
+    {
+      "name": "generator_reconcile_on_terminal",
+      "initial": {
+        "entries": [
+          {
+            "id": "col-gen-term",
+            "kind": "collection",
+            "title": "Generator Terminal Pool",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "collection_spec": {
+              "slug": "gen_term_pool",
+              "mode": "manual",
+              "role": "list",
+              "show_in_lists": true
+            }
+          },
+          {
+            "id": "gen-book-a",
+            "kind": "book",
+            "title": "Book A",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "gen-book-b",
+            "kind": "book",
+            "title": "Book B",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [
+          {
+            "collection_id": "col-gen-term",
+            "entry_id": "gen-book-a",
+            "added_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "collection_id": "col-gen-term",
+            "entry_id": "gen-book-b",
+            "added_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [
+          {
+            "collection_id": "col-gen-term",
+            "enabled": true,
+            "current_entry_id": "gen-book-a",
+            "drawn_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:05:00Z",
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [
+          {
+            "id": "log-finish-gen-a",
+            "entry_id": "gen-book-a",
+            "ts": "2025-06-01T10:05:00Z",
+            "status": "consumed",
+            "created_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "expected": {
+        "entry_states": [],
+        "entry_presence": [],
+        "collection_members": [],
+        "consumption_log_counts": [
+          {
+            "entry_id": "gen-book-a",
+            "count": 1
+          }
+        ],
+        "comparison_orderings": [],
+        "generators": [
+          {
+            "collection_id": "col-gen-term",
+            "enabled": true,
+            "current_entry_id": "gen-book-b"
+          }
+        ],
+        "tombstone_presence": []
+      }
+    },
+    {
+      "name": "generator_reconcile_on_pool_removal",
+      "initial": {
+        "entries": [
+          {
+            "id": "col-gen-rm",
+            "kind": "collection",
+            "title": "Generator Removal Pool",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "collection_spec": {
+              "slug": "gen_rm_pool",
+              "mode": "manual",
+              "role": "list",
+              "show_in_lists": true
+            }
+          },
+          {
+            "id": "gen-book-solo",
+            "kind": "book",
+            "title": "Solo Book",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [
+          {
+            "collection_id": "col-gen-rm",
+            "entry_id": "gen-book-solo",
+            "added_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [
+          {
+            "collection_id": "col-gen-rm",
+            "enabled": true,
+            "current_entry_id": "gen-book-solo",
+            "drawn_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:05:00Z",
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-gen-rm\u0000gen-book-solo",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ]
+      },
+      "expected": {
+        "entry_states": [],
+        "entry_presence": [],
+        "collection_members": [
+          {
+            "collection_id": "col-gen-rm",
+            "entry_ids": []
+          }
+        ],
+        "consumption_log_counts": [],
+        "comparison_orderings": [],
+        "generators": [
+          {
+            "collection_id": "col-gen-rm",
+            "enabled": true,
+            "current_entry_id": null
+          }
+        ],
+        "tombstone_presence": [
+          {
+            "entity_type": "collection_entry",
+            "natural_key": "col-gen-rm\u0000gen-book-solo",
+            "exists": true
+          }
+        ]
+      }
     }
   ]
 }

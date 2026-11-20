@@ -7,12 +7,15 @@ use super::{
     CatalogRepo,
     models::{
         CatalogEntry, CatalogError, CatalogResult, CollectionSummary, DynamicCollectionRule,
-        RawCollectionRow, RawEntryRow, UpsertEntryInput,
+        RawCollectionRow, RawEntryRow, UpsertEntryInput, raw_collection_columns, raw_entry_columns,
     },
 };
 use crate::db::{
+    entries_core::{self, EntryInsertParams},
     sync::{SyncRepo, collection_entry_natural_key, deterministic_system_collection_id},
-    types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind},
+    types::{
+        ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
+    },
 };
 
 impl CatalogRepo<'_> {
@@ -22,15 +25,13 @@ impl CatalogRepo<'_> {
         include_want: bool,
         include_system: bool,
     ) -> CatalogResult<Vec<CollectionSummary>> {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT e.id, cs.slug, e.title, e.summary, e.kind, cs.mode, cs.collection_role,
-                    cs.rule_json, cs.show_in_lists, cs.color,
-                    EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) AS has_generator,
-                    e.created_at, e.updated_at
-             FROM collection_specs cs
+        let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+            "SELECT ",
+            raw_collection_columns!(),
+            " FROM collection_specs cs
              JOIN entries e ON e.id = cs.collection_id
-             WHERE e.merged_into_id IS NULL AND cs.collection_role != 'tag' AND cs.collection_role != 'feed'",
-        );
+             WHERE e.merged_into_id IS NULL AND cs.collection_role != 'tag' AND cs.collection_role != 'feed'"
+        ));
         if !include_want {
             qb.push(" AND cs.collection_role != 'want'");
         }
@@ -152,23 +153,7 @@ impl CatalogRepo<'_> {
                 matched_comps.len()
             };
 
-            out.push(CollectionSummary {
-                id: raw.id,
-                slug: raw.slug,
-                title: raw.title,
-                summary: raw.summary,
-                kind: raw.kind,
-                mode: raw.mode,
-                role: raw.collection_role,
-                rule_json: raw.rule_json,
-                show_in_lists: raw.show_in_lists,
-                color: raw.color,
-                member_count: member_ids.len(),
-                comparison_count: comp_count,
-                has_generator: raw.has_generator,
-                created_at: raw.created_at,
-                updated_at: raw.updated_at,
-            });
+            out.push(raw.into_summary(member_ids.len(), comp_count));
         }
         Ok(out)
     }
@@ -181,29 +166,15 @@ impl CatalogRepo<'_> {
         summary: Option<&str>,
         color: Option<&str>,
     ) -> CatalogResult<CollectionSummary> {
-        let clean_title = title.trim();
-        if clean_title.is_empty() {
-            return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
-        }
-        if !matches!(role, CollectionRole::List | CollectionRole::Want) {
-            return Err(CatalogError::InvalidInput(
-                "Custom collections must have role 'list' or 'want'".to_owned(),
-            ));
-        }
-
-        let derived_slug = slug
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| slugify_title(clean_title), slugify_title);
-        if derived_slug.is_empty() {
-            return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
-        }
-
-        let id = deterministic_system_collection_id(&format!("custom:{derived_slug}"));
-        let now = SyncRepo::now_utc();
+        let (clean_title, derived_slug, id) =
+            derive_manual_collection_slug_and_id(title, slug, role)?;
+        let clean_title = clean_title.as_str();
+        let now = crate::util::clock::now_utc();
         let show_in_lists = role == CollectionRole::List;
         let clean_summary = summary.map(str::trim).filter(|s| !s.is_empty());
-        let clean_color = color.map(str::trim).filter(|s| !s.is_empty());
+        let validated_color = HexColor::parse_optional(color)
+            .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
+        let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
         let mut tx = crate::db::begin_write(self.pool).await?;
         let existing = sqlx::query_scalar!(
@@ -217,16 +188,13 @@ impl CatalogRepo<'_> {
                 "Collection with slug '{derived_slug}' already exists"
             )));
         }
-        sqlx::query!(
-            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?, ?)",
-            &id,
-            clean_title,
-            clean_summary,
-            now as _,
-            now as _,
+        entries_core::insert_entry_row_in_tx(
+            &mut tx,
+            &EntryInsertParams {
+                summary: clean_summary,
+                ..EntryInsertParams::minimal(&id, EntryKind::Collection, clean_title, now, now)
+            },
         )
-        .execute(&mut *tx)
         .await?;
 
         sqlx::query!(
@@ -242,14 +210,7 @@ impl CatalogRepo<'_> {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-            &derived_slug,
-            &id,
-        )
-        .execute(&mut *tx)
-        .await?;
+        entries_core::upsert_entry_identifier_in_tx(&mut tx, &id, "slug", &derived_slug).await?;
 
         SyncRepo::record_activity(
             &mut tx,
@@ -278,63 +239,55 @@ impl CatalogRepo<'_> {
         &self,
         target: &str,
     ) -> CatalogResult<CollectionSummary> {
+        let raw = self.ensure_want_collection_row(target).await?;
+        self.summarize_collection_row(raw).await
+    }
+
+    pub(super) async fn ensure_want_collection_row(
+        &self,
+        target: &str,
+    ) -> CatalogResult<RawCollectionRow> {
         let trimmed = target.trim();
         if let Ok(existing) = self.lookup_collection_row(trimmed, true).await
             && existing.collection_role == CollectionRole::Want
         {
-            return self.summarize_collection_row(existing).await;
+            return Ok(existing);
         }
 
-        let (want_slug, pretty_label) = if let Ok(kind) = EntryKind::parse_flexible(trimmed) {
-            let slug = kind
-                .default_want_slug()
-                .ok_or_else(|| {
-                    CatalogError::InvalidInput(format!(
-                        "Kind '{}' does not have a default want queue",
-                        kind.as_str()
-                    ))
-                })?
-                .to_owned();
-            let label = if slug == crate::db::WANT_TO_READ_SLUG {
-                crate::db::WANT_TO_READ_TITLE.to_owned()
-            } else {
-                format!("Want: {}", kind.display_label())
-            };
-            (slug, label)
-        } else {
-            let base_slug = trimmed
-                .strip_prefix("want:")
-                .unwrap_or(trimmed)
-                .to_ascii_lowercase()
-                .replace('-', "_");
-            if base_slug == "read" || base_slug == "articles" || base_slug == "papers" {
-                (crate::db::WANT_TO_READ_SLUG.to_owned(), crate::db::WANT_TO_READ_TITLE.to_owned())
-            } else {
-                let slug = format!("want:{base_slug}");
-                let label = EntryKind::parse_flexible(&base_slug).map_or_else(
-                    |_| format!("Want: {base_slug}"),
-                    |k| format!("Want: {}", k.display_label()),
-                );
-                (slug, label)
-            }
-        };
-
+        let (want_slug, _) = derive_want_collection_slug_and_label(trimmed)?;
         if let Ok(existing) = self.lookup_collection_row(&want_slug, false).await {
-            return self.summarize_collection_row(existing).await;
+            return Ok(existing);
+        }
+
+        let now = crate::util::clock::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+        let raw = Self::ensure_want_collection_in_tx(&mut tx, trimmed, now).await?;
+        tx.commit().await?;
+        Ok(raw)
+    }
+
+    pub(super) async fn ensure_want_collection_in_tx(
+        tx: &mut SqliteConnection,
+        target: &str,
+        now: DateTime<Utc>,
+    ) -> CatalogResult<RawCollectionRow> {
+        let trimmed = target.trim();
+        if let Ok(existing) = Self::lookup_collection_row_in_tx(tx, trimmed, true).await
+            && existing.collection_role == CollectionRole::Want
+        {
+            return Ok(existing);
+        }
+
+        let (want_slug, pretty_label) = derive_want_collection_slug_and_label(trimmed)?;
+        if let Ok(existing) = Self::lookup_collection_row_in_tx(tx, &want_slug, false).await {
+            return Ok(existing);
         }
 
         let id = deterministic_system_collection_id(&want_slug);
-        let now = SyncRepo::now_utc();
-        let mut tx = crate::db::begin_write(self.pool).await?;
-        let res = sqlx::query!(
-            "INSERT OR IGNORE INTO entries (id, kind, title, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?)",
-            &id,
-            &pretty_label,
-            now as _,
-            now as _,
+        let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
+            tx,
+            &EntryInsertParams::minimal(&id, EntryKind::Collection, &pretty_label, now, now),
         )
-        .execute(&mut *tx)
         .await?;
         sqlx::query!(
             "INSERT OR IGNORE INTO collection_specs
@@ -345,17 +298,10 @@ impl CatalogRepo<'_> {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(
-            "INSERT OR IGNORE INTO entry_identifiers (scheme, value, entry_id)
-             VALUES ('slug', ?, ?)",
-            &want_slug,
-            &id,
-        )
-        .execute(&mut *tx)
-        .await?;
-        if res.rows_affected() > 0 {
+        entries_core::upsert_entry_identifier_in_tx(tx, &id, "slug", &want_slug).await?;
+        if inserted {
             SyncRepo::record_activity(
-                &mut tx,
+                tx,
                 ActivityEntityType::Entry,
                 &id,
                 ActivityAction::Create,
@@ -363,9 +309,68 @@ impl CatalogRepo<'_> {
             )
             .await?;
         }
-        tx.commit().await?;
 
-        self.get_collection_summary(&id).await
+        Self::lookup_collection_row_in_tx(tx, &id, false).await
+    }
+
+    pub(super) async fn attach_collection_member_in_tx(
+        tx: &mut SqliteConnection,
+        col_id: &str,
+        member_id: &str,
+        position: Option<f64>,
+        now: DateTime<Utc>,
+        touch_parent_entry: bool,
+    ) -> CatalogResult<()> {
+        if col_id == member_id {
+            return Err(CatalogError::InvalidInput(
+                "A collection cannot contain itself".to_owned(),
+            ));
+        }
+        if Self::would_introduce_collection_cycle_in_tx(tx, col_id, member_id).await? {
+            return Err(CatalogError::InvalidInput(
+                "Adding entry to collection would create a cycle".to_owned(),
+            ));
+        }
+
+        let nat_key = collection_entry_natural_key(col_id, member_id);
+        SyncRepo::clear_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
+
+        sqlx::query!(
+            "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(collection_id, entry_id) DO UPDATE SET
+                position = COALESCE(excluded.position, collection_entries.position)",
+            col_id,
+            member_id,
+            position,
+            now as _,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        SyncRepo::record_activity(
+            tx,
+            ActivityEntityType::CollectionEntry,
+            &nat_key,
+            ActivityAction::Create,
+            now,
+        )
+        .await?;
+
+        if touch_parent_entry {
+            sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, col_id,)
+                .execute(&mut *tx)
+                .await?;
+            SyncRepo::record_activity(
+                tx,
+                ActivityEntityType::Entry,
+                col_id,
+                ActivityAction::Update,
+                now,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Manually adds an entry to a collection, strictly rejecting `feed` and `dynamic` collections
@@ -376,7 +381,7 @@ impl CatalogRepo<'_> {
         entry_id: &str,
         position: Option<f64>,
     ) -> CatalogResult<()> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(&mut tx, slug_or_id, false).await?;
         if col.mode != CollectionMode::Manual {
@@ -385,54 +390,15 @@ impl CatalogRepo<'_> {
         let target_entry_id = Self::follow_merged_id_in_tx(&mut tx, entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))?;
-        if target_entry_id == col.id {
-            return Err(CatalogError::InvalidInput(
-                "A collection cannot contain itself".to_owned(),
-            ));
-        }
-        if Self::would_introduce_collection_cycle_in_tx(&mut tx, &col.id, &target_entry_id).await? {
-            return Err(CatalogError::InvalidInput(
-                "Adding entry to collection would create a cycle".to_owned(),
-            ));
-        }
-
-        let nat_key = collection_entry_natural_key(&col.id, &target_entry_id);
-        SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key).await?;
-
-        sqlx::query!(
-            "INSERT INTO collection_entries (collection_id, entry_id, position, added_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(collection_id, entry_id) DO UPDATE SET
-                position = COALESCE(excluded.position, collection_entries.position)",
+        Self::attach_collection_member_in_tx(
+            &mut tx,
             &col.id,
             &target_entry_id,
             position,
-            now as _,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, &col.id,)
-            .execute(&mut *tx)
-            .await?;
-
-        SyncRepo::record_activity(
-            &mut tx,
-            ActivityEntityType::CollectionEntry,
-            &nat_key,
-            ActivityAction::Create,
             now,
+            true,
         )
         .await?;
-        SyncRepo::record_activity(
-            &mut tx,
-            ActivityEntityType::Entry,
-            &col.id,
-            ActivityAction::Update,
-            now,
-        )
-        .await?;
-
         tx.commit().await?;
         Ok(())
     }
@@ -443,7 +409,7 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
         entry_id: &str,
     ) -> CatalogResult<bool> {
-        let now = SyncRepo::now_utc();
+        let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let col = Self::lookup_collection_row_in_tx(&mut tx, slug_or_id, false).await?;
         if col.mode != CollectionMode::Manual {
@@ -495,23 +461,84 @@ impl CatalogRepo<'_> {
         input: &UpsertEntryInput,
         target_queue: Option<&str>,
     ) -> CatalogResult<(CollectionSummary, CatalogEntry)> {
-        let entry = self.upsert_entry(input).await?;
+        self.want_resolved_or_upsert(input, None, target_queue, false).await
+    }
+
+    /// Atomically resolves (when `try_resolve_existing` is `true`) or upserts an entry,
+    /// ensures the target `Want` queue exists, and attaches the entry to that queue in a
+    /// single SQLite write transaction.
+    pub async fn want_resolved_or_upsert(
+        &self,
+        input: &UpsertEntryInput,
+        notes: Option<&str>,
+        target_queue: Option<&str>,
+        try_resolve_existing: bool,
+    ) -> CatalogResult<(CollectionSummary, CatalogEntry)> {
+        let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
+        let now = crate::util::clock::now_utc();
+        let mut tx = crate::db::begin_write(self.pool).await?;
+
+        let resolved_existing = if try_resolve_existing {
+            Self::resolve_entry_raw_in_tx(&mut tx, &input.title, input.kind, None).await.ok()
+        } else {
+            None
+        };
+
+        let (upsert_input, kind, title) = if let Some(existing) = resolved_existing {
+            let metadata =
+                clean_notes.map(|note_text| with_want_notes(input.metadata.clone(), note_text));
+            let resolved_kind = existing.kind;
+            let resolved_title = existing.title;
+            let resolved_in = UpsertEntryInput {
+                id: Some(existing.id),
+                kind: Some(resolved_kind),
+                title: resolved_title.clone(),
+                metadata,
+                ..UpsertEntryInput::default()
+            };
+            (resolved_in, resolved_kind, resolved_title)
+        } else {
+            let kind = input
+                .kind
+                .ok_or_else(|| CatalogError::InvalidInput("Entry kind is required".to_owned()))?;
+            let title = input.title.trim();
+            if title.is_empty() {
+                return Err(CatalogError::InvalidInput("Entry title cannot be empty".to_owned()));
+            }
+            let mut enriched = input.clone();
+            if let Some(note_text) = clean_notes {
+                enriched.metadata = Some(with_want_notes(enriched.metadata.take(), note_text));
+            }
+            (enriched, kind, title.to_owned())
+        };
+
+        let entry_id = Self::upsert_entry_in_tx(&mut tx, &upsert_input, kind, &title, now).await?;
+        let persisted_kind: EntryKind = sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
+            .bind(&entry_id)
+            .fetch_one(&mut *tx)
+            .await?;
         let queue_key = match target_queue.map(str::trim).filter(|s| !s.is_empty()) {
             Some(explicit) => explicit.to_owned(),
-            None => entry
-                .kind
+            None => persisted_kind
                 .default_want_slug()
                 .ok_or_else(|| {
                     CatalogError::InvalidInput(format!(
                         "Specify a target want queue for kind '{}'",
-                        entry.kind.as_str()
+                        persisted_kind.as_str()
                     ))
                 })?
                 .to_owned(),
         };
-        let queue = self.get_or_create_want_collection(&queue_key).await?;
-        self.add_collection_entry(&queue.id, &entry.id, None).await?;
+        let queue = Self::ensure_want_collection_in_tx(&mut tx, &queue_key, now).await?;
+        Self::attach_collection_member_in_tx(&mut tx, &queue.id, &entry_id, None, now, true)
+            .await?;
+        tx.commit().await?;
+
         let refreshed_queue = self.get_collection_summary(&queue.id).await?;
+        let entry = self
+            .get_entry(&entry_id)
+            .await?
+            .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))?;
         Ok((refreshed_queue, entry))
     }
 
@@ -520,7 +547,7 @@ impl CatalogRepo<'_> {
         target_queue: &str,
         query_or_id: &str,
     ) -> CatalogResult<CatalogEntry> {
-        let queue = self.get_or_create_want_collection(target_queue).await?;
+        let queue = self.ensure_want_collection_row(target_queue).await?;
         let entry = self.resolve_entry(query_or_id, None, Some(&queue.id)).await?;
         self.remove_collection_entry(&queue.id, &entry.id).await?;
         Ok(entry)
@@ -573,28 +600,19 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<RawCollectionRow> {
         let q = slug_or_id.trim();
         let norm_slug = q.to_ascii_lowercase().replace('-', "_");
-        if let Some(row) = sqlx::query_as!(
-            RawCollectionRow,
-            r#"SELECT e.id as "id!", cs.slug as "slug?", e.title as "title!",
-                      e.summary as "summary?", e.kind as "kind!: EntryKind",
-                      cs.mode as "mode!: CollectionMode",
-                      cs.collection_role as "collection_role!: CollectionRole",
-                      cs.rule_json as "rule_json?",
-                      cs.show_in_lists as "show_in_lists!: bool",
-                      cs.color as "color?",
-                      EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) as "has_generator!: bool",
-                      e.created_at as "created_at!: DateTime<Utc>",
-                      e.updated_at as "updated_at!: DateTime<Utc>"
-               FROM collection_specs cs
-               JOIN entries e ON e.id = cs.collection_id
-               WHERE e.merged_into_id IS NULL
-                 AND (e.id = ? OR LOWER(cs.slug) = LOWER(?) OR LOWER(cs.slug) = ? OR LOWER(e.title) = LOWER(?))
-               LIMIT 1"#,
-            q,
-            q,
-            &norm_slug,
-            q,
-        )
+        if let Some(row) = sqlx::query_as::<_, RawCollectionRow>(concat!(
+            "SELECT ",
+            raw_collection_columns!(),
+            " FROM collection_specs cs
+             JOIN entries e ON e.id = cs.collection_id
+             WHERE e.merged_into_id IS NULL
+               AND (e.id = ? OR LOWER(cs.slug) = LOWER(?) OR LOWER(cs.slug) = ? OR LOWER(e.title) = LOWER(?))
+             LIMIT 1"
+        ))
+        .bind(q)
+        .bind(q)
+        .bind(&norm_slug)
+        .bind(q)
         .fetch_optional(&mut *conn)
         .await?
         {
@@ -604,24 +622,15 @@ impl CatalogRepo<'_> {
         if allow_kind_alias
             && let Ok(kind) = EntryKind::parse_flexible(q)
             && let Some(default_slug) = kind.default_list_slug()
-            && let Some(row) = sqlx::query_as!(
-                RawCollectionRow,
-                r#"SELECT e.id as "id!", cs.slug as "slug?", e.title as "title!",
-                          e.summary as "summary?", e.kind as "kind!: EntryKind",
-                          cs.mode as "mode!: CollectionMode",
-                          cs.collection_role as "collection_role!: CollectionRole",
-                          cs.rule_json as "rule_json?",
-                          cs.show_in_lists as "show_in_lists!: bool",
-                          cs.color as "color?",
-                          EXISTS (SELECT 1 FROM collection_generators cg WHERE cg.collection_id = e.id) as "has_generator!: bool",
-                          e.created_at as "created_at!: DateTime<Utc>",
-                          e.updated_at as "updated_at!: DateTime<Utc>"
-                   FROM collection_specs cs
-                   JOIN entries e ON e.id = cs.collection_id
-                   WHERE e.merged_into_id IS NULL AND cs.slug = ?
-                   LIMIT 1"#,
-                default_slug,
-            )
+            && let Some(row) = sqlx::query_as::<_, RawCollectionRow>(concat!(
+                "SELECT ",
+                raw_collection_columns!(),
+                " FROM collection_specs cs
+                 JOIN entries e ON e.id = cs.collection_id
+                 WHERE e.merged_into_id IS NULL AND cs.slug = ?
+                 LIMIT 1"
+            ))
+            .bind(default_slug)
             .fetch_optional(&mut *conn)
             .await?
         {
@@ -652,23 +661,7 @@ impl CatalogRepo<'_> {
                 .count()
         };
 
-        Ok(CollectionSummary {
-            id: raw.id,
-            slug: raw.slug,
-            title: raw.title,
-            summary: raw.summary,
-            kind: raw.kind,
-            mode: raw.mode,
-            role: raw.collection_role,
-            rule_json: raw.rule_json,
-            show_in_lists: raw.show_in_lists,
-            color: raw.color,
-            member_count: member_ids.len(),
-            comparison_count: comp_count,
-            has_generator: raw.has_generator,
-            created_at: raw.created_at,
-            updated_at: raw.updated_at,
-        })
+        Ok(raw.into_summary(member_ids.len(), comp_count))
     }
 
     pub(super) async fn resolve_rankable_member_ids(
@@ -754,62 +747,41 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<Vec<CatalogEntry>> {
         let raw_rows: Vec<RawEntryRow> = match col.mode {
             CollectionMode::Manual | CollectionMode::Feed => {
-                if col.has_generator {
-                    sqlx::query_as!(
-                        RawEntryRow,
-                        r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
-                                  e.creators_json as "creators_json!", e.url as "url?",
-                                  e.published_at as "published_at?: DateTime<Utc>",
-                                  e.release_year as "release_year?: i32", e.summary as "summary?",
-                                  e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
-                                  e.merged_into_id as "merged_into_id?",
-                                  e.created_at as "created_at!: DateTime<Utc>",
-                                  e.updated_at as "updated_at!: DateTime<Utc>"
-                           FROM collection_entries ce
-                           JOIN entries e ON e.id = ce.entry_id
-                           WHERE ce.collection_id = ?
-                             AND e.merged_into_id IS NULL
-                             AND EXISTS (
-                                 SELECT 1 FROM consumption_log cl
-                                 WHERE cl.entry_id = e.id AND cl.status = 'consumed'
-                             )
-                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
-                        &col.id,
+                let sql = if col.has_generator {
+                    concat!(
+                        "SELECT ",
+                        raw_entry_columns!(e),
+                        " FROM collection_entries ce
+                         JOIN entries e ON e.id = ce.entry_id
+                         WHERE ce.collection_id = ?
+                           AND e.merged_into_id IS NULL
+                           AND EXISTS (
+                               SELECT 1 FROM consumption_log cl
+                               WHERE cl.entry_id = e.id AND cl.status = 'consumed'
+                           )
+                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
                     )
-                    .fetch_all(self.pool)
-                    .await?
                 } else {
-                    sqlx::query_as!(
-                        RawEntryRow,
-                        r#"SELECT e.id as "id!", e.kind as "kind!: EntryKind", e.title as "title!",
-                                  e.creators_json as "creators_json!", e.url as "url?",
-                                  e.published_at as "published_at?: DateTime<Utc>",
-                                  e.release_year as "release_year?: i32", e.summary as "summary?",
-                                  e.thumbnail_url as "thumbnail_url?", e.metadata_json as "metadata_json!",
-                                  e.merged_into_id as "merged_into_id?",
-                                  e.created_at as "created_at!: DateTime<Utc>",
-                                  e.updated_at as "updated_at!: DateTime<Utc>"
-                           FROM collection_entries ce
-                           JOIN entries e ON e.id = ce.entry_id
-                           WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
-                           ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"#,
-                        &col.id,
+                    concat!(
+                        "SELECT ",
+                        raw_entry_columns!(e),
+                        " FROM collection_entries ce
+                         JOIN entries e ON e.id = ce.entry_id
+                         WHERE ce.collection_id = ? AND e.merged_into_id IS NULL
+                         ORDER BY ce.position ASC NULLS LAST, ce.added_at DESC, e.id ASC"
                     )
-                    .fetch_all(self.pool)
-                    .await?
-                }
+                };
+                sqlx::query_as(sql).bind(&col.id).fetch_all(self.pool).await?
             }
             CollectionMode::Dynamic => {
                 let Some(rule) = parse_dynamic_collection_rule(col.rule_json.as_deref()) else {
                     return Ok(Vec::new());
                 };
-                let mut qb = QueryBuilder::<Sqlite>::new(
-                    "SELECT e.id, e.kind, e.title, e.creators_json, e.url, e.published_at,
-                            e.release_year, e.summary, e.thumbnail_url, e.metadata_json,
-                            e.merged_into_id, e.created_at, e.updated_at
-                     FROM entries e
-                     WHERE e.merged_into_id IS NULL",
-                );
+                let mut qb = QueryBuilder::<Sqlite>::new(concat!(
+                    "SELECT ",
+                    raw_entry_columns!(e),
+                    " FROM entries e WHERE e.merged_into_id IS NULL"
+                ));
                 append_dynamic_rule_sql_filters(&mut qb, &rule);
                 qb.push(" ORDER BY LOWER(e.title) ASC, e.id ASC");
                 let mut fetched: Vec<RawEntryRow> =
@@ -829,6 +801,47 @@ impl CatalogRepo<'_> {
         };
 
         self.hydrate_entries(raw_rows).await
+    }
+}
+
+fn with_want_notes(base: Option<serde_json::Value>, note_text: &str) -> serde_json::Value {
+    let mut meta = base.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("want_notes".to_owned(), serde_json::Value::String(note_text.to_owned()));
+    }
+    meta
+}
+
+fn derive_want_collection_slug_and_label(trimmed: &str) -> CatalogResult<(String, String)> {
+    if let Ok(kind) = EntryKind::parse_flexible(trimmed) {
+        let slug = kind
+            .default_want_slug()
+            .ok_or_else(|| {
+                CatalogError::InvalidInput(format!(
+                    "Kind '{}' does not have a default want queue",
+                    kind.as_str()
+                ))
+            })?
+            .to_owned();
+        let label = if slug == crate::db::WANT_TO_READ_SLUG {
+            crate::db::WANT_TO_READ_TITLE.to_owned()
+        } else {
+            format!("Want: {}", kind.display_label())
+        };
+        Ok((slug, label))
+    } else {
+        let base_slug =
+            trimmed.strip_prefix("want:").unwrap_or(trimmed).to_ascii_lowercase().replace('-', "_");
+        if is_want_to_read_base_slug(&base_slug) {
+            Ok((crate::db::WANT_TO_READ_SLUG.to_owned(), crate::db::WANT_TO_READ_TITLE.to_owned()))
+        } else {
+            let slug = format!("want:{base_slug}");
+            let label = EntryKind::parse_flexible(&base_slug).map_or_else(
+                |_| format!("Want: {base_slug}"),
+                |k| format!("Want: {}", k.display_label()),
+            );
+            Ok((slug, label))
+        }
     }
 }
 
@@ -921,7 +934,55 @@ fn append_dynamic_rule_sql_filters(qb: &mut QueryBuilder<Sqlite>, rule: &Dynamic
     }
 }
 
-pub(super) fn slugify_title(title: &str) -> String {
+fn is_want_to_read_base_slug(base_slug: &str) -> bool {
+    matches!(base_slug, "read" | "article" | "articles" | "paper" | "papers")
+}
+
+pub fn derive_manual_collection_slug_and_id(
+    title: &str,
+    slug: Option<&str>,
+    role: CollectionRole,
+) -> CatalogResult<(String, String, String)> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err(CatalogError::InvalidInput("Collection title cannot be empty".to_owned()));
+    }
+    if !matches!(role, CollectionRole::List | CollectionRole::Want) {
+        return Err(CatalogError::InvalidInput(
+            "Custom collections must have role 'list' or 'want'".to_owned(),
+        ));
+    }
+
+    let raw_source = slug.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(clean_title);
+    let slug_input = if role == CollectionRole::Want
+        && raw_source.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("want:"))
+    {
+        &raw_source[5..]
+    } else {
+        raw_source
+    };
+    let base_slug = slugify_title(slug_input);
+    if base_slug.is_empty() {
+        return Err(CatalogError::InvalidInput("Collection slug cannot be empty".to_owned()));
+    }
+
+    let (derived_slug, id) = if role == CollectionRole::Want {
+        let full_slug = if is_want_to_read_base_slug(&base_slug) {
+            crate::db::WANT_TO_READ_SLUG.to_owned()
+        } else {
+            format!("want:{base_slug}")
+        };
+        let det_id = deterministic_system_collection_id(&full_slug);
+        (full_slug, det_id)
+    } else {
+        let det_id = deterministic_system_collection_id(&format!("custom:{base_slug}"));
+        (base_slug, det_id)
+    };
+
+    Ok((clean_title.to_owned(), derived_slug, id))
+}
+
+fn slugify_title(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
     let mut prev_sep = false;
     for ch in title.chars() {
