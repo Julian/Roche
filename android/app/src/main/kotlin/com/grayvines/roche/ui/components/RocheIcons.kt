@@ -78,7 +78,7 @@ fun BottomTabIcon(
                 )
             }
             AppTab.SETTINGS -> {
-                drawSettingsTabIcon(tint = tint, stroke = stroke, strokeWidth = strokeWidth)
+                drawSettingsCogIcon(path = pathA, tint = tint, stroke = stroke)
             }
         }
     }
@@ -267,30 +267,49 @@ private fun DrawScope.drawFeedsTabIcon(tint: Color, stroke: Stroke) {
     )
 }
 
-private fun DrawScope.drawSettingsTabIcon(tint: Color, stroke: Stroke, strokeWidth: Float) {
-    val w = size.width
-    val h = size.height
-    val xStart = w * SLIDER_LEFT
-    val xEnd = w * SLIDER_RIGHT
-    val r = w * SLIDER_KNOB_RADIUS
+/**
+ * Draws a clean continuous 6-tooth mechanical gear/cog outline with a centered hub circle
+ * (Lucide-style Settings icon, distinct from sliders or sun rays).
+ */
+private fun DrawScope.drawSettingsCogIcon(path: Path, tint: Color, stroke: Stroke) {
+    val cx = size.width * 0.5f
+    val cy = size.height * 0.5f
+    val outerR = size.minDimension * 0.42f
+    val valleyR = size.minDimension * 0.295f
+    val teeth = 6
+    val stepDeg = 360.0 / teeth
+    val toothOuterHalfDeg = 10.5
+    val toothBaseHalfDeg = 16.5
 
-    val y1 = h * SLIDER_ROW_1_Y
-    val k1 = w * SLIDER_KNOB_1_X
-    drawLine(tint, Offset(xStart, y1), Offset(k1 - r, y1), strokeWidth, StrokeCap.Round)
-    drawLine(tint, Offset(k1 + r, y1), Offset(xEnd, y1), strokeWidth, StrokeCap.Round)
-    drawCircle(color = tint, radius = r, center = Offset(k1, y1), style = stroke)
-
-    val y2 = h * SLIDER_ROW_2_Y
-    val k2 = w * SLIDER_KNOB_2_X
-    drawLine(tint, Offset(xStart, y2), Offset(k2 - r, y2), strokeWidth, StrokeCap.Round)
-    drawLine(tint, Offset(k2 + r, y2), Offset(xEnd, y2), strokeWidth, StrokeCap.Round)
-    drawCircle(color = tint, radius = r, center = Offset(k2, y2), style = stroke)
-
-    val y3 = h * SLIDER_ROW_3_Y
-    val k3 = w * SLIDER_KNOB_3_X
-    drawLine(tint, Offset(xStart, y3), Offset(k3 - r, y3), strokeWidth, StrokeCap.Round)
-    drawLine(tint, Offset(k3 + r, y3), Offset(xEnd, y3), strokeWidth, StrokeCap.Round)
-    drawCircle(color = tint, radius = r, center = Offset(k3, y3), style = stroke)
+    path.rewind()
+    for (i in 0 until teeth) {
+        val centerDeg = -90.0 + i * stepDeg
+        val points =
+            listOf(
+                valleyR to centerDeg - toothBaseHalfDeg,
+                outerR to centerDeg - toothOuterHalfDeg,
+                outerR to centerDeg + toothOuterHalfDeg,
+                valleyR to centerDeg + toothBaseHalfDeg,
+            )
+        points.forEachIndexed { idx, (r, deg) ->
+            val rad = Math.toRadians(deg)
+            val x = cx + (r * cos(rad)).toFloat()
+            val y = cy + (r * sin(rad)).toFloat()
+            if (i == 0 && idx == 0) {
+                path.moveTo(x, y)
+            } else {
+                path.lineTo(x, y)
+            }
+        }
+    }
+    path.close()
+    drawPath(path = path, color = tint, style = stroke)
+    drawCircle(
+        color = tint,
+        radius = size.minDimension * 0.135f,
+        center = Offset(cx, cy),
+        style = stroke,
+    )
 }
 
 /**
@@ -702,6 +721,81 @@ fun SkipNextIcon(
     }
 }
 
+/** Quiet stroked Skip (`⏭`) icon for skipping a daily collection draw. */
+@Composable
+fun SkipDrawIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 15.dp,
+) {
+    val tri = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        tri.rewind()
+        tri.moveTo(w * 0.22f, h * 0.24f)
+        tri.lineTo(w * 0.58f, h * 0.50f)
+        tri.lineTo(w * 0.22f, h * 0.76f)
+        tri.close()
+        drawPath(path = tri, color = tint, style = stroke)
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.76f, h * 0.24f),
+            end = Offset(w * 0.76f, h * 0.76f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
+/** Crisp crossed-serif Wikipedia `W` outline icon for album/entry lookup buttons. */
+@Composable
+fun WikipediaIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+    size: Dp = 15.dp,
+) {
+    val glyph = remember { Path() }
+    Canvas(modifier = modifier.size(size)) {
+        val strokeWidth = this.size.minDimension * STROKE_FRACTION
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val w = this.size.width
+        val h = this.size.height
+        val topY = h * 0.22f
+        val botY = h * 0.78f
+        drawLine(
+            tint,
+            Offset(w * 0.11f, topY),
+            Offset(w * 0.26f, topY),
+            strokeWidth,
+            StrokeCap.Round,
+        )
+        drawLine(
+            tint,
+            Offset(w * 0.43f, topY),
+            Offset(w * 0.57f, topY),
+            strokeWidth,
+            StrokeCap.Round,
+        )
+        drawLine(
+            tint,
+            Offset(w * 0.74f, topY),
+            Offset(w * 0.89f, topY),
+            strokeWidth,
+            StrokeCap.Round,
+        )
+        glyph.rewind()
+        glyph.moveTo(w * 0.18f, topY)
+        glyph.lineTo(w * 0.33f, botY)
+        glyph.lineTo(w * 0.47f, h * 0.37f)
+        glyph.lineTo(w * 0.62f, botY)
+        glyph.lineTo(w * 0.77f, topY)
+        drawPath(path = glyph, color = tint, style = stroke)
+    }
+}
+
 private const val STROKE_FRACTION = 0.085f
 private const val CABINET_LEFT = 0.16f
 private const val CABINET_RIGHT = 0.84f
@@ -764,13 +858,3 @@ private const val FEEDS_OUTER_TOP = 0.12f
 private const val FEEDS_OUTER_DIAMETER = 1.36f
 
 private const val OFFLINE_CHEVRON_WING_Y = 0.46f
-
-private const val SLIDER_LEFT = 0.16f
-private const val SLIDER_RIGHT = 0.84f
-private const val SLIDER_KNOB_RADIUS = 0.09f
-private const val SLIDER_ROW_1_Y = 0.24f
-private const val SLIDER_ROW_2_Y = 0.50f
-private const val SLIDER_ROW_3_Y = 0.76f
-private const val SLIDER_KNOB_1_X = 0.38f
-private const val SLIDER_KNOB_2_X = 0.66f
-private const val SLIDER_KNOB_3_X = 0.46f

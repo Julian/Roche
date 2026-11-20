@@ -330,7 +330,8 @@ internal fun NavigationSummaryCardSection(
     val colors = LocalRocheColors.current
     val currentTabs = AppTab.normalizeBottomTabs(state.settings.bottomNavTabs)
     val summary = currentTabs.joinToString(" · ") { it.label }
-    val unpinnedTabs = AppTab.bottomTabCandidates.filter { it !in currentTabs }
+    val unpinnedTabs =
+        AppTab.bottomTabCandidates.filter { it !in currentTabs && it != AppTab.SETTINGS }
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         RocheSectionHeader(label = "Navigation")

@@ -71,10 +71,10 @@ class SettingsRepositoryTest {
             assertEquals(
                 listOf(
                     AppTab.HOME,
-                    AppTab.FEEDS,
+                    AppTab.INBOX,
                     AppTab.LISTS,
+                    AppTab.FEEDS,
                     AppTab.STARRED,
-                    AppTab.SETTINGS,
                 ),
                 current.bottomNavTabs,
             )
@@ -560,10 +560,10 @@ class SettingsRepositoryTest {
             assertEquals(
                 listOf(
                     AppTab.HOME,
-                    AppTab.FEEDS,
+                    AppTab.INBOX,
                     AppTab.LISTS,
+                    AppTab.FEEDS,
                     AppTab.STARRED,
-                    AppTab.SETTINGS,
                 ),
                 AppTab.defaultBottomTabs,
             )

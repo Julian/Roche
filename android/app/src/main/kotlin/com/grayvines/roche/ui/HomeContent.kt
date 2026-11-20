@@ -1,4 +1,4 @@
-@file:Suppress("MagicNumber")
+@file:Suppress("MagicNumber", "TooManyFunctions")
 
 package com.grayvines.roche.ui
 
@@ -12,18 +12,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -47,24 +45,25 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
+import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.model.AppTab
-import com.grayvines.roche.model.FeedItem
 import com.grayvines.roche.model.InboxEntry
-import com.grayvines.roche.model.TagItem
 import com.grayvines.roche.ui.components.BottomTabIcon
-import com.grayvines.roche.ui.components.EntrySourceMetadataRow
-import com.grayvines.roche.ui.components.EntryThumbnailPreview
-import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.RocheButtonStyle
 import com.grayvines.roche.ui.components.RocheIconActionButton
@@ -72,19 +71,26 @@ import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheSectionHeader
 import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SearchIcon
 import com.grayvines.roche.ui.components.SiteFaviconBadge
-import com.grayvines.roche.ui.components.SyncHeaderActionButton
+import com.grayvines.roche.ui.components.SkipDrawIcon
+import com.grayvines.roche.ui.components.WikipediaIcon
+import com.grayvines.roche.ui.components.drawArticleImagePlaceholder
+import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.components.rememberHighResImageBitmap
+import com.grayvines.roche.ui.components.resolveCatalogEntryOpenAction
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.text.NumberFormat
+import java.util.Locale
 
 @Composable
 fun HomeTabContent(
     state: MainUiState,
     onAction: (MainAction) -> Unit,
     scrollState: ScrollState = rememberScrollState(),
-    activeAudioEntryId: String? = null,
+    @Suppress("UnusedParameter") activeAudioEntryId: String? = null,
     onOpenExternalUrl: (String) -> Unit = {},
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
         val fallback =
@@ -94,31 +100,19 @@ fun HomeTabContent(
         }
     },
 ) {
-    val isSettingsUnpinned =
-        AppTab.SETTINGS !in AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
-
     RocheRefreshableTabScaffold(
         isRefreshing = state.isSyncing,
         onRefresh = { onAction(MainAction.SyncNow) },
         pullToRefreshTestTag = "home_pull_to_refresh",
         modifier = Modifier.testTag("home_screen"),
-        header = {
-            HomeTopHeaderBar(
-                isSyncing = state.isSyncing,
-                isSettingsUnpinned = isSettingsUnpinned,
-                onAction = onAction,
-            )
-        },
+        header = { HomeTopHeaderBar(onAction = onAction) },
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val isWideLayout = maxWidth >= WIDE_DASHBOARD_BREAKPOINT
-            val isBentoTwoColumn = maxWidth >= BENTO_TWO_COLUMN_BREAKPOINT
             HomeScrollableGrid(
                 state = state,
                 scrollState = scrollState,
                 isWideLayout = isWideLayout,
-                isBentoTwoColumn = isBentoTwoColumn,
-                activeAudioEntryId = activeAudioEntryId,
                 onAction = onAction,
                 onOpenExternalUrl = onOpenExternalUrl,
                 onOpenCollectionDraw = onOpenCollectionDraw,
@@ -128,29 +122,28 @@ fun HomeTabContent(
 }
 
 @Composable
-private fun HomeTopHeaderBar(
-    isSyncing: Boolean,
-    isSettingsUnpinned: Boolean,
-    onAction: (MainAction) -> Unit,
-) {
+private fun HomeTopHeaderBar(onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
     RocheTopHeader(
-        title = "Home",
-        subtitle = if (isSyncing) "Refreshing…" else "Overview",
-    ) {
-        SyncHeaderActionButton(
-            isSyncing = isSyncing,
-            onClick = { onAction(MainAction.SyncNow) },
-            modifier = Modifier.testTag("home_sync_btn"),
-        )
-        if (isSettingsUnpinned) {
+        title = "Roche",
+        titleTrailingAction = {
             RocheIconActionButton(
                 contentDescription = "Settings",
+                outlined = false,
                 onClick = { onAction(MainAction.SelectTab(AppTab.SETTINGS)) },
                 modifier = Modifier.testTag("home_spare_settings_btn"),
             ) {
-                BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textSecondary, size = 17.dp)
+                BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textMuted, size = 17.dp)
             }
+        },
+    ) {
+        RocheIconActionButton(
+            contentDescription = "Search",
+            outlined = true,
+            onClick = { onAction(MainAction.OpenSearch) },
+            modifier = Modifier.testTag("home_search_btn"),
+        ) {
+            SearchIcon(tint = colors.textSecondary, size = 17.dp)
         }
     }
 }
@@ -160,100 +153,41 @@ internal fun HomeScrollableGrid(
     state: MainUiState,
     scrollState: ScrollState,
     isWideLayout: Boolean,
-    isBentoTwoColumn: Boolean,
-    activeAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val activeDraws = state.activeCollectionDraws
-    val hasActiveDraws = activeDraws.isNotEmpty()
     Column(
         modifier =
             Modifier.fillMaxSize()
                 .verticalScroll(scrollState)
-                .padding(horizontal = 14.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        when {
-            isWideLayout -> {
-                HomeWideTwoColumnDashboard(
-                    state = state,
-                    activeDraws = activeDraws,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-            }
-            hasActiveDraws && isBentoTwoColumn -> {
-                HomeUpNextWidget(
-                    state = state,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onAction = onAction,
-                    twoColumnCards = false,
-                )
-                HomeInboxWidget(state = state, onAction = onAction)
-                HomeBentoTwoColumnRow(
-                    state = state,
-                    activeDraws = activeDraws,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-                HomeMediaCompanionWidget(state = state, onAction = onAction)
-            }
-            else -> {
-                HomeSingleColumnDashboard(
-                    state = state,
-                    activeDraws = activeDraws,
-                    splitSourcesWhenUnconfigured = !hasActiveDraws && isBentoTwoColumn,
-                    activeAudioEntryId = activeAudioEntryId,
-                    onAction = onAction,
-                    onOpenExternalUrl = onOpenExternalUrl,
-                    onOpenCollectionDraw = onOpenCollectionDraw,
-                )
-            }
+        if (isWideLayout) {
+            HomeWideTwoColumnDashboard(
+                state = state,
+                activeDraws = activeDraws,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                onOpenCollectionDraw = onOpenCollectionDraw,
+            )
+        } else {
+            HomeSingleColumnDashboard(
+                state = state,
+                activeDraws = activeDraws,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+                onOpenCollectionDraw = onOpenCollectionDraw,
+            )
         }
         Spacer(modifier = Modifier.height(76.dp))
     }
 }
 
 @Composable
-private fun HomeSingleColumnDashboard(
-    state: MainUiState,
-    activeDraws: List<CollectionGeneratorState>,
-    splitSourcesWhenUnconfigured: Boolean,
-    activeAudioEntryId: String?,
-    onAction: (MainAction) -> Unit,
-    onOpenExternalUrl: (String) -> Unit,
-    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
-) {
-    HomeUpNextWidget(
-        state = state,
-        activeAudioEntryId = activeAudioEntryId,
-        onAction = onAction,
-        twoColumnCards = false,
-    )
-    HomeInboxWidget(state = state, onAction = onAction)
-    activeDraws.forEach { gen ->
-        HomeCollectionDrawWidget(
-            generator = gen,
-            onAction = onAction,
-            onOpenExternalUrl = onOpenExternalUrl,
-            onOpenCollectionDraw = onOpenCollectionDraw,
-        )
-    }
-    HomeMediaCompanionWidget(state = state, onAction = onAction)
-    HomeActiveSourcesWidget(
-        state = state,
-        onAction = onAction,
-        splitColumnsWhenUnconfigured = splitSourcesWhenUnconfigured,
-    )
-}
-
-@Composable
-internal fun HomeBentoTwoColumnRow(
+private fun HomeWideTwoColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
     onAction: (MainAction) -> Unit,
@@ -262,12 +196,22 @@ internal fun HomeBentoTwoColumnRow(
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.Top,
     ) {
         Column(
+            modifier = Modifier.weight(1.12f),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            HomeInboxWidget(
+                state = state,
+                maxItems = WIDE_INBOX_ITEMS,
+                onAction = onAction,
+            )
+        }
+        Column(
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             activeDraws.forEach { gen ->
                 HomeCollectionDrawWidget(
@@ -277,73 +221,43 @@ internal fun HomeBentoTwoColumnRow(
                     onOpenCollectionDraw = onOpenCollectionDraw,
                 )
             }
+            HomeRecentDiaryWidget(
+                state = state,
+                maxItems = WIDE_DIARY_ITEMS,
+                onAction = onAction,
+                onOpenExternalUrl = onOpenExternalUrl,
+            )
         }
-        HomeActiveSourcesWidget(
-            state = state,
-            onAction = onAction,
-            modifier = Modifier.weight(1f),
-            splitColumnsWhenUnconfigured = false,
-        )
     }
 }
 
 @Composable
-internal fun HomeWideTwoColumnDashboard(
+private fun HomeSingleColumnDashboard(
     state: MainUiState,
     activeDraws: List<CollectionGeneratorState>,
-    activeAudioEntryId: String? = null,
     onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
-    val hasActiveDraws = activeDraws.isNotEmpty()
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
-        verticalAlignment = Alignment.Top,
-    ) {
-        Column(
-            modifier = Modifier.weight(1.12f),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            HomeUpNextWidget(
-                state = state,
-                activeAudioEntryId = activeAudioEntryId,
-                onAction = onAction,
-                twoColumnCards = true,
-            )
-            HomeInboxWidget(state = state, onAction = onAction)
-            HomeMediaCompanionWidget(state = state, onAction = onAction)
-            if (hasActiveDraws) {
-                HomeActiveSourcesWidget(
-                    state = state,
-                    onAction = onAction,
-                    splitColumnsWhenUnconfigured = true,
-                )
-            }
-        }
-        Column(
-            modifier = Modifier.weight(0.88f),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            if (hasActiveDraws) {
-                activeDraws.forEach { gen ->
-                    HomeCollectionDrawWidget(
-                        generator = gen,
-                        onAction = onAction,
-                        onOpenExternalUrl = onOpenExternalUrl,
-                        onOpenCollectionDraw = onOpenCollectionDraw,
-                    )
-                }
-            } else {
-                HomeActiveSourcesWidget(
-                    state = state,
-                    onAction = onAction,
-                    splitColumnsWhenUnconfigured = false,
-                )
-            }
-        }
+    activeDraws.forEach { gen ->
+        HomeCollectionDrawWidget(
+            generator = gen,
+            onAction = onAction,
+            onOpenExternalUrl = onOpenExternalUrl,
+            onOpenCollectionDraw = onOpenCollectionDraw,
+        )
     }
+    HomeInboxWidget(
+        state = state,
+        maxItems = COMPACT_INBOX_ITEMS,
+        onAction = onAction,
+    )
+    HomeRecentDiaryWidget(
+        state = state,
+        maxItems = COMPACT_DIARY_ITEMS,
+        onAction = onAction,
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
 }
 
 @Composable
@@ -360,18 +274,20 @@ internal fun HomeCollectionDrawWidget(
     }
     Column(
         modifier = modifier.fillMaxWidth().testTag("home_widget_collection_draw"),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         RocheSectionHeader(
-            label = generator.collectionTitle,
-            actionLabel = "Open List →",
+            label = "Daily Draw",
+            actionLabel = "${generator.collectionTitle} →",
             actionTestTag = "collection_draw_header_open_list_btn",
             onActionClick = openCollectionList,
         )
         RocheSurfaceCard {
             if (draw != null) {
                 CollectionDrawSleeveCardBody(
+                    generator = generator,
                     draw = draw,
+                    onAction = onAction,
                     onOpenExternalUrl = onOpenExternalUrl,
                     onOpenCollectionDraw = onOpenCollectionDraw,
                 )
@@ -388,99 +304,362 @@ internal fun HomeCollectionDrawWidget(
 }
 
 @Composable
-internal fun CollectionDrawSleeveCardBody(
+private fun CollectionDrawSleeveCardBody(
+    generator: CollectionGeneratorState,
     draw: CollectionDrawSnapshot,
+    onAction: (MainAction) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-
-    CollectionDrawSquareCover(
-        draw = draw,
-        onClick = { onOpenCollectionDraw(draw) },
-    )
-    HorizontalDivider(color = colors.border, thickness = 1.dp)
     Column(
-        modifier =
-            Modifier.fillMaxWidth()
-                .clickable { onOpenCollectionDraw(draw) }
-                .testTag("collection_draw_meta")
-                .padding(horizontal = 12.dp, vertical = 11.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier.fillMaxWidth().padding(bottom = 11.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        val tagKicker = remember(draw.tags) { buildCollectionDrawTagKicker(draw) }
-        if (tagKicker.isNotEmpty()) {
-            Text(
-                text = tagKicker,
-                color = colors.accentVerdigris,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 9.5.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        Text(
-            text = draw.title,
-            color = colors.textPrimary,
-            fontFamily = headlineFamily,
-            fontSize = 16.sp,
-            lineHeight = 20.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
+        CollectionDrawTitleRow(
+            draw = draw,
+            onOpenDraw = { onOpenCollectionDraw(draw) },
+            onSkip = {
+                onAction(
+                    MainAction.OpenDrawNoteDialog(
+                        generator.collectionId,
+                        DrawNoteDialogMode.ABANDON,
+                    )
+                )
+            },
         )
-        if (draw.creator.isNotBlank()) {
-            Text(
-                text = draw.creator,
-                color = colors.textSecondary,
-                fontSize = 12.5.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        CollectionDrawWikiButton(
-            wikiUrl = draw.wikipediaUrl,
+        CollectionDrawMediaRow(
+            draw = draw,
+            onOpenDraw = { onOpenCollectionDraw(draw) },
             onOpenExternalUrl = onOpenExternalUrl,
+        )
+        HorizontalDivider(
+            color = colors.border,
+            thickness = 1.dp,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+        )
+        CollectionDrawFooterRow(
+            generator = generator,
+            draw = draw,
+            onRank = {
+                onAction(
+                    MainAction.OpenDrawNoteDialog(
+                        generator.collectionId,
+                        DrawNoteDialogMode.FINISH_AND_RANK,
+                    )
+                )
+            },
         )
     }
 }
 
 @Composable
-private fun CollectionDrawWikiButton(
-    wikiUrl: String?,
-    onOpenExternalUrl: (String) -> Unit,
+private fun CollectionDrawTitleRow(
+    draw: CollectionDrawSnapshot,
+    onOpenDraw: () -> Unit,
+    onSkip: () -> Unit,
 ) {
-    if (wikiUrl.isNullOrBlank()) return
-    Spacer(modifier = Modifier.height(4.dp))
-    CompactCardActionButton(
-        label = "Wiki ↗",
-        onClick = { onOpenExternalUrl(wikiUrl) },
-        modifier = Modifier.fillMaxWidth().testTag("collection_draw_wiki_btn"),
-    )
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val titleText =
+        remember(draw.title, draw.releaseDate, colors, headlineFamily) {
+            buildAnnotatedString {
+                withStyle(
+                    SpanStyle(
+                        color = colors.textPrimary,
+                        fontFamily = headlineFamily,
+                        fontSize = 16.5.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                ) {
+                    append(draw.title)
+                }
+                if (draw.releaseDate.isNotBlank()) {
+                    append("  ")
+                    withStyle(
+                        SpanStyle(
+                            color = colors.textMuted,
+                            fontFamily = FontFamily.SansSerif,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Normal,
+                        )
+                    ) {
+                        append(draw.releaseDate)
+                    }
+                }
+            }
+        }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 4.dp, end = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = titleText,
+            lineHeight = 21.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier =
+                Modifier.weight(1f)
+                    .clickable(onClick = onOpenDraw)
+                    .padding(vertical = 4.dp)
+                    .testTag("collection_draw_meta"),
+        )
+        RocheIconActionButton(
+            contentDescription = "Skip ${draw.title}",
+            outlined = false,
+            onClick = onSkip,
+            modifier = Modifier.testTag("collection_draw_skip_btn"),
+        ) {
+            SkipDrawIcon(tint = colors.textMuted, size = 15.dp)
+        }
+    }
 }
 
 @Composable
-internal fun CollectionDrawSquareCover(
+private fun CollectionDrawMediaRow(
+    draw: CollectionDrawSnapshot,
+    onOpenDraw: () -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val genreText = remember(draw.tags) { buildCollectionDrawGenresLine(draw) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(11.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        CollectionDrawCompactCover(draw = draw, onClick = onOpenDraw)
+        Column(
+            modifier = Modifier.weight(1f).heightIn(min = 74.dp),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            if (draw.creator.isNotBlank()) {
+                Text(
+                    text = draw.creator,
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    lineHeight = 17.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier =
+                        Modifier.fillMaxWidth().clickable(onClick = onOpenDraw).padding(top = 1.dp),
+                )
+            } else {
+                Spacer(modifier = Modifier.height(1.dp))
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = genreText,
+                    color = colors.textMuted,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(end = 6.dp),
+                )
+                val wikiUrl = draw.wikipediaUrl
+                if (!wikiUrl.isNullOrBlank()) {
+                    CollectionDrawWikiIconButton(
+                        title = draw.title,
+                        onClick = { onOpenExternalUrl(wikiUrl) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CollectionDrawWikiIconButton(
+    title: String,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Open Wikipedia for $title"
+                }
+                .testTag("collection_draw_wiki_btn"),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.size(width = 30.dp, height = 28.dp)
+                    .clip(shape)
+                    .border(1.dp, colors.border, shape)
+                    .clearAndSetSemantics {},
+        ) {
+            WikipediaIcon(tint = colors.textSecondary, size = 14.dp)
+        }
+    }
+}
+
+@Composable
+private fun CollectionDrawFooterRow(
+    generator: CollectionGeneratorState,
+    draw: CollectionDrawSnapshot,
+    onRank: () -> Unit,
+) {
+    val totalCount = generator.totalCount.coerceAtLeast(draw.totalCount)
+    val completedCount =
+        if (generator.completedCount > 0) {
+            generator.completedCount
+        } else {
+            (draw.drawNumber - 1).coerceAtLeast(0)
+        }
+    val progressFraction =
+        if (totalCount > 0) {
+            (completedCount.toFloat() / totalCount.toFloat()).coerceIn(0.02f, 1f)
+        } else {
+            0.05f
+        }
+    val progressLabel = formatDrawProgressLabel(draw.drawNumber, completedCount, totalCount)
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CollectionDrawProgressMeter(
+            collectionTitle = generator.collectionTitle,
+            progressLabel = progressLabel,
+            progressFraction = progressFraction,
+            modifier = Modifier.weight(1f),
+        )
+        CompactRankButton(
+            onClick = onRank,
+            modifier = Modifier.testTag("collection_draw_rank_btn"),
+        )
+    }
+}
+
+@Composable
+private fun CollectionDrawProgressMeter(
+    collectionTitle: String,
+    progressLabel: String,
+    progressFraction: Float,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val barShape = RoundedCornerShape(999.dp)
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = collectionTitle,
+                color = colors.textMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp),
+            )
+            Text(
+                text = progressLabel,
+                color = colors.textMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+            )
+        }
+        Box(
+            modifier = Modifier.fillMaxWidth().height(4.dp).clip(barShape).background(colors.border)
+        ) {
+            Box(
+                modifier =
+                    Modifier.fillMaxWidth(progressFraction)
+                        .height(4.dp)
+                        .clip(barShape)
+                        .background(colors.accentBlue)
+            )
+        }
+    }
+}
+
+private fun formatDrawProgressLabel(drawNumber: Int, completedCount: Int, totalCount: Int): String =
+    when {
+        totalCount > 0 && drawNumber > 0 -> "#$drawNumber / ${formatIntegerCount(totalCount)}"
+        totalCount > 0 ->
+            "${formatIntegerCount(completedCount)} / ${formatIntegerCount(totalCount)}"
+        else -> "#$drawNumber"
+    }
+
+@Composable
+private fun CompactRankButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button },
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.heightIn(min = 32.dp)
+                    .clip(shape)
+                    .background(colors.accentBlueFilled)
+                    .padding(horizontal = 13.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = "Rank",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CollectionDrawCompactCover(
     draw: CollectionDrawSnapshot,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(7.dp)
     val bitmap =
         rememberHighResImageBitmap(
             primaryKey = draw.imageUrl,
             fallbackKey = draw.thumbnailUrl,
         )
-    val sleeveBadge = remember(draw) { buildCollectionDrawSleeveBadge(draw) }
     val desc = if (draw.creator.isNotBlank()) "${draw.title} by ${draw.creator}" else draw.title
 
     Box(
         modifier =
-            Modifier.fillMaxWidth()
-                .aspectRatio(1f)
+            Modifier.size(74.dp)
+                .clip(shape)
                 .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
                 .clickable(onClick = onClick)
                 .testTag("collection_draw_cover")
     ) {
@@ -495,56 +674,15 @@ internal fun CollectionDrawSquareCover(
         } else {
             Canvas(modifier = Modifier.fillMaxSize()) { drawVinylSleeveArtwork(colors) }
         }
-
-        if (sleeveBadge.isNotEmpty()) {
-            AlbumCoverFloatingPill(
-                label = sleeveBadge,
-                textColor = Color(0xFFE4DFDA),
-                modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
-            )
-        }
-        if (draw.remainingCount > 0) {
-            AlbumCoverFloatingPill(
-                label = "${draw.remainingCount} LEFT",
-                textColor = Color(0xFFD4B483),
-                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
-            )
-        }
         AlbumCoverPlayBadge(
-            accentColor = colors.accentBlue,
-            modifier = Modifier.align(Alignment.BottomEnd).padding(9.dp),
+            accentColor = if (draw.isMusicKind) SPOTIFY_GREEN else colors.accentBlue,
+            modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
         )
     }
 }
 
 @Composable
-internal fun AlbumCoverFloatingPill(
-    label: String,
-    textColor: Color,
-    modifier: Modifier = Modifier,
-) {
-    val shape = RoundedCornerShape(6.dp)
-    Box(
-        modifier =
-            modifier
-                .clip(shape)
-                .background(Color(0xCC141413))
-                .border(width = 0.75.dp, color = Color(0x38E4DFDA), shape = shape)
-                .padding(horizontal = 6.dp, vertical = 2.5.dp)
-    ) {
-        Text(
-            text = label,
-            color = textColor,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 9.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-        )
-    }
-}
-
-@Composable
-internal fun AlbumCoverPlayBadge(
+private fun AlbumCoverPlayBadge(
     accentColor: Color,
     modifier: Modifier = Modifier,
 ) {
@@ -552,12 +690,12 @@ internal fun AlbumCoverPlayBadge(
         contentAlignment = Alignment.Center,
         modifier =
             modifier
-                .size(32.dp)
+                .size(22.dp)
                 .clip(CircleShape)
-                .background(Color(0xD9141413))
-                .border(width = 1.25.dp, color = accentColor, shape = CircleShape),
+                .background(Color(0xDC141413))
+                .border(width = 1.dp, color = accentColor.copy(alpha = 0.85f), shape = CircleShape),
     ) {
-        Canvas(modifier = Modifier.size(12.dp)) {
+        Canvas(modifier = Modifier.size(9.dp)) {
             val w = size.width
             val h = size.height
             val tri =
@@ -567,15 +705,13 @@ internal fun AlbumCoverPlayBadge(
                     lineTo(w * 0.24f, h * 0.86f)
                     close()
                 }
-            drawPath(path = tri, color = Color.White)
+            drawPath(path = tri, color = accentColor)
         }
     }
 }
 
 internal fun DrawScope.drawVinylSleeveArtwork(colors: RocheColors) {
-    val w = size.width
-    val h = size.height
-    val center = Offset(w * 0.5f, h * 0.5f)
+    val center = Offset(size.width * 0.5f, size.height * 0.5f)
     val outerRadius = size.minDimension * 0.40f
 
     drawRect(color = if (colors.isDark) Color(0xFF1E1D1B) else Color(0xFFDCD6CE))
@@ -586,8 +722,7 @@ internal fun DrawScope.drawVinylSleeveArtwork(colors: RocheColors) {
         center = center,
         style = Stroke(width = 2f),
     )
-
-    listOf(0.86f, 0.73f, 0.60f, 0.48f).forEach { ringFrac ->
+    listOf(0.84f, 0.66f, 0.48f).forEach { ringFrac ->
         drawCircle(
             color = Color(0xFF292825),
             radius = outerRadius * ringFrac,
@@ -611,61 +746,7 @@ internal fun DrawScope.drawVinylSleeveArtwork(colors: RocheColors) {
 }
 
 @Composable
-internal fun CompactCardActionButton(
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    style: RocheButtonStyle = RocheButtonStyle.SECONDARY,
-) {
-    val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(8.dp)
-    val isPrimary = style == RocheButtonStyle.PRIMARY
-    val bg = if (isPrimary) colors.accentBlueFilled else colors.surfaceElevated
-    val border = if (isPrimary) colors.accentBlueFilled else colors.controlOutline
-    val textColor = if (isPrimary) Color.White else colors.textPrimary
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier =
-            modifier
-                .minimumInteractiveComponentSize()
-                .clip(shape)
-                .clickable(onClick = onClick)
-                .semantics { role = Role.Button },
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier =
-                Modifier.fillMaxWidth()
-                    .heightIn(min = 33.dp)
-                    .clip(shape)
-                    .background(bg)
-                    .border(1.dp, border, shape)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-        ) {
-            Text(
-                text = label,
-                color = textColor,
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-internal fun buildCollectionDrawSleeveBadge(draw: CollectionDrawSnapshot): String = buildList {
-    if (draw.drawNumber > 0) add("#${draw.drawNumber}")
-    if (draw.releaseDate.isNotBlank()) add(draw.releaseDate)
-}
-    .joinToString(" · ")
-
-internal fun buildCollectionDrawTagKicker(draw: CollectionDrawSnapshot): String =
-    draw.tags.joinToString(" / ") { it.uppercase() }
-
-@Composable
-internal fun CollectionDrawPlaceholderBody(
+private fun CollectionDrawPlaceholderBody(
     collectionTitle: String,
     completedCount: Int,
     totalCount: Int,
@@ -674,14 +755,10 @@ internal fun CollectionDrawPlaceholderBody(
     val colors = LocalRocheColors.current
     val statusText =
         if (totalCount > 0 && completedCount >= totalCount) {
-            "All $totalCount entries in $collectionTitle completed!"
+            "All $totalCount entries in $collectionTitle completed."
         } else {
             "Add unconsumed entries to $collectionTitle to draw your next item."
         }
-    Box(modifier = Modifier.fillMaxWidth().aspectRatio(1.35f).background(colors.surfaceElevated)) {
-        Canvas(modifier = Modifier.fillMaxSize()) { drawVinylSleeveArtwork(colors) }
-    }
-    HorizontalDivider(color = colors.border, thickness = 1.dp)
     Column(
         modifier = Modifier.fillMaxWidth().padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -692,229 +769,40 @@ internal fun CollectionDrawPlaceholderBody(
             fontSize = 12.5.sp,
             lineHeight = 17.sp,
         )
-        CompactCardActionButton(
+        HeaderActionButton(
             label = "View List",
             style = RocheButtonStyle.PRIMARY,
             onClick = onOpenList,
-            modifier = Modifier.fillMaxWidth().testTag("collection_draw_view_list_btn"),
+            modifier = Modifier.testTag("collection_draw_view_list_btn"),
         )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-internal fun HomeMediaCompanionWidget(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val colors = LocalRocheColors.current
-    Column(
-        modifier = modifier.fillMaxWidth().testTag("home_widget_media_companion"),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        RocheSectionHeader(label = "Lists, Diary & Rankings")
-        RocheSurfaceCard {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text =
-                            "${state.catalog.consumedCount} logged · " +
-                                "${state.catalog.comparisonCount} comparisons · " +
-                                "${state.catalog.wantItemCount} want",
-                        color = colors.textSecondary,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.5.sp,
-                        modifier = Modifier.weight(1f).padding(end = 8.dp),
-                    )
-                    HeaderActionButton(
-                        label = "+ Log",
-                        style = RocheButtonStyle.PRIMARY,
-                        onClick = { onAction(MainAction.OpenQuickLogSheet(false)) },
-                        modifier = Modifier.testTag("home_quick_log_btn"),
-                    )
-                }
-                CompanionShortcutChips(
-                    enabledGenerators = state.enabledGenerators,
-                    onAction = onAction,
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun CompanionShortcutChips(
-    enabledGenerators: List<CollectionGeneratorState>,
-    onAction: (MainAction) -> Unit,
-) {
-    FlowRow(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        FilterChipPill(
-            label = "Want to Read",
-            selected = false,
-            onClick = {
-                onAction(
-                    MainAction.OpenCompanionSection(
-                        CompanionSubTab.WANT,
-                        WANT_TO_READ_COLLECTION_ID,
-                    )
-                )
-            },
-            modifier = Modifier.testTag("home_open_want_to_read_btn"),
-        )
-        FilterChipPill(
-            label = "Lists",
-            selected = false,
-            onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS)) },
-            modifier = Modifier.testTag("home_open_lists_btn"),
-        )
-        enabledGenerators.forEach { gen ->
-            FilterChipPill(
-                label = gen.collectionTitle,
-                selected = false,
-                onClick = {
-                    onAction(
-                        MainAction.OpenCompanionSection(CompanionSubTab.LISTS, gen.collectionId)
-                    )
-                },
-                modifier = Modifier.testTag("home_open_draw_list_${gen.collectionSlug}"),
-            )
-        }
-        FilterChipPill(
-            label = "Diary",
-            selected = false,
-            onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.DIARY)) },
-            modifier = Modifier.testTag("home_open_diary_btn"),
-        )
-        FilterChipPill(
-            label = "Want Queue",
-            selected = false,
-            onClick = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.WANT)) },
-            modifier = Modifier.testTag("home_open_want_btn"),
-        )
-    }
-}
-
-@Composable
-internal fun HomeUpNextWidget(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-    modifier: Modifier = Modifier,
-    activeAudioEntryId: String? = null,
-    twoColumnCards: Boolean = false,
-) {
-    val wantToReadIds =
-        remember(state.catalog.entriesByCollectionId) {
-            state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(
-                HashSet()
-            ) {
-                it.entry.id
-            }
-        }
-    val activePlayerEntry = state.resolveActivePlayerEntry(activeAudioEntryId)
-    val spotlightEntries =
-        remember(activePlayerEntry, state.queueEntries, state.allEntries, wantToReadIds) {
-            buildHomeSpotlightEntries(state, wantToReadIds, activePlayerEntry)
-        }
-
-    Column(
-        modifier = modifier.fillMaxWidth().testTag("home_widget_up_next"),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        RocheSectionHeader(label = "Continue & Up Next")
-        if (spotlightEntries.isEmpty()) {
-            HomeUpNextEmptyCard(onAction = onAction)
-        } else {
-            HomeSpotlightEntriesBody(
-                state = state,
-                spotlightEntries = spotlightEntries,
-                wantToReadIds = wantToReadIds,
-                activeAudioEntryId = activeAudioEntryId,
-                twoColumnCards = twoColumnCards,
-                onAction = onAction,
-            )
-        }
-    }
-}
-
-@Composable
-private fun HomeSpotlightEntriesBody(
-    state: MainUiState,
-    spotlightEntries: List<InboxEntry>,
-    wantToReadIds: Set<String>,
-    activeAudioEntryId: String?,
-    twoColumnCards: Boolean,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    if (twoColumnCards && spotlightEntries.size >= 2) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            spotlightEntries.forEach { entry ->
-                RocheSurfaceCard(modifier = Modifier.weight(1f)) {
-                    HomeSpotlightRow(
-                        entry = entry,
-                        isPlayingAudio = entry.id == activeAudioEntryId,
-                        inQueue = state.isEntryInQueue(entry.id),
-                        inWantToRead = entry.id in wantToReadIds,
-                        onClick = { onAction(MainAction.OpenReader(entry.id)) },
-                    )
-                }
-            }
-        }
-    } else {
-        RocheSurfaceCard {
-            spotlightEntries.forEachIndexed { index, entry ->
-                if (index > 0) {
-                    HorizontalDivider(color = colors.border, thickness = 1.dp)
-                }
-                HomeSpotlightRow(
-                    entry = entry,
-                    isPlayingAudio = entry.id == activeAudioEntryId,
-                    inQueue = state.isEntryInQueue(entry.id),
-                    inWantToRead = entry.id in wantToReadIds,
-                    onClick = { onAction(MainAction.OpenReader(entry.id)) },
-                )
-            }
-        }
     }
 }
 
 @Composable
 internal fun HomeInboxWidget(
     state: MainUiState,
+    maxItems: Int,
     onAction: (MainAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val feedInboxEntries =
         remember(state.allEntries) { state.allEntries.filter { it.inFeedInbox && !it.isArchived } }
-    val unreadCount = remember(feedInboxEntries) { feedInboxEntries.count { it.isUnread } }
+    val unreadEntries = remember(feedInboxEntries) { feedInboxEntries.filter { it.isUnread } }
+    val unreadCount = unreadEntries.size
     val previewEntries =
-        remember(feedInboxEntries) { feedInboxEntries.take(MAX_WIDGET_INBOX_ITEMS) }
-    val headerLabel = if (unreadCount > 0) "Feed Inbox · $unreadCount unread" else "Feed Inbox"
+        remember(unreadEntries, feedInboxEntries, maxItems) {
+            unreadEntries.ifEmpty { feedInboxEntries }.take(maxItems)
+        }
     val openInbox = { onAction(MainAction.SelectTab(AppTab.INBOX)) }
 
     Column(
         modifier = modifier.fillMaxWidth().testTag("home_widget_inbox"),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         RocheSectionHeader(
-            label = headerLabel,
-            actionLabel = "Open Inbox →",
+            label = "Inbox",
+            badgeText = if (unreadCount > 0) formatIntegerCount(unreadCount) else null,
+            actionLabel = "All →",
             actionTestTag = "home_open_inbox_btn",
             onActionClick = openInbox,
         )
@@ -924,8 +812,6 @@ internal fun HomeInboxWidget(
             } else {
                 HomeInboxPreviewList(
                     previewEntries = previewEntries,
-                    totalCount = feedInboxEntries.size,
-                    onOpenInbox = openInbox,
                     onOpenEntry = { onAction(MainAction.OpenReader(it)) },
                 )
             }
@@ -936,8 +822,6 @@ internal fun HomeInboxWidget(
 @Composable
 private fun HomeInboxPreviewList(
     previewEntries: List<InboxEntry>,
-    totalCount: Int,
-    onOpenInbox: () -> Unit,
     onOpenEntry: (String) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -946,26 +830,6 @@ private fun HomeInboxPreviewList(
             HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
         HomeInboxPreviewRow(entry = entry, onClick = { onOpenEntry(entry.id) })
-    }
-    if (totalCount > previewEntries.size) {
-        HorizontalDivider(color = colors.border, thickness = 1.dp)
-        Box(
-            contentAlignment = Alignment.CenterStart,
-            modifier =
-                Modifier.fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .clickable(onClick = onOpenInbox)
-                    .padding(horizontal = 13.dp, vertical = 10.dp)
-                    .testTag("home_inbox_view_all_btn"),
-        ) {
-            Text(
-                text = "View all $totalCount feed items in Inbox →",
-                color = colors.accentBlue,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
     }
 }
 
@@ -1004,310 +868,316 @@ private fun HomeInboxPreviewRow(
     Row(
         modifier =
             Modifier.fillMaxWidth()
+                .heightIn(min = 48.dp)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 13.dp, vertical = 10.dp)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
                 .testTag("home_inbox_item_${entry.id}"),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            EntrySourceMetadataRow(
-                entry = entry,
-                showUnreadDot = true,
-                trailingMetaText =
-                    "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
-                trailingMetaFontSize = 10.5.sp,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                SiteFaviconBadge(
+                    primaryFaviconUrl = entry.faviconUrl,
+                    fallbackFaviconUrl = entry.fallbackFaviconUrl,
+                    domain = entry.displayDomain,
+                    title = entry.feedTitle,
+                    size = 15.dp,
+                )
+                Text(
+                    text = entry.feedTitle,
+                    color = colors.textSecondary,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(
+                    text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+                    color = colors.textMuted,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                )
+            }
             Text(
                 text = entry.title,
                 color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
                 fontFamily = headlineFamily,
                 fontSize = 14.5.sp,
                 lineHeight = 19.sp,
-                fontWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Normal,
+                fontWeight = FontWeight.Normal,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
         }
         if (entry.showsThumbnailPreview) {
-            EntryThumbnailPreview(entry = entry)
+            HomeCompactEntryThumbnail(entry = entry)
         }
     }
 }
 
 @Composable
-internal fun HomeUpNextEmptyCard(onAction: (MainAction) -> Unit) {
+private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
     val colors = LocalRocheColors.current
-    RocheSurfaceCard {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Text(
-                text = "Nothing queued right now.",
-                color = colors.textSecondary,
-                fontSize = 13.5.sp,
-                fontWeight = FontWeight.Medium,
+    val shape = RoundedCornerShape(7.dp)
+    val landscapePath = remember { Path() }
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl,
+        )
+    Box(
+        modifier =
+            Modifier.size(46.dp)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                HeaderActionButton(
-                    label = "Add to Want to Read",
-                    onClick = { onAction(MainAction.OpenAddSheet()) },
-                )
-                HeaderActionButton(
-                    label = "Open Inbox",
-                    onClick = { onAction(MainAction.SelectTab(AppTab.INBOX)) },
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawArticleImagePlaceholder(colors = colors, landscape = landscapePath)
+            }
+        }
+    }
+}
+
+@Composable
+internal fun HomeRecentDiaryWidget(
+    state: MainUiState,
+    maxItems: Int,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val diaryEntries =
+        remember(state.catalog.diaryEntries, maxItems) { state.catalog.diaryEntries.take(maxItems) }
+    val readableIds = remember(state.allEntries) { state.allEntries.mapTo(HashSet()) { it.id } }
+    val catalogUrlsById =
+        remember(state.catalog.entriesByCollectionId) {
+            buildMap {
+                state.catalog.entriesByCollectionId.values.flatten().forEach { item ->
+                    item.entry.url?.takeIf { it.isNotBlank() }?.let { put(item.entry.id, it) }
+                }
+            }
+        }
+    val openDiary = { onAction(MainAction.OpenCompanionSection(CompanionSubTab.DIARY)) }
+
+    Column(
+        modifier = modifier.fillMaxWidth().testTag("home_widget_recent_diary"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RocheSectionHeader(
+            label = "Recent Diary",
+            actionLabel = "Diary →",
+            actionTestTag = "home_open_diary_btn",
+            onActionClick = openDiary,
+        )
+        RocheSurfaceCard {
+            if (diaryEntries.isEmpty()) {
+                HomeRecentDiaryEmptyBody(onAction = onAction)
+            } else {
+                HomeRecentDiaryList(
+                    diaryEntries = diaryEntries,
+                    readableIds = readableIds,
+                    catalogUrlsById = catalogUrlsById,
+                    onOpenDiary = openDiary,
+                    onAction = onAction,
+                    onOpenExternalUrl = onOpenExternalUrl,
                 )
             }
         }
     }
 }
 
-internal fun buildHomeSpotlightEntries(
-    state: MainUiState,
-    wantToReadIds: Set<String> =
-        state.catalog.entriesByCollectionId[WANT_TO_READ_COLLECTION_ID].orEmpty().mapTo(HashSet()) {
-            it.entry.id
-        },
-    activePlayerEntry: InboxEntry? = null,
-): List<InboxEntry> {
-    val picked = LinkedHashMap<String, InboxEntry>()
-    activePlayerEntry?.let { picked[it.id] = it }
-    appendSpotlightSlice(picked, state.queueEntries)
-    if (wantToReadIds.isNotEmpty()) {
-        appendSpotlightSlice(picked, state.allEntries) { it.id in wantToReadIds }
-    }
-    appendSpotlightSlice(picked, state.allEntries) {
-        !it.isArchived && it.readProgress > 0.0 && it.readProgress < 0.98
-    }
-    appendSpotlightSlice(picked, state.allEntries) {
-        it.inFeedInbox && !it.isArchived && it.isUnread
-    }
-    return picked.values.toList()
-}
-
-private inline fun appendSpotlightSlice(
-    target: LinkedHashMap<String, InboxEntry>,
-    source: List<InboxEntry>,
-    predicate: (InboxEntry) -> Boolean = { true },
+@Composable
+private fun HomeRecentDiaryList(
+    diaryEntries: List<DiaryEntryItem>,
+    readableIds: Set<String>,
+    catalogUrlsById: Map<String, String>,
+    onOpenDiary: () -> Unit,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
-    if (target.size >= MAX_SPOTLIGHT_ITEMS) return
-    for (entry in source) {
-        if (target.size >= MAX_SPOTLIGHT_ITEMS) break
-        if (predicate(entry)) {
-            target.putIfAbsent(entry.id, entry)
+    val colors = LocalRocheColors.current
+    diaryEntries.forEachIndexed { index, diary ->
+        if (index > 0) {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
         }
+        val onClick =
+            resolveCatalogEntryOpenAction(
+                entryId = diary.entryId,
+                externalUrl = catalogUrlsById[diary.entryId],
+                readableIds = readableIds,
+                onOpenReader = { onAction(MainAction.OpenReader(it)) },
+                onOpenExternalUrl = onOpenExternalUrl,
+            ) ?: onOpenDiary
+        HomeDiaryPreviewRow(diary = diary, onClick = onClick)
     }
 }
 
 @Composable
-internal fun HomeSpotlightRow(
-    entry: InboxEntry,
-    isPlayingAudio: Boolean,
-    inQueue: Boolean,
-    inWantToRead: Boolean = false,
-    onClick: () -> Unit,
-) {
+private fun HomeRecentDiaryEmptyBody(onAction: (MainAction) -> Unit) {
     val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val badge =
-        when {
-            isPlayingAudio -> "NOW PLAYING"
-            inQueue -> "QUEUED"
-            inWantToRead && entry.readProgress <= 0.0 -> "WANT TO READ"
-            entry.readProgress > 0.0 -> "${(entry.readProgress * 100).toInt()}% READ"
-            else -> "LATEST UNREAD"
-        }
-
     Row(
-        modifier =
-            Modifier.fillMaxWidth()
-                .clickable(onClick = onClick)
-                .padding(horizontal = 13.dp, vertical = 12.dp)
-                .testTag("home_spotlight_${entry.id}"),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            EntrySourceMetadataRow(
-                entry = entry,
-                faviconSize = 15.dp,
-                feedLabelFontSize = 11.5.sp,
-                trailingBadge = badge,
-            )
-            Text(
-                text = entry.title,
-                color = colors.textPrimary,
-                fontFamily = headlineFamily,
-                fontSize = 15.sp,
-                lineHeight = 20.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (entry.showsThumbnailPreview) {
-            EntryThumbnailPreview(entry = entry)
-        }
-    }
-}
-
-@Composable
-internal fun HomeActiveSourcesWidget(
-    state: MainUiState,
-    onAction: (MainAction) -> Unit,
-    modifier: Modifier = Modifier,
-    splitColumnsWhenUnconfigured: Boolean = false,
-) {
-    val colors = LocalRocheColors.current
-    val topUnreadFeeds =
-        remember(state.activeFeeds) {
-            state.activeFeeds
-                .filter { it.unreadCount > 0 }
-                .sortedByDescending { it.unreadCount }
-                .take(MAX_WIDGET_FEEDS)
-        }
-    val topTags = remember(state.tags) { state.tags.take(MAX_WIDGET_TAGS) }
-
-    Column(
-        modifier = modifier.fillMaxWidth().testTag("home_widget_sources"),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        RocheSectionHeader(label = "Active Feeds & Topics")
-        when {
-            topUnreadFeeds.isEmpty() && topTags.isEmpty() ->
-                RocheSurfaceCard {
-                    Box(modifier = Modifier.fillMaxWidth().padding(14.dp)) {
-                        Text(
-                            text = "All subscribed feeds are caught up.",
-                            color = colors.textMuted,
-                            fontSize = 12.5.sp,
-                        )
-                    }
-                }
-            splitColumnsWhenUnconfigured && topUnreadFeeds.isNotEmpty() && topTags.isNotEmpty() ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    RocheSurfaceCard(modifier = Modifier.weight(1f)) {
-                        HomeUnreadFeedsList(topUnreadFeeds = topUnreadFeeds, onAction = onAction)
-                    }
-                    RocheSurfaceCard(modifier = Modifier.weight(1f)) {
-                        HomeTopicsFlowGrid(topTags = topTags, onAction = onAction)
-                    }
-                }
-            else ->
-                RocheSurfaceCard {
-                    HomeUnreadFeedsList(topUnreadFeeds = topUnreadFeeds, onAction = onAction)
-                    if (topTags.isNotEmpty()) {
-                        if (topUnreadFeeds.isNotEmpty()) {
-                            HorizontalDivider(color = colors.border, thickness = 1.dp)
-                        }
-                        HomeTopicsFlowGrid(topTags = topTags, onAction = onAction)
-                    }
-                }
-        }
-    }
-}
-
-@Composable
-internal fun HomeUnreadFeedsList(
-    topUnreadFeeds: List<FeedItem>,
-    onAction: (MainAction) -> Unit,
-) {
-    val colors = LocalRocheColors.current
-    topUnreadFeeds.forEachIndexed { index, feed ->
-        if (index > 0) {
-            HorizontalDivider(
-                color = colors.border,
-                thickness = 1.dp,
-                modifier = Modifier.padding(start = 42.dp),
-            )
-        }
-        HomeFeedShortcutRow(
-            feed = feed,
-            onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+        Text(
+            text = "No diary entries logged yet.",
+            color = colors.textMuted,
+            fontSize = 12.5.sp,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        HeaderActionButton(
+            label = "+ Log",
+            onClick = { onAction(MainAction.OpenQuickLogSheet(false)) },
+            modifier = Modifier.testTag("home_quick_log_btn"),
         )
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun HomeTopicsFlowGrid(
-    topTags: List<TagItem>,
-    onAction: (MainAction) -> Unit,
-) {
-    FlowRow(
-        modifier = Modifier.fillMaxWidth().padding(10.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        topTags.forEach { tag ->
-            FilterChipPill(
-                label = "#${tag.name} (${tag.unreadCount})",
-                selected = false,
-                onClick = { onAction(MainAction.FilterByTag(tag.name)) },
-            )
-        }
-    }
-}
-
-@Composable
-internal fun HomeFeedShortcutRow(
-    feed: FeedItem,
+private fun HomeDiaryPreviewRow(
+    diary: DiaryEntryItem,
     onClick: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val subtitle = remember(diary.creators, diary.releaseYear) { buildHomeDiarySubtitle(diary) }
+
     Row(
         modifier =
             Modifier.fillMaxWidth()
                 .heightIn(min = 48.dp)
                 .clickable(onClick = onClick)
-                .padding(horizontal = 11.dp, vertical = 10.dp)
-                .testTag("home_feed_${feed.id}"),
-        horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(horizontal = 11.dp, vertical = 8.dp)
+                .testTag("home_diary_item_${diary.id}"),
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
-            modifier = Modifier.weight(1f).padding(end = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SiteFaviconBadge(
-                primaryFaviconUrl = feed.faviconUrl,
-                fallbackFaviconUrl = feed.fallbackFaviconUrl,
-                domain = feed.displayDomain,
-                title = feed.title,
-                feedType = feed.feedType,
-                size = 22.dp,
-            )
-            Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = diary.dateLabel,
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            modifier = Modifier.widthIn(min = 38.dp),
+        )
+        HomeDiaryThumbnail(thumbnailUrl = diary.thumbnailUrl, kind = diary.kind)
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
             Text(
-                text = feed.title,
+                text = diary.title,
                 color = colors.textPrimary,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
+                fontFamily = headlineFamily,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.Normal,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    color = colors.textSecondary,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
+        if (diary.tier != null) {
+            HomeTierPill(tier = diary.tier)
+        }
+    }
+}
+
+@Composable
+private fun HomeDiaryThumbnail(thumbnailUrl: String?, kind: EntryKind) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(5.dp)
+    val bitmap = rememberEntryThumbnailBitmap(primaryKey = null, fallbackKey = thumbnailUrl)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.size(32.dp)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape),
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Text(
+                text = if (kind == EntryKind.ALBUM || kind == EntryKind.SONG) "♪" else "▪",
+                color = colors.textMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.clearAndSetSemantics {},
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeTierPill(tier: Char) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val tierColor = resolveTierColor(tier, colors)
+    val shape = RoundedCornerShape(4.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.size(20.dp).clip(shape).border(1.dp, tierColor.copy(alpha = 0.72f), shape),
+    ) {
         Text(
-            text = feed.unreadCount.toString(),
-            color = colors.accentBlue,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
+            text = tier.toString(),
+            color = tierColor,
+            fontFamily = headlineFamily,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
         )
     }
 }
 
-private val BENTO_TWO_COLUMN_BREAKPOINT = 340.dp
-private val WIDE_DASHBOARD_BREAKPOINT = 680.dp
-private const val MAX_SPOTLIGHT_ITEMS = 2
-private const val MAX_WIDGET_INBOX_ITEMS = 4
-private const val MAX_WIDGET_FEEDS = 4
-private const val MAX_WIDGET_TAGS = 6
+internal fun buildCollectionDrawGenresLine(draw: CollectionDrawSnapshot): String =
+    draw.tags.take(3).joinToString(", ")
+
+internal fun buildHomeDiarySubtitle(diary: DiaryEntryItem): String {
+    val creatorText = diary.creators.joinToString(", ")
+    val year = diary.releaseYear?.takeIf { it > 0 }
+    return when {
+        creatorText.isNotBlank() && year != null -> "$creatorText ($year)"
+        creatorText.isNotBlank() -> creatorText
+        year != null -> year.toString()
+        else -> ""
+    }
+}
+
+private fun formatIntegerCount(value: Int): String =
+    NumberFormat.getIntegerInstance(Locale.US).format(value)
+
+private val WIDE_DASHBOARD_BREAKPOINT = 540.dp
+private val SPOTIFY_GREEN = Color(0xFF1ED760)
+private const val WIDE_INBOX_ITEMS = 7
+private const val COMPACT_INBOX_ITEMS = 4
+private const val WIDE_DIARY_ITEMS = 6
+private const val COMPACT_DIARY_ITEMS = 3

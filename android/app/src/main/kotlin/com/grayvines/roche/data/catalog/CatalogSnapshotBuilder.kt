@@ -595,6 +595,7 @@ private fun buildDiaryItems(
                 status = status,
                 notes = log.notes?.takeIf { it.isNotBlank() },
                 tier = if (status == ConsumptionStatus.CONSUMED) globalTiers[entry.id] else null,
+                thumbnailUrl = entry.thumbnailUrl,
             )
         }
 }
@@ -787,7 +788,7 @@ private fun formatDiaryTimestamp(rawIso: String): Pair<String, String> {
     }
 }
 
-private const val MAX_GENRE_CHIPS = 2
+private const val MAX_GENRE_CHIPS = 3
 private const val MONTH_PREFIX_LEN = 7
 private const val DATE_PREFIX_LEN = 10
 private val DIARY_MONTH_FMT = DateTimeFormatter.ofPattern("yyyy-MM", Locale.US)

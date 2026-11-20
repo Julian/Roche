@@ -97,10 +97,10 @@ enum class AppTab(val label: String) {
         private const val CENTER_SLOT_INDEX = 2
 
         val bottomTabCandidates: List<AppTab> =
-            listOf(HOME, FEEDS, LISTS, STARRED, SETTINGS, QUEUE, OFFLINE, INBOX)
+            listOf(HOME, INBOX, LISTS, FEEDS, STARRED, QUEUE, OFFLINE, SETTINGS)
         val sideTabCandidates: List<AppTab> = bottomTabCandidates
 
-        val defaultBottomTabs: List<AppTab> = listOf(HOME, FEEDS, LISTS, STARRED, SETTINGS)
+        val defaultBottomTabs: List<AppTab> = listOf(HOME, INBOX, LISTS, FEEDS, STARRED)
         val defaultSideTabs: List<AppTab> = defaultBottomTabs
 
         fun normalizeBottomTabs(tabs: List<AppTab>): List<AppTab> {

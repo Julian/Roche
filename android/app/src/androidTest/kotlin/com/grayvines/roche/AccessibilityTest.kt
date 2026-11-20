@@ -88,7 +88,7 @@ class AccessibilityTest {
             state = populatedState(activeTab = AppTab.HOME, themeMode = ThemeMode.DARK),
             expectedVisibleText = SAMPLE_ARTICLE_TITLE,
             themeMode = ThemeMode.DARK,
-            scrollToTagAndAudit = "home_widget_media_companion",
+            scrollToTagAndAudit = "home_widget_recent_diary",
         )
     }
 
@@ -98,7 +98,7 @@ class AccessibilityTest {
             state = populatedState(activeTab = AppTab.HOME, themeMode = ThemeMode.LIGHT),
             expectedVisibleText = SAMPLE_ARTICLE_TITLE,
             themeMode = ThemeMode.LIGHT,
-            scrollToTagAndAudit = "home_widget_media_companion",
+            scrollToTagAndAudit = "home_widget_recent_diary",
         )
     }
 

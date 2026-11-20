@@ -356,10 +356,10 @@ class MainViewModelTest {
             assertEquals(
                 listOf(
                     AppTab.HOME,
-                    AppTab.FEEDS,
+                    AppTab.INBOX,
                     AppTab.LISTS,
+                    AppTab.FEEDS,
                     AppTab.STARRED,
-                    AppTab.SETTINGS,
                 ),
                 afterUnread.settings.bottomNavTabs,
             )
@@ -372,8 +372,8 @@ class MainViewModelTest {
                     AppTab.HOME,
                     AppTab.OFFLINE,
                     AppTab.LISTS,
+                    AppTab.FEEDS,
                     AppTab.STARRED,
-                    AppTab.SETTINGS,
                 ),
                 afterNavUpdate.settings.bottomNavTabs,
             )
@@ -384,10 +384,10 @@ class MainViewModelTest {
             assertEquals(
                 listOf(
                     AppTab.HOME,
-                    AppTab.FEEDS,
+                    AppTab.INBOX,
                     AppTab.LISTS,
+                    AppTab.FEEDS,
                     AppTab.STARRED,
-                    AppTab.SETTINGS,
                 ),
                 afterNavReset.settings.bottomNavTabs,
             )

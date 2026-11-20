@@ -157,12 +157,12 @@ class MainScreenTest {
         composeRule.onNodeWithTag("settings_server_row").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_nav_row").performScrollTo().assertExists()
         composeRule
-            .onNodeWithText("Home · Feeds · Lists · Stars · Settings")
+            .onNodeWithText("Home · Inbox · Lists · Feeds · Stars")
             .performScrollTo()
             .assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_queue").performScrollTo().assertExists()
         composeRule.onNodeWithTag("settings_unpinned_tab_offline").performScrollTo().assertExists()
-        composeRule.onNodeWithTag("settings_unpinned_tab_inbox").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("settings_unpinned_tab_settings").assertDoesNotExist()
         composeRule.onNodeWithTag("collection_draws_home_toggle").performScrollTo().assertExists()
         composeRule.onNodeWithTag("import_opml_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("export_opml_btn").performScrollTo().assertExists()
@@ -280,10 +280,12 @@ class MainScreenTest {
         composeRule.onNodeWithTag("home_widget_collection_draw").assertDoesNotExist()
         composeRule.onNodeWithTag("home_widget_inbox").assertExists()
         composeRule.onNodeWithTag("home_open_inbox_btn").assertExists()
-        composeRule.onNodeWithTag("home_open_want_to_read_btn").assertExists()
-        composeRule.onNodeWithTag("home_widget_up_next").performScrollTo().assertExists()
-        composeRule.onNodeWithTag("home_widget_sources").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_spare_settings_btn").assertExists()
+        composeRule.onNodeWithTag("home_search_btn").assertExists()
+        composeRule.onNodeWithTag("home_widget_recent_diary").performScrollTo().assertExists()
+        composeRule.onNodeWithTag("home_open_diary_btn").performScrollTo().assertExists()
         composeRule.onNodeWithTag("save_fab").assertExists()
+        composeRule.onNodeWithTag("search_fab").assertDoesNotExist()
         composeRule.onNodeWithTag("global_sync_indicator").assertDoesNotExist()
 
         uiState = uiState.copy(isSyncing = true)
@@ -291,7 +293,7 @@ class MainScreenTest {
         composeRule.onNodeWithTag("global_sync_pill").assertDoesNotExist()
         uiState = uiState.copy(isSyncing = false)
 
-        composeRule.onNodeWithTag("search_fab").performClick()
+        composeRule.onNodeWithTag("home_search_btn").performClick()
         composeRule.onNodeWithTag("search_overlay").assertExists()
         composeRule.onNodeWithTag("close_search_btn").performClick()
         composeRule.onNodeWithTag("home_screen").assertExists()
@@ -351,13 +353,12 @@ class MainScreenTest {
 
         composeRule.onNodeWithTag("home_widget_collection_draw").assertExists()
         composeRule.onNodeWithTag("collection_draw_cover").assertExists()
-        composeRule.onNodeWithText("Sample Album").assertExists()
+        composeRule.onNodeWithText("Sample Album  1972").assertExists()
         composeRule.onNodeWithText("Sample Artist").assertExists()
-        composeRule.onNodeWithText("#11 · 1972", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("ROCK", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithText("40 LEFT", useUnmergedTree = true).assertExists()
-        composeRule.onNodeWithTag("companion_draw_finish_btn").assertDoesNotExist()
-        composeRule.onNodeWithTag("companion_draw_abandon_btn").assertDoesNotExist()
+        composeRule.onNodeWithText("rock", useUnmergedTree = true).assertExists()
+        composeRule.onNodeWithTag("collection_draw_wiki_btn").assertExists()
+        composeRule.onNodeWithTag("collection_draw_rank_btn").assertExists()
+        composeRule.onNodeWithTag("collection_draw_skip_btn").assertExists()
 
         composeRule.onNodeWithTag("collection_draw_cover").performScrollTo().performClick()
         org.junit.Assert.assertEquals(listOf(draw), openedDraws)
@@ -366,14 +367,23 @@ class MainScreenTest {
             .onNodeWithTag("collection_draw_header_open_list_btn")
             .performScrollTo()
             .performClick()
-        composeRule.onNodeWithTag("home_open_draw_list_jazz_canon").performScrollTo().performClick()
-        val expectedOpenListAction =
-            com.grayvines.roche.ui.MainAction.OpenCompanionSection(
-                com.grayvines.roche.ui.CompanionSubTab.LISTS,
-                "col-jazz-canon",
-            )
+        composeRule.onNodeWithTag("collection_draw_rank_btn").performScrollTo().performClick()
+        composeRule.onNodeWithTag("collection_draw_skip_btn").performScrollTo().performClick()
         org.junit.Assert.assertEquals(
-            listOf(expectedOpenListAction, expectedOpenListAction),
+            listOf(
+                com.grayvines.roche.ui.MainAction.OpenCompanionSection(
+                    com.grayvines.roche.ui.CompanionSubTab.LISTS,
+                    "col-jazz-canon",
+                ),
+                com.grayvines.roche.ui.MainAction.OpenDrawNoteDialog(
+                    "col-jazz-canon",
+                    com.grayvines.roche.ui.DrawNoteDialogMode.FINISH_AND_RANK,
+                ),
+                com.grayvines.roche.ui.MainAction.OpenDrawNoteDialog(
+                    "col-jazz-canon",
+                    com.grayvines.roche.ui.DrawNoteDialogMode.ABANDON,
+                ),
+            ),
             actions,
         )
     }

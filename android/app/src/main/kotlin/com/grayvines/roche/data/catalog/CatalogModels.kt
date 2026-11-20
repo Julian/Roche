@@ -228,6 +228,7 @@ data class DiaryEntryItem(
     val status: ConsumptionStatus,
     val notes: String?,
     val tier: Char?,
+    val thumbnailUrl: String? = null,
 )
 
 data class CollectionGeneratorState(

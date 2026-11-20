@@ -59,10 +59,10 @@ class BaselineProfileGenerator {
         val BOTTOM_TAB_TAGS =
             listOf(
                 "bottom_tab_home",
-                "bottom_tab_feeds",
+                "bottom_tab_inbox",
                 "bottom_tab_lists",
+                "bottom_tab_feeds",
                 "bottom_tab_starred",
-                "bottom_tab_settings",
             )
     }
 }

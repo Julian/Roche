@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Scaffold
@@ -152,6 +153,7 @@ fun MainScreen(
             playerStateFlow = playerStateFlow,
             showBottomBar = chromeFlags.showChrome,
             hasFab = chromeFlags.hasFab,
+            showSearchFab = chromeFlags.showSearchFab,
             showAddFab = chromeFlags.showAddFab,
             activeTabForBar = activeTabForBar,
             onChromeBottomHeightChange = { chromeBottomPx = it },
@@ -260,20 +262,20 @@ private class RetentionRef<T>(var value: T)
 private data class MainChromeFlags(
     val showChrome: Boolean,
     val hasFab: Boolean,
+    val showSearchFab: Boolean,
     val showAddFab: Boolean,
 )
 
 private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
     val showChrome = topKey !is RocheNavKey.Reader && topKey !is RocheNavKey.FullscreenPlayer
-    val isInboxTop =
-        topKey is RocheNavKey.ScopedInbox || (topKey as? RocheNavKey.Tab)?.tab == AppTab.INBOX
-    val hasFab =
-        showChrome &&
-            topKey !is RocheNavKey.Search &&
-            (topKey as? RocheNavKey.Tab)?.tab != AppTab.SETTINGS
+    val topTab = (topKey as? RocheNavKey.Tab)?.tab
+    val isHomeTop = topTab == AppTab.HOME
+    val isInboxTop = topKey is RocheNavKey.ScopedInbox || topTab == AppTab.INBOX
+    val hasFab = showChrome && topKey !is RocheNavKey.Search && topTab != AppTab.SETTINGS
     return MainChromeFlags(
         showChrome = showChrome,
         hasFab = hasFab,
+        showSearchFab = hasFab && !isHomeTop,
         showAddFab = hasFab && !isInboxTop,
     )
 }
@@ -315,6 +317,7 @@ internal fun MainDestinationScaffold(
     playerStateFlow: StateFlow<PodcastPlayerState>,
     showBottomBar: Boolean,
     hasFab: Boolean,
+    showSearchFab: Boolean = hasFab,
     showAddFab: Boolean = hasFab,
     activeTabForBar: AppTab,
     onChromeBottomHeightChange: (Int) -> Unit,
@@ -326,8 +329,9 @@ internal fun MainDestinationScaffold(
         modifier = Modifier.fillMaxSize().background(colors.background),
         containerColor = colors.background,
         floatingActionButton = {
-            if (hasFab) {
+            if (hasFab && (showSearchFab || showAddFab)) {
                 FloatingOverlayButtonStack(
+                    showSearchFab = showSearchFab,
                     showAddFab = showAddFab,
                     onOpenSearch = { onAction(MainAction.OpenSearch) },
                     onOpenAddSheet = { onAction(MainAction.OpenAddSheet()) },
@@ -389,9 +393,14 @@ internal fun MainBottomBarChrome(
                 onAction = onAction,
             )
         }
+        val inboxUnreadCount =
+            remember(state.allEntries) {
+                state.allEntries.count { it.inFeedInbox && !it.isArchived && it.isUnread }
+            }
         RocheBottomBar(
             activeTab = activeTab,
             sideTabs = state.settings.bottomNavTabs,
+            inboxUnreadCount = inboxUnreadCount,
             onSelectTab = { onAction(MainAction.SelectTab(it)) },
         )
     }
@@ -415,13 +424,16 @@ private fun DockedMiniPlayerSlot(
 internal fun FloatingOverlayButtonStack(
     onOpenSearch: () -> Unit,
     onOpenAddSheet: () -> Unit,
+    showSearchFab: Boolean = true,
     showAddFab: Boolean = true,
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        SearchFloatingActionButton(onClick = onOpenSearch)
+        if (showSearchFab) {
+            SearchFloatingActionButton(onClick = onOpenSearch)
+        }
         if (showAddFab) {
             SaveFloatingActionButton(onClick = onOpenAddSheet)
         }
@@ -487,7 +499,7 @@ internal fun SaveFloatingActionButton(onClick: () -> Unit) {
     val colors = LocalRocheColors.current
     FloatingActionButton(
         onClick = onClick,
-        shape = CircleShape,
+        shape = RoundedCornerShape(15.dp),
         containerColor = colors.accentBlueFilled,
         contentColor = Color.White,
         modifier =

@@ -137,9 +137,16 @@ fun RocheBottomBar(
     activeTab: AppTab,
     onSelectTab: (AppTab) -> Unit,
     sideTabs: List<AppTab> = AppTab.defaultBottomTabs,
+    inboxUnreadCount: Int = 0,
 ) {
     val colors = LocalRocheColors.current
     val tabs = AppTab.normalizeBottomTabs(sideTabs)
+    val inboxBadgeText =
+        when {
+            inboxUnreadCount <= 0 -> null
+            inboxUnreadCount > MAX_BADGE_COUNT -> "${MAX_BADGE_COUNT}+"
+            else -> inboxUnreadCount.toString()
+        }
 
     Column(
         modifier =
@@ -158,6 +165,7 @@ fun RocheBottomBar(
                 BottomBarTabItem(
                     tab = tab,
                     isSelected = tab == activeTab,
+                    badgeText = if (tab == AppTab.INBOX) inboxBadgeText else null,
                     onClick = { onSelectTab(tab) },
                 )
             }
@@ -165,13 +173,20 @@ fun RocheBottomBar(
     }
 }
 
+private const val MAX_BADGE_COUNT = 99
+
 @Composable
-private fun RowScope.BottomBarTabItem(tab: AppTab, isSelected: Boolean, onClick: () -> Unit) {
+private fun RowScope.BottomBarTabItem(
+    tab: AppTab,
+    isSelected: Boolean,
+    badgeText: String?,
+    onClick: () -> Unit,
+) {
     val colors = LocalRocheColors.current
     val pillBg = if (isSelected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
     val iconTint = if (isSelected) colors.accentBlue else colors.textSecondary
     val labelColor = if (isSelected) colors.textPrimary else colors.textSecondary
-    val labelWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+    val labelWeight = if (isSelected) FontWeight.Medium else FontWeight.Normal
 
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -188,23 +203,64 @@ private fun RowScope.BottomBarTabItem(tab: AppTab, isSelected: Boolean, onClick:
                 .testTag("bottom_tab_${tab.name.lowercase()}"),
     ) {
         Box(
-            modifier =
-                Modifier.width(48.dp)
-                    .height(28.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(pillBg),
+            modifier = Modifier.width(52.dp).height(28.dp),
             contentAlignment = Alignment.Center,
         ) {
-            BottomTabIcon(tab = tab, tint = iconTint, size = 19.dp)
+            Box(
+                modifier =
+                    Modifier.width(48.dp)
+                        .height(28.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(pillBg),
+                contentAlignment = Alignment.Center,
+            ) {
+                BottomTabIcon(tab = tab, tint = iconTint, size = 19.dp)
+            }
+            if (badgeText != null) {
+                BottomBarTabBadge(
+                    badgeText = badgeText,
+                    testTag = "bottom_tab_${tab.name.lowercase()}_badge",
+                    modifier = Modifier.align(Alignment.TopEnd),
+                )
+            }
         }
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = tab.label,
             color = labelColor,
-            fontSize = 11.5.sp,
+            fontSize = 11.sp,
             fontWeight = labelWeight,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+internal fun BottomBarTabBadge(
+    badgeText: String,
+    testTag: String,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(colors.accentBlueFilled)
+                .padding(horizontal = 4.dp, vertical = 1.dp)
+                .testTag(testTag),
+    ) {
+        Text(
+            text = badgeText,
+            color = Color.White,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 8.5.sp,
+            lineHeight = 11.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            modifier = Modifier.clearAndSetSemantics {},
         )
     }
 }
@@ -215,19 +271,20 @@ fun RocheTopHeader(
     modifier: Modifier = Modifier,
     subtitle: String? = null,
     navigationAction: (@Composable () -> Unit)? = null,
+    titleTrailingAction: (@Composable () -> Unit)? = null,
     content: (@Composable RowScope.() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     val headlineFamily = currentHeadlineFontFamily()
 
     Row(
-        modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
             modifier = Modifier.weight(1f, fill = false),
         ) {
             if (navigationAction != null) {
@@ -256,6 +313,9 @@ fun RocheTopHeader(
                         modifier = Modifier.padding(bottom = 3.dp),
                     )
                 }
+            }
+            if (titleTrailingAction != null) {
+                titleTrailingAction()
             }
         }
         if (content != null) {
@@ -563,53 +623,76 @@ fun UndoOrStatusSnackbar(
 internal fun RocheSectionHeader(
     label: String,
     modifier: Modifier = Modifier,
+    badgeText: String? = null,
     actionLabel: String? = null,
     actionTestTag: String? = null,
     onActionClick: (() -> Unit)? = null,
 ) {
     val colors = LocalRocheColors.current
     if (actionLabel == null || onActionClick == null) {
-        Text(
-            text = label.uppercase(),
-            color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 10.5.sp,
-            letterSpacing = 0.7.sp,
-            modifier = modifier.padding(horizontal = 4.dp).semantics { heading() },
-        )
+        Box(modifier = modifier.padding(horizontal = 2.dp)) {
+            SectionHeaderLabelGroup(label = label, badgeText = badgeText)
+        }
         return
     }
     val actionMod =
         Modifier.minimumInteractiveComponentSize()
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(6.dp))
             .clickable(onClick = onActionClick)
             .semantics { role = Role.Button }
             .padding(horizontal = 4.dp, vertical = 2.dp)
             .let { base -> if (actionTestTag != null) base.testTag(actionTestTag) else base }
     Row(
-        modifier = modifier.fillMaxWidth().padding(horizontal = 4.dp),
+        modifier = modifier.fillMaxWidth().padding(horizontal = 2.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SectionHeaderLabelGroup(label = label, badgeText = badgeText)
+        Box(contentAlignment = Alignment.Center, modifier = actionMod) {
+            Text(
+                text = actionLabel,
+                color = colors.accentBlue,
+                fontWeight = FontWeight.Normal,
+                fontSize = 12.sp,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun SectionHeaderLabelGroup(label: String, badgeText: String?) {
+    val colors = LocalRocheColors.current
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
             text = label.uppercase(),
             color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 10.5.sp,
-            letterSpacing = 0.7.sp,
+            fontWeight = FontWeight.Medium,
+            fontSize = 11.sp,
+            letterSpacing = 0.8.sp,
             modifier = Modifier.semantics { heading() },
         )
-        Text(
-            text = actionLabel.uppercase(),
-            color = colors.accentVerdigris,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 10.5.sp,
-            letterSpacing = 0.5.sp,
-            modifier = actionMod,
-        )
+        if (!badgeText.isNullOrBlank()) {
+            val badgeShape = RoundedCornerShape(999.dp)
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier =
+                    Modifier.clip(badgeShape)
+                        .background(colors.surfaceElevated)
+                        .border(1.dp, colors.border, badgeShape)
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+            ) {
+                Text(
+                    text = badgeText,
+                    color = colors.textSecondary,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Normal,
+                    fontSize = 10.5.sp,
+                )
+            }
+        }
     }
 }
 
