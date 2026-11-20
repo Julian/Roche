@@ -76,7 +76,13 @@ enum class InboxFilter(val label: String) {
     VIDEOS("Videos"),
     PODCASTS("Podcasts"),
     STARRED("Starred"),
-    ARCHIVED("Archived"),
+    ARCHIVED("Archived");
+
+    companion object {
+        /** Filters shown in the Inbox strip (Starred lives on the dedicated Stars tab). */
+        val inboxStripFilters: List<InboxFilter> =
+            listOf(ALL, UNREAD, ARTICLES, PAPERS, VIDEOS, PODCASTS, ARCHIVED)
+    }
 }
 
 @kotlinx.serialization.Serializable

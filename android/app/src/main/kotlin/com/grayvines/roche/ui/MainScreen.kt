@@ -272,11 +272,13 @@ private fun computeChromeFlags(topKey: RocheNavKey): MainChromeFlags {
     val isHomeTop = topTab == AppTab.HOME
     val isInboxTop = topKey is RocheNavKey.ScopedInbox || topTab == AppTab.INBOX
     val hasFab = showChrome && topKey !is RocheNavKey.Search && topTab != AppTab.SETTINGS
+    val showSearchFab = hasFab && !isHomeTop && !isInboxTop
+    val showAddFab = hasFab && !isInboxTop
     return MainChromeFlags(
         showChrome = showChrome,
-        hasFab = hasFab,
-        showSearchFab = hasFab && !isHomeTop,
-        showAddFab = hasFab && !isInboxTop,
+        hasFab = showSearchFab || showAddFab,
+        showSearchFab = showSearchFab,
+        showAddFab = showAddFab,
     )
 }
 

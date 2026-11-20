@@ -59,7 +59,6 @@ class MainScreenTest {
             }
         }
 
-        composeRule.onNodeWithText("Roche").assertExists()
         composeRule.onNodeWithText("Home").assertExists()
         composeRule.onNodeWithTag("bottom_nav_bar").assertExists()
         composeRule.onNodeWithTag("bottom_tab_inbox").assertExists()
@@ -67,11 +66,12 @@ class MainScreenTest {
         composeRule.onNodeWithTag("bottom_tab_feeds").assertExists()
         composeRule.onNodeWithTag("bottom_tab_starred").assertExists()
         composeRule.onNodeWithTag("bottom_tab_offline").assertExists()
-        composeRule.onNodeWithTag("inbox_spare_settings_btn").assertExists()
+        composeRule.onNodeWithTag("inbox_search_btn").assertExists()
+        composeRule.onNodeWithTag("inbox_spare_settings_btn").assertDoesNotExist()
         composeRule.onNodeWithText(sample.title).assertExists()
         composeRule.onNodeWithTag("star_btn_${sample.id}").assertExists()
         composeRule.onNodeWithTag("archive_btn_${sample.id}").assertExists()
-        composeRule.onNodeWithTag("search_fab").assertExists()
+        composeRule.onNodeWithTag("search_fab").assertDoesNotExist()
         composeRule.onNodeWithTag("save_fab").assertDoesNotExist()
 
         composeRule.onNodeWithTag("inbox_tag_filter_drawer").assertDoesNotExist()

@@ -270,13 +270,11 @@ fun RocheTopHeader(
     title: String,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
+    badgeText: String? = null,
     navigationAction: (@Composable () -> Unit)? = null,
     titleTrailingAction: (@Composable () -> Unit)? = null,
     content: (@Composable RowScope.() -> Unit)? = null,
 ) {
-    val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-
     Row(
         modifier = modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -284,47 +282,86 @@ fun RocheTopHeader(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.weight(1f, fill = false),
         ) {
-            if (navigationAction != null) {
-                navigationAction()
-            }
-            Row(
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text(
-                    text = title,
-                    color = colors.textPrimary,
-                    fontFamily = headlineFamily,
-                    fontSize = 23.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.semantics { heading() },
-                )
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        color = colors.textMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(bottom = 3.dp),
-                    )
-                }
-            }
-            if (titleTrailingAction != null) {
-                titleTrailingAction()
-            }
+            navigationAction?.invoke()
+            TopHeaderTitleCluster(
+                title = title,
+                subtitle = subtitle,
+                badgeText = badgeText,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            titleTrailingAction?.invoke()
         }
         if (content != null) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
                 content = content,
             )
         }
+    }
+}
+
+@Composable
+private fun TopHeaderTitleCluster(
+    title: String,
+    subtitle: String?,
+    badgeText: String?,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = modifier,
+    ) {
+        Text(
+            text = title,
+            color = colors.textPrimary,
+            fontFamily = headlineFamily,
+            fontSize = 23.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false).semantics { heading() },
+        )
+        if (!badgeText.isNullOrBlank()) {
+            TopHeaderCountPill(text = badgeText)
+        }
+        if (!subtitle.isNullOrBlank()) {
+            Text(
+                text = subtitle,
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
+    }
+}
+
+@Composable
+internal fun TopHeaderCountPill(text: String) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(999.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
+                .padding(horizontal = 7.dp, vertical = 1.dp),
+    ) {
+        Text(
+            text = text,
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Normal,
+            fontSize = 11.sp,
+            maxLines = 1,
+        )
     }
 }
 

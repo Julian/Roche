@@ -873,9 +873,22 @@ private fun HomeInboxPreviewRow(
                 .padding(horizontal = 12.dp, vertical = 10.dp)
                 .testTag("home_inbox_item_${entry.id}"),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = Alignment.Top,
     ) {
+        if (entry.showsThumbnailPreview) {
+            HomeCompactEntryThumbnail(entry = entry)
+        }
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(
+                text = entry.title,
+                color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
+                fontFamily = headlineFamily,
+                fontSize = 14.5.sp,
+                lineHeight = 19.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -885,7 +898,7 @@ private fun HomeInboxPreviewRow(
                     fallbackFaviconUrl = entry.fallbackFaviconUrl,
                     domain = entry.displayDomain,
                     title = entry.feedTitle,
-                    size = 15.dp,
+                    size = 14.dp,
                 )
                 Text(
                     text = entry.feedTitle,
@@ -904,19 +917,6 @@ private fun HomeInboxPreviewRow(
                     maxLines = 1,
                 )
             }
-            Text(
-                text = entry.title,
-                color = if (entry.isUnread) colors.textPrimary else colors.textSecondary,
-                fontFamily = headlineFamily,
-                fontSize = 14.5.sp,
-                lineHeight = 19.sp,
-                fontWeight = FontWeight.Normal,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        if (entry.showsThumbnailPreview) {
-            HomeCompactEntryThumbnail(entry = entry)
         }
     }
 }
@@ -924,7 +924,7 @@ private fun HomeInboxPreviewRow(
 @Composable
 private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
     val colors = LocalRocheColors.current
-    val shape = RoundedCornerShape(7.dp)
+    val shape = RoundedCornerShape(5.dp)
     val landscapePath = remember { Path() }
     val bitmap =
         rememberEntryThumbnailBitmap(
@@ -933,7 +933,8 @@ private fun HomeCompactEntryThumbnail(entry: InboxEntry) {
         )
     Box(
         modifier =
-            Modifier.size(46.dp)
+            Modifier.padding(top = 2.dp)
+                .size(width = 56.dp, height = 40.dp)
                 .clip(shape)
                 .background(colors.surfaceElevated)
                 .border(1.dp, colors.border, shape)

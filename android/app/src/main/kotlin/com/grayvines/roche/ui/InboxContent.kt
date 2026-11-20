@@ -1,9 +1,13 @@
-@file:Suppress("TooManyFunctions")
+@file:Suppress("TooManyFunctions", "MagicNumber")
 
 package com.grayvines.roche.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -13,22 +17,26 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -39,12 +47,19 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
@@ -52,15 +67,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.parseIsoInstant
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.ContentType
 import com.grayvines.roche.model.InboxEntry
 import com.grayvines.roche.model.InboxFilter
 import com.grayvines.roche.reader.extractInboxSnippet
-import com.grayvines.roche.ui.components.BottomTabIcon
 import com.grayvines.roche.ui.components.DownloadTrayIcon
-import com.grayvines.roche.ui.components.EntrySourceMetadataRow
-import com.grayvines.roche.ui.components.EntryThumbnailPreview
 import com.grayvines.roche.ui.components.FilingCabinetIcon
 import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.FilterFunnelIcon
@@ -70,11 +83,19 @@ import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheIconActionButton
 import com.grayvines.roche.ui.components.RocheRefreshableTabScaffold
 import com.grayvines.roche.ui.components.RocheTopHeader
+import com.grayvines.roche.ui.components.SearchIcon
+import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.StarIcon
-import com.grayvines.roche.ui.components.SyncHeaderActionButton
+import com.grayvines.roche.ui.components.drawArticleImagePlaceholder
+import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.RocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.text.NumberFormat
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
+import java.util.Locale
 
 @Composable
 fun InboxTabContent(
@@ -132,33 +153,31 @@ internal fun InboxEntryListBody(
 ) {
     val colors = LocalRocheColors.current
     if (state.visibleEntries.isEmpty()) {
-        if (state.isInitialLoading) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(32.dp).testTag("inbox_loading_state"),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Loading inbox…",
-                    color = colors.textMuted,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                )
-            }
-        } else {
-            InboxEmptyState(
-                hasEntriesAtAll = state.allEntries.any { it.inFeedInbox },
-                onManageFeedsClick = { onAction(MainAction.SelectTab(AppTab.FEEDS)) },
-                onSyncClick = { onAction(MainAction.SyncNow) },
-            )
+        InboxEmptyOrLoadingPane(state = state, onAction = onAction)
+        return
+    }
+
+    val nextQueuedAudioId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id
+    val zoneId = remember { ZoneId.systemDefault() }
+    val today = remember { LocalDate.now(zoneId) }
+    val dayBuckets =
+        remember(state.visibleEntries, today, zoneId) {
+            state.visibleEntries.map { entry -> resolveInboxDayBucket(entry, today, zoneId) }
         }
-    } else {
-        val nextQueuedAudioId = state.resolveNextQueuedAudioEntry(activeAudioEntryId)?.id
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize().testTag("inbox_list"),
-            contentPadding = PaddingValues(bottom = 88.dp),
-        ) {
-            items(items = state.visibleEntries, key = { it.id }) { entry ->
+
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize().testTag("inbox_list"),
+        contentPadding = PaddingValues(bottom = 24.dp),
+    ) {
+        itemsIndexed(items = state.visibleEntries, key = { _, item -> item.id }) { index, entry ->
+            val bucket = dayBuckets[index]
+            val showDividerHeader =
+                bucket != null && (index == 0 || dayBuckets[index - 1] != bucket)
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (showDividerHeader) {
+                    InboxDayDivider(label = bucket)
+                }
                 InboxEntryRowItem(
                     entry = entry,
                     ultraDense = state.settings.ultraDenseRows,
@@ -178,6 +197,67 @@ internal fun InboxEntryListBody(
 }
 
 @Composable
+private fun InboxEmptyOrLoadingPane(state: MainUiState, onAction: (MainAction) -> Unit) {
+    val colors = LocalRocheColors.current
+    if (state.isInitialLoading) {
+        Box(
+            modifier = Modifier.fillMaxSize().padding(32.dp).testTag("inbox_loading_state"),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "Loading inbox…",
+                color = colors.textMuted,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Normal,
+            )
+        }
+    } else {
+        InboxEmptyState(
+            hasEntriesAtAll = state.allEntries.any { it.inFeedInbox },
+            onManageFeedsClick = { onAction(MainAction.SelectTab(AppTab.FEEDS)) },
+            onSyncClick = { onAction(MainAction.SyncNow) },
+        )
+    }
+}
+
+@Composable
+private fun InboxDayDivider(label: String) {
+    val colors = LocalRocheColors.current
+    Box(
+        modifier =
+            Modifier.fillMaxWidth()
+                .background(colors.background)
+                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 5.dp)
+    ) {
+        Text(
+            text = label.uppercase(),
+            color = colors.textMuted,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.semantics { heading() },
+        )
+    }
+}
+
+internal fun resolveInboxDayBucket(
+    entry: InboxEntry,
+    today: LocalDate,
+    zoneId: ZoneId,
+): String? {
+    val instant =
+        parseIsoInstant(entry.publishedAt) ?: parseIsoInstant(entry.createdAt) ?: return null
+    val entryDate = instant.atZone(zoneId).toLocalDate()
+    val daysAgo = ChronoUnit.DAYS.between(entryDate, today)
+    return when {
+        daysAgo <= 0L -> "Today"
+        daysAgo == 1L -> "Yesterday"
+        daysAgo <= DAYS_IN_WEEK -> "This Week"
+        else -> "Earlier"
+    }
+}
+
+@Composable
 private fun InboxHeaderSection(
     state: MainUiState,
     showTagFilterDrawer: Boolean,
@@ -188,16 +268,16 @@ private fun InboxHeaderSection(
     val unarchivedCount = state.visibleEntries.count { !it.isArchived }
     var showArchiveAllConfirm by rememberSaveable { mutableStateOf(false) }
     val title = resolveInboxHeaderTitle(state)
-    val subtitle =
+    val badgeText =
         if (state.isInitialLoading && state.visibleEntries.isEmpty()) {
-            "Loading…"
+            null
         } else {
-            "${state.visibleEntries.size} items"
+            NumberFormat.getIntegerInstance(Locale.US).format(state.visibleEntries.size)
         }
 
     RocheTopHeader(
         title = title,
-        subtitle = subtitle,
+        badgeText = badgeText,
         navigationAction =
             if (hasScopeFilter) {
                 {
@@ -218,8 +298,7 @@ private fun InboxHeaderSection(
             showTagFilterDrawer = showTagFilterDrawer,
             onToggleTagDrawer = onToggleTagDrawer,
             onShowArchiveConfirm = { showArchiveAllConfirm = true },
-            onSync = { onAction(MainAction.SyncNow) },
-            onOpenSettings = { onAction(MainAction.SelectTab(AppTab.SETTINGS)) },
+            onOpenSearch = { onAction(MainAction.OpenSearch) },
         )
     }
     if (showArchiveAllConfirm) {
@@ -239,7 +318,7 @@ private fun resolveInboxHeaderTitle(state: MainUiState): String =
     when {
         state.selectedFeedId != null -> state.selectedFeedTitle ?: "Feed"
         state.selectedTag != null -> "#${state.selectedTag}"
-        else -> "Roche"
+        else -> "Inbox"
     }
 
 @Composable
@@ -249,12 +328,9 @@ internal fun InboxHeaderActions(
     showTagFilterDrawer: Boolean,
     onToggleTagDrawer: () -> Unit,
     onShowArchiveConfirm: () -> Unit,
-    onSync: () -> Unit,
-    onOpenSettings: () -> Unit,
+    onOpenSearch: () -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    val isSettingsUnpinned =
-        AppTab.SETTINGS !in AppTab.normalizeSideTabs(state.settings.bottomNavTabs)
     if (state.tags.isNotEmpty()) {
         val filterTint =
             if (showTagFilterDrawer || state.selectedTag != null) {
@@ -264,6 +340,7 @@ internal fun InboxHeaderActions(
             }
         RocheIconActionButton(
             contentDescription = "Filter by Tag",
+            outlined = false,
             onClick = onToggleTagDrawer,
             modifier = Modifier.testTag("inbox_tag_filter_btn"),
         ) {
@@ -273,25 +350,20 @@ internal fun InboxHeaderActions(
     if (unarchivedCount > 0) {
         RocheIconActionButton(
             contentDescription = "Archive All",
+            outlined = false,
             onClick = onShowArchiveConfirm,
             modifier = Modifier.testTag("archive_all_btn"),
         ) {
             FilingCabinetIcon(tint = colors.textSecondary, isArchived = false, size = 17.dp)
         }
     }
-    SyncHeaderActionButton(
-        isSyncing = state.isSyncing,
-        onClick = onSync,
-        modifier = Modifier.testTag("inbox_sync_btn"),
-    )
-    if (isSettingsUnpinned) {
-        RocheIconActionButton(
-            contentDescription = "Settings",
-            onClick = onOpenSettings,
-            modifier = Modifier.testTag("inbox_spare_settings_btn"),
-        ) {
-            BottomTabIcon(tab = AppTab.SETTINGS, tint = colors.textSecondary, size = 17.dp)
-        }
+    RocheIconActionButton(
+        contentDescription = "Search",
+        outlined = true,
+        onClick = onOpenSearch,
+        modifier = Modifier.testTag("inbox_search_btn"),
+    ) {
+        SearchIcon(tint = colors.textSecondary, size = 17.dp)
     }
 }
 
@@ -315,8 +387,9 @@ private fun InboxTagFilterDrawer(
         Text(
             text = "FILTER BY TAG",
             color = colors.textMuted,
-            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium,
             fontSize = 10.5.sp,
+            letterSpacing = 0.8.sp,
         )
         FlowRow(
             modifier = Modifier.fillMaxWidth(),
@@ -394,7 +467,7 @@ private fun InboxEmptyState(
                     },
                 color = colors.textSecondary,
                 fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
+                fontWeight = FontWeight.Normal,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 HeaderActionButton(label = "Manage Feeds", onClick = onManageFeedsClick)
@@ -410,24 +483,69 @@ private fun InboxFilterStrip(state: MainUiState, onAction: (MainAction) -> Unit)
         modifier =
             Modifier.fillMaxWidth()
                 .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         if (state.selectedTag != null || state.selectedFeedId != null) {
             val scopeLabel =
                 state.selectedTag?.let { "#$it ✕" } ?: "${state.selectedFeedTitle ?: "Feed"} ✕"
-            FilterChipPill(
+            InboxFilterTab(
                 label = scopeLabel,
                 selected = true,
-                onClick = { onAction(MainAction.NavigateBackFromScope) },
                 role = Role.Button,
+                onClick = { onAction(MainAction.NavigateBackFromScope) },
             )
         }
-        InboxFilter.entries.forEach { filter ->
-            FilterChipPill(
+        InboxFilter.inboxStripFilters.forEach { filter ->
+            InboxFilterTab(
                 label = filter.label,
                 selected = state.activeFilter == filter,
                 onClick = { onAction(MainAction.SelectFilter(filter)) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun InboxFilterTab(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    role: Role = Role.Tab,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(8.dp)
+    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val textColor = if (selected) colors.accentBlue else colors.textSecondary
+    val weight = if (selected) FontWeight.Medium else FontWeight.Normal
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            Modifier.minimumInteractiveComponentSize()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    this.role = role
+                    this.selected = selected
+                },
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.heightIn(min = 30.dp)
+                    .clip(shape)
+                    .background(bg)
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Text(
+                text = label,
+                color = textColor,
+                fontSize = 12.sp,
+                fontWeight = weight,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -517,7 +635,7 @@ private fun InboxEntryRowSurface(
     onDownloadOffline: (() -> Unit)?,
 ) {
     val colors = LocalRocheColors.current
-    val verticalPadding = if (ultraDense) 9.dp else 12.dp
+    val verticalPadding = if (ultraDense) 8.dp else 10.dp
     val (rowBackground, leftAccentColor) =
         resolveInboxRowHighlight(colors, isPlayingAudio, isQueuedNextAudio)
     val rowStateLabel = buildInboxRowStateLabel(entry, isPlayingAudio, isQueuedNextAudio)
@@ -542,25 +660,25 @@ private fun InboxEntryRowSurface(
                     }
                 }
                 .padding(
-                    start = 10.dp,
-                    end = 12.dp,
+                    start = 4.dp,
+                    end = 4.dp,
                     top = verticalPadding,
                     bottom = verticalPadding,
                 )
                 .testTag("entry_row_${entry.id}"),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = if (ultraDense) Alignment.CenterVertically else Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         EntryLeadingStarButton(entry = entry, onToggleStar = onToggleStar)
 
         if (entry.showsThumbnailPreview) {
-            EntryThumbnailPreview(entry = entry, modifier = Modifier.padding(top = 2.dp))
+            InboxLandscapeThumbnail(entry = entry, ultraDense = ultraDense)
         }
 
         InboxEntryTextColumn(
             entry = entry,
             ultraDense = ultraDense,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.weight(1f).padding(start = 2.dp),
         )
 
         EntryTrailingActionButtons(
@@ -568,6 +686,41 @@ private fun InboxEntryRowSurface(
             onDownloadOffline = onDownloadOffline,
             onToggleArchive = onToggleArchive,
         )
+    }
+}
+
+@Composable
+private fun InboxLandscapeThumbnail(entry: InboxEntry, ultraDense: Boolean) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(5.dp)
+    val landscapePath = remember { Path() }
+    val width = if (ultraDense) 46.dp else 62.dp
+    val height = if (ultraDense) 34.dp else 44.dp
+    val bitmap =
+        rememberEntryThumbnailBitmap(
+            primaryKey = entry.thumbnailMediaId,
+            fallbackKey = entry.effectiveThumbnailUrl,
+        )
+    Box(
+        modifier =
+            Modifier.padding(top = if (ultraDense) 0.dp else 2.dp)
+                .size(width = width, height = height)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.matchParentSize()) {
+                drawArticleImagePlaceholder(colors = colors, landscape = landscapePath)
+            }
+        }
     }
 }
 
@@ -599,9 +752,6 @@ private fun buildInboxRowStateLabel(
 }
     .joinToString(", ")
 
-private const val PLAYING_ROW_BG_ALPHA = 0.12f
-private const val QUEUED_ROW_BG_ALPHA = 0.11f
-
 @Composable
 private fun EntryLeadingStarButton(
     entry: InboxEntry,
@@ -620,7 +770,7 @@ private fun EntryLeadingStarButton(
         StarIcon(
             tint = starTint,
             isStarred = entry.isFavorite,
-            size = 17.dp,
+            size = 16.dp,
         )
     }
 }
@@ -637,7 +787,7 @@ private fun EntryTrailingActionButtons(
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        horizontalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         if (
             entry.contentType == ContentType.AUDIO &&
@@ -650,10 +800,7 @@ private fun EntryTrailingActionButtons(
                 outlined = false,
                 modifier = Modifier.testTag("download_btn_${entry.id}"),
             ) {
-                DownloadTrayIcon(
-                    tint = colors.accentBlue,
-                    size = 17.dp,
-                )
+                DownloadTrayIcon(tint = colors.accentBlue, size = 16.dp)
             }
         }
         RocheIconActionButton(
@@ -665,7 +812,7 @@ private fun EntryTrailingActionButtons(
             FilingCabinetIcon(
                 tint = colors.textMuted,
                 isArchived = entry.isArchived,
-                size = 17.dp,
+                size = 16.dp,
             )
         }
     }
@@ -678,49 +825,26 @@ private fun InboxEntryTextColumn(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalRocheColors.current
-    val headlineFamily = currentHeadlineFontFamily()
-    val titleColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
-    val titleWeight = if (entry.isUnread) FontWeight.SemiBold else FontWeight.Normal
-    val (titleSize, titleLineHeight, maxTitleLines) =
-        if (ultraDense) Triple(14.sp, 19.sp, 1) else Triple(15.5.sp, 21.sp, 2)
     val snippet =
         remember(entry.summary, ultraDense) {
             if (ultraDense) "" else extractInboxSnippet(entry.summary.orEmpty())
         }
 
-    Column(modifier = modifier) {
-        EntrySourceMetadataRow(
-            entry = entry,
-            showUnreadDot = true,
-            unreadDotTestTag = "unread_dot_${entry.id}",
-            emphasizeFeedTitleWhenUnread = true,
-            trailingMetaText = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
-            showOfflineIndicator = true,
-        )
-        Spacer(modifier = Modifier.height(3.dp))
-        Text(
-            text = entry.title,
-            color = titleColor,
-            fontFamily = headlineFamily,
-            fontSize = titleSize,
-            lineHeight = titleLineHeight,
-            fontWeight = titleWeight,
-            maxLines = maxTitleLines,
-            overflow = TextOverflow.Ellipsis,
-        )
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        InboxEntryHeadlineRow(entry = entry, ultraDense = ultraDense)
+        InboxEntryBylineRow(entry = entry)
         if (snippet.isNotBlank()) {
-            Spacer(modifier = Modifier.height(3.dp))
             Text(
                 text = snippet,
-                color = colors.textSecondary,
+                color = colors.textMuted,
                 fontSize = 12.5.sp,
                 lineHeight = 17.sp,
+                fontWeight = FontWeight.Normal,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
         entry.formattedListeningHistoryLabel?.let { historyLabel ->
-            Spacer(modifier = Modifier.height(3.dp))
             Text(
                 text = historyLabel,
                 color = colors.accentVerdigris,
@@ -733,3 +857,116 @@ private fun InboxEntryTextColumn(
         }
     }
 }
+
+@Composable
+private fun InboxEntryHeadlineRow(entry: InboxEntry, ultraDense: Boolean) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val titleColor = if (entry.isUnread) colors.textPrimary else colors.textSecondary
+    val (titleSize, titleLineHeight, maxTitleLines) =
+        if (ultraDense) Triple(14.sp, 19.sp, 1) else Triple(15.sp, 20.sp, 2)
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        if (entry.isUnread) {
+            Box(
+                modifier =
+                    Modifier.size(6.dp)
+                        .clip(CircleShape)
+                        .background(colors.accentBlue)
+                        .testTag("unread_dot_${entry.id}")
+            )
+        }
+        Text(
+            text = entry.title,
+            color = titleColor,
+            fontFamily = headlineFamily,
+            fontSize = titleSize,
+            lineHeight = titleLineHeight,
+            fontWeight = FontWeight.Normal,
+            maxLines = maxTitleLines,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun InboxEntryBylineRow(entry: InboxEntry) {
+    val colors = LocalRocheColors.current
+    val kindLabel =
+        when (entry.contentType) {
+            ContentType.PDF -> "PDF"
+            ContentType.AUDIO -> "Audio"
+            ContentType.VIDEO -> "Video"
+            ContentType.ARTICLE -> null
+        }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        if (kindLabel != null) {
+            InboxEntryKindPill(label = kindLabel)
+        }
+        SiteFaviconBadge(
+            primaryFaviconUrl = entry.faviconUrl,
+            fallbackFaviconUrl = entry.fallbackFaviconUrl,
+            domain = entry.displayDomain,
+            title = entry.feedTitle,
+            size = 14.dp,
+        )
+        Text(
+            text = entry.feedTitle,
+            color = colors.textSecondary,
+            fontSize = 11.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        Text(
+            text = "· ${entry.formattedPublishedLabel} · ${entry.readEstimateLabel}",
+            color = colors.textMuted,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+        )
+        if (entry.isCachedOffline) {
+            Text(
+                text = "↓",
+                color = colors.accentVerdigris,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+                modifier = Modifier.semantics { contentDescription = "Cached offline" },
+            )
+        }
+    }
+}
+
+@Composable
+private fun InboxEntryKindPill(label: String) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(4.dp)
+    Box(
+        modifier =
+            Modifier.clip(shape)
+                .background(colors.accentVerdigris.copy(alpha = 0.14f))
+                .padding(horizontal = 5.dp, vertical = 1.dp)
+    ) {
+        Text(
+            text = label,
+            color = colors.accentVerdigris,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 9.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+        )
+    }
+}
+
+private const val PLAYING_ROW_BG_ALPHA = 0.12f
+private const val QUEUED_ROW_BG_ALPHA = 0.11f
+private const val DAYS_IN_WEEK = 7L
