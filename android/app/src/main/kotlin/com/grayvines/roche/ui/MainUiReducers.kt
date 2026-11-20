@@ -31,6 +31,7 @@ private fun reduceNavigationUiAction(
                         },
                     selectedReaderEntryId = null,
                     readerContent = null,
+                    catalogDetailEntryId = null,
                     selectedFeedId = null,
                     selectedTag = null,
                     scopeOriginTab = null,
@@ -92,6 +93,7 @@ private fun reduceOverlayUiAction(
                 isSearchOpen = true,
                 contextSheetEntryId = null,
                 feedContextSheetId = null,
+                catalogDetailEntryId = null,
                 isAddSheetOpen = false,
             )
         MainAction.CloseSearch -> state.clearSearch()
@@ -127,6 +129,7 @@ private fun reduceOpenReader(
         readerContent = state.readerContent?.takeIf { it.itemId == action.entryId },
         hydratingEntryIds = state.hydratingEntryIds + action.entryId,
         contextSheetEntryId = null,
+        catalogDetailEntryId = null,
         isPlayerFullscreenOpen =
             if (action.forceArticleView) false else state.isPlayerFullscreenOpen,
         isPlayerSpeedSheetOpen =
@@ -172,18 +175,29 @@ private fun reduceCatalogUiAction(
             state.copy(selectedCatalogCollectionId = action.collectionId)
         is MainAction.SelectWantCollection ->
             state.copy(selectedWantCollectionId = action.collectionId)
+        is MainAction.OpenCatalogDetailSheet -> state.copy(catalogDetailEntryId = action.entryId)
+        MainAction.CloseCatalogDetailSheet -> state.copy(catalogDetailEntryId = null)
         is MainAction.OpenQuickLogSheet ->
             state.copy(
+                catalogDetailEntryId = null,
                 isQuickLogSheetOpen = true,
                 quickLogDefaultWant = action.defaultToWant,
                 quickLogTargetCollectionId = action.targetCollectionId,
                 quickLogTargetCollectionTitle = action.targetCollectionTitle,
+                quickLogPrefillKind = action.prefillKind,
+                quickLogPrefillTitle = action.prefillTitle,
+                quickLogPrefillCreators = action.prefillCreators,
+                quickLogPrefillReleaseYear = action.prefillReleaseYear,
             )
         MainAction.CloseQuickLogSheet ->
             state.copy(
                 isQuickLogSheetOpen = false,
                 quickLogTargetCollectionId = null,
                 quickLogTargetCollectionTitle = null,
+                quickLogPrefillKind = null,
+                quickLogPrefillTitle = "",
+                quickLogPrefillCreators = "",
+                quickLogPrefillReleaseYear = null,
             )
         is MainAction.OpenDrawNoteDialog ->
             state.copy(drawNoteDialog = DrawNoteDialogState(action.collectionId, action.mode))
@@ -226,6 +240,7 @@ private fun reduceOpenCompanionSection(
                 },
             selectedReaderEntryId = null,
             readerContent = null,
+            catalogDetailEntryId = null,
             selectedFeedId = null,
             selectedTag = null,
             scopeOriginTab = null,

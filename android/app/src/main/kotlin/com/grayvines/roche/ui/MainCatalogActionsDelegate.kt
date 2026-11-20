@@ -158,7 +158,7 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 }
             }
         if (nextSession != null) {
-            host.updateTransient { it.copy(rankSession = nextSession) }
+            host.updateTransient { it.copy(rankSession = nextSession, catalogDetailEntryId = null) }
         }
         return nextSession != null
     }
@@ -345,6 +345,10 @@ internal class MainCatalogActionsDelegate(private val host: MainDelegateHost) {
                 isQuickLogSheetOpen = false,
                 quickLogTargetCollectionId = null,
                 quickLogTargetCollectionTitle = null,
+                quickLogPrefillKind = null,
+                quickLogPrefillTitle = "",
+                quickLogPrefillCreators = "",
+                quickLogPrefillReleaseYear = null,
                 optimisticFavorites = it.optimisticFavorites - entryId,
             )
         }

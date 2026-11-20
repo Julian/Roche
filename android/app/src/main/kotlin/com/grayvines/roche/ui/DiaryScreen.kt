@@ -249,6 +249,10 @@ private fun DiaryMonthsList(
                                     readableIds = readableIds,
                                     onOpenReader = { onAction(MainAction.OpenReader(it)) },
                                     onOpenExternalUrl = onOpenExternalUrl,
+                                    entryKind = diary.kind,
+                                    onOpenCatalogDetail = {
+                                        onAction(MainAction.OpenCatalogDetailSheet(it))
+                                    },
                                 )
                             DiaryLogRow(diary = diary, onOpen = onOpen)
                         }

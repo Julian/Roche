@@ -1023,6 +1023,8 @@ private fun HomeRecentDiaryList(
                 readableIds = readableIds,
                 onOpenReader = { onAction(MainAction.OpenReader(it)) },
                 onOpenExternalUrl = onOpenExternalUrl,
+                entryKind = diary.kind,
+                onOpenCatalogDetail = { onAction(MainAction.OpenCatalogDetailSheet(it)) },
             ) ?: onOpenDiary
         HomeDiaryPreviewRow(diary = diary, onClick = onClick)
     }

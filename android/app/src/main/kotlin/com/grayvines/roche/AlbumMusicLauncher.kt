@@ -11,6 +11,7 @@ import android.content.pm.verify.domain.DomainVerificationUserState
 import android.provider.MediaStore
 import androidx.core.net.toUri
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.candidateStreamingUrls
 import com.grayvines.roche.data.catalog.hasYoutubeAlbumBrowseId
 import kotlinx.coroutines.Dispatchers
@@ -317,6 +318,59 @@ internal fun buildAlbumSearchIntent(
         putExtra(MediaStore.EXTRA_MEDIA_FOCUS, MediaStore.Audio.Albums.ENTRY_CONTENT_TYPE)
         putExtra(MediaStore.EXTRA_MEDIA_ALBUM, album.title)
         putExtra(MediaStore.EXTRA_MEDIA_ARTIST, album.creator)
+        putExtra(SearchManager.QUERY, query)
+    }
+}
+
+internal fun launchMusicTrack(
+    context: Context,
+    track: MusicTrackLaunchRequest,
+    onOpenFallbackUrl: (String) -> Unit,
+) {
+    val trackUrl =
+        track.spotifyUri
+            ?.removePrefix("spotify:track:")
+            ?.takeIf { it.isNotBlank() && it != track.spotifyUri }
+            ?.let { "https://open.spotify.com/track/$it" }
+    if (trackUrl != null) {
+        val browserPackages = queryBrowserPackages(context.packageManager)
+        val resolution =
+            selectMusicUrlResolution(
+                candidates = queryUrlListCandidates(context, listOf(trackUrl)),
+                selfPackageName = context.packageName,
+                browserPackages = browserPackages,
+            )
+        val dummy = CollectionDrawSnapshot(title = track.trackTitle, creator = track.artist)
+        if (launchStreamingResolution(context, dummy, resolution)) return
+    }
+    val launched =
+        listOf(
+                MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH,
+                MediaStore.INTENT_ACTION_MEDIA_SEARCH,
+            )
+            .any { action ->
+                runCatching {
+                        context.startActivity(buildTrackSearchIntent(action, track))
+                        true
+                    }
+                    .getOrDefault(false)
+            }
+    if (!launched) {
+        val query = "${track.artist} ${track.trackTitle}".trim().ifBlank { track.trackTitle }
+        onOpenFallbackUrl("https://music.youtube.com/search?q=${android.net.Uri.encode(query)}")
+    }
+}
+
+internal fun buildTrackSearchIntent(
+    action: String,
+    track: MusicTrackLaunchRequest,
+): Intent {
+    val query = "${track.artist} ${track.trackTitle}".trim().ifBlank { track.trackTitle }
+    return Intent(action).apply {
+        putExtra(MediaStore.EXTRA_MEDIA_FOCUS, MediaStore.Audio.Media.ENTRY_CONTENT_TYPE)
+        putExtra(MediaStore.EXTRA_MEDIA_TITLE, track.trackTitle)
+        putExtra(MediaStore.EXTRA_MEDIA_ALBUM, track.albumTitle)
+        putExtra(MediaStore.EXTRA_MEDIA_ARTIST, track.artist)
         putExtra(SearchManager.QUERY, query)
     }
 }

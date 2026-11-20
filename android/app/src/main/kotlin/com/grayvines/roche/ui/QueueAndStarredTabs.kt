@@ -311,6 +311,10 @@ private fun StarredEntriesList(
                             readableIds = readableIds,
                             onOpenReader = { entryId -> onAction(MainAction.OpenReader(entryId)) },
                             onOpenExternalUrl = onOpenExternalUrl,
+                            entryKind = catItem.entry.kind,
+                            onOpenCatalogDetail = { entryId ->
+                                onAction(MainAction.OpenCatalogDetailSheet(entryId))
+                            },
                         )
                     StarredCatalogEntryRow(
                         item = catItem,
@@ -703,6 +707,10 @@ private fun WantQueueEntriesList(
                             readableIds = readableIds,
                             onOpenReader = { onAction(MainAction.OpenReader(it)) },
                             onOpenExternalUrl = onOpenExternalUrl,
+                            entryKind = item.entry.kind,
+                            onOpenCatalogDetail = {
+                                onAction(MainAction.OpenCatalogDetailSheet(it))
+                            },
                         )
                     WantQueueRow(
                         item = item,

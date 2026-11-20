@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.grayvines.roche.data.catalog.EntryKind
 import com.grayvines.roche.ui.theme.LocalRocheColors
 import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
 
@@ -42,6 +43,18 @@ internal fun RocheAlertDialog(
     )
 }
 
+internal fun EntryKind.prefersCatalogDetailSheet(): Boolean =
+    when (this) {
+        EntryKind.ALBUM,
+        EntryKind.ARTIST,
+        EntryKind.MOVIE,
+        EntryKind.TV,
+        EntryKind.BOOK,
+        EntryKind.GAME,
+        EntryKind.SONG -> true
+        else -> false
+    }
+
 @Suppress("LongParameterList")
 internal fun resolveCatalogEntryOpenAction(
     entryId: String,
@@ -50,14 +63,22 @@ internal fun resolveCatalogEntryOpenAction(
     onOpenReader: (String) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
     onFallback: (() -> Unit)? = null,
+    entryKind: EntryKind? = null,
+    onOpenCatalogDetail: ((String) -> Unit)? = null,
 ): (() -> Unit)? {
     val cleanUrl = externalUrl?.takeIf { it.isNotBlank() }
     return when {
         entryId in readableIds -> {
             { onOpenReader(entryId) }
         }
+        onOpenCatalogDetail != null && entryKind?.prefersCatalogDetailSheet() == true -> {
+            { onOpenCatalogDetail(entryId) }
+        }
         cleanUrl != null -> {
             { onOpenExternalUrl(cleanUrl) }
+        }
+        onOpenCatalogDetail != null -> {
+            { onOpenCatalogDetail(entryId) }
         }
         else -> onFallback
     }

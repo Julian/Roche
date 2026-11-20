@@ -178,6 +178,7 @@ data class CatalogEntryItem(
     val summary: String?,
     val thumbnailUrl: String?,
     val identifiers: List<EntryIdentifierDto>,
+    val metadataJson: String = "{}",
 ) {
     val primaryCreator: String
         get() = creators.firstOrNull().orEmpty()
@@ -189,6 +190,29 @@ data class CatalogEntryItem(
         }
             .joinToString(" · ")
 }
+
+data class AlbumTrackItem(
+    val disc: Int,
+    val number: Int,
+    val title: String,
+    val durationMs: Long? = null,
+    val artists: List<String> = emptyList(),
+    val spotifyUri: String? = null,
+)
+
+data class DiscographyAlbumItem(
+    val title: String,
+    val releaseYear: Int? = null,
+    val thumbnailUrl: String? = null,
+    val appleMusicId: String? = null,
+)
+
+data class MusicTrackLaunchRequest(
+    val trackTitle: String,
+    val albumTitle: String,
+    val artist: String,
+    val spotifyUri: String? = null,
+)
 
 data class RankedCatalogEntry(
     val entry: CatalogEntryItem,
@@ -252,6 +276,7 @@ data class CatalogSnapshot(
     val lists: List<CatalogListSummary> = emptyList(),
     val wantQueues: List<CatalogListSummary> = emptyList(),
     val entriesByCollectionId: Map<String, List<RankedCatalogEntry>> = emptyMap(),
+    val entriesById: Map<String, CatalogEntryItem> = emptyMap(),
     val diaryEntries: List<DiaryEntryItem> = emptyList(),
     val generators: List<CollectionGeneratorState> = emptyList(),
     val comparisonCount: Int = 0,

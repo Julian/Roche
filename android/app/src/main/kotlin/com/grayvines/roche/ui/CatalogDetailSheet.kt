@@ -1,0 +1,1483 @@
+@file:Suppress("TooManyFunctions", "MagicNumber")
+
+package com.grayvines.roche.ui
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.grayvines.roche.core.parseIsoInstant
+import com.grayvines.roche.data.catalog.AlbumTrackItem
+import com.grayvines.roche.data.catalog.CatalogEntryItem
+import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.CollectionMode
+import com.grayvines.roche.data.catalog.ConsumptionStatus
+import com.grayvines.roche.data.catalog.DiaryEntryItem
+import com.grayvines.roche.data.catalog.DiscographyAlbumItem
+import com.grayvines.roche.data.catalog.EntryKind
+import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
+import com.grayvines.roche.data.catalog.extractAlbumTracks
+import com.grayvines.roche.data.catalog.extractArtistDiscography
+import com.grayvines.roche.data.catalog.extractMetadataGenres
+import com.grayvines.roche.data.catalog.resolveWikipediaUrl
+import com.grayvines.roche.data.catalog.toMusicLaunchSnapshot
+import com.grayvines.roche.ui.components.RocheSurfaceCard
+import com.grayvines.roche.ui.components.WikipediaIcon
+import com.grayvines.roche.ui.components.rememberEntryThumbnailBitmap
+import com.grayvines.roche.ui.components.rememberHighResImageBitmap
+import com.grayvines.roche.ui.theme.LocalRocheColors
+import com.grayvines.roche.ui.theme.currentHeadlineFontFamily
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+private data class CatalogListAppearance(
+    val collectionId: String,
+    val title: String,
+    val rank: Int,
+    val totalCount: Int,
+    val tier: Char?,
+    val isDynamic: Boolean,
+)
+
+private data class ArtistLibraryAlbum(
+    val entry: CatalogEntryItem,
+    val tier: Char?,
+)
+
+private data class CatalogDetailModel(
+    val entry: CatalogEntryItem,
+    val appearances: List<CatalogListAppearance>,
+    val primaryAppearance: CatalogListAppearance?,
+    val matchingArtistId: String?,
+    val diaryLogs: List<DiaryEntryItem>,
+    val genres: List<String>,
+    val tracks: List<AlbumTrackItem>,
+    val wikiUrl: String?,
+    val artistLibraryAlbums: List<ArtistLibraryAlbum>,
+    val artistExternalDiscography: List<DiscographyAlbumItem>,
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun CatalogDetailBottomSheet(
+    entryId: String,
+    state: MainUiState,
+    onAction: (MainAction) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val model = remember(entryId, state.catalog) { buildCatalogDetailModel(entryId, state) }
+    if (model == null) return
+    val colors = LocalRocheColors.current
+
+    ModalBottomSheet(
+        onDismissRequest = { onAction(MainAction.CloseCatalogDetailSheet) },
+        containerColor = colors.surface,
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val isWide = maxWidth >= CATALOG_DETAIL_WIDE_BREAKPOINT
+            val horizontalPad = if (isWide) 20.dp else 16.dp
+            Column(
+                modifier =
+                    Modifier.fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = horizontalPad, vertical = 6.dp)
+                        .testTag("catalog_detail_sheet"),
+                verticalArrangement = Arrangement.spacedBy(20.dp),
+            ) {
+                when (model.entry.kind) {
+                    EntryKind.ALBUM ->
+                        AlbumDetailSheetBody(
+                            model = model,
+                            isWide = isWide,
+                            onAction = onAction,
+                            onPlayAlbum = {
+                                onOpenCollectionDraw(model.entry.toMusicLaunchSnapshot())
+                            },
+                            onPlayMusicTrack = onPlayMusicTrack,
+                            onOpenExternalUrl = onOpenExternalUrl,
+                        )
+                    EntryKind.ARTIST ->
+                        ArtistDetailSheetBody(
+                            model = model,
+                            isWide = isWide,
+                            onAction = onAction,
+                            onOpenExternalUrl = onOpenExternalUrl,
+                        )
+                    else ->
+                        GenericCatalogDetailBody(
+                            model = model,
+                            isWide = isWide,
+                            onAction = onAction,
+                            onOpenExternalUrl = onOpenExternalUrl,
+                        )
+                }
+                Spacer(modifier = Modifier.height(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlbumDetailSheetBody(
+    model: CatalogDetailModel,
+    isWide: Boolean,
+    onAction: (MainAction) -> Unit,
+    onPlayAlbum: () -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val openList: (String) -> Unit = { colId ->
+        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId))
+    }
+    AlbumDetailHero(
+        model = model,
+        onPlayAlbum = onPlayAlbum,
+        onOpenArtist =
+            model.matchingArtistId?.let { id ->
+                { onAction(MainAction.OpenCatalogDetailSheet(id)) }
+            },
+        onRank = { startFocusedRank(model.primaryAppearance, model.entry.id, onAction) },
+    )
+    if (isWide) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(18.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(modifier = Modifier.weight(ALBUM_TRACKLIST_WEIGHT)) {
+                AlbumTracklistSection(model.entry, model.tracks, onPlayAlbum, onPlayMusicTrack)
+            }
+            Column(
+                modifier = Modifier.weight(ALBUM_SIDE_WEIGHT),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                CatalogListsSection(
+                    model.appearances,
+                    model.wikiUrl,
+                    null,
+                    openList,
+                    onOpenExternalUrl,
+                )
+                CatalogDiarySection(model.entry, model.diaryLogs, onAction)
+            }
+        }
+    } else {
+        AlbumTracklistSection(model.entry, model.tracks, onPlayAlbum, onPlayMusicTrack)
+        CatalogListsSection(model.appearances, model.wikiUrl, null, openList, onOpenExternalUrl)
+        CatalogDiarySection(model.entry, model.diaryLogs, onAction)
+    }
+}
+
+@Composable
+private fun AlbumDetailHero(
+    model: CatalogDetailModel,
+    onPlayAlbum: () -> Unit,
+    onOpenArtist: (() -> Unit)?,
+    onRank: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val entry = model.entry
+    val genresLine = remember(model.genres) { model.genres.take(3).joinToString(" · ") }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AlbumHeroCoverButton(entry = entry, onClick = onPlayAlbum)
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            HeroTitleWithYear(
+                title = entry.title,
+                releaseYear = entry.releaseYear,
+                onClick = onPlayAlbum,
+                testTag = "catalog_detail_play_title",
+            )
+            if (entry.primaryCreator.isNotBlank()) {
+                AlbumHeroArtistLine(
+                    artistName = entry.creators.joinToString(", "),
+                    onOpenArtist = onOpenArtist,
+                )
+            }
+            if (genresLine.isNotBlank()) {
+                Text(
+                    text = genresLine,
+                    color = colors.textSecondary,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HeroCompactRankBadge(
+            appearance = model.primaryAppearance,
+            onClick = onRank,
+        )
+    }
+}
+
+@Composable
+private fun AlbumHeroCoverButton(
+    entry: CatalogEntryItem,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(10.dp)
+    val bitmap = rememberHighResImageBitmap(primaryKey = entry.thumbnailUrl, fallbackKey = null)
+    Box(
+        modifier =
+            Modifier.size(78.dp)
+                .clip(shape)
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.border, shape)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Play ${entry.title} in music app"
+                }
+                .testTag("catalog_detail_album_cover")
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                filterQuality = FilterQuality.Medium,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Canvas(modifier = Modifier.fillMaxSize()) { drawVinylSleeveArtwork(colors) }
+        }
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.align(Alignment.BottomEnd)
+                    .padding(5.dp)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xD6141413))
+                    .border(1.dp, Color.White.copy(alpha = 0.22f), CircleShape),
+        ) {
+            Canvas(modifier = Modifier.size(9.dp)) {
+                val w = size.width
+                val h = size.height
+                val tri =
+                    Path().apply {
+                        moveTo(w * 0.26f, h * 0.14f)
+                        lineTo(w * 0.88f, h * 0.50f)
+                        lineTo(w * 0.26f, h * 0.86f)
+                        close()
+                    }
+                drawPath(path = tri, color = colors.textPrimary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlbumHeroArtistLine(
+    artistName: String,
+    onOpenArtist: (() -> Unit)?,
+) {
+    val colors = LocalRocheColors.current
+    if (onOpenArtist != null) {
+        Text(
+            text = "$artistName →",
+            color = colors.accentBlue,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier =
+                Modifier.clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onOpenArtist)
+                    .semantics { role = Role.Button }
+                    .padding(vertical = 1.dp)
+                    .testTag("catalog_detail_artist_link"),
+        )
+    } else {
+        Text(
+            text = artistName,
+            color = colors.textSecondary,
+            fontSize = 13.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun HeroTitleWithYear(
+    title: String,
+    releaseYear: Int?,
+    onClick: (() -> Unit)? = null,
+    testTag: String? = null,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val annotated =
+        remember(title, releaseYear, colors, headlineFamily) {
+            buildAnnotatedString {
+                withStyle(
+                    SpanStyle(
+                        color = colors.textPrimary,
+                        fontFamily = headlineFamily,
+                        fontSize = 21.sp,
+                        fontWeight = FontWeight.Normal,
+                    )
+                ) {
+                    append(title)
+                }
+                if (releaseYear != null && releaseYear > 0) {
+                    append("  ")
+                    withStyle(
+                        SpanStyle(
+                            color = colors.textMuted,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Normal,
+                        )
+                    ) {
+                        append(releaseYear.toString())
+                    }
+                }
+            }
+        }
+    var mod: Modifier = Modifier
+    if (onClick != null) {
+        mod = mod.clickable(onClick = onClick).semantics { role = Role.Button }
+    }
+    if (testTag != null) {
+        mod = mod.testTag(testTag)
+    }
+    Text(
+        text = annotated,
+        lineHeight = 25.sp,
+        maxLines = 2,
+        overflow = TextOverflow.Ellipsis,
+        modifier = mod,
+    )
+}
+
+@Composable
+private fun HeroCompactRankBadge(
+    appearance: CatalogListAppearance?,
+    onClick: () -> Unit,
+) {
+    if (appearance == null) return
+    val colors = LocalRocheColors.current
+    val canRank = appearance.totalCount >= 2
+    val clickMod =
+        if (canRank) {
+            Modifier.minimumInteractiveComponentSize()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Rank in ${appearance.title}"
+                }
+        } else {
+            Modifier
+        }
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier =
+            clickMod.padding(horizontal = 6.dp, vertical = 4.dp).testTag("catalog_detail_rank_btn"),
+    ) {
+        if (appearance.tier != null) {
+            TierBadgePill(tier = appearance.tier)
+        }
+        Text(
+            text = "#${appearance.rank}",
+            color = colors.textSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun AlbumTracklistSection(
+    entry: CatalogEntryItem,
+    tracks: List<AlbumTrackItem>,
+    onPlayAlbum: () -> Unit,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+) {
+    val summaryNote = remember(tracks) { formatTracklistSummary(tracks) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SheetSectionHeaderRow(title = "Tracklist", trailingNote = summaryNote)
+        RocheSurfaceCard {
+            if (tracks.isEmpty()) {
+                AlbumTracklistEmptyFallback(onPlayAlbum = onPlayAlbum)
+            } else {
+                AlbumTracklistRows(
+                    entry = entry,
+                    tracks = tracks,
+                    onPlayMusicTrack = onPlayMusicTrack,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlbumTracklistEmptyFallback(onPlayAlbum: () -> Unit) {
+    val colors = LocalRocheColors.current
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clickable(onClick = onPlayAlbum)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 14.dp, vertical = 14.dp)
+                .testTag("catalog_detail_play_album_fallback"),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = "Open album in your music app",
+            color = colors.accentBlue,
+            fontSize = 13.5.sp,
+        )
+        Text(
+            text = "Tracklist appears automatically once album metadata is enriched.",
+            color = colors.textMuted,
+            fontSize = 11.5.sp,
+            lineHeight = 16.sp,
+        )
+    }
+}
+
+@Composable
+private fun AlbumTracklistRows(
+    entry: CatalogEntryItem,
+    tracks: List<AlbumTrackItem>,
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val multiDisc = remember(tracks) { tracks.any { it.disc > 1 } }
+    tracks.forEachIndexed { idx, track ->
+        val isNewDisc = multiDisc && (idx == 0 || tracks[idx - 1].disc != track.disc)
+        if (idx > 0) {
+            HorizontalDivider(color = colors.border, thickness = 1.dp)
+        }
+        if (isNewDisc) {
+            Text(
+                text = "DISC ${track.disc}",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                letterSpacing = 0.8.sp,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+            )
+        }
+        AlbumTrackRow(
+            track = track,
+            onClick = {
+                onPlayMusicTrack(
+                    MusicTrackLaunchRequest(
+                        trackTitle = track.title,
+                        albumTitle = entry.title,
+                        artist = track.artists.firstOrNull() ?: entry.primaryCreator,
+                        spotifyUri = track.spotifyUri,
+                    )
+                )
+            },
+        )
+    }
+}
+
+@Composable
+private fun AlbumTrackRow(
+    track: AlbumTrackItem,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val duration = remember(track.durationMs) { formatTrackDuration(track.durationMs) }
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 44.dp)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Play ${track.title}"
+                }
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+                .testTag("catalog_track_${track.disc}_${track.number}"),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = track.number.toString(),
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.5.sp,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(22.dp),
+        )
+        Text(
+            text = track.title,
+            color = colors.textPrimary,
+            fontSize = 13.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (duration.isNotEmpty()) {
+            Text(
+                text = duration,
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.5.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun CatalogListsSection(
+    appearances: List<CatalogListAppearance>,
+    wikiUrl: String?,
+    externalUrl: String?,
+    onOpenList: (String) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    if (appearances.isEmpty() && wikiUrl == null && externalUrl == null) return
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "LISTS",
+                color = colors.textMuted,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.8.sp,
+                modifier = Modifier.semantics { heading() },
+            )
+            if (wikiUrl != null) {
+                QuietWikiButton(onClick = { onOpenExternalUrl(wikiUrl) })
+            } else if (externalUrl != null) {
+                Text(
+                    text = "Open ↗",
+                    color = colors.accentBlue,
+                    fontSize = 12.sp,
+                    modifier =
+                        Modifier.clickable { onOpenExternalUrl(externalUrl) }
+                            .semantics { role = Role.Button },
+                )
+            }
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            appearances.forEach { app ->
+                CatalogListLinkButton(appearance = app, onClick = { onOpenList(app.collectionId) })
+            }
+        }
+    }
+}
+
+@Composable
+private fun CatalogListLinkButton(
+    appearance: CatalogListAppearance,
+    onClick: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val shape = RoundedCornerShape(10.dp)
+    Row(
+        modifier =
+            Modifier.fillMaxWidth()
+                .heightIn(min = 44.dp)
+                .clip(shape)
+                .background(colors.background)
+                .border(1.dp, colors.border, shape)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .testTag("catalog_detail_list_btn_${appearance.collectionId}"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = appearance.title,
+            color = colors.textPrimary,
+            fontFamily = headlineFamily,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.Normal,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f).padding(end = 8.dp),
+        )
+        Text(
+            text = "#${appearance.rank}",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun QuietWikiButton(onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier =
+            Modifier.clip(RoundedCornerShape(6.dp))
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Button
+                    contentDescription = "Open Wikipedia"
+                }
+                .padding(horizontal = 4.dp, vertical = 2.dp)
+                .testTag("catalog_detail_wiki_btn"),
+    ) {
+        WikipediaIcon(tint = colors.textSecondary, size = 14.dp)
+        Text(text = "Wiki", color = colors.textSecondary, fontSize = 11.5.sp)
+    }
+}
+
+@Composable
+private fun CatalogDiarySection(
+    entry: CatalogEntryItem,
+    logs: List<DiaryEntryItem>,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "DIARY",
+                color = colors.textMuted,
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.8.sp,
+                modifier = Modifier.semantics { heading() },
+            )
+            Text(
+                text = "+ Log",
+                color = colors.accentBlue,
+                fontSize = 12.sp,
+                modifier =
+                    Modifier.clip(RoundedCornerShape(6.dp))
+                        .clickable {
+                            onAction(
+                                MainAction.OpenQuickLogSheet(
+                                    defaultToWant = false,
+                                    prefillKind = entry.kind,
+                                    prefillTitle = entry.title,
+                                    prefillCreators = entry.creators.joinToString(", "),
+                                    prefillReleaseYear = entry.releaseYear,
+                                )
+                            )
+                        }
+                        .semantics { role = Role.Button }
+                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                        .testTag("catalog_detail_log_btn"),
+            )
+        }
+        RocheSurfaceCard {
+            if (logs.isEmpty()) {
+                Text(
+                    text = "No plays logged yet.",
+                    color = colors.textMuted,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                )
+            } else {
+                logs.forEachIndexed { idx, log ->
+                    if (idx > 0) {
+                        HorizontalDivider(color = colors.border, thickness = 1.dp)
+                    }
+                    CatalogDiaryHistoryRow(log = log)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CatalogDiaryHistoryRow(log: DiaryEntryItem) {
+    val colors = LocalRocheColors.current
+    val dateText = remember(log.ts, log.dateLabel) { formatDiaryFullDate(log.ts, log.dateLabel) }
+    val (statusLabel, statusTint) =
+        when (log.status) {
+            ConsumptionStatus.CONSUMED -> "Finished" to colors.accentVerdigris
+            ConsumptionStatus.STARTED -> "Started" to colors.accentBlue
+            ConsumptionStatus.ABANDONED -> "Abandoned" to colors.accentIndianRed
+        }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = dateText,
+                color = colors.textSecondary,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.5.sp,
+            )
+            Box(
+                modifier =
+                    Modifier.clip(RoundedCornerShape(6.dp))
+                        .background(statusTint.copy(alpha = 0.14f))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = statusLabel,
+                    color = statusTint,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.5.sp,
+                )
+            }
+        }
+        if (!log.notes.isNullOrBlank()) {
+            Text(
+                text = log.notes,
+                color = colors.accentEcru,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArtistDetailSheetBody(
+    model: CatalogDetailModel,
+    isWide: Boolean,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val portraitUrl =
+        model.entry.thumbnailUrl
+            ?: model.artistLibraryAlbums
+                .firstOrNull { !it.entry.thumbnailUrl.isNullOrBlank() }
+                ?.entry
+                ?.thumbnailUrl
+    ArtistDetailHero(
+        entry = model.entry,
+        portraitUrl = portraitUrl,
+        inLibraryCount = model.artistLibraryAlbums.size,
+        primaryAppearance = model.primaryAppearance,
+        onRank = { startFocusedRank(model.primaryAppearance, model.entry.id, onAction) },
+    )
+    ArtistDiscographySection(
+        artistName = model.entry.title,
+        inLibraryAlbums = model.artistLibraryAlbums,
+        externalAlbums = model.artistExternalDiscography,
+        columns = if (isWide) 3 else 2,
+        wikiUrl = model.wikiUrl,
+        onOpenAlbum = { albumId -> onAction(MainAction.OpenCatalogDetailSheet(albumId)) },
+        onAddExternalAlbum = { ext ->
+            onAction(
+                MainAction.OpenQuickLogSheet(
+                    defaultToWant = false,
+                    prefillKind = EntryKind.ALBUM,
+                    prefillTitle = ext.title,
+                    prefillCreators = model.entry.title,
+                    prefillReleaseYear = ext.releaseYear,
+                )
+            )
+        },
+        onOpenExternalUrl = onOpenExternalUrl,
+    )
+}
+
+@Composable
+private fun ArtistDetailHero(
+    entry: CatalogEntryItem,
+    portraitUrl: String?,
+    inLibraryCount: Int,
+    primaryAppearance: CatalogListAppearance?,
+    onRank: () -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val headlineFamily = currentHeadlineFontFamily()
+    val bitmap = rememberHighResImageBitmap(primaryKey = portraitUrl, fallbackKey = null)
+    val countLabel =
+        if (inLibraryCount == 1) "1 album in library" else "$inLibraryCount albums in library"
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.size(70.dp)
+                    .clip(CircleShape)
+                    .background(colors.surfaceElevated)
+                    .border(1.dp, colors.border, CircleShape),
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    text = entry.title.take(1).uppercase(),
+                    color = colors.textMuted,
+                    fontFamily = headlineFamily,
+                    fontSize = 24.sp,
+                    modifier = Modifier.clearAndSetSemantics {},
+                )
+            }
+        }
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(
+                text = "ARTIST",
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                letterSpacing = 0.8.sp,
+            )
+            Text(
+                text = entry.title,
+                color = colors.textPrimary,
+                fontFamily = headlineFamily,
+                fontSize = 21.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(text = countLabel, color = colors.textSecondary, fontSize = 12.sp)
+        }
+        HeroCompactRankBadge(appearance = primaryAppearance, onClick = onRank)
+    }
+}
+
+private sealed interface DiscographyTile {
+    data class InLibrary(val item: ArtistLibraryAlbum) : DiscographyTile
+
+    data class External(val item: DiscographyAlbumItem) : DiscographyTile
+}
+
+@Suppress("LongParameterList")
+@Composable
+private fun ArtistDiscographySection(
+    artistName: String,
+    inLibraryAlbums: List<ArtistLibraryAlbum>,
+    externalAlbums: List<DiscographyAlbumItem>,
+    columns: Int,
+    wikiUrl: String?,
+    onOpenAlbum: (String) -> Unit,
+    onAddExternalAlbum: (DiscographyAlbumItem) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val tiles =
+        remember(inLibraryAlbums, externalAlbums) {
+            inLibraryAlbums.map(DiscographyTile::InLibrary) +
+                externalAlbums.map(DiscographyTile::External)
+        }
+    val note =
+        if (externalAlbums.isNotEmpty()) {
+            "${inLibraryAlbums.size} of ${tiles.size} in library"
+        } else {
+            "${inLibraryAlbums.size} in library"
+        }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        ArtistDiscographyHeader(
+            note = note,
+            wikiUrl = wikiUrl,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+        if (tiles.isEmpty()) {
+            RocheSurfaceCard {
+                Text(
+                    text = "No albums for $artistName in your library yet.",
+                    color = colors.textMuted,
+                    fontSize = 12.5.sp,
+                    modifier = Modifier.padding(14.dp),
+                )
+            }
+        } else {
+            ArtistDiscographyGrid(
+                tiles = tiles,
+                columns = columns,
+                onOpenAlbum = onOpenAlbum,
+                onAddExternalAlbum = onAddExternalAlbum,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArtistDiscographyHeader(
+    note: String,
+    wikiUrl: String?,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "DISCOGRAPHY",
+            color = colors.textMuted,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.semantics { heading() },
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = note,
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+            if (wikiUrl != null) {
+                QuietWikiButton(onClick = { onOpenExternalUrl(wikiUrl) })
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArtistDiscographyGrid(
+    tiles: List<DiscographyTile>,
+    columns: Int,
+    onOpenAlbum: (String) -> Unit,
+    onAddExternalAlbum: (DiscographyAlbumItem) -> Unit,
+) {
+    val rows = remember(tiles, columns) { tiles.chunked(columns) }
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        rows.forEach { rowTiles ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                rowTiles.forEach { tile ->
+                    Box(modifier = Modifier.weight(1f)) {
+                        when (tile) {
+                            is DiscographyTile.InLibrary ->
+                                DiscographyLibraryCard(
+                                    album = tile.item,
+                                    onClick = { onOpenAlbum(tile.item.entry.id) },
+                                )
+                            is DiscographyTile.External ->
+                                DiscographyExternalCard(
+                                    album = tile.item,
+                                    onClick = { onAddExternalAlbum(tile.item) },
+                                )
+                        }
+                    }
+                }
+                repeat(columns - rowTiles.size) { Spacer(modifier = Modifier.weight(1f)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscographyLibraryCard(album: ArtistLibraryAlbum, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(9.dp)
+    val bitmap = rememberEntryThumbnailBitmap(null, album.entry.thumbnailUrl)
+    Column(
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .clickable(onClick = onClick)
+                .semantics { role = Role.Button }
+                .testTag("artist_discog_album_${album.entry.id}"),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.fillMaxWidth()
+                    .aspectRatio(1f)
+                    .clip(shape)
+                    .background(colors.background)
+                    .border(1.dp, colors.border, shape),
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap,
+                    null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(text = "♪", color = colors.textMuted, fontSize = 18.sp)
+            }
+        }
+        Text(
+            text = album.entry.title,
+            color = colors.textPrimary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 13.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = album.entry.releaseYear?.takeIf { it > 0 }?.toString().orEmpty(),
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+            if (album.tier != null) {
+                TierBadgePill(tier = album.tier)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiscographyExternalCard(album: DiscographyAlbumItem, onClick: () -> Unit) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(9.dp)
+    val pillShape = RoundedCornerShape(999.dp)
+    val bitmap = rememberEntryThumbnailBitmap(null, album.thumbnailUrl)
+    Column(
+        modifier =
+            Modifier.fillMaxWidth().clip(shape).clickable(onClick = onClick).semantics {
+                role = Role.Button
+            },
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier =
+                Modifier.fillMaxWidth()
+                    .aspectRatio(1f)
+                    .clip(shape)
+                    .background(colors.background)
+                    .border(1.dp, colors.border, shape),
+        ) {
+            if (bitmap != null) {
+                Image(
+                    bitmap,
+                    null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize().alpha(0.45f),
+                )
+            }
+            Box(
+                modifier =
+                    Modifier.clip(pillShape)
+                        .background(colors.surface.copy(alpha = 0.88f))
+                        .border(1.dp, colors.border, pillShape)
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    "+ Add",
+                    color = colors.accentBlue,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+        Text(
+            text = album.title,
+            color = colors.textSecondary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 13.5.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = album.releaseYear?.toString() ?: "Album",
+            color = colors.textMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun GenericCatalogDetailBody(
+    model: CatalogDetailModel,
+    isWide: Boolean,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val entry = model.entry
+    val openList: (String) -> Unit = { colId ->
+        onAction(MainAction.OpenCompanionSection(CompanionSubTab.LISTS, colId))
+    }
+    GenericCatalogDetailHero(model = model, onAction = onAction)
+    if (!entry.summary.isNullOrBlank()) {
+        RocheSurfaceCard {
+            Text(
+                text = entry.summary,
+                color = colors.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.padding(14.dp),
+            )
+        }
+    }
+    if (isWide) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(18.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                CatalogListsSection(
+                    model.appearances,
+                    model.wikiUrl,
+                    entry.url,
+                    openList,
+                    onOpenExternalUrl,
+                )
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                CatalogDiarySection(entry, model.diaryLogs, onAction)
+            }
+        }
+    } else {
+        CatalogListsSection(
+            model.appearances,
+            model.wikiUrl,
+            entry.url,
+            openList,
+            onOpenExternalUrl,
+        )
+        CatalogDiarySection(entry, model.diaryLogs, onAction)
+    }
+}
+
+@Composable
+private fun GenericCatalogDetailHero(
+    model: CatalogDetailModel,
+    onAction: (MainAction) -> Unit,
+) {
+    val colors = LocalRocheColors.current
+    val entry = model.entry
+    val genresLine = remember(model.genres) { model.genres.take(3).joinToString(" · ") }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CatalogCoverThumbnail(thumbnailUrl = entry.thumbnailUrl, kind = entry.kind, size = 72.dp)
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                text = entry.kind.displayLabel.uppercase(),
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                letterSpacing = 0.8.sp,
+            )
+            HeroTitleWithYear(title = entry.title, releaseYear = entry.releaseYear)
+            if (entry.creators.isNotEmpty()) {
+                Text(
+                    text = entry.creators.joinToString(", "),
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (genresLine.isNotBlank()) {
+                Text(
+                    text = genresLine,
+                    color = colors.textMuted,
+                    fontSize = 11.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        HeroCompactRankBadge(
+            appearance = model.primaryAppearance,
+            onClick = { startFocusedRank(model.primaryAppearance, entry.id, onAction) },
+        )
+    }
+}
+
+@Composable
+private fun SheetSectionHeaderRow(title: String, trailingNote: String = "") {
+    val colors = LocalRocheColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title.uppercase(),
+            color = colors.textMuted,
+            fontSize = 10.5.sp,
+            fontWeight = FontWeight.Medium,
+            letterSpacing = 0.8.sp,
+            modifier = Modifier.semantics { heading() },
+        )
+        if (trailingNote.isNotBlank()) {
+            Text(
+                text = trailingNote,
+                color = colors.textMuted,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp,
+            )
+        }
+    }
+}
+
+private fun startFocusedRank(
+    appearance: CatalogListAppearance?,
+    entryId: String,
+    onAction: (MainAction) -> Unit,
+) {
+    if (appearance == null || appearance.totalCount < 2) return
+    onAction(MainAction.StartRankingSession(appearance.collectionId, entryId))
+}
+
+private fun buildCatalogDetailModel(entryId: String, state: MainUiState): CatalogDetailModel? {
+    val catalog = state.catalog
+    val entry = resolveCatalogEntryById(entryId, state) ?: return null
+    val appearances = collectListAppearances(entryId, state)
+    val matchingArtistId =
+        if (entry.kind == EntryKind.ALBUM && entry.primaryCreator.isNotBlank()) {
+            findArtistEntryId(entry.primaryCreator, state)
+        } else {
+            null
+        }
+    val artistAlbums =
+        if (entry.kind == EntryKind.ARTIST) {
+            collectArtistLibraryAlbums(entry.title, state)
+        } else {
+            emptyList()
+        }
+    val inLibTitleKeys = artistAlbums.mapTo(HashSet()) { it.entry.title.trim().lowercase() }
+    val externalDiscog =
+        if (entry.kind == EntryKind.ARTIST) {
+            extractArtistDiscography(entry.metadataJson).filter {
+                it.title.trim().lowercase() !in inLibTitleKeys
+            }
+        } else {
+            emptyList()
+        }
+    return CatalogDetailModel(
+        entry = entry,
+        appearances = appearances,
+        primaryAppearance = appearances.firstOrNull(),
+        matchingArtistId = matchingArtistId,
+        diaryLogs = catalog.diaryEntries.filter { it.entryId == entry.id },
+        genres = extractMetadataGenres(entry.metadataJson),
+        tracks =
+            if (entry.kind == EntryKind.ALBUM) {
+                extractAlbumTracks(entry.metadataJson)
+            } else {
+                emptyList()
+            },
+        wikiUrl = entry.resolveWikipediaUrl(),
+        artistLibraryAlbums = artistAlbums,
+        artistExternalDiscography = externalDiscog,
+    )
+}
+
+private fun resolveCatalogEntryById(entryId: String, state: MainUiState): CatalogEntryItem? =
+    state.catalog.entriesById[entryId]
+        ?: state.catalog.entriesByCollectionId.values
+            .asSequence()
+            .flatten()
+            .firstOrNull { it.entry.id == entryId }
+            ?.entry
+        ?: state.catalog.diaryEntries
+            .firstOrNull { it.entryId == entryId }
+            ?.let { diary ->
+                CatalogEntryItem(
+                    id = diary.entryId,
+                    kind = diary.kind,
+                    title = diary.title,
+                    creators = diary.creators,
+                    url = null,
+                    publishedAt = null,
+                    releaseYear = diary.releaseYear,
+                    summary = null,
+                    thumbnailUrl = diary.thumbnailUrl,
+                    identifiers = emptyList(),
+                )
+            }
+
+private fun collectListAppearances(
+    entryId: String,
+    state: MainUiState,
+): List<CatalogListAppearance> {
+    val result = mutableListOf<CatalogListAppearance>()
+    for (summary in state.catalog.lists) {
+        val ranked = state.catalog.entriesByCollectionId[summary.collectionId].orEmpty()
+        val match = ranked.firstOrNull { it.entry.id == entryId } ?: continue
+        result.add(
+            CatalogListAppearance(
+                collectionId = summary.collectionId,
+                title = summary.title,
+                rank = match.rank,
+                totalCount = ranked.size,
+                tier = match.tier,
+                isDynamic = summary.mode == CollectionMode.DYNAMIC,
+            )
+        )
+    }
+    return result.sortedWith(
+        compareByDescending<CatalogListAppearance> { it.isDynamic }.thenBy { it.title.lowercase() }
+    )
+}
+
+private fun findArtistEntryId(artistName: String, state: MainUiState): String? {
+    val clean = artistName.trim()
+    if (clean.isEmpty()) return null
+    return state.catalog.entriesById.values
+        .firstOrNull { it.kind == EntryKind.ARTIST && it.title.equals(clean, ignoreCase = true) }
+        ?.id
+        ?: state.catalog.entriesByCollectionId.values
+            .asSequence()
+            .flatten()
+            .firstOrNull {
+                it.entry.kind == EntryKind.ARTIST && it.entry.title.equals(clean, ignoreCase = true)
+            }
+            ?.entry
+            ?.id
+}
+
+private fun collectArtistLibraryAlbums(
+    artistName: String,
+    state: MainUiState,
+): List<ArtistLibraryAlbum> {
+    val tierByEntryId = buildMap {
+        state.catalog.lists
+            .filter { it.mode == CollectionMode.DYNAMIC }
+            .forEach { list ->
+                state.catalog.entriesByCollectionId[list.collectionId].orEmpty().forEach { ranked ->
+                    if (ranked.tier != null) put(ranked.entry.id, ranked.tier)
+                }
+            }
+    }
+    val allEntries =
+        buildMap<String, CatalogEntryItem> {
+            state.catalog.entriesById.values.forEach { put(it.id, it) }
+            state.catalog.entriesByCollectionId.values.flatten().forEach {
+                putIfAbsent(it.entry.id, it.entry)
+            }
+        }
+    return allEntries.values
+        .filter { entry ->
+            entry.kind == EntryKind.ALBUM &&
+                entry.creators.any { it.equals(artistName, ignoreCase = true) }
+        }
+        .sortedWith(
+            compareByDescending<CatalogEntryItem> { it.releaseYear ?: Int.MIN_VALUE }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.title }
+        )
+        .map { ArtistLibraryAlbum(entry = it, tier = tierByEntryId[it.id]) }
+}
+
+private fun formatTracklistSummary(tracks: List<AlbumTrackItem>): String {
+    if (tracks.isEmpty()) return ""
+    val songWord = if (tracks.size == 1) "song" else "songs"
+    val totalMs = tracks.mapNotNull { it.durationMs }.sum()
+    val totalMinutes = (totalMs / MS_PER_MINUTE).toInt()
+    return if (totalMinutes > 0) {
+        "${tracks.size} $songWord · $totalMinutes min"
+    } else {
+        "${tracks.size} $songWord"
+    }
+}
+
+private fun formatTrackDuration(durationMs: Long?): String {
+    if (durationMs == null || durationMs <= 0L) return ""
+    val totalSec = durationMs / MS_PER_SECOND
+    val min = totalSec / SECONDS_PER_MINUTE
+    val sec = totalSec % SECONDS_PER_MINUTE
+    return "%d:%02d".format(Locale.US, min, sec)
+}
+
+private fun formatDiaryFullDate(rawIso: String, fallback: String): String {
+    val parsed = parseIsoInstant(rawIso) ?: return fallback
+    return DIARY_FULL_DATE_FMT.format(parsed.atZone(ZoneOffset.UTC))
+}
+
+private val CATALOG_DETAIL_WIDE_BREAKPOINT = 480.dp
+private const val ALBUM_TRACKLIST_WEIGHT = 1.55f
+private const val ALBUM_SIDE_WEIGHT = 1f
+private const val MS_PER_SECOND = 1_000L
+private const val SECONDS_PER_MINUTE = 60L
+private const val MS_PER_MINUTE = 60_000L
+private val DIARY_FULL_DATE_FMT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("MMM d, yyyy", Locale.US)

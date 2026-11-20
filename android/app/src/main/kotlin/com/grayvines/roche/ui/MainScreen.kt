@@ -56,6 +56,7 @@ import com.grayvines.roche.core.STARRED_COLLECTION_ID
 import com.grayvines.roche.core.WANT_TO_READ_COLLECTION_ID
 import com.grayvines.roche.data.RocheRepository
 import com.grayvines.roche.data.catalog.CollectionDrawSnapshot
+import com.grayvines.roche.data.catalog.MusicTrackLaunchRequest
 import com.grayvines.roche.data.catalog.generatorFor
 import com.grayvines.roche.model.AppTab
 import com.grayvines.roche.model.InboxEntry
@@ -94,6 +95,7 @@ fun MainScreen(
     onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = { draw ->
         openCollectionDrawFallback(draw, onOpenExternalUrl)
     },
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit = {},
 ) {
     val colors = LocalRocheColors.current
     val scrollStates = rememberMainScrollStates()
@@ -256,6 +258,8 @@ fun MainScreen(
         onAction = onAction,
         onShareEntry = onShareEntry,
         onOpenExternalUrl = onOpenExternalUrl,
+        onOpenCollectionDraw = onOpenCollectionDraw,
+        onPlayMusicTrack = onPlayMusicTrack,
     )
 }
 
@@ -528,6 +532,8 @@ internal fun MainOverlaySheets(
     onAction: (MainAction) -> Unit,
     onShareEntry: (InboxEntry) -> Unit,
     onOpenExternalUrl: (String) -> Unit,
+    onOpenCollectionDraw: (CollectionDrawSnapshot) -> Unit = {},
+    onPlayMusicTrack: (MusicTrackLaunchRequest) -> Unit = {},
 ) {
     val contextEntry = state.contextSheetEntry
     if (contextEntry != null) {
@@ -593,11 +599,27 @@ internal fun MainOverlaySheets(
         )
     }
 
+    val catalogDetailId = state.catalogDetailEntryId
+    if (catalogDetailId != null) {
+        CatalogDetailBottomSheet(
+            entryId = catalogDetailId,
+            state = state,
+            onAction = onAction,
+            onOpenCollectionDraw = onOpenCollectionDraw,
+            onPlayMusicTrack = onPlayMusicTrack,
+            onOpenExternalUrl = onOpenExternalUrl,
+        )
+    }
+
     if (state.isQuickLogSheetOpen) {
         QuickLogBottomSheet(
             defaultToWant = state.quickLogDefaultWant,
             targetCollectionId = state.quickLogTargetCollectionId,
             targetCollectionTitle = state.quickLogTargetCollectionTitle,
+            prefillKind = state.quickLogPrefillKind,
+            prefillTitle = state.quickLogPrefillTitle,
+            prefillCreators = state.quickLogPrefillCreators,
+            prefillReleaseYear = state.quickLogPrefillReleaseYear,
             onAction = onAction,
         )
     }

@@ -2,16 +2,22 @@
 
 package com.grayvines.roche.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -24,16 +30,23 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.grayvines.roche.data.catalog.CollectionGeneratorState
 import com.grayvines.roche.data.catalog.ConsumptionStatus
 import com.grayvines.roche.data.catalog.EntryKind
-import com.grayvines.roche.ui.components.FilterChipPill
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SheetActionFooter
 import com.grayvines.roche.ui.theme.LocalRocheColors
@@ -99,8 +112,8 @@ private fun DrawNoteSheetHeader(
         text = if (isAbandon) "Abandon Draw" else "Finish & Rank",
         color = colors.textPrimary,
         fontFamily = currentHeadlineFontFamily(),
-        fontSize = 19.sp,
-        fontWeight = FontWeight.SemiBold,
+        fontSize = 20.sp,
+        fontWeight = FontWeight.Normal,
     )
     if (draw != null) {
         val subtitle =
@@ -156,6 +169,10 @@ internal fun QuickLogBottomSheet(
     defaultToWant: Boolean,
     targetCollectionId: String? = null,
     targetCollectionTitle: String? = null,
+    prefillKind: EntryKind? = null,
+    prefillTitle: String = "",
+    prefillCreators: String = "",
+    prefillReleaseYear: Int? = null,
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
@@ -167,6 +184,10 @@ internal fun QuickLogBottomSheet(
             defaultToWant = defaultToWant,
             targetCollectionId = targetCollectionId,
             targetCollectionTitle = targetCollectionTitle,
+            prefillKind = prefillKind,
+            prefillTitle = prefillTitle,
+            prefillCreators = prefillCreators,
+            prefillReleaseYear = prefillReleaseYear,
             onAction = onAction,
         )
     }
@@ -177,12 +198,16 @@ private const val DEFAULT_LIST_LABEL = "List"
 private fun formatAddToListLabel(targetCollectionTitle: String?): String =
     "Add to ${targetCollectionTitle ?: DEFAULT_LIST_LABEL}"
 
-@Suppress("LongMethod")
+@Suppress("LongMethod", "LongParameterList")
 @Composable
 private fun QuickLogSheetBody(
     defaultToWant: Boolean,
     targetCollectionId: String?,
     targetCollectionTitle: String?,
+    prefillKind: EntryKind?,
+    prefillTitle: String,
+    prefillCreators: String,
+    prefillReleaseYear: Int?,
     onAction: (MainAction) -> Unit,
 ) {
     val hasTargetList = !targetCollectionId.isNullOrBlank()
@@ -191,11 +216,14 @@ private fun QuickLogSheetBody(
             mutableStateOf(hasTargetList && !defaultToWant)
         }
     var addToWant by rememberSaveable(defaultToWant) { mutableStateOf(defaultToWant) }
-    var kind by rememberSaveable { mutableStateOf(EntryKind.MOVIE) }
+    var kind by rememberSaveable(prefillKind) { mutableStateOf(prefillKind ?: EntryKind.ALBUM) }
     var status by rememberSaveable { mutableStateOf(ConsumptionStatus.CONSUMED) }
-    var title by rememberSaveable { mutableStateOf("") }
-    var creators by rememberSaveable { mutableStateOf("") }
-    var yearText by rememberSaveable { mutableStateOf("") }
+    var title by rememberSaveable(prefillTitle) { mutableStateOf(prefillTitle) }
+    var creators by rememberSaveable(prefillCreators) { mutableStateOf(prefillCreators) }
+    var yearText by
+        rememberSaveable(prefillReleaseYear) {
+            mutableStateOf(prefillReleaseYear?.takeIf { it > 0 }?.toString().orEmpty())
+        }
     var notes by rememberSaveable { mutableStateOf("") }
     var rankAfterLog by rememberSaveable { mutableStateOf(true) }
 
@@ -206,7 +234,7 @@ private fun QuickLogSheetBody(
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 10.dp)
                 .testTag("quick_log_sheet"),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         QuickLogSelectorsSection(
             addToListOnly = addToListOnly,
@@ -260,10 +288,9 @@ private fun QuickLogSheetBody(
                 addToWant -> "Add to Want"
                 else -> "Save Log"
             }
-        val canSubmit = title.isNotBlank()
         SheetActionFooter(
             confirmLabel = submitLabel,
-            confirmEnabled = canSubmit,
+            confirmEnabled = title.isNotBlank(),
             confirmTestTag = "quick_log_submit_btn",
             onCancel = { onAction(MainAction.CloseQuickLogSheet) },
             onConfirm = { onAction(submitAction) },
@@ -322,40 +349,42 @@ private fun QuickLogSelectorsSection(
             !targetCollectionTitle.isNullOrBlank() -> "Log & Add to $targetCollectionTitle"
             else -> "Log to Diary"
         }
-    Text(
-        text = heading,
-        color = colors.textPrimary,
-        fontFamily = currentHeadlineFontFamily(),
-        fontSize = 19.sp,
-        fontWeight = FontWeight.SemiBold,
-    )
-    QuickLogModeChipsRow(
-        hasTargetList = hasTargetList,
-        targetCollectionTitle = targetCollectionTitle,
-        addToListOnly = addToListOnly,
-        addToWant = addToWant,
-        onSelectMode = onSelectMode,
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        loggableKinds.forEach { kind ->
-            FilterChipPill(
-                label = kind.displayLabel,
-                selected = selectedKind == kind,
-                onClick = { onSelectKind(kind) },
-            )
-        }
-    }
-    if (!addToWant && !addToListOnly) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            ConsumptionStatus.entries.forEach { status ->
-                FilterChipPill(
-                    label = status.displayLabel,
-                    selected = selectedStatus == status,
-                    onClick = { onSelectStatus(status) },
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = heading,
+            color = colors.textPrimary,
+            fontFamily = currentHeadlineFontFamily(),
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Normal,
+        )
+        QuickLogModeChipsRow(
+            hasTargetList = hasTargetList,
+            targetCollectionTitle = targetCollectionTitle,
+            addToListOnly = addToListOnly,
+            addToWant = addToWant,
+            onSelectMode = onSelectMode,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            loggableKinds.forEach { kind ->
+                SoftStripTab(
+                    label = kind.displayLabel,
+                    selected = selectedKind == kind,
+                    onClick = { onSelectKind(kind) },
                 )
+            }
+        }
+        if (!addToWant && !addToListOnly) {
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                ConsumptionStatus.entries.forEach { status ->
+                    SoftStripTab(
+                        label = status.displayLabel,
+                        selected = selectedStatus == status,
+                        onClick = { onSelectStatus(status) },
+                    )
+                }
             }
         }
     }
@@ -369,38 +398,87 @@ private fun QuickLogModeChipsRow(
     addToWant: Boolean,
     onSelectMode: (listOnly: Boolean, want: Boolean) -> Unit,
 ) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(10.dp)
     Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        modifier =
+            Modifier.fillMaxWidth()
+                .clip(shape)
+                .background(colors.background)
+                .border(1.dp, colors.border, shape)
+                .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         if (hasTargetList) {
-            FilterChipPill(
+            QuickLogModeSegment(
                 label = formatAddToListLabel(targetCollectionTitle),
                 selected = addToListOnly,
                 onClick = { onSelectMode(true, false) },
+                modifier = Modifier.weight(1f),
             )
-            FilterChipPill(
+            QuickLogModeSegment(
                 label = "Log & Add",
                 selected = !addToListOnly && !addToWant,
                 onClick = { onSelectMode(false, false) },
+                modifier = Modifier.weight(1f),
             )
-            FilterChipPill(
+            QuickLogModeSegment(
                 label = "Want & Add",
                 selected = !addToListOnly && addToWant,
                 onClick = { onSelectMode(false, true) },
+                modifier = Modifier.weight(1f),
             )
         } else {
-            FilterChipPill(
+            QuickLogModeSegment(
                 label = "Log Diary",
                 selected = !addToWant,
                 onClick = { onSelectMode(false, false) },
+                modifier = Modifier.weight(1f),
             )
-            FilterChipPill(
+            QuickLogModeSegment(
                 label = "Want Queue",
                 selected = addToWant,
                 onClick = { onSelectMode(false, true) },
+                modifier = Modifier.weight(1f),
             )
         }
+    }
+}
+
+@Composable
+private fun QuickLogModeSegment(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalRocheColors.current
+    val shape = RoundedCornerShape(7.dp)
+    val bg = if (selected) colors.accentBlue.copy(alpha = 0.16f) else Color.Transparent
+    val textColor = if (selected) colors.accentBlue else colors.textSecondary
+    val weight = if (selected) FontWeight.Medium else FontWeight.Normal
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier =
+            modifier
+                .heightIn(min = 38.dp)
+                .clip(shape)
+                .background(bg)
+                .clickable(onClick = onClick)
+                .semantics {
+                    role = Role.Tab
+                    this.selected = selected
+                }
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+    ) {
+        Text(
+            text = label,
+            color = textColor,
+            fontSize = 13.sp,
+            fontWeight = weight,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -414,32 +492,34 @@ private fun QuickLogMetadataFields(
     onCreatorsChange: (String) -> Unit,
     onYearChange: (String) -> Unit,
 ) {
-    OutlinedTextField(
-        value = title,
-        onValueChange = onTitleChange,
-        label = { Text("Title") },
-        singleLine = true,
-        modifier = Modifier.fillMaxWidth().testTag("quick_log_title_input"),
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         OutlinedTextField(
-            value = creators,
-            onValueChange = onCreatorsChange,
-            label = { Text("Creator / Artist") },
+            value = title,
+            onValueChange = onTitleChange,
+            label = { Text("Title") },
             singleLine = true,
-            modifier = Modifier.weight(CREATOR_FIELD_WEIGHT).testTag("quick_log_creator_input"),
+            modifier = Modifier.fillMaxWidth().testTag("quick_log_title_input"),
         )
-        OutlinedTextField(
-            value = yearText,
-            onValueChange = onYearChange,
-            label = { Text("Year") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.weight(YEAR_FIELD_WEIGHT),
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            OutlinedTextField(
+                value = creators,
+                onValueChange = onCreatorsChange,
+                label = { Text("Creator / Artist") },
+                singleLine = true,
+                modifier = Modifier.weight(CREATOR_FIELD_WEIGHT).testTag("quick_log_creator_input"),
+            )
+            OutlinedTextField(
+                value = yearText,
+                onValueChange = onYearChange,
+                label = { Text("Year") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(YEAR_FIELD_WEIGHT),
+            )
+        }
     }
 }
 
@@ -453,21 +533,23 @@ private fun QuickLogDiaryOptions(
     onNotesChange: (String) -> Unit,
     onRankToggle: (Boolean) -> Unit,
 ) {
-    OutlinedTextField(
-        value = notes,
-        onValueChange = onNotesChange,
-        label = { Text("Notes (optional)") },
-        minLines = 2,
-        maxLines = 3,
-        modifier = Modifier.fillMaxWidth(),
-    )
-    if (selectedStatus == ConsumptionStatus.CONSUMED) {
-        SettingToggleRow(
-            title = "Rank immediately after logging",
-            subtitle = "Compare against entries in $rankTargetTitle",
-            checked = rankAfterLog,
-            onCheckedChange = onRankToggle,
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        OutlinedTextField(
+            value = notes,
+            onValueChange = onNotesChange,
+            label = { Text("Notes (optional)") },
+            minLines = 2,
+            maxLines = 3,
+            modifier = Modifier.fillMaxWidth(),
         )
+        if (selectedStatus == ConsumptionStatus.CONSUMED) {
+            SettingToggleRow(
+                title = "Rank immediately after logging",
+                subtitle = "Compare against entries in $rankTargetTitle",
+                checked = rankAfterLog,
+                onCheckedChange = onRankToggle,
+            )
+        }
     }
 }
 
@@ -477,8 +559,8 @@ private const val YEAR_FIELD_WEIGHT = 0.6f
 
 private val QUICK_LOG_KINDS =
     listOf(
-        EntryKind.MOVIE,
         EntryKind.ALBUM,
+        EntryKind.MOVIE,
         EntryKind.BOOK,
         EntryKind.TV,
         EntryKind.GAME,

@@ -103,6 +103,9 @@ class MainActivity : ComponentActivity() {
                         onImportOpml = { importOpmlLauncher.launch(OPML_MIME_TYPES) },
                         onExportOpml = { exportOpmlLauncher.launch("roche-feeds.opml") },
                         onOpenCollectionDraw = ::openCollectionDraw,
+                        onPlayMusicTrack = { track ->
+                            launchMusicTrack(this@MainActivity, track, ::openUrlInBrowser)
+                        },
                     )
                 }
             }

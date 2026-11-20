@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -29,7 +28,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
@@ -52,6 +50,7 @@ import com.grayvines.roche.ui.components.HeaderActionButton
 import com.grayvines.roche.ui.components.PodcastSpeedStrip
 import com.grayvines.roche.ui.components.RocheAlertDialog
 import com.grayvines.roche.ui.components.RocheButtonStyle
+import com.grayvines.roche.ui.components.RocheSurfaceCard
 import com.grayvines.roche.ui.components.SettingToggleRow
 import com.grayvines.roche.ui.components.SiteFaviconBadge
 import com.grayvines.roche.ui.components.TagChipsEditor
@@ -81,16 +80,15 @@ fun EntryContextBottomSheet(
                 Modifier.fillMaxWidth()
                     .imePadding()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 10.dp)
+                    .padding(horizontal = 20.dp, vertical = 8.dp)
                     .testTag("context_bottom_sheet"),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             ContextSheetHeaderAndTags(
                 entry = entry,
                 allTags = allTags,
                 onAction = onAction,
             )
-            HorizontalDivider(color = colors.border, thickness = 1.dp)
             ContextSheetActionsList(
                 entry = entry,
                 isInQueue = isInQueue,
@@ -104,7 +102,7 @@ fun EntryContextBottomSheet(
                     onOpenExternalUrl(entry.url)
                 },
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
@@ -116,41 +114,44 @@ private fun ContextSheetHeaderAndTags(
     onAction: (MainAction) -> Unit,
 ) {
     val colors = LocalRocheColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.Top,
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(
-                text = entry.title,
-                color = colors.textPrimary,
-                fontFamily = currentHeadlineFontFamily(),
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Medium,
-            )
-            Spacer(modifier = Modifier.height(3.dp))
-            Text(
-                text = "${entry.feedTitle} · ${entry.url}",
-                color = colors.textMuted,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 11.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
+        ) {
+            Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                Text(
+                    text = entry.title,
+                    color = colors.textPrimary,
+                    fontFamily = currentHeadlineFontFamily(),
+                    fontSize = 17.5.sp,
+                    lineHeight = 23.sp,
+                    fontWeight = FontWeight.Normal,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "${entry.feedTitle} · ${entry.url}",
+                    color = colors.textMuted,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            CompactStarAndArchiveButtons(
+                entry = entry,
+                tagPrefix = "sheet",
+                onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
+                onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
             )
         }
-        CompactStarAndArchiveButtons(
+        ContextSheetTagsEditor(
             entry = entry,
-            tagPrefix = "sheet",
-            onToggleStar = { onAction(MainAction.ToggleStar(entry.id)) },
-            onToggleArchive = { onAction(MainAction.ToggleArchive(entry)) },
+            allTags = allTags,
+            onAction = onAction,
         )
     }
-    ContextSheetTagsEditor(
-        entry = entry,
-        allTags = allTags,
-        onAction = onAction,
-    )
 }
 
 @Composable
@@ -171,6 +172,32 @@ internal fun ContextSheetTagsEditor(
     )
 }
 
+private data class ContextActionSpec(
+    val label: String,
+    val onClick: () -> Unit,
+    val textColor: Color? = null,
+    val modifier: Modifier = Modifier,
+)
+
+@Composable
+private fun ContextActionCardGroup(actions: List<ContextActionSpec>) {
+    if (actions.isEmpty()) return
+    val colors = LocalRocheColors.current
+    RocheSurfaceCard {
+        actions.forEachIndexed { idx, spec ->
+            if (idx > 0) {
+                HorizontalDivider(color = colors.border, thickness = 1.dp)
+            }
+            ContextActionItem(
+                label = spec.label,
+                textColor = spec.textColor ?: colors.textPrimary,
+                onClick = spec.onClick,
+                modifier = spec.modifier,
+            )
+        }
+    }
+}
+
 @Composable
 private fun ContextSheetActionsList(
     entry: InboxEntry,
@@ -179,47 +206,50 @@ private fun ContextSheetActionsList(
     onShare: () -> Unit,
     onOpenExternalUrl: () -> Unit,
 ) {
+    val colors = LocalRocheColors.current
     val isAudio = entry.contentType == ContentType.AUDIO
     val isLocalPdf = isLocalPdfUrl(entry.url)
     var confirmDeleteEntry by rememberSaveable(entry.id) { mutableStateOf(false) }
 
-    ContextSheetPrimaryActions(entry = entry, isAudio = isAudio, onAction = onAction)
-    ContextActionItem(
-        label = "Play Next in Queue",
-        onClick = { onAction(MainAction.AddToQueue(entryId = entry.id, playNext = true)) },
-    )
-    ContextActionItem(
-        label = if (isInQueue) "Remove from Queue" else "Add to Queue",
-        onClick = { onAction(MainAction.ToggleQueueMembership(entry.id)) },
-    )
-    ContextActionItem(
-        label = if (entry.isRead) "Mark as Unread" else "Mark as Read",
-        onClick = { onAction(MainAction.ToggleReadState(entry.id)) },
-    )
-    if (!isLocalPdf) {
-        ContextActionItem(label = "Share…", onClick = onShare)
+    val primaryGroup =
+        buildEntryPrimaryActions(
+            entry = entry,
+            isAudio = isAudio,
+            isInQueue = isInQueue,
+            accentBlue = colors.accentBlue,
+            accentVerdigris = colors.accentVerdigris,
+            onAction = onAction,
+        )
+    val secondaryGroup = buildList {
+        if (entry.feedId != null) {
+            add(
+                ContextActionSpec(
+                    label = "Filter Inbox by ${entry.feedTitle}",
+                    onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
+                )
+            )
+        }
+        if (!isLocalPdf) {
+            add(ContextActionSpec(label = "Share…", onClick = onShare))
+        }
+        if (!isLocalPdf && entry.url.isNotBlank()) {
+            add(ContextActionSpec(label = "Open Original URL ↗", onClick = onOpenExternalUrl))
+        }
     }
-    ContextActionItem(
-        label = resolveOfflineActionLabel(entry = entry, isAudio = isAudio),
-        onClick = {
-            onAction(MainAction.CloseContextSheet)
-            onAction(MainAction.ToggleOfflineCache(entry.id))
-        },
-    )
-    if (entry.feedId != null) {
-        ContextActionItem(
-            label = "Filter Inbox by ${entry.feedTitle}",
-            onClick = { onAction(MainAction.FilterByFeed(entry.feedId)) },
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        ContextActionCardGroup(primaryGroup)
+        ContextActionCardGroup(secondaryGroup)
+        ContextActionCardGroup(
+            listOf(
+                ContextActionSpec(
+                    label = "Delete Entry",
+                    textColor = colors.accentIndianRed,
+                    onClick = { confirmDeleteEntry = true },
+                )
+            )
         )
     }
-    if (!isLocalPdf && entry.url.isNotBlank()) {
-        ContextActionItem(label = "Open Original URL", onClick = onOpenExternalUrl)
-    }
-    ContextActionItem(
-        label = "Delete Entry",
-        textColor = LocalRocheColors.current.accentIndianRed,
-        onClick = { confirmDeleteEntry = true },
-    )
     if (confirmDeleteEntry) {
         DestructiveConfirmDialog(
             title = "Delete entry?",
@@ -234,45 +264,79 @@ private fun ContextSheetActionsList(
     }
 }
 
+@Suppress("LongParameterList")
+private fun buildEntryPrimaryActions(
+    entry: InboxEntry,
+    isAudio: Boolean,
+    isInQueue: Boolean,
+    accentBlue: Color,
+    accentVerdigris: Color,
+    onAction: (MainAction) -> Unit,
+): List<ContextActionSpec> = buildList {
+    if (isAudio) {
+        add(
+            ContextActionSpec(
+                "Play Episode Now",
+                { onAction(MainAction.PlayAudioEntry(entry.id, true)) },
+                accentBlue,
+            )
+        )
+        add(
+            ContextActionSpec(
+                "Open Full Show Notes in Reader",
+                { onAction(MainAction.OpenReader(entry.id, forceArticleView = true)) },
+            )
+        )
+    }
+    add(
+        ContextActionSpec(
+            "Finish & Log to Diary",
+            { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = false)) },
+            accentVerdigris,
+        )
+    )
+    add(
+        ContextActionSpec(
+            "Finish & Rank",
+            { onAction(MainAction.MarkFeedEntryFinished(entry.id, rankImmediately = true)) },
+        )
+    )
+    add(
+        ContextActionSpec(
+            "Play Next in Queue",
+            { onAction(MainAction.AddToQueue(entry.id, playNext = true)) },
+        )
+    )
+    add(
+        ContextActionSpec(
+            if (isInQueue) "Remove from Queue" else "Add to Queue",
+            { onAction(MainAction.ToggleQueueMembership(entry.id)) },
+        )
+    )
+    add(
+        ContextActionSpec(
+            if (entry.isRead) "Mark as Unread" else "Mark as Read",
+            { onAction(MainAction.ToggleReadState(entry.id)) },
+        )
+    )
+    add(
+        ContextActionSpec(
+            resolveOfflineActionLabel(entry, isAudio),
+            {
+                onAction(MainAction.CloseContextSheet)
+                onAction(MainAction.ToggleOfflineCache(entry.id))
+            },
+        )
+    )
+}
+
 private fun resolveOfflineActionLabel(entry: InboxEntry, isAudio: Boolean): String =
     when {
         isAudio && entry.isCachedOffline -> "Delete Local Episode Download"
         isAudio -> "Download Episode for Offline Playback"
-        entry.isCachedOffline -> "Remove Local Offline Copy"
-        else -> "Download Local Offline Copy"
+        entry.isCachedOffline -> "Remove Offline Copy"
+        else -> "Save Offline Copy"
     }
-
-@Composable
-private fun ContextSheetPrimaryActions(
-    entry: InboxEntry,
-    isAudio: Boolean,
-    onAction: (MainAction) -> Unit,
-) {
-    if (isAudio) {
-        ContextActionItem(
-            label = "▶ Play Episode Now",
-            textColor = LocalRocheColors.current.accentBlue,
-            onClick = { onAction(MainAction.PlayAudioEntry(entry.id, openFullscreen = true)) },
-        )
-        ContextActionItem(
-            label = "Open Full Show Notes in Reader",
-            onClick = { onAction(MainAction.OpenReader(entry.id, forceArticleView = true)) },
-        )
-    }
-    ContextActionItem(
-        label = "✓ Finished & Log to Diary",
-        textColor = LocalRocheColors.current.accentVerdigris,
-        onClick = {
-            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = false))
-        },
-    )
-    ContextActionItem(
-        label = "★ Finish & Rank",
-        onClick = {
-            onAction(MainAction.MarkFeedEntryFinished(entryId = entry.id, rankImmediately = true))
-        },
-    )
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -331,8 +395,8 @@ internal fun FeedContextHeaderRow(feed: FeedItem) {
                 text = feed.title,
                 color = colors.textPrimary,
                 fontFamily = currentHeadlineFontFamily(),
-                fontSize = 17.sp,
-                fontWeight = FontWeight.Medium,
+                fontSize = 17.5.sp,
+                fontWeight = FontWeight.Normal,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -451,44 +515,20 @@ internal fun FeedContextActionsList(
 ) {
     val colors = LocalRocheColors.current
     var confirmDeleteFeed by rememberSaveable(feed.id) { mutableStateOf(false) }
-    ContextActionItem(
-        label = "View Feed Items (${feed.unreadCount} unread)",
-        onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
-    )
-    if (feed.unreadCount > 0) {
-        ContextActionItem(
-            label = "Archive All Unread in Feed (${feed.unreadCount})",
-            onClick = { onAction(MainAction.ArchiveFeedUnread(feed.id)) },
-            modifier = Modifier.testTag("feed_archive_unread_btn"),
+    val feedActions = buildFeedPrimaryActions(feed, onAction, onOpenExternalUrl)
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        ContextActionCardGroup(feedActions)
+        ContextActionCardGroup(
+            listOf(
+                ContextActionSpec(
+                    label = "Unsubscribe from Feed",
+                    textColor = colors.accentIndianRed,
+                    onClick = { confirmDeleteFeed = true },
+                    modifier = Modifier.testTag("delete_feed_${feed.id}"),
+                )
+            )
         )
     }
-    if (!feed.isArchived) {
-        ContextActionItem(
-            label = "Refresh Feed Now",
-            onClick = {
-                onAction(MainAction.CloseFeedContextSheet)
-                onAction(MainAction.RefreshFeed(feed.id))
-            },
-        )
-    }
-    ContextActionItem(
-        label = "Open Feed / Site URL",
-        onClick = {
-            onAction(MainAction.CloseFeedContextSheet)
-            onOpenExternalUrl(feed.siteUrl ?: feed.url)
-        },
-    )
-    ContextActionItem(
-        label = if (feed.isArchived) "Unarchive Feed" else "Archive Feed",
-        onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
-        modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
-    )
-    ContextActionItem(
-        label = "Unsubscribe from Feed",
-        textColor = colors.accentIndianRed,
-        onClick = { confirmDeleteFeed = true },
-        modifier = Modifier.testTag("delete_feed_${feed.id}"),
-    )
     if (confirmDeleteFeed) {
         DestructiveConfirmDialog(
             title = "Unsubscribe from feed?",
@@ -502,6 +542,55 @@ internal fun FeedContextActionsList(
             },
         )
     }
+}
+
+private fun buildFeedPrimaryActions(
+    feed: FeedItem,
+    onAction: (MainAction) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
+): List<ContextActionSpec> = buildList {
+    add(
+        ContextActionSpec(
+            label = "View Feed Items (${feed.unreadCount} unread)",
+            onClick = { onAction(MainAction.FilterByFeed(feed.id)) },
+        )
+    )
+    if (feed.unreadCount > 0) {
+        add(
+            ContextActionSpec(
+                label = "Archive All Unread in Feed (${feed.unreadCount})",
+                onClick = { onAction(MainAction.ArchiveFeedUnread(feed.id)) },
+                modifier = Modifier.testTag("feed_archive_unread_btn"),
+            )
+        )
+    }
+    if (!feed.isArchived) {
+        add(
+            ContextActionSpec(
+                label = "Refresh Feed Now",
+                onClick = {
+                    onAction(MainAction.CloseFeedContextSheet)
+                    onAction(MainAction.RefreshFeed(feed.id))
+                },
+            )
+        )
+    }
+    add(
+        ContextActionSpec(
+            label = "Open Feed / Site URL ↗",
+            onClick = {
+                onAction(MainAction.CloseFeedContextSheet)
+                onOpenExternalUrl(feed.siteUrl ?: feed.url)
+            },
+        )
+    )
+    add(
+        ContextActionSpec(
+            label = if (feed.isArchived) "Unarchive Feed" else "Archive Feed",
+            onClick = { onAction(MainAction.ToggleFeedArchive(feed.id)) },
+            modifier = Modifier.testTag("toggle_archive_feed_${feed.id}"),
+        )
+    )
 }
 
 @Composable
@@ -545,10 +634,9 @@ private fun ContextActionItem(
             modifier
                 .fillMaxWidth()
                 .heightIn(min = 48.dp)
-                .clip(RoundedCornerShape(8.dp))
                 .clickable(onClick = onClick)
                 .semantics { role = Role.Button }
-                .padding(vertical = 12.dp, horizontal = 8.dp),
+                .padding(vertical = 13.dp, horizontal = 16.dp),
     )
 }
 

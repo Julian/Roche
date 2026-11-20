@@ -113,10 +113,15 @@ data class MainUiState(
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
+    val catalogDetailEntryId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
     val quickLogTargetCollectionTitle: String? = null,
+    val quickLogPrefillKind: EntryKind? = null,
+    val quickLogPrefillTitle: String = "",
+    val quickLogPrefillCreators: String = "",
+    val quickLogPrefillReleaseYear: Int? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val isPlayerFullscreenOpen: Boolean = false,
@@ -402,10 +407,18 @@ sealed interface MainAction {
 
     data class SelectWantCollection(val collectionId: String) : CatalogUi
 
+    data class OpenCatalogDetailSheet(val entryId: String) : CatalogUi
+
+    data object CloseCatalogDetailSheet : CatalogUi
+
     data class OpenQuickLogSheet(
         val defaultToWant: Boolean = false,
         val targetCollectionId: String? = null,
         val targetCollectionTitle: String? = null,
+        val prefillKind: EntryKind? = null,
+        val prefillTitle: String = "",
+        val prefillCreators: String = "",
+        val prefillReleaseYear: Int? = null,
     ) : CatalogUi
 
     data object CloseQuickLogSheet : CatalogUi
@@ -513,10 +526,15 @@ internal data class TransientUiState(
     val queueSubTab: QueueSubTab = QueueSubTab.UP_NEXT,
     val selectedCatalogCollectionId: String? = null,
     val selectedWantCollectionId: String? = null,
+    val catalogDetailEntryId: String? = null,
     val isQuickLogSheetOpen: Boolean = false,
     val quickLogDefaultWant: Boolean = false,
     val quickLogTargetCollectionId: String? = null,
     val quickLogTargetCollectionTitle: String? = null,
+    val quickLogPrefillKind: EntryKind? = null,
+    val quickLogPrefillTitle: String = "",
+    val quickLogPrefillCreators: String = "",
+    val quickLogPrefillReleaseYear: Int? = null,
     val drawNoteDialog: DrawNoteDialogState? = null,
     val rankSession: ActiveRankSessionUiState? = null,
     val isPlayerFullscreenOpen: Boolean = false,
@@ -760,10 +778,15 @@ internal class MainUiStateMemoizer {
             queueSubTab = local.queueSubTab,
             selectedCatalogCollectionId = local.selectedCatalogCollectionId,
             selectedWantCollectionId = local.selectedWantCollectionId,
+            catalogDetailEntryId = local.catalogDetailEntryId,
             isQuickLogSheetOpen = local.isQuickLogSheetOpen,
             quickLogDefaultWant = local.quickLogDefaultWant,
             quickLogTargetCollectionId = local.quickLogTargetCollectionId,
             quickLogTargetCollectionTitle = local.quickLogTargetCollectionTitle,
+            quickLogPrefillKind = local.quickLogPrefillKind,
+            quickLogPrefillTitle = local.quickLogPrefillTitle,
+            quickLogPrefillCreators = local.quickLogPrefillCreators,
+            quickLogPrefillReleaseYear = local.quickLogPrefillReleaseYear,
             drawNoteDialog = local.drawNoteDialog,
             rankSession = local.rankSession,
             isPlayerFullscreenOpen = local.isPlayerFullscreenOpen,

@@ -63,6 +63,7 @@ internal fun buildCatalogSnapshot(
         lists = collectionBundle.sortedLists,
         wantQueues = collectionBundle.sortedWants,
         entriesByCollectionId = collectionBundle.entriesByCollectionId,
+        entriesById = rankedInput.domainEntries.filterValues { it.kind != EntryKind.COLLECTION },
         diaryEntries = buildDiaryItems(tables.logs, rankedInput.domainEntries, globalTiers),
         generators =
             buildCollectionGeneratorStates(
@@ -716,8 +717,8 @@ internal fun toCollectionDrawSnapshot(
         deezerId = identsByScheme["deezer"],
         amazonMusicId = identsByScheme["amazon_music"],
         wikipediaUrl =
-            identsByScheme["wikipedia"]
-                ?.let { externalIdentifierUrl("wikipedia", it) }
+            identsByScheme[SCHEME_WIKIPEDIA]
+                ?.let { externalIdentifierUrl(SCHEME_WIKIPEDIA, it) }
                 ?.let(::sanitizeHttpUrl),
     )
 }
@@ -766,7 +767,95 @@ internal fun toDomainCatalogEntry(
         summary = raw.summary?.takeIf { it.isNotBlank() },
         thumbnailUrl = raw.thumbnailUrl?.takeIf { it.isNotBlank() },
         identifiers = identifiers,
+        metadataJson = raw.metadataJson,
     )
+
+internal fun CatalogEntryItem.toMusicLaunchSnapshot(): CollectionDrawSnapshot {
+    val identsByScheme = identifiers.associate { it.scheme.lowercase() to it.value }
+    return CollectionDrawSnapshot(
+        entryId = id,
+        kind = kind,
+        title = title,
+        creator = primaryCreator,
+        releaseDate = releaseYear?.takeIf { it > 0 }?.toString().orEmpty(),
+        url = url,
+        imageUrl = sanitizeHttpUrl(thumbnailUrl),
+        thumbnailUrl = sanitizeHttpUrl(thumbnailUrl),
+        tags = extractMetadataGenres(metadataJson),
+        youtubeMusicId = pickPreferredYoutubeMusicId(identifiers),
+        spotifyId = identsByScheme["spotify"],
+        appleMusicId = identsByScheme["apple_music"],
+        tidalId = identsByScheme["tidal"],
+        qobuzId = identsByScheme["qobuz"],
+        deezerId = identsByScheme["deezer"],
+        amazonMusicId = identsByScheme["amazon_music"],
+        wikipediaUrl = resolveWikipediaUrl(),
+    )
+}
+
+internal fun CatalogEntryItem.resolveWikipediaUrl(): String? =
+    identifiers
+        .firstOrNull { it.scheme.equals(SCHEME_WIKIPEDIA, ignoreCase = true) }
+        ?.value
+        ?.let { externalIdentifierUrl(SCHEME_WIKIPEDIA, it) }
+        ?.let(::sanitizeHttpUrl)
+
+internal fun extractAlbumTracks(metadataJson: String): List<AlbumTrackItem> {
+    val obj =
+        runCatching { coreJson.parseToJsonElement(metadataJson) as? JsonObject }.getOrNull()
+            ?: return emptyList()
+    val arr = obj["tracks"] as? JsonArray ?: return emptyList()
+    return arr.take(MAX_PARSED_TRACKS).mapIndexedNotNull { idx, elem ->
+        parseAlbumTrackItem(elem as? JsonObject, idx + 1)
+    }
+}
+
+private fun parseAlbumTrackItem(item: JsonObject?, fallbackNumber: Int): AlbumTrackItem? {
+    val title =
+        (item?.get("title") as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return null
+    val disc =
+        (item["disc"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()?.takeIf { it > 0 } ?: 1
+    val number =
+        (item["number"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()?.takeIf { it > 0 }
+            ?: fallbackNumber
+    val durationMs =
+        (item["duration_ms"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()?.takeIf { it > 0L }
+    val artists =
+        (item["artists"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
+    val spotifyUri =
+        (item["spotify_uri"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+    return AlbumTrackItem(disc, number, title, durationMs, artists, spotifyUri)
+}
+
+internal fun extractArtistDiscography(metadataJson: String): List<DiscographyAlbumItem> {
+    val obj =
+        runCatching { coreJson.parseToJsonElement(metadataJson) as? JsonObject }.getOrNull()
+            ?: return emptyList()
+    val arr = obj["discography"] as? JsonArray ?: return emptyList()
+    return arr.take(MAX_PARSED_DISCOGRAPHY).mapNotNull { elem ->
+        parseDiscographyAlbumItem(elem as? JsonObject)
+    }
+}
+
+private fun parseDiscographyAlbumItem(item: JsonObject?): DiscographyAlbumItem? {
+    val title =
+        (item?.get("title") as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return null
+    val year =
+        (item["release_year"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()?.takeIf {
+            it in MIN_RELEASE_YEAR..MAX_RELEASE_YEAR
+        }
+    val thumb = (item["thumbnail_url"] as? JsonPrimitive)?.contentOrNull?.let(::sanitizeHttpUrl)
+    val appleId =
+        (item["apple_music_id"] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf {
+            it.isNotEmpty() && it.all(Char::isDigit)
+        }
+    return DiscographyAlbumItem(title, year, thumb, appleId)
+}
 
 internal fun decodeComparisonOrdering(rawJson: String): List<List<String>>? = runCatching {
     coreJson.decodeFromString(
@@ -788,7 +877,12 @@ private fun formatDiaryTimestamp(rawIso: String): Pair<String, String> {
     }
 }
 
+private const val SCHEME_WIKIPEDIA = "wikipedia"
 private const val MAX_GENRE_CHIPS = 3
+private const val MAX_PARSED_TRACKS = 120
+private const val MAX_PARSED_DISCOGRAPHY = 80
+private const val MIN_RELEASE_YEAR = 1900
+private const val MAX_RELEASE_YEAR = 2100
 private const val MONTH_PREFIX_LEN = 7
 private const val DATE_PREFIX_LEN = 10
 private val DIARY_MONTH_FMT = DateTimeFormatter.ofPattern("yyyy-MM", Locale.US)
