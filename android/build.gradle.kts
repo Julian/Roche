@@ -20,17 +20,22 @@ plugins {
 
 spotless {
     kotlin {
-        target("app/src/**/*.kt", "baselineprofile/src/**/*.kt")
+        target("app/src/**/*.kt", "baselineprofile/src/**/*.kt", "releasesmoke/src/**/*.kt")
         ktfmt(libs.versions.ktfmt.get()).kotlinlangStyle()
     }
     kotlinGradle {
-        target("*.gradle.kts", "app/*.gradle.kts", "baselineprofile/*.gradle.kts")
+        target(
+            "*.gradle.kts",
+            "app/*.gradle.kts",
+            "baselineprofile/*.gradle.kts",
+            "releasesmoke/*.gradle.kts",
+        )
         ktfmt(libs.versions.ktfmt.get()).kotlinlangStyle()
     }
 }
 
 detekt {
-    source.setFrom("app/src", "baselineprofile/src")
+    source.setFrom("app/src", "baselineprofile/src", "releasesmoke/src")
     config.setFrom("config/detekt/detekt.yml")
     buildUponDefaultConfig = true
     allRules = true
@@ -49,6 +54,7 @@ tasks.register("preflight") {
         ":app:testDebugUnitTest",
         ":app:compileDebugAndroidTestKotlin",
         ":baselineprofile:compileNonMinifiedReleaseKotlin",
+        ":releasesmoke:compileReleaseKotlin",
     )
 }
 

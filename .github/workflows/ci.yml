@@ -49,8 +49,30 @@ jobs:
           SQLX_OFFLINE: "true"
         run: cargo test --workspace --locked
 
+  build-server:
+    name: Build Rust server release binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build server release binary
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release --locked -p roche-server
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: roche-server-linux-x86_64
+          path: target/release/roche-server
+          retention-days: 1
+          if-no-files-found: error
+
   web-a11y:
     name: Web accessibility (Playwright + axe-core)
+    needs: [build-server]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -64,14 +86,14 @@ jobs:
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: web-a11y/package.json
-      - name: Install pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - name: Build server binary
-        env:
-          SQLX_OFFLINE: "true"
-        run: cargo build --locked -p roche-server
+      - name: Download built server binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: roche-server-linux-x86_64
+          path: target/release
       - name: Install Playwright and axe-core
         run: |
+          chmod +x target/release/roche-server
           pnpm --dir web-a11y install --frozen-lockfile --ignore-scripts
           for attempt in 1 2 3; do
             ./web-a11y/node_modules/.bin/playwright install --only-shell --with-deps chromium && break
@@ -79,6 +101,8 @@ jobs:
             sleep 5
           done
       - name: Run Playwright WCAG AA accessibility checks
+        env:
+          ROCHE_SERVER_BIN: ${{ github.workspace }}/target/release/roche-server
         run: pnpm --dir web-a11y test
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure() || cancelled()
@@ -112,7 +136,9 @@ jobs:
         run: >
           ./android/gradlew -p android
           spotlessCheck detekt :app:lintDebug :app:testDebugUnitTest
-          :app:assembleDebugAndroidTest :baselineprofile:compileNonMinifiedReleaseKotlin
+          :app:compileDebugAndroidTestKotlin
+          :baselineprofile:compileNonMinifiedReleaseKotlin
+          :releasesmoke:compileReleaseKotlin
           $EXTRA_RELEASE_TASK
 
   instrumented:
@@ -213,6 +239,7 @@ jobs:
         with:
           name: baseline-profile
           path: android/app/src/release/generated/baselineProfiles/
+          retention-days: 1
           if-no-files-found: error
 
   signing:
@@ -228,17 +255,15 @@ jobs:
           test -n "$KEY_B64" || { echo "::error::ROCHE_RELEASE_KEY_B64 is not set"; exit 1; }
           test -n "$KEY_PASSWORD" || { echo "::error::ROCHE_RELEASE_KEY_PASSWORD is not set"; exit 1; }
 
-  release:
-    name: Publish the release
-    # A version tag (v0.1.0) publishes a signed APK and server binary as a GitHub release,
-    # which Obtainium watches, once every check above has passed. Signing needs two repository
-    # secrets: ROCHE_RELEASE_KEY_B64 (the PKCS#12 key file, base64) and ROCHE_RELEASE_KEY_PASSWORD.
+  build-android-release:
+    name: Build and smoke-test signed Android release
+    # Builds the signed R8-minified APK with the recorded baseline profile once, verifies its
+    # signature and launches it on a managed emulator, then uploads the exact tested APK.
+    # Signing needs ROCHE_RELEASE_KEY_B64 (PKCS#12 key, base64) and ROCHE_RELEASE_KEY_PASSWORD.
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: [signing, lint, test, web-a11y, checks, instrumented, profile]
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    permissions:
-      contents: write # to create the GitHub release and upload the APK and server binary
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,24 +276,31 @@ jobs:
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
         with:
           cache-disabled: true
-      - name: Install pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - name: Build server release binary
-        env:
-          SQLX_OFFLINE: "true"
-          TAG: ${{ github.ref_name }}
+      - name: Enable KVM
         run: |
-          cargo build --release --locked -p roche-server
-          cp target/release/roche-server "roche-server-$TAG-x86_64-unknown-linux-gnu"
-      - name: Write the signing key
-        env:
-          KEY_B64: ${{ secrets.ROCHE_RELEASE_KEY_B64 }}
-        run: printf '%s' "$KEY_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Fetch the managed device image
+        run: |
+          extra_flags=""
+          for attempt in 1 2 3; do
+            ./android/gradlew -p android :releasesmoke:pixel10ProApi37Setup $extra_flags -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect && break
+            test "$attempt" -lt 3 || exit 1
+            pkill -f qemu-system || true
+            rm -rf "${ANDROID_HOME:-/usr/local/lib/android/sdk}/.temp"
+            extra_flags="--refresh-dependencies"
+            sleep 5
+          done
       - name: Fetch the profile the profile job recorded
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: baseline-profile
           path: android/app/src/release/generated/baselineProfiles/
+      - name: Write the signing key
+        env:
+          KEY_B64: ${{ secrets.ROCHE_RELEASE_KEY_B64 }}
+        run: printf '%s' "$KEY_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
       - name: Build the signed release, with the recorded baseline profile
         env:
           ORG_GRADLE_PROJECT_rocheStoreFile: ${{ runner.temp }}/release.p12
@@ -282,11 +314,71 @@ jobs:
             extra_flags="--refresh-dependencies"
             sleep 5
           done
+          apksigner="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -n1)"
+          test -x "$apksigner" || { echo "::error::apksigner not found in ANDROID_HOME/build-tools"; exit 1; }
+          "$apksigner" verify --verbose android/app/build/outputs/apk/release/app-release.apk
+          sha256sum android/app/build/outputs/apk/release/app-release.apk > "$RUNNER_TEMP/app-release.apk.sha256"
+      - name: Smoke-test the signed release APK on the managed device
+        env:
+          ORG_GRADLE_PROJECT_rocheStoreFile: ${{ runner.temp }}/release.p12
+          ORG_GRADLE_PROJECT_rocheStorePassword: ${{ secrets.ROCHE_RELEASE_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_rocheVersionName: ${{ github.ref_name }}
+        run: |
+          ./android/gradlew -p android :releasesmoke:pixel10ProApi37ReleaseAndroidTest -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+          sha256sum -c "$RUNNER_TEMP/app-release.apk.sha256"
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.p12"
+      - name: Upload release smoke-test report on failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-smoke-test-report
+          path: |
+            android/releasesmoke/build/reports/androidTests/
+            android/releasesmoke/build/outputs/androidTest-results/
+          if-no-files-found: ignore
+      - name: Stage tested release artifacts
+        run: |
+          mkdir -p "$RUNNER_TEMP/android-release"
+          cp android/app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/android-release/app-release.apk"
+          cp android/app/build/outputs/mapping/release/mapping.txt "$RUNNER_TEMP/android-release/mapping.txt"
+      - name: Upload tested Android release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-release
+          path: ${{ runner.temp }}/android-release/
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    # A version tag (v0.1.0) publishes the already-built and tested signed APK and server binary
+    # as a GitHub release, which Obtainium watches, once every check above has passed.
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: [signing, lint, test, build-server, web-a11y, checks, instrumented, profile, build-android-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # to create the GitHub release and upload the APK and server binary
+    steps:
+      - name: Download tested server release binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: roche-server-linux-x86_64
+          path: release-assets/server
+      - name: Download tested Android release artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: android-release
+          path: release-assets/android
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          cp android/app/build/outputs/apk/release/app-release.apk "roche-$TAG.apk"
-          cp android/app/build/outputs/mapping/release/mapping.txt "roche-$TAG-mapping.txt"
-          gh release create "$TAG" "roche-$TAG.apk" "roche-$TAG-mapping.txt" "roche-server-$TAG-x86_64-unknown-linux-gnu" --title "Roche $TAG" --generate-notes
+          cp release-assets/android/app-release.apk "roche-$TAG.apk"
+          cp release-assets/android/mapping.txt "roche-$TAG-mapping.txt"
+          cp release-assets/server/roche-server "roche-server-$TAG-x86_64-unknown-linux-gnu"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "roche-$TAG.apk" "roche-$TAG-mapping.txt" "roche-server-$TAG-x86_64-unknown-linux-gnu" --title "Roche $TAG" --generate-notes

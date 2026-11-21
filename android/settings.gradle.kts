@@ -19,3 +19,5 @@ rootProject.name = "Roche"
 include(":app")
 
 include(":baselineprofile")
+
+include(":releasesmoke")
