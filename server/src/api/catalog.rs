@@ -7,13 +7,12 @@ use serde::{Deserialize, Serialize};
 use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{
-        CatalogBatchInput, CatalogBatchResult, CatalogEntry, ClusterSelectFilter,
-        CollectionGeneratorState, CollectionSummary, ComparisonRecord, ConsumptionLogView,
-        EntryDetailView, RankedCollectionView, UpsertEntryInput,
+        CatalogBatchInput, CatalogBatchResult, CatalogEntry, CollectionGeneratorState,
+        CollectionSummary, ComparisonRecord, ConsumptionLogView, EntryDetailView, UpsertEntryInput,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::Score,
-    service::{RocheService, WorkspaceSearchResults},
+    service::{ClusterSelectFilter, RankedCollectionView, RocheService, WorkspaceSearchResults},
 };
 
 #[derive(Debug, Default, Deserialize)]

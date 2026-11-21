@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     db::{
+        WriteTx,
         sync::{SyncRepo, canonical_ordering_json, deterministic_comparison_id},
         types::{ActivityAction, ActivityEntityType, CollectionMode, CollectionRole},
     },
@@ -31,7 +32,7 @@ impl CatalogRepo<'_> {
         for group in ordering {
             let mut resolved_group = Vec::with_capacity(group.len());
             for raw_id in group {
-                let canon_id = Self::follow_merged_id_in_tx(&mut tx, raw_id)
+                let canon_id = Self::follow_merged_id_in_tx(tx.conn(), raw_id)
                     .await?
                     .ok_or_else(|| CatalogError::NotFound(format!("Entry '{raw_id}'")))?;
                 resolved_group.push(canon_id);
@@ -42,7 +43,7 @@ impl CatalogRepo<'_> {
 
         let clean_scope = match scope_collection_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(sc) => {
-                let col = Self::lookup_collection_row_in_tx(&mut tx, sc, false).await?;
+                let col = Self::lookup_collection_row_in_tx(tx.conn(), sc, false).await?;
                 Some(col.id)
             }
             None => None,
@@ -65,12 +66,12 @@ impl CatalogRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query("DELETE FROM comparisons WHERE id = ?")
             .bind(trimmed)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         let deleted = res.rows_affected() > 0;
         if deleted {
             SyncRepo::record_activity(
-                &mut tx,
+                tx.conn(),
                 ActivityEntityType::Comparison,
                 trimmed,
                 ActivityAction::Delete,
@@ -85,7 +86,7 @@ impl CatalogRepo<'_> {
     }
 
     pub(super) async fn append_comparison_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         clean_scope: Option<String>,
         resolved_ordering: Vec<Vec<String>>,
         event_ts: DateTime<Utc>,
@@ -99,21 +100,23 @@ impl CatalogRepo<'_> {
         let ord_json = canonical_ordering_json(&resolved_ordering);
 
         let clean_scope_ref = clean_scope.as_deref();
-        let res = sqlx::query!(
-            "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-            &comp_id,
-            event_ts as _,
-            clean_scope_ref,
-            &ord_json,
-            now as _,
+        let comp_hlc = tx.next_hlc().await?;
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at, hlc)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .execute(&mut *tx)
+        .bind(&comp_id)
+        .bind(event_ts)
+        .bind(clean_scope_ref)
+        .bind(&ord_json)
+        .bind(now)
+        .bind(&comp_hlc)
+        .execute(tx.conn())
         .await?;
         let inserted = res.rows_affected() > 0;
         if inserted {
             SyncRepo::record_activity(
-                tx,
+                tx.conn(),
                 ActivityEntityType::Comparison,
                 &comp_id,
                 ActivityAction::Create,
@@ -145,15 +148,17 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
         want: bool,
     ) -> CatalogResult<CollectionRankingInputs> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
         let raw_col = if want {
-            self.lookup_want_collection_row(slug_or_id).await?.ok_or_else(|| {
-                CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found"))
-            })?
+            Self::lookup_want_collection_row_in_tx(tx.conn(), slug_or_id).await?.ok_or_else(
+                || CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found")),
+            )?
         } else {
-            self.lookup_collection_row(slug_or_id, true).await?
+            Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await?
         };
         let is_priority_scope = raw_col.collection_role == CollectionRole::Want;
-        let members = self.resolve_rankable_members(&raw_col).await?;
+        let members = Self::resolve_rankable_members_in_tx(tx.conn(), &raw_col).await?;
+        tx.commit().await?;
         let summary = raw_col.into_summary(members.len(), 0);
         Ok(CollectionRankingInputs { collection: summary, is_priority_scope, members })
     }
@@ -165,17 +170,19 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
         want: bool,
     ) -> CatalogResult<usize> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
         let raw_col = if want {
-            let Some(col) = self.lookup_want_collection_row(slug_or_id).await? else {
+            let Some(col) = Self::lookup_want_collection_row_in_tx(tx.conn(), slug_or_id).await?
+            else {
                 return Ok(0);
             };
             col
         } else {
-            self.lookup_collection_row(slug_or_id, true).await?
+            Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await?
         };
-        match raw_col.mode {
+        let count = match raw_col.mode {
             CollectionMode::Manual | CollectionMode::Feed => {
-                let count: i64 = if raw_col.has_generator {
+                let raw_count: i64 = if raw_col.has_generator {
                     sqlx::query_scalar(
                         "SELECT COUNT(*)
                          FROM collection_entries ce
@@ -188,7 +195,7 @@ impl CatalogRepo<'_> {
                            )",
                     )
                     .bind(&raw_col.id)
-                    .fetch_one(self.pool)
+                    .fetch_one(tx.conn())
                     .await?
                 } else {
                     sqlx::query_scalar(
@@ -198,13 +205,17 @@ impl CatalogRepo<'_> {
                          WHERE ce.collection_id = ? AND e.merged_into_id IS NULL",
                     )
                     .bind(&raw_col.id)
-                    .fetch_one(self.pool)
+                    .fetch_one(tx.conn())
                     .await?
                 };
-                Ok(usize::try_from(count).unwrap_or(0))
+                usize::try_from(raw_count).unwrap_or(0)
             }
-            CollectionMode::Dynamic => Ok(self.resolve_rankable_member_ids(&raw_col).await?.len()),
-        }
+            CollectionMode::Dynamic => {
+                Self::resolve_rankable_member_ids_in_tx(tx.conn(), &raw_col).await?.len()
+            }
+        };
+        tx.commit().await?;
+        Ok(count)
     }
 
     /// Resolves `raw_parent_id` across merges and returns its member entry IDs.
@@ -288,13 +299,15 @@ impl CatalogRepo<'_> {
         slug_or_id: &str,
         want: bool,
     ) -> CatalogResult<(bool, Option<String>)> {
+        let mut tx = crate::db::begin_read(self.pool).await?;
         let raw_col = if want {
-            self.lookup_want_collection_row(slug_or_id).await?.ok_or_else(|| {
-                CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found"))
-            })?
+            Self::lookup_want_collection_row_in_tx(tx.conn(), slug_or_id).await?.ok_or_else(
+                || CatalogError::NotFound(format!("Want collection '{slug_or_id}' not found")),
+            )?
         } else {
-            self.lookup_collection_row(slug_or_id, true).await?
+            Self::lookup_collection_row_in_tx(tx.conn(), slug_or_id, true).await?
         };
+        tx.commit().await?;
         if raw_col.collection_role == CollectionRole::Want {
             Ok((true, Some(raw_col.id)))
         } else {
@@ -316,7 +329,7 @@ impl CatalogRepo<'_> {
                  WHERE scope_collection_id = ?",
             )
             .bind(scope_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?
         } else {
             sqlx::query_as(
@@ -324,38 +337,17 @@ impl CatalogRepo<'_> {
                  FROM comparisons
                  WHERE scope_collection_id IS NULL",
             )
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?
         };
-        let json_rows: Vec<String> = if let Some(scope_id) = scope_collection_id {
-            sqlx::query_scalar(
-                "SELECT ordering_json FROM comparisons
-                 WHERE scope_collection_id = ?
-                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
-            )
-            .bind(scope_id)
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                "SELECT ordering_json FROM comparisons
-                 WHERE scope_collection_id IS NULL
-                 ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC",
-            )
-            .fetch_all(&mut *tx)
-            .await?
-        };
+        let orderings =
+            Self::load_orderings_for_scope_in_tx(tx.conn(), scope_collection_id).await?;
         tx.commit().await?;
-        let orderings = json_rows
-            .into_iter()
-            .filter_map(|j| serde_json::from_str::<Vec<Vec<String>>>(&j).ok())
-            .collect();
         Ok((rev, orderings))
     }
 
-    /// Loads comparison orderings for a priority collection scope (`Some(id)`) or global scope (`None`).
-    pub async fn load_orderings_for_scope(
-        &self,
+    pub(super) async fn load_orderings_for_scope_in_tx(
+        conn: &mut SqliteConnection,
         scope_collection_id: Option<&str>,
     ) -> CatalogResult<Vec<Vec<Vec<String>>>> {
         let json_rows = if let Some(scope_id) = scope_collection_id {
@@ -365,7 +357,7 @@ impl CatalogRepo<'_> {
                    ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC"#,
                 scope_id,
             )
-            .fetch_all(self.pool)
+            .fetch_all(&mut *conn)
             .await?
         } else {
             sqlx::query_scalar!(
@@ -373,12 +365,22 @@ impl CatalogRepo<'_> {
                    WHERE scope_collection_id IS NULL
                    ORDER BY strftime('%Y-%m-%dT%H:%M:%fZ', ts) ASC, id ASC"#,
             )
-            .fetch_all(self.pool)
+            .fetch_all(&mut *conn)
             .await?
         };
         Ok(json_rows
             .into_iter()
             .filter_map(|j| serde_json::from_str::<Vec<Vec<String>>>(&j).ok())
             .collect())
+    }
+
+    /// Loads comparison orderings for a priority collection scope (`Some(id)`) or global scope (`None`).
+    #[cfg(test)]
+    pub async fn load_orderings_for_scope(
+        &self,
+        scope_collection_id: Option<&str>,
+    ) -> CatalogResult<Vec<Vec<Vec<String>>>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::load_orderings_for_scope_in_tx(&mut conn, scope_collection_id).await
     }
 }

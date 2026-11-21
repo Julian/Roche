@@ -17,11 +17,9 @@ use super::{
     parse_diary_date_input, parse_optional_year, render_kind_options,
 };
 use crate::{
-    db::{
-        CatalogEntry, CollectionSummary, ConsumptionLogView, RankedCollectionView, UpsertEntryInput,
-    },
+    db::{CatalogEntry, CollectionSummary, ConsumptionLogView, UpsertEntryInput},
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
-    service::{CatalogService, RocheService},
+    service::{CatalogService, RankedCollectionView, RocheService},
     web::{
         auth::WebSession,
         html::{

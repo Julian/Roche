@@ -23,6 +23,7 @@ import com.grayvines.roche.data.local.CollectionGeneratorEntity
 import com.grayvines.roche.data.local.CollectionSpecEntity
 import com.grayvines.roche.data.local.ComparisonEntity
 import com.grayvines.roche.data.local.ConsumptionLogEntity
+import com.grayvines.roche.data.local.EntryContentEntity
 import com.grayvines.roche.data.local.EntryEntity
 import com.grayvines.roche.data.local.EntryStateEntity
 import com.grayvines.roche.data.local.RocheDao
@@ -170,7 +171,22 @@ internal data class ExpectedEntryStateVector(
     @SerialName("inbox_state") val inboxState: String,
     @SerialName("read_at_present") val readAtPresent: Boolean,
     val progress: Double,
-    val hlc: String,
+    val hlc: String? = null,
+)
+
+@Serializable
+internal data class ExpectedEntryMetadataVector(
+    @SerialName("entry_id") val entryId: String,
+    val summary: String? = null,
+    @SerialName("content_html_present") val contentHtmlPresent: Boolean,
+)
+
+@Serializable
+internal data class ExpectedConsumptionLogVector(
+    val id: String,
+    @SerialName("entry_id") val entryId: String,
+    val status: String,
+    val notes: String? = null,
 )
 
 @Serializable
@@ -211,12 +227,17 @@ internal data class ExpectedSyncOutcomeVector(
     @SerialName("entry_states") val entryStates: List<ExpectedEntryStateVector> = emptyList(),
     @SerialName("entry_presence")
     val entryPresence: List<ExpectedEntryPresenceVector> = emptyList(),
+    @SerialName("entry_metadata")
+    val entryMetadata: List<ExpectedEntryMetadataVector> = emptyList(),
     @SerialName("collection_members")
     val collectionMembers: List<ExpectedCollectionMembersVector> = emptyList(),
     @SerialName("consumption_log_counts")
     val consumptionLogCounts: List<ExpectedLogCountVector> = emptyList(),
+    @SerialName("consumption_logs")
+    val consumptionLogs: List<ExpectedConsumptionLogVector> = emptyList(),
     @SerialName("comparison_orderings")
     val comparisonOrderings: List<List<List<String>>> = emptyList(),
+    @SerialName("comparison_ids") val comparisonIds: List<String>? = null,
     val generators: List<ExpectedGeneratorVector> = emptyList(),
     @SerialName("tombstone_presence")
     val tombstonePresence: List<ExpectedTombstonePresenceVector> = emptyList(),
@@ -391,11 +412,11 @@ class CrossStackSyncAndDomainVectorsTest {
 
 internal const val MIN_CUSTOM_COLLECTION_VECTORS = 15
 internal const val MIN_URL_CLASSIFICATION_VECTORS = 15
-internal const val MIN_SSRF_IP_VECTORS = 25
-internal const val MIN_SSRF_URL_VECTORS = 20
+internal const val MIN_SSRF_IP_VECTORS = 40
+internal const val MIN_SSRF_URL_VECTORS = 40
 internal const val MIN_EXTERNAL_ID_URL_VECTORS = 30
 internal const val MIN_RANK_BOARD_SCENARIOS = 4
-internal const val MIN_PEER_SYNC_SCENARIOS = 4
+internal const val MIN_PEER_SYNC_SCENARIOS = 10
 internal const val SYNC_PROGRESS_EPSILON = 1e-9
 
 internal fun loadExpandedGoldenVectors(): ExpandedCrossStackVectors {
@@ -461,55 +482,85 @@ internal suspend fun seedInitialSyncStateInDao(
     fallbackIso: String,
 ) {
     for (entry in initial.entries) {
-        val created = entry.createdAt ?: fallbackIso
-        val updated = entry.updatedAt ?: created
-        dao.upsertEntry(
-            EntryEntity(
-                id = entry.id,
-                kind = entry.kind,
-                title = entry.title,
-                creatorsJson = encodeCreatorsJson(entry.creators),
-                url = entry.url,
-                publishedAt = entry.publishedAt,
-                releaseYear = entry.releaseYear,
-                summary = entry.summary,
-                thumbnailUrl = entry.thumbnailUrl,
-                mergedIntoId = entry.mergedIntoId,
-                createdAt = created,
-                updatedAt = updated,
-                hlc = entry.hlc,
+        seedSingleInitialEntryInDao(dao, entry, fallbackIso)
+    }
+    seedInitialSyncEdgesInDao(dao, initial)
+}
+
+private suspend fun seedSingleInitialEntryInDao(
+    dao: RocheDao,
+    entry: SyncEntryRecordDto,
+    fallbackIso: String,
+) {
+    val created = entry.createdAt ?: fallbackIso
+    val updated = entry.updatedAt ?: created
+    dao.upsertEntry(
+        EntryEntity(
+            id = entry.id,
+            kind = entry.kind,
+            title = entry.title,
+            creatorsJson = encodeCreatorsJson(entry.creators),
+            url = entry.url,
+            publishedAt = entry.publishedAt,
+            releaseYear = entry.releaseYear,
+            summary = entry.summary,
+            thumbnailUrl = entry.thumbnailUrl,
+            mergedIntoId = entry.mergedIntoId,
+            createdAt = created,
+            updatedAt = updated,
+            hlc = entry.hlc,
+            isLocalDirty = false,
+        )
+    )
+    seedSingleInitialEntrySubTablesInDao(dao, entry, updated)
+}
+
+private suspend fun seedSingleInitialEntrySubTablesInDao(
+    dao: RocheDao,
+    entry: SyncEntryRecordDto,
+    updated: String,
+) {
+    entry.collectionSpec?.let { spec ->
+        dao.upsertCollectionSpec(
+            CollectionSpecEntity(
+                collectionId = entry.id,
+                slug = spec.slug,
+                mode = spec.mode,
+                role = spec.role,
+                ruleJson = spec.ruleJson,
+                showInLists = spec.showInLists,
+                color = spec.color,
+            )
+        )
+    }
+    entry.content?.let { content ->
+        dao.upsertEntryContent(
+            EntryContentEntity(
+                entryId = entry.id,
+                contentType = content.contentType,
+                contentText = null,
+                contentHtml = content.contentHtml,
+                audioUrl = content.audioUrl,
+                duration = null,
+                thumbnailMediaId = null,
+                fallbackFeedTitle = null,
+            )
+        )
+    }
+    entry.state?.let { st ->
+        dao.upsertEntryState(
+            EntryStateEntity(
+                entryId = entry.id,
+                inboxState = st.inboxState,
+                readAt = st.readAt,
+                progress = st.progress,
+                interactionUpdatedAt = st.interactionUpdatedAt,
+                updatedAt = st.interactionUpdatedAt ?: updated,
+                hlc = st.hlc,
                 isLocalDirty = false,
             )
         )
-        entry.collectionSpec?.let { spec ->
-            dao.upsertCollectionSpec(
-                CollectionSpecEntity(
-                    collectionId = entry.id,
-                    slug = spec.slug,
-                    mode = spec.mode,
-                    role = spec.role,
-                    ruleJson = spec.ruleJson,
-                    showInLists = spec.showInLists,
-                    color = spec.color,
-                )
-            )
-        }
-        entry.state?.let { st ->
-            dao.upsertEntryState(
-                EntryStateEntity(
-                    entryId = entry.id,
-                    inboxState = st.inboxState,
-                    readAt = st.readAt,
-                    progress = st.progress,
-                    interactionUpdatedAt = st.interactionUpdatedAt,
-                    updatedAt = st.interactionUpdatedAt ?: updated,
-                    hlc = st.hlc,
-                    isLocalDirty = false,
-                )
-            )
-        }
     }
-    seedInitialSyncEdgesInDao(dao, initial)
 }
 
 internal suspend fun seedInitialSyncEdgesInDao(dao: RocheDao, initial: InitialSyncVector) {
@@ -611,7 +662,12 @@ internal suspend fun assertExpectedEntriesInDao(
             SYNC_PROGRESS_EPSILON,
             "$name: progress for ${expState.entryId}",
         )
-        assertEquals(expState.hlc, actual.hlc, "$name: state hlc for ${expState.entryId}")
+        val expHlc = expState.hlc
+        if (expHlc != null) {
+            assertEquals(expHlc, actual.hlc, "$name: state hlc for ${expState.entryId}")
+        } else {
+            assertTrue(actual.hlc.isNotBlank(), "$name: empty state hlc for ${expState.entryId}")
+        }
     }
     for (expEntry in expected.entryPresence) {
         val actual = dao.getEntryById(expEntry.entryId)
@@ -624,6 +680,19 @@ internal suspend fun assertExpectedEntriesInDao(
             )
         }
     }
+    for (expMeta in expected.entryMetadata) {
+        val actualEntry =
+            checkNotNull(dao.getEntryById(expMeta.entryId)) {
+                "$name: missing entry for ${expMeta.entryId}"
+            }
+        assertEquals(expMeta.summary, actualEntry.summary, "$name: summary for ${expMeta.entryId}")
+        val actualContent = dao.getEntryContentById(expMeta.entryId)
+        assertEquals(
+            expMeta.contentHtmlPresent,
+            !actualContent?.contentHtml.isNullOrBlank(),
+            "$name: content_html_present for ${expMeta.entryId}",
+        )
+    }
 }
 
 internal suspend fun assertExpectedGraphInDao(
@@ -635,11 +704,21 @@ internal suspend fun assertExpectedGraphInDao(
         val actual = dao.getCollectionMemberships(expCol.collectionId).map { it.entryId }.sorted()
         assertEquals(expCol.entryIds, actual, "$name: members for ${expCol.collectionId}")
     }
-    if (expected.consumptionLogCounts.isNotEmpty()) {
+    if (expected.consumptionLogCounts.isNotEmpty() || expected.consumptionLogs.isNotEmpty()) {
         val allLogs = dao.getAllConsumptionLogs()
         for (expLog in expected.consumptionLogCounts) {
             val count = allLogs.count { it.entryId == expLog.entryId }
             assertEquals(expLog.count, count, "$name: log count for ${expLog.entryId}")
+        }
+        val logsById = allLogs.associateBy { it.id }
+        for (expLog in expected.consumptionLogs) {
+            val actual =
+                checkNotNull(logsById[expLog.id]) {
+                    "$name: missing consumption log ${expLog.id}"
+                }
+            assertEquals(expLog.entryId, actual.entryId, "$name: log entryId for ${expLog.id}")
+            assertEquals(expLog.status, actual.status, "$name: log status for ${expLog.id}")
+            assertEquals(expLog.notes, actual.notes, "$name: log notes for ${expLog.id}")
         }
     }
     if (expected.comparisonOrderings.isNotEmpty()) {
@@ -649,6 +728,10 @@ internal suspend fun assertExpectedGraphInDao(
                 .sortedBy { canonicalOrderingJson(it) }
         val expectedSorted = expected.comparisonOrderings.sortedBy { canonicalOrderingJson(it) }
         assertEquals(expectedSorted, actualOrderings, "$name: comparisons")
+    }
+    expected.comparisonIds?.let { expIds ->
+        val actualIds = dao.getAllComparisons().map { it.id }.sorted()
+        assertEquals(expIds.sorted(), actualIds, "$name: comparison_ids")
     }
     for (expGen in expected.generators) {
         val actual =

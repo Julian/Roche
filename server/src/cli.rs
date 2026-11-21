@@ -9,12 +9,12 @@ use figment::{
 use crate::{
     config::Config,
     db::{
-        CatalogBatchInput, CatalogEntry, ClusterSelectFilter, CollectionGeneratorState, Db,
-        EntryIdentifier, UpsertEntryInput,
+        CatalogBatchInput, CatalogEntry, CollectionGeneratorState, Db, EntryIdentifier,
+        UpsertEntryInput,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::RANDOM_SEED_EVERY,
-    service::CatalogService,
+    service::{CatalogService, ClusterSelectFilter},
     tui_rank::{ClusterRankOutcome, open_system_browser, prompt_cluster_tty},
 };
 

@@ -1301,6 +1301,30 @@
       {
         "ip": "ff02::1",
         "expected_allowed": false
+      },
+      {
+        "ip": "192.88.99.1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2001:10::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "3fff::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "3fff:0fff::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "5f00::1",
+        "expected_allowed": false
+      },
+      {
+        "ip": "2606:4700:4700::1111",
+        "expected_allowed": true
       }
     ],
     "urls": [
@@ -1422,6 +1446,62 @@
       },
       {
         "url": "http://[64:ff9b::93.184.216.34]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://192.88.99.1/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[2001:10::1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[3fff::1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[3fff:0fff::1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://[5f00::1]/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "https://[2606:4700:4700::1111]/rss",
+        "expected_allowed": true
+      },
+      {
+        "url": "http://0177.0.0.1/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://2130706433/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://0x7f000001/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://0x7f.0.0.1/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://127.1/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://user@example.com/rss",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://127.0.0.1\\@example.com/",
+        "expected_allowed": false
+      },
+      {
+        "url": "http://example.com%2f.evil.com/",
         "expected_allowed": false
       }
     ]
@@ -2828,6 +2908,1302 @@
           }
         ]
       }
+    },
+    {
+      "name": "equal_hlc_entry_state_join_and_progress_clamp",
+      "initial": {
+        "entries": [
+          {
+            "id": "entry-eq-1",
+            "kind": "article",
+            "title": "Equal HLC Article 1",
+            "url": "https://example.com/eq-1",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0001-peer-shared",
+            "state": {
+              "inbox_state": "unread",
+              "read_at": null,
+              "progress": 0.65,
+              "interaction_updated_at": "2025-06-01T10:00:00Z",
+              "hlc": "001748772000000-0001-peer-shared"
+            }
+          },
+          {
+            "id": "entry-eq-2",
+            "kind": "article",
+            "title": "Equal HLC Article 2",
+            "url": "https://example.com/eq-2",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0002-peer-shared",
+            "state": {
+              "inbox_state": "dismissed",
+              "read_at": "2025-06-01T10:02:00Z",
+              "progress": 0.9,
+              "interaction_updated_at": "2025-06-01T10:02:00Z",
+              "hlc": "001748772000000-0002-peer-shared"
+            }
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:05:00Z",
+        "entries": [
+          {
+            "id": "entry-eq-1",
+            "kind": "article",
+            "title": "Equal HLC Article 1",
+            "url": "https://example.com/eq-1",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772000000-0001-peer-shared",
+            "state": {
+              "inbox_state": "dismissed",
+              "read_at": "2025-06-01T10:05:00Z",
+              "progress": 1.75,
+              "interaction_updated_at": "2025-06-01T10:05:00Z",
+              "hlc": "001748772000000-0001-peer-shared"
+            }
+          },
+          {
+            "id": "entry-eq-2",
+            "kind": "article",
+            "title": "Equal HLC Article 2",
+            "url": "https://example.com/eq-2",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772000000-0002-peer-shared",
+            "state": {
+              "inbox_state": "unread",
+              "read_at": null,
+              "progress": -0.4,
+              "interaction_updated_at": "2025-06-01T10:01:00Z",
+              "hlc": "001748772000000-0002-peer-shared"
+            }
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "expected": {
+        "entry_states": [
+          {
+            "entry_id": "entry-eq-1",
+            "inbox_state": "dismissed",
+            "read_at_present": true,
+            "progress": 1.0,
+            "hlc": "001748772000000-0001-peer-shared"
+          },
+          {
+            "entry_id": "entry-eq-2",
+            "inbox_state": "dismissed",
+            "read_at_present": true,
+            "progress": 0.9,
+            "hlc": "001748772000000-0002-peer-shared"
+          }
+        ]
+      }
+    },
+    {
+      "name": "consumption_log_lww_edit_and_tombstone",
+      "initial": {
+        "entries": [
+          {
+            "id": "book-diary-test",
+            "kind": "book",
+            "title": "The Dispossessed",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [
+          {
+            "id": "log-edit",
+            "entry_id": "book-diary-test",
+            "ts": "2025-06-01T10:00:00Z",
+            "status": "started",
+            "notes": "Initial notes",
+            "created_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "log-del",
+            "entry_id": "book-diary-test",
+            "ts": "2025-06-01T10:01:00Z",
+            "status": "consumed",
+            "notes": "Delete me",
+            "created_at": "2025-06-01T10:01:00Z",
+            "hlc": "001748772060000-0000-local-peer"
+          },
+          {
+            "id": "log-newer",
+            "entry_id": "book-diary-test",
+            "ts": "2025-06-01T10:10:00Z",
+            "status": "consumed",
+            "notes": "Keep me",
+            "created_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-local-peer"
+          }
+        ],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:10:00Z",
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [
+          {
+            "id": "log-edit",
+            "entry_id": "book-diary-test",
+            "ts": "2025-06-01T10:05:00Z",
+            "status": "abandoned",
+            "notes": "Updated note",
+            "created_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "consumption_log",
+            "natural_key": "log-del",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entity_type": "consumption_log",
+            "natural_key": "log-newer",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ]
+      },
+      "expected": {
+        "consumption_log_counts": [
+          {
+            "entry_id": "book-diary-test",
+            "count": 2
+          }
+        ],
+        "consumption_logs": [
+          {
+            "id": "log-edit",
+            "entry_id": "book-diary-test",
+            "status": "abandoned",
+            "notes": "Updated note"
+          },
+          {
+            "id": "log-newer",
+            "entry_id": "book-diary-test",
+            "status": "consumed",
+            "notes": "Keep me"
+          }
+        ],
+        "tombstone_presence": [
+          {
+            "entity_type": "consumption_log",
+            "natural_key": "log-del",
+            "exists": true
+          },
+          {
+            "entity_type": "consumption_log",
+            "natural_key": "log-newer",
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "comparison_tombstone_and_stale_tombstone",
+      "initial": {
+        "entries": [
+          {
+            "id": "alb-1",
+            "kind": "album",
+            "title": "Album 1",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "alb-2",
+            "kind": "album",
+            "title": "Album 2",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [
+          {
+            "id": "comp-del",
+            "ts": "2025-06-01T10:00:00Z",
+            "scope_collection_id": null,
+            "ordering": [
+              [
+                "alb-1"
+              ],
+              [
+                "alb-2"
+              ]
+            ],
+            "created_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer"
+          },
+          {
+            "id": "comp-keep",
+            "ts": "2025-06-01T10:10:00Z",
+            "scope_collection_id": null,
+            "ordering": [
+              [
+                "alb-2"
+              ],
+              [
+                "alb-1"
+              ]
+            ],
+            "created_at": "2025-06-01T10:10:00Z",
+            "hlc": "001748772600000-0000-local-peer"
+          }
+        ],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:10:00Z",
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "comparison",
+            "natural_key": "comp-del",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          },
+          {
+            "entity_type": "comparison",
+            "natural_key": "comp-keep",
+            "deleted_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ]
+      },
+      "expected": {
+        "comparison_orderings": [
+          [
+            [
+              "alb-2"
+            ],
+            [
+              "alb-1"
+            ]
+          ]
+        ],
+        "comparison_ids": [
+          "comp-keep"
+        ],
+        "tombstone_presence": [
+          {
+            "entity_type": "comparison",
+            "natural_key": "comp-del",
+            "exists": true
+          },
+          {
+            "entity_type": "comparison",
+            "natural_key": "comp-keep",
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "protected_system_collection_tombstone_immunity",
+      "initial": {
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:10:00Z",
+        "entries": [],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": [
+          {
+            "entity_type": "entry",
+            "natural_key": "533b1315-6e2e-57d3-ba85-dc88531c5a0b",
+            "deleted_at": "2025-06-01T10:10:00Z",
+            "hlc": "001999999999999-9999-remote-peer"
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "3864ff37-5ed3-5256-9380-f85ff8054f1c",
+            "deleted_at": "2025-06-01T10:10:00Z",
+            "hlc": "001999999999999-9999-remote-peer"
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "2ef71101-a716-5331-9515-cb7b5ce8b3c3",
+            "deleted_at": "2025-06-01T10:10:00Z",
+            "hlc": "001999999999999-9999-remote-peer"
+          }
+        ]
+      },
+      "expected": {
+        "entry_presence": [
+          {
+            "entry_id": "533b1315-6e2e-57d3-ba85-dc88531c5a0b",
+            "exists": true,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "3864ff37-5ed3-5256-9380-f85ff8054f1c",
+            "exists": true,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "2ef71101-a716-5331-9515-cb7b5ce8b3c3",
+            "exists": true,
+            "merged_into_id": null
+          }
+        ],
+        "tombstone_presence": [
+          {
+            "entity_type": "entry",
+            "natural_key": "533b1315-6e2e-57d3-ba85-dc88531c5a0b",
+            "exists": false
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "3864ff37-5ed3-5256-9380-f85ff8054f1c",
+            "exists": false
+          },
+          {
+            "entity_type": "entry",
+            "natural_key": "2ef71101-a716-5331-9515-cb7b5ce8b3c3",
+            "exists": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "merged_into_id_duplicate_state_and_content_fold",
+      "initial": {
+        "entries": [
+          {
+            "id": "art-canon",
+            "kind": "article",
+            "title": "Deep Dive",
+            "url": "https://example.com/deep-dive",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "state": {
+              "inbox_state": "unread",
+              "read_at": null,
+              "progress": 0.2,
+              "interaction_updated_at": "2025-06-01T10:00:00Z",
+              "hlc": "001748772000000-0000-local-peer"
+            }
+          },
+          {
+            "id": "art-dup",
+            "kind": "article",
+            "title": "Deep Dive (Copy)",
+            "url": "https://example.com/deep-dive-dup",
+            "summary": "Recovered summary from duplicate",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:00:00Z",
+            "hlc": "001748772000000-0000-local-peer",
+            "content": {
+              "content_type": "article",
+              "content_html": "<p>Full body migrated from duplicate</p>"
+            },
+            "state": {
+              "inbox_state": "dismissed",
+              "read_at": "2025-06-01T10:04:00Z",
+              "progress": 0.85,
+              "interaction_updated_at": "2025-06-01T10:04:00Z",
+              "hlc": "001748772240000-0000-local-peer"
+            }
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "incoming": {
+        "peer_id": "remote-peer",
+        "sync_timestamp": "2025-06-01T10:05:00Z",
+        "entries": [
+          {
+            "id": "art-dup",
+            "kind": "article",
+            "title": "Deep Dive (Copy)",
+            "merged_into_id": "art-canon",
+            "created_at": "2025-06-01T10:00:00Z",
+            "updated_at": "2025-06-01T10:05:00Z",
+            "hlc": "001748772300000-0000-remote-peer"
+          }
+        ],
+        "collection_entries": [],
+        "consumption_log": [],
+        "comparisons": [],
+        "collection_generators": [],
+        "tombstones": []
+      },
+      "expected": {
+        "entry_presence": [
+          {
+            "entry_id": "art-canon",
+            "exists": true,
+            "merged_into_id": null
+          },
+          {
+            "entry_id": "art-dup",
+            "exists": true,
+            "merged_into_id": "art-canon"
+          }
+        ],
+        "entry_states": [
+          {
+            "entry_id": "art-canon",
+            "inbox_state": "dismissed",
+            "read_at_present": true,
+            "progress": 0.85,
+            "hlc": null
+          }
+        ],
+        "entry_metadata": [
+          {
+            "entry_id": "art-canon",
+            "summary": "Recovered summary from duplicate",
+            "content_html_present": true
+          }
+        ]
+      }
     }
-  ]
+  ],
+  "poll_decision_matrix": [
+    {
+      "name": "inactive_feed_never_polled",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": false,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "never_polled_winner_claims",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "never_polled_non_winner_defers",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "healthy_not_yet_due",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001221,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001221
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001221
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1699999486,
+        "last_polled_by": "server",
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "healthy_due_winner_claims",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1699999486,
+        "last_polled_by": "server",
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "healthy_due_non_winner_defers",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1699999486,
+        "last_polled_by": "server",
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "failure_1_cross_peer_rescue_other_peer",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1700001221,
+        "last_polled_by": "server",
+        "last_error": "HTTP 503",
+        "last_error_by": "server",
+        "consecutive_failures": 1
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "failure_1_same_peer_waits",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1700001221,
+        "last_polled_by": "server",
+        "last_error": "HTTP 503",
+        "last_error_by": "server",
+        "consecutive_failures": 1
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "failure_2_backoff_no_ping_pong",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1700000981,
+        "last_polled_by": "android-pixel",
+        "last_error": "HTTP 503",
+        "last_error_by": "android-pixel",
+        "consecutive_failures": 2
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "overdue_full_interval_rescue_by_non_winner",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700003081,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700003081
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700003081
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1699999486,
+        "last_polled_by": "server",
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "single_peer_claims_due_feed",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": 1699999486,
+        "last_polled_by": "server",
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "stale_peer_liveness_decay_prefers_fresh_peer",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 2.0,
+          "last_seen_epoch_secs": 1699997681
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "nan_weight_peer_excluded_server",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 0.0,
+          "weight_special": "nan",
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    },
+    {
+      "name": "nan_weight_peer_excluded_healthy_peer_wins",
+      "local_peer_id": "android-pixel",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "wifi",
+          "weight": 0.0,
+          "weight_special": "nan",
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": true
+    },
+    {
+      "name": "offline_tier_peer_excluded",
+      "local_peer_id": "server",
+      "now_epoch_secs": 1700001281,
+      "peers": [
+        {
+          "peer_id": "server",
+          "network_tier": "offline",
+          "weight": 5.0,
+          "last_seen_epoch_secs": 1700001281
+        },
+        {
+          "peer_id": "android-pixel",
+          "network_tier": "wifi",
+          "weight": 1.0,
+          "last_seen_epoch_secs": 1700001281
+        }
+      ],
+      "feed": {
+        "url": "https://blog.rust-lang.org/feed.xml",
+        "poll_interval_mins": 30,
+        "is_active": true,
+        "last_polled_epoch_secs": null,
+        "last_polled_by": null,
+        "last_error": null,
+        "last_error_by": null,
+        "consecutive_failures": 0
+      },
+      "expected_should_poll": false
+    }
+  ],
+  "feed_xml_fixtures": [
+    {
+      "name": "rss_2_0_podcast_enclosure_duration_itunes_art",
+      "feed_url": "https://www.acquired.fm/rss.xml",
+      "feed_type": "rss",
+      "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\">\n<channel>\n  <title>Acquired</title>\n  <link>https://www.acquired.fm</link>\n  <description>Every company has a story.</description>\n  <itunes:author>Ben Gilbert &amp; David Rosenthal</itunes:author>\n  <itunes:image href=\"https://cdn.example.com/acquired-cover.jpg\"/>\n  <item>\n    <title>NVIDIA: The GPU Company (Part III)</title>\n    <link>https://www.acquired.fm/episodes/nvidia-part-3</link>\n    <guid isPermaLink=\"false\">ep-nvidia-3</guid>\n    <description><![CDATA[<p>00:00 Intro<br/>18:40 CUDA Ecosystem</p>]]></description>\n    <enclosure url=\"https://cdn.example.com/audio/nvidia-part-3.mp3\" length=\"151200000\" type=\"audio/mpeg\"/>\n    <itunes:duration>04:12:20</itunes:duration>\n  </item>\n  <item>\n    <title>Linkless Episode With Custom Art</title>\n    <guid isPermaLink=\"false\">ep-linkless</guid>\n    <description>Episode without link tag</description>\n    <enclosure url=\"https://cdn.example.com/audio/linkless.m4a\" length=\"45000000\" type=\"audio/mp4\"/>\n    <itunes:duration>48:15</itunes:duration>\n    <itunes:author>Guest Host</itunes:author>\n    <itunes:image href=\"https://cdn.example.com/episodes/linkless-art.png\"/>\n  </item>\n</channel>\n</rss>",
+      "expected_feed_title": "Acquired",
+      "expected_items": [
+        {
+          "title": "NVIDIA: The GPU Company (Part III)",
+          "url": "https://www.acquired.fm/episodes/nvidia-part-3",
+          "audio_url": "https://cdn.example.com/audio/nvidia-part-3.mp3",
+          "duration_secs": 15140,
+          "thumbnail_url": "https://cdn.example.com/acquired-cover.jpg",
+          "author": "Ben Gilbert & David Rosenthal",
+          "published_at": null,
+          "description_contains": "CUDA Ecosystem",
+          "expected_item_id": "82edd9f7-09f9-5980-88c0-018b33d71bb3"
+        },
+        {
+          "title": "Linkless Episode With Custom Art",
+          "url": "https://cdn.example.com/audio/linkless.m4a",
+          "audio_url": "https://cdn.example.com/audio/linkless.m4a",
+          "duration_secs": 2895,
+          "thumbnail_url": "https://cdn.example.com/episodes/linkless-art.png",
+          "author": "Guest Host",
+          "published_at": null,
+          "description_contains": "Episode without link tag",
+          "expected_item_id": "7fa8c523-da64-500f-ae3e-4b6aa716d1cc"
+        }
+      ]
+    },
+    {
+      "name": "atom_1_0_prefers_alternate_over_edit_and_enclosure",
+      "feed_url": "https://example.com/atom.xml",
+      "feed_type": "rss",
+      "xml": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n  <title>Atom Feed</title>\n  <link rel=\"self\" href=\"https://example.com/atom.xml\"/>\n  <link rel=\"alternate\" href=\"https://example.com\"/>\n  <entry>\n    <title>Atom Article</title>\n    <id>urn:uuid:atom-alt-1</id>\n    <link rel=\"edit\" href=\"https://example.com/edit/atom-1\"/>\n    <link rel=\"enclosure\" type=\"audio/mpeg\" href=\"https://cdn.example.com/other.mp3\"/>\n    <link rel=\"alternate\" href=\"https://example.com/posts/atom-alternate\"/>\n    <author><name>Jane Doe</name></author>\n    <published>2026-05-01T12:30:00Z</published>\n    <summary>Atom summary text</summary>\n  </entry>\n</feed>",
+      "expected_feed_title": "Atom Feed",
+      "expected_items": [
+        {
+          "title": "Atom Article",
+          "url": "https://example.com/posts/atom-alternate",
+          "audio_url": "https://cdn.example.com/other.mp3",
+          "duration_secs": null,
+          "thumbnail_url": null,
+          "author": "Jane Doe",
+          "published_at": "2026-05-01T12:30:00Z",
+          "description_contains": "Atom summary text",
+          "expected_item_id": "1e06187f-07d6-5c4b-9178-50722598671e"
+        }
+      ]
+    },
+    {
+      "name": "youtube_atom_video_id_and_media_description",
+      "feed_url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
+      "feed_type": "youtube",
+      "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<feed xmlns:yt=\"http://www.youtube.com/xml/schemas/2015\"\n      xmlns:media=\"http://search.yahoo.com/mrss/\"\n      xmlns=\"http://www.w3.org/2005/Atom\">\n  <link rel=\"self\" href=\"http://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA\"/>\n  <id>yt:channel:UCX6OQ3DkcsbYNE6H8uQQuVA</id>\n  <title>Test Channel</title>\n  <entry>\n    <id>yt:video:dQw4w9WgXcQ</id>\n    <yt:videoId>dQw4w9WgXcQ</yt:videoId>\n    <title>Test Video</title>\n    <link rel=\"alternate\" href=\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\"/>\n    <published>2026-10-14T08:00:00+00:00</published>\n    <media:group>\n      <media:title>Test Video</media:title>\n      <media:description>A description mentioning secondVidId</media:description>\n      <media:thumbnail url=\"https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg\" width=\"480\" height=\"360\"/>\n    </media:group>\n  </entry>\n  <entry>\n    <id>yt:video:secondVidId</id>\n    <yt:videoId>secondVidId</yt:videoId>\n    <title>Second Video</title>\n    <link rel=\"alternate\" href=\"https://www.youtube.com/watch?v=secondVidId\"/>\n  </entry>\n</feed>",
+      "expected_feed_title": "Test Channel",
+      "expected_items": [
+        {
+          "title": "Test Video",
+          "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+          "audio_url": null,
+          "duration_secs": null,
+          "thumbnail_url": null,
+          "author": null,
+          "published_at": "2026-10-14T08:00:00Z",
+          "description_contains": "A description mentioning secondVidId",
+          "expected_item_id": "3b96f287-3f79-50ad-b1b6-743c7f922a0d"
+        },
+        {
+          "title": "Second Video",
+          "url": "https://www.youtube.com/watch?v=secondVidId",
+          "audio_url": null,
+          "duration_secs": null,
+          "thumbnail_url": null,
+          "author": null,
+          "published_at": null,
+          "description_contains": null,
+          "expected_item_id": "f6b5a339-272c-54c8-9b15-760f72e399d2"
+        }
+      ]
+    },
+    {
+      "name": "arxiv_rdf_versionless_https_canonicalization",
+      "feed_url": "https://rss.arxiv.org/rss/cs.LG",
+      "feed_type": "arxiv",
+      "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"\n         xmlns=\"http://purl.org/rss/1.0/\"\n         xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n  <channel rdf:about=\"http://arxiv.org/rss/cs.LG\">\n    <title>cs.LG updates on arXiv.org</title>\n    <link>http://arxiv.org/rss/cs.LG</link>\n    <description>arXiv cs.LG updates</description>\n  </channel>\n  <item rdf:about=\"http://arxiv.org/abs/2603.11842v1\">\n    <title>Speculative Decoding</title>\n    <link>http://arxiv.org/abs/2603.11842v1</link>\n    <description>Abstract about speculative decoding</description>\n    <dc:creator>Vaswani, Ashish</dc:creator>\n  </item>\n  <item rdf:about=\"http://arxiv.org/abs/hep-th/9901001v2\">\n    <title>Classic Paper</title>\n    <link>http://arxiv.org/abs/hep-th/9901001v2</link>\n    <description>Classic physics paper</description>\n  </item>\n</rdf:RDF>",
+      "expected_feed_title": "cs.LG updates on arXiv.org",
+      "expected_items": [
+        {
+          "title": "Speculative Decoding",
+          "url": "https://arxiv.org/abs/2603.11842",
+          "audio_url": null,
+          "duration_secs": null,
+          "thumbnail_url": null,
+          "author": "Vaswani, Ashish",
+          "published_at": null,
+          "description_contains": "speculative decoding",
+          "expected_item_id": "d08d527a-420f-5912-80bf-65a37783f5e4"
+        },
+        {
+          "title": "Classic Paper",
+          "url": "https://arxiv.org/abs/hep-th/9901001",
+          "audio_url": null,
+          "duration_secs": null,
+          "thumbnail_url": null,
+          "author": null,
+          "published_at": null,
+          "description_contains": "Classic physics paper",
+          "expected_item_id": "f0f88b53-780c-59e3-9e50-6a71e4cb3876"
+        }
+      ]
+    }
+  ],
+  "wire_dto_roundtrip": {
+    "peer_sync_request": {
+      "peer_id": "android-pixel-9",
+      "device_name": "Pixel 9 Pro",
+      "network_tier": "wifi",
+      "weight": 2.75,
+      "since_seq": 1042,
+      "client_hlc": "001748772300000-0003-android-pixel-9",
+      "entries": [
+        {
+          "id": "af903f9e-774e-5f56-8729-5a0c74c0d020",
+          "kind": "article",
+          "title": "Rust 2026 Roadmap",
+          "creators": [
+            "Rust Team"
+          ],
+          "url": "https://blog.rust-lang.org/2026/05/01/rust.html",
+          "published_at": "2026-05-01T10:00:00Z",
+          "summary": "Summary of the 2026 roadmap",
+          "thumbnail_url": "https://blog.rust-lang.org/hero.png",
+          "identifiers": [
+            {
+              "scheme": "url",
+              "value": "https://blog.rust-lang.org/2026/05/01/rust.html"
+            }
+          ],
+          "created_at": "2026-05-01T10:05:00Z",
+          "updated_at": "2026-05-01T11:00:00Z",
+          "hlc": "001748772300000-0001-android-pixel-9",
+          "content": {
+            "content_type": "article",
+            "content_html": "<p>Roadmap details</p>",
+            "duration": 360
+          },
+          "state": {
+            "inbox_state": "unread",
+            "progress": 0.45,
+            "interaction_updated_at": "2026-05-01T11:00:00Z",
+            "hlc": "001748772300000-0002-android-pixel-9"
+          }
+        },
+        {
+          "id": "06890597-e45d-5598-982b-d412998d0712",
+          "kind": "publication",
+          "title": "Rust Blog",
+          "creators": [],
+          "created_at": "2026-05-01T09:00:00Z",
+          "updated_at": "2026-05-01T09:00:00Z",
+          "hlc": "001748771000000-0000-android-pixel-9",
+          "collection_spec": {
+            "mode": "feed",
+            "role": "feed",
+            "show_in_lists": false
+          },
+          "feed_source": {
+            "feed_url": "https://blog.rust-lang.org/feed.xml",
+            "source_type": "rss",
+            "feed_title": "Rust Blog",
+            "language": "en",
+            "poll_interval": 30,
+            "is_active": true,
+            "last_polled_at": "2026-05-01T10:55:00Z",
+            "last_polled_by": "android-pixel-9",
+            "consecutive_failures": 0,
+            "hlc": "001748771000000-0000-android-pixel-9"
+          }
+        },
+        {
+          "id": "album-ok-computer",
+          "kind": "album",
+          "title": "OK Computer",
+          "creators": [
+            "Radiohead"
+          ],
+          "release_year": 1997,
+          "metadata": {
+            "genres": [
+              "Alternative Rock"
+            ],
+            "tracks": 12
+          },
+          "identifiers": [
+            {
+              "scheme": "spotify",
+              "value": "spotify:album:6dVIqQ8qmQ5GBnJ9shOYGE"
+            }
+          ],
+          "created_at": "2026-05-01T08:00:00Z",
+          "updated_at": "2026-05-01T08:00:00Z",
+          "hlc": "001748770000000-0000-android-pixel-9"
+        },
+        {
+          "id": "a4c3776a-fa5b-5946-944f-6d0cda118d63",
+          "kind": "collection",
+          "title": "Favorites 2026",
+          "creators": [],
+          "created_at": "2026-05-01T08:00:00Z",
+          "updated_at": "2026-05-01T08:00:00Z",
+          "hlc": "001748770000000-0001-android-pixel-9",
+          "collection_spec": {
+            "slug": "favorites_2026",
+            "mode": "manual",
+            "role": "list",
+            "show_in_lists": true,
+            "color": "#3b82f6"
+          }
+        }
+      ],
+      "collection_entries": [
+        {
+          "collection_id": "a4c3776a-fa5b-5946-944f-6d0cda118d63",
+          "entry_id": "album-ok-computer",
+          "position": 2.5,
+          "added_at": "2026-05-01T08:05:00Z",
+          "hlc": "001748770300000-0000-android-pixel-9"
+        }
+      ],
+      "collection_generators": [
+        {
+          "collection_id": "a4c3776a-fa5b-5946-944f-6d0cda118d63",
+          "enabled": true,
+          "current_entry_id": "album-ok-computer",
+          "drawn_at": "2026-05-01T08:10:00Z",
+          "updated_at": "2026-05-01T08:10:00Z",
+          "hlc": "001748770600000-0000-android-pixel-9"
+        }
+      ],
+      "consumption_log": [
+        {
+          "id": "log-wire-1",
+          "entry_id": "album-ok-computer",
+          "ts": "2026-05-01T09:00:00Z",
+          "status": "consumed",
+          "notes": "Masterpiece",
+          "created_at": "2026-05-01T09:00:00Z",
+          "hlc": "001748771100000-0000-android-pixel-9"
+        }
+      ],
+      "comparisons": [
+        {
+          "id": "comp-wire-1",
+          "ts": "2026-05-01T09:30:00Z",
+          "scope_collection_id": "a4c3776a-fa5b-5946-944f-6d0cda118d63",
+          "ordering": [
+            [
+              "album-ok-computer",
+              "album-kid-a"
+            ],
+            [
+              "album-pablo-honey"
+            ]
+          ],
+          "created_at": "2026-05-01T09:30:00Z",
+          "hlc": "001748771200000-0000-android-pixel-9"
+        }
+      ],
+      "tombstones": [
+        {
+          "entity_type": "collection_entry",
+          "natural_key": "a4c3776a-fa5b-5946-944f-6d0cda118d63\u0000album-old",
+          "deleted_at": "2026-05-01T09:45:00Z",
+          "hlc": "001748771300000-0000-android-pixel-9"
+        }
+      ]
+    },
+    "peer_sync_response": {
+      "server_peer_id": "server",
+      "sync_seq": 2048,
+      "server_hlc": "001748772900000-0007-server",
+      "sync_timestamp": "2026-05-01T11:10:00Z",
+      "has_more": true,
+      "reset_required": false,
+      "active_peers": [
+        {
+          "peer_id": "server",
+          "device_name": "Roche Server",
+          "network_tier": "wired",
+          "weight": 5.0,
+          "last_seen_at": "2026-05-01T11:10:00Z"
+        },
+        {
+          "peer_id": "android-pixel-9",
+          "device_name": "Pixel 9 Pro",
+          "network_tier": "wifi",
+          "weight": 2.75,
+          "last_seen_at": "2026-05-01T11:09:58Z"
+        }
+      ],
+      "entries": [
+        {
+          "id": "podcast-ep-1",
+          "kind": "podcast_episode",
+          "title": "Episode 42",
+          "creators": [
+            "Host Name"
+          ],
+          "url": "https://pod.example.com/ep42",
+          "published_at": "2026-05-01T07:00:00Z",
+          "created_at": "2026-05-01T07:05:00Z",
+          "updated_at": "2026-05-01T11:05:00Z",
+          "hlc": "001748772800000-0000-server",
+          "content": {
+            "content_type": "audio",
+            "audio_url": "https://cdn.example.com/ep42.mp3",
+            "duration": 3615
+          },
+          "state": {
+            "inbox_state": "dismissed",
+            "read_at": "2026-05-01T11:05:00Z",
+            "progress": 1.0,
+            "interaction_updated_at": "2026-05-01T11:05:00Z",
+            "hlc": "001748772800000-0001-server"
+          }
+        }
+      ],
+      "collection_entries": [],
+      "collection_generators": [],
+      "consumption_log": [],
+      "comparisons": [],
+      "tombstones": [
+        {
+          "entity_type": "comparison",
+          "natural_key": "comp-deleted-1",
+          "deleted_at": "2026-05-01T11:00:00Z",
+          "hlc": "001748772700000-0000-server"
+        }
+      ]
+    }
+  }
 }

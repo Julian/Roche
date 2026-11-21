@@ -8,10 +8,93 @@ use url::Url;
 use super::error::{ApiError, ProblemJson, ProblemPath, ProblemQuery};
 use crate::{
     db::{ItemFilter, ItemPage},
-    domain::{ItemStatus, READER_AUTO_READ_THRESHOLD, ReadAtPatch},
+    domain::{
+        ContentType, ItemSortField, ItemStatus, ItemStatusFilter, READER_AUTO_READ_THRESHOLD,
+        ReadAtPatch, SortOrder,
+    },
     service::{ItemDetail, RocheService},
     util::clock::now_utc,
 };
+
+fn deserialize_optional_rfc3339<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = opt else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(serde::de::Error::custom("updated_after cannot be empty"));
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+    if trimmed.contains(' ')
+        && let Ok(dt) = DateTime::parse_from_rfc3339(&trimmed.replace(' ', "+"))
+    {
+        return Ok(Some(dt.with_timezone(&Utc)));
+    }
+    Err(serde::de::Error::custom(format!(
+        "Invalid RFC 3339 timestamp for updated_after: '{trimmed}'"
+    )))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ItemListQuery {
+    status: Option<ItemStatusFilter>,
+    feed_id: Option<String>,
+    tag_id: Option<String>,
+    #[serde(default)]
+    collection_id: Option<String>,
+    #[serde(default)]
+    inbox_only: Option<bool>,
+    #[serde(default)]
+    in_progress_only: Option<bool>,
+    content_type: Option<ContentType>,
+    is_favorite: Option<bool>,
+    is_read: Option<bool>,
+    include_content: Option<bool>,
+    search: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_rfc3339")]
+    updated_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    updated_after_item_id: Option<String>,
+    sort: Option<ItemSortField>,
+    order: Option<SortOrder>,
+    page: Option<usize>,
+    per_page: Option<usize>,
+    #[serde(default)]
+    sort_updated_asc: bool,
+}
+
+impl From<ItemListQuery> for ItemFilter {
+    fn from(q: ItemListQuery) -> Self {
+        Self {
+            status: q.status,
+            feed_id: q.feed_id,
+            tag_id: q.tag_id,
+            collection_id: q.collection_id,
+            inbox_only: q.inbox_only,
+            in_progress_only: q.in_progress_only,
+            content_type: q.content_type,
+            is_favorite: q.is_favorite,
+            is_read: q.is_read,
+            include_content: q.include_content,
+            search: q.search,
+            updated_after: q.updated_after,
+            updated_after_item_id: q.updated_after_item_id,
+            sort: q.sort,
+            order: q.order,
+            page: q.page,
+            per_page: q.per_page,
+            sort_updated_asc: q.sort_updated_asc,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SaveItemRequest {
@@ -59,9 +142,9 @@ pub(super) struct AddItemTagRequest {
 
 pub(super) async fn items_list(
     State(service): State<Arc<RocheService>>,
-    ProblemQuery(filter): ProblemQuery<ItemFilter>,
+    ProblemQuery(query): ProblemQuery<ItemListQuery>,
 ) -> Result<Json<ItemPage>, ApiError> {
-    let page = service.items().query().with_filter(filter).list_page().await?;
+    let page = service.items().query().with_filter(ItemFilter::from(query)).list_page().await?;
     Ok(Json(page))
 }
 

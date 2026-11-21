@@ -2,20 +2,25 @@
 
 use std::net::IpAddr;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
+use roche_core::{
+    feeds::{ArxivParser, RssParser, YouTubeParser},
+    hrw::{FeedPollState, NetworkTier, PeerNode, should_peer_poll_feed},
+    identity::deterministic_item_id,
+};
 use serde::Deserialize;
 use url::Url;
 
 use super::{
-    PeerSyncRequest, PreparedSyncEntry, SyncCollectionEntryRecord, SyncCollectionGeneratorRecord,
-    SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryRecord, SyncTombstone,
-    canonical_ordering_json,
+    PeerSyncRequest, PeerSyncResponse, PreparedSyncEntry, SyncCollectionEntryRecord,
+    SyncCollectionGeneratorRecord, SyncComparisonRecord, SyncConsumptionLogRecord, SyncEntryRecord,
+    SyncTombstone, canonical_ordering_json,
 };
 use crate::{
     content::classify::{classify_url, infer_feed_type},
     db::{
-        ActivityEntityType, CollectionRole, ContentType, Db, EntryKind, InboxState,
-        derive_manual_collection_slug_and_id, external_identifier_url_for_kind,
+        ActivityEntityType, CollectionRole, ConsumptionStatus, ContentType, Db, EntryKind,
+        InboxState, derive_manual_collection_slug_and_id, external_identifier_url_for_kind,
     },
     ranking::RankBoard,
     service::enrich::{
@@ -160,7 +165,23 @@ struct ExpectedEntryStateFixture {
     inbox_state: InboxState,
     read_at_present: bool,
     progress: f64,
-    hlc: String,
+    #[serde(default)]
+    hlc: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedEntryMetadataFixture {
+    entry_id: String,
+    summary: Option<String>,
+    content_html_present: bool,
+}
+
+#[derive(Deserialize)]
+struct ExpectedConsumptionLogFixture {
+    id: String,
+    entry_id: String,
+    status: ConsumptionStatus,
+    notes: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -203,11 +224,17 @@ struct ExpectedSyncOutcomeFixture {
     #[serde(default)]
     entry_presence: Vec<ExpectedEntryPresenceFixture>,
     #[serde(default)]
+    entry_metadata: Vec<ExpectedEntryMetadataFixture>,
+    #[serde(default)]
     collection_members: Vec<ExpectedCollectionMembersFixture>,
     #[serde(default)]
     consumption_log_counts: Vec<ExpectedLogCountFixture>,
     #[serde(default)]
+    consumption_logs: Vec<ExpectedConsumptionLogFixture>,
+    #[serde(default)]
     comparison_orderings: Vec<Vec<Vec<String>>>,
+    #[serde(default)]
+    comparison_ids: Option<Vec<String>>,
     #[serde(default)]
     generators: Vec<ExpectedGeneratorFixture>,
     #[serde(default)]
@@ -223,6 +250,67 @@ struct PeerSyncScenarioVector {
 }
 
 #[derive(Deserialize)]
+struct PollDecisionPeerFixture {
+    peer_id: String,
+    network_tier: NetworkTier,
+    weight: f64,
+    #[serde(default)]
+    weight_special: Option<String>,
+    last_seen_epoch_secs: i64,
+}
+
+#[derive(Deserialize)]
+struct PollDecisionFeedFixture {
+    url: String,
+    poll_interval_mins: i64,
+    is_active: bool,
+    last_polled_epoch_secs: Option<i64>,
+    last_polled_by: Option<String>,
+    last_error: Option<String>,
+    last_error_by: Option<String>,
+    consecutive_failures: i64,
+}
+
+#[derive(Deserialize)]
+struct PollDecisionVector {
+    name: String,
+    local_peer_id: String,
+    now_epoch_secs: i64,
+    peers: Vec<PollDecisionPeerFixture>,
+    feed: PollDecisionFeedFixture,
+    expected_should_poll: bool,
+}
+
+#[derive(Deserialize)]
+struct FeedXmlExpectedItemFixture {
+    title: String,
+    url: String,
+    audio_url: Option<String>,
+    duration_secs: Option<i64>,
+    thumbnail_url: Option<String>,
+    author: Option<String>,
+    published_at: Option<String>,
+    description_contains: Option<String>,
+    expected_item_id: String,
+}
+
+#[derive(Deserialize)]
+struct FeedXmlFixtureVector {
+    name: String,
+    feed_url: String,
+    feed_type: String,
+    xml: String,
+    expected_feed_title: String,
+    expected_items: Vec<FeedXmlExpectedItemFixture>,
+}
+
+#[derive(Deserialize)]
+struct WireDtoRoundtripSuite {
+    peer_sync_request: serde_json::Value,
+    peer_sync_response: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 struct ExpandedCrossStackVectors {
     custom_collection_ids: Vec<CustomCollectionIdVector>,
     url_classification: Vec<UrlClassificationVector>,
@@ -231,6 +319,9 @@ struct ExpandedCrossStackVectors {
     rank_board_operations: Vec<RankBoardScenarioVector>,
     artist_wikipedia_scoring: ArtistEnrichmentSuite,
     peer_sync_merge_scenarios: Vec<PeerSyncScenarioVector>,
+    poll_decision_matrix: Vec<PollDecisionVector>,
+    feed_xml_fixtures: Vec<FeedXmlFixtureVector>,
+    wire_dto_roundtrip: WireDtoRoundtripSuite,
 }
 
 fn load_expanded_vectors() -> ExpandedCrossStackVectors {
@@ -474,6 +565,18 @@ async fn seed_initial_sync_entries(db: &Db, entries: &[SyncEntryRecord]) {
             .await
             .unwrap();
         }
+        if let Some(ref content) = entry.content {
+            sqlx::query(
+                "INSERT INTO entry_content (entry_id, content_html, content_type)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&entry.id)
+            .bind(content.content_html.as_deref())
+            .bind(content.content_type)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
         if let Some(ref st) = entry.state {
             sqlx::query(
                 "INSERT INTO entry_state
@@ -599,7 +702,11 @@ async fn assert_expected_entries_and_states(
             row.2,
             exp_st.progress
         );
-        assert_eq!(row.3, exp_st.hlc, "{name}: state hlc for {}", exp_st.entry_id);
+        if let Some(ref exp_hlc) = exp_st.hlc {
+            assert_eq!(row.3, *exp_hlc, "{name}: state hlc for {}", exp_st.entry_id);
+        } else {
+            assert!(!row.3.trim().is_empty(), "{name}: empty state hlc for {}", exp_st.entry_id);
+        }
     }
     for exp_entry in &expected.entry_presence {
         let row: Option<(Option<String>,)> =
@@ -616,6 +723,28 @@ async fn assert_expected_entries_and_states(
                 exp_entry.entry_id
             );
         }
+    }
+    for exp_meta in &expected.entry_metadata {
+        let summary: Option<String> =
+            sqlx::query_scalar("SELECT summary FROM entries WHERE id = ?")
+                .bind(&exp_meta.entry_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(summary, exp_meta.summary, "{name}: summary for {}", exp_meta.entry_id);
+        let content_html: Option<String> =
+            sqlx::query_scalar("SELECT content_html FROM entry_content WHERE entry_id = ?")
+                .bind(&exp_meta.entry_id)
+                .fetch_optional(db.pool())
+                .await
+                .unwrap()
+                .flatten();
+        assert_eq!(
+            content_html.as_deref().is_some_and(|h| !h.trim().is_empty()),
+            exp_meta.content_html_present,
+            "{name}: content_html_present for {}",
+            exp_meta.entry_id
+        );
     }
 }
 
@@ -643,6 +772,17 @@ async fn assert_expected_graph_and_tombstones(
                 .unwrap();
         assert_eq!(count, exp_log.count, "{name}: log count for {}", exp_log.entry_id);
     }
+    for exp_log in &expected.consumption_logs {
+        let row: (String, ConsumptionStatus, Option<String>) =
+            sqlx::query_as("SELECT entry_id, status, notes FROM consumption_log WHERE id = ?")
+                .bind(&exp_log.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(row.0, exp_log.entry_id, "{name}: log entry_id for {}", exp_log.id);
+        assert_eq!(row.1, exp_log.status, "{name}: log status for {}", exp_log.id);
+        assert_eq!(row.2, exp_log.notes, "{name}: log notes for {}", exp_log.id);
+    }
     if !expected.comparison_orderings.is_empty() {
         let mut actual_orderings: Vec<Vec<Vec<String>>> =
             sqlx::query_scalar::<_, String>("SELECT ordering_json FROM comparisons")
@@ -656,6 +796,16 @@ async fn assert_expected_graph_and_tombstones(
         let mut wanted = expected.comparison_orderings.clone();
         wanted.sort();
         assert_eq!(actual_orderings, wanted, "{name}: comparisons");
+    }
+    if let Some(ref exp_comp_ids) = expected.comparison_ids {
+        let actual_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM comparisons ORDER BY id ASC")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let mut sorted_expected = exp_comp_ids.clone();
+        sorted_expected.sort();
+        assert_eq!(actual_ids, sorted_expected, "{name}: comparison_ids");
     }
     for exp_gen in &expected.generators {
         let (enabled, cur): (bool, Option<String>) = sqlx::query_as(
@@ -694,7 +844,7 @@ async fn assert_expected_graph_and_tombstones(
 #[tokio::test]
 async fn test_cross_stack_peer_sync_merge_scenarios() {
     let scenarios = load_expanded_vectors().peer_sync_merge_scenarios;
-    assert!(scenarios.len() >= 4);
+    assert!(scenarios.len() >= 10);
 
     for scenario in scenarios {
         let db = Db::connect("sqlite::memory:").await.unwrap();
@@ -718,4 +868,213 @@ async fn test_cross_stack_peer_sync_merge_scenarios() {
         assert_expected_entries_and_states(&db, &scenario.name, &scenario.expected).await;
         assert_expected_graph_and_tombstones(&db, &scenario.name, &scenario.expected).await;
     }
+}
+
+#[test]
+fn test_cross_stack_poll_decision_matrix() {
+    let cases = load_expanded_vectors().poll_decision_matrix;
+    assert!(cases.len() >= 12);
+
+    for case in cases {
+        let now = Utc.timestamp_opt(case.now_epoch_secs, 0).unwrap();
+        let peers: Vec<PeerNode> = case
+            .peers
+            .iter()
+            .map(|p| PeerNode {
+                peer_id: p.peer_id.clone(),
+                device_name: p.peer_id.clone(),
+                network_tier: p.network_tier,
+                weight: match p.weight_special.as_deref() {
+                    Some("nan") => f64::NAN,
+                    Some("inf") => f64::INFINITY,
+                    _ => p.weight,
+                },
+                last_seen_at: Utc.timestamp_opt(p.last_seen_epoch_secs, 0).unwrap(),
+            })
+            .collect();
+        let feed = FeedPollState {
+            url: case.feed.url.clone(),
+            poll_interval: case.feed.poll_interval_mins,
+            is_active: case.feed.is_active,
+            last_polled: case.feed.last_polled_epoch_secs.map(|s| Utc.timestamp_opt(s, 0).unwrap()),
+            last_polled_by: case.feed.last_polled_by.clone(),
+            last_error: case.feed.last_error.clone(),
+            last_error_by: case.feed.last_error_by.clone(),
+            consecutive_failures: case.feed.consecutive_failures,
+        };
+        let actual = should_peer_poll_feed(&case.local_peer_id, &peers, &feed, now);
+        assert_eq!(
+            actual, case.expected_should_poll,
+            "poll_decision_matrix mismatch for '{}'",
+            case.name
+        );
+    }
+}
+
+fn assert_youtube_xml_fixture(fixture: &FeedXmlFixtureVector) {
+    let parsed = YouTubeParser::parse(&fixture.xml).unwrap();
+    assert_eq!(parsed.channel_title, fixture.expected_feed_title, "{}", fixture.name);
+    assert_eq!(parsed.items.len(), fixture.expected_items.len(), "{}", fixture.name);
+    for (item, exp) in parsed.items.iter().zip(&fixture.expected_items) {
+        assert_eq!(item.title, exp.title, "{}", fixture.name);
+        assert_eq!(item.watch_url.as_str(), exp.url, "{}", fixture.name);
+        assert_eq!(
+            deterministic_item_id(Some(&fixture.feed_url), item.watch_url.as_str()),
+            exp.expected_item_id,
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            item.published_at.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            exp.published_at,
+            "{}",
+            fixture.name
+        );
+        if let Some(ref needle) = exp.description_contains {
+            assert!(
+                item.description.contains(needle),
+                "{}: expected '{}' in '{}'",
+                fixture.name,
+                needle,
+                item.description
+            );
+        }
+    }
+}
+
+fn assert_arxiv_xml_fixture(fixture: &FeedXmlFixtureVector) {
+    let parsed = ArxivParser::parse(&fixture.xml).unwrap();
+    assert_eq!(parsed.title, fixture.expected_feed_title, "{}", fixture.name);
+    assert_eq!(parsed.items.len(), fixture.expected_items.len(), "{}", fixture.name);
+    for (item, exp) in parsed.items.iter().zip(&fixture.expected_items) {
+        let url_str = item.abstract_url.as_ref().unwrap().as_str();
+        assert_eq!(item.title, exp.title, "{}", fixture.name);
+        assert_eq!(url_str, exp.url, "{}", fixture.name);
+        assert_eq!(
+            deterministic_item_id(Some(&fixture.feed_url), url_str),
+            exp.expected_item_id,
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            item.authors.first().map(String::as_str),
+            exp.author.as_deref(),
+            "{}",
+            fixture.name
+        );
+        if let Some(ref needle) = exp.description_contains {
+            assert!(
+                item.summary.contains(needle),
+                "{}: expected '{}' in '{}'",
+                fixture.name,
+                needle,
+                item.summary
+            );
+        }
+    }
+}
+
+fn assert_rss_xml_fixture(fixture: &FeedXmlFixtureVector) {
+    let (feed, items) = RssParser::parse(&fixture.xml).unwrap();
+    assert_eq!(feed.title, fixture.expected_feed_title, "{}", fixture.name);
+    assert_eq!(items.len(), fixture.expected_items.len(), "{}", fixture.name);
+    for (item, exp) in items.iter().zip(&fixture.expected_items) {
+        let url_str = item.link.as_ref().unwrap().as_str();
+        assert_eq!(item.title, exp.title, "{}", fixture.name);
+        assert_eq!(url_str, exp.url, "{}", fixture.name);
+        assert_eq!(
+            deterministic_item_id(Some(&fixture.feed_url), url_str),
+            exp.expected_item_id,
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            item.audio_url.as_ref().map(Url::as_str),
+            exp.audio_url.as_deref(),
+            "{}",
+            fixture.name
+        );
+        assert_eq!(item.duration, exp.duration_secs, "{}", fixture.name);
+        assert_eq!(item.thumbnail_url, exp.thumbnail_url, "{}", fixture.name);
+        assert_eq!(
+            item.authors.first().map(String::as_str),
+            exp.author.as_deref(),
+            "{}",
+            fixture.name
+        );
+        assert_eq!(
+            item.pub_date.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+            exp.published_at,
+            "{}",
+            fixture.name
+        );
+        if let Some(ref needle) = exp.description_contains {
+            assert!(
+                item.description.contains(needle),
+                "{}: expected '{}' in '{}'",
+                fixture.name,
+                needle,
+                item.description
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cross_stack_feed_xml_fixtures() {
+    let fixtures = load_expanded_vectors().feed_xml_fixtures;
+    assert!(fixtures.len() >= 4);
+
+    for fixture in &fixtures {
+        match fixture.feed_type.as_str() {
+            "youtube" => assert_youtube_xml_fixture(fixture),
+            "arxiv" => assert_arxiv_xml_fixture(fixture),
+            _ => assert_rss_xml_fixture(fixture),
+        }
+    }
+}
+
+#[test]
+fn test_cross_stack_wire_dto_roundtrip() {
+    let suite = load_expanded_vectors().wire_dto_roundtrip;
+
+    let req: PeerSyncRequest = serde_json::from_value(suite.peer_sync_request).unwrap();
+    assert_eq!(req.peer_id, "android-pixel-9");
+    assert_eq!(req.network_tier, NetworkTier::Wifi);
+    assert_eq!(req.since_seq, 1042);
+    assert_eq!(req.entries.len(), 4);
+    assert_eq!(req.entries[0].content.as_ref().unwrap().duration, Some(360));
+    assert_eq!(req.entries[1].feed_source.as_ref().unwrap().poll_interval, 30);
+    assert_eq!(req.entries[2].release_year, Some(1997));
+    assert_eq!(req.entries[3].collection_spec.as_ref().unwrap().color.as_deref(), Some("#3b82f6"));
+    assert_eq!(req.collection_entries[0].position, Some(2.5));
+    assert_eq!(req.collection_generators[0].current_entry_id.as_deref(), Some("album-ok-computer"));
+    assert_eq!(req.consumption_log[0].status, ConsumptionStatus::Consumed);
+    assert_eq!(req.comparisons[0].ordering.len(), 2);
+    assert_eq!(req.tombstones[0].entity_type, ActivityEntityType::CollectionEntry);
+
+    let req_json = serde_json::to_string(&req).unwrap();
+    let req_rt: PeerSyncRequest = serde_json::from_str(&req_json).unwrap();
+    assert_eq!(req_rt.peer_id, req.peer_id);
+    assert_eq!(req_rt.entries.len(), req.entries.len());
+    assert_eq!(req_rt.collection_entries[0].position, req.collection_entries[0].position);
+    assert_eq!(req_rt.comparisons[0].ordering, req.comparisons[0].ordering);
+
+    let resp: PeerSyncResponse = serde_json::from_value(suite.peer_sync_response).unwrap();
+    assert_eq!(resp.server_peer_id, "server");
+    assert_eq!(resp.sync_seq, 2048);
+    assert!(resp.has_more);
+    assert!(!resp.reset_required);
+    assert_eq!(resp.active_peers.len(), 2);
+    assert_eq!(resp.active_peers[0].network_tier, NetworkTier::Wired);
+    assert_eq!(resp.entries[0].content.as_ref().unwrap().content_type, ContentType::Audio);
+    assert_eq!(resp.entries[0].content.as_ref().unwrap().duration, Some(3615));
+    assert_eq!(resp.tombstones[0].entity_type, ActivityEntityType::Comparison);
+
+    let resp_json = serde_json::to_string(&resp).unwrap();
+    let resp_rt: PeerSyncResponse = serde_json::from_str(&resp_json).unwrap();
+    assert_eq!(resp_rt.server_peer_id, resp.server_peer_id);
+    assert_eq!(resp_rt.sync_seq, resp.sync_seq);
+    assert_eq!(resp_rt.active_peers.len(), resp.active_peers.len());
+    assert_eq!(resp_rt.entries[0].state.as_ref().unwrap().inbox_state, InboxState::Dismissed);
 }

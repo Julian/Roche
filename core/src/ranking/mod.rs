@@ -14,6 +14,8 @@ use std::{
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 
+pub use crate::domain::MAX_FOCUSED_ROUNDS;
+
 pub const PRIOR_ALPHA: f64 = 1.0;
 pub const COLD_START_VARIANCE: f64 = 1.0 / PRIOR_ALPHA;
 pub const MIN_K: usize = 2;
@@ -687,8 +689,6 @@ fn match_moments_logit(mean_cav: f64, cov_cav: f64) -> (f64, f64, f64) {
         (0.0, 0.0, 0.0, 0.0)
     };
 
-    // Short-circuit in the pure asymptotic tail so `0.0 * NaN` from extreme probit evaluations
-    // can never poison the blended moments.
     if 1.0 - lambd < 1e-15 {
         return (logpart2, dlogpart2, d2logpart2);
     }
@@ -862,12 +862,21 @@ mod tests {
     fn test_ep_ranking_matches_golden_vectors() {
         let raw = include_str!("../../../testdata/ep_ranking_vectors.json");
         let parsed: EpGoldenFile = serde_json::from_str(raw).unwrap();
-        assert!(parsed.ep_cases.len() >= 6);
+        assert!(parsed.ep_cases.len() >= 9);
 
         for case in parsed.ep_cases {
             let scores = infer_scores(&case.items, &case.orderings);
             for (id, expected) in &case.expected_scores {
                 let actual = scores.get(id).unwrap();
+                assert!(
+                    actual.mean.is_finite()
+                        && actual.variance.is_finite()
+                        && actual.variance >= 0.0,
+                    "case '{}' item '{}' produced non-finite or negative variance: {:?}",
+                    case.name,
+                    id,
+                    actual
+                );
                 assert!(
                     (actual.mean - expected.mean).abs() <= 1e-6,
                     "case '{}' item '{}' mean mismatch: actual={} expected={}",
@@ -959,7 +968,6 @@ mod tests {
 
     #[test]
     fn test_match_moments_logit_and_site_delta_resist_nan_poisoning() {
-        // Extreme positive/negative tail must return finite values without `0.0 * NaN`
         for mean_cav in [-1000.0, -50.0, 50.0, 1000.0] {
             let (lp, dlp, d2lp) = match_moments_logit(mean_cav, 1.0);
             assert!(lp.is_finite(), "logpart non-finite for mean_cav={mean_cav}: {lp}");
@@ -967,9 +975,17 @@ mod tests {
             assert!(d2lp.is_finite(), "d2logpart non-finite for mean_cav={mean_cav}: {d2lp}");
         }
 
-        // Non-finite site values must fail convergence check instead of collapsing to 0.0 via f64::max
         assert!(max_finite_site_delta(&[f64::NAN], &[0.0], &[0.0], &[0.0]).is_none());
         assert!(max_finite_site_delta(&[0.0], &[0.0], &[f64::INFINITY], &[0.0]).is_none());
         assert_eq!(max_finite_site_delta(&[0.1], &[0.0], &[0.0], &[0.2]), Some(0.2));
+    }
+
+    #[test]
+    fn test_confusability_zero_variance_parity() {
+        let base = Score { mean: 1.0, variance: 0.0 };
+        let within_eps = Score { mean: 1.0 + f64::EPSILON * 0.5, variance: 0.0 };
+        let outside_eps = Score { mean: 1.0 + 1e-12, variance: 0.0 };
+        assert!((confusability(base, within_eps) - 0.5).abs() <= f64::EPSILON);
+        assert!((confusability(base, outside_eps) - 0.0).abs() <= f64::EPSILON);
     }
 }

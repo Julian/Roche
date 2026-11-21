@@ -108,11 +108,17 @@ pub(super) async fn feeds_refresh(
 pub(super) async fn feeds_items(
     State(service): State<Arc<RocheService>>,
     ProblemPath(id): ProblemPath<String>,
-    ProblemQuery(filter): ProblemQuery<ItemFilter>,
+    ProblemQuery(query): ProblemQuery<super::items::ItemListQuery>,
 ) -> Result<Json<ItemPage>, ApiError> {
     // Verify feed exists first
     let _ = service.feeds().get(&id).await?;
-    let page = service.items().query().with_filter(filter).feed_id(id).list_page().await?;
+    let page = service
+        .items()
+        .query()
+        .with_filter(ItemFilter::from(query))
+        .feed_id(id)
+        .list_page()
+        .await?;
     Ok(Json(page))
 }
 

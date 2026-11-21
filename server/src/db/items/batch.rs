@@ -97,6 +97,7 @@ impl ItemRepo<'_> {
 
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
+        let state_hlc = tx.next_hlc().await?;
         let mut archived_ids = Vec::with_capacity(candidate_ids.len());
         let mut high_progress: Vec<(String, f64, Option<DateTime<Utc>>)> = Vec::new();
 
@@ -109,6 +110,8 @@ impl ItemRepo<'_> {
                 .push_bind(now)
                 .push(", updated_at = ")
                 .push_bind(now)
+                .push(", hlc = ")
+                .push_bind(&state_hlc)
                 .push(" WHERE inbox_state = 'unread' AND entry_id IN (");
             let mut sep = qb.separated(", ");
             for id in chunk {
@@ -116,7 +119,7 @@ impl ItemRepo<'_> {
             }
             sep.push_unseparated(") RETURNING entry_id, progress, read_at");
             let updated: Vec<(String, f64, Option<DateTime<Utc>>)> =
-                qb.build_query_as().fetch_all(&mut *tx).await?;
+                qb.build_query_as().fetch_all(tx.conn()).await?;
             for (id, progress, read_at) in updated {
                 if progress >= 0.9 {
                     high_progress.push((id.clone(), progress, read_at));
@@ -133,7 +136,7 @@ impl ItemRepo<'_> {
                 sep.push_bind(id.as_str());
             }
             sep.push_unseparated(")");
-            qb.build().execute(&mut *tx).await?;
+            qb.build().execute(tx.conn()).await?;
         }
 
         // Batch-archived items whose progress had already reached >= 0.9 are auto-logged,
@@ -148,7 +151,7 @@ impl ItemRepo<'_> {
                 }
                 sep.push_unseparated(")");
                 let kinds: Vec<(String, EntryKind)> =
-                    qb.build_query_as().fetch_all(&mut *tx).await?;
+                    qb.build_query_as().fetch_all(tx.conn()).await?;
                 for (id, kind) in kinds {
                     kind_map.insert(id, kind);
                 }
@@ -178,7 +181,7 @@ impl ItemRepo<'_> {
                     .push_bind(ActivityAction::Archive)
                     .push_bind(now);
             });
-            qb.build().execute(&mut *tx).await?;
+            qb.build().execute(tx.conn()).await?;
         }
 
         tx.commit().await?;
@@ -242,19 +245,22 @@ impl ItemRepo<'_> {
                 id,
                 id,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
-            sqlx::query!(
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query(
                 "UPDATE entries
                  SET thumbnail_url = COALESCE(thumbnail_url, ?),
-                     summary = ?
+                     summary = ?,
+                     hlc = ?
                  WHERE id = ?",
-                thumb,
-                excerpt,
-                id,
             )
-            .execute(&mut *tx)
+            .bind(thumb)
+            .bind(excerpt)
+            .bind(&entry_hlc)
+            .bind(&id)
+            .execute(tx.conn())
             .await?;
         }
         tx.commit().await?;
@@ -316,8 +322,12 @@ impl ItemRepo<'_> {
         let count = u64::try_from(updates.len()).unwrap_or(0);
         let mut tx = crate::db::begin_write(self.pool).await?;
         for (id, thumb) in updates {
-            sqlx::query!("UPDATE entries SET thumbnail_url = ? WHERE id = ?", thumb, id)
-                .execute(&mut *tx)
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET thumbnail_url = ?, hlc = ? WHERE id = ?")
+                .bind(thumb)
+                .bind(&entry_hlc)
+                .bind(&id)
+                .execute(tx.conn())
                 .await?;
         }
         tx.commit().await?;

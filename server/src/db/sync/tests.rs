@@ -4477,3 +4477,557 @@ async fn test_comparison_tombstone_sync_deletes_and_blocks_stale_resurrection() 
         .unwrap();
     assert_eq!(remaining, 0, "tombstone must suppress stale comparison resurrection");
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn test_rust_hlc_causal_monotonicity_under_peer_clock_skew() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let now = Utc::now();
+    // Simulate a peer whose local wall clock is 5 minutes ahead of the server (within MAX_CLOCK_DRIFT_MS).
+    let skewed_future = now + chrono::Duration::minutes(5);
+    let skewed_hlc = HlcTimestamp::from_datetime(skewed_future, "android-skewed").encode();
+
+    let feed_url = "https://skewed.example.com/rss.xml";
+    let feed_id = deterministic_feed_id(feed_url);
+    let item_url = "https://skewed.example.com/post-1";
+    let item_id = deterministic_item_id(Some(feed_url), item_url);
+
+    // 1. Skewed peer pushes a feed + unread item with +5m HLCs.
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-skewed".to_owned(),
+            client_hlc: Some(skewed_hlc.clone()),
+            since_seq: 0,
+            entries: vec![
+                SyncEntryRecord {
+                    id: feed_id.clone(),
+                    kind: EntryKind::Publication,
+                    title: "Skewed Feed".to_owned(),
+                    creators: Vec::new(),
+                    url: None,
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(skewed_future),
+                    hlc: skewed_hlc.clone(),
+                    identifiers: Vec::new(),
+                    content: None,
+                    state: None,
+                    collection_spec: Some(SyncCollectionSpec {
+                        slug: None,
+                        mode: CollectionMode::Feed,
+                        role: CollectionRole::Feed,
+                        rule_json: None,
+                        show_in_lists: false,
+                        color: None,
+                    }),
+                    feed_source: Some(SyncFeedSource {
+                        feed_url: feed_url.to_owned(),
+                        source_type: FeedType::Rss,
+                        feed_title: Some("Skewed Feed".to_owned()),
+                        language: None,
+                        poll_interval: 30,
+                        is_active: true,
+                        last_polled_at: None,
+                        last_polled_by: None,
+                        last_error: None,
+                        last_error_by: None,
+                        consecutive_failures: 0,
+                        hlc: skewed_hlc.clone(),
+                    }),
+                },
+                SyncEntryRecord {
+                    id: item_id.clone(),
+                    kind: EntryKind::Article,
+                    title: "Skewed Post".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(item_url.to_owned()),
+                    published_at: Some(now),
+                    release_year: None,
+                    summary: Some("Initial summary".to_owned()),
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(skewed_future),
+                    hlc: skewed_hlc.clone(),
+                    identifiers: Vec::new(),
+                    content: Some(SyncEntryContent {
+                        content_html: Some("<p>Body</p>".to_owned()),
+                        content_type: ContentType::Article,
+                        audio_url: None,
+                        duration: None,
+                    }),
+                    state: Some(SyncEntryState {
+                        inbox_state: InboxState::Unread,
+                        read_at: None,
+                        progress: 0.0,
+                        interaction_updated_at: Some(skewed_future),
+                        hlc: skewed_hlc.clone(),
+                    }),
+                    collection_spec: None,
+                    feed_source: None,
+                },
+            ],
+            collection_entries: vec![SyncCollectionEntryRecord {
+                collection_id: feed_id.clone(),
+                entry_id: item_id.clone(),
+                position: None,
+                added_at: now,
+                hlc: skewed_hlc.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    // 2. Server locally updates feed title and deletes the item using normal wall clock (`now`).
+    assert!(db.feeds().update(&feed_id, Some("Server Renamed Feed"), None, None).await.unwrap());
+    assert!(db.items().delete(&item_id).await.unwrap());
+
+    let local_feed_hlc: String =
+        sqlx::query_scalar("SELECT hlc FROM feed_sources WHERE collection_id = ?")
+            .bind(&feed_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        local_feed_hlc > skewed_hlc,
+        "local feed config HLC ({local_feed_hlc}) must strictly dominate +5m peer HLC ({skewed_hlc})"
+    );
+
+    let item_tomb_key = item_natural_key(Some(feed_url), item_url);
+    let local_tomb_hlc: String = sqlx::query_scalar(
+        "SELECT hlc FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ?",
+    )
+    .bind(&item_tomb_key)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        local_tomb_hlc > skewed_hlc,
+        "local item tombstone HLC ({local_tomb_hlc}) must strictly dominate +5m peer HLC ({skewed_hlc})"
+    );
+
+    // 3. Replaying the skewed peer's stale feed title + deleted item must NOT resurrect or overwrite.
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "android-skewed".to_owned(),
+            since_seq: 0,
+            entries: vec![
+                SyncEntryRecord {
+                    id: feed_id.clone(),
+                    kind: EntryKind::Publication,
+                    title: "Skewed Feed".to_owned(),
+                    creators: Vec::new(),
+                    url: None,
+                    published_at: None,
+                    release_year: None,
+                    summary: None,
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(skewed_future),
+                    hlc: skewed_hlc.clone(),
+                    identifiers: Vec::new(),
+                    content: None,
+                    state: None,
+                    collection_spec: Some(SyncCollectionSpec {
+                        slug: None,
+                        mode: CollectionMode::Feed,
+                        role: CollectionRole::Feed,
+                        rule_json: None,
+                        show_in_lists: false,
+                        color: None,
+                    }),
+                    feed_source: Some(SyncFeedSource {
+                        feed_url: feed_url.to_owned(),
+                        source_type: FeedType::Rss,
+                        feed_title: Some("Skewed Feed".to_owned()),
+                        language: None,
+                        poll_interval: 30,
+                        is_active: true,
+                        last_polled_at: None,
+                        last_polled_by: None,
+                        last_error: None,
+                        last_error_by: None,
+                        consecutive_failures: 0,
+                        hlc: skewed_hlc.clone(),
+                    }),
+                },
+                SyncEntryRecord {
+                    id: item_id.clone(),
+                    kind: EntryKind::Article,
+                    title: "Skewed Post".to_owned(),
+                    creators: Vec::new(),
+                    url: Some(item_url.to_owned()),
+                    published_at: Some(now),
+                    release_year: None,
+                    summary: Some("Initial summary".to_owned()),
+                    thumbnail_url: None,
+                    metadata: None,
+                    merged_into_id: None,
+                    created_at: Some(now),
+                    updated_at: Some(skewed_future),
+                    hlc: skewed_hlc.clone(),
+                    identifiers: Vec::new(),
+                    content: Some(SyncEntryContent {
+                        content_html: Some("<p>Body</p>".to_owned()),
+                        content_type: ContentType::Article,
+                        audio_url: None,
+                        duration: None,
+                    }),
+                    state: Some(SyncEntryState {
+                        inbox_state: InboxState::Unread,
+                        read_at: None,
+                        progress: 0.0,
+                        interaction_updated_at: Some(skewed_future),
+                        hlc: skewed_hlc.clone(),
+                    }),
+                    collection_spec: None,
+                    feed_source: None,
+                },
+            ],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.feeds().get(&feed_id).await.unwrap().unwrap().title.as_deref(),
+        Some("Server Renamed Feed"),
+        "stale skewed feed config must not overwrite server's causally newer rename"
+    );
+    assert!(
+        db.items().get(&item_id).await.unwrap().is_none(),
+        "stale skewed item must not resurrect after server local delete"
+    );
+}
+
+#[tokio::test]
+async fn test_migration_019_to_020_backfills_last_hlc_and_removes_julianday_triggers() {
+    let temp_dir = std::env::temp_dir().join(format!("roche-mig020-test-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+    let db_path = temp_dir.join("roche.db");
+
+    // 1. Apply migrations 001..=019 only and seed a row with a high HLC while `sync_clock.last_hlc` is empty.
+    let pre_opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pre_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(pre_opts)
+        .await
+        .unwrap();
+    let mut migrator_v19 = sqlx::migrate!("./migrations");
+    migrator_v19.migrations.to_mut().retain(|m| m.version <= 19);
+    migrator_v19.run(&pre_pool).await.unwrap();
+
+    let high_hlc = "001999999999999-000a-legacy-peer";
+    sqlx::query(
+        "INSERT INTO entries (id, kind, title, created_at, updated_at, hlc)
+         VALUES ('pre-020-entry', 'book', 'Legacy Book', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+    )
+    .bind(high_hlc)
+    .execute(&pre_pool)
+    .await
+    .unwrap();
+
+    let last_hlc_before: String =
+        sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
+            .fetch_one(&pre_pool)
+            .await
+            .unwrap();
+    assert!(last_hlc_before.is_empty(), "pre-020 local insert left sync_clock.last_hlc empty");
+    pre_pool.close().await;
+
+    // 2. Connect via `Db::connect` (applying migration 020).
+    let db = Db::connect(&db_path).await.unwrap();
+
+    let last_hlc_after: String = sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        last_hlc_after, high_hlc,
+        "migration 020 must backfill sync_clock.last_hlc to the highest HLC across all HLC tables"
+    );
+
+    let julianday_triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%julianday%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        julianday_triggers.is_empty(),
+        "migration 020 must remove all julianday HLC triggers, found: {julianday_triggers:?}"
+    );
+
+    let has_comp_au: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'comparisons_sync_seq_au'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert!(has_comp_au.is_some(), "migration 020 must install comparisons_sync_seq_au");
+
+    db.pool().close().await;
+    drop(db);
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_merge_entries_orders_generator_hlc_above_tombstone_without_wall_clock_bump() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let catalog = db.catalog();
+
+    let canon_col = catalog
+        .create_manual_collection(
+            "Canonical List",
+            Some("canon_list"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let dup_col = catalog
+        .create_manual_collection(
+            "Duplicate List",
+            Some("dup_list"),
+            CollectionRole::List,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let album = catalog
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Album),
+            title: "Kind of Blue".to_owned(),
+            creators: vec!["Miles Davis".to_owned()],
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    catalog.add_collection_entry(&canon_col.id, &album.id, None).await.unwrap();
+    catalog.add_collection_entry(&dup_col.id, &album.id, None).await.unwrap();
+    catalog.set_collection_generator_enabled(&canon_col.id, true).await.unwrap();
+    catalog.set_collection_generator_enabled(&dup_col.id, true).await.unwrap();
+
+    catalog.merge_entries(&dup_col.id, &canon_col.id).await.unwrap();
+
+    let (tomb_deleted_at, tomb_hlc): (DateTime<Utc>, String) = sqlx::query_as(
+        "SELECT deleted_at, hlc FROM sync_tombstones
+         WHERE entity_type = 'collection_generator' AND natural_key = ?",
+    )
+    .bind(&dup_col.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let (canon_updated_at, canon_hlc): (DateTime<Utc>, String) =
+        sqlx::query_as("SELECT updated_at, hlc FROM collection_generators WHERE collection_id = ?")
+            .bind(&canon_col.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+    assert!(
+        canon_hlc > tomb_hlc,
+        "canonical generator HLC ({canon_hlc}) must strictly exceed duplicate generator tombstone HLC ({tomb_hlc})"
+    );
+    assert_eq!(
+        canon_updated_at, tomb_deleted_at,
+        "causal HLC counter increment must preserve exact updated_at without +1ms wall-clock hack"
+    );
+}
+
+#[tokio::test]
+async fn test_all_local_repo_writes_stamp_valid_causal_hlcs_and_single_insert_merge_in() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+
+    // Exercise local writes across all 8 HLC tables.
+    let feed = db
+        .feeds()
+        .create(
+            FeedType::Rss,
+            &Url::parse("https://hlc.example.com/feed.xml").unwrap(),
+            Some("HLC Feed"),
+            None,
+        )
+        .await
+        .unwrap();
+    let (item, tags) = db
+        .items()
+        .save_manual_input_with_tags(&ManualItemInput {
+            url: &Url::parse("https://hlc.example.com/post").unwrap(),
+            title: "HLC Post",
+            summary: Some("Summary"),
+            content_html: Some("<p>Body</p>"),
+            thumbnail_url: None,
+            audio_url: None,
+            duration: None,
+            content_type: ContentType::Article,
+            tags: &["hlc-tag".to_owned()],
+        })
+        .await
+        .unwrap();
+    assert_eq!(tags.len(), 1);
+    db.items().toggle_star(&item.id).await.unwrap();
+
+    let col = db
+        .catalog()
+        .create_manual_collection("HLC Queue", Some("hlc_queue"), CollectionRole::List, None, None)
+        .await
+        .unwrap();
+    let a = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book A".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    let b = db
+        .catalog()
+        .upsert_entry(&crate::db::UpsertEntryInput {
+            kind: Some(EntryKind::Book),
+            title: "Book B".to_owned(),
+            ..crate::db::UpsertEntryInput::default()
+        })
+        .await
+        .unwrap();
+    db.catalog().add_collection_entry(&col.id, &a.id, None).await.unwrap();
+    db.catalog().add_collection_entry(&col.id, &b.id, None).await.unwrap();
+    db.catalog().set_collection_generator_enabled(&col.id, true).await.unwrap();
+    let log = db
+        .catalog()
+        .log_consumption(&a.id, ConsumptionStatus::Consumed, Some("Great"), None)
+        .await
+        .unwrap();
+    db.catalog().update_consumption_log(&log.id, None, Some(Some("Updated")), None).await.unwrap();
+    let comp = db
+        .catalog()
+        .append_comparison(None, &[vec![a.id.clone()], vec![b.id.clone()]], None)
+        .await
+        .unwrap();
+    assert!(db.catalog().delete_comparison(&comp.id).await.unwrap());
+    let _ = db
+        .catalog()
+        .append_comparison(None, &[vec![b.id.clone()], vec![a.id.clone()]], None)
+        .await
+        .unwrap();
+    assert!(db.feeds().update(&feed.id, Some("HLC Feed 2"), Some(45), None).await.unwrap());
+
+    let last_hlc: String = sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(HlcTimestamp::parse(&last_hlc).is_some(), "sync_clock.last_hlc must be valid HLC");
+
+    for (table, query) in [
+        ("entries", "SELECT hlc FROM entries"),
+        ("entry_state", "SELECT hlc FROM entry_state"),
+        ("feed_sources", "SELECT hlc FROM feed_sources"),
+        ("collection_entries", "SELECT hlc FROM collection_entries"),
+        ("collection_generators", "SELECT hlc FROM collection_generators"),
+        ("consumption_log", "SELECT hlc FROM consumption_log"),
+        ("comparisons", "SELECT hlc FROM comparisons"),
+        ("sync_tombstones", "SELECT hlc FROM sync_tombstones"),
+    ] {
+        let hlcs: Vec<String> = sqlx::query_scalar(query).fetch_all(db.pool()).await.unwrap();
+        assert!(!hlcs.is_empty(), "expected at least one row in {table}");
+        for h in hlcs {
+            assert!(
+                HlcTimestamp::parse(&h).is_some(),
+                "table {table} contains invalid/empty HLC: '{h}'"
+            );
+            assert!(
+                h <= last_hlc,
+                "table {table} row HLC ({h}) must not exceed sync_clock.last_hlc ({last_hlc})"
+            );
+        }
+    }
+
+    // Verify `merge_in` inserts incoming work + consumption log with exact incoming HLC in one write
+    // without post-insert double-writes.
+    let now = Utc::now();
+    let seq_before: i64 = sqlx::query_scalar("SELECT current_seq FROM sync_clock WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let inc_hlc =
+        HlcTimestamp::from_datetime(now - chrono::Duration::seconds(5), "peer-one").encode();
+    let work_id = "single-insert-work-1";
+    let log_id = "single-insert-log-1";
+    let _ = db
+        .sync()
+        .merge_peer_state(&PeerSyncRequest {
+            peer_id: "peer-one".to_owned(),
+            since_seq: seq_before,
+            entries: vec![SyncEntryRecord {
+                id: work_id.to_owned(),
+                kind: EntryKind::Movie,
+                title: "Stalker".to_owned(),
+                creators: vec!["Andrei Tarkovsky".to_owned()],
+                url: None,
+                published_at: None,
+                release_year: Some(1979),
+                summary: None,
+                thumbnail_url: None,
+                metadata: None,
+                merged_into_id: None,
+                created_at: Some(now - chrono::Duration::seconds(10)),
+                updated_at: Some(now - chrono::Duration::seconds(5)),
+                hlc: inc_hlc.clone(),
+                identifiers: Vec::new(),
+                content: None,
+                state: None,
+                collection_spec: None,
+                feed_source: None,
+            }],
+            consumption_log: vec![SyncConsumptionLogRecord {
+                id: log_id.to_owned(),
+                entry_id: work_id.to_owned(),
+                ts: now - chrono::Duration::seconds(5),
+                status: ConsumptionStatus::Consumed,
+                notes: Some("Masterpiece".to_owned()),
+                created_at: Some(now - chrono::Duration::seconds(5)),
+                hlc: inc_hlc.clone(),
+            }],
+            ..PeerSyncRequest::default()
+        })
+        .await
+        .unwrap();
+
+    let (stored_work_hlc, stored_work_seq): (String, i64) =
+        sqlx::query_as("SELECT hlc, sync_seq FROM entries WHERE id = ?")
+            .bind(work_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let (stored_log_hlc, stored_log_seq): (String, i64) =
+        sqlx::query_as("SELECT hlc, sync_seq FROM consumption_log WHERE id = ?")
+            .bind(log_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_work_hlc, inc_hlc);
+    assert_eq!(stored_log_hlc, inc_hlc);
+    assert_eq!(stored_work_seq, seq_before + 1, "entry insert must bump sync_seq exactly once");
+    assert_eq!(
+        stored_log_seq,
+        seq_before + 2,
+        "consumption_log insert must bump sync_seq exactly once"
+    );
+}

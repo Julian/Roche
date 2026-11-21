@@ -32,9 +32,10 @@ pub fn clamp_incoming_timestamp_opt(
     ts.map(|t| clamp_incoming_timestamp(t, now))
 }
 
-/// Clamps historical domain dates (e.g., diary logs or release/comparison dates) into
-/// `[0001-01-01T00:00:00Z, now + MAX_CLOCK_DRIFT_MS]` so peers preserve historical dates while
-/// never injecting BCE dates (which SQLite `strftime` rejects as `NULL`) or far-future timestamps.
+/// Clamps historical domain dates into `[0001-01-01T00:00:00Z, now + MAX_CLOCK_DRIFT_MS]`.
+///
+/// Preserves historical diary/comparison dates while rejecting BCE dates (which SQLite `strftime`
+/// rejects as `NULL`) and far-future timestamps.
 #[must_use]
 pub fn clamp_incoming_upper_timestamp(ts: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
     let min_ts = chrono::NaiveDate::from_ymd_opt(1, 1, 1)

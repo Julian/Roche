@@ -5,6 +5,7 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use super::{
     ActivityAction, ActivityEntityType, EntryKind, HexColor, SyncRepo, WANT_TO_READ_COLLECTION_ID,
+    WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{deterministic_tag_id, tag_natural_key},
 };
@@ -103,7 +104,7 @@ impl<'a> TagRepo<'a> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Tag, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Tag, &nat_key).await?;
 
         let existing = sqlx::query_scalar!(
             "SELECT e.id
@@ -114,7 +115,7 @@ impl<'a> TagRepo<'a> {
             id,
             name,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if existing.is_some() {
             return Err(super::ConflictError(format!("Tag '{name}' already exists")).into());
@@ -170,7 +171,7 @@ impl<'a> TagRepo<'a> {
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
             id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if exists.is_none() {
             return Ok(false);
@@ -191,30 +192,30 @@ impl<'a> TagRepo<'a> {
                 slug,
                 n,
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
             if duplicate.is_some() {
                 return Err(super::ConflictError(format!("Tag '{n}' already exists")).into());
             }
-            sqlx::query!(
-                "UPDATE entries SET title = ?, updated_at = ? WHERE id = ?",
-                n,
-                now as _,
-                id
-            )
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query!("UPDATE collection_specs SET slug = ? WHERE collection_id = ?", slug, id)
-                .execute(&mut *tx)
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET title = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(n)
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(id)
+                .execute(tx.conn())
                 .await?;
-            entries_core::replace_entry_identifier_in_tx(&mut tx, id, "tag", &nat_key).await?;
+            sqlx::query!("UPDATE collection_specs SET slug = ? WHERE collection_id = ?", slug, id)
+                .execute(tx.conn())
+                .await?;
+            entries_core::replace_entry_identifier_in_tx(tx.conn(), id, "tag", &nat_key).await?;
             sqlx::query!(
                 "UPDATE entries SET updated_at = ?
                  WHERE id IN (SELECT entry_id FROM collection_entries WHERE collection_id = ?)",
                 now as _,
                 id,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
 
@@ -224,15 +225,19 @@ impl<'a> TagRepo<'a> {
                 c as _,
                 id,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
-            sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
-                .execute(&mut *tx)
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(id)
+                .execute(tx.conn())
                 .await?;
         }
 
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Tag,
             id,
             ActivityAction::Update,
@@ -250,7 +255,7 @@ impl<'a> TagRepo<'a> {
             "SELECT 1 AS \"found!: i64\" FROM collection_specs WHERE collection_id = ? AND collection_role = 'tag'",
             id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if exists.is_none() {
             return Ok(false);
@@ -262,14 +267,14 @@ impl<'a> TagRepo<'a> {
             now as _,
             id,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         let deleted_name = sqlx::query_scalar!(
             "DELETE FROM entries WHERE id = ? RETURNING title AS \"title!: String\"",
             id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         let Some(tag_name) = deleted_name else {
             return Ok(false);
@@ -283,7 +288,7 @@ impl<'a> TagRepo<'a> {
         )
         .await?;
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Tag,
             id,
             ActivityAction::Delete,
@@ -294,8 +299,8 @@ impl<'a> TagRepo<'a> {
         Ok(true)
     }
 
-    pub async fn get_or_create_in_tx(
-        conn: &mut SqliteConnection,
+    pub(crate) async fn get_or_create_in_tx(
+        tx: &mut WriteTx<'_>,
         name: &str,
         color: Option<&HexColor>,
         created_at: DateTime<Utc>,
@@ -304,7 +309,7 @@ impl<'a> TagRepo<'a> {
         let new_tag_id = deterministic_tag_id(name);
         let nat_key = tag_natural_key(name);
         let slug = format!("tag:{nat_key}");
-        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::Tag, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Tag, &nat_key).await?;
 
         let existing_id = sqlx::query_scalar!(
             "SELECT e.id
@@ -317,7 +322,7 @@ impl<'a> TagRepo<'a> {
             slug,
             name,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(tx.conn())
         .await?;
 
         if let Some(id) = existing_id {
@@ -325,7 +330,7 @@ impl<'a> TagRepo<'a> {
         }
 
         let inserted = entries_core::insert_entry_row_or_ignore_in_tx(
-            &mut *conn,
+            tx,
             &EntryInsertParams::minimal(&new_tag_id, EntryKind::Collection, name, created_at, now),
         )
         .await?;
@@ -338,12 +343,12 @@ impl<'a> TagRepo<'a> {
                 slug,
                 color as _,
             )
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
-            entries_core::upsert_entry_identifier_in_tx(&mut *conn, &new_tag_id, "tag", &nat_key)
+            entries_core::upsert_entry_identifier_in_tx(tx.conn(), &new_tag_id, "tag", &nat_key)
                 .await?;
             SyncRepo::record_activity(
-                &mut *conn,
+                tx.conn(),
                 ActivityEntityType::Tag,
                 &new_tag_id,
                 ActivityAction::Create,
@@ -362,61 +367,66 @@ impl<'a> TagRepo<'a> {
             slug,
             name,
         )
-        .fetch_one(&mut *conn)
+        .fetch_one(tx.conn())
         .await
     }
 
-    pub async fn get_or_create_and_attach_in_tx(
-        conn: &mut SqliteConnection,
+    pub(crate) async fn get_or_create_and_attach_in_tx(
+        tx: &mut WriteTx<'_>,
         item_id: &str,
         name: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<Tag, sqlx::Error> {
-        let tag_id = Self::get_or_create_in_tx(&mut *conn, name, None, now, now).await?;
-        Self::attach_in_tx(&mut *conn, item_id, &tag_id, now).await?;
+        let tag_id = Self::get_or_create_in_tx(tx, name, None, now, now).await?;
+        Self::attach_in_tx(tx, item_id, &tag_id, now).await?;
 
         let tag = sqlx::query_as::<_, Tag>(TAG_SELECT_BY_ID_SQL)
             .bind(WANT_TO_READ_COLLECTION_ID)
             .bind(&tag_id)
-            .fetch_one(&mut *conn)
+            .fetch_one(tx.conn())
             .await?;
         Ok(tag)
     }
 
-    pub async fn attach_in_tx(
-        conn: &mut SqliteConnection,
+    pub(crate) async fn attach_in_tx(
+        tx: &mut WriteTx<'_>,
         item_id: &str,
         tag_id: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
         let nat_key = crate::db::sync::collection_entry_natural_key(tag_id, item_id);
-        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::CollectionEntry, &nat_key)
-            .await?;
-        let res = sqlx::query!(
-            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-             SELECT cs.collection_id, ?, ?
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::CollectionEntry, &nat_key).await?;
+        let ce_hlc = tx.next_hlc().await?;
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+             SELECT cs.collection_id, ?, ?, ?
              FROM collection_specs cs
              WHERE cs.collection_id = ? AND cs.collection_role = 'tag'",
-            item_id,
-            now as _,
-            tag_id,
         )
-        .execute(&mut *conn)
+        .bind(item_id)
+        .bind(now)
+        .bind(&ce_hlc)
+        .bind(tag_id)
+        .execute(tx.conn())
         .await?;
         if res.rows_affected() > 0 {
-            sqlx::query!(
-                "UPDATE entry_state SET interaction_updated_at = ?, updated_at = ? WHERE entry_id = ?",
-                now as _,
-                now as _,
-                item_id,
+            let state_hlc = tx.next_hlc().await?;
+            sqlx::query(
+                "UPDATE entry_state
+                 SET interaction_updated_at = ?, updated_at = ?, hlc = ?
+                 WHERE entry_id = ?",
             )
-            .execute(&mut *conn)
+            .bind(now)
+            .bind(now)
+            .bind(&state_hlc)
+            .bind(item_id)
+            .execute(tx.conn())
             .await?;
             sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, item_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
             SyncRepo::record_activity(
-                &mut *conn,
+                tx.conn(),
                 ActivityEntityType::Item,
                 item_id,
                 ActivityAction::TagAdd,
@@ -458,7 +468,7 @@ impl<'a> TagRepo<'a> {
             tag_id,
             item_id,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         if res.rows_affected() == 0 {
             return Ok(false);
@@ -466,19 +476,23 @@ impl<'a> TagRepo<'a> {
         let nat_key = crate::db::sync::collection_entry_natural_key(tag_id, item_id);
         SyncRepo::record_tombstone(&mut tx, ActivityEntityType::CollectionEntry, &nat_key, now)
             .await?;
-        sqlx::query!(
-            "UPDATE entry_state SET interaction_updated_at = ?, updated_at = ? WHERE entry_id = ?",
-            now as _,
-            now as _,
-            item_id,
+        let state_hlc = tx.next_hlc().await?;
+        sqlx::query(
+            "UPDATE entry_state
+             SET interaction_updated_at = ?, updated_at = ?, hlc = ?
+             WHERE entry_id = ?",
         )
-        .execute(&mut *tx)
+        .bind(now)
+        .bind(now)
+        .bind(&state_hlc)
+        .bind(item_id)
+        .execute(tx.conn())
         .await?;
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, item_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Item,
             item_id,
             ActivityAction::TagRemove,

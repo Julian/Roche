@@ -6,7 +6,7 @@ use url::Url;
 
 use super::{
     ActivityAction, ActivityEntityType, CatalogRepo, ContentType, EntryKind, FeedType, InboxState,
-    ItemRepo, MediaRepo, SyncRepo,
+    ItemRepo, MediaRepo, SyncRepo, WriteTx,
     entries_core::{self, EntryInsertParams},
     sync::{
         MAX_CONSECUTIVE_FAILURES, SERVER_PEER_ID, canonicalize_sync_url, deterministic_feed_id,
@@ -191,6 +191,8 @@ pub(super) struct NewFeedRow<'a> {
     pub consecutive_failures: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub entry_hlc: Option<&'a str>,
+    pub feed_hlc: Option<&'a str>,
 }
 
 pub(super) async fn resolve_dedup_entry_id(
@@ -221,6 +223,16 @@ pub(super) async fn resolve_dedup_entry_id(
     Ok(None)
 }
 
+#[derive(sqlx::FromRow)]
+struct ExistingFeedPollMeta {
+    feed_url: String,
+    source_type: FeedType,
+    feed_title: Option<String>,
+    kind: EntryKind,
+    summary: Option<String>,
+    language: Option<String>,
+}
+
 pub struct FeedRepo<'a> {
     pub(crate) pool: &'a SqlitePool,
 }
@@ -243,7 +255,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     async fn reactivate_archived_feed_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         url_str: &str,
         det_id: &str,
         title: Option<&str>,
@@ -258,20 +270,22 @@ impl<'a> FeedRepo<'a> {
         )
         .bind(url_str)
         .bind(det_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         let Some(existing_id) = existing_archived_id else {
             return Ok(None);
         };
 
+        let feed_hlc = tx.next_hlc().await?;
         let feed_sql = if prefer_incoming_title {
             "UPDATE feed_sources
              SET is_active = 1,
                  feed_title = COALESCE(?, feed_title),
                  consecutive_failures = 0,
                  last_error = NULL,
-                 last_error_by = NULL
+                 last_error_by = NULL,
+                 hlc = ?
              WHERE collection_id = ?"
         } else {
             "UPDATE feed_sources
@@ -279,41 +293,52 @@ impl<'a> FeedRepo<'a> {
                  feed_title = COALESCE(feed_title, ?),
                  consecutive_failures = 0,
                  last_error = NULL,
-                 last_error_by = NULL
+                 last_error_by = NULL,
+                 hlc = ?
              WHERE collection_id = ?"
         };
-        sqlx::query(feed_sql).bind(title).bind(&existing_id).execute(&mut *tx).await?;
+        sqlx::query(feed_sql)
+            .bind(title)
+            .bind(&feed_hlc)
+            .bind(&existing_id)
+            .execute(tx.conn())
+            .await?;
 
+        let entry_hlc = tx.next_hlc().await?;
         if prefer_incoming_title {
             sqlx::query(
                 "UPDATE entries
                  SET title = COALESCE(?, title),
                      summary = COALESCE(?, summary),
-                     updated_at = ?
+                     updated_at = ?,
+                     hlc = ?
                  WHERE id = ?",
             )
             .bind(title)
             .bind(description)
             .bind(now)
+            .bind(&entry_hlc)
             .bind(&existing_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         } else {
             sqlx::query(
                 "UPDATE entries
                  SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
-                     updated_at = ?
+                     updated_at = ?,
+                     hlc = ?
                  WHERE id = ?",
             )
             .bind(&existing_id)
             .bind(now)
+            .bind(&entry_hlc)
             .bind(&existing_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
 
         SyncRepo::record_activity(
-            &mut *tx,
+            tx.conn(),
             ActivityEntityType::Feed,
             &existing_id,
             ActivityAction::Unarchive,
@@ -338,7 +363,7 @@ impl<'a> FeedRepo<'a> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        SyncRepo::clear_tombstone(&mut tx, ActivityEntityType::Feed, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &nat_key).await?;
 
         if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
             &mut tx,
@@ -363,7 +388,7 @@ impl<'a> FeedRepo<'a> {
             id,
             url_str,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         if active_feed_exists.is_some() {
@@ -388,6 +413,8 @@ impl<'a> FeedRepo<'a> {
                 consecutive_failures: 0,
                 created_at: now,
                 updated_at: now,
+                entry_hlc: None,
+                feed_hlc: None,
             },
         )
         .await?;
@@ -414,7 +441,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub(super) async fn insert_feed_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         row: &NewFeedRow<'_>,
     ) -> std::result::Result<(), sqlx::Error> {
         let entry_kind = entry_kind_for_feed_type(row.feed_type);
@@ -423,24 +450,34 @@ impl<'a> FeedRepo<'a> {
         let nat_key = feed_natural_key(row.feed_url);
         let norm_failures =
             normalize_consecutive_failures(row.last_error, row.consecutive_failures);
+        let entry_hlc = match row.entry_hlc {
+            Some(h) if !h.is_empty() => h.to_owned(),
+            _ => tx.next_hlc().await?,
+        };
+        let feed_hlc = match row.feed_hlc {
+            Some(h) if !h.is_empty() => h.to_owned(),
+            _ => tx.next_hlc().await?,
+        };
 
-        sqlx::query!(
-            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+        sqlx::query(
+            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  kind = excluded.kind,
                  title = excluded.title,
                  summary = COALESCE(excluded.summary, entries.summary),
                  created_at = excluded.created_at,
-                 updated_at = excluded.updated_at",
-            row.id,
-            entry_kind as _,
-            entry_title,
-            row.description,
-            row.created_at as _,
-            row.updated_at as _,
+                 updated_at = excluded.updated_at,
+                 hlc = excluded.hlc",
         )
-        .execute(&mut *conn)
+        .bind(row.id)
+        .bind(entry_kind)
+        .bind(entry_title)
+        .bind(row.description)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .bind(&entry_hlc)
+        .execute(tx.conn())
         .await?;
 
         sqlx::query!(
@@ -451,15 +488,15 @@ impl<'a> FeedRepo<'a> {
                  collection_role = 'feed'",
             row.id,
         )
-        .execute(&mut *conn)
+        .execute(tx.conn())
         .await?;
 
         sqlx::query(
             "INSERT OR IGNORE INTO feed_sources
              (collection_id, feed_url, source_type, feed_title, language, poll_interval,
               is_active, last_polled_at, last_polled_by, last_error, last_error_by,
-              consecutive_failures)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              consecutive_failures, hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(row.id)
         .bind(row.feed_url)
@@ -473,14 +510,15 @@ impl<'a> FeedRepo<'a> {
         .bind(row.last_error)
         .bind(row.last_error_by)
         .bind(norm_failures)
-        .execute(&mut *conn)
+        .bind(&feed_hlc)
+        .execute(tx.conn())
         .await?;
 
-        entries_core::upsert_entry_identifier_in_tx(&mut *conn, row.id, "feed_url", &nat_key)
+        entries_core::upsert_entry_identifier_in_tx(tx.conn(), row.id, "feed_url", &nat_key)
             .await?;
 
         SyncRepo::record_activity(
-            &mut *conn,
+            tx.conn(),
             ActivityEntityType::Feed,
             row.id,
             ActivityAction::Create,
@@ -511,7 +549,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     async fn import_single_outline_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         outline: OpmlOutline,
         default_interval: i64,
         now: DateTime<Utc>,
@@ -520,10 +558,10 @@ impl<'a> FeedRepo<'a> {
         let id = deterministic_feed_id(xml_url_str);
         let nat_key = feed_natural_key(xml_url_str);
         let clean_title = outline.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
-        SyncRepo::clear_tombstone(&mut *tx, ActivityEntityType::Feed, &nat_key).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::Feed, &nat_key).await?;
 
         if let Some(existing_id) = Self::reactivate_archived_feed_in_tx(
-            &mut *tx,
+            tx,
             xml_url_str,
             &id,
             clean_title,
@@ -535,7 +573,7 @@ impl<'a> FeedRepo<'a> {
         {
             let raw = sqlx::query_as::<_, RawFeedRow>(FEED_SELECT_BY_ID_SQL)
                 .bind(&existing_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
             return Ok(raw.map(Feed::try_from).transpose()?);
         }
@@ -545,14 +583,14 @@ impl<'a> FeedRepo<'a> {
             xml_url_str,
             id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if already_exists.is_some() {
             return Ok(None);
         }
 
         Self::insert_feed_in_tx(
-            &mut *tx,
+            tx,
             &NewFeedRow {
                 id: &id,
                 feed_url: xml_url_str,
@@ -569,6 +607,8 @@ impl<'a> FeedRepo<'a> {
                 consecutive_failures: 0,
                 created_at: now,
                 updated_at: now,
+                entry_hlc: None,
+                feed_hlc: None,
             },
         )
         .await?;
@@ -626,33 +666,38 @@ impl<'a> FeedRepo<'a> {
 
         let existing_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
         let Some(feed_url) = existing_url else {
             return Ok(false);
         };
 
+        let feed_hlc = tx.next_hlc().await?;
         if let Some(t) = title {
             let entry_title = if t.trim().is_empty() { feed_url.as_str() } else { t };
-            sqlx::query!("UPDATE feed_sources SET feed_title = ? WHERE collection_id = ?", t, id,)
-                .execute(&mut *tx)
+            sqlx::query("UPDATE feed_sources SET feed_title = ?, hlc = ? WHERE collection_id = ?")
+                .bind(t)
+                .bind(&feed_hlc)
+                .bind(id)
+                .execute(tx.conn())
                 .await?;
-            sqlx::query!(
-                "UPDATE entries SET title = ?, updated_at = ? WHERE id = ?",
-                entry_title,
-                now as _,
-                id,
-            )
-            .execute(&mut *tx)
-            .await?;
+            let entry_hlc = tx.next_hlc().await?;
+            sqlx::query("UPDATE entries SET title = ?, updated_at = ?, hlc = ? WHERE id = ?")
+                .bind(entry_title)
+                .bind(now)
+                .bind(&entry_hlc)
+                .bind(id)
+                .execute(tx.conn())
+                .await?;
         }
         if let Some(interval) = poll_interval {
-            sqlx::query!(
-                "UPDATE feed_sources SET poll_interval = ? WHERE collection_id = ?",
-                interval,
-                id,
+            sqlx::query(
+                "UPDATE feed_sources SET poll_interval = ?, hlc = ? WHERE collection_id = ?",
             )
-            .execute(&mut *tx)
+            .bind(interval)
+            .bind(&feed_hlc)
+            .bind(id)
+            .execute(tx.conn())
             .await?;
         }
         if let Some(active) = is_active {
@@ -662,21 +707,26 @@ impl<'a> FeedRepo<'a> {
                      SET is_active = 1,
                          consecutive_failures = 0,
                          last_error = NULL,
-                         last_error_by = NULL
+                         last_error_by = NULL,
+                         hlc = ?
                      WHERE collection_id = ?",
                 )
+                .bind(&feed_hlc)
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             } else {
-                sqlx::query("UPDATE feed_sources SET is_active = 0 WHERE collection_id = ?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE feed_sources SET is_active = 0, hlc = ? WHERE collection_id = ?",
+                )
+                .bind(&feed_hlc)
+                .bind(id)
+                .execute(tx.conn())
+                .await?;
             }
         }
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
         let action = match is_active {
@@ -685,7 +735,7 @@ impl<'a> FeedRepo<'a> {
             None => ActivityAction::Update,
         };
 
-        SyncRepo::record_activity(&mut tx, ActivityEntityType::Feed, id, action, now).await?;
+        SyncRepo::record_activity(tx.conn(), ActivityEntityType::Feed, id, action, now).await?;
 
         tx.commit().await?;
         Ok(true)
@@ -700,7 +750,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     pub(crate) async fn delete_feed_preserving_history_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         feed_id: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
@@ -717,7 +767,7 @@ impl<'a> FeedRepo<'a> {
         )
         .bind(feed_id)
         .bind(feed_id)
-        .fetch_all(&mut *conn)
+        .fetch_all(tx.conn())
         .await?;
 
         for (entry_id, keep_in_inbox) in member_rows {
@@ -727,38 +777,37 @@ impl<'a> FeedRepo<'a> {
                 )
                 .bind(feed_id)
                 .bind(&entry_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
             } else {
-                let _ = ItemRepo::delete_inbox_item_preserving_history_in_tx(
-                    &mut *conn, &entry_id, false, now,
-                )
-                .await?;
+                let _ =
+                    ItemRepo::delete_inbox_item_preserving_history_in_tx(tx, &entry_id, false, now)
+                        .await?;
             }
         }
 
         sqlx::query!("DELETE FROM feed_sources WHERE collection_id = ?", feed_id)
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
 
         let has_preserved_children: Option<i64> = sqlx::query_scalar!(
             "SELECT 1 AS \"found!: i64\" FROM collection_entries WHERE collection_id = ? LIMIT 1",
             feed_id,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(tx.conn())
         .await?;
 
         if has_preserved_children.is_some()
-            || ItemRepo::entry_has_catalog_history_in_tx(&mut *conn, feed_id).await?
+            || ItemRepo::entry_has_catalog_history_in_tx(tx.conn(), feed_id).await?
         {
             sqlx::query!("DELETE FROM collection_specs WHERE collection_id = ?", feed_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
             sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, feed_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
         } else {
-            sqlx::query!("DELETE FROM entries WHERE id = ?", feed_id).execute(&mut *conn).await?;
+            sqlx::query!("DELETE FROM entries WHERE id = ?", feed_id).execute(tx.conn()).await?;
         }
         Ok(())
     }
@@ -768,7 +817,7 @@ impl<'a> FeedRepo<'a> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         let deleted_url: Option<String> =
             sqlx::query_scalar!("SELECT feed_url FROM feed_sources WHERE collection_id = ?", id,)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
         let Some(feed_url) = deleted_url else {
             return Ok(false);
@@ -784,7 +833,7 @@ impl<'a> FeedRepo<'a> {
         )
         .await?;
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Feed,
             id,
             ActivityAction::Delete,
@@ -830,23 +879,34 @@ impl<'a> FeedRepo<'a> {
 
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        let existing_meta = sqlx::query!(
-            "SELECT fs.feed_url, fs.feed_title, e.summary, fs.language
+        let existing_meta: Option<ExistingFeedPollMeta> = sqlx::query_as(
+            "SELECT fs.feed_url, fs.source_type, fs.feed_title, e.kind, e.summary, fs.language
              FROM feed_sources fs
              JOIN entries e ON e.id = fs.collection_id
              WHERE fs.collection_id = ?",
-            feed_id,
         )
-        .fetch_optional(&mut *tx)
+        .bind(feed_id)
+        .fetch_optional(tx.conn())
         .await?;
 
         let feed_url = existing_meta.as_ref().map(|r| r.feed_url.clone());
-        let metadata_updated = existing_meta.as_ref().is_some_and(|r| {
-            (r.feed_title.is_none() && new_title.is_some())
-                || (r.summary.is_none() && new_desc.is_some())
-                || (r.language.is_none() && new_lang.is_some())
+        let feed_config_changed = existing_meta.as_ref().is_some_and(|meta| {
+            (meta.feed_title.is_none() && new_title.is_some())
+                || (meta.language.is_none() && new_lang.is_some())
+                || (has_audio_items && meta.source_type == FeedType::Rss)
+        });
+        let entry_meta_changed = existing_meta.as_ref().is_some_and(|meta| {
+            (meta.feed_title.is_none() && new_title.is_some())
+                || (meta.summary.is_none() && new_desc.is_some())
+                || (has_audio_items && meta.kind == EntryKind::Publication)
+        });
+        let metadata_updated = existing_meta.as_ref().is_some_and(|meta| {
+            (meta.feed_title.is_none() && new_title.is_some())
+                || (meta.summary.is_none() && new_desc.is_some())
+                || (meta.language.is_none() && new_lang.is_some())
         });
 
+        let feed_hlc_opt = if feed_config_changed { Some(tx.next_hlc().await?) } else { None };
         sqlx::query(
             "UPDATE feed_sources
              SET feed_title = COALESCE(feed_title, ?),
@@ -856,7 +916,8 @@ impl<'a> FeedRepo<'a> {
                  last_polled_by = ?,
                  last_error = NULL,
                  last_error_by = NULL,
-                 consecutive_failures = 0
+                 consecutive_failures = 0,
+                 hlc = COALESCE(?, hlc)
              WHERE collection_id = ?",
         )
         .bind(new_title)
@@ -864,29 +925,33 @@ impl<'a> FeedRepo<'a> {
         .bind(has_audio_items)
         .bind(now)
         .bind(peer_id)
+        .bind(feed_hlc_opt.as_deref())
         .bind(feed_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
-        sqlx::query!(
+        let entry_hlc_opt = if entry_meta_changed { Some(tx.next_hlc().await?) } else { None };
+        sqlx::query(
             "UPDATE entries
              SET title = COALESCE((SELECT feed_title FROM feed_sources WHERE collection_id = ?), title),
                  summary = COALESCE(summary, ?),
                  kind = CASE WHEN ? AND kind = 'publication' THEN 'podcast' ELSE kind END,
-                 updated_at = ?
+                 updated_at = ?,
+                 hlc = COALESCE(?, hlc)
              WHERE id = ?",
-            feed_id,
-            new_desc,
-            has_audio_items as _,
-            now as _,
-            feed_id,
         )
-        .execute(&mut *tx)
+        .bind(feed_id)
+        .bind(new_desc)
+        .bind(has_audio_items)
+        .bind(now)
+        .bind(entry_hlc_opt.as_deref())
+        .bind(feed_id)
+        .execute(tx.conn())
         .await?;
 
         if metadata_updated {
             SyncRepo::record_activity(
-                &mut tx,
+                tx.conn(),
                 ActivityEntityType::Feed,
                 feed_id,
                 ActivityAction::Update,
@@ -905,7 +970,7 @@ impl<'a> FeedRepo<'a> {
                 "SELECT 1 AS \"found!: i64\" FROM sync_tombstones WHERE entity_type = 'item' AND natural_key = ? LIMIT 1",
                 natural_key,
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
             if tombstoned.is_some() {
                 continue;
@@ -917,44 +982,59 @@ impl<'a> FeedRepo<'a> {
             let clean_duration = item.duration.filter(|&d| d > 0);
 
             if let Some(existing_id) =
-                resolve_dedup_entry_id(&mut tx, &det_id, &canon_url, arxiv_id.as_deref()).await?
+                resolve_dedup_entry_id(tx.conn(), &det_id, &canon_url, arxiv_id.as_deref()).await?
             {
                 let existing_state: Option<InboxState> = sqlx::query_scalar!(
                     "SELECT inbox_state AS \"inbox_state: InboxState\" FROM entry_state WHERE entry_id = ? LIMIT 1",
                     existing_id,
                 )
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
 
-                sqlx::query!(
-                    "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-                     VALUES (?, ?, ?)",
-                    feed_id,
-                    existing_id,
-                    now as _,
+                let ce_hlc = tx.next_hlc().await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                     VALUES (?, ?, ?, ?)",
                 )
-                .execute(&mut *tx)
+                .bind(feed_id)
+                .bind(&existing_id)
+                .bind(now)
+                .bind(&ce_hlc)
+                .execute(tx.conn())
                 .await?;
 
                 if existing_state.is_none() {
                     let clean_summary =
                         Some(item.summary.as_str()).filter(|s| !s.trim().is_empty());
-                    sqlx::query!(
+                    let entry_hlc = tx.next_hlc().await?;
+                    sqlx::query(
                         "UPDATE entries
                          SET url = COALESCE(url, ?),
                              published_at = COALESCE(published_at, ?),
                              summary = COALESCE(summary, ?),
                              thumbnail_url = COALESCE(thumbnail_url, ?),
-                             updated_at = ?
+                             updated_at = ?,
+                             hlc = CASE
+                                 WHEN url IS NULL
+                                   OR (published_at IS NULL AND ? IS NOT NULL)
+                                   OR (summary IS NULL AND ? IS NOT NULL)
+                                   OR (thumbnail_url IS NULL AND ? IS NOT NULL)
+                                 THEN ?
+                                 ELSE hlc
+                             END
                          WHERE id = ?",
-                        item_url_str,
-                        item.published_at as _,
-                        clean_summary,
-                        item_thumb,
-                        now as _,
-                        existing_id,
                     )
-                    .execute(&mut *tx)
+                    .bind(item_url_str)
+                    .bind(item.published_at)
+                    .bind(clean_summary)
+                    .bind(item_thumb)
+                    .bind(now)
+                    .bind(item.published_at)
+                    .bind(clean_summary)
+                    .bind(item_thumb)
+                    .bind(&entry_hlc)
+                    .bind(&existing_id)
+                    .execute(tx.conn())
                     .await?;
 
                     sqlx::query!(
@@ -967,7 +1047,7 @@ impl<'a> FeedRepo<'a> {
                         item_content_html,
                         item.content_type as _,
                     )
-                    .execute(&mut *tx)
+                    .execute(tx.conn())
                     .await?;
 
                     entries_core::ensure_entry_state_in_tx(
@@ -979,7 +1059,7 @@ impl<'a> FeedRepo<'a> {
                     .await?;
 
                     entries_core::upsert_url_and_arxiv_identifiers_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         &existing_id,
                         &canon_url,
                         arxiv_id.as_deref(),
@@ -987,7 +1067,7 @@ impl<'a> FeedRepo<'a> {
                     .await?;
 
                     MediaRepo::upsert_audio_enclosure_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         &existing_id,
                         item.audio_url.as_deref(),
                         clean_duration,
@@ -1005,7 +1085,7 @@ impl<'a> FeedRepo<'a> {
                     .await?;
 
                     SyncRepo::record_activity(
-                        &mut tx,
+                        tx.conn(),
                         ActivityEntityType::Item,
                         &existing_id,
                         ActivityAction::Create,
@@ -1043,7 +1123,7 @@ impl<'a> FeedRepo<'a> {
 
                 if inserted_entry {
                     entries_core::insert_entry_content_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         &det_id,
                         item_content_html,
                         item.content_type,
@@ -1059,25 +1139,27 @@ impl<'a> FeedRepo<'a> {
                     .await?;
 
                     entries_core::upsert_url_and_arxiv_identifiers_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         &det_id,
                         &canon_url,
                         arxiv_id.as_deref(),
                     )
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-                         VALUES (?, ?, ?)",
-                        feed_id,
-                        det_id,
-                        now as _,
+                    let ce_hlc = tx.next_hlc().await?;
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                         VALUES (?, ?, ?, ?)",
                     )
-                    .execute(&mut *tx)
+                    .bind(feed_id)
+                    .bind(&det_id)
+                    .bind(now)
+                    .bind(&ce_hlc)
+                    .execute(tx.conn())
                     .await?;
 
                     MediaRepo::upsert_audio_enclosure_in_tx(
-                        &mut tx,
+                        tx.conn(),
                         &det_id,
                         item.audio_url.as_deref(),
                         clean_duration,
@@ -1086,7 +1168,7 @@ impl<'a> FeedRepo<'a> {
                     .await?;
 
                     SyncRepo::record_activity(
-                        &mut tx,
+                        tx.conn(),
                         ActivityEntityType::Item,
                         &det_id,
                         ActivityAction::Create,
@@ -1103,7 +1185,7 @@ impl<'a> FeedRepo<'a> {
     }
 
     async fn backfill_existing_poll_item_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         existing_id: &str,
         item: &PollItemCandidate,
         clean_duration: Option<i64>,
@@ -1124,27 +1206,30 @@ impl<'a> FeedRepo<'a> {
 
         let mut changed = false;
 
-        let entry_res = sqlx::query!(
+        let entry_hlc = tx.next_hlc().await?;
+        let entry_res = sqlx::query(
             "UPDATE entries
              SET thumbnail_url = COALESCE(thumbnail_url, ?),
                  creators_json = CASE WHEN creators_json = '[]' AND ? IS NOT NULL THEN ? ELSE creators_json END,
                  kind = CASE WHEN ? IS NOT NULL AND kind = 'article' THEN 'podcast_episode' ELSE kind END,
-                 updated_at = ?
+                 updated_at = ?,
+                 hlc = ?
              WHERE id = ?
                AND ((thumbnail_url IS NULL AND ? IS NOT NULL)
                     OR (creators_json = '[]' AND ? IS NOT NULL)
                     OR (kind = 'article' AND ? IS NOT NULL))",
-            thumb_ref as _,
-            creators_ref as _,
-            creators_ref as _,
-            audio_ref as _,
-            now as _,
-            existing_id,
-            thumb_ref as _,
-            creators_ref as _,
-            audio_ref as _,
         )
-        .execute(&mut *conn)
+        .bind(thumb_ref)
+        .bind(creators_ref)
+        .bind(creators_ref)
+        .bind(audio_ref)
+        .bind(now)
+        .bind(&entry_hlc)
+        .bind(existing_id)
+        .bind(thumb_ref)
+        .bind(creators_ref)
+        .bind(audio_ref)
+        .execute(tx.conn())
         .await?;
         if entry_res.rows_affected() > 0 {
             changed = true;
@@ -1157,7 +1242,7 @@ impl<'a> FeedRepo<'a> {
                  WHERE entry_id = ? AND content_type != 'audio'",
                 existing_id,
             )
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
             if ct_res.rows_affected() > 0 {
                 changed = true;
@@ -1166,7 +1251,7 @@ impl<'a> FeedRepo<'a> {
 
         if item.audio_url.is_some() || clean_duration.is_some() {
             let enclosure_updated = Self::backfill_poll_audio_enclosure_in_tx(
-                &mut *conn,
+                tx.conn(),
                 existing_id,
                 item.audio_url.as_deref(),
                 clean_duration,
@@ -1178,7 +1263,7 @@ impl<'a> FeedRepo<'a> {
 
         if changed {
             SyncRepo::record_activity(
-                &mut *conn,
+                tx.conn(),
                 ActivityEntityType::Item,
                 existing_id,
                 ActivityAction::Update,
@@ -1249,10 +1334,10 @@ impl<'a> FeedRepo<'a> {
         .bind(now)
         .bind(MAX_CONSECUTIVE_FAILURES)
         .bind(id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", now as _, id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         tx.commit().await?;
         Ok(())

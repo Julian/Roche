@@ -8,15 +8,15 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use super::AppError;
 use crate::{
     db::{
-        CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, ClusterSelectFilter,
-        CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
-        ConsumptionLogView, Db, EntryDetailView, EntryIdentifier, RankedCollectionView,
-        RankedEntryRow, UpsertEntryInput, WantSearchMatch,
+        CatalogBatchInput, CatalogBatchResult, CatalogEntry, CatalogRepo, CollectionGeneratorState,
+        CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogView, Db,
+        EntryDetailView, EntryIdentifier, UpsertEntryInput, WantSearchMatch,
     },
     domain::{CollectionRole, ConsumptionStatus, EntryKind},
     ranking::{
@@ -24,6 +24,33 @@ use crate::{
         select_cluster, sort_by_score_with_ties, tier_label,
     },
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedEntryRow {
+    pub rank: usize,
+    pub entry: CatalogEntry,
+    pub score: Score,
+    pub tier: Option<char>,
+    pub bar_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedCollectionView {
+    pub collection: CollectionSummary,
+    pub is_priority_scope: bool,
+    pub comparison_count: usize,
+    pub rows: Vec<RankedEntryRow>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClusterSelectFilter {
+    pub max_k: usize,
+    pub iteration: usize,
+    pub focus_ids: Vec<String>,
+    pub recent_limit: Option<usize>,
+    pub by_creator: Option<String>,
+    pub from_parent_id: Option<String>,
+}
 
 const MAX_COVERED_CLUSTER_RETRIES: usize = 4;
 const SPAWN_BLOCKING_EP_THRESHOLD: usize = 150;

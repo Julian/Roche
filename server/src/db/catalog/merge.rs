@@ -1,6 +1,7 @@
-use std::collections::HashSet;
-
 use chrono::{DateTime, Utc};
+use roche_core::crdt::{
+    EntryStateSnapshot, merge_entry_state_for_duplicate_fold, rewrite_ordering_after_merge,
+};
 use sqlx::SqliteConnection;
 
 use super::{
@@ -8,7 +9,7 @@ use super::{
     models::{CatalogEntry, CatalogError, CatalogResult, RawEntryRow, raw_entry_columns},
 };
 use crate::db::{
-    MediaRepo,
+    MediaRepo, WriteTx,
     entries_core::{self, EntryStateUpsert},
     sync::{
         SyncRepo, canonical_ordering_json, deterministic_auto_consumption_log_id,
@@ -27,10 +28,10 @@ impl CatalogRepo<'_> {
     ) -> CatalogResult<CatalogEntry> {
         let now = crate::util::clock::now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        let dup_resolved = Self::follow_merged_id_in_tx(&mut tx, duplicate_id)
+        let dup_resolved = Self::follow_merged_id_in_tx(tx.conn(), duplicate_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Duplicate entry '{duplicate_id}'")))?;
-        let canon_resolved = Self::follow_merged_id_in_tx(&mut tx, canonical_id)
+        let canon_resolved = Self::follow_merged_id_in_tx(tx.conn(), canonical_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Canonical entry '{canonical_id}'")))?;
 
@@ -38,7 +39,7 @@ impl CatalogRepo<'_> {
             return Err(CatalogError::InvalidInput("Cannot merge an entry into itself".to_owned()));
         }
 
-        Self::validate_mergeable_specs_in_tx(&mut tx, &dup_resolved, &canon_resolved).await?;
+        Self::validate_mergeable_specs_in_tx(tx.conn(), &dup_resolved, &canon_resolved).await?;
         Self::fold_live_duplicate_in_tx(&mut tx, &dup_resolved, &canon_resolved, now).await?;
 
         tx.commit().await?;
@@ -145,32 +146,35 @@ impl CatalogRepo<'_> {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn fold_live_duplicate_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         dup_resolved: &str,
         canon_resolved: &str,
         now: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
         // Compress any prior chains pointing to `dup_resolved`
-        sqlx::query!(
-            "UPDATE entries SET merged_into_id = ?, updated_at = ? WHERE merged_into_id = ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
+        let chain_hlc = tx.next_hlc().await?;
+        sqlx::query(
+            "UPDATE entries SET merged_into_id = ?, updated_at = ?, hlc = ? WHERE merged_into_id = ?",
         )
-        .execute(&mut *tx)
+        .bind(canon_resolved)
+        .bind(now)
+        .bind(&chain_hlc)
+        .bind(dup_resolved)
+        .execute(tx.conn())
         .await?;
 
         // Backfill missing metadata onto canonical from duplicate
         let dup_row: RawEntryRow =
             sqlx::query_as(concat!("SELECT ", raw_entry_columns!(), " FROM entries WHERE id = ?"))
                 .bind(dup_resolved)
-                .fetch_one(&mut *tx)
+                .fetch_one(tx.conn())
                 .await?;
 
         let dup_url = dup_row.url.as_deref();
         let dup_summary = dup_row.summary.as_deref();
         let dup_thumb = dup_row.thumbnail_url.as_deref();
-        sqlx::query!(
+        let backfill_hlc = tx.next_hlc().await?;
+        sqlx::query(
             "UPDATE entries
              SET creators_json = CASE WHEN creators_json = '[]' AND ? != '[]' THEN ? ELSE creators_json END,
                  url = COALESCE(url, ?),
@@ -179,21 +183,40 @@ impl CatalogRepo<'_> {
                  summary = COALESCE(summary, ?),
                  thumbnail_url = COALESCE(thumbnail_url, ?),
                  metadata_json = CASE WHEN metadata_json = '{}' AND ? != '{}' THEN ? ELSE metadata_json END,
-                 updated_at = ?
+                 updated_at = ?,
+                 hlc = CASE
+                     WHEN (creators_json = '[]' AND ? != '[]')
+                       OR (url IS NULL AND ? IS NOT NULL)
+                       OR (published_at IS NULL AND ? IS NOT NULL)
+                       OR (release_year IS NULL AND ? IS NOT NULL)
+                       OR (summary IS NULL AND ? IS NOT NULL)
+                       OR (thumbnail_url IS NULL AND ? IS NOT NULL)
+                       OR (metadata_json = '{}' AND ? != '{}')
+                     THEN ?
+                     ELSE hlc
+                 END
              WHERE id = ?",
-            &dup_row.creators_json,
-            &dup_row.creators_json,
-            dup_url,
-            dup_row.published_at as _,
-            dup_row.release_year as _,
-            dup_summary,
-            dup_thumb,
-            &dup_row.metadata_json,
-            &dup_row.metadata_json,
-            now as _,
-            canon_resolved,
         )
-        .execute(&mut *tx)
+        .bind(&dup_row.creators_json)
+        .bind(&dup_row.creators_json)
+        .bind(dup_url)
+        .bind(dup_row.published_at)
+        .bind(dup_row.release_year)
+        .bind(dup_summary)
+        .bind(dup_thumb)
+        .bind(&dup_row.metadata_json)
+        .bind(&dup_row.metadata_json)
+        .bind(now)
+        .bind(&dup_row.creators_json)
+        .bind(dup_url)
+        .bind(dup_row.published_at)
+        .bind(dup_row.release_year)
+        .bind(dup_summary)
+        .bind(dup_thumb)
+        .bind(&dup_row.metadata_json)
+        .bind(&backfill_hlc)
+        .bind(canon_resolved)
+        .execute(tx.conn())
         .await?;
 
         // Remove duplicate manual collection spec if present (identifiers re-point below)
@@ -204,7 +227,7 @@ impl CatalogRepo<'_> {
                AND collection_role IN ('list', 'want')",
             dup_resolved,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         // Re-point all identifiers (preserving multi-valued schemes such as syndicated URLs)
@@ -213,10 +236,10 @@ impl CatalogRepo<'_> {
             canon_resolved,
             dup_resolved,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         sqlx::query!("DELETE FROM entry_identifiers WHERE entry_id = ?", dup_resolved)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
         // Migrate `entry_media` (both audio enclosures and downloaded local files)
@@ -227,11 +250,11 @@ impl CatalogRepo<'_> {
                LIMIT 1"#,
             dup_resolved,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if let Some(enc) = dup_enclosure {
             MediaRepo::upsert_audio_enclosure_in_tx(
-                &mut *tx,
+                tx.conn(),
                 canon_resolved,
                 enc.remote_url.as_deref(),
                 enc.duration,
@@ -242,7 +265,7 @@ impl CatalogRepo<'_> {
                 "DELETE FROM entry_media WHERE entry_id = ? AND local_path IS NULL",
                 dup_resolved,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
         sqlx::query!(
@@ -252,7 +275,7 @@ impl CatalogRepo<'_> {
             canon_resolved,
             dup_resolved,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         // Merge reader content & state if present
@@ -261,7 +284,7 @@ impl CatalogRepo<'_> {
                FROM entry_content WHERE entry_id = ?"#,
             dup_resolved,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if let Some(dc) = dup_content {
             let dup_html = dc.content_html.as_deref();
@@ -274,10 +297,10 @@ impl CatalogRepo<'_> {
                 dup_html,
                 &dc.content_type,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
             sqlx::query!("DELETE FROM entry_content WHERE entry_id = ?", dup_resolved)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
         }
 
@@ -289,7 +312,7 @@ impl CatalogRepo<'_> {
                FROM entry_state WHERE entry_id = ?"#,
             dup_resolved,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if let Some(ds) = dup_state {
             let canon_state = sqlx::query!(
@@ -300,7 +323,7 @@ impl CatalogRepo<'_> {
                    FROM entry_state WHERE entry_id = ?"#,
                 canon_resolved,
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
 
             let parse_inbox = |raw: &str| match raw {
@@ -308,28 +331,22 @@ impl CatalogRepo<'_> {
                 "unread" => InboxState::Unread,
                 _ => InboxState::None,
             };
-            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) = if let Some(cs) =
-                canon_state
-            {
-                let inbox = if cs.inbox_state == "dismissed" || ds.inbox_state == "dismissed" {
-                    InboxState::Dismissed
-                } else if cs.inbox_state == "unread" || ds.inbox_state == "unread" {
-                    InboxState::Unread
-                } else {
-                    InboxState::None
-                };
-                let read_at = match (cs.read_at, ds.read_at) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-                let progress = cs.progress.max(ds.progress);
-                let inter_ts = cs.interaction_updated_at.max(ds.interaction_updated_at);
-                (inbox, read_at, progress, inter_ts)
-            } else {
-                (parse_inbox(&ds.inbox_state), ds.read_at, ds.progress, ds.interaction_updated_at)
+            let dup_snap = EntryStateSnapshot {
+                inbox_state: parse_inbox(&ds.inbox_state),
+                read_at: ds.read_at,
+                progress: ds.progress,
+                interaction_updated_at: ds.interaction_updated_at,
+                hlc: String::new(),
             };
+            let canon_snap = canon_state.map(|cs| EntryStateSnapshot {
+                inbox_state: parse_inbox(&cs.inbox_state),
+                read_at: cs.read_at,
+                progress: cs.progress,
+                interaction_updated_at: cs.interaction_updated_at,
+                hlc: String::new(),
+            });
+            let (merged_inbox, merged_read_at, merged_progress, merged_inter_ts) =
+                merge_entry_state_for_duplicate_fold(canon_snap.as_ref(), &dup_snap);
 
             entries_core::upsert_entry_state_in_tx(
                 tx,
@@ -344,41 +361,45 @@ impl CatalogRepo<'_> {
             )
             .await?;
             sqlx::query!("DELETE FROM entry_state WHERE entry_id = ?", dup_resolved)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
         }
 
         // Move collection memberships (both as member and as parent collection)
-        sqlx::query!(
-            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at)
-             SELECT collection_id, ?, position, ?
+        let ce_member_hlc = tx.next_hlc().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at, hlc)
+             SELECT collection_id, ?, position, ?, ?
              FROM collection_entries
              WHERE entry_id = ? AND collection_id != ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
-            canon_resolved,
         )
-        .execute(&mut *tx)
+        .bind(canon_resolved)
+        .bind(now)
+        .bind(&ce_member_hlc)
+        .bind(dup_resolved)
+        .bind(canon_resolved)
+        .execute(tx.conn())
         .await?;
         sqlx::query!("DELETE FROM collection_entries WHERE entry_id = ?", dup_resolved)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
-        sqlx::query!(
-            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at)
-             SELECT ?, entry_id, position, ?
+        let ce_parent_hlc = tx.next_hlc().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, position, added_at, hlc)
+             SELECT ?, entry_id, position, ?, ?
              FROM collection_entries
              WHERE collection_id = ? AND entry_id != ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
-            canon_resolved,
         )
-        .execute(&mut *tx)
+        .bind(canon_resolved)
+        .bind(now)
+        .bind(&ce_parent_hlc)
+        .bind(dup_resolved)
+        .bind(canon_resolved)
+        .execute(tx.conn())
         .await?;
         sqlx::query!("DELETE FROM collection_entries WHERE collection_id = ?", dup_resolved)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
         // Canonicalize auto-completion consumption_log ID if present, then re-point manual logs
@@ -389,40 +410,45 @@ impl CatalogRepo<'_> {
                FROM consumption_log WHERE id = ?"#,
             &dup_auto_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if let Some(auto_row) = dup_auto_row {
             let auto_notes = auto_row.notes.as_deref();
-            sqlx::query!(
-                "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
-                 VALUES (?, ?, ?, 'consumed', ?, ?)
+            let auto_hlc = tx.next_hlc().await?;
+            sqlx::query(
+                "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at, hlc)
+                 VALUES (?, ?, ?, 'consumed', ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                     notes = COALESCE(consumption_log.notes, excluded.notes),
-                    created_at = excluded.created_at",
-                &canon_auto_id,
-                canon_resolved,
-                auto_row.ts as _,
-                auto_notes,
-                now as _,
+                    created_at = excluded.created_at,
+                    hlc = excluded.hlc",
             )
-            .execute(&mut *tx)
+            .bind(&canon_auto_id)
+            .bind(canon_resolved)
+            .bind(auto_row.ts)
+            .bind(auto_notes)
+            .bind(now)
+            .bind(&auto_hlc)
+            .execute(tx.conn())
             .await?;
             sqlx::query!("DELETE FROM consumption_log WHERE id = ?", &dup_auto_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
         }
 
-        sqlx::query!(
-            "UPDATE consumption_log SET entry_id = ?, created_at = ? WHERE entry_id = ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
+        let log_repoint_hlc = tx.next_hlc().await?;
+        sqlx::query(
+            "UPDATE consumption_log SET entry_id = ?, created_at = ?, hlc = ? WHERE entry_id = ?",
         )
-        .execute(&mut *tx)
+        .bind(canon_resolved)
+        .bind(now)
+        .bind(&log_repoint_hlc)
+        .bind(dup_resolved)
+        .execute(tx.conn())
         .await?;
 
         // Rewrite comparisons involving `dup_resolved` (in ordering OR scope_collection_id)
-        // using new deterministic comparison IDs + `created_at = now` so additive peer sync converges!
+        // using new deterministic comparison IDs + causal HLC so additive peer sync converges!
         let like_dup = crate::db::json_string_like_pattern(dup_resolved);
         let comp_rows: Vec<(String, DateTime<Utc>, Option<String>, String)> = sqlx::query_as(
             "SELECT id, ts, scope_collection_id, ordering_json
@@ -431,7 +457,7 @@ impl CatalogRepo<'_> {
         )
         .bind(&like_dup)
         .bind(dup_resolved)
-        .fetch_all(&mut *tx)
+        .fetch_all(tx.conn())
         .await?;
 
         for (comp_id, comp_ts, scope_collection_id, ordering_json) in comp_rows {
@@ -444,7 +470,7 @@ impl CatalogRepo<'_> {
             }
 
             sqlx::query!("DELETE FROM comparisons WHERE id = ?", &comp_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
 
             let new_scope = scope_collection_id
@@ -459,30 +485,34 @@ impl CatalogRepo<'_> {
                 );
                 let new_json = canonical_ordering_json(&rewritten);
                 let new_scope_ref = new_scope.as_deref();
-                sqlx::query!(
-                    "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                    &new_comp_id,
-                    comp_ts as _,
-                    new_scope_ref,
-                    &new_json,
-                    now as _,
+                let comp_hlc = tx.next_hlc().await?;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO comparisons (id, ts, scope_collection_id, ordering_json, created_at, hlc)
+                     VALUES (?, ?, ?, ?, ?, ?)",
                 )
-                .execute(&mut *tx)
+                .bind(&new_comp_id)
+                .bind(comp_ts)
+                .bind(new_scope_ref)
+                .bind(&new_json)
+                .bind(now)
+                .bind(&comp_hlc)
+                .execute(tx.conn())
                 .await?;
             }
         }
 
         // Update active generator pointer if needed
-        sqlx::query!(
+        let gen_ptr_hlc = tx.next_hlc().await?;
+        sqlx::query(
             "UPDATE collection_generators
-             SET current_entry_id = ?, updated_at = ?
+             SET current_entry_id = ?, updated_at = ?, hlc = ?
              WHERE current_entry_id = ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
         )
-        .execute(&mut *tx)
+        .bind(canon_resolved)
+        .bind(now)
+        .bind(&gen_ptr_hlc)
+        .bind(dup_resolved)
+        .execute(tx.conn())
         .await?;
 
         // Migrate or delete any `collection_generators` row owned by `dup_resolved`
@@ -492,7 +522,7 @@ impl CatalogRepo<'_> {
              WHERE collection_id = ?",
         )
         .bind(dup_resolved)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         if let Some((dup_enabled, mut dup_cur_entry, mut dup_drawn_at)) = dup_gen {
@@ -500,58 +530,61 @@ impl CatalogRepo<'_> {
                 "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
             )
             .bind(canon_resolved)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
             let canon_eligible = canon_spec.is_some_and(|(mode, role)| {
                 Self::is_generator_eligible(canon_resolved, mode, role)
             });
-            let canon_gen_updated: Option<DateTime<Utc>> = sqlx::query_scalar(
-                "SELECT updated_at FROM collection_generators WHERE collection_id = ?",
-            )
-            .bind(canon_resolved)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let canon_gen_exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM collection_generators WHERE collection_id = ?")
+                    .bind(canon_resolved)
+                    .fetch_optional(tx.conn())
+                    .await?;
 
             sqlx::query("DELETE FROM collection_generators WHERE collection_id = ?")
                 .bind(dup_resolved)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
 
-            if canon_eligible && canon_gen_updated.is_none() {
+            if canon_eligible && canon_gen_exists.is_none() {
                 if let Some(ref cur_id) = dup_cur_entry {
                     let in_pool: Option<i64> = sqlx::query_scalar(
                         "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
                     )
                     .bind(canon_resolved)
                     .bind(cur_id)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(tx.conn())
                     .await?;
-                    if in_pool.is_none() || Self::is_entry_terminal_in_tx(tx, cur_id).await? {
+                    if in_pool.is_none() || Self::is_entry_terminal_in_tx(tx.conn(), cur_id).await?
+                    {
                         dup_cur_entry = None;
                         dup_drawn_at = None;
                     }
                 }
                 if dup_enabled && dup_cur_entry.is_none() {
-                    dup_cur_entry = Self::draw_random_remaining_in_tx(tx, canon_resolved).await?;
+                    dup_cur_entry =
+                        Self::draw_random_remaining_in_tx(tx.conn(), canon_resolved).await?;
                     dup_drawn_at = dup_cur_entry.as_ref().map(|_| now);
                 }
                 SyncRepo::clear_tombstone(
-                    tx,
+                    tx.conn(),
                     ActivityEntityType::CollectionGenerator,
                     canon_resolved,
                 )
                 .await?;
+                let migrated_gen_hlc = tx.next_hlc().await?;
                 sqlx::query(
                     "INSERT INTO collection_generators
-                     (collection_id, enabled, current_entry_id, drawn_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?)",
+                     (collection_id, enabled, current_entry_id, drawn_at, updated_at, hlc)
+                     VALUES (?, ?, ?, ?, ?, ?)",
                 )
                 .bind(canon_resolved)
                 .bind(dup_enabled)
                 .bind(dup_cur_entry.as_deref())
                 .bind(dup_drawn_at)
                 .bind(now)
-                .execute(&mut *tx)
+                .bind(&migrated_gen_hlc)
+                .execute(tx.conn())
                 .await?;
             } else {
                 SyncRepo::record_tombstone(
@@ -562,7 +595,7 @@ impl CatalogRepo<'_> {
                 )
                 .await?;
                 SyncRepo::record_activity(
-                    tx,
+                    tx.conn(),
                     ActivityEntityType::CollectionGenerator,
                     dup_resolved,
                     ActivityAction::Delete,
@@ -570,32 +603,35 @@ impl CatalogRepo<'_> {
                 )
                 .await?;
                 // Ensure canonical's existing generator HLC strictly exceeds `dup_resolved`'s
-                // tombstone HLC in case a peer resolves merged IDs when applying tombstones.
-                if let Some(canon_upd) = canon_gen_updated {
-                    let bump_ts = canon_upd.max(now) + chrono::Duration::milliseconds(1);
+                // tombstone HLC via the next causal HLC tick (same ms, counter + 1).
+                if canon_gen_exists.is_some() {
+                    let bump_hlc = tx.next_hlc().await?;
                     sqlx::query(
-                        "UPDATE collection_generators SET updated_at = ? WHERE collection_id = ?",
+                        "UPDATE collection_generators
+                         SET updated_at = ?, hlc = ?
+                         WHERE collection_id = ?",
                     )
-                    .bind(bump_ts)
+                    .bind(now)
+                    .bind(&bump_hlc)
                     .bind(canon_resolved)
-                    .execute(&mut *tx)
+                    .execute(tx.conn())
                     .await?;
                 }
             }
         }
 
         // Mark duplicate as merged tombstone (`entries_fts_au` removes it from FTS automatically)
-        sqlx::query!(
-            "UPDATE entries SET merged_into_id = ?, updated_at = ? WHERE id = ?",
-            canon_resolved,
-            now as _,
-            dup_resolved,
-        )
-        .execute(&mut *tx)
-        .await?;
+        let dup_tomb_hlc = tx.next_hlc().await?;
+        sqlx::query("UPDATE entries SET merged_into_id = ?, updated_at = ?, hlc = ? WHERE id = ?")
+            .bind(canon_resolved)
+            .bind(now)
+            .bind(&dup_tomb_hlc)
+            .bind(dup_resolved)
+            .execute(tx.conn())
+            .await?;
 
         SyncRepo::record_activity(
-            tx,
+            tx.conn(),
             ActivityEntityType::Entry,
             canon_resolved,
             ActivityAction::Update,
@@ -603,7 +639,7 @@ impl CatalogRepo<'_> {
         )
         .await?;
         SyncRepo::record_activity(
-            tx,
+            tx.conn(),
             ActivityEntityType::Entry,
             dup_resolved,
             ActivityAction::Delete,
@@ -613,26 +649,4 @@ impl CatalogRepo<'_> {
 
         Ok(())
     }
-}
-
-pub(super) fn rewrite_ordering_after_merge(
-    ordering: &[Vec<String>],
-    duplicate_id: &str,
-    canonical_id: &str,
-) -> Vec<Vec<String>> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::with_capacity(ordering.len());
-    for group in ordering {
-        let mut new_group = Vec::new();
-        for id in group {
-            let mapped = if id == duplicate_id { canonical_id } else { id.as_str() };
-            if seen.insert(mapped.to_owned()) {
-                new_group.push(mapped.to_owned());
-            }
-        }
-        if !new_group.is_empty() {
-            out.push(new_group);
-        }
-    }
-    out
 }

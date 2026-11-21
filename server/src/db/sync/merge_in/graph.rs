@@ -7,8 +7,8 @@ use sqlx::SqliteConnection;
 use super::super::{
     STARRED_COLLECTION_ID, SyncRepo, WANT_TO_READ_COLLECTION_ID, WANT_TO_READ_SLUG,
     hlc::{
-        HlcClock, clamp_incoming_timestamp, clamp_incoming_timestamp_opt,
-        clamp_incoming_upper_timestamp, resolve_or_synthesize_hlc,
+        clamp_incoming_timestamp, clamp_incoming_timestamp_opt, clamp_incoming_upper_timestamp,
+        resolve_or_synthesize_hlc,
     },
     identity::{
         canonical_ordering_json, collection_entry_natural_key,
@@ -25,7 +25,7 @@ use super::MergeContext;
 use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole,
-        ConsumptionStatus, EntryKind, HexColor,
+        ConsumptionStatus, EntryKind, HexColor, WriteTx,
         entries_core::{self, EntryInsertParams},
     },
     ranking::validate_ordering,
@@ -257,7 +257,7 @@ impl SyncRepo<'_> {
     }
 
     pub(super) async fn apply_pending_merges_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         pending_merges: &[(&PreparedSyncEntry, String)],
         ctx: &mut MergeContext<'_>,
     ) -> Result<()> {
@@ -267,7 +267,8 @@ impl SyncRepo<'_> {
             if raw_dup.is_empty() {
                 continue;
             }
-            let Some(canon_resolved) = ctx.id_resolver.resolve_live_in_tx(tx, raw_target).await?
+            let Some(canon_resolved) =
+                ctx.id_resolver.resolve_live_in_tx(tx.conn(), raw_target).await?
             else {
                 continue;
             };
@@ -279,12 +280,12 @@ impl SyncRepo<'_> {
             let existing_dup: Option<(Option<String>, EntryKind, String)> =
                 sqlx::query_as("SELECT merged_into_id, kind, hlc FROM entries WHERE id = ?")
                     .bind(raw_dup)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(tx.conn())
                     .await?;
             let canon_kind: Option<EntryKind> =
                 sqlx::query_scalar("SELECT kind FROM entries WHERE id = ?")
                     .bind(&canon_resolved)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(tx.conn())
                     .await?;
             let Some(canon_kind) = canon_kind else {
                 continue;
@@ -315,9 +316,13 @@ impl SyncRepo<'_> {
                     {
                         continue;
                     }
-                    if CatalogRepo::validate_mergeable_specs_in_tx(tx, raw_dup, &canon_resolved)
-                        .await
-                        .is_ok()
+                    if CatalogRepo::validate_mergeable_specs_in_tx(
+                        tx.conn(),
+                        raw_dup,
+                        &canon_resolved,
+                    )
+                    .await
+                    .is_ok()
                     {
                         CatalogRepo::fold_live_duplicate_in_tx(
                             tx,
@@ -336,16 +341,19 @@ impl SyncRepo<'_> {
     }
 
     pub(super) async fn merge_incoming_collection_entries_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         memberships: &[SyncCollectionEntryRecord],
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
         for ce in memberships {
-            let Some(col_id) = ctx.id_resolver.resolve_live_in_tx(tx, &ce.collection_id).await?
+            let Some(col_id) =
+                ctx.id_resolver.resolve_live_in_tx(tx.conn(), &ce.collection_id).await?
             else {
                 continue;
             };
-            let Some(entry_id) = ctx.id_resolver.resolve_live_in_tx(tx, &ce.entry_id).await? else {
+            let Some(entry_id) =
+                ctx.id_resolver.resolve_live_in_tx(tx.conn(), &ce.entry_id).await?
+            else {
                 continue;
             };
             if col_id == entry_id {
@@ -356,12 +364,14 @@ impl SyncRepo<'_> {
                 "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
             )
             .bind(&col_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
             if spec_info.as_ref().is_some_and(|s| s.mode == CollectionMode::Dynamic) {
                 continue;
             }
-            if CatalogRepo::would_introduce_collection_cycle_in_tx(tx, &col_id, &entry_id).await? {
+            if CatalogRepo::would_introduce_collection_cycle_in_tx(tx.conn(), &col_id, &entry_id)
+                .await?
+            {
                 continue;
             }
 
@@ -370,7 +380,7 @@ impl SyncRepo<'_> {
                 resolve_or_synthesize_hlc(&ce.hlc, Some(safe_added_at), ctx.now, ctx.peer_id);
             let nat_key = collection_entry_natural_key(&col_id, &entry_id);
             if Self::check_and_clear_tombstone_in_tx(
-                tx,
+                tx.conn(),
                 ActivityEntityType::CollectionEntry,
                 &nat_key,
                 &ce_hlc,
@@ -405,7 +415,7 @@ impl SyncRepo<'_> {
             .bind(ce.position)
             .bind(safe_added_at)
             .bind(&ce_hlc)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
             // Auto-upgrade RSS publication feed to Podcast when an audio episode joins it
@@ -419,7 +429,7 @@ impl SyncRepo<'_> {
     }
 
     async fn maybe_upgrade_feed_to_podcast_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         col_id: &str,
         entry_id: &str,
     ) -> Result<()> {
@@ -430,29 +440,33 @@ impl SyncRepo<'_> {
              LIMIT 1",
         )
         .bind(entry_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if is_audio_entry.is_some() {
+            let fs_hlc = tx.next_hlc().await?;
             sqlx::query(
-                "UPDATE feed_sources SET source_type = 'podcast'
+                "UPDATE feed_sources SET source_type = 'podcast', hlc = ?
                  WHERE collection_id = ? AND source_type = 'rss'",
             )
+            .bind(&fs_hlc)
             .bind(col_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
+            let entry_hlc = tx.next_hlc().await?;
             sqlx::query(
-                "UPDATE entries SET kind = 'podcast'
+                "UPDATE entries SET kind = 'podcast', hlc = ?
                  WHERE id = ? AND kind = 'publication'",
             )
+            .bind(&entry_hlc)
             .bind(col_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
         Ok(())
     }
 
     pub(super) async fn merge_incoming_consumption_log_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         logs: &[SyncConsumptionLogRecord],
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
@@ -463,12 +477,12 @@ impl SyncRepo<'_> {
     }
 
     async fn merge_single_consumption_log_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         log: &SyncConsumptionLogRecord,
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
         let raw_ent = log.entry_id.trim();
-        let Some(entry_id) = ctx.id_resolver.resolve_live_in_tx(tx, raw_ent).await? else {
+        let Some(entry_id) = ctx.id_resolver.resolve_live_in_tx(tx.conn(), raw_ent).await? else {
             return Ok(());
         };
         let log_hlc = resolve_or_synthesize_hlc(
@@ -481,7 +495,7 @@ impl SyncRepo<'_> {
         let trimmed_id = log.id.trim();
         if !trimmed_id.is_empty()
             && Self::check_and_clear_tombstone_in_tx(
-                tx,
+                tx.conn(),
                 ActivityEntityType::ConsumptionLog,
                 trimmed_id,
                 &log_hlc,
@@ -514,7 +528,7 @@ impl SyncRepo<'_> {
         };
         if resolved_log_id != trimmed_id
             && Self::check_and_clear_tombstone_in_tx(
-                tx,
+                tx.conn(),
                 ActivityEntityType::ConsumptionLog,
                 &resolved_log_id,
                 &log_hlc,
@@ -538,7 +552,7 @@ impl SyncRepo<'_> {
     }
 
     async fn upsert_synced_consumption_log_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         resolved_log_id: &str,
         entry_id: &str,
         log: &SyncConsumptionLogRecord,
@@ -549,7 +563,7 @@ impl SyncRepo<'_> {
         let existing_row: Option<(String, ConsumptionStatus)> =
             sqlx::query_as("SELECT hlc, status FROM consumption_log WHERE id = ?")
                 .bind(resolved_log_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
         if let Some((ex_hlc, ex_status)) = existing_row {
             if log_hlc > ex_hlc.as_str() {
@@ -564,7 +578,7 @@ impl SyncRepo<'_> {
                 .bind(safe_log_ts)
                 .bind(log_hlc)
                 .bind(resolved_log_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
                 if ex_status != ConsumptionStatus::Consumed
                     && log.status == ConsumptionStatus::Consumed
@@ -581,7 +595,7 @@ impl SyncRepo<'_> {
             return Ok(());
         }
 
-        let (saved_id, _, inserted_new) = CatalogRepo::log_consumption_with_id_in_tx(
+        let _ = CatalogRepo::log_consumption_with_id_in_tx(
             tx,
             resolved_log_id,
             entry_id,
@@ -589,26 +603,9 @@ impl SyncRepo<'_> {
             log.notes.as_deref(),
             safe_log_ts,
             now,
+            Some(log_hlc),
         )
         .await?;
-        if inserted_new {
-            sqlx::query("UPDATE consumption_log SET hlc = ? WHERE id = ?")
-                .bind(log_hlc)
-                .bind(&saved_id)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            sqlx::query(
-                "UPDATE consumption_log
-                 SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END
-                 WHERE id = ?",
-            )
-            .bind(log_hlc)
-            .bind(log_hlc)
-            .bind(&saved_id)
-            .execute(&mut *tx)
-            .await?;
-        }
         Ok(())
     }
 
@@ -745,31 +742,31 @@ impl SyncRepo<'_> {
     }
 
     pub(super) async fn merge_incoming_generators_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         generators: &[SyncCollectionGeneratorRecord],
-        clock: &mut HlcClock,
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
         for inc in generators {
-            Self::merge_single_generator_in_tx(tx, inc, clock, ctx).await?;
+            Self::merge_single_generator_in_tx(tx, inc, ctx).await?;
         }
-        Self::advance_stale_local_generators_in_tx(tx, clock, ctx.now).await
+        Self::advance_stale_local_generators_in_tx(tx, ctx.now).await
     }
 
     async fn merge_single_generator_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         inc: &SyncCollectionGeneratorRecord,
-        clock: &mut HlcClock,
         ctx: &MergeContext<'_>,
     ) -> Result<()> {
-        let Some(col_id) = ctx.id_resolver.resolve_live_in_tx(tx, &inc.collection_id).await? else {
+        let Some(col_id) =
+            ctx.id_resolver.resolve_live_in_tx(tx.conn(), &inc.collection_id).await?
+        else {
             return Ok(());
         };
         let spec_ok: Option<CollectionSpecModeRole> = sqlx::query_as(
             "SELECT mode, collection_role FROM collection_specs WHERE collection_id = ?",
         )
         .bind(&col_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if !spec_ok
             .is_some_and(|s| CatalogRepo::is_generator_eligible(&col_id, s.mode, s.collection_role))
@@ -780,7 +777,7 @@ impl SyncRepo<'_> {
         let inc_hlc =
             resolve_or_synthesize_hlc(&inc.hlc, Some(inc.updated_at), ctx.now, ctx.peer_id);
         if Self::check_and_clear_tombstone_in_tx(
-            tx,
+            tx.conn(),
             ActivityEntityType::CollectionGenerator,
             &col_id,
             &inc_hlc,
@@ -795,7 +792,7 @@ impl SyncRepo<'_> {
              FROM collection_generators WHERE collection_id = ?",
         )
         .bind(&col_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         let mapped_inc_entry = inc
@@ -812,7 +809,7 @@ impl SyncRepo<'_> {
             inc_hlc,
             ctx.now,
         );
-        Self::reconcile_generator_target_in_tx(tx, &col_id, &mut target, clock, ctx.now).await?;
+        Self::reconcile_generator_target_in_tx(tx, &col_id, &mut target, ctx.now).await?;
 
         let needs_upsert = local_gen.as_ref().is_none_or(|local| {
             target.enabled != local.enabled
@@ -839,11 +836,11 @@ impl SyncRepo<'_> {
             .bind(target.drawn_at)
             .bind(target.updated_at)
             .bind(&target.hlc)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         } else if target.local_won_conflict {
             sqlx::query("UPDATE sync_clock SET current_seq = current_seq + 1 WHERE id = 1")
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             sqlx::query(
                 "UPDATE collection_generators
@@ -851,67 +848,69 @@ impl SyncRepo<'_> {
                  WHERE collection_id = ?",
             )
             .bind(&col_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
         Ok(())
     }
 
     async fn reconcile_generator_target_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         col_id: &str,
         target: &mut GeneratorTargetState,
-        clock: &mut HlcClock,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let now_ms = now.timestamp_millis();
         if let Some(ref cur_id) = target.current_entry_id {
-            if let Some(canon_entry_id) = CatalogRepo::follow_merged_id_in_tx(tx, cur_id).await? {
+            if let Some(canon_entry_id) =
+                CatalogRepo::follow_merged_id_in_tx(tx.conn(), cur_id).await?
+            {
                 let in_pool: Option<i64> = sqlx::query_scalar(
                     "SELECT 1 FROM collection_entries WHERE collection_id = ? AND entry_id = ?",
                 )
                 .bind(col_id)
                 .bind(&canon_entry_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
                 if in_pool.is_none()
-                    || CatalogRepo::is_entry_terminal_in_tx(tx, &canon_entry_id).await?
+                    || CatalogRepo::is_entry_terminal_in_tx(tx.conn(), &canon_entry_id).await?
                 {
                     target.current_entry_id = None;
                     target.drawn_at = None;
                     target.updated_at = now;
-                    target.hlc = clock.tick(now_ms).encode();
+                    target.hlc = tx.next_hlc_at(now_ms).await?;
                 } else if canon_entry_id.as_str() != cur_id.as_str() {
                     target.current_entry_id = Some(canon_entry_id);
                     target.updated_at = now;
-                    target.hlc = clock.tick(now_ms).encode();
+                    target.hlc = tx.next_hlc_at(now_ms).await?;
                 }
             } else {
                 target.current_entry_id = None;
                 target.drawn_at = None;
                 target.updated_at = now;
-                target.hlc = clock.tick(now_ms).encode();
+                target.hlc = tx.next_hlc_at(now_ms).await?;
             }
         }
 
         if target.enabled && target.current_entry_id.is_none() {
-            if let Some(drawn_id) = CatalogRepo::draw_random_remaining_in_tx(tx, col_id).await? {
+            if let Some(drawn_id) =
+                CatalogRepo::draw_random_remaining_in_tx(tx.conn(), col_id).await?
+            {
                 target.current_entry_id = Some(drawn_id);
                 target.drawn_at = Some(now);
                 target.updated_at = now;
-                target.hlc = clock.tick(now_ms).encode();
+                target.hlc = tx.next_hlc_at(now_ms).await?;
             } else if target.drawn_at.is_some() {
                 target.drawn_at = None;
                 target.updated_at = now;
-                target.hlc = clock.tick(now_ms).encode();
+                target.hlc = tx.next_hlc_at(now_ms).await?;
             }
         }
         Ok(())
     }
 
     async fn advance_stale_local_generators_in_tx(
-        tx: &mut SqliteConnection,
-        clock: &mut HlcClock,
+        tx: &mut WriteTx<'_>,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let now_ms = now.timestamp_millis();
@@ -921,7 +920,7 @@ impl SyncRepo<'_> {
             "SELECT collection_id, enabled, current_entry_id
              FROM collection_generators WHERE current_entry_id IS NOT NULL",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(tx.conn())
         .await?;
         for row in active {
             let in_pool: Option<i64> = sqlx::query_scalar(
@@ -931,18 +930,18 @@ impl SyncRepo<'_> {
             )
             .bind(&row.collection_id)
             .bind(&row.current_entry_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.conn())
             .await?;
             if in_pool.is_none()
-                || CatalogRepo::is_entry_terminal_in_tx(tx, &row.current_entry_id).await?
+                || CatalogRepo::is_entry_terminal_in_tx(tx.conn(), &row.current_entry_id).await?
             {
                 let next_id = if row.enabled {
-                    CatalogRepo::draw_random_remaining_in_tx(tx, &row.collection_id).await?
+                    CatalogRepo::draw_random_remaining_in_tx(tx.conn(), &row.collection_id).await?
                 } else {
                     None
                 };
                 let next_drawn = next_id.as_ref().map(|_| now);
-                let next_hlc = clock.tick(now_ms).encode();
+                let next_hlc = tx.next_hlc_at(now_ms).await?;
                 sqlx::query(
                     "UPDATE collection_generators
                      SET current_entry_id = ?, drawn_at = ?, updated_at = ?, hlc = ?
@@ -953,7 +952,7 @@ impl SyncRepo<'_> {
                 .bind(now)
                 .bind(&next_hlc)
                 .bind(&row.collection_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             }
         }

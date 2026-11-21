@@ -52,6 +52,10 @@ class EpRankingEngineTest {
             for ((id, expected) in case.expectedScores) {
                 val actual = scores.getValue(id)
                 assertTrue(
+                    actual.mean.isFinite() && actual.variance.isFinite() && actual.variance >= 0.0,
+                    "case '${case.name}' item '$id' produced non-finite or negative variance: $actual",
+                )
+                assertTrue(
                     abs(actual.mean - expected.mean) <= TOLERANCE,
                     "case '${case.name}' item '$id' mean mismatch: actual=${actual.mean} expected=${expected.mean}",
                 )
@@ -117,4 +121,4 @@ class EpRankingEngineTest {
 }
 
 private const val TOLERANCE = 1e-6
-private const val MIN_EXPECTED_CASES = 6
+private const val MIN_EXPECTED_CASES = 9

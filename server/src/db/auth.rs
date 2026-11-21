@@ -30,7 +30,7 @@ impl<'a> AuthRepo<'a> {
         let normalized = code.trim().to_ascii_lowercase();
         let code_hash = sha256_hex(&normalized);
         let mut tx = crate::db::begin_write(self.pool).await?;
-        sqlx::query!("DELETE FROM pairing_codes").execute(&mut *tx).await?;
+        sqlx::query!("DELETE FROM pairing_codes").execute(tx.conn()).await?;
 
         sqlx::query!(
             "INSERT INTO pairing_codes (code, failed_attempts, created_at, expires_at) VALUES (?, 0, ?, ?)",
@@ -38,7 +38,7 @@ impl<'a> AuthRepo<'a> {
             now as _,
             expires_at as _,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
         Ok(())
@@ -67,7 +67,7 @@ impl<'a> AuthRepo<'a> {
             "DELETE FROM pairing_codes WHERE datetime(expires_at) <= datetime(?)",
             now as _
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         let result = sqlx::query!(
@@ -77,7 +77,7 @@ impl<'a> AuthRepo<'a> {
             now as _,
             MAX_PAIRING_ATTEMPTS,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         if result.rows_affected() > 0 {
@@ -86,10 +86,10 @@ impl<'a> AuthRepo<'a> {
         }
 
         sqlx::query!("UPDATE pairing_codes SET failed_attempts = failed_attempts + 1")
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         sqlx::query!("DELETE FROM pairing_codes WHERE failed_attempts >= ?", MAX_PAIRING_ATTEMPTS)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
         tx.commit().await?;
@@ -154,7 +154,7 @@ impl<'a> AuthRepo<'a> {
         let current: Option<Option<String>> =
             sqlx::query_scalar("SELECT bound_peer_id FROM device_tokens WHERE id = ?")
                 .bind(token_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
         let Some(existing_bound) = current else {
             return Ok(false);
@@ -167,7 +167,7 @@ impl<'a> AuthRepo<'a> {
         )
         .bind(peer_id)
         .bind(token_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if claimed_by_other.is_some() {
             return Ok(false);
@@ -177,7 +177,7 @@ impl<'a> AuthRepo<'a> {
         )
         .bind(peer_id)
         .bind(token_id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
         Ok(true)

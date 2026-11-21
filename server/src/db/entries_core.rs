@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
 
-use super::types::{ContentType, EntryKind, InboxState};
+use super::{
+    tx::WriteTx,
+    types::{ContentType, EntryKind, InboxState},
+};
 
 const INSERT_ENTRY_SQL: &str = "INSERT INTO entries
     (id, kind, title, creators_json, url, published_at, release_year, summary,
@@ -34,7 +37,7 @@ pub struct EntryInsertParams<'a> {
 
 impl<'a> EntryInsertParams<'a> {
     /// Constructs an entry insert payload with canonical defaults (`creators_json = "[]"`,
-    /// `metadata_json = "{}"`, no optional metadata, and trigger-synthesized HLC).
+    /// `metadata_json = "{}"`, no optional metadata, and a causal HLC minted by `WriteTx`).
     #[must_use]
     pub const fn minimal(
         id: &'a str,
@@ -74,10 +77,14 @@ pub struct EntryStateUpsert<'a> {
 }
 
 async fn execute_entry_insert_in_tx(
-    tx: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     sql: &'static str,
     params: &EntryInsertParams<'_>,
 ) -> std::result::Result<u64, sqlx::Error> {
+    let hlc = match params.hlc {
+        Some(explicit) if !explicit.is_empty() => explicit.to_owned(),
+        _ => tx.next_hlc().await?,
+    };
     let res = sqlx::query(sql)
         .bind(params.id)
         .bind(params.kind)
@@ -92,15 +99,15 @@ async fn execute_entry_insert_in_tx(
         .bind(params.merged_into_id)
         .bind(params.created_at)
         .bind(params.updated_at)
-        .bind(params.hlc.unwrap_or(""))
-        .execute(&mut *tx)
+        .bind(&hlc)
+        .execute(tx.conn())
         .await?;
     Ok(res.rows_affected())
 }
 
 /// Inserts a new row into `entries`, failing if `params.id` already exists.
 pub async fn insert_entry_row_in_tx(
-    tx: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     params: &EntryInsertParams<'_>,
 ) -> std::result::Result<(), sqlx::Error> {
     let _ = execute_entry_insert_in_tx(tx, INSERT_ENTRY_SQL, params).await?;
@@ -110,7 +117,7 @@ pub async fn insert_entry_row_in_tx(
 /// Inserts a new row into `entries` with `INSERT OR IGNORE`, returning `true` when a new row was
 /// inserted and `false` when `params.id` already existed.
 pub async fn insert_entry_row_or_ignore_in_tx(
-    tx: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     params: &EntryInsertParams<'_>,
 ) -> std::result::Result<bool, sqlx::Error> {
     Ok(execute_entry_insert_in_tx(tx, INSERT_ENTRY_OR_IGNORE_SQL, params).await? > 0)
@@ -220,38 +227,42 @@ pub async fn insert_entry_content_in_tx(
 /// Ensures an `entry_state` row exists with the given initial `inbox_state` and `progress = 0.0`
 /// without overwriting any existing state row.
 pub async fn ensure_entry_state_in_tx(
-    tx: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     entry_id: &str,
     inbox_state: InboxState,
     updated_at: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
+    let hlc = tx.next_hlc().await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO entry_state (entry_id, inbox_state, progress, updated_at)
-         VALUES (?, ?, 0.0, ?)",
+        "INSERT OR IGNORE INTO entry_state (entry_id, inbox_state, progress, updated_at, hlc)
+         VALUES (?, ?, 0.0, ?, ?)",
     )
     .bind(entry_id)
     .bind(inbox_state)
     .bind(updated_at)
-    .execute(&mut *tx)
+    .bind(&hlc)
+    .execute(tx.conn())
     .await?;
     Ok(())
 }
 
 /// Inserts or updates an `entry_state` row with full reader/inbox state fields.
 pub async fn upsert_entry_state_in_tx(
-    tx: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     state: &EntryStateUpsert<'_>,
 ) -> std::result::Result<(), sqlx::Error> {
+    let hlc = tx.next_hlc().await?;
     sqlx::query(
         "INSERT INTO entry_state
-         (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+         (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at, hlc)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(entry_id) DO UPDATE SET
              inbox_state = excluded.inbox_state,
              read_at = excluded.read_at,
              progress = excluded.progress,
              interaction_updated_at = excluded.interaction_updated_at,
-             updated_at = excluded.updated_at",
+             updated_at = excluded.updated_at,
+             hlc = excluded.hlc",
     )
     .bind(state.entry_id)
     .bind(state.inbox_state)
@@ -259,7 +270,8 @@ pub async fn upsert_entry_state_in_tx(
     .bind(state.progress)
     .bind(state.interaction_updated_at)
     .bind(state.updated_at)
-    .execute(&mut *tx)
+    .bind(&hlc)
+    .execute(tx.conn())
     .await?;
     Ok(())
 }

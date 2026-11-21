@@ -1,14 +1,10 @@
 use chrono::{DateTime, Utc};
+pub use roche_core::domain::{DynamicCollectionRule, EntryIdentifier};
+use roche_core::external_links::EXTERNAL_ID_DISPLAY_ORDER;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::identity_norm::{
-    EXTERNAL_ID_DISPLAY_ORDER, external_identifier_label, external_identifier_url,
-};
-use crate::{
-    db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, HexColor},
-    ranking::Score,
-};
+use crate::db::types::{CollectionMode, CollectionRole, ConsumptionStatus, EntryKind, HexColor};
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -35,24 +31,6 @@ pub enum CatalogError {
 }
 
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryIdentifier {
-    pub scheme: String,
-    pub value: String,
-}
-
-impl EntryIdentifier {
-    #[must_use]
-    pub fn label(&self) -> &str {
-        external_identifier_label(&self.scheme)
-    }
-
-    #[must_use]
-    pub fn external_url(&self) -> Option<String> {
-        external_identifier_url(&self.scheme, &self.value)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
@@ -213,22 +191,6 @@ pub struct UpsertEntryInput {
     pub parent_position: Option<f64>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DynamicCollectionRule {
-    #[serde(default)]
-    pub kind: Option<EntryKind>,
-    #[serde(default)]
-    pub kinds: Vec<EntryKind>,
-    #[serde(default)]
-    pub consumed: Option<bool>,
-    #[serde(default)]
-    pub status: Option<ConsumptionStatus>,
-    #[serde(default, alias = "creator_contains")]
-    pub creator: Option<String>,
-    #[serde(default)]
-    pub release_year: Option<i32>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSummary {
     pub id: String,
@@ -246,23 +208,6 @@ pub struct CollectionSummary {
     pub has_generator: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankedEntryRow {
-    pub rank: usize,
-    pub entry: CatalogEntry,
-    pub score: Score,
-    pub tier: Option<char>,
-    pub bar_pct: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RankedCollectionView {
-    pub collection: CollectionSummary,
-    pub is_priority_scope: bool,
-    pub comparison_count: usize,
-    pub rows: Vec<RankedEntryRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,16 +252,6 @@ pub struct CollectionGeneratorState {
     pub consumed_count: usize,
     pub abandoned_count: usize,
     pub remaining_count: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ClusterSelectFilter {
-    pub max_k: usize,
-    pub iteration: usize,
-    pub focus_ids: Vec<String>,
-    pub recent_limit: Option<usize>,
-    pub by_creator: Option<String>,
-    pub from_parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

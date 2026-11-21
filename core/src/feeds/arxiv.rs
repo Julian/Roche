@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use url::Url;
 
 use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp, select_entry_link};
-use crate::util::{media_urls, url_guard::parse_public_url};
+use crate::{media_urls, url_guard::parse_public_url};
 
 #[derive(Debug, Clone)]
 pub struct ArxivFeed {
@@ -23,12 +23,6 @@ pub struct ArxivPaper {
 pub struct ArxivParser;
 
 impl ArxivParser {
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn is_arxiv_host(host: Option<&str>) -> bool {
-        media_urls::is_arxiv_host(host)
-    }
-
     pub fn parse(content: &str) -> Result<ArxivFeed> {
         let mut feed = feed_rs::parser::parse(content.as_bytes())?;
         feed.entries.truncate(MAX_PARSED_FEED_ENTRIES);
@@ -43,7 +37,7 @@ impl ArxivParser {
                 let abstract_url = select_entry_link(&entry.links)
                     .map(|url| media_urls::canonical_arxiv_abstract_url(&url).unwrap_or(url))
                     .or_else(|| {
-                        Self::extract_arxiv_id(&entry.id).and_then(|id| {
+                        media_urls::extract_arxiv_id(&entry.id).and_then(|id| {
                             let versionless = media_urls::strip_arxiv_version(&id);
                             parse_public_url(&format!("https://arxiv.org/abs/{versionless}")).ok()
                         })
@@ -67,17 +61,6 @@ impl ArxivParser {
 
         Ok(ArxivFeed { title, items })
     }
-
-    #[must_use]
-    pub fn extract_arxiv_id(url_or_id: &str) -> Option<String> {
-        media_urls::extract_arxiv_id(url_or_id)
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn pdf_url_for_paper(paper_url: &Url) -> Option<Url> {
-        media_urls::arxiv_pdf_url(paper_url)
-    }
 }
 
 #[cfg(test)]
@@ -88,26 +71,26 @@ mod tests {
     #[test]
     fn test_extract_arxiv_id() {
         assert_eq!(
-            ArxivParser::extract_arxiv_id("http://arxiv.org/abs/2301.07041"),
+            media_urls::extract_arxiv_id("http://arxiv.org/abs/2301.07041"),
             Some("2301.07041".to_string())
         );
         assert_eq!(
-            ArxivParser::extract_arxiv_id("https://arxiv.org/pdf/2301.07041.pdf"),
+            media_urls::extract_arxiv_id("https://arxiv.org/pdf/2301.07041.pdf"),
             Some("2301.07041".to_string())
         );
         assert_eq!(
-            ArxivParser::extract_arxiv_id("http://arxiv.org/abs/2301.07041v2?context=cs"),
+            media_urls::extract_arxiv_id("http://arxiv.org/abs/2301.07041v2?context=cs"),
             Some("2301.07041v2".to_string())
         );
         assert_eq!(
-            ArxivParser::extract_arxiv_id("oai:arXiv.org:2301.07041v1"),
+            media_urls::extract_arxiv_id("oai:arXiv.org:2301.07041v1"),
             Some("2301.07041v1".to_string())
         );
         assert_eq!(
-            ArxivParser::extract_arxiv_id("http://arxiv.org/abs/hep-th/9901001"),
+            media_urls::extract_arxiv_id("http://arxiv.org/abs/hep-th/9901001"),
             Some("hep-th/9901001".to_string())
         );
-        assert_eq!(ArxivParser::extract_arxiv_id("2301.07041"), Some("2301.07041".to_string()));
+        assert_eq!(media_urls::extract_arxiv_id("2301.07041"), Some("2301.07041".to_string()));
     }
 
     #[test]

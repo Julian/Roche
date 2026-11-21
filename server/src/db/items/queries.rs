@@ -219,8 +219,8 @@ impl ItemRepo<'_> {
                 " ORDER BY CASE WHEN fts.fts_rank IS NULL THEN 1 ELSE 0 END ASC, fts.fts_rank {rank_dir}, COALESCE(i.published_at, i.created_at) DESC, i.id DESC"
             ));
         } else {
-            let sort_col = filter.sort.unwrap_or_default().as_sql_expr();
-            let sort_dir = filter.order.unwrap_or_default().as_sql();
+            let sort_col = item_sort_sql_expr(filter.sort.unwrap_or_default());
+            let sort_dir = sort_order_sql(filter.order.unwrap_or_default());
             qb.push(format_args!(" ORDER BY {sort_col} {sort_dir}, i.id DESC"));
         }
 
@@ -289,19 +289,23 @@ impl ItemRepo<'_> {
     }
 
     pub async fn count_unread(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM entry_state es
-             JOIN entries e ON e.id = es.entry_id
-             WHERE e.merged_into_id IS NULL
-               AND es.inbox_state = 'unread'
-               AND EXISTS (
-                   SELECT 1 FROM collection_entries ce_f
-                   JOIN feed_sources fs_f ON fs_f.collection_id = ce_f.collection_id
-                   WHERE ce_f.entry_id = e.id
-               )",
-        )
-        .fetch_one(self.pool)
-        .await?)
+        self.count_by_status(ItemStatus::Unread).await
+    }
+}
+
+const fn item_sort_sql_expr(field: ItemSortField) -> &'static str {
+    match field {
+        ItemSortField::CreatedAt => "i.created_at",
+        ItemSortField::PublishedAt | ItemSortField::Relevance => {
+            "COALESCE(i.published_at, i.created_at)"
+        }
+        ItemSortField::Title => "i.title COLLATE NOCASE",
+    }
+}
+
+const fn sort_order_sql(order: SortOrder) -> &'static str {
+    match order {
+        SortOrder::Asc => "ASC",
+        SortOrder::Desc => "DESC",
     }
 }

@@ -7,6 +7,8 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
+roche-core = { version = "0.1.0", path = "../core", features = ["sqlx"] }
+
 # HTTP framework
 axum = { version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.12", features = ["typed-header"] }
@@ -37,13 +39,11 @@ subtle = "2.6"
 # HTTP client
 reqwest = "0.13"
 
-# Feed parsing
-feed-rs = "3"
+# XML utilities
 quick-xml = "0.42"
 
 # Validation
 url = { version = "2", features = ["serde"] }
-ip_network = "0.4"
 
 # HTML sanitization
 ammonia = "4"

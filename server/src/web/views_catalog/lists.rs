@@ -16,12 +16,11 @@ use super::{
     render_search_kind_options,
 };
 use crate::{
-    db::{
-        CatalogEntry, CollectionGeneratorState, CollectionSummary, RankedCollectionView,
-        RankedEntryRow, UpsertEntryInput,
-    },
+    db::{CatalogEntry, CollectionGeneratorState, CollectionSummary, UpsertEntryInput},
     domain::{CollectionMode, CollectionRole, EntryKind},
-    service::{AppError, RankedCollectionFilter, RocheService},
+    service::{
+        AppError, RankedCollectionFilter, RankedCollectionView, RankedEntryRow, RocheService,
+    },
     web::{
         auth::WebSession,
         html::{
@@ -818,7 +817,7 @@ fn render_list_entries_section(
     out: &mut String,
     ctx: &ListDetailRenderCtx<'_>,
     slug: &str,
-    slice: &[crate::db::RankedEntryRow],
+    slice: &[RankedEntryRow],
     ranked_mode: bool,
     is_editable_manual: bool,
 ) {

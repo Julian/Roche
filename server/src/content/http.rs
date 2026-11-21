@@ -4,7 +4,7 @@ use anyhow::Result;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::Url;
 
-use super::classify::UrlClassifier;
+use super::classify::is_valid_pdf_bytes;
 use crate::util::url_guard::{is_global_ip, validate_public_url};
 
 /// Custom DNS resolver for `reqwest` that validates every resolved IP address against
@@ -151,7 +151,7 @@ impl SafeHttpClient {
     pub async fn fetch_html_text(&self, url: &Url, max_bytes: usize) -> Result<String> {
         let bytes =
             self.fetch_bytes_with_validation(url, max_bytes, FetchValidation::HtmlText).await?;
-        if UrlClassifier::is_valid_pdf_bytes(&bytes) || bytes.contains(&0) {
+        if is_valid_pdf_bytes(&bytes) || bytes.contains(&0) {
             anyhow::bail!("Upstream response from {url} is binary, not HTML");
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -197,7 +197,7 @@ impl SafeHttpClient {
             }
             buffer.extend_from_slice(&chunk);
             if require_pdf_magic && !checked_pdf_magic && buffer.len() >= 5 {
-                if !UrlClassifier::is_valid_pdf_bytes(&buffer) {
+                if !is_valid_pdf_bytes(&buffer) {
                     anyhow::bail!(
                         "Upstream response from {url} does not start with %PDF- magic header"
                     );
@@ -205,7 +205,7 @@ impl SafeHttpClient {
                 checked_pdf_magic = true;
             }
         }
-        if require_pdf_magic && !UrlClassifier::is_valid_pdf_bytes(&buffer) {
+        if require_pdf_magic && !is_valid_pdf_bytes(&buffer) {
             anyhow::bail!("Upstream response from {url} does not start with %PDF- magic header");
         }
         Ok(buffer)

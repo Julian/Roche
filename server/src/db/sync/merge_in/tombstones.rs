@@ -13,7 +13,7 @@ use super::super::{
     },
 };
 use super::MergeContext;
-use crate::db::{ActivityAction, ActivityEntityType, FeedRepo, ItemRepo};
+use crate::db::{ActivityAction, ActivityEntityType, FeedRepo, ItemRepo, WriteTx};
 
 #[derive(sqlx::FromRow)]
 struct FeedTombstoneTarget {
@@ -32,7 +32,7 @@ impl SyncRepo<'_> {
     /// Applies entry-level tombstones (`feed`, `item`, `tag`, `entry`) prior to
     /// `merge_incoming_entries_in_tx` so tombstones suppress resurrected entries in the same batch.
     pub(super) async fn apply_incoming_entry_tombstones(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         tombstones: &[SyncTombstone],
         ctx: &mut MergeContext<'_>,
     ) -> Result<()> {
@@ -47,32 +47,32 @@ impl SyncRepo<'_> {
 
             match tomb.entity_type {
                 ActivityEntityType::Feed => {
-                    Self::apply_feed_tombstone_in_tx(
-                        conn,
-                        key,
-                        safe_deleted_at,
-                        &tomb_hlc,
-                        ctx.now,
-                    )
-                    .await?;
+                    Self::apply_feed_tombstone_in_tx(tx, key, safe_deleted_at, &tomb_hlc, ctx.now)
+                        .await?;
                 }
                 ActivityEntityType::Item => {
-                    Self::apply_item_tombstone_in_tx(
-                        conn,
+                    Self::apply_item_tombstone_in_tx(tx, key, safe_deleted_at, &tomb_hlc, ctx.now)
+                        .await?;
+                }
+                ActivityEntityType::Tag => {
+                    Self::apply_tag_tombstone_in_tx(
+                        tx.conn(),
                         key,
                         safe_deleted_at,
                         &tomb_hlc,
-                        ctx.now,
+                        ctx,
                     )
                     .await?;
                 }
-                ActivityEntityType::Tag => {
-                    Self::apply_tag_tombstone_in_tx(conn, key, safe_deleted_at, &tomb_hlc, ctx)
-                        .await?;
-                }
                 ActivityEntityType::Entry => {
-                    Self::apply_entry_tombstone_in_tx(conn, key, safe_deleted_at, &tomb_hlc, ctx)
-                        .await?;
+                    Self::apply_entry_tombstone_in_tx(
+                        tx.conn(),
+                        key,
+                        safe_deleted_at,
+                        &tomb_hlc,
+                        ctx,
+                    )
+                    .await?;
                 }
                 ActivityEntityType::CollectionEntry
                 | ActivityEntityType::CollectionGenerator
@@ -191,7 +191,7 @@ impl SyncRepo<'_> {
     }
 
     async fn apply_feed_tombstone_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         key: &str,
         deleted_at: DateTime<Utc>,
         tomb_hlc: &str,
@@ -208,7 +208,7 @@ impl SyncRepo<'_> {
         )
         .bind(&canon_key)
         .bind(&det_id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(tx.conn())
         .await?;
 
         if let Some(target) = existing {
@@ -216,10 +216,9 @@ impl SyncRepo<'_> {
             if live_hlc > tomb_hlc {
                 return Ok(());
             }
-            FeedRepo::delete_feed_preserving_history_in_tx(&mut *conn, &target.collection_id, now)
-                .await?;
+            FeedRepo::delete_feed_preserving_history_in_tx(tx, &target.collection_id, now).await?;
             Self::record_activity(
-                &mut *conn,
+                tx.conn(),
                 ActivityEntityType::Feed,
                 &target.collection_id,
                 ActivityAction::Delete,
@@ -228,7 +227,7 @@ impl SyncRepo<'_> {
             .await?;
         }
         Self::record_tombstone_with_hlc(
-            &mut *conn,
+            tx.conn(),
             ActivityEntityType::Feed,
             &canon_key,
             deleted_at,
@@ -239,7 +238,7 @@ impl SyncRepo<'_> {
     }
 
     async fn apply_item_tombstone_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         key: &str,
         deleted_at: DateTime<Utc>,
         tomb_hlc: &str,
@@ -259,7 +258,7 @@ impl SyncRepo<'_> {
                 (ck, did, Some(cf), ci)
             } else {
                 Self::record_tombstone_with_hlc(
-                    &mut *conn,
+                    tx.conn(),
                     ActivityEntityType::Item,
                     key,
                     deleted_at,
@@ -287,7 +286,7 @@ impl SyncRepo<'_> {
             .bind(&canon_item)
             .bind(cf)
             .bind(&parent_feed_id)
-            .fetch_all(&mut *conn)
+            .fetch_all(tx.conn())
             .await?
         } else {
             sqlx::query_as(
@@ -303,7 +302,7 @@ impl SyncRepo<'_> {
             )
             .bind(&det_id)
             .bind(&canon_item)
-            .fetch_all(&mut *conn)
+            .fetch_all(tx.conn())
             .await?
         };
 
@@ -311,11 +310,10 @@ impl SyncRepo<'_> {
             return Ok(());
         }
         for cand in candidates {
-            if ItemRepo::delete_inbox_item_preserving_history_in_tx(&mut *conn, &cand.id, true, now)
-                .await?
+            if ItemRepo::delete_inbox_item_preserving_history_in_tx(tx, &cand.id, true, now).await?
             {
                 Self::record_activity(
-                    &mut *conn,
+                    tx.conn(),
                     ActivityEntityType::Item,
                     &cand.id,
                     ActivityAction::Delete,
@@ -325,7 +323,7 @@ impl SyncRepo<'_> {
             }
         }
         Self::record_tombstone_with_hlc(
-            &mut *conn,
+            tx.conn(),
             ActivityEntityType::Item,
             &canon_key,
             deleted_at,

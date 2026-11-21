@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use url::Url;
 
-use super::url_guard::parse_public_url;
+use crate::url_guard::parse_public_url;
 
 #[must_use]
 pub fn is_arxiv_host(host: Option<&str>) -> bool {
@@ -128,7 +128,6 @@ fn is_youtu_be_host(host: Option<&str>) -> bool {
     })
 }
 
-#[cfg(test)]
 #[must_use]
 pub fn is_youtube_url(url: &Url) -> bool {
     is_youtube_host(url.host_str()) || is_youtu_be_host(url.host_str())
@@ -244,4 +243,18 @@ pub fn is_direct_audio_url(url: &Url) -> bool {
             "mp3" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "wav" | "flac"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_arxiv_id_rejects_query_injection() {
+        assert_eq!(extract_arxiv_id("2301.07041v2").as_deref(), Some("2301.07041v2"));
+        assert_eq!(extract_arxiv_id("hep-th/9901001").as_deref(), Some("hep-th/9901001"));
+        assert!(extract_arxiv_id("2301.07041&max_results=999").is_none());
+        assert!(extract_arxiv_id("2301.07041%26search_query=all").is_none());
+        assert!(extract_arxiv_id("../etc/passwd").is_none());
+    }
 }

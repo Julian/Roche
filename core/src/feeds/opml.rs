@@ -7,9 +7,9 @@ use quick_xml::{
 use url::Url;
 
 use crate::{
-    content::xml_util,
     domain::{FeedType, OpmlOutline},
-    util::url_guard::parse_public_url,
+    url_guard::parse_public_url,
+    xml_util,
 };
 
 const MAX_OPML_OUTLINES: usize = 2_000;

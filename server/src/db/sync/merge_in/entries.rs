@@ -25,7 +25,7 @@ use super::{IndexedTag, MergeContext};
 use crate::db::{
     ActivityAction, ActivityEntityType, CatalogRepo, CollectionMode, CollectionRole, ContentType,
     EntryIdentifier, EntryKind, FeedRepo, FeedType, HexColor, InboxState, MediaRepo,
-    PollItemCandidate, UpsertEntryInput, entries_core,
+    PollItemCandidate, UpsertEntryInput, WriteTx, entries_core,
     feeds::{NewFeedRow, entry_kind_for_feed_type, resolve_dedup_entry_id},
 };
 
@@ -114,7 +114,7 @@ enum ItemTombstoneAction {
 
 impl SyncRepo<'_> {
     pub(super) async fn merge_incoming_entries_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entries: &[PreparedSyncEntry],
         incoming_memberships: &[SyncCollectionEntryRecord],
         ctx: &mut MergeContext<'_>,
@@ -142,7 +142,7 @@ impl SyncRepo<'_> {
                     }
                 }
             } else if let Some(ref cs) = rec.collection_spec {
-                Self::merge_collection_spec_entry_in_tx(tx, prep, cs, ctx).await?;
+                Self::merge_collection_spec_entry_in_tx(tx.conn(), prep, cs, ctx).await?;
             }
         }
 
@@ -215,7 +215,7 @@ impl SyncRepo<'_> {
     }
 
     async fn merge_single_feed_entry_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         prep: &PreparedSyncEntry,
         fs: &SyncFeedSource,
         ctx: &mut MergeContext<'_>,
@@ -245,7 +245,7 @@ impl SyncRepo<'_> {
         let effective_hlc = if entry_hlc > fs_hlc { &entry_hlc } else { &fs_hlc };
 
         if Self::check_and_clear_tombstone_in_tx(
-            tx,
+            tx.conn(),
             ActivityEntityType::Feed,
             &nat_key,
             effective_hlc,
@@ -265,7 +265,7 @@ impl SyncRepo<'_> {
         .bind(feed_url)
         .bind(rec.id.trim())
         .bind(&det_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         let clean_feed_title =
@@ -294,7 +294,7 @@ impl SyncRepo<'_> {
         };
 
         let (local_id, local_url) = if let Some(existing_feed) = existing {
-            Self::update_existing_feed_in_tx(tx, existing_feed, fs, &fields, ctx.now).await?
+            Self::update_existing_feed_in_tx(tx.conn(), existing_feed, fs, &fields, ctx.now).await?
         } else {
             Self::insert_new_feed_in_tx(tx, rec.created_at, fs, &fields, ctx.now).await?
         };
@@ -431,7 +431,7 @@ impl SyncRepo<'_> {
     }
 
     async fn insert_new_feed_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         rec_created_at: Option<DateTime<Utc>>,
         fs: &SyncFeedSource,
         fields: &NormalizedFeedFields<'_>,
@@ -458,23 +458,12 @@ impl SyncRepo<'_> {
                 consecutive_failures: fields.clean_consecutive_failures,
                 created_at,
                 updated_at: now,
+                entry_hlc: Some(&fields.entry_hlc),
+                feed_hlc: Some(&fields.fs_hlc),
             },
         )
         .await?;
 
-        sqlx::query("UPDATE entries SET hlc = ? WHERE id = ?")
-            .bind(&fields.entry_hlc)
-            .bind(&local_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE feed_sources SET hlc = ? WHERE collection_id = ?")
-            .bind(&fields.fs_hlc)
-            .bind(&local_id)
-            .execute(&mut *tx)
-            .await?;
-
-        Self::record_activity(tx, ActivityEntityType::Feed, &local_id, ActivityAction::Create, now)
-            .await?;
         Ok((local_id, fields.feed_url.to_owned()))
     }
 
@@ -647,7 +636,7 @@ impl SyncRepo<'_> {
     }
 
     async fn merge_single_work_or_item_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         prep: &PreparedSyncEntry,
         incoming_parent_feed: &HashMap<&str, &str>,
         feed_url_by_id: &HashMap<String, String>,
@@ -668,7 +657,7 @@ impl SyncRepo<'_> {
 
         if !rec.id.trim().is_empty()
             && Self::check_and_clear_tombstone_in_tx(
-                tx,
+                tx.conn(),
                 ActivityEntityType::Entry,
                 rec.id.trim(),
                 &entry_hlc,
@@ -679,7 +668,7 @@ impl SyncRepo<'_> {
         }
 
         let resolved_feed_url = Self::resolve_parent_feed_url_in_tx(
-            tx,
+            tx.conn(),
             rec.id.trim(),
             incoming_parent_feed,
             feed_url_by_id,
@@ -692,7 +681,7 @@ impl SyncRepo<'_> {
             .is_some_and(|s| matches!(s.inbox_state, InboxState::Unread | InboxState::Dismissed));
 
         let tombstone_action = Self::check_item_tombstone_suppression_in_tx(
-            tx,
+            tx.conn(),
             prep,
             resolved_feed_url.as_deref(),
             &entry_hlc,
@@ -729,12 +718,12 @@ impl SyncRepo<'_> {
         ctx.id_resolver.record(&rec.id, &target_id);
 
         if !suppress_payload {
-            Self::merge_entry_content_in_tx(tx, &target_id, prep, ctx.now).await?;
+            Self::merge_entry_content_in_tx(tx.conn(), &target_id, prep, ctx.now).await?;
         }
         let was_new_inbox_item =
             if let Some(st) = (!suppress_payload).then_some(rec.state.as_ref()).flatten() {
                 let st_hlc = state_hlc_opt.as_deref().unwrap_or(entry_hlc.as_str());
-                Self::merge_entry_state_in_tx(tx, &target_id, st, st_hlc, ctx.now).await?
+                Self::merge_entry_state_in_tx(tx.conn(), &target_id, st, st_hlc, ctx.now).await?
             } else {
                 false
             };
@@ -749,7 +738,7 @@ impl SyncRepo<'_> {
     }
 
     async fn upsert_or_merge_work_entry_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         prep: &PreparedSyncEntry,
         target: &WorkMergeTarget<'_>,
         idents: Vec<EntryIdentifier>,
@@ -757,7 +746,7 @@ impl SyncRepo<'_> {
         is_active_inbox: bool,
     ) -> Result<Option<(String, bool)>> {
         let pre_matched_id = Self::resolve_existing_work_or_item_id_in_tx(
-            tx,
+            tx.conn(),
             prep,
             target.target_kind,
             &idents,
@@ -765,11 +754,17 @@ impl SyncRepo<'_> {
         )
         .await?;
         if let Some(existing_id) = pre_matched_id {
-            if Self::is_immutable_or_collection_target_in_tx(tx, &existing_id).await? {
+            if Self::is_immutable_or_collection_target_in_tx(tx.conn(), &existing_id).await? {
                 return Ok(None);
             }
-            Self::merge_into_existing_entry_row_in_tx(tx, &existing_id, prep, target, &idents)
-                .await?;
+            Self::merge_into_existing_entry_row_in_tx(
+                tx.conn(),
+                &existing_id,
+                prep,
+                target,
+                &idents,
+            )
+            .await?;
             Ok(Some((existing_id, false)))
         } else {
             let rec_id = prep.record.id.trim();
@@ -779,7 +774,7 @@ impl SyncRepo<'_> {
                 Some(rec_id.to_owned())
             };
             if let Some(ref pid) = preferred_id
-                && Self::is_immutable_or_collection_target_in_tx(tx, pid).await?
+                && Self::is_immutable_or_collection_target_in_tx(tx.conn(), pid).await?
             {
                 return Ok(None);
             }
@@ -937,7 +932,7 @@ impl SyncRepo<'_> {
     }
 
     async fn insert_new_work_or_item_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         prep: &PreparedSyncEntry,
         preferred_id: Option<String>,
         target: &WorkMergeTarget<'_>,
@@ -946,6 +941,7 @@ impl SyncRepo<'_> {
         let rec = &prep.record;
         let clamped_updated =
             clamp_incoming_timestamp(rec.updated_at.unwrap_or(target.now), target.now);
+        let clamped_created = clamp_incoming_timestamp_opt(rec.created_at, target.now);
         let clamped_published =
             rec.published_at.map(|ts| clamp_incoming_upper_timestamp(ts, target.now));
         let upsert_input = UpsertEntryInput {
@@ -963,39 +959,16 @@ impl SyncRepo<'_> {
             parent_collection_id: None,
             parent_position: None,
         };
-        let (created_id, inserted_new) = CatalogRepo::upsert_entry_with_created_in_tx(
+        let (created_id, _) = CatalogRepo::upsert_entry_with_created_in_tx(
             tx,
             &upsert_input,
             target.target_kind,
             target.final_title,
             clamped_updated,
+            clamped_created,
+            Some(target.entry_hlc),
         )
         .await?;
-        if inserted_new {
-            if let Some(c_at) = clamp_incoming_timestamp_opt(rec.created_at, target.now) {
-                sqlx::query("UPDATE entries SET created_at = ?, hlc = ? WHERE id = ?")
-                    .bind(c_at)
-                    .bind(target.entry_hlc)
-                    .bind(&created_id)
-                    .execute(&mut *tx)
-                    .await?;
-            } else {
-                sqlx::query("UPDATE entries SET hlc = ? WHERE id = ?")
-                    .bind(target.entry_hlc)
-                    .bind(&created_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        } else {
-            sqlx::query(
-                "UPDATE entries SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END WHERE id = ?",
-            )
-            .bind(target.entry_hlc)
-            .bind(target.entry_hlc)
-            .bind(&created_id)
-            .execute(&mut *tx)
-            .await?;
-        }
         Ok(created_id)
     }
 
@@ -1020,8 +993,11 @@ impl SyncRepo<'_> {
         let merged_html = existing_content.as_ref().map_or_else(
             || prep.clean_html.clone(),
             |ex| {
-                pick_richer_text(ex.content_html.as_deref(), prep.clean_html.as_deref())
-                    .map(str::to_owned)
+                roche_core::crdt::pick_richer_text(
+                    ex.content_html.as_deref(),
+                    prep.clean_html.as_deref(),
+                )
+                .map(str::to_owned)
             },
         );
         let merged_ct = match &existing_content {
@@ -1083,7 +1059,21 @@ impl SyncRepo<'_> {
         .await?;
 
         if let Some(existing) = existing_state {
-            let next = resolve_merged_entry_state(&existing, st, clamped_prog, st_hlc, now);
+            let ex_snap = roche_core::crdt::EntryStateSnapshot {
+                inbox_state: existing.inbox_state,
+                read_at: existing.read_at,
+                progress: existing.progress,
+                interaction_updated_at: existing.interaction_updated_at,
+                hlc: existing.hlc.clone(),
+            };
+            let inc_snap = roche_core::crdt::EntryStateSnapshot {
+                inbox_state: st.inbox_state,
+                read_at: st.read_at,
+                progress: clamped_prog,
+                interaction_updated_at: st.interaction_updated_at,
+                hlc: st_hlc.to_owned(),
+            };
+            let next = roche_core::crdt::resolve_merged_entry_state(&ex_snap, &inc_snap, now);
             if next.inbox_state != existing.inbox_state
                 || next.read_at != existing.read_at
                 || (next.progress - existing.progress).abs() > f64::EPSILON
@@ -1273,8 +1263,9 @@ fn compute_merged_entry_row(
         } else {
             existing.kind
         };
-    let title = compute_merged_entry_title(
-        existing,
+    let title = roche_core::crdt::compute_merged_entry_title(
+        &existing.title,
+        existing.url.as_deref(),
         rec.url.as_deref(),
         target.target_kind,
         target.final_title,
@@ -1306,11 +1297,17 @@ fn compute_merged_entry_row(
     } else {
         existing.release_year.or(rec.release_year)
     };
-    let summary = pick_richer_text(existing.summary.as_deref(), prep.clean_summary.as_deref())
-        .map(str::to_owned);
+    let summary = roche_core::crdt::pick_richer_text(
+        existing.summary.as_deref(),
+        prep.clean_summary.as_deref(),
+    )
+    .map(str::to_owned);
     let thumbnail_url = existing.thumbnail_url.clone().or_else(|| prep.clean_thumb.clone());
-    let metadata_json =
-        merge_entry_metadata_json(&existing.metadata_json, rec.metadata.as_ref(), inc_newer);
+    let metadata_json = roche_core::crdt::merge_entry_metadata_json(
+        &existing.metadata_json,
+        rec.metadata.as_ref(),
+        inc_newer,
+    );
     let hlc = if inc_newer { target.entry_hlc.to_owned() } else { existing.hlc.clone() };
 
     let changed = kind != existing.kind
@@ -1413,124 +1410,4 @@ fn build_work_identifiers(prep: &PreparedSyncEntry) -> Vec<EntryIdentifier> {
         idents.push(EntryIdentifier { scheme: "arxiv".to_owned(), value: aid.clone() });
     }
     idents
-}
-
-fn compute_merged_entry_title(
-    existing: &ExistingEntryRow,
-    inc_url: Option<&str>,
-    target_kind: EntryKind,
-    final_title: &str,
-    inc_newer: bool,
-) -> String {
-    let ex_is_url_placeholder = existing.title.trim().is_empty()
-        || existing.url.as_deref().is_some_and(|u| existing.title == u)
-        || inc_url.is_some_and(|u| existing.title == u.trim());
-    let inc_is_url_placeholder = inc_url.is_some_and(|u| final_title == u.trim());
-    if (ex_is_url_placeholder || (inc_newer && !inc_is_url_placeholder)) && !final_title.is_empty()
-    {
-        final_title.to_owned()
-    } else if target_kind == EntryKind::Album {
-        let cur_stripped = crate::db::strip_album_edition_suffix(&existing.title);
-        let inc_stripped = crate::db::strip_album_edition_suffix(final_title);
-        if existing.title.len() > cur_stripped.len() && final_title.len() == inc_stripped.len() {
-            final_title.to_owned()
-        } else {
-            existing.title.clone()
-        }
-    } else {
-        existing.title.clone()
-    }
-}
-
-fn merge_entry_metadata_json(
-    existing_json: &str,
-    incoming_meta: Option<&serde_json::Value>,
-    inc_newer: bool,
-) -> String {
-    if let Some(serde_json::Value::Object(inc_map)) = incoming_meta
-        && !inc_map.is_empty()
-    {
-        let mut cur_obj = serde_json::from_str::<serde_json::Value>(existing_json)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        for (k, v) in inc_map {
-            if inc_newer || !cur_obj.contains_key(k) {
-                cur_obj.insert(k.clone(), v.clone());
-            }
-        }
-        serde_json::Value::Object(cur_obj).to_string()
-    } else {
-        existing_json.to_owned()
-    }
-}
-
-fn pick_richer_text<'a>(existing: Option<&'a str>, incoming: Option<&'a str>) -> Option<&'a str> {
-    match (
-        existing.map(str::trim).filter(|s| !s.is_empty()),
-        incoming.map(str::trim).filter(|s| !s.is_empty()),
-    ) {
-        (Some(ex), Some(inc)) => {
-            if inc.len() > ex.len() {
-                incoming
-            } else {
-                existing
-            }
-        }
-        (Some(_), None) => existing,
-        (None, Some(_)) => incoming,
-        (None, None) => None,
-    }
-}
-
-fn resolve_merged_entry_state(
-    existing: &EntryStateRow,
-    incoming: &SyncEntryState,
-    inc_progress: f64,
-    inc_hlc: &str,
-    now: DateTime<Utc>,
-) -> EntryStateRow {
-    let inc_inter = clamp_incoming_timestamp_opt(incoming.interaction_updated_at, now)
-        .map(|ts| ts.trunc_subsecs(3));
-    let inc_read_at = clamp_incoming_timestamp_opt(incoming.read_at, now);
-    let (inbox_state, raw_read_at, progress, interaction_updated_at, hlc) =
-        match inc_hlc.cmp(existing.hlc.as_str()) {
-            std::cmp::Ordering::Greater => {
-                (incoming.inbox_state, inc_read_at, inc_progress, inc_inter, inc_hlc.to_owned())
-            }
-            std::cmp::Ordering::Equal => {
-                let merged_inbox = if existing.inbox_state == InboxState::Dismissed
-                    || incoming.inbox_state == InboxState::Dismissed
-                {
-                    InboxState::Dismissed
-                } else if existing.inbox_state == InboxState::Unread
-                    || incoming.inbox_state == InboxState::Unread
-                {
-                    InboxState::Unread
-                } else {
-                    InboxState::None
-                };
-                (
-                    merged_inbox,
-                    existing.read_at.max(inc_read_at),
-                    existing.progress.max(inc_progress),
-                    existing.interaction_updated_at.max(inc_inter),
-                    existing.hlc.clone(),
-                )
-            }
-            std::cmp::Ordering::Less => (
-                existing.inbox_state,
-                existing.read_at,
-                existing.progress,
-                existing.interaction_updated_at,
-                existing.hlc.clone(),
-            ),
-        };
-
-    let read_at = if inbox_state == InboxState::Dismissed {
-        raw_read_at.or(existing.read_at).or(inc_read_at).or(interaction_updated_at).or(Some(now))
-    } else {
-        raw_read_at
-    };
-    EntryStateRow { inbox_state, read_at, progress, interaction_updated_at, hlc }
 }

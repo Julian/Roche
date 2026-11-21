@@ -10,14 +10,13 @@ use sqlx::SqliteConnection;
 
 use super::{
     SyncRepo,
-    hlc::HlcClock,
     hrw::{NetworkTier, SERVER_PEER_ID, bound_peer_weight},
     models::{
         InsertedItemCandidate, MAX_PEER_SYNC_PAGE_CHANGES, PeerSyncRequest, PeerSyncResponse,
         PreparedSyncEntry,
     },
 };
-use crate::db::{ActivityEntityType, CatalogRepo};
+use crate::db::{ActivityEntityType, CatalogRepo, WriteTx};
 
 pub(super) struct MergeContext<'a> {
     pub peer_id: &'a str,
@@ -261,10 +260,10 @@ impl SyncRepo<'_> {
 
         let mut tx = crate::db::begin_write(self.pool).await?;
 
-        Self::ensure_server_peer_in_tx(&mut tx, now).await?;
+        Self::ensure_server_peer_in_tx(tx.conn(), now).await?;
         if !peer_id.is_empty() && peer_id != SERVER_PEER_ID {
             Self::upsert_peer_in_tx(
-                &mut tx,
+                tx.conn(),
                 peer_id,
                 device_name,
                 req.network_tier,
@@ -274,15 +273,10 @@ impl SyncRepo<'_> {
             .await?;
         }
 
-        let stored_hlc: String = sqlx::query_scalar("SELECT last_hlc FROM sync_clock WHERE id = 1")
-            .fetch_one(&mut *tx)
-            .await?;
-        let mut clock =
-            HlcClock::new(SERVER_PEER_ID, (!stored_hlc.is_empty()).then_some(stored_hlc.as_str()));
         if let Some(ref client_hlc) = req.client_hlc {
-            clock.witness_str(client_hlc, now_ms);
+            tx.witness_hlc(client_hlc, now_ms).await?;
         }
-        witness_request_hlcs(&mut clock, req, now_ms);
+        witness_request_hlcs(&mut tx, req, now_ms).await?;
 
         let mut ctx = MergeContext::new(safe_peer, now);
 
@@ -296,7 +290,7 @@ impl SyncRepo<'_> {
         )
         .await?;
 
-        Self::apply_incoming_graph_tombstones(&mut tx, &req.tombstones, &mut ctx).await?;
+        Self::apply_incoming_graph_tombstones(tx.conn(), &req.tombstones, &mut ctx).await?;
 
         if !req.collection_entries.is_empty() {
             Self::merge_incoming_collection_entries_in_tx(&mut tx, &req.collection_entries, &ctx)
@@ -306,22 +300,11 @@ impl SyncRepo<'_> {
             Self::merge_incoming_consumption_log_in_tx(&mut tx, &req.consumption_log, &ctx).await?;
         }
         if !req.comparisons.is_empty() {
-            Self::merge_incoming_comparisons_in_tx(&mut tx, &req.comparisons, &ctx).await?;
+            Self::merge_incoming_comparisons_in_tx(tx.conn(), &req.comparisons, &ctx).await?;
         }
-        Self::merge_incoming_generators_in_tx(
-            &mut tx,
-            &req.collection_generators,
-            &mut clock,
-            &ctx,
-        )
-        .await?;
+        Self::merge_incoming_generators_in_tx(&mut tx, &req.collection_generators, &ctx).await?;
 
-        let server_hlc = clock.tick(now_ms).encode();
-        sqlx::query("UPDATE sync_clock SET last_hlc = ? WHERE id = 1")
-            .bind(&server_hlc)
-            .execute(&mut *tx)
-            .await?;
-
+        let server_hlc = tx.next_hlc_at(now_ms).await?;
         tx.commit().await?;
 
         let response = self
@@ -379,45 +362,50 @@ impl SyncRepo<'_> {
     }
 }
 
-fn witness_request_hlcs(clock: &mut HlcClock, req: &PeerSyncRequest, now_ms: i64) {
+async fn witness_request_hlcs(
+    tx: &mut WriteTx<'_>,
+    req: &PeerSyncRequest,
+    now_ms: i64,
+) -> std::result::Result<(), sqlx::Error> {
     for entry in &req.entries {
         if !entry.hlc.is_empty() {
-            clock.witness_str(&entry.hlc, now_ms);
+            tx.witness_hlc(&entry.hlc, now_ms).await?;
         }
         if let Some(ref st) = entry.state
             && !st.hlc.is_empty()
         {
-            clock.witness_str(&st.hlc, now_ms);
+            tx.witness_hlc(&st.hlc, now_ms).await?;
         }
         if let Some(ref fs) = entry.feed_source
             && !fs.hlc.is_empty()
         {
-            clock.witness_str(&fs.hlc, now_ms);
+            tx.witness_hlc(&fs.hlc, now_ms).await?;
         }
     }
     for ce in &req.collection_entries {
         if !ce.hlc.is_empty() {
-            clock.witness_str(&ce.hlc, now_ms);
+            tx.witness_hlc(&ce.hlc, now_ms).await?;
         }
     }
     for gen_rec in &req.collection_generators {
         if !gen_rec.hlc.is_empty() {
-            clock.witness_str(&gen_rec.hlc, now_ms);
+            tx.witness_hlc(&gen_rec.hlc, now_ms).await?;
         }
     }
     for log in &req.consumption_log {
         if !log.hlc.is_empty() {
-            clock.witness_str(&log.hlc, now_ms);
+            tx.witness_hlc(&log.hlc, now_ms).await?;
         }
     }
     for comp in &req.comparisons {
         if !comp.hlc.is_empty() {
-            clock.witness_str(&comp.hlc, now_ms);
+            tx.witness_hlc(&comp.hlc, now_ms).await?;
         }
     }
     for tomb in &req.tombstones {
         if !tomb.hlc.is_empty() {
-            clock.witness_str(&tomb.hlc, now_ms);
+            tx.witness_hlc(&tomb.hlc, now_ms).await?;
         }
     }
+    Ok(())
 }

@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
 
+use roche_core::identity_norm::{normalize_identifier_scheme, normalize_identifier_value};
+
 use super::{
     CatalogRepo,
     collections::derive_manual_collection_slug_and_id,
-    identity_norm::{normalize_identifier_scheme, normalize_identifier_value},
     models::{
         BatchCollectionInput, BatchComparisonInput, BatchGeneratorInput, CatalogBatchInput,
         CatalogBatchResult, CatalogError, CatalogResult,
@@ -14,7 +15,7 @@ use super::{
 };
 use crate::{
     db::{
-        entries_core,
+        WriteTx, entries_core,
         sync::SyncRepo,
         types::{
             ActivityAction, ActivityEntityType, CollectionMode, CollectionRole, EntryKind, HexColor,
@@ -123,7 +124,7 @@ impl CatalogRepo<'_> {
         let mut logs_recorded = 0usize;
         for log in &batch.logs {
             let target_id =
-                Self::resolve_batch_ref_in_tx(&mut tx, &ref_map, &log.entry_ref).await?;
+                Self::resolve_batch_ref_in_tx(tx.conn(), &ref_map, &log.entry_ref).await?;
             let event_ts = log.ts.unwrap_or(now);
             Self::log_consumption_in_tx(
                 &mut tx,
@@ -160,7 +161,7 @@ impl CatalogRepo<'_> {
     }
 
     async fn apply_batch_collections_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         ref_map: &mut HashMap<String, String>,
         collections: &[BatchCollectionInput],
         now: DateTime<Utc>,
@@ -173,7 +174,7 @@ impl CatalogRepo<'_> {
             }
             for member in &col.members {
                 let member_id =
-                    Self::resolve_batch_ref_in_tx(tx, ref_map, &member.entry_ref).await?;
+                    Self::resolve_batch_ref_in_tx(tx.conn(), ref_map, &member.entry_ref).await?;
                 Self::attach_collection_member_in_tx(
                     tx,
                     &col_id,
@@ -190,7 +191,7 @@ impl CatalogRepo<'_> {
     }
 
     async fn upsert_batch_collection_spec_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         col: &BatchCollectionInput,
         now: DateTime<Utc>,
     ) -> CatalogResult<String> {
@@ -206,7 +207,7 @@ impl CatalogRepo<'_> {
         .bind(&requested_id)
         .bind(&derived_slug)
         .bind(&requested_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         let target_id = if let Some((ex_id, ex_mode, ex_role)) = existing {
@@ -234,7 +235,7 @@ impl CatalogRepo<'_> {
         let existing_entry: Option<(EntryKind, Option<String>)> =
             sqlx::query_as("SELECT kind, merged_into_id FROM entries WHERE id = ?")
                 .bind(&target_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
         if let Some((ex_kind, ex_merged)) = existing_entry
             && (ex_kind != EntryKind::Collection || ex_merged.is_some())
@@ -250,20 +251,23 @@ impl CatalogRepo<'_> {
             .map_err(|e| CatalogError::InvalidInput(e.to_string()))?;
         let clean_color = validated_color.as_ref().map(HexColor::as_str);
 
+        let entry_hlc = tx.next_hlc().await?;
         sqlx::query(
-            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at)
-             VALUES (?, 'collection', ?, ?, ?, ?)
+            "INSERT INTO entries (id, kind, title, summary, created_at, updated_at, hlc)
+             VALUES (?, 'collection', ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 summary = COALESCE(excluded.summary, entries.summary),
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                hlc = excluded.hlc",
         )
         .bind(&target_id)
         .bind(&clean_title)
         .bind(clean_summary)
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .bind(&entry_hlc)
+        .execute(tx.conn())
         .await?;
 
         sqlx::query(
@@ -280,13 +284,14 @@ impl CatalogRepo<'_> {
         .bind(col.role)
         .bind(show_in_lists)
         .bind(clean_color)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
-        entries_core::upsert_entry_identifier_in_tx(tx, &target_id, "slug", &derived_slug).await?;
+        entries_core::upsert_entry_identifier_in_tx(tx.conn(), &target_id, "slug", &derived_slug)
+            .await?;
 
         SyncRepo::record_activity(
-            tx,
+            tx.conn(),
             ActivityEntityType::Entry,
             &target_id,
             ActivityAction::Update,
@@ -298,7 +303,7 @@ impl CatalogRepo<'_> {
     }
 
     async fn apply_batch_comparisons_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         ref_map: &HashMap<String, String>,
         comparisons: &[BatchComparisonInput],
         now: DateTime<Utc>,
@@ -309,7 +314,7 @@ impl CatalogRepo<'_> {
             for bucket in &cmp.ordering {
                 let mut resolved_bucket = Vec::with_capacity(bucket.len());
                 for item_ref in bucket {
-                    let id = Self::resolve_batch_ref_in_tx(tx, ref_map, item_ref).await?;
+                    let id = Self::resolve_batch_ref_in_tx(tx.conn(), ref_map, item_ref).await?;
                     if !resolved_bucket.contains(&id) {
                         resolved_bucket.push(id);
                     }
@@ -323,7 +328,9 @@ impl CatalogRepo<'_> {
             let scope_id =
                 match cmp.scope_collection_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     Some(raw_scope) => Some(
-                        Self::resolve_batch_collection_ref_in_tx(tx, ref_map, raw_scope).await?.0,
+                        Self::resolve_batch_collection_ref_in_tx(tx.conn(), ref_map, raw_scope)
+                            .await?
+                            .0,
                     ),
                     None => None,
                 };
@@ -338,16 +345,19 @@ impl CatalogRepo<'_> {
     }
 
     async fn apply_batch_generators_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         ref_map: &HashMap<String, String>,
         generators: &[BatchGeneratorInput],
         now: DateTime<Utc>,
     ) -> CatalogResult<usize> {
         let mut updated = 0usize;
         for gen_input in generators {
-            let (col_id, col_title, mode, role) =
-                Self::resolve_batch_collection_ref_in_tx(tx, ref_map, &gen_input.collection_ref)
-                    .await?;
+            let (col_id, col_title, mode, role) = Self::resolve_batch_collection_ref_in_tx(
+                tx.conn(),
+                ref_map,
+                &gen_input.collection_ref,
+            )
+            .await?;
             Self::ensure_generator_eligible(&col_id, &col_title, mode, role)?;
             let explicit_entry_id = match gen_input
                 .current_entry_ref
@@ -355,7 +365,7 @@ impl CatalogRepo<'_> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                Some(r) => Some(Self::resolve_batch_ref_in_tx(tx, ref_map, r).await?),
+                Some(r) => Some(Self::resolve_batch_ref_in_tx(tx.conn(), ref_map, r).await?),
                 None => None,
             };
             Self::update_collection_generator_in_tx(

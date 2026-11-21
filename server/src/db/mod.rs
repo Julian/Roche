@@ -13,21 +13,22 @@ mod items;
 mod media;
 mod sync;
 mod tags;
+pub(crate) mod tx;
 mod types;
 
 pub use auth::{AuthRepo, DeviceToken};
 pub use catalog::{
     BatchCollectionInput, BatchCollectionMemberInput, BatchComparisonInput, BatchEntryInput,
     BatchGeneratorInput, BatchLogInput, CatalogBatchInput, CatalogBatchResult, CatalogEntry,
-    CatalogError, CatalogExportSnapshot, CatalogRepo, CatalogResult, ClusterSelectFilter,
-    CollectionGeneratorState, CollectionRankingInputs, CollectionSummary, ComparisonRecord,
-    ConsumptionLogRow, ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
+    CatalogError, CatalogExportSnapshot, CatalogRepo, CatalogResult, CollectionGeneratorState,
+    CollectionRankingInputs, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
+    ConsumptionLogView, DynamicCollectionRule, EntryDetailView, EntryIdentifier,
     ExportCatalogEntry, ExportCollectionEntry, ExportCollectionGenerator, ExportComparison,
-    ExportConsumptionLog, PREFERRED_IDENTIFIER_SCHEMES, RankedCollectionView, RankedEntryRow,
-    UpsertEntryInput, WantSearchMatch, choose_deterministic_entry_id,
-    derive_manual_collection_slug_and_id, external_identifier_label, external_identifier_url,
-    external_identifier_url_for_kind, matches_dynamic_collection_rule, normalize_identifier_scheme,
-    normalize_identifier_value, parse_dynamic_collection_rule, strip_album_edition_suffix,
+    ExportConsumptionLog, PREFERRED_IDENTIFIER_SCHEMES, UpsertEntryInput, WantSearchMatch,
+    choose_deterministic_entry_id, derive_manual_collection_slug_and_id, external_identifier_label,
+    external_identifier_url, external_identifier_url_for_kind, matches_dynamic_collection_rule,
+    normalize_identifier_scheme, normalize_identifier_value, parse_dynamic_collection_rule,
+    strip_album_edition_suffix,
 };
 pub use feeds::{Feed, FeedRepo, PollBatch, PollItemCandidate};
 #[cfg(test)]
@@ -90,21 +91,20 @@ pub(crate) fn serialize_creators_json(creators: &[String]) -> Option<String> {
     serde_json::to_string(&cleaned).ok()
 }
 
-/// Begins a SQLite write transaction using `BEGIN IMMEDIATE` so WAL-mode writers
-/// acquire the RESERVED lock up-front and respect `busy_timeout` instead of failing
-/// immediately with `SQLITE_BUSY` on a read-to-write lock upgrade.
+pub(crate) use tx::{ReadTx, WriteTx};
+
+/// Begins a SQLite write transaction using `BEGIN IMMEDIATE` wrapped in [`WriteTx`] so WAL-mode
+/// writers acquire the RESERVED lock up-front and share a single causal [`HlcClock`].
 pub(crate) async fn begin_write(
     pool: &SqlitePool,
-) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
-    pool.begin_with("BEGIN IMMEDIATE").await
+) -> std::result::Result<WriteTx<'_>, sqlx::Error> {
+    WriteTx::begin(pool).await
 }
 
-/// Begins a SQLite read-snapshot transaction (`BEGIN DEFERRED`) so multiple SELECT
-/// queries observe a single consistent WAL point-in-time snapshot.
-pub(crate) async fn begin_read(
-    pool: &SqlitePool,
-) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
-    pool.begin().await
+/// Begins a SQLite read-snapshot transaction (`BEGIN DEFERRED`) wrapped in [`ReadTx`] so multiple
+/// SELECT queries observe a single consistent WAL point-in-time snapshot.
+pub(crate) async fn begin_read(pool: &SqlitePool) -> std::result::Result<ReadTx<'_>, sqlx::Error> {
+    ReadTx::begin(pool).await
 }
 
 #[derive(Debug, Clone)]
@@ -113,9 +113,12 @@ pub struct Db {
 }
 
 impl Db {
-    pub(crate) async fn begin_read(
-        &self,
-    ) -> std::result::Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
+    #[cfg(test)]
+    pub(crate) async fn begin_write(&self) -> std::result::Result<WriteTx<'_>, sqlx::Error> {
+        begin_write(&self.pool).await
+    }
+
+    pub(crate) async fn begin_read(&self) -> std::result::Result<ReadTx<'_>, sqlx::Error> {
         begin_read(&self.pool).await
     }
 
@@ -205,7 +208,7 @@ impl Db {
                     entry_id,
                     legacy_lower,
                 )
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             }
             sqlx::query!(
@@ -214,7 +217,7 @@ impl Db {
                 canon,
                 entry_id,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
 
@@ -233,7 +236,7 @@ impl Db {
                     collection_id,
                     legacy_lower,
                 )
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             }
             sqlx::query!(
@@ -242,7 +245,7 @@ impl Db {
                 canon,
                 collection_id,
             )
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
 
@@ -394,13 +397,13 @@ pub(crate) async fn prepare_pre_v010_schema_if_needed(pool: &SqlitePool) -> Resu
             )
             .bind(survivor_id)
             .bind(dup_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
             sqlx::query("DELETE FROM item_tags WHERE tag_id = ?")
                 .bind(dup_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
-            sqlx::query("DELETE FROM tags WHERE id = ?").bind(dup_id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM tags WHERE id = ?").bind(dup_id).execute(tx.conn()).await?;
         }
     }
     tx.commit().await?;
@@ -456,7 +459,7 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
         "entries_fts integrity/rowid check failed (likely after external VACUUM); rebuilding FTS5 index"
     );
     let mut tx = begin_write(pool).await?;
-    sqlx::query!("DELETE FROM entries_fts").execute(&mut *tx).await?;
+    sqlx::query!("DELETE FROM entries_fts").execute(tx.conn()).await?;
     sqlx::query!(
         "INSERT INTO entries_fts (rowid, entry_id, title, creators, summary, content_html)
          SELECT e.rowid, e.id, e.title, e.creators_json, COALESCE(e.summary, ''), COALESCE(ec.content_html, '')
@@ -464,7 +467,7 @@ pub async fn verify_and_heal_fts_index(pool: &SqlitePool) -> Result<bool> {
          LEFT JOIN entry_content ec ON ec.entry_id = e.id
          WHERE e.merged_into_id IS NULL",
     )
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
     tx.commit().await?;
     Ok(true)

@@ -318,44 +318,7 @@ impl HtmlSanitizer {
 
     #[must_use]
     pub fn resolve_and_validate_thumbnail_url(raw: &str, base_url: Option<&Url>) -> Option<String> {
-        let candidate = raw.trim();
-        if candidate.is_empty()
-            || candidate.starts_with("data:")
-            || candidate.starts_with("javascript:")
-            || candidate.starts_with("mailto:")
-        {
-            return None;
-        }
-        let parsed = match Url::parse(candidate) {
-            Ok(url) => url,
-            Err(url::ParseError::RelativeUrlWithoutBase) => base_url?.join(candidate).ok()?,
-            Err(_) => return None,
-        };
-        validate_public_url(&parsed).ok()?;
-        if Self::is_non_thumbnail_url(&parsed) {
-            return None;
-        }
-        Some(parsed.into())
-    }
-
-    #[must_use]
-    pub fn is_non_thumbnail_url(url: &Url) -> bool {
-        let path_lower = url.path().to_ascii_lowercase();
-        if std::path::Path::new(&path_lower)
-            .extension()
-            .is_some_and(|ext| matches!(ext.to_str().unwrap_or(""), "svg" | "svgz" | "ico"))
-        {
-            return true;
-        }
-        let full_lower = url.as_str().to_ascii_lowercase();
-        full_lower.contains("/images/core/emoji/")
-            || full_lower.contains("/wpcom-smileys/")
-            || full_lower.contains("/twemoji/")
-            || full_lower.contains("feeds.feedburner.com/~")
-            || path_lower.ends_with("/spacer.gif")
-            || path_lower.ends_with("/blank.gif")
-            || path_lower.ends_with("/1x1.gif")
-            || path_lower.ends_with("/pixel.gif")
+        roche_core::url_guard::resolve_and_validate_thumbnail_url(raw, base_url)
     }
 
     fn parse_small_dimension(raw: &str) -> bool {

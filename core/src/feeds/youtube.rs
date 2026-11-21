@@ -6,10 +6,7 @@ use quick_xml::{Reader, events::Event};
 use url::Url;
 
 use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp};
-use crate::{
-    content::xml_util,
-    util::{media_urls, url_guard::parse_public_url},
-};
+use crate::{media_urls, url_guard::parse_public_url, xml_util};
 
 #[derive(Debug, Clone)]
 pub struct YouTubeFeed {
@@ -28,34 +25,6 @@ pub struct YouTubeVideo {
 pub struct YouTubeParser;
 
 impl YouTubeParser {
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn is_youtube_host(host: Option<&str>) -> bool {
-        media_urls::is_youtube_host(host)
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn is_youtube_feed_url(url: &Url) -> bool {
-        media_urls::is_youtube_feed_url(url)
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn extract_video_id(url: &Url) -> Option<String> {
-        media_urls::extract_youtube_video_id(url)
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn canonical_watch_url(url: &Url) -> Option<Url> {
-        media_urls::canonical_youtube_watch_url(url)
-    }
-
-    pub fn feed_url_for_channel_id(channel_id: &str) -> Result<Url> {
-        media_urls::youtube_feed_url_for_channel_id(channel_id)
-    }
-
     pub fn parse(content: &str) -> Result<YouTubeFeed> {
         let mut feed = feed_rs::parser::parse(content.as_bytes())?;
         feed.entries.truncate(MAX_PARSED_FEED_ENTRIES);
@@ -97,11 +66,6 @@ impl YouTubeParser {
             .collect();
 
         Ok(YouTubeFeed { channel_title, items })
-    }
-
-    #[must_use]
-    pub fn extract_channel_id(input: &str) -> Option<String> {
-        media_urls::extract_youtube_channel_id(input)
     }
 
     fn extract_all_media_descriptions(xml: &str) -> HashMap<String, String> {
@@ -172,7 +136,7 @@ mod tests {
             "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA",
         )
         .unwrap();
-        assert!(YouTubeParser::is_youtube_feed_url(&valid));
+        assert!(media_urls::is_youtube_feed_url(&valid));
 
         for spoofed in [
             "https://evil.example/page?q=youtube.com/feeds/videos.xml",
@@ -181,34 +145,38 @@ mod tests {
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         ] {
             let parsed = Url::parse(spoofed).unwrap();
-            assert!(!YouTubeParser::is_youtube_feed_url(&parsed), "expected false for {spoofed}");
+            assert!(!media_urls::is_youtube_feed_url(&parsed), "expected false for {spoofed}");
         }
     }
 
     #[test]
     fn test_extract_channel_id() {
         assert_eq!(
-            YouTubeParser::extract_channel_id("UCX6OQ3DkcsbYNE6H8uQQuVA"),
+            media_urls::extract_youtube_channel_id("UCX6OQ3DkcsbYNE6H8uQQuVA"),
             Some("UCX6OQ3DkcsbYNE6H8uQQuVA".to_string())
         );
         assert_eq!(
-            YouTubeParser::extract_channel_id(
+            media_urls::extract_youtube_channel_id(
                 "https://www.youtube.com/feeds/videos.xml?channel_id=UCX6OQ3DkcsbYNE6H8uQQuVA"
             ),
             Some("UCX6OQ3DkcsbYNE6H8uQQuVA".to_string())
         );
         assert_eq!(
-            YouTubeParser::extract_channel_id(
+            media_urls::extract_youtube_channel_id(
                 "https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA/videos"
             ),
             Some("UCX6OQ3DkcsbYNE6H8uQQuVA".to_string())
         );
         assert_eq!(
-            YouTubeParser::extract_channel_id("https://evil.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA"),
+            media_urls::extract_youtube_channel_id(
+                "https://evil.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA"
+            ),
             None
         );
         assert_eq!(
-            YouTubeParser::extract_channel_id("https://www.youtube.com/channel/not-a-valid-id"),
+            media_urls::extract_youtube_channel_id(
+                "https://www.youtube.com/channel/not-a-valid-id"
+            ),
             None
         );
     }

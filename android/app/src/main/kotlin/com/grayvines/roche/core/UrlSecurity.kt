@@ -42,6 +42,8 @@ private const val IPV4_DOC_TEST_NET_2_B1 = 51
 private const val IPV4_DOC_TEST_NET_2_B2 = 100
 private const val IPV4_DOC_TEST_NET_3_B0 = 203
 private const val IPV4_DOC_TEST_NET_3_B2 = 113
+private const val IPV4_6TO4_RELAY_B1 = 88
+private const val IPV4_6TO4_RELAY_B2 = 99
 private const val IPV4_MULTICAST_START = 224
 private const val IPV6_SEGMENT_SHIFT = 8
 private const val IPV6_ULA_SEG_MASK = 0xfe00
@@ -59,8 +61,12 @@ private const val IPV6_2001_SEG0 = 0x2001
 private const val IPV6_DOC_SEG1 = 0x0db8
 private const val IPV6_BENCHMARK_SEG1 = 0x0002
 private const val IPV6_ORCHID_MASK = 0xfff0
+private const val IPV6_ORCHID_V1_PREFIX = 0x0010
 private const val IPV6_ORCHID_V2_PREFIX = 0x0020
 private const val IPV6_6TO4_SEG0 = 0x2002
+private const val IPV6_DOC_3FFF_SEG0 = 0x3fff
+private const val IPV6_DOC_3FFF_SEG1_MASK = 0xf000
+private const val IPV6_SRV6_SEG0 = 0x5f00
 private const val TS_NET_SUFFIX = ".ts.net"
 private const val HOME_ARPA_DOMAIN = "home.arpa"
 private val TAILSCALE_ULA_PREFIX =
@@ -96,6 +102,14 @@ internal fun isSyncableItemUrl(rawUrl: String): Boolean {
         host.isNotBlank()
 }
 
+private fun hasDisallowedHostSyntax(normalized: String, labels: List<String>): Boolean =
+    normalized.isEmpty() ||
+        '.' !in normalized ||
+        labels.any { it.isEmpty() } ||
+        '%' in normalized ||
+        '\\' in normalized ||
+        '@' in normalized
+
 internal fun isPublicHost(rawHost: String): Boolean {
     val lower = rawHost.trim().lowercase(Locale.ROOT)
     if (lower.startsWith("[") && lower.endsWith("]")) {
@@ -105,7 +119,7 @@ internal fun isPublicHost(rawHost: String): Boolean {
     val labels = normalized.split('.')
     val tldFirstChar = labels.lastOrNull()?.firstOrNull()
     return when {
-        normalized.isEmpty() || '.' !in normalized || labels.any { it.isEmpty() } -> false
+        hasDisallowedHostSyntax(normalized, labels) -> false
         normalized.all { it.isDigit() || it == '.' } -> isPublicIpv4Literal(normalized)
         tldFirstChar == null || tldFirstChar !in 'a'..'z' -> false
         else ->
@@ -225,8 +239,13 @@ private fun isIpv4PrivateOrLocal(first: Int, second: Int): Boolean =
 private fun isIpv4DocumentationOrBenchmark(first: Int, second: Int, third: Int): Boolean =
     isIpv4TestNet1OrIetf(first, second, third) || isIpv4TestNet2Or3OrBenchmark(first, second, third)
 
-private fun isIpv4TestNet1OrIetf(first: Int, second: Int, third: Int): Boolean =
-    first == IPV4_PRIVATE_192 && second == 0 && (third == 0 || third == IPV4_DOC_TEST_NET_1_B2)
+private fun isIpv4TestNet1OrIetf(first: Int, second: Int, third: Int): Boolean {
+    val isTestNet1OrIetf =
+        first == IPV4_PRIVATE_192 && second == 0 && (third == 0 || third == IPV4_DOC_TEST_NET_1_B2)
+    val is6to4Relay =
+        first == IPV4_PRIVATE_192 && second == IPV4_6TO4_RELAY_B1 && third == IPV4_6TO4_RELAY_B2
+    return isTestNet1OrIetf || is6to4Relay
+}
 
 private fun isIpv4TestNet2Or3OrBenchmark(first: Int, second: Int, third: Int): Boolean {
     val isTestNet2 =
@@ -296,7 +315,8 @@ private fun isSpecialPurposeIpv6(bytes: ByteArray): Boolean {
         s0 == IPV6_NAT64_SEG0 && s1 == IPV6_NAT64_SEG1 -> true
         isDiscardIpv6(bytes, s0) -> true
         is2001SpecialIpv6(s0, s1, s2) -> true
-        s0 == IPV6_6TO4_SEG0 -> true
+        s0 == IPV6_6TO4_SEG0 || s0 == IPV6_SRV6_SEG0 -> true
+        s0 == IPV6_DOC_3FFF_SEG0 && s1 and IPV6_DOC_3FFF_SEG1_MASK == 0 -> true
         else -> false
     }
 }
@@ -311,6 +331,7 @@ private fun is2001SpecialIpv6(s0: Int, s1: Int, s2: Int): Boolean {
         s1 == 0 -> true
         s1 == IPV6_DOC_SEG1 -> true
         s1 == IPV6_BENCHMARK_SEG1 && s2 == 0 -> true
+        s1 and IPV6_ORCHID_MASK == IPV6_ORCHID_V1_PREFIX -> true
         s1 and IPV6_ORCHID_MASK == IPV6_ORCHID_V2_PREFIX -> true
         else -> false
     }

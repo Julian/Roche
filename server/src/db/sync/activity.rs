@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
 use super::SyncRepo;
-use crate::db::{ActivityAction, ActivityEntityType};
+use crate::db::{ActivityAction, ActivityEntityType, WriteTx};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SyncTombstone {
@@ -45,31 +45,14 @@ impl SyncRepo<'_> {
         Ok(())
     }
 
-    pub async fn record_tombstone(
-        conn: &mut SqliteConnection,
+    pub(crate) async fn record_tombstone(
+        tx: &mut WriteTx<'_>,
         entity_type: ActivityEntityType,
         natural_key: &str,
         deleted_at: DateTime<Utc>,
     ) -> std::result::Result<(), sqlx::Error> {
-        let recorded_at = Self::now_utc();
-        sqlx::query(
-            "INSERT INTO sync_tombstones (entity_type, natural_key, deleted_at, recorded_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(entity_type, natural_key) DO UPDATE SET
-                 deleted_at = CASE
-                     WHEN strftime('%Y-%m-%dT%H:%M:%fZ', excluded.deleted_at) > strftime('%Y-%m-%dT%H:%M:%fZ', sync_tombstones.deleted_at)
-                     THEN excluded.deleted_at
-                     ELSE sync_tombstones.deleted_at
-                 END,
-                 recorded_at = excluded.recorded_at",
-        )
-        .bind(entity_type)
-        .bind(natural_key)
-        .bind(deleted_at)
-        .bind(recorded_at)
-        .execute(conn)
-        .await?;
-        Ok(())
+        let hlc = tx.next_hlc().await?;
+        Self::record_tombstone_with_hlc(tx.conn(), entity_type, natural_key, deleted_at, &hlc).await
     }
 
     pub async fn record_tombstone_with_hlc(
@@ -180,7 +163,7 @@ impl SyncRepo<'_> {
                  < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
         )
         .bind(cutoff)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?
         .flatten();
 
@@ -189,7 +172,7 @@ impl SyncRepo<'_> {
                 "UPDATE sync_clock SET min_retained_seq = MAX(min_retained_seq, ?) WHERE id = 1",
             )
             .bind(seq)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         }
 
@@ -198,7 +181,7 @@ impl SyncRepo<'_> {
              WHERE strftime('%Y-%m-%dT%H:%M:%fZ', timestamp) < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
             cutoff as _,
         )
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         sqlx::query(
             "DELETE FROM sync_tombstones
@@ -206,7 +189,7 @@ impl SyncRepo<'_> {
                  < strftime('%Y-%m-%dT%H:%M:%fZ', ?)",
         )
         .bind(cutoff)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         tx.commit().await?;
         Ok(result.rows_affected())

@@ -123,7 +123,7 @@ impl<'a> MediaRepo<'a> {
         let mut out = Vec::with_capacity(specs.len());
 
         for spec in specs {
-            out.push(Self::insert_media_row_in_tx(&mut tx, item_id, spec, now).await?);
+            out.push(Self::insert_media_row_in_tx(tx.conn(), item_id, spec, now).await?);
         }
 
         tx.commit().await?;
@@ -171,7 +171,7 @@ impl<'a> MediaRepo<'a> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         let media = Self::insert_media_row_in_tx(
-            &mut tx,
+            tx.conn(),
             item_id,
             &NewMediaSpec { media_type, path, file_size, duration },
             now,
@@ -277,7 +277,7 @@ impl<'a> MediaRepo<'a> {
     pub async fn delete(&self, id: &str) -> Result<()> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
-        Self::delete_local_in_tx(&mut tx, id, now).await?;
+        Self::delete_local_in_tx(tx.conn(), id, now).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -292,7 +292,7 @@ impl<'a> MediaRepo<'a> {
         let now = now_utc();
         let mut tx = crate::db::begin_write(self.pool).await?;
         for media in &media_list {
-            Self::delete_local_in_tx(&mut tx, &media.id, now).await?;
+            Self::delete_local_in_tx(tx.conn(), &media.id, now).await?;
         }
         tx.commit().await?;
         Ok(media_list)

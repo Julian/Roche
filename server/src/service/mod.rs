@@ -31,7 +31,10 @@ use self::{
     tags::TagService,
 };
 pub use self::{
-    catalog::{CatalogService, EntryListAppearance, EpScoreCache, RankedCollectionFilter},
+    catalog::{
+        CatalogService, ClusterSelectFilter, EntryListAppearance, EpScoreCache,
+        RankedCollectionFilter, RankedCollectionView, RankedEntryRow,
+    },
     error::AppError,
     feeds::FeedService,
     items::ItemDetail,
@@ -42,10 +45,9 @@ use crate::{
     config::Config,
     content::{HtmlSanitizer, MAX_SUMMARY_CHARS},
     db::{
-        ActivityEntry, CatalogEntry, CatalogRepo, CollectionSummary, ComparisonRecord,
-        ConsumptionLogRow, ConsumptionLogView, Db, ExportCollectionEntry,
-        ExportCollectionGenerator, Feed, Item, ItemFilter, ItemStatusFilter, ItemTag, SyncRepo,
-        Tag, WantSearchMatch,
+        ActivityEntry, CatalogEntry, CollectionSummary, ComparisonRecord, ConsumptionLogRow,
+        ConsumptionLogView, Db, ExportCollectionEntry, ExportCollectionGenerator, Feed, Item,
+        ItemFilter, ItemStatusFilter, ItemTag, Tag, WantSearchMatch,
     },
     domain::EntryKind,
     ingest::{
@@ -391,15 +393,13 @@ impl RocheService {
     pub async fn export_data(&self) -> Result<ExportBundle, AppError> {
         const MAX_EXPORT_ROWS: usize = 5_000;
         let mut tx = self.db.begin_read().await?;
-        let feeds = crate::db::FeedRepo::list_in_tx(&mut tx).await?;
-        let items =
-            crate::db::ItemRepo::list_in_tx(&mut tx, None, None, Some(MAX_EXPORT_ROWS)).await?;
-        let tags = crate::db::TagRepo::list_in_tx(&mut tx).await?;
+        let feeds = tx.list_feeds().await?;
+        let items = tx.list_items(None, None, Some(MAX_EXPORT_ROWS)).await?;
+        let tags = tx.list_tags().await?;
         let item_ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        let item_tags =
-            crate::db::TagRepo::list_item_tags_for_items_in_tx(&mut tx, &item_ids).await?;
-        let activity = SyncRepo::list_activity_in_tx(&mut tx).await?;
-        let catalog = CatalogRepo::export_catalog_snapshot_in_tx(&mut tx).await?;
+        let item_tags = tx.list_item_tags_for_items(&item_ids).await?;
+        let activity = tx.list_activity().await?;
+        let catalog = tx.export_catalog_snapshot().await?;
         tx.commit().await?;
 
         Ok(ExportBundle {

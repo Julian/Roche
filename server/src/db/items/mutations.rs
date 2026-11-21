@@ -50,7 +50,7 @@ use crate::{
     db::{
         ActivityAction, ActivityEntityType, CatalogError, CatalogRepo, CatalogResult,
         ConsumptionLogView, ConsumptionStatus, EntryKind, InboxState, ItemStatus, MediaRepo,
-        ReadAtPatch, SyncRepo, Tag, TagRepo,
+        ReadAtPatch, SyncRepo, Tag, TagRepo, WriteTx,
         entries_core::{self, EntryInsertParams, EntryStateUpsert},
         feeds::resolve_dedup_entry_id,
         sync::{
@@ -71,7 +71,7 @@ use crate::{
 /// `deterministic_auto_consumption_log_id`, removes from `Want` queues, engages parent
 /// `podcast`/`publication`/`channel` collections, and records sync activity without duplicate SQL.
 pub(super) async fn maybe_auto_log_feed_completion_in_tx(
-    conn: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     entry_id: &str,
     entry_kind: EntryKind,
     inbox_state: InboxState,
@@ -90,7 +90,7 @@ pub(super) async fn maybe_auto_log_feed_completion_in_tx(
         return Ok(());
     }
 
-    match CatalogRepo::ensure_auto_consumed_with_parents_in_tx(conn, entry_id, None, ts, ts).await {
+    match CatalogRepo::ensure_auto_consumed_with_parents_in_tx(tx, entry_id, None, ts, ts).await {
         Ok(_) => Ok(()),
         Err(CatalogError::Db(e)) => Err(e),
         Err(other) => Err(sqlx::Error::Protocol(other.to_string())),
@@ -98,7 +98,7 @@ pub(super) async fn maybe_auto_log_feed_completion_in_tx(
 }
 
 pub(super) async fn set_collection_flag_membership_in_tx(
-    conn: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     collection_id: &str,
     entry_id: &str,
     present: bool,
@@ -106,44 +106,40 @@ pub(super) async fn set_collection_flag_membership_in_tx(
 ) -> std::result::Result<(), sqlx::Error> {
     let nat_key = crate::db::sync::collection_entry_natural_key(collection_id, entry_id);
     if present {
-        SyncRepo::clear_tombstone(&mut *conn, ActivityEntityType::CollectionEntry, &nat_key)
-            .await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::CollectionEntry, &nat_key).await?;
+        let ce_hlc = tx.next_hlc().await?;
         sqlx::query(
-            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-             VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+             VALUES (?, ?, ?, ?)",
         )
         .bind(collection_id)
         .bind(entry_id)
         .bind(now)
-        .execute(&mut *conn)
+        .bind(&ce_hlc)
+        .execute(tx.conn())
         .await?;
     } else {
         let res =
             sqlx::query("DELETE FROM collection_entries WHERE collection_id = ? AND entry_id = ?")
                 .bind(collection_id)
                 .bind(entry_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
         if res.rows_affected() > 0 {
-            SyncRepo::record_tombstone(
-                &mut *conn,
-                ActivityEntityType::CollectionEntry,
-                &nat_key,
-                now,
-            )
-            .await?;
+            SyncRepo::record_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key, now)
+                .await?;
         }
     }
     Ok(())
 }
 
 pub(super) async fn set_favorite_membership_in_tx(
-    conn: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     entry_id: &str,
     is_favorite: bool,
     now: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
-    set_collection_flag_membership_in_tx(conn, STARRED_COLLECTION_ID, entry_id, is_favorite, now)
+    set_collection_flag_membership_in_tx(tx, STARRED_COLLECTION_ID, entry_id, is_favorite, now)
         .await
 }
 
@@ -216,7 +212,7 @@ impl ItemRepo<'_> {
 
     #[cfg(test)]
     async fn insert_created_item_rows_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         id: &str,
         new_item: &NewItem<'_>,
         entry_kind: EntryKind,
@@ -236,19 +232,22 @@ impl ItemRepo<'_> {
         )
         .await?;
 
-        entries_core::insert_entry_content_in_tx(tx, id, None, new_item.content_type).await?;
+        entries_core::insert_entry_content_in_tx(tx.conn(), id, None, new_item.content_type)
+            .await?;
         entries_core::ensure_entry_state_in_tx(tx, id, InboxState::Unread, now).await?;
-        entries_core::upsert_entry_identifier_in_tx(tx, id, "url", canon_url).await?;
+        entries_core::upsert_entry_identifier_in_tx(tx.conn(), id, "url", canon_url).await?;
 
         if let Some(fid) = new_item.feed_id {
-            sqlx::query!(
-                "INSERT INTO collection_entries (collection_id, entry_id, added_at)
-                 VALUES (?, ?, ?)",
-                fid,
-                id,
-                now as _,
+            let ce_hlc = tx.next_hlc().await?;
+            sqlx::query(
+                "INSERT INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                 VALUES (?, ?, ?, ?)",
             )
-            .execute(&mut *tx)
+            .bind(fid)
+            .bind(id)
+            .bind(now)
+            .bind(&ce_hlc)
+            .execute(tx.conn())
             .await?;
         }
         Ok(())
@@ -290,7 +289,7 @@ impl ItemRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
 
         SyncRepo::clear_tombstone(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Item,
             &item_natural_key(None, url_str),
         )
@@ -300,7 +299,8 @@ impl ItemRepo<'_> {
         // or arXiv ID (whether unread, archived, or catalog-only), idempotently update/unarchive
         // it rather than attempting a duplicate `INSERT INTO entries`.
         let existing_dedup =
-            resolve_dedup_entry_id(&mut tx, &det_item_id, &canon_url, arxiv_id.as_deref()).await?;
+            resolve_dedup_entry_id(tx.conn(), &det_item_id, &canon_url, arxiv_id.as_deref())
+                .await?;
 
         let (final_item_id, activity_action) = if let Some(existing_id) = existing_dedup {
             Self::update_existing_manual_item_in_tx(
@@ -329,7 +329,7 @@ impl ItemRepo<'_> {
         .await?;
 
         entries_core::upsert_url_and_arxiv_identifiers_in_tx(
-            &mut tx,
+            tx.conn(),
             &final_item_id,
             &canon_url,
             arxiv_id.as_deref(),
@@ -337,7 +337,7 @@ impl ItemRepo<'_> {
         .await?;
 
         MediaRepo::upsert_audio_enclosure_in_tx(
-            &mut tx,
+            tx.conn(),
             &final_item_id,
             input.audio_url,
             clean_duration,
@@ -346,7 +346,7 @@ impl ItemRepo<'_> {
         .await?;
 
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Item,
             &final_item_id,
             activity_action,
@@ -369,14 +369,14 @@ impl ItemRepo<'_> {
 
         let mut qb = item_select_query_builder(ItemContentProjection::Full);
         qb.push(" WHERE i.id = ").push_bind(&final_item_id);
-        let item: Item = qb.build_query_as().fetch_one(&mut *tx).await?;
+        let item: Item = qb.build_query_as().fetch_one(tx.conn()).await?;
 
         tx.commit().await?;
         Ok((item, attached_tags))
     }
 
     async fn insert_new_manual_item_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         det_item_id: &str,
         entry_kind: EntryKind,
         input: &ManualItemInput<'_>,
@@ -393,7 +393,7 @@ impl ItemRepo<'_> {
         )
         .await?;
         entries_core::insert_entry_content_in_tx(
-            tx,
+            tx.conn(),
             det_item_id,
             input.content_html,
             input.content_type,
@@ -403,7 +403,7 @@ impl ItemRepo<'_> {
     }
 
     async fn update_existing_manual_item_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         existing_id: &str,
         det_item_id: &str,
         trimmed_title: &str,
@@ -416,11 +416,12 @@ impl ItemRepo<'_> {
              WHERE ce.entry_id = ? LIMIT 1",
         )
         .bind(existing_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         let url_str = input.url.as_str();
         let has_explicit_non_url_title = !trimmed_title.is_empty() && trimmed_title != url_str;
+        let entry_hlc = tx.next_hlc().await?;
         sqlx::query(
             "UPDATE entries
              SET title = CASE
@@ -430,7 +431,15 @@ impl ItemRepo<'_> {
                  END,
                  summary = COALESCE(summary, ?),
                  thumbnail_url = COALESCE(thumbnail_url, ?),
-                 updated_at = ?
+                 updated_at = ?,
+                 hlc = CASE
+                     WHEN (? = ? AND ? AND title IS NOT ?)
+                       OR (title = url AND ? != '' AND title IS NOT ?)
+                       OR (summary IS NULL AND ? IS NOT NULL)
+                       OR (thumbnail_url IS NULL AND ? IS NOT NULL)
+                     THEN ?
+                     ELSE hlc
+                 END
              WHERE id = ?",
         )
         .bind(existing_id)
@@ -443,7 +452,16 @@ impl ItemRepo<'_> {
         .bind(input.thumbnail_url)
         .bind(now)
         .bind(existing_id)
-        .execute(&mut *tx)
+        .bind(det_item_id)
+        .bind(has_explicit_non_url_title)
+        .bind(input.title)
+        .bind(trimmed_title)
+        .bind(input.title)
+        .bind(input.summary)
+        .bind(input.thumbnail_url)
+        .bind(&entry_hlc)
+        .bind(existing_id)
+        .execute(tx.conn())
         .await?;
 
         sqlx::query(
@@ -455,26 +473,35 @@ impl ItemRepo<'_> {
         .bind(existing_id)
         .bind(input.content_html)
         .bind(input.content_type)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
+        let state_hlc = tx.next_hlc().await?;
         let state_sql = if has_feed_source.is_some() {
-            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-             VALUES (?, 'unread', 0.0, ?, ?)
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at, hlc)
+             VALUES (?, 'unread', 0.0, ?, ?, ?)
              ON CONFLICT(entry_id) DO UPDATE SET
                  read_at = NULL,
                  interaction_updated_at = excluded.interaction_updated_at,
-                 updated_at = excluded.updated_at"
+                 updated_at = excluded.updated_at,
+                 hlc = excluded.hlc"
         } else {
-            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at)
-             VALUES (?, 'none', 0.0, ?, ?)
+            "INSERT INTO entry_state (entry_id, inbox_state, progress, interaction_updated_at, updated_at, hlc)
+             VALUES (?, 'none', 0.0, ?, ?, ?)
              ON CONFLICT(entry_id) DO UPDATE SET
                  inbox_state = 'none',
                  read_at = NULL,
                  interaction_updated_at = excluded.interaction_updated_at,
-                 updated_at = excluded.updated_at"
+                 updated_at = excluded.updated_at,
+                 hlc = excluded.hlc"
         };
-        sqlx::query(state_sql).bind(existing_id).bind(now).bind(now).execute(&mut *tx).await?;
+        sqlx::query(state_sql)
+            .bind(existing_id)
+            .bind(now)
+            .bind(now)
+            .bind(&state_hlc)
+            .execute(tx.conn())
+            .await?;
         Ok(())
     }
 
@@ -515,7 +542,7 @@ impl ItemRepo<'_> {
              WHERE ce.entry_id = ? LIMIT 1",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?
         .is_some();
 
@@ -564,7 +591,7 @@ impl ItemRepo<'_> {
              WHERE ce.entry_id = ? LIMIT 1",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?
         .is_some();
 
@@ -620,7 +647,7 @@ impl ItemRepo<'_> {
             .push_bind(id)
             .push(" AND i.merged_into_id IS NULL AND ")
             .push(IS_LIVE_ITEM_SQL);
-        let current_fav: Option<bool> = qb.build_query_scalar().fetch_optional(&mut *tx).await?;
+        let current_fav: Option<bool> = qb.build_query_scalar().fetch_optional(tx.conn()).await?;
         let Some(cur) = current_fav else {
             return Ok(None);
         };
@@ -663,7 +690,7 @@ impl ItemRepo<'_> {
             );
             qb.push_bind(id).push(" AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
             let Some(existing_prog): Option<f64> =
-                qb.build_query_scalar().fetch_optional(&mut *tx).await?
+                qb.build_query_scalar().fetch_optional(tx.conn()).await?
             else {
                 return Ok(false);
             };
@@ -693,7 +720,7 @@ impl ItemRepo<'_> {
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn update_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         id: &str,
         status: Option<ItemStatus>,
         is_favorite: Option<bool>,
@@ -734,7 +761,7 @@ impl ItemRepo<'_> {
             .push(IS_LIVE_ITEM_SQL);
 
         let existing: Option<ExistingItemStateRow> =
-            check_qb.build_query_as().fetch_optional(&mut *tx).await?;
+            check_qb.build_query_as().fetch_optional(tx.conn()).await?;
 
         let Some(ExistingItemStateRow {
             kind: entry_kind,
@@ -819,7 +846,7 @@ impl ItemRepo<'_> {
         sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
             .bind(now)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
         if fav_changed {
@@ -858,18 +885,18 @@ impl ItemRepo<'_> {
                 ItemStatus::Archived => ActivityAction::Archive,
                 ItemStatus::Unread => ActivityAction::Unarchive,
             };
-            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx.conn(), ActivityEntityType::Item, id, action, now).await?;
         }
 
         if fav_changed {
             let action =
                 if target_favorite { ActivityAction::Favorite } else { ActivityAction::Unfavorite };
-            SyncRepo::record_activity(tx, ActivityEntityType::Item, id, action, now).await?;
+            SyncRepo::record_activity(tx.conn(), ActivityEntityType::Item, id, action, now).await?;
         }
 
         if (read_at_changed && !status_changed) || progress_changed {
             SyncRepo::record_activity(
-                tx,
+                tx.conn(),
                 ActivityEntityType::Item,
                 id,
                 ActivityAction::Update,
@@ -930,7 +957,7 @@ impl ItemRepo<'_> {
     /// references it.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn delete_inbox_item_preserving_history_outcome_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         item_id: &str,
         detach_want_queues: bool,
         now: DateTime<Utc>,
@@ -945,7 +972,7 @@ impl ItemRepo<'_> {
             )
             .bind(item_id)
             .bind(STARRED_COLLECTION_ID)
-            .fetch_all(&mut *conn)
+            .fetch_all(tx.conn())
             .await?;
             sqlx::query(
                 "DELETE FROM collection_entries
@@ -959,42 +986,40 @@ impl ItemRepo<'_> {
             )
             .bind(item_id)
             .bind(STARRED_COLLECTION_ID)
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
             for col_id in detached_item_cols {
                 let nat_key = crate::db::sync::collection_entry_natural_key(&col_id, item_id);
-                SyncRepo::record_tombstone(
-                    &mut *conn,
-                    ActivityEntityType::CollectionEntry,
-                    &nat_key,
-                    now,
-                )
-                .await?;
+                SyncRepo::record_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key, now)
+                    .await?;
             }
         }
 
-        if Self::entry_has_catalog_history_in_tx(&mut *conn, item_id).await? {
+        if Self::entry_has_catalog_history_in_tx(tx.conn(), item_id).await? {
             let res = sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(item_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
             if res.rows_affected() == 0 {
                 return Ok(ItemDeleteOutcome { deleted: false, readable_content_removed: false });
             }
+            let state_hlc = tx.next_hlc().await?;
             sqlx::query(
-                "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at)
-                 VALUES (?, 'none', NULL, 0.0, ?, ?)
+                "INSERT INTO entry_state (entry_id, inbox_state, read_at, progress, interaction_updated_at, updated_at, hlc)
+                 VALUES (?, 'none', NULL, 0.0, ?, ?, ?)
                  ON CONFLICT(entry_id) DO UPDATE SET
                      inbox_state = 'none',
                      read_at = NULL,
                      interaction_updated_at = excluded.interaction_updated_at,
-                     updated_at = excluded.updated_at",
+                     updated_at = excluded.updated_at,
+                     hlc = excluded.hlc",
             )
             .bind(item_id)
             .bind(now)
             .bind(now)
-            .execute(&mut *conn)
+            .bind(&state_hlc)
+            .execute(tx.conn())
             .await?;
 
             let keep_readable_content: Option<i64> = sqlx::query_scalar(
@@ -1004,13 +1029,13 @@ impl ItemRepo<'_> {
                  LIMIT 1",
             )
             .bind(item_id)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(tx.conn())
             .await?;
 
             if keep_readable_content.is_none() {
                 sqlx::query("DELETE FROM entry_content WHERE entry_id = ?")
                     .bind(item_id)
-                    .execute(&mut *conn)
+                    .execute(tx.conn())
                     .await?;
             }
 
@@ -1027,7 +1052,7 @@ impl ItemRepo<'_> {
             .bind(item_id)
             .bind(UP_NEXT_COLLECTION_ID)
             .bind(keep_readable_content.is_none())
-            .fetch_all(&mut *conn)
+            .fetch_all(tx.conn())
             .await?;
             sqlx::query(
                 "DELETE FROM collection_entries
@@ -1042,17 +1067,12 @@ impl ItemRepo<'_> {
             .bind(item_id)
             .bind(UP_NEXT_COLLECTION_ID)
             .bind(keep_readable_content.is_none())
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
             for col_id in detached_cols {
                 let nat_key = crate::db::sync::collection_entry_natural_key(&col_id, item_id);
-                SyncRepo::record_tombstone(
-                    &mut *conn,
-                    ActivityEntityType::CollectionEntry,
-                    &nat_key,
-                    now,
-                )
-                .await?;
+                SyncRepo::record_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key, now)
+                    .await?;
             }
             Ok(ItemDeleteOutcome {
                 deleted: true,
@@ -1061,7 +1081,7 @@ impl ItemRepo<'_> {
         } else {
             let res = sqlx::query("DELETE FROM entries WHERE id = ?")
                 .bind(item_id)
-                .execute(&mut *conn)
+                .execute(tx.conn())
                 .await?;
             let deleted = res.rows_affected() > 0;
             Ok(ItemDeleteOutcome { deleted, readable_content_removed: deleted })
@@ -1069,13 +1089,13 @@ impl ItemRepo<'_> {
     }
 
     pub(crate) async fn delete_inbox_item_preserving_history_in_tx(
-        conn: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         item_id: &str,
         detach_want_queues: bool,
         now: DateTime<Utc>,
     ) -> std::result::Result<bool, sqlx::Error> {
         Ok(Self::delete_inbox_item_preserving_history_outcome_in_tx(
-            conn,
+            tx,
             item_id,
             detach_want_queues,
             now,
@@ -1107,7 +1127,7 @@ impl ItemRepo<'_> {
         );
         key_qb.push_bind(id).push(" AND i.merged_into_id IS NULL AND ").push(IS_LIVE_ITEM_SQL);
         let existing_keys: Option<(Option<String>, Option<String>)> =
-            key_qb.build_query_as().fetch_optional(&mut *tx).await?;
+            key_qb.build_query_as().fetch_optional(tx.conn()).await?;
         let Some((item_url_opt, feed_url)) = existing_keys else {
             return Ok(ItemDeleteOutcome { deleted: false, readable_content_removed: false });
         };
@@ -1129,7 +1149,7 @@ impl ItemRepo<'_> {
             .await?;
         }
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::Item,
             id,
             ActivityAction::Delete,
@@ -1141,7 +1161,7 @@ impl ItemRepo<'_> {
     }
 
     async fn backfill_entry_fields_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         id: &str,
         backfill: &EntryMetadataBackfill<'_>,
         now: DateTime<Utc>,
@@ -1150,6 +1170,7 @@ impl ItemRepo<'_> {
             return Ok(false);
         }
         let creators_ref = backfill.creators_json.as_deref();
+        let entry_hlc = tx.next_hlc().await?;
         let entry_res = sqlx::query(
             "UPDATE entries
              SET title = CASE WHEN title = url AND ? IS NOT NULL THEN ? ELSE title END,
@@ -1157,7 +1178,8 @@ impl ItemRepo<'_> {
                  published_at = COALESCE(published_at, ?),
                  summary = COALESCE(summary, ?),
                  thumbnail_url = COALESCE(thumbnail_url, ?),
-                 updated_at = ?
+                 updated_at = ?,
+                 hlc = ?
              WHERE id = ?
                AND ((title = url AND ? IS NOT NULL)
                     OR (creators_json = '[]' AND ? IS NOT NULL)
@@ -1173,13 +1195,14 @@ impl ItemRepo<'_> {
         .bind(backfill.summary)
         .bind(backfill.thumbnail_url)
         .bind(now)
+        .bind(&entry_hlc)
         .bind(id)
         .bind(backfill.title)
         .bind(creators_ref)
         .bind(backfill.published_at)
         .bind(backfill.summary)
         .bind(backfill.thumbnail_url)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         Ok(entry_res.rows_affected() > 0)
     }
@@ -1216,7 +1239,7 @@ impl ItemRepo<'_> {
              WHERE e.id = ? AND e.merged_into_id IS NULL",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if live.is_none() {
             return Ok(());
@@ -1233,21 +1256,21 @@ impl ItemRepo<'_> {
             )
             .bind(html)
             .bind(id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
             if content_res.rows_affected() > 0 {
                 content_updated = true;
                 sqlx::query("UPDATE entries SET updated_at = ? WHERE id = ?")
                     .bind(now)
                     .bind(id)
-                    .execute(&mut *tx)
+                    .execute(tx.conn())
                     .await?;
             }
         }
 
         if entry_updated || content_updated {
             SyncRepo::record_activity(
-                &mut tx,
+                tx.conn(),
                 ActivityEntityType::Item,
                 id,
                 ActivityAction::Update,
@@ -1284,7 +1307,7 @@ impl ItemRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         if Self::backfill_entry_fields_in_tx(&mut tx, id, &backfill, now).await? {
             SyncRepo::record_activity(
-                &mut tx,
+                tx.conn(),
                 ActivityEntityType::Item,
                 id,
                 ActivityAction::Update,

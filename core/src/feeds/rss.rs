@@ -7,11 +7,12 @@ use url::Url;
 
 use super::{MAX_PARSED_FEED_ENTRIES, extract_entry_timestamp, select_entry_link};
 use crate::{
-    content::HtmlSanitizer,
-    util::{
-        media_urls::is_direct_audio_url,
-        url_guard::{parse_public_url, validate_public_url},
+    media_urls::is_direct_audio_url,
+    url_guard::{
+        is_non_thumbnail_url, parse_public_url, resolve_and_validate_thumbnail_url,
+        validate_public_url,
     },
+    xml_util,
 };
 
 #[derive(Debug, Clone)]
@@ -316,8 +317,6 @@ impl<'a> SupplementalIndex<'a> {
             return Some(&self.entries[found_idx]);
         }
 
-        // Any unused entry whose `entry_id == norm_entry_id` would already have matched above,
-        // so an ID-compatible link fallback can only match supplemental entries with no `entry_id`.
         if let Some(elink) = norm_entry_link
             && let Some(queue) = self.by_link_without_id.get_mut(elink)
             && let Some(found_idx) = Self::take_first_unused(queue, &mut self.used)
@@ -360,21 +359,17 @@ impl RssParser {
         let feed_fallback_thumb = feed
             .logo
             .as_ref()
-            .and_then(|img| {
-                HtmlSanitizer::resolve_and_validate_thumbnail_url(&img.uri, feed_base_url.as_ref())
-            })
+            .and_then(|img| resolve_and_validate_thumbnail_url(&img.uri, feed_base_url.as_ref()))
             .or_else(|| {
                 feed.icon.as_ref().and_then(|img| {
-                    HtmlSanitizer::resolve_and_validate_thumbnail_url(
-                        &img.uri,
-                        feed_base_url.as_ref(),
-                    )
+                    resolve_and_validate_thumbnail_url(&img.uri, feed_base_url.as_ref())
                 })
             })
             .or_else(|| {
-                supplemental.feed_image_url.as_deref().and_then(|raw| {
-                    HtmlSanitizer::resolve_and_validate_thumbnail_url(raw, feed_base_url.as_ref())
-                })
+                supplemental
+                    .feed_image_url
+                    .as_deref()
+                    .and_then(|raw| resolve_and_validate_thumbnail_url(raw, feed_base_url.as_ref()))
             });
 
         let parsed_feed = RssFeed {
@@ -404,9 +399,8 @@ impl RssParser {
                 let base_for_thumb = link.as_ref().or(feed_base_url.as_ref());
                 let thumbnail_url = Self::extract_entry_thumbnail_url(&entry, base_for_thumb)
                     .or_else(|| {
-                        supp.and_then(|s| s.itunes_image_url.as_deref()).and_then(|raw| {
-                            HtmlSanitizer::resolve_and_validate_thumbnail_url(raw, base_for_thumb)
-                        })
+                        supp.and_then(|s| s.itunes_image_url.as_deref())
+                            .and_then(|raw| resolve_and_validate_thumbnail_url(raw, base_for_thumb))
                     })
                     .or_else(|| audio_url.is_some().then(|| feed_fallback_thumb.clone()).flatten());
                 let title = entry.title.map_or_default(|t| t.content);
@@ -568,10 +562,10 @@ impl RssParser {
                 Ok(Event::Start(tag)) => state.handle_open_tag(&tag, false),
                 Ok(Event::Empty(tag)) => state.handle_open_tag(&tag, true),
                 Ok(Event::Text(text)) if state.active_text_tag.is_some() => {
-                    state.text_buf.push_str(&crate::content::xml_util::decode_text(&text));
+                    state.text_buf.push_str(&xml_util::decode_text(&text));
                 }
                 Ok(Event::GeneralRef(entity)) if state.active_text_tag.is_some() => {
-                    state.text_buf.push_str(&crate::content::xml_util::decode_entity(&entity));
+                    state.text_buf.push_str(&xml_util::decode_entity(&entity));
                 }
                 Ok(Event::CData(cdata)) if state.active_text_tag.is_some() => {
                     state.text_buf.push_str(cdata.as_ref());
@@ -665,7 +659,7 @@ impl RssParser {
     }
 
     fn extract_attr(tag: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
-        crate::content::xml_util::find_non_empty_attr(tag, name)
+        xml_util::find_non_empty_attr(tag, name)
     }
 
     fn inspect_enclosure_tag(tag: &quick_xml::events::BytesStart<'_>) -> Option<Url> {
@@ -681,9 +675,7 @@ impl RssParser {
     ) -> Option<String> {
         for media in &entry.media {
             for thumb in &media.thumbnails {
-                if let Some(url) =
-                    HtmlSanitizer::resolve_and_validate_thumbnail_url(&thumb.image.uri, base_url)
-                {
+                if let Some(url) = resolve_and_validate_thumbnail_url(&thumb.image.uri, base_url) {
                     return Some(url);
                 }
             }
@@ -695,7 +687,7 @@ impl RssParser {
                 if let Some(ref url) = content.url {
                     let has_img_ext = Self::has_image_extension(url.path());
                     if (is_image_mime || has_img_ext)
-                        && !HtmlSanitizer::is_non_thumbnail_url(url)
+                        && !is_non_thumbnail_url(url)
                         && validate_public_url(url).is_ok()
                     {
                         return Some(url.as_str().to_owned());
@@ -712,8 +704,7 @@ impl RssParser {
                 .is_some_and(|mt| mt.trim().to_ascii_lowercase().starts_with("image/"));
             if is_enclosure
                 && is_image_mime
-                && let Some(url) =
-                    HtmlSanitizer::resolve_and_validate_thumbnail_url(&link.href, base_url)
+                && let Some(url) = resolve_and_validate_thumbnail_url(&link.href, base_url)
             {
                 return Some(url);
             }
@@ -833,7 +824,6 @@ mod tests {
         );
         assert_eq!(items[0].authors, vec!["Ben Gilbert & David Rosenthal"]);
 
-        // Second item has no <link> and non-URL <guid>, so link falls back to audio_url
         assert_eq!(
             items[1].link.as_ref().map(Url::as_str),
             Some("https://cdn.example.com/audio/linkless.m4a")
@@ -965,13 +955,11 @@ mod tests {
         ];
         let mut index = SupplementalIndex::new(&entries);
 
-        // 1. Reordered entry matches by ID despite shifted index
         let m1 = index
             .match_entry(0, Some("ep-by-id"), Some("https://podcast.example.com/shared"))
             .unwrap();
         assert_eq!(m1.duration_secs, Some(360));
 
-        // 2. Entry with synthesized/non-matching feed-rs ID matches unused entry by primary link
         let m2 = index
             .match_entry(
                 1,
@@ -981,7 +969,6 @@ mod tests {
             .unwrap();
         assert_eq!(m2.duration_secs, Some(240));
 
-        // 3. Mismatched ID and link at idx 0 must NOT steal ep-skipped via positional fallback
         let m3 = index.match_entry(
             0,
             Some("ep-different"),

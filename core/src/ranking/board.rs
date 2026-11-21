@@ -263,7 +263,6 @@ mod tests {
         let mut board = RankBoard::from_buckets(vec![vec![s("a"), s("b")], vec![s("c")]]);
         assert!(board.select_entry_id("c"));
 
-        // Moving singleton "c" above tie group ["a", "b"] keeps "a" and "b" tied at #2!
         board.move_up();
         assert_eq!(board.to_ordering(), vec![vec![s("c")], vec![s("a"), s("b")]]);
         let rows = board.flat_rows();
@@ -272,7 +271,6 @@ mod tests {
         assert_eq!(rows[2].display_rank, 2);
         assert!(rows[2].is_tied_with_above);
 
-        // Moving "c" back down restores [["a", "b"], ["c"]].
         board.move_down();
         assert_eq!(board.to_ordering(), vec![vec![s("a"), s("b")], vec![s("c")]]);
     }
@@ -285,7 +283,6 @@ mod tests {
         board.move_up();
         assert_eq!(board.to_ordering(), vec![vec![s("b")], vec![s("a"), s("c")]]);
 
-        // Re-tying ["a", "c"] onto "b" via "=" on "a":
         assert!(board.select_entry_id("a"));
         board.toggle_tie_with_above();
         assert_eq!(board.to_ordering(), vec![vec![s("b"), s("a"), s("c")]]);
@@ -308,7 +305,6 @@ mod tests {
             RankBoard::from_buckets(vec![vec![s("a")], vec![s("b"), s("c")], vec![s("d")]]);
         assert!(board.select_entry_id("d"));
 
-        // Press '2' (slot 1): "d" moves to #2 above ["b", "c"], keeping ["b", "c"] tied at #3.
         board.move_to_rank_slot(1);
         assert_eq!(board.to_ordering(), vec![vec![s("a")], vec![s("d")], vec![s("b"), s("c")]]);
     }

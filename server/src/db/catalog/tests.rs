@@ -422,7 +422,7 @@ async fn test_diary_jan_1st_space_timestamp_and_auto_consumption_idempotency() {
     assert_eq!(diary_2026[0].entry.id, book.id);
 
     // Replaying auto-completion at a different timestamp must NOT duplicate the Diary entry
-    let mut tx = db.pool().begin().await.unwrap();
+    let mut tx = db.begin_write().await.unwrap();
     let now = chrono::Utc::now();
     let returned_id =
         CatalogRepo::ensure_auto_consumed_with_parents_in_tx(&mut tx, &book.id, None, now, now)

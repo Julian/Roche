@@ -173,7 +173,7 @@ impl SyncRepo<'_> {
 
         let clock: SyncClockRow =
             sqlx::query_as("SELECT current_seq, min_retained_seq FROM sync_clock WHERE id = 1")
-                .fetch_one(&mut *tx)
+                .fetch_one(tx.conn())
                 .await?;
 
         let clamped_since = requested_since_seq.max(0);
@@ -184,7 +184,7 @@ impl SyncRepo<'_> {
                 (false, clamped_since)
             };
 
-        let active_peers = Self::list_active_peers_in_tx(&mut tx, now).await?;
+        let active_peers = Self::list_active_peers_in_tx(tx.conn(), now).await?;
         if effective_since >= clock.current_seq {
             return Ok(empty_peer_sync_response(
                 clock.current_seq,
@@ -196,7 +196,7 @@ impl SyncRepo<'_> {
         }
 
         let candidates =
-            Self::probe_outgoing_candidates_in_tx(&mut tx, effective_since, max_page_changes)
+            Self::probe_outgoing_candidates_in_tx(tx.conn(), effective_since, max_page_changes)
                 .await?;
         if candidates.is_empty() {
             return Ok(empty_peer_sync_response(
@@ -221,9 +221,13 @@ impl SyncRepo<'_> {
             let can_shrink = distinct_seqs.len() > 1;
             let stub_budget =
                 if can_shrink { Some(page_budget.saturating_sub(used_bytes)) } else { None };
-            if let Some(page) =
-                Self::load_sync_page_delta_in_tx(&mut tx, effective_since, cutoff_seq, stub_budget)
-                    .await?
+            if let Some(page) = Self::load_sync_page_delta_in_tx(
+                tx.conn(),
+                effective_since,
+                cutoff_seq,
+                stub_budget,
+            )
+            .await?
             {
                 break page;
             }

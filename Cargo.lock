@@ -2337,6 +2337,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "roche-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "feed-rs",
+ "ip_network",
+ "quick-xml",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "roche-server"
 version = "0.1.0"
 dependencies = [
@@ -2347,17 +2367,16 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
- "feed-rs",
  "figment",
  "headers",
  "hex",
  "hmac",
- "ip_network",
  "open",
  "quick-xml",
  "rand",
  "ratatui",
  "reqwest",
+ "roche-core",
  "serde",
  "serde_json",
  "sha2 0.11.1",

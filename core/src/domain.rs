@@ -1,15 +1,26 @@
+use std::str::FromStr;
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::{
+    external_links::{external_identifier_label, external_identifier_url},
+    identity::{WANT_TO_READ_SLUG, deterministic_system_collection_id},
+};
+
 /// Reader scroll / playback progress threshold (`>= 0.98`) at which an item is automatically
 /// marked read (and podcast episodes auto-log completion).
 pub const READER_AUTO_READ_THRESHOLD: f64 = 0.98;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+/// Canonical focused-placement ranking round budget shared across Web and Android.
+pub const MAX_FOCUSED_ROUNDS: usize = 5;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum FeedType {
     #[default]
     Rss,
@@ -26,9 +37,10 @@ pub struct OpmlOutline {
     pub title: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum ItemStatus {
     #[default]
     Unread,
@@ -124,9 +136,10 @@ impl ItemStatusFilter {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum ContentType {
     #[default]
     Article,
@@ -137,9 +150,10 @@ pub enum ContentType {
     Pdf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum MediaType {
     Video,
     Audio,
@@ -157,17 +171,6 @@ pub enum ItemSortField {
     Relevance,
 }
 
-impl ItemSortField {
-    #[must_use]
-    pub const fn as_sql_expr(self) -> &'static str {
-        match self {
-            Self::CreatedAt => "i.created_at",
-            Self::PublishedAt | Self::Relevance => "COALESCE(i.published_at, i.created_at)",
-            Self::Title => "i.title COLLATE NOCASE",
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
@@ -176,19 +179,10 @@ pub enum SortOrder {
     Desc,
 }
 
-impl SortOrder {
-    #[must_use]
-    pub const fn as_sql(self) -> &'static str {
-        match self {
-            Self::Asc => "ASC",
-            Self::Desc => "DESC",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 pub enum EntryKind {
     Article,
     Paper,
@@ -370,9 +364,10 @@ impl EntryKind {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum InboxState {
     #[default]
     None,
@@ -389,18 +384,20 @@ impl From<ItemStatus> for InboxState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum CollectionMode {
     Manual,
     Feed,
     Dynamic,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum CollectionRole {
     #[default]
     List,
@@ -410,9 +407,10 @@ pub enum CollectionRole {
     Feed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
 pub enum ConsumptionStatus {
     Started,
     Consumed,
@@ -428,11 +426,34 @@ impl ConsumptionStatus {
             Self::Abandoned => "abandoned",
         }
     }
+
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Consumed => "Finished",
+            Self::Started => "Started",
+            Self::Abandoned => "Skipped",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+impl FromStr for ConsumptionStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "started" => Ok(Self::Started),
+            "consumed" | "finished" => Ok(Self::Consumed),
+            "abandoned" | "skipped" => Ok(Self::Abandoned),
+            other => anyhow::bail!("Unknown consumption status '{other}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 pub enum ActivityEntityType {
     Feed,
     Item,
@@ -446,9 +467,10 @@ pub enum ActivityEntityType {
     Comparison,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(rename_all = "snake_case")]
-#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 pub enum ActivityAction {
     Create,
     Update,
@@ -462,9 +484,10 @@ pub enum ActivityAction {
 }
 
 /// Validated CSS hex color (`#RRGGBB`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[serde(try_from = "String", into = "String")]
-#[sqlx(transparent)]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 pub struct HexColor(String);
 
 impl HexColor {
@@ -514,6 +537,161 @@ impl From<HexColor> for String {
     fn from(color: HexColor) -> Self {
         color.0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryIdentifier {
+    pub scheme: String,
+    pub value: String,
+}
+
+impl EntryIdentifier {
+    #[must_use]
+    pub fn label(&self) -> &str {
+        external_identifier_label(&self.scheme)
+    }
+
+    #[must_use]
+    pub fn external_url(&self) -> Option<String> {
+        external_identifier_url(&self.scheme, &self.value)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicCollectionRule {
+    #[serde(default)]
+    pub kind: Option<EntryKind>,
+    #[serde(default)]
+    pub kinds: Vec<EntryKind>,
+    #[serde(default)]
+    pub consumed: Option<bool>,
+    #[serde(default)]
+    pub status: Option<ConsumptionStatus>,
+    #[serde(default, alias = "creator_contains")]
+    pub creator: Option<String>,
+    #[serde(default)]
+    pub release_year: Option<i32>,
+}
+
+#[must_use]
+pub fn parse_dynamic_collection_rule(rule_json: Option<&str>) -> Option<DynamicCollectionRule> {
+    let trimmed = rule_json.map(str::trim).filter(|s| !s.is_empty())?;
+    serde_json::from_str::<DynamicCollectionRule>(trimmed).ok()
+}
+
+/// Evaluates whether an entry with `statuses` (its recorded `consumption_log` statuses) satisfies
+/// `rule`, matching the SQL + creator semantics used across Rust and Kotlin.
+#[must_use]
+pub fn matches_dynamic_collection_rule(
+    rule: &DynamicCollectionRule,
+    kind: EntryKind,
+    creators: &[String],
+    release_year: Option<i32>,
+    statuses: &[ConsumptionStatus],
+) -> bool {
+    let mut target_kinds: Vec<EntryKind> = Vec::new();
+    if let Some(k) = rule.kind {
+        target_kinds.push(k);
+    }
+    for &k in &rule.kinds {
+        if !target_kinds.contains(&k) {
+            target_kinds.push(k);
+        }
+    }
+    if !target_kinds.is_empty() && !target_kinds.contains(&kind) {
+        return false;
+    }
+    if let Some(consumed_flag) = rule.consumed {
+        let has_consumed = statuses.contains(&ConsumptionStatus::Consumed);
+        if consumed_flag != has_consumed {
+            return false;
+        }
+    }
+    if let Some(st) = rule.status
+        && !statuses.contains(&st)
+    {
+        return false;
+    }
+    if let Some(yr) = rule.release_year
+        && release_year != Some(yr)
+    {
+        return false;
+    }
+    if let Some(creator_needle) = rule.creator.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let lower_needle = creator_needle.to_lowercase();
+        if !creators.iter().any(|c| c.to_lowercase().contains(&lower_needle)) {
+            return false;
+        }
+    }
+    true
+}
+
+#[must_use]
+pub fn is_want_to_read_base_slug(base_slug: &str) -> bool {
+    matches!(base_slug, "read" | "article" | "articles" | "paper" | "papers")
+}
+
+#[must_use]
+pub fn slugify_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_sep = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep && !out.is_empty() {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Derives `(clean_title, derived_slug, deterministic_collection_id)` for a manual `List` or `Want`
+/// collection. Returns `Err(message)` when the title, role, or derived slug is invalid.
+pub fn derive_manual_collection_slug_and_id(
+    title: &str,
+    slug: Option<&str>,
+    role: CollectionRole,
+) -> std::result::Result<(String, String, String), String> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err("Collection title cannot be empty".to_owned());
+    }
+    if !matches!(role, CollectionRole::List | CollectionRole::Want) {
+        return Err("Custom collections must have role 'list' or 'want'".to_owned());
+    }
+
+    let raw_source = slug.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(clean_title);
+    let slug_input = if role == CollectionRole::Want
+        && raw_source.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("want:"))
+    {
+        &raw_source[5..]
+    } else {
+        raw_source
+    };
+    let base_slug = slugify_title(slug_input);
+    if base_slug.is_empty() {
+        return Err("Collection slug cannot be empty".to_owned());
+    }
+
+    let (derived_slug, id) = if role == CollectionRole::Want {
+        let full_slug = if is_want_to_read_base_slug(&base_slug) {
+            WANT_TO_READ_SLUG.to_owned()
+        } else {
+            format!("want:{base_slug}")
+        };
+        let det_id = deterministic_system_collection_id(&full_slug);
+        (full_slug, det_id)
+    } else {
+        let det_id = deterministic_system_collection_id(&format!("custom:{base_slug}"));
+        (base_slug, det_id)
+    };
+
+    Ok((clean_title.to_owned(), derived_slug, id))
 }
 
 #[cfg(test)]
@@ -569,6 +747,21 @@ mod tests {
         assert_eq!(EntryKind::Article.parent_kind(), Some(EntryKind::Publication));
         assert_eq!(EntryKind::Video.parent_kind(), Some(EntryKind::Channel));
         assert_eq!(EntryKind::Movie.parent_kind(), None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_consumption_status_from_str_and_display_label() {
+        assert_eq!("consumed".parse::<ConsumptionStatus>().unwrap(), ConsumptionStatus::Consumed);
+        assert_eq!("finished".parse::<ConsumptionStatus>().unwrap(), ConsumptionStatus::Consumed);
+        assert_eq!("started".parse::<ConsumptionStatus>().unwrap(), ConsumptionStatus::Started);
+        assert_eq!("abandoned".parse::<ConsumptionStatus>().unwrap(), ConsumptionStatus::Abandoned);
+        assert_eq!("skipped".parse::<ConsumptionStatus>().unwrap(), ConsumptionStatus::Abandoned);
+        assert!("bogus".parse::<ConsumptionStatus>().is_err());
+
+        assert_eq!(ConsumptionStatus::Consumed.display_label(), "Finished");
+        assert_eq!(ConsumptionStatus::Started.display_label(), "Started");
+        assert_eq!(ConsumptionStatus::Abandoned.display_label(), "Skipped");
     }
 
     #[test]

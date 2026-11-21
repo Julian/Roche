@@ -4,17 +4,21 @@ pub mod rss;
 pub mod youtube;
 
 use anyhow::Result;
-pub use arxiv::ArxivParser;
+pub use arxiv::{ArxivFeed, ArxivPaper, ArxivParser};
 use chrono::{DateTime, SubsecRound, Utc};
 pub use opml::OpmlDocument;
-pub use rss::RssParser;
+pub use rss::{RssFeed, RssItem, RssParser};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-pub use youtube::YouTubeParser;
+pub use youtube::{YouTubeFeed, YouTubeParser, YouTubeVideo};
 
 use crate::{
     domain::FeedType,
-    util::{media_urls::is_direct_pdf_url, url_guard::parse_public_url},
+    media_urls::{
+        extract_youtube_channel_id, is_arxiv_host, is_direct_pdf_url, is_youtube_feed_url,
+        is_youtube_host, youtube_feed_url_for_channel_id,
+    },
+    url_guard::parse_public_url,
 };
 
 pub const MAX_PARSED_FEED_ENTRIES: usize = 1_000;
@@ -33,7 +37,7 @@ impl FeedSource {
         if trimmed.is_empty() {
             anyhow::bail!("Feed URL cannot be empty");
         }
-        if let Some(channel_id) = YouTubeParser::extract_channel_id(trimmed)
+        if let Some(channel_id) = extract_youtube_channel_id(trimmed)
             && !trimmed.contains("://")
         {
             return Ok(Self::YouTubeChannelId(channel_id));
@@ -54,51 +58,49 @@ impl FeedSource {
         match self {
             Self::YouTubeChannelId(channel_id) => match requested_type {
                 FeedType::Youtube | FeedType::Rss => {
-                    Ok((FeedType::Youtube, YouTubeParser::feed_url_for_channel_id(&channel_id)?))
+                    Ok((FeedType::Youtube, youtube_feed_url_for_channel_id(&channel_id)?))
                 }
                 FeedType::Arxiv | FeedType::Podcast => anyhow::bail!(
                     "Bare YouTube channel ID '{channel_id}' is only valid for youtube feeds"
                 ),
             },
             Self::Url(url) => {
-                let is_youtube_feed_url = YouTubeParser::is_youtube_feed_url(&url);
+                let is_yt_feed = is_youtube_feed_url(&url);
                 match requested_type {
                     FeedType::Youtube => {
-                        if !is_youtube_feed_url
-                            && let Some(channel_id) =
-                                YouTubeParser::extract_channel_id(url.as_str())
+                        if !is_yt_feed
+                            && let Some(channel_id) = extract_youtube_channel_id(url.as_str())
                         {
                             return Ok((
                                 FeedType::Youtube,
-                                YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                                youtube_feed_url_for_channel_id(&channel_id)?,
                             ));
                         }
-                        if !YouTubeParser::is_youtube_host(url.host_str()) {
+                        if !is_youtube_host(url.host_str()) {
                             anyhow::bail!("YouTube feed URL must point to youtube.com");
                         }
                         Ok((FeedType::Youtube, url))
                     }
                     FeedType::Arxiv => {
-                        if !ArxivParser::is_arxiv_host(url.host_str()) {
+                        if !is_arxiv_host(url.host_str()) {
                             anyhow::bail!("arXiv feed URL must point to arxiv.org");
                         }
                         Self::validate_arxiv_feed_url(&url)?;
                         Ok((FeedType::Arxiv, url))
                     }
                     FeedType::Rss | FeedType::Podcast => {
-                        if !is_youtube_feed_url
-                            && let Some(channel_id) =
-                                YouTubeParser::extract_channel_id(url.as_str())
+                        if !is_yt_feed
+                            && let Some(channel_id) = extract_youtube_channel_id(url.as_str())
                         {
                             return Ok((
                                 FeedType::Youtube,
-                                YouTubeParser::feed_url_for_channel_id(&channel_id)?,
+                                youtube_feed_url_for_channel_id(&channel_id)?,
                             ));
                         }
-                        if is_youtube_feed_url {
+                        if is_yt_feed {
                             return Ok((FeedType::Youtube, url));
                         }
-                        if ArxivParser::is_arxiv_host(url.host_str()) {
+                        if is_arxiv_host(url.host_str()) {
                             Self::validate_arxiv_feed_url(&url)?;
                             return Ok((FeedType::Arxiv, url));
                         }
@@ -129,6 +131,7 @@ impl<'de> Deserialize<'de> for FeedSource {
 }
 
 /// Shared helper to pick the preferred (`rel="alternate"`) validated HTTP(S) link from a `feed-rs` entry.
+///
 /// Excludes `rel="enclosure"` links so episode/article webpage permalinks (including `<guid>` / `<id>`)
 /// take priority over media enclosures.
 #[must_use]

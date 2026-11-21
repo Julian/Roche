@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use sqlx::SqliteConnection;
 
+use roche_core::domain::{matches_dynamic_collection_rule, parse_dynamic_collection_rule};
+
 use super::{
     CatalogRepo,
-    collections::{matches_dynamic_collection_rule, parse_dynamic_collection_rule},
     models::{
         CatalogEntry, CatalogExportSnapshot, CatalogResult, CollectionSummary, ComparisonRecord,
         ConsumptionLogRow, ExportCollectionEntry, ExportCollectionGenerator, RawCollectionRow,
@@ -27,7 +28,7 @@ impl CatalogRepo<'_> {
     /// Exports a consistent read-snapshot of the entire unified catalog graph.
     pub async fn export_catalog_snapshot(&self) -> CatalogResult<CatalogExportSnapshot> {
         let mut tx = crate::db::begin_read(self.pool).await?;
-        let snapshot = Self::export_catalog_snapshot_in_tx(&mut tx).await?;
+        let snapshot = Self::export_catalog_snapshot_in_tx(tx.conn()).await?;
         tx.commit().await?;
         Ok(snapshot)
     }

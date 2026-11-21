@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
-use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
+use sqlx::{QueryBuilder, Sqlite};
 
 use super::{
     CatalogRepo,
@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     db::{
+        WriteTx,
         sync::{
             SyncRepo, collection_entry_natural_key, deterministic_auto_consumption_log_id,
             deterministic_consumption_log_id,
@@ -20,10 +21,10 @@ use crate::{
     util::clock::now_utc,
 };
 
-/// Removes `entry_id` from all `Want` queues inside `conn` and records `collection_entry`
+/// Removes `entry_id` from all `Want` queues inside `tx` and records `collection_entry`
 /// tombstones + activity events so peer sync propagates the promotion out of offline Want queues.
 pub(super) async fn remove_from_want_queues_in_tx(
-    conn: &mut SqliteConnection,
+    tx: &mut WriteTx<'_>,
     entry_id: &str,
     ts: DateTime<Utc>,
 ) -> std::result::Result<(), sqlx::Error> {
@@ -34,7 +35,7 @@ pub(super) async fn remove_from_want_queues_in_tx(
            WHERE ce.entry_id = ? AND cs.collection_role = 'want'"#,
         entry_id,
     )
-    .fetch_all(&mut *conn)
+    .fetch_all(tx.conn())
     .await?;
 
     for col_id in want_col_ids {
@@ -43,12 +44,12 @@ pub(super) async fn remove_from_want_queues_in_tx(
             &col_id,
             entry_id,
         )
-        .execute(&mut *conn)
+        .execute(tx.conn())
         .await?;
         let nat_key = collection_entry_natural_key(&col_id, entry_id);
-        SyncRepo::record_tombstone(conn, ActivityEntityType::CollectionEntry, &nat_key, ts).await?;
+        SyncRepo::record_tombstone(tx, ActivityEntityType::CollectionEntry, &nat_key, ts).await?;
         SyncRepo::record_activity(
-            conn,
+            tx.conn(),
             ActivityEntityType::CollectionEntry,
             &nat_key,
             ActivityAction::Delete,
@@ -56,7 +57,7 @@ pub(super) async fn remove_from_want_queues_in_tx(
         )
         .await?;
         sqlx::query!("UPDATE entries SET updated_at = ? WHERE id = ?", ts as _, &col_id,)
-            .execute(&mut *conn)
+            .execute(tx.conn())
             .await?;
     }
     Ok(())
@@ -113,8 +114,8 @@ impl CatalogRepo<'_> {
         log_id: &str,
         canon_id: &str,
     ) -> CatalogResult<ConsumptionLogView> {
-        let entry = self
-            .get_entry(canon_id)
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let entry = Self::get_entry_in_tx(tx.conn(), canon_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{canon_id}'")))?;
         let row = sqlx::query_as!(
@@ -126,8 +127,9 @@ impl CatalogRepo<'_> {
                WHERE id = ?"#,
             log_id,
         )
-        .fetch_one(self.pool)
+        .fetch_one(tx.conn())
         .await?;
+        tx.commit().await?;
         Ok(ConsumptionLogView {
             id: row.id,
             entry,
@@ -139,14 +141,14 @@ impl CatalogRepo<'_> {
     }
 
     pub(crate) async fn log_consumption_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         status: ConsumptionStatus,
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<(String, String)> {
-        let canon_id = Self::follow_merged_id_in_tx(tx, entry_id)
+        let canon_id = Self::follow_merged_id_in_tx(tx.conn(), entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{entry_id}'")))?;
         let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
@@ -164,6 +166,7 @@ impl CatalogRepo<'_> {
             event_ts,
             now,
             true,
+            None,
         )
         .await?;
         Ok((log_id, canon_id))
@@ -178,16 +181,18 @@ impl CatalogRepo<'_> {
     /// Intentionally defers generator advancement so `merge_incoming_generators_in_tx` can first
     /// merge the peer's own generator state (with its HLC) before advancing any remaining terminal
     /// local draws.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn log_consumption_with_id_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         incoming_log_id: &str,
         raw_entry_id: &str,
         status: ConsumptionStatus,
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
+        explicit_hlc: Option<&str>,
     ) -> CatalogResult<(String, String, bool)> {
-        let canon_id = Self::follow_merged_id_in_tx(tx, raw_entry_id)
+        let canon_id = Self::follow_merged_id_in_tx(tx.conn(), raw_entry_id)
             .await?
             .ok_or_else(|| CatalogError::NotFound(format!("Entry '{raw_entry_id}'")))?;
         let trimmed_incoming = incoming_log_id.trim();
@@ -198,7 +203,13 @@ impl CatalogRepo<'_> {
         if is_auto_id
             && let Some((auto_id, inserted_new)) =
                 Self::ensure_auto_consumed_with_parents_inner_in_tx(
-                    tx, &canon_id, notes, event_ts, now, false,
+                    tx,
+                    &canon_id,
+                    notes,
+                    event_ts,
+                    now,
+                    false,
+                    explicit_hlc,
                 )
                 .await?
         {
@@ -233,6 +244,7 @@ impl CatalogRepo<'_> {
             event_ts,
             now,
             false,
+            explicit_hlc,
         )
         .await?;
         Ok((final_log_id, canon_id, inserted_new))
@@ -241,7 +253,7 @@ impl CatalogRepo<'_> {
     /// Runs Want-queue cleanup and parent engagement side effects when an existing log transitions
     /// to `Consumed` (e.g., via synced LWW update).
     pub(crate) async fn promote_entry_consumed_side_effects_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
@@ -255,28 +267,29 @@ impl CatalogRepo<'_> {
     /// (unless it already has a `'consumed'` log), removes it from `Want` queues, and engages parent
     /// `podcast`/`publication`/`channel`/`artist` entries.
     pub(crate) async fn ensure_auto_consumed_with_parents_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> CatalogResult<Option<String>> {
         Ok(Self::ensure_auto_consumed_with_parents_inner_in_tx(
-            tx, entry_id, notes, event_ts, now, true,
+            tx, entry_id, notes, event_ts, now, true, None,
         )
         .await?
         .map(|(id, _)| id))
     }
 
     async fn ensure_auto_consumed_with_parents_inner_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         notes: Option<&str>,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
         advance_generators: bool,
+        explicit_hlc: Option<&str>,
     ) -> CatalogResult<Option<(String, bool)>> {
-        let Some(canon_id) = Self::follow_merged_id_in_tx(tx, entry_id).await? else {
+        let Some(canon_id) = Self::follow_merged_id_in_tx(tx.conn(), entry_id).await? else {
             return Ok(None);
         };
         let clean_notes = notes.map(str::trim).filter(|s| !s.is_empty());
@@ -285,17 +298,44 @@ impl CatalogRepo<'_> {
             r#"SELECT id as "id!" FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1"#,
             &canon_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
 
         if let Some(existing_id) = existing_consumed_id {
             if let Some(n) = clean_notes {
-                sqlx::query!(
-                    "UPDATE consumption_log SET notes = COALESCE(notes, ?) WHERE id = ?",
-                    n,
-                    &existing_id,
+                let use_max = explicit_hlc.is_some_and(|h| !h.is_empty());
+                let hlc = match explicit_hlc {
+                    Some(h) if !h.is_empty() => h.to_owned(),
+                    _ => tx.next_hlc().await?,
+                };
+                sqlx::query(
+                    "UPDATE consumption_log
+                     SET notes = COALESCE(notes, ?),
+                         hlc = CASE
+                             WHEN ? THEN CASE WHEN ? > hlc THEN ? ELSE hlc END
+                             WHEN notes IS NULL THEN ?
+                             ELSE hlc
+                         END
+                     WHERE id = ?",
                 )
-                .execute(&mut *tx)
+                .bind(n)
+                .bind(use_max)
+                .bind(&hlc)
+                .bind(&hlc)
+                .bind(&hlc)
+                .bind(&existing_id)
+                .execute(tx.conn())
+                .await?;
+            } else if let Some(h) = explicit_hlc.filter(|s| !s.is_empty()) {
+                sqlx::query(
+                    "UPDATE consumption_log
+                     SET hlc = CASE WHEN ? > hlc THEN ? ELSE hlc END
+                     WHERE id = ?",
+                )
+                .bind(h)
+                .bind(h)
+                .bind(&existing_id)
+                .execute(tx.conn())
                 .await?;
             }
             remove_from_want_queues_in_tx(tx, &canon_id, now).await?;
@@ -313,6 +353,7 @@ impl CatalogRepo<'_> {
             event_ts,
             now,
             advance_generators,
+            explicit_hlc,
         )
         .await?;
         Ok(Some((auto_id, inserted_new)))
@@ -320,7 +361,7 @@ impl CatalogRepo<'_> {
 
     #[allow(clippy::too_many_arguments)]
     async fn insert_consumption_and_engage_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         log_id: &str,
         canon_id: &str,
         status: ConsumptionStatus,
@@ -328,32 +369,42 @@ impl CatalogRepo<'_> {
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
         advance_generators: bool,
+        explicit_hlc: Option<&str>,
     ) -> CatalogResult<bool> {
-        SyncRepo::clear_tombstone(tx, ActivityEntityType::ConsumptionLog, log_id).await?;
+        SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::ConsumptionLog, log_id).await?;
 
         let existed_before: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM consumption_log WHERE id = ?")
                 .bind(log_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.conn())
                 .await?;
 
-        sqlx::query!(
-            "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+        let log_hlc = match explicit_hlc {
+            Some(h) if !h.is_empty() => h.to_owned(),
+            _ => tx.next_hlc().await?,
+        };
+        sqlx::query(
+            "INSERT INTO consumption_log (id, entry_id, ts, status, notes, created_at, hlc)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
-                notes = COALESCE(excluded.notes, consumption_log.notes)",
-            log_id,
-            canon_id,
-            event_ts as _,
-            status as _,
-            clean_notes,
-            now as _,
+                notes = COALESCE(excluded.notes, consumption_log.notes),
+                hlc = CASE
+                    WHEN excluded.hlc > consumption_log.hlc THEN excluded.hlc
+                    ELSE consumption_log.hlc
+                END",
         )
-        .execute(&mut *tx)
+        .bind(log_id)
+        .bind(canon_id)
+        .bind(event_ts)
+        .bind(status)
+        .bind(clean_notes)
+        .bind(now)
+        .bind(&log_hlc)
+        .execute(tx.conn())
         .await?;
 
         SyncRepo::record_activity(
-            tx,
+            tx.conn(),
             ActivityEntityType::ConsumptionLog,
             log_id,
             ActivityAction::Create,
@@ -374,7 +425,7 @@ impl CatalogRepo<'_> {
     }
 
     async fn engage_consumed_parents_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         canon_id: &str,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
@@ -384,7 +435,7 @@ impl CatalogRepo<'_> {
                FROM entries WHERE id = ?"#,
             canon_id,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.conn())
         .await?;
         let entry_kind = row_meta.kind;
         let creators_json = row_meta.creators_json;
@@ -400,7 +451,7 @@ impl CatalogRepo<'_> {
                  AND pe.kind IN ('podcast', 'publication', 'channel')"#,
             canon_id,
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(tx.conn())
         .await?;
         for parent_id in parent_feed_cols {
             Self::ensure_once_consumed_in_tx(tx, &parent_id, event_ts, now).await?;
@@ -412,14 +463,16 @@ impl CatalogRepo<'_> {
             for creator in creators {
                 if !creator.trim().is_empty() {
                     let artist_id = Self::ensure_artist_entry_in_tx(tx, &creator, now).await?;
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at)
-                         VALUES (?, ?, ?)",
-                        &artist_id,
-                        canon_id,
-                        now as _,
+                    let ce_hlc = tx.next_hlc().await?;
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO collection_entries (collection_id, entry_id, added_at, hlc)
+                         VALUES (?, ?, ?, ?)",
                     )
-                    .execute(&mut *tx)
+                    .bind(&artist_id)
+                    .bind(canon_id)
+                    .bind(now)
+                    .bind(&ce_hlc)
+                    .execute(tx.conn())
                     .await?;
                     Self::ensure_once_consumed_in_tx(tx, &artist_id, event_ts, now).await?;
                 }
@@ -429,7 +482,7 @@ impl CatalogRepo<'_> {
     }
 
     pub(crate) async fn ensure_once_consumed_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         event_ts: DateTime<Utc>,
         now: DateTime<Utc>,
@@ -438,24 +491,27 @@ impl CatalogRepo<'_> {
             r#"SELECT 1 as "found!: i64" FROM consumption_log WHERE entry_id = ? AND status = 'consumed' LIMIT 1"#,
             entry_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         if already.is_none() {
             let log_id = deterministic_auto_consumption_log_id(entry_id);
-            let res = sqlx::query!(
-                "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at)
-                 VALUES (?, ?, ?, 'consumed', NULL, ?)",
-                &log_id,
-                entry_id,
-                event_ts as _,
-                now as _,
+            let log_hlc = tx.next_hlc().await?;
+            let res = sqlx::query(
+                "INSERT OR IGNORE INTO consumption_log (id, entry_id, ts, status, notes, created_at, hlc)
+                 VALUES (?, ?, ?, 'consumed', NULL, ?, ?)",
             )
-            .execute(&mut *tx)
+            .bind(&log_id)
+            .bind(entry_id)
+            .bind(event_ts)
+            .bind(now)
+            .bind(&log_hlc)
+            .execute(tx.conn())
             .await?;
             if res.rows_affected() > 0 {
-                SyncRepo::clear_tombstone(tx, ActivityEntityType::ConsumptionLog, &log_id).await?;
+                SyncRepo::clear_tombstone(tx.conn(), ActivityEntityType::ConsumptionLog, &log_id)
+                    .await?;
                 SyncRepo::record_activity(
-                    tx,
+                    tx.conn(),
                     ActivityEntityType::ConsumptionLog,
                     &log_id,
                     ActivityAction::Create,
@@ -511,14 +567,16 @@ impl CatalogRepo<'_> {
             .push(" OFFSET ")
             .push_bind(skip);
 
-        let log_rows: Vec<ConsumptionLogRow> = qb.build_query_as().fetch_all(self.pool).await?;
+        let mut tx = crate::db::begin_read(self.pool).await?;
+        let log_rows: Vec<ConsumptionLogRow> = qb.build_query_as().fetch_all(tx.conn()).await?;
         let unique_entry_ids: Vec<String> = log_rows
             .iter()
             .map(|r| r.entry_id.clone())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let entry_map = self.load_entries_by_ids(&unique_entry_ids).await?;
+        let entry_map = Self::load_entries_by_ids_in_tx(tx.conn(), &unique_entry_ids).await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(log_rows.len());
         for row in log_rows {
@@ -557,6 +615,7 @@ impl CatalogRepo<'_> {
         let bounded_q: String = trimmed.chars().take(256).collect();
         let notes_pattern = format!("%{}%", crate::db::escape_like_literal(&bounded_q));
 
+        let mut tx = crate::db::begin_read(self.pool).await?;
         let log_rows: Vec<ConsumptionLogRow> = sqlx::query_as(
             "SELECT cl.id, cl.entry_id, cl.ts, cl.status, cl.notes, cl.created_at
              FROM consumption_log cl
@@ -573,7 +632,7 @@ impl CatalogRepo<'_> {
         .bind(&fts_query)
         .bind(&notes_pattern)
         .bind(cap)
-        .fetch_all(self.pool)
+        .fetch_all(tx.conn())
         .await?;
 
         let unique_entry_ids: Vec<String> = log_rows
@@ -582,7 +641,8 @@ impl CatalogRepo<'_> {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let entry_map = self.load_entries_by_ids(&unique_entry_ids).await?;
+        let entry_map = Self::load_entries_by_ids_in_tx(tx.conn(), &unique_entry_ids).await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(log_rows.len());
         for row in log_rows {
@@ -639,7 +699,7 @@ impl CatalogRepo<'_> {
              FROM consumption_log WHERE id = ?",
         )
         .bind(log_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.conn())
         .await?;
         let Some(row) = existing else {
             return Err(CatalogError::NotFound(format!("Consumption log '{log_id}'")));
@@ -654,23 +714,25 @@ impl CatalogRepo<'_> {
             None => row.notes,
         };
         let next_ts = ts.unwrap_or(row.ts);
+        let log_hlc = tx.next_hlc().await?;
         sqlx::query(
             "UPDATE consumption_log
-             SET status = ?, notes = ?, ts = ?
+             SET status = ?, notes = ?, ts = ?, hlc = ?
              WHERE id = ?",
         )
         .bind(next_status)
         .bind(next_notes.as_deref())
         .bind(next_ts)
+        .bind(&log_hlc)
         .bind(&row.id)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
         if next_status == ConsumptionStatus::Consumed && row.status != ConsumptionStatus::Consumed {
             remove_from_want_queues_in_tx(&mut tx, &row.entry_id, now).await?;
             Self::engage_consumed_parents_in_tx(&mut tx, &row.entry_id, next_ts, now).await?;
         }
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::ConsumptionLog,
             &row.id,
             ActivityAction::Update,
@@ -687,7 +749,7 @@ impl CatalogRepo<'_> {
         let mut tx = crate::db::begin_write(self.pool).await?;
         let res = sqlx::query("DELETE FROM consumption_log WHERE id = ?")
             .bind(log_id)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
         if res.rows_affected() == 0 {
             return Ok(false);
@@ -695,7 +757,7 @@ impl CatalogRepo<'_> {
         SyncRepo::record_tombstone(&mut tx, ActivityEntityType::ConsumptionLog, log_id, now)
             .await?;
         SyncRepo::record_activity(
-            &mut tx,
+            tx.conn(),
             ActivityEntityType::ConsumptionLog,
             log_id,
             ActivityAction::Delete,
@@ -707,27 +769,27 @@ impl CatalogRepo<'_> {
     }
 
     pub(crate) async fn delete_consumed_logs_for_entry_in_tx(
-        tx: &mut SqliteConnection,
+        tx: &mut WriteTx<'_>,
         entry_id: &str,
         now: DateTime<Utc>,
     ) -> CatalogResult<usize> {
-        let Some(canon_id) = Self::follow_merged_id_in_tx(tx, entry_id).await? else {
+        let Some(canon_id) = Self::follow_merged_id_in_tx(tx.conn(), entry_id).await? else {
             return Ok(0);
         };
         let log_ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM consumption_log WHERE entry_id = ? AND status = 'consumed'",
         )
         .bind(&canon_id)
-        .fetch_all(&mut *tx)
+        .fetch_all(tx.conn())
         .await?;
         for log_id in &log_ids {
             sqlx::query("DELETE FROM consumption_log WHERE id = ?")
                 .bind(log_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             SyncRepo::record_tombstone(tx, ActivityEntityType::ConsumptionLog, log_id, now).await?;
             SyncRepo::record_activity(
-                tx,
+                tx.conn(),
                 ActivityEntityType::ConsumptionLog,
                 log_id,
                 ActivityAction::Delete,

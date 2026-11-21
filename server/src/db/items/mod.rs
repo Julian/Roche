@@ -241,58 +241,25 @@ pub struct ItemPage {
     pub has_more: bool,
 }
 
-fn deserialize_optional_rfc3339<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<DateTime<Utc>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt = Option::<String>::deserialize(deserializer)?;
-    let Some(raw) = opt else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(serde::de::Error::custom("updated_after cannot be empty"));
-    }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(Some(dt.with_timezone(&Utc)));
-    }
-    if trimmed.contains(' ')
-        && let Ok(dt) = DateTime::parse_from_rfc3339(&trimmed.replace(' ', "+"))
-    {
-        return Ok(Some(dt.with_timezone(&Utc)));
-    }
-    Err(serde::de::Error::custom(format!(
-        "Invalid RFC 3339 timestamp for updated_after: '{trimmed}'"
-    )))
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone)]
 pub struct ItemFilter {
     pub status: Option<ItemStatusFilter>,
     pub feed_id: Option<String>,
     pub tag_id: Option<String>,
-    #[serde(default)]
     pub collection_id: Option<String>,
-    #[serde(default)]
     pub inbox_only: Option<bool>,
-    #[serde(default)]
     pub in_progress_only: Option<bool>,
     pub content_type: Option<ContentType>,
     pub is_favorite: Option<bool>,
     pub is_read: Option<bool>,
     pub include_content: Option<bool>,
     pub search: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_rfc3339")]
     pub updated_after: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub updated_after_item_id: Option<String>,
     pub sort: Option<ItemSortField>,
     pub order: Option<SortOrder>,
     pub page: Option<usize>,
     pub per_page: Option<usize>,
-    #[serde(default)]
     pub sort_updated_asc: bool,
 }
 

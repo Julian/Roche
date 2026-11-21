@@ -25,11 +25,11 @@ use super::{
     },
 };
 use crate::{
-    db::{CatalogEntry, ClusterSelectFilter, RankedCollectionView, RankedEntryRow},
-    service::RocheService,
+    db::CatalogEntry,
+    ranking::MAX_FOCUSED_ROUNDS,
+    service::{ClusterSelectFilter, RankedCollectionView, RankedEntryRow, RocheService},
 };
 
-const MAX_FOCUSED_ROUNDS: usize = 5;
 const MAX_CUSTOM_ROUNDS: usize = 50;
 const MAX_COVERED_CLUSTERS: usize = 12;
 
